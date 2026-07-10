@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
@@ -346,7 +346,29 @@ impl RealtimeInferenceDiagnostics {
     }
 }
 
-pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: String) {
+pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_id: String) {
+    let Some(_session_permit) = state.try_acquire_realtime_session() else {
+        let _ = socket
+            .send(Message::Text(
+                json!({
+                    "type": "error",
+                    "code": "realtime_session_capacity",
+                    "message": "Realtime websocket session capacity is exhausted",
+                    "fatal": true,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013,
+                reason: "realtime_session_capacity".into(),
+            })))
+            .await;
+        return;
+    };
+
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (raw_out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
     let out_tx = OutboundTx::new(raw_out_tx, state.runtime.clone(), "transcription realtime");

@@ -13,7 +13,15 @@ export type VoiceRealtimeMode = "modular" | "unified";
 
 export type VoiceRealtimeServerEvent =
   | { type: "connected"; protocol: string; server_time_ms?: number }
-  | { type: "session_ready"; protocol: string }
+  | {
+      type: "session_ready";
+      protocol: string;
+      session_id: string;
+      owner_instance_id: string;
+      connection_epoch: number;
+      resumable: false;
+      resume_window_ms: 0;
+    }
   | {
       type: "input_stream_ready";
       vad?: {
@@ -32,7 +40,11 @@ export type VoiceRealtimeServerEvent =
       type: "user_speech_end";
       utterance_id: string;
       utterance_seq: number;
-      reason?: "silence" | "max_duration" | "stream_stopped";
+      reason?:
+        | "silence"
+        | "max_duration"
+        | "stream_stopped"
+        | "client_pause";
     }
   | { type: "turn_processing"; utterance_id: string; utterance_seq: number }
   | {
@@ -45,6 +57,12 @@ export type VoiceRealtimeServerEvent =
       utterance_id: string;
       utterance_seq: number;
       delta: string;
+    }
+  | {
+      type: "user_transcript_snapshot";
+      utterance_id: string;
+      utterance_seq: number;
+      text: string;
     }
   | {
       type: "user_transcript_final";
@@ -73,6 +91,12 @@ export type VoiceRealtimeServerEvent =
       delta: string;
     }
   | {
+      type: "assistant_text_snapshot";
+      utterance_id: string;
+      utterance_seq: number;
+      text: string;
+    }
+  | {
       type: "assistant_audio_start";
       utterance_id: string;
       utterance_seq: number;
@@ -83,6 +107,12 @@ export type VoiceRealtimeServerEvent =
       type: "assistant_audio_done";
       utterance_id: string;
       utterance_seq: number;
+    }
+  | {
+      type: "turn_interrupted";
+      utterance_id: string;
+      utterance_seq: number;
+      reason?: string;
     }
   | {
       type: "turn_done";
@@ -96,6 +126,8 @@ export type VoiceRealtimeServerEvent =
       utterance_id?: string | null;
       utterance_seq?: number | null;
       message: string;
+      code?: string;
+      fatal?: boolean;
     }
   | { type: "pong"; timestamp_ms?: number; server_time_ms?: number };
 
@@ -432,11 +464,88 @@ export function buildVoiceRealtimeWebSocketUrl(apiBaseUrl: string): string {
 export function isVoiceRealtimeServerEvent(
   value: unknown,
 ): value is VoiceRealtimeServerEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Record<string, unknown>;
+  const type = event.type;
+  if (typeof type !== "string") return false;
+
+  const hasTurnIdentity = () =>
+    typeof event.utterance_id === "string" &&
+    typeof event.utterance_seq === "number";
+  const hasTurnText = (field: "delta" | "text") =>
+    hasTurnIdentity() && typeof event[field] === "string";
+
+  switch (type) {
+    case "connected":
+      return typeof event.protocol === "string";
+    case "session_ready":
+      return (
+        typeof event.protocol === "string" &&
+        typeof event.session_id === "string" &&
+        typeof event.owner_instance_id === "string" &&
+        typeof event.connection_epoch === "number" &&
+        event.resumable === false &&
+        event.resume_window_ms === 0
+      );
+    case "input_stream_ready":
+    case "input_stream_stopped":
+    case "pong":
+      return true;
+    case "user_speech_start":
+    case "user_speech_rejected":
+    case "user_speech_end":
+    case "turn_processing":
+    case "user_transcript_start":
+    case "assistant_text_start":
+    case "assistant_audio_done":
+    case "turn_interrupted":
+      return hasTurnIdentity();
+    case "user_transcript_delta":
+    case "assistant_text_delta":
+      return hasTurnText("delta");
+    case "user_transcript_snapshot":
+    case "user_transcript_final":
+    case "assistant_text_snapshot":
+    case "assistant_text_final":
+      return hasTurnText("text");
+    case "assistant_audio_start":
+      return (
+        hasTurnIdentity() &&
+        typeof event.sample_rate === "number" &&
+        ["pcm_i16", "pcm_f32", "wav"].includes(String(event.audio_format))
+      );
+    case "turn_done":
+      return (
+        hasTurnIdentity() &&
+        ["ok", "error", "timeout", "interrupted", "no_input"].includes(
+          String(event.status),
+        )
+      );
+    case "error":
+      return typeof event.message === "string";
+    default:
+      return false;
+  }
+}
+
+export function shouldStopVoiceRealtimePlayback(
+  event: VoiceRealtimeServerEvent,
+  activeUtteranceSeq: number | null,
+): boolean {
+  if (activeUtteranceSeq == null) {
+    return false;
+  }
+
+  if (event.type === "user_speech_start") {
+    return activeUtteranceSeq < event.utterance_seq;
+  }
+  if (event.type === "turn_interrupted") {
+    return activeUtteranceSeq === event.utterance_seq;
+  }
   return (
-    !!value &&
-    typeof value === "object" &&
-    "type" in value &&
-    typeof (value as { type?: unknown }).type === "string"
+    event.type === "turn_done" &&
+    event.status === "interrupted" &&
+    activeUtteranceSeq === event.utterance_seq
   );
 }
 

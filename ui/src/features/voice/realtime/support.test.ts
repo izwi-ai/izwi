@@ -4,11 +4,14 @@ import {
   encodeVoiceRealtimeClientPcm16Frame,
   formatModelVariantLabel,
   isAsrVariant,
+  isVoiceRealtimeServerEvent,
   isUnifiedAudioChatVariant,
   makeTranscriptEntryId,
   mergeSampleChunks,
   parseFinalAnswer,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
+  shouldStopVoiceRealtimePlayback,
+  type VoiceRealtimeServerEvent,
 } from "./support";
 
 describe("voice realtime support", () => {
@@ -99,5 +102,74 @@ describe("voice realtime support", () => {
         mergeSampleChunks([new Float32Array([1, 2]), new Float32Array([3])]),
       ),
     ).toEqual([1, 2, 3]);
+  });
+
+  it("models voice websocket ownership as process-local and non-resumable", () => {
+    const event = {
+      type: "session_ready",
+      protocol: "voice_realtime_v1",
+      session_id: "transport-session",
+      owner_instance_id: "process-123",
+      connection_epoch: 0,
+      resumable: false,
+      resume_window_ms: 0,
+    } satisfies VoiceRealtimeServerEvent;
+
+    expect(event.owner_instance_id).toBe("process-123");
+    expect(event.resumable).toBe(false);
+    expect(event.resume_window_ms).toBe(0);
+  });
+
+  it("rejects unknown and malformed voice server events", () => {
+    expect(isVoiceRealtimeServerEvent({ type: "made_up" })).toBe(false);
+    expect(
+      isVoiceRealtimeServerEvent({
+        type: "session_ready",
+        protocol: "voice_realtime_v1",
+      }),
+    ).toBe(false);
+    expect(
+      isVoiceRealtimeServerEvent({
+        type: "assistant_text_snapshot",
+        utterance_id: "turn-1",
+        utterance_seq: 1,
+        text: "Hello",
+      }),
+    ).toBe(true);
+  });
+
+  it("cuts off scheduled playback immediately for barge-in and interruption", () => {
+    expect(
+      shouldStopVoiceRealtimePlayback(
+        {
+          type: "user_speech_start",
+          utterance_id: "next",
+          utterance_seq: 8,
+        },
+        7,
+      ),
+    ).toBe(true);
+    expect(
+      shouldStopVoiceRealtimePlayback(
+        {
+          type: "turn_interrupted",
+          utterance_id: "active",
+          utterance_seq: 7,
+          reason: "barge_in",
+        },
+        7,
+      ),
+    ).toBe(true);
+    expect(
+      shouldStopVoiceRealtimePlayback(
+        {
+          type: "turn_done",
+          utterance_id: "other",
+          utterance_seq: 6,
+          status: "interrupted",
+        },
+        7,
+      ),
+    ).toBe(false);
   });
 });

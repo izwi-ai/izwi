@@ -45,6 +45,7 @@ import {
   makeTranscriptEntryId,
   mergeSampleChunks,
   parseFinalAnswer,
+  shouldStopVoiceRealtimePlayback,
   type VoiceRealtimeMode,
   parseVoiceRealtimeAssistantAudioBinaryChunk,
   type RuntimeStatus,
@@ -863,6 +864,17 @@ export function VoicePage({
         return;
       }
 
+      if (
+        shouldStopVoiceRealtimePlayback(
+          event,
+          voiceWsPlaybackRef.current?.utteranceSeq ?? null,
+        )
+      ) {
+        clearAudioPlayback();
+        voiceWsPlaybackRef.current = null;
+        processingRef.current = false;
+      }
+
       switch (event.type) {
         case "connected":
           return;
@@ -946,6 +958,12 @@ export function VoicePage({
           });
           return;
         }
+        case "user_transcript_snapshot": {
+          const entryId = voiceUserEntryIdsRef.current.get(event.utterance_id);
+          if (!entryId) return;
+          setTranscriptEntryText(entryId, event.text);
+          return;
+        }
         case "user_transcript_final": {
           const entryId = voiceUserEntryIdsRef.current.get(event.utterance_id);
           if (!entryId) return;
@@ -989,6 +1007,14 @@ export function VoicePage({
             };
             return next;
           });
+          return;
+        }
+        case "assistant_text_snapshot": {
+          const entryId = voiceAssistantEntryIdsRef.current.get(
+            event.utterance_id,
+          );
+          if (!entryId) return;
+          setTranscriptEntryText(entryId, event.text);
           return;
         }
         case "assistant_text_final": {
@@ -1061,17 +1087,21 @@ export function VoicePage({
           );
           return;
         }
+        case "turn_interrupted":
+          processingRef.current = false;
+          if (
+            isSessionActiveRef.current &&
+            runtimeStatusRef.current !== "user_speaking"
+          ) {
+            setRuntimeStatus("listening");
+          }
+          return;
         case "turn_done": {
           if (event.status !== "ok" && event.status !== "interrupted") {
             processingRef.current = false;
           }
 
           if (event.status === "interrupted") {
-            if (
-              voiceWsPlaybackRef.current?.utteranceSeq === event.utterance_seq
-            ) {
-              voiceWsPlaybackRef.current = null;
-            }
             return;
           }
 

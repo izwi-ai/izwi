@@ -12,10 +12,11 @@
 //! - interruption / barge-in cancellation
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
@@ -36,7 +37,7 @@ use izwi_vad::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::chat_store::ChatStore;
@@ -62,35 +63,314 @@ const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
 const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
 const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const WS_OUTBOUND_AUDIO_MAX_BYTES: usize = 4 * 1024 * 1024;
+const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
 const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 struct OutboundTx {
-    tx: mpsc::Sender<Message>,
+    mailbox: Arc<OutboundMailbox>,
     runtime: Arc<RuntimeService>,
     label: &'static str,
 }
 
 impl OutboundTx {
-    fn new(tx: mpsc::Sender<Message>, runtime: Arc<RuntimeService>, label: &'static str) -> Self {
-        Self { tx, runtime, label }
+    fn new(runtime: Arc<RuntimeService>, label: &'static str) -> Self {
+        Self {
+            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::from_env())),
+            runtime,
+            label,
+        }
     }
 
     fn send(&self, message: Message) -> bool {
-        match self.tx.try_send(message) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
+        self.enqueue(message, OutboundClass::Critical, None).is_ok()
+    }
+
+    fn send_turn(&self, generation: u64, message: Message) -> bool {
+        self.enqueue(message, OutboundClass::Critical, Some(generation))
+            .is_ok()
+    }
+
+    fn send_text_snapshot(&self, generation: u64, key: String, message: Message) -> bool {
+        self.enqueue(
+            message,
+            OutboundClass::CoalescibleText(key),
+            Some(generation),
+        )
+        .is_ok()
+    }
+
+    fn send_audio(
+        &self,
+        generation: u64,
+        message: Message,
+        bytes: usize,
+        duration_ms: u64,
+    ) -> Result<(), OutboundEnqueueError> {
+        self.enqueue(
+            message,
+            OutboundClass::Audio { bytes, duration_ms },
+            Some(generation),
+        )
+    }
+
+    fn send_diagnostic(&self, message: Message) -> bool {
+        self.enqueue(message, OutboundClass::Diagnostic, None)
+            .is_ok()
+    }
+
+    fn enqueue(
+        &self,
+        message: Message,
+        class: OutboundClass,
+        turn_generation: Option<u64>,
+    ) -> Result<(), OutboundEnqueueError> {
+        let result = self.mailbox.enqueue(OutboundItem {
+            message,
+            class,
+            turn_generation,
+        });
+        if let Err(err) = &result {
+            if !matches!(err, OutboundEnqueueError::Cutoff) {
                 self.runtime.record_voice_stream_backpressure();
-                warn!(
-                    "{} outbound websocket queue is full; dropping message",
-                    self.label
-                );
-                false
+                warn!(label = self.label, error = ?err, "voice outbound delivery rejected");
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+        result
+    }
+
+    fn cutoff_turn(&self, generation: u64) {
+        self.mailbox.cutoff_turn(generation);
+    }
+
+    async fn next(&self) -> Option<MailboxOutput> {
+        self.mailbox.next().await
+    }
+
+    fn close(&self) {
+        self.mailbox.close();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutboundClass {
+    Critical,
+    CoalescibleText(String),
+    Audio { bytes: usize, duration_ms: u64 },
+    Diagnostic,
+}
+
+struct OutboundItem {
+    message: Message,
+    class: OutboundClass,
+    turn_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutboundLimits {
+    max_items: usize,
+    max_audio_bytes: usize,
+    max_audio_ms: u64,
+}
+
+impl OutboundLimits {
+    fn from_env() -> Self {
+        Self {
+            max_items: env_usize("IZWI_VOICE_WS_OUTBOUND_ITEMS", WS_OUTBOUND_QUEUE_CAPACITY),
+            max_audio_bytes: env_usize(
+                "IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES",
+                WS_OUTBOUND_AUDIO_MAX_BYTES,
+            ),
+            max_audio_ms: env_u64("IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", WS_OUTBOUND_AUDIO_MAX_MS),
         }
     }
+}
+
+struct OutboundMailbox {
+    limits: OutboundLimits,
+    state: Mutex<OutboundMailboxState>,
+    notify: Notify,
+    minimum_turn_generation: AtomicU64,
+}
+
+#[derive(Default)]
+struct OutboundMailboxState {
+    queue: VecDeque<OutboundItem>,
+    audio_bytes: usize,
+    audio_ms: u64,
+    close_reason: Option<String>,
+    closed: bool,
+}
+
+enum MailboxOutput {
+    Message(Message),
+    Close(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundEnqueueError {
+    Cutoff,
+    AudioSaturated,
+    QueueSaturated,
+    Closed,
+    DroppedDiagnostic,
+}
+
+impl OutboundMailbox {
+    fn new(limits: OutboundLimits) -> Self {
+        Self {
+            limits,
+            state: Mutex::new(OutboundMailboxState::default()),
+            notify: Notify::new(),
+            minimum_turn_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if item.turn_generation.is_some_and(|generation| {
+            generation < self.minimum_turn_generation.load(Ordering::Acquire)
+        }) {
+            return Err(OutboundEnqueueError::Cutoff);
+        }
+        if state.closed {
+            return Err(OutboundEnqueueError::Closed);
+        }
+
+        if let OutboundClass::CoalescibleText(key) = &item.class {
+            if let Some(existing) = state.queue.iter_mut().find(|queued| {
+                queued.turn_generation == item.turn_generation
+                    && matches!(&queued.class, OutboundClass::CoalescibleText(existing_key) if existing_key == key)
+            }) {
+                existing.message = item.message;
+                return Ok(());
+            }
+        }
+
+        if let OutboundClass::Audio { bytes, duration_ms } = &item.class {
+            if state.audio_bytes.saturating_add(*bytes) > self.limits.max_audio_bytes
+                || state.audio_ms.saturating_add(*duration_ms) > self.limits.max_audio_ms
+            {
+                state.close_reason = Some("outbound_audio_saturated".to_string());
+                self.notify.notify_one();
+                return Err(OutboundEnqueueError::AudioSaturated);
+            }
+        }
+
+        if state.queue.len() >= self.limits.max_items {
+            match &item.class {
+                OutboundClass::Critical => {
+                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
+                    self.notify.notify_one();
+                    return Err(OutboundEnqueueError::QueueSaturated);
+                }
+                OutboundClass::Audio { .. } => {
+                    state.close_reason = Some("outbound_audio_saturated".to_string());
+                    self.notify.notify_one();
+                    return Err(OutboundEnqueueError::AudioSaturated);
+                }
+                OutboundClass::Diagnostic => {
+                    return Err(OutboundEnqueueError::DroppedDiagnostic);
+                }
+                OutboundClass::CoalescibleText(_) => {
+                    return Err(OutboundEnqueueError::QueueSaturated);
+                }
+            }
+        }
+
+        if let OutboundClass::Audio { bytes, duration_ms } = &item.class {
+            state.audio_bytes = state.audio_bytes.saturating_add(*bytes);
+            state.audio_ms = state.audio_ms.saturating_add(*duration_ms);
+        }
+        state.queue.push_back(item);
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    fn cutoff_turn(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.minimum_turn_generation
+            .fetch_max(generation.saturating_add(1), Ordering::AcqRel);
+        let mut retained = VecDeque::with_capacity(state.queue.len());
+        while let Some(item) = state.queue.pop_front() {
+            if item.turn_generation == Some(generation) {
+                subtract_audio_depth(&mut state, &item.class);
+            } else {
+                retained.push_back(item);
+            }
+        }
+        state.queue = retained;
+    }
+
+    async fn next(&self) -> Option<MailboxOutput> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if let Some(reason) = state.close_reason.take() {
+                    state.queue.clear();
+                    state.audio_bytes = 0;
+                    state.audio_ms = 0;
+                    state.closed = true;
+                    return Some(MailboxOutput::Close(reason));
+                }
+                if let Some(item) = state.queue.pop_front() {
+                    subtract_audio_depth(&mut state, &item.class);
+                    return Some(MailboxOutput::Message(item.message));
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.closed = true;
+        drop(state);
+        self.notify.notify_waiters();
+    }
+}
+
+fn subtract_audio_depth(state: &mut OutboundMailboxState, class: &OutboundClass) {
+    if let OutboundClass::Audio { bytes, duration_ms } = class {
+        state.audio_bytes = state.audio_bytes.saturating_sub(*bytes);
+        state.audio_ms = state.audio_ms.saturating_sub(*duration_ms);
+    }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +474,73 @@ struct ActiveTurn {
     turn_record_id: String,
     state: AppState,
     task: tokio::task::JoinHandle<()>,
+    control: TurnControl,
+    output_generation: u64,
+}
+
+#[derive(Clone)]
+struct TurnControl {
+    inner: Arc<TurnControlInner>,
+}
+
+struct TurnControlInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl TurnControl {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(TurnControlInner {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct AbortOnDropTask<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        self.handle.take().expect("task handle must exist").await
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +678,9 @@ struct ConnectionState {
     active_turn: Option<ActiveTurn>,
     voice_session: VoiceSession,
     started: bool,
+    transport_session_id: String,
+    owner_instance_id: String,
+    next_turn_generation: u64,
 }
 
 impl Default for ConnectionState {
@@ -345,8 +695,18 @@ impl Default for ConnectionState {
             active_turn: None,
             voice_session: VoiceSession::default(),
             started: false,
+            transport_session_id: uuid::Uuid::new_v4().to_string(),
+            owner_instance_id: process_owner_instance_id().to_string(),
+            next_turn_generation: 0,
         }
     }
+}
+
+fn process_owner_instance_id() -> &'static str {
+    static OWNER_INSTANCE_ID: OnceLock<String> = OnceLock::new();
+    OWNER_INSTANCE_ID
+        .get_or_init(|| format!("process-{}-{}", std::process::id(), uuid::Uuid::new_v4()))
+        .as_str()
 }
 
 impl ConnectionState {
@@ -665,7 +1025,7 @@ async fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
-    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
+    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn").await {
         state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
     }
@@ -708,6 +1068,9 @@ async fn finalize_stream_vad_utterance(
     };
 
     let turn_record_id = turn_record.id.clone();
+    conn.next_turn_generation = conn.next_turn_generation.saturating_add(1);
+    let output_generation = conn.next_turn_generation;
+    let control = TurnControl::new();
     let task = spawn_turn_task(
         state.clone(),
         correlation_id.to_string(),
@@ -719,6 +1082,8 @@ async fn finalize_stream_vad_utterance(
         voice_profile_id,
         conn.system_prompt.clone(),
         turn_record_id.clone(),
+        control.clone(),
+        output_generation,
     );
 
     conn.active_turn = Some(ActiveTurn {
@@ -727,6 +1092,8 @@ async fn finalize_stream_vad_utterance(
         turn_record_id: turn_record_id.clone(),
         state: state.clone(),
         task,
+        control,
+        output_generation,
     });
     conn.voice_session.begin_processing(turn_record_id);
 
@@ -806,18 +1173,45 @@ fn encode_assistant_audio_binary_frame(
     out
 }
 
-pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: String) {
+pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_id: String) {
+    let Some(_session_permit) = state.try_acquire_realtime_session() else {
+        let _ = socket
+            .send(Message::Text(
+                json!({
+                    "type": "error",
+                    "code": "realtime_session_capacity",
+                    "message": "Realtime websocket session capacity is exhausted",
+                    "fatal": true,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013,
+                reason: "realtime_session_capacity".into(),
+            })))
+            .await;
+        return;
+    };
+
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (raw_out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
-    let out_tx = OutboundTx::new(raw_out_tx, state.runtime.clone(), "voice realtime");
+    let out_tx = OutboundTx::new(state.runtime.clone(), "voice realtime");
+    let writer_out_tx = out_tx.clone();
 
     let writer = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
-            if tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message))
-                .await
-                .is_err()
-            {
-                break;
+        while let Some(output) = writer_out_tx.next().await {
+            let message = match output {
+                MailboxOutput::Message(message) => message,
+                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
+                    code: 1013,
+                    reason: reason.into(),
+                })),
+            };
+            match tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => break,
             }
             if ws_tx.flush().await.is_err() {
                 break;
@@ -912,13 +1306,13 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
             }
             Message::Close(_) => break,
             Message::Ping(payload) => {
-                let _ = out_tx.send(Message::Pong(payload));
+                let _ = out_tx.send_diagnostic(Message::Pong(payload));
             }
             Message::Pong(_) => {}
         }
     }
 
-    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed") {
+    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed").await {
         state.runtime.record_voice_interruption();
     }
     if let Some(session_id) = conn.close_voice_session_now() {
@@ -928,7 +1322,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
             state.runtime.record_voice_session_closed();
         }
     }
-    drop(out_tx);
+    out_tx.close();
     let _ = writer.await;
 }
 
@@ -963,11 +1357,18 @@ async fn handle_text_message(
                 conn.system_prompt = profile.system_prompt;
             }
             conn.started = true;
+            let transport_session_id = conn.transport_session_id.clone();
+            let owner_instance_id = conn.owner_instance_id.clone();
             send_json(
                 out_tx,
                 json!({
                     "type": "session_ready",
                     "protocol": "voice_realtime_v1",
+                    "session_id": transport_session_id,
+                    "owner_instance_id": owner_instance_id,
+                    "connection_epoch": 0,
+                    "resumable": false,
+                    "resume_window_ms": 0,
                 }),
             );
         }
@@ -1163,13 +1564,13 @@ async fn handle_text_message(
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
-            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
+            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason).await {
                 state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
             }
         }
         ClientEvent::Ping { timestamp_ms } => {
-            send_json(
+            send_diagnostic_json(
                 out_tx,
                 json!({
                     "type": "pong",
@@ -1210,7 +1611,7 @@ async fn handle_binary_message(
             let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
 
             if let Some((expected, received)) = frame_result.sequence_gap {
-                send_json(
+                send_diagnostic_json(
                     out_tx,
                     json!({
                         "type": "input_sequence_gap",
@@ -1223,7 +1624,7 @@ async fn handle_binary_message(
             }
 
             if let Some(evt) = frame_result.speech_start {
-                if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
+                if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await {
                     state.runtime.record_voice_interruption();
                     state.runtime.record_voice_barge_in();
                     conn.voice_session.interrupt("barge_in");
@@ -1287,6 +1688,8 @@ fn spawn_turn_task(
     voice_profile_id: Option<String>,
     system_prompt: String,
     turn_record_id: String,
+    control: TurnControl,
+    output_generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let timeout_secs = state.request_timeout_secs.max(1);
@@ -1299,8 +1702,9 @@ fn spawn_turn_task(
                 .map_err(|_| "Server is shutting down".to_string())?;
             let runtime_context = permit.runtime_context();
 
-            send_json(
+            send_turn_json(
                 &out_tx,
+                output_generation,
                 json!({
                     "type": "turn_processing",
                     "utterance_id": commit.utterance_id,
@@ -1310,8 +1714,9 @@ fn spawn_turn_task(
             match &commit.turn_config {
                 VoiceTurnConfig::Modular(config) => {
                     state.runtime.record_modular_voice_pipeline_turn();
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "user_transcript_start",
                             "utterance_id": commit.utterance_id,
@@ -1325,6 +1730,7 @@ fn spawn_turn_task(
                         let utt_seq = commit.utterance_seq;
                         let asr_model_id = config.asr_model_id.clone();
                         let asr_language = config.asr_language.clone();
+                        let mut snapshot = String::new();
                         state
                             .runtime
                             .asr_transcribe_streaming_bytes_with_runtime_context(
@@ -1339,13 +1745,16 @@ fn spawn_turn_task(
                                     if delta.is_empty() {
                                         return;
                                     }
-                                    send_json(
+                                    snapshot.push_str(&delta);
+                                    send_turn_text_snapshot(
                                         &tx,
+                                        output_generation,
+                                        format!("user-transcript-{utt_seq}"),
                                         json!({
-                                            "type": "user_transcript_delta",
+                                            "type": "user_transcript_snapshot",
                                             "utterance_id": utt_id,
                                             "utterance_seq": utt_seq,
-                                            "delta": delta,
+                                            "text": snapshot,
                                         }),
                                     );
                                 },
@@ -1355,8 +1764,9 @@ fn spawn_turn_task(
                     };
 
                     let user_text = transcript.text.trim().to_string();
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "user_transcript_final",
                             "utterance_id": commit.utterance_id,
@@ -1383,8 +1793,9 @@ fn spawn_turn_task(
                             .complete_turn(turn_record_id.clone(), "no_input", None)
                             .await
                             .map_err(|err| format!("Voice storage error: {err}"))?;
-                        send_json(
+                        send_turn_json(
                             &out_tx,
+                            output_generation,
                             json!({
                                 "type": "turn_done",
                                 "utterance_id": commit.utterance_id,
@@ -1395,8 +1806,9 @@ fn spawn_turn_task(
                         return Ok::<(), String>(());
                     }
 
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "assistant_text_start",
                             "utterance_id": commit.utterance_id,
@@ -1420,8 +1832,9 @@ fn spawn_turn_task(
                     .await?;
                     let assistant_text = strip_think_tags(&assistant_raw);
 
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "assistant_text_final",
                             "utterance_id": commit.utterance_id,
@@ -1446,8 +1859,9 @@ fn spawn_turn_task(
                             .complete_turn(turn_record_id.clone(), "ok", None)
                             .await
                             .map_err(|err| format!("Voice storage error: {err}"))?;
-                        send_json(
+                        send_turn_json(
                             &out_tx,
+                            output_generation,
                             json!({
                                 "type": "turn_done",
                                 "utterance_id": commit.utterance_id,
@@ -1468,6 +1882,8 @@ fn spawn_turn_task(
                         config.speaker.clone(),
                         assistant_text.as_str(),
                         runtime_context,
+                        &control,
+                        output_generation,
                     )
                     .await?;
                     state
@@ -1486,8 +1902,9 @@ fn spawn_turn_task(
                         assistant_text.clone(),
                     );
 
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "turn_done",
                             "utterance_id": commit.utterance_id,
@@ -1499,16 +1916,18 @@ fn spawn_turn_task(
                 }
                 VoiceTurnConfig::Unified(config) => {
                     state.runtime.record_unified_voice_pipeline_turn();
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "user_transcript_start",
                             "utterance_id": commit.utterance_id,
                             "utterance_seq": commit.utterance_seq,
                         }),
                     );
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "assistant_text_start",
                             "utterance_id": commit.utterance_id,
@@ -1531,6 +1950,8 @@ fn spawn_turn_task(
                         config.max_output_tokens,
                         audio_bytes.as_slice(),
                         runtime_context,
+                        &control,
+                        output_generation,
                     )
                     .await?;
 
@@ -1539,8 +1960,9 @@ fn spawn_turn_task(
                         .unwrap_or_default()
                         .trim()
                         .to_string();
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "user_transcript_final",
                             "utterance_id": commit.utterance_id,
@@ -1562,8 +1984,9 @@ fn spawn_turn_task(
                         .map_err(|err| format!("Voice storage error: {err}"))?;
 
                     let assistant_text = strip_think_tags(generation.text.trim());
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "assistant_text_final",
                             "utterance_id": commit.utterance_id,
@@ -1588,8 +2011,9 @@ fn spawn_turn_task(
                             .complete_turn(turn_record_id.clone(), "no_input", None)
                             .await
                             .map_err(|err| format!("Voice storage error: {err}"))?;
-                        send_json(
+                        send_turn_json(
                             &out_tx,
+                            output_generation,
                             json!({
                                 "type": "turn_done",
                                 "utterance_id": commit.utterance_id,
@@ -1605,8 +2029,9 @@ fn spawn_turn_task(
                         .complete_turn(turn_record_id.clone(), "ok", None)
                         .await
                         .map_err(|err| format!("Voice storage error: {err}"))?;
-                    send_json(
+                    send_turn_json(
                         &out_tx,
+                        output_generation,
                         json!({
                             "type": "turn_done",
                             "utterance_id": commit.utterance_id,
@@ -1619,21 +2044,28 @@ fn spawn_turn_task(
             }
         };
 
-        match tokio::time::timeout(timeout, turn_future).await {
+        let turn_result = tokio::select! {
+            _ = control.cancelled() => return,
+            result = tokio::time::timeout(timeout, turn_future) => result,
+        };
+
+        match turn_result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 let _ = state
                     .voice_store
                     .complete_turn(turn_record_id.clone(), "error", Some(err.clone()))
                     .await;
-                send_error(
+                send_turn_error(
                     &out_tx,
+                    output_generation,
                     Some(commit.utterance_id.clone()),
                     Some(commit.utterance_seq),
                     err,
                 );
-                send_json(
+                send_turn_json(
                     &out_tx,
+                    output_generation,
                     json!({
                         "type": "turn_done",
                         "utterance_id": commit.utterance_id,
@@ -1652,14 +2084,16 @@ fn spawn_turn_task(
                         Some(timeout_reason.clone()),
                     )
                     .await;
-                send_error(
+                send_turn_error(
                     &out_tx,
+                    output_generation,
                     Some(commit.utterance_id.clone()),
                     Some(commit.utterance_seq),
                     timeout_reason,
                 );
-                send_json(
+                send_turn_json(
                     &out_tx,
+                    output_generation,
                     json!({
                         "type": "turn_done",
                         "utterance_id": commit.utterance_id,
@@ -1682,7 +2116,12 @@ async fn stream_tts_to_socket(
     speaker: Option<String>,
     text: &str,
     runtime_context: RuntimeRequestContext,
+    control: &TurnControl,
+    output_generation: u64,
 ) -> Result<(), String> {
+    if control.is_cancelled() {
+        return Err("Turn cancelled".to_string());
+    }
     let tts_variant = parse_tts_model_variant(tts_model_id)
         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
     state
@@ -1694,8 +2133,9 @@ async fn stream_tts_to_socket(
     let sample_rate = state.runtime.sample_rate().await;
     let encoder = AudioEncoder::new(sample_rate, 1);
 
-    send_json(
+    send_turn_json(
         out_tx,
+        output_generation,
         json!({
             "type": "assistant_audio_start",
             "utterance_id": utterance_id,
@@ -1726,10 +2166,18 @@ async fn stream_tts_to_socket(
 
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<izwi_core::AudioChunk>(32);
     let runtime = state.runtime.clone();
-    let generation_task =
-        tokio::spawn(async move { runtime.generate_streaming(gen_request, chunk_tx).await });
+    let generation_task = AbortOnDropTask::new(tokio::spawn(async move {
+        runtime.generate_streaming(gen_request, chunk_tx).await
+    }));
 
-    while let Some(chunk) = chunk_rx.recv().await {
+    loop {
+        let chunk = tokio::select! {
+            _ = control.cancelled() => return Err("Turn cancelled".to_string()),
+            chunk = chunk_rx.recv() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         if chunk.samples.is_empty() && !chunk.is_final {
             continue;
         }
@@ -1746,13 +2194,26 @@ async fn stream_tts_to_socket(
             chunk.is_final,
             &encoded,
         );
-        let _ = out_tx.send(Message::Binary(frame.into()));
+        let sample_count = encoded.len() / std::mem::size_of::<i16>();
+        let duration_ms = (sample_count as u64)
+            .saturating_mul(1_000)
+            .checked_div(sample_rate.max(1) as u64)
+            .unwrap_or(0);
+        out_tx
+            .send_audio(
+                output_generation,
+                Message::Binary(frame.into()),
+                encoded.len(),
+                duration_ms,
+            )
+            .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
     }
 
-    match generation_task.await {
+    match generation_task.join().await {
         Ok(Ok(())) => {
-            send_json(
+            send_turn_json(
                 out_tx,
+                output_generation,
                 json!({
                     "type": "assistant_audio_done",
                     "utterance_id": utterance_id,
@@ -1818,7 +2279,12 @@ async fn stream_unified_s2s_to_socket(
     max_output_tokens: usize,
     audio_bytes: &[u8],
     runtime_context: RuntimeRequestContext,
+    control: &TurnControl,
+    output_generation: u64,
 ) -> Result<izwi_core::SpeechToSpeechGeneration, String> {
+    if control.is_cancelled() {
+        return Err("Turn cancelled".to_string());
+    }
     let variant = parse_model_variant(s2s_model_id)
         .map_err(|err| format!("Unsupported unified audio model: {err}"))?;
     if !variant.is_audio_chat() {
@@ -1833,8 +2299,9 @@ async fn stream_unified_s2s_to_socket(
         .await
         .map_err(|err| format!("Failed to load unified audio model: {err}"))?;
 
-    send_json(
+    send_turn_json(
         out_tx,
+        output_generation,
         json!({
             "type": "assistant_audio_start",
             "utterance_id": utterance_id,
@@ -1845,6 +2312,7 @@ async fn stream_unified_s2s_to_socket(
     );
 
     let encoder = AudioEncoder::new(24_000, 1);
+    let delivery_error = Arc::new(Mutex::new(None::<String>));
     let mut params = GenerationParams::default();
     params.max_tokens = max_output_tokens.clamp(1, 4096);
     params.speaker = speaker.clone();
@@ -1863,16 +2331,25 @@ async fn stream_unified_s2s_to_socket(
             {
                 let out_tx = out_tx.clone();
                 let utterance_id = utterance_id.to_string();
+                let control = control.clone();
+                let delivery_error = delivery_error.clone();
+                let mut text_snapshot = String::new();
                 move |chunk| {
+                    if control.is_cancelled() {
+                        return;
+                    }
                     if let Some(delta) = chunk.text.as_deref() {
                         if !delta.is_empty() {
-                            send_json(
+                            text_snapshot.push_str(delta);
+                            send_turn_text_snapshot(
                                 &out_tx,
+                                output_generation,
+                                format!("assistant-text-{utterance_seq}"),
                                 json!({
-                                    "type": "assistant_text_delta",
+                                    "type": "assistant_text_snapshot",
                                     "utterance_id": utterance_id,
                                     "utterance_seq": utterance_seq,
-                                    "delta": delta,
+                                    "text": text_snapshot,
                                 }),
                             );
                         }
@@ -1889,11 +2366,28 @@ async fn stream_unified_s2s_to_socket(
                                     chunk.is_final,
                                     &encoded,
                                 );
-                                let _ = out_tx.send(Message::Binary(frame.into()));
+                                let sample_count = encoded.len() / std::mem::size_of::<i16>();
+                                let duration_ms = (sample_count as u64)
+                                    .saturating_mul(1_000)
+                                    .checked_div(chunk.sample_rate.max(1) as u64)
+                                    .unwrap_or(0);
+                                if let Err(err) = out_tx.send_audio(
+                                    output_generation,
+                                    Message::Binary(frame.into()),
+                                    encoded.len(),
+                                    duration_ms,
+                                ) {
+                                    *delivery_error
+                                        .lock()
+                                        .unwrap_or_else(|poison| poison.into_inner()) =
+                                        Some(format!("Outbound audio delivery failed: {err:?}"));
+                                    control.cancel();
+                                }
                             }
                             Err(err) => {
-                                send_error(
+                                send_turn_error(
                                     &out_tx,
+                                    output_generation,
                                     Some(utterance_id.clone()),
                                     Some(utterance_seq),
                                     format!("Failed to encode unified streamed audio chunk: {err}"),
@@ -1907,8 +2401,17 @@ async fn stream_unified_s2s_to_socket(
         .await
         .map_err(|err| format!("Unified speech-to-speech failed: {err}"))?;
 
-    send_json(
+    if let Some(err) = delivery_error
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take()
+    {
+        return Err(err);
+    }
+
+    send_turn_json(
         out_tx,
+        output_generation,
         json!({
             "type": "assistant_audio_done",
             "utterance_id": utterance_id,
@@ -1919,25 +2422,45 @@ async fn stream_unified_s2s_to_socket(
     Ok(generation)
 }
 
-fn interrupt_active_turn(
+async fn interrupt_active_turn(
     out_tx: &OutboundTx,
     active_turn: &mut Option<ActiveTurn>,
     reason: &str,
 ) -> bool {
-    if let Some(turn) = active_turn.take() {
+    if let Some(mut turn) = active_turn.take() {
+        out_tx.cutoff_turn(turn.output_generation);
         if turn.task.is_finished() {
+            let _ = turn.task.await;
             return false;
         }
-        turn.task.abort();
-        let state = turn.state.clone();
-        let turn_record_id = turn.turn_record_id.clone();
-        let reason_text = reason.to_string();
-        tokio::spawn(async move {
-            let _ = state
-                .voice_store
-                .complete_turn(turn_record_id, "interrupted", Some(reason_text))
-                .await;
-        });
+
+        turn.control.cancel();
+        send_json(
+            out_tx,
+            json!({
+                "type": "turn_interrupted",
+                "utterance_id": turn.utterance_id,
+                "utterance_seq": turn.utterance_seq,
+                "reason": reason,
+            }),
+        );
+        if tokio::time::timeout(TURN_CANCELLATION_TIMEOUT, &mut turn.task)
+            .await
+            .is_err()
+        {
+            turn.task.abort();
+            let _ = turn.task.await;
+        }
+
+        let _ = tokio::time::timeout(
+            TURN_CANCELLATION_TIMEOUT,
+            turn.state.voice_store.complete_turn(
+                turn.turn_record_id.clone(),
+                "interrupted",
+                Some(reason.to_string()),
+            ),
+        )
+        .await;
         send_json(
             out_tx,
             json!({
@@ -2173,6 +2696,41 @@ fn send_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
     }
 }
 
+fn send_turn_json(out_tx: &OutboundTx, output_generation: u64, value: serde_json::Value) -> bool {
+    match serde_json::to_string(&value) {
+        Ok(text) => out_tx.send_turn(output_generation, Message::Text(text.into())),
+        Err(err) => {
+            warn!("failed to serialize voice ws turn event: {err}");
+            false
+        }
+    }
+}
+
+fn send_turn_text_snapshot(
+    out_tx: &OutboundTx,
+    output_generation: u64,
+    key: String,
+    value: serde_json::Value,
+) -> bool {
+    match serde_json::to_string(&value) {
+        Ok(text) => out_tx.send_text_snapshot(output_generation, key, Message::Text(text.into())),
+        Err(err) => {
+            warn!("failed to serialize voice ws text snapshot: {err}");
+            false
+        }
+    }
+}
+
+fn send_diagnostic_json(out_tx: &OutboundTx, value: serde_json::Value) -> bool {
+    match serde_json::to_string(&value) {
+        Ok(text) => out_tx.send_diagnostic(Message::Text(text.into())),
+        Err(err) => {
+            warn!("failed to serialize voice ws diagnostic: {err}");
+            false
+        }
+    }
+}
+
 fn send_error(
     out_tx: &OutboundTx,
     utterance_id: Option<String>,
@@ -2182,6 +2740,26 @@ fn send_error(
     let message = message.into();
     let _ = send_json(
         out_tx,
+        json!({
+            "type": "error",
+            "utterance_id": utterance_id,
+            "utterance_seq": utterance_seq,
+            "message": message,
+        }),
+    );
+}
+
+fn send_turn_error(
+    out_tx: &OutboundTx,
+    output_generation: u64,
+    utterance_id: Option<String>,
+    utterance_seq: Option<u64>,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    let _ = send_turn_json(
+        out_tx,
+        output_generation,
         json!({
             "type": "error",
             "utterance_id": utterance_id,
@@ -2343,11 +2921,7 @@ impl ModelBackend for IzwiRuntimeBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::extract::ws::Message;
-    use izwi_core::{EngineConfig, RuntimeService};
-    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -2368,31 +2942,147 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_tx_drops_full_queue_and_records_backpressure() {
-        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
-        let before = runtime
-            .telemetry_snapshot()
-            .await
-            .voice
-            .stream_backpressure_total;
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(Message::Text("occupied".into()))
-            .expect("queue should accept first message");
-        let outbound = OutboundTx::new(tx, runtime.clone(), "voice test");
+    async fn outbound_mailbox_coalesces_text_snapshots() {
+        let mailbox = OutboundMailbox::new(OutboundLimits {
+            max_items: 4,
+            max_audio_bytes: 100,
+            max_audio_ms: 100,
+        });
 
-        assert!(!outbound.send(Message::Text("dropped".into())));
+        for text in ["first", "latest"] {
+            mailbox
+                .enqueue(OutboundItem {
+                    message: Message::Text(text.into()),
+                    class: OutboundClass::CoalescibleText("transcript-1".to_string()),
+                    turn_generation: Some(1),
+                })
+                .expect("snapshot should enqueue");
+        }
 
-        let after = runtime
-            .telemetry_snapshot()
-            .await
-            .voice
-            .stream_backpressure_total;
-        assert_eq!(after, before + 1);
-        assert!(rx.try_recv().is_ok());
+        let Some(MailboxOutput::Message(Message::Text(text))) = mailbox.next().await else {
+            panic!("latest text snapshot should be delivered");
+        };
+        assert_eq!(text.as_str(), "latest");
+    }
+
+    #[tokio::test]
+    async fn outbound_mailbox_preserves_audio_order_and_closes_on_saturation() {
+        let ordered = OutboundMailbox::new(OutboundLimits {
+            max_items: 4,
+            max_audio_bytes: 8,
+            max_audio_ms: 100,
+        });
+        for byte in [1_u8, 2_u8] {
+            ordered
+                .enqueue(OutboundItem {
+                    message: Message::Binary(vec![byte].into()),
+                    class: OutboundClass::Audio {
+                        bytes: 1,
+                        duration_ms: 10,
+                    },
+                    turn_generation: Some(1),
+                })
+                .expect("audio should enqueue");
+        }
+        for expected in [1_u8, 2_u8] {
+            let Some(MailboxOutput::Message(Message::Binary(bytes))) = ordered.next().await else {
+                panic!("audio should be delivered in order");
+            };
+            assert_eq!(bytes.as_ref(), &[expected]);
+        }
+
+        let saturated = OutboundMailbox::new(OutboundLimits {
+            max_items: 4,
+            max_audio_bytes: 1,
+            max_audio_ms: 10,
+        });
+        saturated
+            .enqueue(OutboundItem {
+                message: Message::Binary(vec![1].into()),
+                class: OutboundClass::Audio {
+                    bytes: 1,
+                    duration_ms: 10,
+                },
+                turn_generation: Some(1),
+            })
+            .expect("first audio should enqueue");
+        assert_eq!(
+            saturated.enqueue(OutboundItem {
+                message: Message::Binary(vec![2].into()),
+                class: OutboundClass::Audio {
+                    bytes: 1,
+                    duration_ms: 1,
+                },
+                turn_generation: Some(1),
+            }),
+            Err(OutboundEnqueueError::AudioSaturated)
+        );
         assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            saturated.next().await,
+            Some(MailboxOutput::Close(reason)) if reason == "outbound_audio_saturated"
         ));
+    }
+
+    #[tokio::test]
+    async fn outbound_mailbox_drops_diagnostics_and_cuts_off_cancelled_turns() {
+        let mailbox = OutboundMailbox::new(OutboundLimits {
+            max_items: 2,
+            max_audio_bytes: 100,
+            max_audio_ms: 100,
+        });
+        mailbox
+            .enqueue(OutboundItem {
+                message: Message::Text("cancelled".into()),
+                class: OutboundClass::Critical,
+                turn_generation: Some(7),
+            })
+            .expect("cancelled turn event should initially enqueue");
+        mailbox
+            .enqueue(OutboundItem {
+                message: Message::Text("next".into()),
+                class: OutboundClass::Critical,
+                turn_generation: Some(8),
+            })
+            .expect("next turn event should enqueue");
+        assert_eq!(
+            mailbox.enqueue(OutboundItem {
+                message: Message::Text("diagnostic".into()),
+                class: OutboundClass::Diagnostic,
+                turn_generation: None,
+            }),
+            Err(OutboundEnqueueError::DroppedDiagnostic)
+        );
+
+        mailbox.cutoff_turn(7);
+        assert_eq!(
+            mailbox.enqueue(OutboundItem {
+                message: Message::Text("late".into()),
+                class: OutboundClass::Critical,
+                turn_generation: Some(7),
+            }),
+            Err(OutboundEnqueueError::Cutoff)
+        );
+        let Some(MailboxOutput::Message(Message::Text(text))) = mailbox.next().await else {
+            panic!("next turn output should remain queued");
+        };
+        assert_eq!(text.as_str(), "next");
+    }
+
+    #[tokio::test]
+    async fn turn_control_wakes_cooperative_cleanup() {
+        let control = TurnControl::new();
+        let waiting_control = control.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_control.cancelled().await;
+            waiting_control.is_cancelled()
+        });
+
+        control.cancel();
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), waiter)
+            .await
+            .expect("cancellation should wake waiter")
+            .expect("waiter should finish"));
     }
 
     #[test]
