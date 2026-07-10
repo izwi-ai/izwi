@@ -16,6 +16,10 @@ impl Migrator {
             ensure_column(db, column).await?;
         }
 
+        for statement in POST_COMPATIBILITY_SCHEMA {
+            db.execute_unprepared(statement).await?;
+        }
+
         ensure_default_voice_profile(db).await?;
         Ok(())
     }
@@ -428,6 +432,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         model_id TEXT NULL,
         worker_id TEXT NULL,
         lease_expires_at INTEGER NULL,
+        available_at INTEGER NULL,
+        attempt_token TEXT NULL,
         attempt_count INTEGER NOT NULL DEFAULT 0,
         max_attempts INTEGER NOT NULL DEFAULT 1,
         input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -500,7 +506,21 @@ const BASELINE_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_runtime_worker_heartbeats_last ON runtime_worker_heartbeats(last_heartbeat_at DESC);",
 ];
 
+const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_claim_ready ON job_stages(status, available_at, lease_expires_at, sequence);",
+];
+
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "available_at",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "attempt_token",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "chat_messages",
         column: "content_parts",

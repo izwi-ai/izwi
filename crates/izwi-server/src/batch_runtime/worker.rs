@@ -30,6 +30,7 @@ pub struct BatchWorkerConfig {
     pub draining: bool,
     pub poll_interval: Duration,
     pub lease_duration: Duration,
+    pub maintenance_interval: Duration,
 }
 
 impl BatchWorkerConfig {
@@ -43,6 +44,7 @@ impl BatchWorkerConfig {
             draining: false,
             poll_interval: Duration::from_millis(250),
             lease_duration: Duration::from_secs(60),
+            maintenance_interval: Duration::from_secs(30),
         }
     }
 }
@@ -221,6 +223,7 @@ pub struct BatchWorkerRunner {
     health: BatchWorkerHealth,
     drain: BatchWorkerDrain,
     runtime_observer: Option<Arc<RuntimeService>>,
+    last_maintenance_at: Arc<RwLock<Option<Instant>>>,
 }
 
 impl BatchWorkerRunner {
@@ -261,6 +264,7 @@ impl BatchWorkerRunner {
             health,
             drain,
             runtime_observer: None,
+            last_maintenance_at: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -274,10 +278,7 @@ impl BatchWorkerRunner {
     }
 
     pub async fn run_once(&self) -> anyhow::Result<bool> {
-        self.store
-            .recover_expired_stage_leases()
-            .await
-            .context("Failed to recover expired runtime stage leases")?;
+        self.run_maintenance_if_due().await?;
         if self.drain.is_draining() {
             self.record_heartbeat("draining", None).await?;
             return Ok(false);
@@ -448,6 +449,36 @@ impl BatchWorkerRunner {
         }
 
         Ok(true)
+    }
+
+    async fn run_maintenance_if_due(&self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let should_run = {
+            let mut guard = self
+                .last_maintenance_at
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let due = guard.is_none_or(|last| {
+                now.saturating_duration_since(last) >= self.config.maintenance_interval
+            });
+            if due {
+                *guard = Some(now);
+            }
+            due
+        };
+        if !should_run {
+            return Ok(());
+        }
+
+        self.store
+            .reconcile_inconsistent_states()
+            .await
+            .context("Failed to reconcile durable runtime state")?;
+        self.store
+            .recover_expired_stage_leases()
+            .await
+            .context("Failed to recover expired runtime stage leases")?;
+        Ok(())
     }
 
     pub async fn run_until_idle(&self, max_iterations: usize) -> anyhow::Result<usize> {

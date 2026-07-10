@@ -282,6 +282,10 @@ pub struct JobStage {
     pub model_id: Option<String>,
     pub worker_id: Option<String>,
     pub lease_expires_at: Option<u64>,
+    /// Earliest wall-clock time at which a queued/retrying stage may be claimed.
+    pub available_at: Option<u64>,
+    /// Opaque identity for the current or most recently completed execution attempt.
+    pub attempt_token: Option<String>,
     pub attempt_count: u32,
     pub max_attempts: u32,
     pub input_artifact_ids: Vec<String>,
@@ -348,6 +352,7 @@ pub struct StageLease {
     pub stage_id: String,
     pub worker_id: String,
     pub attempt_count: u32,
+    pub attempt_token: Option<String>,
 }
 
 impl ClaimedStage {
@@ -356,6 +361,7 @@ impl ClaimedStage {
             stage_id: self.stage.id.clone(),
             worker_id: self.stage.worker_id.clone()?,
             attempt_count: self.stage.attempt_count,
+            attempt_token: self.stage.attempt_token.clone(),
         })
     }
 }

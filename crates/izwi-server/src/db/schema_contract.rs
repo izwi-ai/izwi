@@ -380,6 +380,8 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "model_id",
             "worker_id",
             "lease_expires_at",
+            "available_at",
+            "attempt_token",
             "attempt_count",
             "max_attempts",
             "input_artifact_ids_json",
