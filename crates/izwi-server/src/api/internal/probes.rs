@@ -8,7 +8,8 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::state::{AppState, RequestAdmissionSnapshot};
+use crate::media_ingest::MediaIngestLaneSnapshot;
+use crate::state::{AppState, RealtimeSessionAdmissionSnapshot, RequestAdmissionSnapshot};
 
 #[derive(Debug, Serialize)]
 pub struct ProbeCheck {
@@ -34,6 +35,8 @@ pub struct ReadyResponse {
     pub draining: bool,
     pub uptime_secs: u64,
     pub request_admission: RequestAdmissionSnapshot,
+    pub realtime_session_admission: RealtimeSessionAdmissionSnapshot,
+    pub media_ingest: MediaIngestLaneSnapshot,
     pub checks: Vec<ProbeCheck>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub startup_warnings: Vec<String>,
@@ -65,6 +68,8 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
     let startup_warnings = lifecycle.startup_warnings.clone();
     let preload_complete = startup_warnings.is_empty();
     let request_admission = state.request_admission_snapshot();
+    let realtime_session_admission = state.realtime_session_admission_snapshot();
+    let media_ingest = state.media_ingest.lane_snapshot();
 
     let mut checks = vec![
         ProbeCheck {
@@ -146,6 +151,8 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         draining: lifecycle.draining,
         uptime_secs: now_saturating_sub(lifecycle.started_at),
         request_admission,
+        realtime_session_admission,
+        media_ingest,
         checks,
         startup_warnings,
     }
@@ -221,7 +228,32 @@ mod tests {
             .any(|check| check.name == "preload_complete" && !check.ok));
     }
 
+    #[tokio::test]
+    async fn readiness_reports_realtime_session_saturation_without_becoming_unready() {
+        let (_guard, state) = test_state_with_realtime_sessions("readiness_sessions_full", Some(1));
+        state.lifecycle.mark_ready();
+        let _session = state
+            .try_acquire_realtime_session()
+            .expect("configured realtime session should be admitted");
+
+        let response = readiness_response(&state).await;
+
+        assert!(response.ready);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.realtime_session_admission.capacity, 1);
+        assert_eq!(response.realtime_session_admission.active, 1);
+        assert_eq!(response.realtime_session_admission.available, 0);
+        assert!(response.checks.iter().all(|check| check.ok));
+    }
+
     fn test_state(name: &str) -> (TempDirGuard, AppState) {
+        test_state_with_realtime_sessions(name, None)
+    }
+
+    fn test_state_with_realtime_sessions(
+        name: &str,
+        realtime_session_capacity: Option<usize>,
+    ) -> (TempDirGuard, AppState) {
         let temp_dir = std::env::temp_dir().join(format!(
             "izwi-probes-{name}-{}",
             std::time::SystemTime::now()
@@ -238,6 +270,9 @@ mod tests {
         let guard = env_lock();
         std::env::set_var("IZWI_DB_PATH", &db_path);
         std::env::set_var("IZWI_MEDIA_DIR", &media_dir);
+        if let Some(capacity) = realtime_session_capacity {
+            std::env::set_var("IZWI_MAX_REALTIME_SESSIONS", capacity.to_string());
+        }
 
         let serve_config = ServeRuntimeConfig {
             backend: BackendPreference::Cpu,
@@ -249,6 +284,7 @@ mod tests {
         let state = AppState::new(runtime, &serve_config).expect("state");
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
+        std::env::remove_var("IZWI_MAX_REALTIME_SESSIONS");
 
         (
             TempDirGuard {

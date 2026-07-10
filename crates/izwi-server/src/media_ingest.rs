@@ -1,10 +1,17 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use izwi_core::audio::{
     decode_and_inspect_audio_bytes, resample_mono_high_quality, AudioEncoder, AudioFormat,
     AudioInspection, AudioSourceMetadata,
 };
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider, StoredMediaBytes};
+use serde::Serialize;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
@@ -209,6 +216,16 @@ pub struct MediaIngestService {
     media_storage: Arc<dyn MediaStorageProvider>,
     batch_store: Arc<BatchRuntimeStore>,
     decode_lanes: Arc<Semaphore>,
+    decode_lane_capacity: usize,
+    decode_waiters: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MediaIngestLaneSnapshot {
+    pub capacity: usize,
+    pub active: usize,
+    pub available: usize,
+    pub queued: usize,
 }
 
 impl MediaIngestService {
@@ -228,10 +245,23 @@ impl MediaIngestService {
         batch_store: Arc<BatchRuntimeStore>,
         decode_lane_capacity: usize,
     ) -> Self {
+        let decode_lane_capacity = decode_lane_capacity.max(1);
         Self {
             media_storage,
             batch_store,
-            decode_lanes: Arc::new(Semaphore::new(decode_lane_capacity.max(1))),
+            decode_lanes: Arc::new(Semaphore::new(decode_lane_capacity)),
+            decode_lane_capacity,
+            decode_waiters: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn lane_snapshot(&self) -> MediaIngestLaneSnapshot {
+        let available = self.decode_lanes.available_permits();
+        MediaIngestLaneSnapshot {
+            capacity: self.decode_lane_capacity,
+            active: self.decode_lane_capacity.saturating_sub(available),
+            available,
+            queued: self.decode_waiters.load(Ordering::Acquire),
         }
     }
 
@@ -483,12 +513,14 @@ impl MediaIngestService {
         policy: AudioIngestPolicy,
         canonical_profile: CanonicalAudioProfile,
     ) -> Result<PreparedAudio, MediaIngestError> {
+        let waiting = DecodeWaiterGuard::new(self.decode_waiters.clone());
         let permit = self
             .decode_lanes
             .clone()
             .acquire_owned()
             .await
             .map_err(|err| MediaIngestError::ProcessingTask(err.to_string()))?;
+        drop(waiting);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             prepare_audio_blocking(source_bytes, &policy, canonical_profile)
@@ -624,6 +656,23 @@ impl MediaIngestService {
         if let Err(err) = delete_media_object(&self.media_storage, Some(key)).await {
             warn!(storage_key = key, error = %err, "failed compensating media object write");
         }
+    }
+}
+
+struct DecodeWaiterGuard {
+    waiters: Arc<AtomicUsize>,
+}
+
+impl DecodeWaiterGuard {
+    fn new(waiters: Arc<AtomicUsize>) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self { waiters }
+    }
+}
+
+impl Drop for DecodeWaiterGuard {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -908,6 +957,26 @@ mod tests {
             writer.finalize().expect("finalize");
         }
         bytes
+    }
+
+    #[test]
+    fn decode_lane_snapshot_reports_bounded_capacity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(RecordingMediaProvider::default());
+        let store = Arc::new(BatchRuntimeStore::initialize_with_database(
+            StoreDatabase::new(temp.path().join("runtime.sqlite")),
+        ));
+        let service = MediaIngestService::with_decode_lane_capacity(provider, store, 3);
+
+        assert_eq!(
+            service.lane_snapshot(),
+            MediaIngestLaneSnapshot {
+                capacity: 3,
+                active: 0,
+                available: 3,
+                queued: 0,
+            }
+        );
     }
 
     fn request(bytes: Vec<u8>) -> MediaIngestRequest {

@@ -46,6 +46,7 @@ pub async fn metrics_prometheus(State(state): State<AppState>) -> Response<Body>
             payload.push_str("izwi_batch_runtime_metrics_collect_error 1\n");
         }
     }
+    append_server_admission_prometheus_metrics(&mut payload, &state);
     Response::builder()
         .header(
             header::CONTENT_TYPE,
@@ -53,6 +54,47 @@ pub async fn metrics_prometheus(State(state): State<AppState>) -> Response<Body>
         )
         .body(Body::from(payload))
         .unwrap()
+}
+
+fn append_server_admission_prometheus_metrics(payload: &mut String, state: &AppState) {
+    let realtime = state.realtime_session_admission_snapshot();
+    let media = state.media_ingest.lane_snapshot();
+    payload.push_str(
+        "# HELP izwi_realtime_sessions Active and available realtime websocket session slots.\n",
+    );
+    payload.push_str("# TYPE izwi_realtime_sessions gauge\n");
+    payload.push_str(&format!(
+        "izwi_realtime_sessions{{state=\"active\"}} {}\n",
+        realtime.active
+    ));
+    payload.push_str(&format!(
+        "izwi_realtime_sessions{{state=\"available\"}} {}\n",
+        realtime.available
+    ));
+    payload.push_str(&format!(
+        "izwi_realtime_sessions{{state=\"capacity\"}} {}\n",
+        realtime.capacity
+    ));
+    payload.push_str(
+        "# HELP izwi_media_ingest_decode_lanes Active and available bounded media decode lanes.\n",
+    );
+    payload.push_str("# TYPE izwi_media_ingest_decode_lanes gauge\n");
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"active\"}} {}\n",
+        media.active
+    ));
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"available\"}} {}\n",
+        media.available
+    ));
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"capacity\"}} {}\n",
+        media.capacity
+    ));
+    payload.push_str(&format!(
+        "izwi_media_ingest_decode_lanes{{state=\"queued\"}} {}\n",
+        media.queued
+    ));
 }
 
 async fn collect_batch_runtime_metrics(

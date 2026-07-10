@@ -67,6 +67,8 @@ use crate::api::openai::audio::align::{
         OpenAiModelsResponse,
         ProbeCheck,
         ReadyResponse,
+        MediaIngestLaneSnapshot,
+        RealtimeSessionAdmissionSnapshot,
         RequestAdmissionClassSnapshot,
         RequestAdmissionSnapshot,
         ResponseDeletedObject,
@@ -1860,6 +1862,8 @@ pub struct ReadyResponse {
     pub draining: bool,
     pub uptime_secs: u64,
     pub request_admission: RequestAdmissionSnapshot,
+    pub realtime_session_admission: RealtimeSessionAdmissionSnapshot,
+    pub media_ingest: MediaIngestLaneSnapshot,
     pub checks: Vec<ProbeCheck>,
     pub startup_warnings: Vec<String>,
 }
@@ -1869,6 +1873,23 @@ pub struct ReadyResponse {
 pub struct RequestAdmissionClassSnapshot {
     pub capacity: usize,
     pub available: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RealtimeSessionAdmissionSnapshot {
+    pub capacity: usize,
+    pub active: usize,
+    pub available: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MediaIngestLaneSnapshot {
+    pub capacity: usize,
+    pub active: usize,
+    pub available: usize,
+    pub queued: usize,
 }
 
 #[allow(dead_code)]
@@ -2168,6 +2189,42 @@ pub struct ServerSentEvent {
 mod tests {
     use super::document;
     use std::collections::HashSet;
+
+    #[test]
+    fn openapi_documents_realtime_session_admission_in_readiness() {
+        let openapi = document();
+        let schemas = openapi["components"]["schemas"]
+            .as_object()
+            .expect("schemas should exist");
+
+        assert_eq!(
+            schemas["ReadyResponse"]["properties"]["realtime_session_admission"]["$ref"].as_str(),
+            Some("#/components/schemas/RealtimeSessionAdmissionSnapshot")
+        );
+        let properties = schemas["RealtimeSessionAdmissionSnapshot"]["properties"]
+            .as_object()
+            .expect("realtime session admission properties should exist");
+        for field in ["capacity", "active", "available"] {
+            assert!(
+                properties.contains_key(field),
+                "realtime session admission schema should document {field}"
+            );
+        }
+
+        assert_eq!(
+            schemas["ReadyResponse"]["properties"]["media_ingest"]["$ref"].as_str(),
+            Some("#/components/schemas/MediaIngestLaneSnapshot")
+        );
+        let media_properties = schemas["MediaIngestLaneSnapshot"]["properties"]
+            .as_object()
+            .expect("media ingest lane properties should exist");
+        for field in ["capacity", "active", "available", "queued"] {
+            assert!(
+                media_properties.contains_key(field),
+                "media ingest schema should document {field}"
+            );
+        }
+    }
 
     #[test]
     fn openapi_documents_compatibility_contract_endpoints() {
