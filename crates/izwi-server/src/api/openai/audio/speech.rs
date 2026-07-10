@@ -23,6 +23,7 @@ use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
+    WorkloadClass,
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
@@ -145,13 +146,14 @@ pub async fn speech(
         req.allow_format_fallback.unwrap_or(false),
     )?;
 
-    state.runtime.load_model(variant).await?;
-
     if streaming {
         return stream_speech(state, req, ctx.correlation_id, variant, resolved_format).await;
     }
 
-    let _permit = state.acquire_permit().await;
+    let permit = state
+        .acquire_workload_permit(WorkloadClass::Interactive)
+        .await;
+    state.runtime.load_model(variant).await?;
 
     let timeout = Duration::from_secs(resolve_speech_timeout_secs(
         state.request_timeout_secs,
@@ -163,7 +165,8 @@ pub async fn speech(
     let format_fallback = resolved_format.fallback;
 
     let result = tokio::time::timeout(timeout, async {
-        let gen_request = build_generation_request(&req, ctx.correlation_id, false, variant);
+        let gen_request = build_generation_request(&req, ctx.correlation_id, false, variant)
+            .with_runtime_context(permit.runtime_context());
         state.runtime.generate(gen_request).await
     })
     .await
@@ -403,15 +406,18 @@ async fn stream_speech(
 ) -> Result<Response<Body>, ApiError> {
     let format = resolved_format.format;
     let format_fallback = resolved_format.fallback;
-    let gen_request = build_generation_request(&req, correlation_id, true, variant);
+    let mut gen_request = build_generation_request(&req, correlation_id, true, variant);
     let stream_request_id = gen_request.id.clone();
     let stream_audio_format = stream_audio_format_label(format);
     let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
 
     let engine = state.runtime.clone();
-    let semaphore = state.request_semaphore.clone();
+    let admission_state = state.clone();
     tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
+        let permit = match admission_state
+            .acquire_owned_workload_permit(WorkloadClass::Streaming)
+            .await
+        {
             Ok(permit) => permit,
             Err(_) => {
                 let error_event = SpeechStreamEvent {
@@ -433,6 +439,29 @@ async fn stream_speech(
                 return;
             }
         };
+        gen_request = gen_request.with_runtime_context(permit.runtime_context());
+        if let Err(err) = engine.load_model(variant).await {
+            let _ = send_stream_event(
+                &event_tx,
+                SpeechStreamEvent {
+                    event: "audio.failed",
+                    request_id: Some(stream_request_id.clone()),
+                    sequence: None,
+                    audio_base64: None,
+                    sample_count: None,
+                    is_final: None,
+                    sample_rate: None,
+                    audio_format: None,
+                    tokens_generated: None,
+                    generation_time_ms: None,
+                    audio_duration_secs: None,
+                    rtf: None,
+                    error: Some(err.to_string()),
+                },
+            )
+            .await;
+            return;
+        }
 
         let fallback_sample_rate = engine.sample_rate().await;
         let start_event = SpeechStreamEvent {
@@ -669,6 +698,7 @@ fn build_generation_request(
         id: uuid::Uuid::new_v4().to_string(),
         model_variant: Some(variant),
         correlation_id: Some(correlation_id),
+        runtime_context: Default::default(),
         text: req.input.clone(),
         config: gen_config,
         language: req.language.clone(),

@@ -20,8 +20,8 @@ use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_s
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{
-    AsrTranscription, SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus,
-    SpeakerAttributedAsrTurn,
+    AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
+    SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
 };
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
@@ -286,6 +286,7 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
 
@@ -295,12 +296,14 @@ impl RuntimeService {
                 variant,
                 language.map(ToOwned::to_owned),
                 correlation_id.map(ToOwned::to_owned),
+                runtime_context,
             )?,
             AsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
                 audio_bytes.to_vec(),
                 variant,
                 language.map(ToOwned::to_owned),
                 correlation_id.map(ToOwned::to_owned),
+                runtime_context,
             )?,
         }
         .with_prompt(prompt.map(ToOwned::to_owned));
@@ -374,6 +377,7 @@ impl RuntimeService {
                 prompt,
                 max_tokens,
                 correlation_id,
+                RuntimeRequestContext::default(),
             )
             .await?;
         let output = self.run_request(request).await?;
@@ -461,6 +465,7 @@ impl RuntimeService {
                 prompt,
                 max_tokens,
                 correlation_id,
+                RuntimeRequestContext::default(),
             )
             .await?;
         let mut streamed_text = String::new();
@@ -530,6 +535,29 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            RuntimeRequestContext::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             return self
@@ -545,6 +573,7 @@ impl RuntimeService {
                 prompt,
                 max_tokens,
                 correlation_id,
+                runtime_context,
             )
             .await?;
         let output = self.run_request(request).await?;
@@ -659,6 +688,7 @@ impl RuntimeService {
             on_delta,
             on_progress,
             true,
+            RuntimeRequestContext::default(),
         )
         .await
     }
@@ -675,6 +705,7 @@ impl RuntimeService {
         mut on_delta: F,
         mut on_progress: P,
         broker_streaming_required: bool,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String) + Send + 'static,
@@ -699,6 +730,7 @@ impl RuntimeService {
                 prompt,
                 max_tokens,
                 correlation_id,
+                runtime_context,
             )
             .await?;
         let mut streamed_text = String::new();
@@ -881,6 +913,30 @@ impl RuntimeService {
             prompt,
             max_tokens,
             correlation_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_bytes_with_runtime_context(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<AsrTranscription> {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            runtime_context,
         )
         .await
     }
@@ -1073,6 +1129,37 @@ impl RuntimeService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_streaming_bytes_with_runtime_context<F>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+        on_delta: F,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_callback_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            on_delta,
+            |_progress| {},
+            true,
+            runtime_context,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn asr_transcribe_streaming_bytes_with_progress_and_correlation<F, P>(
         &self,
         audio_bytes: &[u8],
@@ -1096,6 +1183,37 @@ impl RuntimeService {
             correlation_id,
             on_delta,
             on_progress,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_streaming_bytes_with_progress_and_runtime_context<F, P>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+        on_delta: F,
+        on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_callback_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            None,
+            None,
+            correlation_id,
+            on_delta,
+            on_progress,
+            true,
+            runtime_context,
         )
         .await
     }
@@ -1124,6 +1242,38 @@ impl RuntimeService {
             on_delta,
             on_progress,
             false,
+            RuntimeRequestContext::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_bytes_with_progress_and_runtime_context<F, P>(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+        on_delta: F,
+        on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        let variant = resolve_asr_model_variant(model_id);
+        self.asr_transcribe_bytes_with_variant_callback_and_prompt_options_with_progress(
+            variant,
+            audio_bytes,
+            language,
+            None,
+            None,
+            correlation_id,
+            on_delta,
+            on_progress,
+            false,
+            runtime_context,
         )
         .await
     }

@@ -84,3 +84,10 @@ memmap2 = "0.9.10"
 
 # Configuration
 config = "0.14"
+
+# With fp16 disabled for Candle on Apple Silicon, gemm-f16's inline fp16
+# assembly needs enough optimization to remain in its target-feature context.
+# The built-in test profile inherits this dev override; release is already
+# optimized. Scope it to Candle 0.11.0's exact transitive gemm-f16 version.
+[profile.dev.package."gemm-f16:0.19.0"]
+opt-level = 1

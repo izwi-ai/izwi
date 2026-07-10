@@ -7,7 +7,7 @@ use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
 use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::RuntimeService;
-use crate::runtime::types::ChatGeneration;
+use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 
 impl RuntimeService {
     fn prompt_token_config(
@@ -33,6 +33,7 @@ impl RuntimeService {
         mut params: GenerationParams,
         chat_config: ChatRequestConfig,
         correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
         let _lease = self.acquire_model_residency_lease(variant);
@@ -54,6 +55,7 @@ impl RuntimeService {
             chat_config,
             prompt_tokens,
             correlation_id.map(ToOwned::to_owned),
+            runtime_context,
         )?
         .into_engine_request())
     }
@@ -71,6 +73,7 @@ impl RuntimeService {
             params,
             ChatRequestConfig::default(),
             correlation_id,
+            RuntimeRequestContext::default(),
         )
         .await
     }
@@ -84,8 +87,15 @@ impl RuntimeService {
     ) -> Result<EngineCoreRequest> {
         let mut params = GenerationParams::default();
         params.max_tokens = max_new_tokens.max(1);
-        self.build_chat_request_with_params(variant, messages, params, correlation_id)
-            .await
+        self.build_chat_request_with_params_and_config(
+            variant,
+            messages,
+            params,
+            ChatRequestConfig::default(),
+            correlation_id,
+            RuntimeRequestContext::default(),
+        )
+        .await
     }
 
     pub async fn chat_generate(
@@ -105,8 +115,35 @@ impl RuntimeService {
         max_new_tokens: usize,
         correlation_id: Option<&str>,
     ) -> Result<ChatGeneration> {
+        self.chat_generate_with_correlation_and_runtime_context(
+            variant,
+            messages,
+            max_new_tokens,
+            correlation_id,
+            RuntimeRequestContext::default(),
+        )
+        .await
+    }
+
+    pub async fn chat_generate_with_correlation_and_runtime_context(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        max_new_tokens: usize,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<ChatGeneration> {
+        let mut params = GenerationParams::default();
+        params.max_tokens = max_new_tokens.max(1);
         let request = self
-            .build_chat_request(variant, messages, max_new_tokens, correlation_id)
+            .build_chat_request_with_params_and_config(
+                variant,
+                messages,
+                params,
+                ChatRequestConfig::default(),
+                correlation_id,
+                runtime_context,
+            )
             .await?;
         let output = self.run_request(request).await?;
         Ok(ChatGeneration {
@@ -152,6 +189,26 @@ impl RuntimeService {
         chat_config: ChatRequestConfig,
         correlation_id: Option<&str>,
     ) -> Result<ChatGeneration> {
+        self.chat_generate_with_runtime_context(
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            RuntimeRequestContext::default(),
+        )
+        .await
+    }
+
+    pub async fn chat_generate_with_runtime_context(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        chat_config: ChatRequestConfig,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<ChatGeneration> {
         let request = self
             .build_chat_request_with_params_and_config(
                 variant,
@@ -159,6 +216,7 @@ impl RuntimeService {
                 params,
                 chat_config,
                 correlation_id,
+                runtime_context,
             )
             .await?;
         let output = self.run_request(request).await?;
@@ -196,13 +254,45 @@ impl RuntimeService {
         messages: Vec<ChatMessage>,
         max_new_tokens: usize,
         correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<ChatGeneration>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.chat_generate_streaming_with_correlation_and_runtime_context(
+            variant,
+            messages,
+            max_new_tokens,
+            correlation_id,
+            RuntimeRequestContext::default(),
+            on_delta,
+        )
+        .await
+    }
+
+    pub async fn chat_generate_streaming_with_correlation_and_runtime_context<F>(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        max_new_tokens: usize,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
         mut on_delta: F,
     ) -> Result<ChatGeneration>
     where
         F: FnMut(String) + Send + 'static,
     {
+        let mut params = GenerationParams::default();
+        params.max_tokens = max_new_tokens.max(1);
         let request = self
-            .build_chat_request(variant, messages, max_new_tokens, correlation_id)
+            .build_chat_request_with_params_and_config(
+                variant,
+                messages,
+                params,
+                ChatRequestConfig::default(),
+                correlation_id,
+                runtime_context,
+            )
             .await?;
         let mut streamed_text = String::new();
         let output = self
@@ -270,6 +360,32 @@ impl RuntimeService {
         params: GenerationParams,
         chat_config: ChatRequestConfig,
         correlation_id: Option<&str>,
+        on_delta: F,
+    ) -> Result<ChatGeneration>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.chat_generate_streaming_with_runtime_context(
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            RuntimeRequestContext::default(),
+            on_delta,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chat_generate_streaming_with_runtime_context<F>(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        chat_config: ChatRequestConfig,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
         mut on_delta: F,
     ) -> Result<ChatGeneration>
     where
@@ -282,6 +398,7 @@ impl RuntimeService {
                 params,
                 chat_config,
                 correlation_id,
+                runtime_context,
             )
             .await?;
         let mut streamed_text = String::new();

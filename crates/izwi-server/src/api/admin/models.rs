@@ -7,6 +7,7 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use tokio::sync::broadcast::error::RecvError;
@@ -43,6 +44,8 @@ pub struct AdminModelInfo {
     pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
     pub cuda_support: serde_json::Value,
     pub cuda_quantization: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -111,6 +114,12 @@ pub struct AdminModelDownloadProgressEvent {
 
 impl From<ModelInfo> for AdminModelInfo {
     fn from(info: ModelInfo) -> Self {
+        Self::from_model_info(info, None)
+    }
+}
+
+impl AdminModelInfo {
+    fn from_model_info(info: ModelInfo, runtime_diagnostics: Option<serde_json::Value>) -> Self {
         let variant = info.variant;
         Self {
             variant: variant.dir_name().to_string(),
@@ -134,6 +143,7 @@ impl From<ModelInfo> for AdminModelInfo {
                 .unwrap_or(serde_json::Value::Null),
             cuda_quantization: serde_json::to_value(info.cuda_quantization)
                 .unwrap_or(serde_json::Value::Null),
+            runtime_diagnostics,
         }
     }
 }
@@ -293,8 +303,15 @@ pub async fn list_models(
         .filter(|model| model.enabled)
         .collect();
     models.sort_by_key(model_sort_key);
+    let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
     Ok(Json(AdminModelsResponse {
-        models: models.into_iter().map(AdminModelInfo::from).collect(),
+        models: models
+            .into_iter()
+            .map(|info| {
+                let diagnostics = runtime_diagnostics.get(info.variant.dir_name()).cloned();
+                AdminModelInfo::from_model_info(info, diagnostics)
+            })
+            .collect(),
     }))
 }
 
@@ -315,7 +332,27 @@ pub async fn get_model_info(
         .await
         .ok_or_else(|| ApiError::not_found("Model not found"))?;
 
-    Ok(Json(AdminModelInfo::from(info)))
+    let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
+    Ok(Json(AdminModelInfo::from_model_info(
+        info,
+        runtime_diagnostics.get(variant.dir_name()).cloned(),
+    )))
+}
+
+async fn loaded_model_diagnostics_by_variant(
+    state: &AppState,
+) -> HashMap<String, serde_json::Value> {
+    state
+        .runtime
+        .loaded_model_diagnostics()
+        .await
+        .into_iter()
+        .filter_map(|diagnostics| {
+            serde_json::to_value(&diagnostics)
+                .ok()
+                .map(|value| (diagnostics.variant_id, value))
+        })
+        .collect()
 }
 
 /// SSE progress event
@@ -733,5 +770,46 @@ fn model_precision_rank(dir_name: &str) -> u8 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use izwi_core::LoadedModelDiagnostics;
+
+    #[test]
+    fn admin_model_runtime_diagnostics_preserve_actual_and_policy_values() {
+        let diagnostics = LoadedModelDiagnostics {
+            variant_id: ModelVariant::Qwen306BGguf.dir_name().to_string(),
+            variant: ModelVariant::Qwen306BGguf.to_string(),
+            family: "qwen3_chat",
+            task: "chat",
+            handle_kind: "native_chat",
+            loaded_model_kind: "qwen3_chat",
+            backend_kind: "cuda".to_string(),
+            device_kind: "Cuda".to_string(),
+            actual_device_kind: Some("cuda".to_string()),
+            actual_compute_dtype: Some("f16".to_string()),
+            default_compute_dtype: "bf16".to_string(),
+            default_dtype_reason: "CUDA policy prefers BF16".to_string(),
+            supports_incremental_decode: Some(true),
+            supports_realtime_stream_decode: None,
+            family_diagnostics: None,
+        };
+        let model = AdminModelInfo::from_model_info(
+            ModelInfo::new(ModelVariant::Qwen306BGguf),
+            Some(serde_json::to_value(diagnostics).expect("serialize runtime diagnostics")),
+        );
+
+        let value = serde_json::to_value(model).expect("serialize admin model");
+        assert_eq!(
+            value["runtime_diagnostics"]["actual_compute_dtype"],
+            "f16"
+        );
+        assert_eq!(
+            value["runtime_diagnostics"]["default_compute_dtype"],
+            "bf16"
+        );
     }
 }

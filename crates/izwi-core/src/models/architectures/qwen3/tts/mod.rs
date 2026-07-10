@@ -18,6 +18,7 @@ pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -135,6 +136,9 @@ pub struct TtsDecodeStep {
     pub samples: Vec<f32>,
     pub frames_generated: usize,
     pub finished: bool,
+    pub sampling_ms: f64,
+    pub decode_ms: f64,
+    pub codec_ms: f64,
 }
 
 /// Batch input for CustomVoice (preset speaker) generation.
@@ -192,6 +196,24 @@ pub struct Qwen3TtsModel {
     kv_page_size: usize,
     /// KV cache quantization mode.
     kv_quantization: KvCacheQuantization,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Qwen3TtsDiagnostics {
+    pub model_family: &'static str,
+    pub model_type: String,
+    pub model_size: String,
+    pub device_kind: String,
+    pub talker_dtype: String,
+    pub code_predictor_dtype: String,
+    pub speech_tokenizer_dtype: String,
+    pub kv_page_size: usize,
+    pub kv_quantization: String,
+    pub speaker_count: usize,
+    pub vocab_size: usize,
+    pub text_vocab_size: usize,
+    pub num_code_groups: usize,
+    pub cuda_sampling: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +393,25 @@ impl Qwen3TtsModel {
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
         })
+    }
+
+    pub fn diagnostics(&self) -> Qwen3TtsDiagnostics {
+        Qwen3TtsDiagnostics {
+            model_family: "qwen3_tts",
+            model_type: self.config.tts_model_type.clone(),
+            model_size: self.config.tts_model_size.clone(),
+            device_kind: format!("{:?}", self.device.kind),
+            talker_dtype: format!("{:?}", self.dtype),
+            code_predictor_dtype: format!("{:?}", self.code_predictor_dtype),
+            speech_tokenizer_dtype: format!("{:?}", self.speech_tokenizer_dtype),
+            kv_page_size: self.kv_page_size,
+            kv_quantization: format!("{:?}", self.kv_quantization).to_ascii_lowercase(),
+            speaker_count: self.config.talker_config.spk_id.len(),
+            vocab_size: self.config.talker_config.vocab_size,
+            text_vocab_size: self.config.talker_config.text_vocab_size,
+            num_code_groups: self.config.talker_config.num_code_groups,
+            cuda_sampling: qwen_tts_uses_cuda_sampling(&self.device),
+        }
     }
 
     /// Generate speech using a preset speaker (CustomVoice mode)
@@ -1078,16 +1119,23 @@ impl Qwen3TtsModel {
                 samples: Vec::new(),
                 frames_generated: state.all_code_groups.first().map(|g| g.len()).unwrap_or(0),
                 finished: true,
+                sampling_ms: 0.0,
+                decode_ms: 0.0,
+                codec_ms: 0.0,
             });
         }
 
         if state.frame_idx >= state.max_frames {
             state.finished = true;
+            let codec_started = Instant::now();
             let final_samples = self.collect_incremental_audio(state, true)?;
             return Ok(TtsDecodeStep {
                 samples: final_samples,
                 frames_generated: state.all_code_groups.first().map(|g| g.len()).unwrap_or(0),
                 finished: true,
+                sampling_ms: 0.0,
+                decode_ms: 0.0,
+                codec_ms: codec_started.elapsed().as_secs_f64() * 1000.0,
             });
         }
 
@@ -1113,11 +1161,15 @@ impl Qwen3TtsModel {
                 device = ?self.device.kind,
                 "Qwen3-TTS decode reached semantic EOS"
             );
+            let codec_started = Instant::now();
             let final_samples = self.collect_incremental_audio(state, true)?;
             return Ok(TtsDecodeStep {
                 samples: final_samples,
                 frames_generated: state.all_code_groups.first().map(|g| g.len()).unwrap_or(0),
                 finished: true,
+                sampling_ms: semantic_ms,
+                decode_ms: 0.0,
+                codec_ms: codec_started.elapsed().as_secs_f64() * 1000.0,
             });
         }
 
@@ -1175,12 +1227,12 @@ impl Qwen3TtsModel {
 
         let audio_start = Instant::now();
         let mut samples = self.collect_incremental_audio(state, false)?;
-        let audio_ms = audio_start.elapsed().as_secs_f64() * 1000.0;
         if state.frame_idx >= state.max_frames {
             state.finished = true;
             let final_samples = self.collect_incremental_audio(state, true)?;
             samples.extend(final_samples);
         }
+        let audio_ms = audio_start.elapsed().as_secs_f64() * 1000.0;
 
         if self.device.kind.is_cuda() {
             debug!(
@@ -1195,10 +1247,14 @@ impl Qwen3TtsModel {
             );
         }
 
+        let total_ms = step_start.elapsed().as_secs_f64() * 1000.0;
         Ok(TtsDecodeStep {
             samples,
             frames_generated: state.all_code_groups.first().map(|g| g.len()).unwrap_or(0),
             finished: state.finished,
+            sampling_ms: semantic_ms,
+            decode_ms: (total_ms - semantic_ms - audio_ms).max(0.0),
+            codec_ms: audio_ms,
         })
     }
 

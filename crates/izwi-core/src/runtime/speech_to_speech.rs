@@ -7,7 +7,7 @@ use crate::model::ModelVariant;
 use crate::models::shared::chat::ChatMessage;
 use crate::runtime::request::AudioChatRuntimeRequest;
 use crate::runtime::service::RuntimeService;
-use crate::runtime::types::SpeechToSpeechGeneration;
+use crate::runtime::types::{RuntimeRequestContext, SpeechToSpeechGeneration};
 
 enum SpeechAudioInput<'a> {
     Base64(&'a str),
@@ -40,6 +40,7 @@ impl RuntimeService {
         mut params: GenerationParams,
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<EngineCoreRequest> {
         self.load_model(variant).await?;
 
@@ -53,6 +54,7 @@ impl RuntimeService {
                     params,
                     system_prompt.map(ToOwned::to_owned),
                     correlation_id.map(ToOwned::to_owned),
+                    runtime_context,
                 )?
             }
             SpeechAudioInput::Bytes(audio_bytes) => AudioChatRuntimeRequest::speech_to_speech_bytes(
@@ -62,6 +64,7 @@ impl RuntimeService {
                 params,
                 system_prompt.map(ToOwned::to_owned),
                 correlation_id.map(ToOwned::to_owned),
+                runtime_context,
             )?,
         };
         Ok(runtime_request.into_engine_request())
@@ -84,6 +87,7 @@ impl RuntimeService {
                 params,
                 system_prompt,
                 correlation_id,
+                RuntimeRequestContext::default(),
             )
             .await?;
         let output = self.run_request(request).await?;
@@ -113,6 +117,7 @@ impl RuntimeService {
                 params,
                 system_prompt,
                 correlation_id,
+                RuntimeRequestContext::default(),
             )
             .await?;
         let output = self.run_request(request).await?;
@@ -133,6 +138,34 @@ impl RuntimeService {
         params: GenerationParams,
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
+        on_chunk: F,
+    ) -> Result<SpeechToSpeechGeneration>
+    where
+        F: FnMut(StreamingOutput) + Send + 'static,
+    {
+        self.speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context(
+            variant,
+            audio_bytes,
+            messages,
+            params,
+            system_prompt,
+            correlation_id,
+            RuntimeRequestContext::default(),
+            on_chunk,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context<F>(
+        &self,
+        variant: ModelVariant,
+        audio_bytes: &[u8],
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        system_prompt: Option<&str>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
         mut on_chunk: F,
     ) -> Result<SpeechToSpeechGeneration>
     where
@@ -146,6 +179,7 @@ impl RuntimeService {
                 params,
                 system_prompt,
                 correlation_id,
+                runtime_context,
             )
             .await?;
         let mut streamed_text = String::new();

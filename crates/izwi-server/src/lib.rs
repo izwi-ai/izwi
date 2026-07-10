@@ -33,12 +33,14 @@ mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
 
+use batch_runtime::worker::{
+    BatchWorkerConfig, BatchWorkerDrain, BatchWorkerRunner, BatchWorkerSupervisor,
+};
 use izwi_core::backends::{self, BackendPreference, CudaRuntimeDiagnostics};
 use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
 use izwi_hooks::EnterpriseHooks;
-use batch_runtime::worker::{BatchWorkerConfig, BatchWorkerRunner, BatchWorkerSupervisor};
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
 use state::AppState;
@@ -163,6 +165,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 
     info!("Runtime service initialized");
     let batch_worker_supervisor = start_batch_runtime_worker(&state);
+    let batch_worker_drain = batch_worker_supervisor.drain_handle();
 
     // Build router
     let app = api::create_router(state.clone(), &serve_config);
@@ -180,11 +183,13 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     let shutdown_state = state.clone();
 
     // Spawn server with graceful shutdown
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(shutdown_state));
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_state, batch_worker_drain));
 
     info!("Server ready. Press Ctrl+C to stop.");
     let server_result = server.await;
     batch_worker_supervisor.shutdown().await?;
+    cleanup_runtime_for_shutdown(&state).await;
     server_result?;
 
     Ok(())
@@ -192,7 +197,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 
 fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
     let mut config = BatchWorkerConfig::local(format!("local-batch-worker-{}", std::process::id()));
-    config.lease_duration = Duration::from_secs(24 * 60 * 60);
+    config.capabilities = vec!["asr".to_string(), "tts".to_string()];
     BatchWorkerRunner::new(
         state.batch_runtime_store.clone(),
         vec![
@@ -484,7 +489,7 @@ async fn warmup_preloaded_asr_models(state: &AppState) -> Vec<String> {
 }
 
 /// Wait for shutdown signal and cleanup
-async fn shutdown_signal(state: AppState) {
+async fn shutdown_signal(state: AppState, batch_worker_drain: BatchWorkerDrain) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -512,7 +517,12 @@ async fn shutdown_signal(state: AppState) {
     }
 
     state.lifecycle.mark_draining();
+    batch_worker_drain.begin();
 
+    drop(state);
+}
+
+async fn cleanup_runtime_for_shutdown(state: &AppState) {
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
     match tokio::time::timeout(CLEANUP_TIMEOUT, state.runtime.unload_all_models()).await {
         Ok(Ok(unloaded)) => {
@@ -531,8 +541,6 @@ async fn shutdown_signal(state: AppState) {
             );
         }
     }
-
-    drop(state);
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::state::AppState;
+use crate::state::{AppState, RequestAdmissionSnapshot};
 
 #[derive(Debug, Serialize)]
 pub struct ProbeCheck {
@@ -33,6 +33,7 @@ pub struct ReadyResponse {
     pub phase: String,
     pub draining: bool,
     pub uptime_secs: u64,
+    pub request_admission: RequestAdmissionSnapshot,
     pub checks: Vec<ProbeCheck>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub startup_warnings: Vec<String>,
@@ -63,6 +64,7 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
     let telemetry = state.runtime.telemetry_snapshot().await;
     let startup_warnings = lifecycle.startup_warnings.clone();
     let preload_complete = startup_warnings.is_empty();
+    let request_admission = state.request_admission_snapshot();
 
     let mut checks = vec![
         ProbeCheck {
@@ -100,8 +102,8 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         },
         ProbeCheck {
             name: "request_capacity",
-            ok: state.request_semaphore.available_permits() > 0,
-            message: (state.request_semaphore.available_permits() == 0)
+            ok: request_admission.global.available > 0,
+            message: (request_admission.global.available == 0)
                 .then(|| "all request permits are currently in use".to_string()),
         },
     ];
@@ -143,6 +145,7 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
         phase: lifecycle.phase,
         draining: lifecycle.draining,
         uptime_secs: now_saturating_sub(lifecycle.started_at),
+        request_admission,
         checks,
         startup_warnings,
     }
@@ -172,6 +175,11 @@ mod tests {
 
         assert!(response.ready);
         assert_eq!(response.status, "ready");
+        assert!(response.request_admission.global.capacity >= 1);
+        assert_eq!(
+            response.request_admission.global.available,
+            response.request_admission.global.capacity
+        );
         assert!(response.checks.iter().all(|check| check.ok));
     }
 

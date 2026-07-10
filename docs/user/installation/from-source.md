@@ -100,6 +100,11 @@ IZWI_BUILD_BACKEND=cuda ./scripts/install-cli.sh
 
 On Linux, the script defaults to `cpu`. On Apple Silicon macOS, it defaults to `metal`.
 
+The repository's Cargo configuration includes a stable-Rust workaround for
+Candle `0.11.0` on Apple Silicon. Keep `.cargo/config.toml` in the checkout and
+avoid replacing its target flags with a workspace-wide `RUSTFLAGS` value;
+release, debug, and test profiles are configured to work together.
+
 ### Manual Cargo Builds
 
 If you only want specific binaries, use package-scoped commands:
@@ -249,11 +254,16 @@ cargo test -- --nocapture
 
 ## Building Release Packages
 
+Tauri installer bundles include the release CLI and server binaries as bundled
+resources, so build those binaries before running `cargo tauri build`. If you
+chain the commands, use `&&` so Tauri does not continue after a failed binary
+build.
+
 ### macOS DMG
 
 ```bash
-cd crates/izwi-desktop
-cargo tauri build
+cargo build --release --features metal --bin izwi --bin izwi-server &&
+cargo tauri build --bundles dmg
 ```
 
 Output: `target/release/bundle/dmg/Izwi_*.dmg`
@@ -261,8 +271,8 @@ Output: `target/release/bundle/dmg/Izwi_*.dmg`
 ### Linux DEB
 
 ```bash
-cd crates/izwi-desktop
-cargo tauri build
+cargo build --release --bin izwi --bin izwi-server &&
+cargo tauri build --bundles deb
 ```
 
 Output: `target/release/bundle/deb/izwi_*.deb`
@@ -270,8 +280,8 @@ Output: `target/release/bundle/deb/izwi_*.deb`
 ### Windows Installer
 
 ```powershell
-cd crates/izwi-desktop
-cargo tauri build
+cargo build --release --bin izwi --bin izwi-server
+cargo tauri build --bundles nsis
 ```
 
 Output: `target/release/bundle/nsis/Izwi_*-setup.exe`

@@ -47,7 +47,7 @@ pub use engine::{
     AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics,
     EngineOutput, EngineTask, GenerationParams, KVCacheManager, ModelExecutor, OutputProcessor,
     PinnedBlockHandle, RequestProcessor, RequestStatus, Scheduler, SchedulerConfig,
-    SchedulingPolicy, StreamingOutput, TtsEngineInput,
+    SchedulingPolicy, StreamingOutput, TtsEngineInput, WorkloadClass,
 };
 
 // Legacy re-exports for backward compatibility
@@ -72,13 +72,13 @@ pub use runtime::{
     GenerationRequest, GenerationResult,
 };
 pub use runtime::{
-    AudioChunk, EngineRuntimeTelemetrySnapshot, GenerationConfig,
+    AudioChunk, EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
-    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream,
+    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeLatencyStats,
     RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,
-    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
-    RuntimeService, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
-    SpeechToSpeechGeneration,
+    RuntimeRequestContext, RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters,
+    RuntimeStageTiming, RuntimeService, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
+    RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration,
     VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION,
     RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
     TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,
@@ -106,7 +106,8 @@ pub use runtime_models::shared::chat::{
 pub use backends::{DeviceProfile, DeviceSelector};
 pub use runtime_models::{
     model_family_registrations, registration_for_variant, registrations_for_capability,
-    FamilyRegistration, LoadedModelRegistry, ModelRegistry, MODEL_FAMILY_REGISTRATIONS,
+    FamilyRegistration, LoadedModelDiagnostics, LoadedModelRegistry, ModelRegistry,
+    MODEL_FAMILY_REGISTRATIONS,
 };
 
 #[cfg(test)]

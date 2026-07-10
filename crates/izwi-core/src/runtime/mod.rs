@@ -34,11 +34,12 @@ pub use conformance::{
 pub use service::RuntimeService;
 pub use telemetry::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
-    EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,
-    PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeObservabilityTelemetrySnapshot,
-    RuntimeObservationContext, RuntimeReplayRecord, RuntimeStageObservation, RuntimeStageOutcome,
-    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetrySnapshot, RuntimeTraceContract,
-    RuntimeTracePhase, VoiceRuntimeTelemetrySnapshot, RUNTIME_REPLAY_REDACTION,
+    EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot,
+    InferenceBrokerRuntimeTelemetrySnapshot, PipelineRuntimeTelemetrySnapshot, ReplayRedaction,
+    RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext,
+    RuntimeReplayRecord, RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters,
+    RuntimeStageTiming, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
+    RuntimeWorkloadClassTelemetrySnapshot, VoiceRuntimeTelemetrySnapshot, RUNTIME_REPLAY_REDACTION,
     RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
     TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,
     TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
@@ -46,7 +47,7 @@ pub use telemetry::{
 pub use types::{
     AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
     DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions,
+    GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions, RuntimeRequestContext,
     SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
     SpeechToSpeechGeneration,
 };

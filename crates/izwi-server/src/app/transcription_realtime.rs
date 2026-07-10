@@ -7,7 +7,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
-    RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService,
+    RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -603,7 +603,7 @@ async fn maybe_process_native_stream_frame(
 
     if !session.native_stream_checked {
         session.native_stream_checked = true;
-        let _permit = state.acquire_permit().await;
+        let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
         session.native_asr_stream = state
             .runtime
             .try_start_asr_realtime_stream(
@@ -621,7 +621,7 @@ async fn maybe_process_native_stream_frame(
 
     let samples = pcm16_i16_to_f32(frame_samples);
     let started = Instant::now();
-    let _permit = state.acquire_permit().await;
+    let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
     let events = state
         .runtime
         .push_asr_realtime_samples(stream, &samples, sample_rate)
@@ -643,7 +643,7 @@ async fn finish_native_stream_if_needed(
 
     let sample_rate = session.sample_rate.unwrap_or(16_000);
     let started = Instant::now();
-    let _permit = state.acquire_permit().await;
+    let _permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
     let events = state
         .runtime
         .finish_asr_realtime_stream(&mut stream)
@@ -852,15 +852,18 @@ async fn run_inference(
 ) -> Result<InferenceResult, String> {
     let wav_bytes = wav_bytes_from_pcm16_mono(&samples_i16, sample_rate)?;
 
-    let permit_wait_started = Instant::now();
-    let _permit = state.acquire_permit().await;
-    let queue_wait_ms = permit_wait_started.elapsed().as_secs_f64() * 1000.0;
+    let permit = state.acquire_workload_permit(WorkloadClass::Realtime).await;
+    let queue_wait_ms = permit.wait_ms();
     let output = state
         .runtime
-        .asr_transcribe_bytes(
+        .asr_transcribe_bytes_with_runtime_context(
             wav_bytes.as_slice(),
             model_id.as_deref(),
             language.as_deref(),
+            None,
+            None,
+            Some(correlation_id.as_str()),
+            permit.runtime_context(),
         )
         .await
         .map_err(|err| err.to_string())?;

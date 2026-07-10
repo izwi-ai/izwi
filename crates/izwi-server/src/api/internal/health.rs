@@ -5,6 +5,7 @@ use izwi_core::backends::{CudaRuntimeDiagnostics, DTypeSelectionRequest};
 use izwi_core::runtime_models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
+use izwi_core::LoadedModelDiagnostics;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -28,6 +29,7 @@ pub struct RuntimeBackendResponse {
     pub dtype_policy: DTypePolicyResponse,
     pub fused_attention: FusedAttentionResponse,
     pub cuda_runtime: CudaRuntimeResponse,
+    pub loaded_models: Vec<LoadedModelDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loaded_tts_model: Option<serde_json::Value>,
 }
@@ -83,6 +85,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     let device = context.device.clone();
     let dtype_selection = device.resolve_dtype(DTypeSelectionRequest::new(None));
     let cuda_runtime = CudaRuntimeDiagnostics::detect(&current_server_binary_name());
+    let loaded_models = state.runtime.loaded_model_diagnostics().await;
     let loaded_tts_model = state.runtime.loaded_tts_model_diagnostics().await;
 
     Json(HealthResponse {
@@ -122,6 +125,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 requested: flash_attention_requested(),
             },
             cuda_runtime: CudaRuntimeResponse::from(cuda_runtime),
+            loaded_models,
             loaded_tts_model,
         },
     })
@@ -229,6 +233,27 @@ mod tests {
                 device_usable: Some(true),
                 notes: Vec::new(),
             },
+            loaded_models: vec![LoadedModelDiagnostics {
+                variant_id: "VibeVoice-1.5B-TTS".to_string(),
+                variant: "VibeVoice 1.5B TTS".to_string(),
+                family: "vibevoice_tts",
+                task: "tts",
+                handle_kind: "vibevoice_tts",
+                loaded_model_kind: "vibevoice_tts",
+                backend_kind: "cuda".to_string(),
+                device_kind: "Cuda".to_string(),
+                actual_device_kind: Some("cuda".to_string()),
+                actual_compute_dtype: Some("f16".to_string()),
+                default_compute_dtype: "bf16".to_string(),
+                default_dtype_reason: "CUDA default uses BF16".to_string(),
+                supports_incremental_decode: None,
+                supports_realtime_stream_decode: None,
+                family_diagnostics: Some(serde_json::json!({
+                    "model_family": "vibevoice_tts",
+                    "device_kind": "Cuda",
+                    "dtype": "BF16"
+                })),
+            }],
             loaded_tts_model: Some(serde_json::json!({
                 "model_family": "vibevoice_tts",
                 "device_kind": "Cuda",
@@ -244,5 +269,18 @@ mod tests {
         );
         assert_eq!(value["loaded_tts_model"]["device_kind"], "Cuda");
         assert_eq!(value["loaded_tts_model"]["dtype"], "BF16");
+        assert_eq!(value["loaded_models"][0]["family"], "vibevoice_tts");
+        assert_eq!(
+            value["loaded_models"][0]["actual_compute_dtype"],
+            "f16"
+        );
+        assert_eq!(
+            value["loaded_models"][0]["default_compute_dtype"],
+            "bf16"
+        );
+        assert_eq!(
+            value["loaded_models"][0]["family_diagnostics"]["dtype"],
+            "BF16"
+        );
     }
 }

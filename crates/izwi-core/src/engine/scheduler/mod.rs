@@ -15,7 +15,7 @@ use tracing::debug;
 
 use super::config::EngineCoreConfig;
 use super::kv_cache::{CacheResidency, KVCacheManager};
-use super::request::{EngineCoreRequest, RequestStatus};
+use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{BlockId, Priority, RequestId, SequenceId, TaskType};
 use crate::model::ModelVariant;
 
@@ -169,6 +169,7 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
 struct PriorityRequest {
     request_id: RequestId,
     priority: Priority,
+    workload_class: WorkloadClass,
     arrival_time: Instant,
 }
 
@@ -190,7 +191,12 @@ impl Ord for PriorityRequest {
     fn cmp(&self, other: &Self) -> Ordering {
         // Higher priority first, then earlier arrival time
         match self.priority.cmp(&other.priority) {
-            Ordering::Equal => other.arrival_time.cmp(&self.arrival_time), // Earlier is greater
+            Ordering::Equal => self
+                .workload_class
+                .adaptive_score_boost()
+                .partial_cmp(&other.workload_class.adaptive_score_boost())
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| other.arrival_time.cmp(&self.arrival_time)), // Earlier is greater
             ord => ord,
         }
     }
@@ -326,6 +332,7 @@ struct RequestMetadata {
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
     priority: Priority,
+    workload_class: WorkloadClass,
     arrival_time: Instant,
     deadline_at: Instant,
     total_prompt_tokens: usize,
@@ -348,6 +355,8 @@ struct RunningRequest {
     prefill_complete: bool,
     /// Priority of this request
     priority: Priority,
+    /// Coarse latency/throughput class for this request.
+    workload_class: WorkloadClass,
     /// Whether this request has produced its first output token.
     first_token_emitted: bool,
     /// Whether this request is temporarily paused due to preemption.
@@ -389,7 +398,8 @@ impl Scheduler {
             (_, 0) => 2048,
             (_, value) => value,
         };
-        let deadline_at = arrival_time + self.deadline_for_priority(request.priority);
+        let deadline_at =
+            arrival_time + self.deadline_for_request(request.priority, request.workload_class);
 
         let metadata = RequestMetadata {
             request_id: request.id.clone(),
@@ -397,6 +407,7 @@ impl Scheduler {
             task_type: request.task_type,
             model_variant: request.model_variant,
             priority: request.priority,
+            workload_class: request.workload_class,
             arrival_time,
             deadline_at,
             total_prompt_tokens: request.num_prompt_tokens(),
@@ -428,6 +439,9 @@ impl Scheduler {
         self.update_dynamic_budget();
 
         let mut total_budget = self.current_token_budget();
+        let latency_sensitive_waiting = self.has_latency_sensitive_waiting();
+        let throughput_waiting_only =
+            !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
         let kv_stats = kv_cache.stats();
         let kv_utilization = if kv_stats.soft_max_blocks > 0 {
             kv_stats.allocated_blocks as f64 / kv_stats.soft_max_blocks as f64
@@ -444,13 +458,23 @@ impl Scheduler {
         let mut decode_budget = total_budget;
         let mut reserved_prefill_budget = 0;
         if self.config.enable_adaptive_batching && total_budget > 0 {
-            let prefill_share = if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms {
+            let target_ttft_ms = self.config.target_ttft_ms;
+            let mut prefill_share: f64 = if self.telemetry.avg_ttft_ms > target_ttft_ms {
                 0.55
-            } else if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms * 0.8 {
+            } else if self.telemetry.avg_ttft_ms > target_ttft_ms * 0.8 {
                 0.40
             } else {
                 0.25
             };
+            if latency_sensitive_waiting {
+                prefill_share = prefill_share.max(0.55);
+            } else if throughput_waiting_only {
+                prefill_share = if self.running.is_empty() {
+                    prefill_share.max(0.50)
+                } else {
+                    prefill_share.min(0.30)
+                };
+            }
             reserved_prefill_budget = ((total_budget as f64) * prefill_share) as usize;
             reserved_prefill_budget = reserved_prefill_budget.clamp(1, total_budget);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
@@ -479,6 +503,7 @@ impl Scheduler {
                     remaining_decode_tokens,
                     r.num_tokens_generated,
                     r.paused,
+                    metadata.workload_class,
                     overdue_ms,
                 ))
             })
@@ -487,9 +512,14 @@ impl Scheduler {
         if self.config.enable_adaptive_batching {
             // Favor overdue requests first, then requests close to completion.
             decode_candidates.sort_by(|a, b| {
-                b.8.partial_cmp(&a.8)
+                b.9.partial_cmp(&a.9)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.7.cmp(&a.7))
+                    .then_with(|| {
+                        b.8.adaptive_score_boost()
+                            .partial_cmp(&a.8.adaptive_score_boost())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| a.5.cmp(&b.5))
                     .then_with(|| b.2.cmp(&a.2))
                     .then_with(|| a.6.cmp(&b.6))
@@ -508,6 +538,7 @@ impl Scheduler {
             remaining_decode_tokens,
             _generated_tokens,
             _paused,
+            workload_class,
             overdue_ms,
         ) in decode_candidates
         {
@@ -521,6 +552,7 @@ impl Scheduler {
                 self.waiting_count() > 0,
                 kv_utilization,
                 overdue_ms,
+                workload_class,
             );
             if num_tokens == 0 {
                 continue;
@@ -895,6 +927,7 @@ impl Scheduler {
                 block_ids: block_ids.clone(),
                 prefill_complete: num_tokens >= metadata.total_prompt_tokens,
                 priority: metadata.priority,
+                workload_class: metadata.workload_class,
                 first_token_emitted: false,
                 paused: false,
             };
@@ -1131,19 +1164,21 @@ impl Scheduler {
             SchedulingPolicy::Priority => self.waiting_priority.push(PriorityRequest {
                 request_id,
                 priority: metadata.priority,
+                workload_class: metadata.workload_class,
                 arrival_time: metadata.arrival_time,
             }),
         }
     }
 
-    fn deadline_for_priority(&self, priority: Priority) -> Duration {
+    fn deadline_for_request(&self, priority: Priority, workload_class: WorkloadClass) -> Duration {
         let ms = match priority {
             Priority::Critical => self.config.critical_sla_ms.max(1),
             Priority::High => self.config.high_sla_ms.max(1),
             Priority::Normal => self.config.normal_sla_ms.max(1),
             Priority::Low => self.config.low_sla_ms.max(1),
         };
-        Duration::from_millis(ms)
+        let scaled = ((ms as f64) * workload_class.deadline_scale()).round() as u64;
+        Duration::from_millis(scaled.max(1))
     }
 
     fn request_overdue_ms(&self, metadata: &RequestMetadata) -> f64 {
@@ -1195,9 +1230,13 @@ impl Scheduler {
         has_waiting_work: bool,
         kv_utilization: f64,
         overdue_ms: f64,
+        workload_class: WorkloadClass,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
         if !self.config.enable_decode_quanta {
+            return 1.min(base);
+        }
+        if workload_class.prefers_single_token_decode() {
             return 1.min(base);
         }
         let active_decode_requests = self.running.values().filter(|r| r.prefill_complete).count();
@@ -1237,7 +1276,34 @@ impl Scheduler {
             / (1.0
                 + (metadata.total_prompt_tokens as f64
                     / self.config.chunked_prefill_threshold.max(1) as f64));
-        base_priority + age_boost + overdue_boost + (prompt_bonus * 0.2)
+        base_priority
+            + metadata.workload_class.adaptive_score_boost()
+            + age_boost
+            + overdue_boost
+            + (prompt_bonus * 0.2)
+    }
+
+    fn has_latency_sensitive_waiting(&self) -> bool {
+        self.waiting_members.iter().any(|request_id| {
+            self.requests
+                .get(request_id)
+                .map(|metadata| metadata.workload_class.is_latency_sensitive())
+                .unwrap_or(false)
+        })
+    }
+
+    fn has_throughput_or_background_waiting(&self) -> bool {
+        self.waiting_members.iter().any(|request_id| {
+            self.requests
+                .get(request_id)
+                .map(|metadata| {
+                    matches!(
+                        metadata.workload_class,
+                        WorkloadClass::Batch | WorkloadClass::Background
+                    )
+                })
+                .unwrap_or(false)
+        })
     }
 
     fn refresh_queue_age_sample(&mut self) {
@@ -1589,6 +1655,92 @@ mod tests {
         let scheduled = scheduler.schedule(&mut kv_cache);
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(scheduled.prefill_requests[0].request_id, old_id);
+    }
+
+    #[test]
+    fn adaptive_scheduler_promotes_latency_sensitive_workload() {
+        let config = SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 32,
+            policy: SchedulingPolicy::Priority,
+            enable_adaptive_batching: true,
+            priority_aging_ms: 10_000,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 128,
+            block_size: 16,
+            ..Default::default()
+        });
+
+        let mut online = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "summarize this report".to_string(),
+        }])
+        .with_priority(Priority::High)
+        .with_workload_class(WorkloadClass::Online);
+        online.id = "online-high".to_string();
+        online.prompt_tokens = vec![1, 2, 3, 4];
+
+        let mut realtime = EngineCoreRequest::speech_to_speech("UklGRg==")
+            .with_priority(Priority::Normal)
+            .with_workload_class(WorkloadClass::Realtime);
+        realtime.id = "realtime-normal".to_string();
+        realtime.prompt_tokens = vec![5, 6];
+
+        scheduler.add_request(&online);
+        scheduler.add_request(&realtime);
+
+        let scheduled = scheduler.schedule(&mut kv_cache);
+        assert_eq!(scheduled.prefill_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests[0].request_id, "realtime-normal");
+    }
+
+    #[test]
+    fn decode_quanta_respect_latency_sensitive_workload_class() {
+        fn schedule_decode_for(workload_class: WorkloadClass) -> usize {
+            let config = SchedulerConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 16,
+                min_tokens_per_step: 1,
+                policy: SchedulingPolicy::FCFS,
+                enable_chunked_prefill: false,
+                enable_preemption: false,
+                enable_adaptive_batching: true,
+                enable_decode_quanta: true,
+                max_decode_tokens_per_request: 4,
+                ..Default::default()
+            };
+            let mut scheduler = Scheduler::new(config);
+            let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+                max_blocks: 128,
+                block_size: 16,
+                ..Default::default()
+            });
+
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: "continue".to_string(),
+            }])
+            .with_workload_class(workload_class);
+            request.id = format!("decode-{}", workload_class.as_str());
+            request.prompt_tokens = vec![1];
+            request.params.max_tokens = 16;
+
+            scheduler.add_request(&request);
+            let first = scheduler.schedule(&mut kv_cache);
+            assert_eq!(first.prefill_requests.len(), 1);
+            scheduler.update_after_step(&request.id, 1, 1, Vec::new(), 1.0);
+
+            let second = scheduler.schedule(&mut kv_cache);
+            assert_eq!(second.decode_requests.len(), 1);
+            second.decode_requests[0].num_tokens
+        }
+
+        assert_eq!(schedule_decode_for(WorkloadClass::Realtime), 1);
+        assert_eq!(schedule_decode_for(WorkloadClass::Streaming), 1);
+        assert_eq!(schedule_decode_for(WorkloadClass::Batch), 4);
     }
 
     #[test]

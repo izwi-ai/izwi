@@ -1,9 +1,9 @@
 use axum::{
-    Json, RequestExt,
     body::Body,
     extract::{Extension, Multipart, Path, Query, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
+    Json, RequestExt,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
-use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
+use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::diarization_store::{
     CompleteDiarizationRecord, DiarizationProcessingStatus, DiarizationRecord,
@@ -25,8 +25,9 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    ChatMessage, ChatRole, DiarizationConfig, GenerationParams, ModelVariant, RuntimeService,
-    parse_chat_model_variant, parse_model_variant,
+    parse_chat_model_variant, parse_model_variant, ChatMessage, ChatRequestConfig, ChatRole,
+    DiarizationConfig, GenerationParams, ModelVariant, RuntimeRequestContext, RuntimeService,
+    WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -223,9 +224,7 @@ pub async fn rerun_record(
     let mut rerun_request = build_rerun_create_request(&source_record, source_audio, req);
     let placeholder = create_pending_record(&state, &mut rerun_request).await?;
     spawn_diarization_processing_task(
-        state.runtime.clone(),
-        state.diarization_store.clone(),
-        state.request_semaphore.clone(),
+        state.clone(),
         state.request_timeout_secs,
         placeholder.id.clone(),
         rerun_request,
@@ -281,9 +280,7 @@ pub async fn create_record(
 
     let placeholder = create_pending_record(&state, &mut parsed).await?;
     spawn_diarization_processing_task(
-        state.runtime.clone(),
-        state.diarization_store.clone(),
-        state.request_semaphore.clone(),
+        state.clone(),
         state.request_timeout_secs,
         placeholder.id.clone(),
         parsed,
@@ -315,9 +312,7 @@ pub async fn regenerate_summary(
         .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
 
     maybe_spawn_summary_generation(
-        state.runtime.clone(),
-        state.diarization_store.clone(),
-        state.request_semaphore.clone(),
+        state.clone(),
         state.request_timeout_secs,
         &record,
         Some(ctx.correlation_id),
@@ -412,15 +407,15 @@ struct GeneratedDiarizationArtifacts {
 }
 
 fn spawn_diarization_processing_task(
-    runtime: Arc<RuntimeService>,
-    diarization_store: Arc<DiarizationStore>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    state: AppState,
     request_timeout_secs: u64,
     record_id: String,
     parsed: ParsedDiarizationCreateRequest,
     correlation_id: Option<String>,
 ) {
     tokio::spawn(async move {
+        let runtime = state.runtime.clone();
+        let diarization_store = state.diarization_store.clone();
         let _ = diarization_store
             .update_processing_status(
                 record_id.clone(),
@@ -454,8 +449,8 @@ fn spawn_diarization_processing_task(
         };
 
         match generate_diarization_artifacts(
+            &state,
             runtime.clone(),
-            semaphore.clone(),
             audio_bytes.as_slice(),
             &parsed,
             correlation_id.as_deref(),
@@ -500,9 +495,7 @@ fn spawn_diarization_processing_task(
                 {
                     Ok(Some(record)) => {
                         maybe_spawn_summary_generation(
-                            runtime.clone(),
-                            diarization_store.clone(),
-                            semaphore.clone(),
+                            state.clone(),
                             request_timeout_secs,
                             &record,
                             correlation_id,
@@ -534,13 +527,13 @@ fn spawn_diarization_processing_task(
 }
 
 async fn generate_diarization_artifacts(
+    state: &AppState,
     runtime: Arc<RuntimeService>,
-    semaphore: Arc<tokio::sync::Semaphore>,
     audio_bytes: &[u8],
     parsed: &ParsedDiarizationCreateRequest,
     _correlation_id: Option<&str>,
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
-    let _permit = stateful_acquire(semaphore).await?;
+    let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
     let started = Instant::now();
     // Keep diarization processing unbounded by wall-clock timeout so valid
     // long jobs can finish and persist successfully.
@@ -619,15 +612,6 @@ async fn generate_diarization_artifacts(
     })
 }
 
-async fn stateful_acquire(
-    semaphore: Arc<tokio::sync::Semaphore>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
-    semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::internal("Request semaphore closed"))
-}
-
 fn build_rerun_create_request(
     source_record: &DiarizationRecord,
     source_audio: StoredDiarizationAudio,
@@ -685,9 +669,7 @@ fn initial_summary_state(transcript: &str) -> (DiarizationSummaryStatus, Option<
 }
 
 fn maybe_spawn_summary_generation(
-    runtime: Arc<RuntimeService>,
-    diarization_store: Arc<DiarizationStore>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    state: AppState,
     summary_timeout_secs: u64,
     record: &DiarizationRecord,
     correlation_id: Option<String>,
@@ -697,9 +679,7 @@ fn maybe_spawn_summary_generation(
     }
 
     spawn_summary_generation_task(
-        runtime,
-        diarization_store,
-        semaphore,
+        state,
         summary_timeout_secs,
         record.id.clone(),
         record.transcript.clone(),
@@ -708,16 +688,19 @@ fn maybe_spawn_summary_generation(
 }
 
 fn spawn_summary_generation_task(
-    runtime: Arc<RuntimeService>,
-    diarization_store: Arc<DiarizationStore>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    state: AppState,
     summary_timeout_secs: u64,
     record_id: String,
     transcript: String,
     correlation_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        let permit = match semaphore.acquire_owned().await {
+        let runtime = state.runtime.clone();
+        let diarization_store = state.diarization_store.clone();
+        let permit = match state
+            .acquire_owned_workload_permit(WorkloadClass::Background)
+            .await
+        {
             Ok(permit) => permit,
             Err(_) => {
                 persist_summary_update(
@@ -738,6 +721,7 @@ fn spawn_summary_generation_task(
                 transcript.as_str(),
                 correlation_id.as_deref(),
                 summary_timeout_secs,
+                permit.runtime_context(),
             )
             .await
         };
@@ -764,10 +748,11 @@ async fn generate_diarization_summary_with_timeout(
     transcript: &str,
     correlation_id: Option<&str>,
     timeout_secs: u64,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(runtime, transcript, correlation_id),
+        generate_diarization_summary(runtime, transcript, correlation_id, runtime_context),
     )
     .await
     .map_err(|_| summary_timeout_error(timeout_secs))?
@@ -777,6 +762,7 @@ async fn generate_diarization_summary(
     runtime: Arc<RuntimeService>,
     transcript: &str,
     correlation_id: Option<&str>,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     let variant =
         parse_chat_model_variant(Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)).map_err(|err| {
@@ -788,7 +774,7 @@ async fn generate_diarization_summary(
     params.top_p = 0.9;
 
     let generation = runtime
-        .chat_generate_with_generation_params_and_correlation(
+        .chat_generate_with_runtime_context(
             variant,
             vec![
                 ChatMessage {
@@ -804,7 +790,9 @@ async fn generate_diarization_summary(
                 },
             ],
             params,
+            ChatRequestConfig::default(),
             correlation_id,
+            runtime_context,
         )
         .await
         .map_err(|err| format!("Summary generation failed: {err}"))?;

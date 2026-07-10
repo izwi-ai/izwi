@@ -90,11 +90,23 @@ impl KvCacheBackend {
 struct RequestPhaseTiming {
     first_scheduled_at: Option<Instant>,
     queue_wait_ms: f64,
+    media_decode_ms: Option<f64>,
+    normalization_ms: Option<f64>,
     prefill_ms: f64,
     decode_ms: f64,
+    sampling_ms: Option<f64>,
+    codec_ms: Option<f64>,
+    postprocess_ms: Option<f64>,
     first_output_ms: Option<f64>,
     prefill_steps: u32,
     decode_steps: u32,
+}
+
+fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
+    if let Some(value) = value {
+        let value = value.max(0.0);
+        *target = Some(target.unwrap_or(0.0) + value);
+    }
 }
 
 /// The engine core - manages the inference loop.
@@ -645,10 +657,29 @@ impl EngineCore {
                     .request_phase_timings
                     .entry(request_id.clone())
                     .or_default();
-                phase.prefill_ms = override_timing.prefill_ms.max(0.0);
-                phase.decode_ms = override_timing.decode_ms.max(0.0);
-                phase.prefill_steps = override_timing.prefill_steps;
-                phase.decode_steps = override_timing.decode_steps;
+                merge_optional_phase_ms(
+                    &mut phase.media_decode_ms,
+                    override_timing.media_decode_ms,
+                );
+                merge_optional_phase_ms(
+                    &mut phase.normalization_ms,
+                    override_timing.normalization_ms,
+                );
+                if let Some(prefill_ms) = override_timing.prefill_ms {
+                    phase.prefill_ms = prefill_ms.max(0.0);
+                }
+                if let Some(decode_ms) = override_timing.decode_ms {
+                    phase.decode_ms = decode_ms.max(0.0);
+                }
+                merge_optional_phase_ms(&mut phase.sampling_ms, override_timing.sampling_ms);
+                merge_optional_phase_ms(&mut phase.codec_ms, override_timing.codec_ms);
+                merge_optional_phase_ms(&mut phase.postprocess_ms, override_timing.postprocess_ms);
+                if let Some(prefill_steps) = override_timing.prefill_steps {
+                    phase.prefill_steps = prefill_steps;
+                }
+                if let Some(decode_steps) = override_timing.decode_steps {
+                    phase.decode_steps = decode_steps;
+                }
                 if let Some(first_output_ms_since_start) =
                     override_timing.first_output_ms_since_start
                 {
@@ -692,8 +723,13 @@ impl EngineCore {
                 }
                 engine_output.latency_breakdown = Some(LatencyBreakdown {
                     queue_wait_ms: phase.queue_wait_ms,
+                    media_decode_ms: phase.media_decode_ms,
+                    normalization_ms: phase.normalization_ms,
                     prefill_ms: phase.prefill_ms,
                     decode_ms: phase.decode_ms,
+                    sampling_ms: phase.sampling_ms,
+                    codec_ms: phase.codec_ms,
+                    postprocess_ms: phase.postprocess_ms,
                     ttft_ms: phase.first_output_ms,
                     total_ms: generation_time_ms,
                     prefill_steps: phase.prefill_steps,
@@ -833,7 +869,7 @@ impl Drop for EngineCore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::executor::{ExecutorOutput, ModelExecutor};
+    use super::super::executor::{ExecutorOutput, ExecutorPhaseTiming, ModelExecutor};
     use super::super::scheduler::ScheduledRequest;
     use super::super::types::{AudioOutput, Priority};
     use super::*;
@@ -1006,6 +1042,56 @@ mod tests {
                     tokens_generated: 1,
                     finished: true,
                     phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .collect())
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorOutput>> {
+            Ok(Vec::new())
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PhaseTimingExecutor;
+
+    impl ModelExecutor for PhaseTimingExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorOutput>> {
+            Ok(scheduled
+                .iter()
+                .map(|entry| ExecutorOutput {
+                    request_id: entry.request_id.clone(),
+                    audio: None,
+                    text: Some("done".to_string()),
+                    input_transcription: None,
+                    tokens_processed: entry.num_tokens.max(1),
+                    tokens_generated: 1,
+                    finished: true,
+                    phase_timing_override: Some(ExecutorPhaseTiming {
+                        media_decode_ms: Some(12.5),
+                        sampling_ms: Some(1.25),
+                        ..ExecutorPhaseTiming::default()
+                    }),
                     asr_diagnostics: None,
                     error: None,
                 })
@@ -1253,5 +1339,36 @@ mod tests {
             .expect("latency breakdown");
         assert!(latency.ttft_ms.is_some());
         assert!(latency.ttft_ms.unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_step_preserves_optional_executor_phase_timings() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(PhaseTimingExecutor));
+        let config = EngineCoreConfig {
+            enable_chunked_prefill: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+
+        let mut request = EngineCoreRequest::tts("phase timing");
+        request.id = "phase-req".to_string();
+        request.prompt_tokens = vec![1, 2, 3];
+
+        core.add_request(request).unwrap();
+        let outputs = core.step().await.unwrap();
+
+        let latency = outputs[0]
+            .latency_breakdown
+            .as_ref()
+            .expect("latency breakdown");
+        assert_eq!(latency.media_decode_ms, Some(12.5));
+        assert_eq!(latency.sampling_ms, Some(1.25));
+        assert!(
+            latency.prefill_ms >= 0.0,
+            "scheduler prefill timing remains available"
+        );
+        assert_eq!(latency.decode_ms, 0.0);
     }
 }

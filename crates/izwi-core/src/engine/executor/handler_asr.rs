@@ -10,7 +10,7 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
-use super::{ExecutorOutput, NativeExecutor};
+use super::{ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
@@ -54,10 +54,14 @@ impl NativeExecutor {
                         active_state = None;
                     }
 
+                    let mut initial_media_decode_ms = None;
                     let mut active_state = if let Some(state) = active_state {
                         state
                     } else {
+                        let audio_decode_started = Instant::now();
                         let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
+                        let audio_decode_ms = audio_decode_started.elapsed().as_secs_f64() * 1000.0;
+                        initial_media_decode_ms = Some(audio_decode_ms);
                         let samples_len = samples.len();
 
                         let chunk_plan = Self::asr_chunk_plan(
@@ -101,10 +105,12 @@ impl NativeExecutor {
                                     },
                                 )
                             })?;
-                            let diagnostics =
+                            let diagnostics = Self::with_audio_decode_timing(
                                 Some(chunk_plan.diagnostics_with_chunk_transcriptions(
                                     chunked.chunk_diagnostics,
-                                ));
+                                )),
+                                audio_decode_ms,
+                            );
 
                             return Ok(ExecutorOutput {
                                 request_id: request.id.clone(),
@@ -122,7 +128,9 @@ impl NativeExecutor {
                                 tokens_processed: request.num_prompt_tokens(),
                                 tokens_generated: (samples_len / 256).max(1),
                                 finished: true,
-                                phase_timing_override: None,
+                                phase_timing_override: Some(
+                                    ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms),
+                                ),
                                 asr_diagnostics: diagnostics,
                                 error: None,
                             });
@@ -231,7 +239,8 @@ impl NativeExecutor {
                         tokens_processed,
                         tokens_generated: total_tokens_generated,
                         finished,
-                        phase_timing_override: None,
+                        phase_timing_override: initial_media_decode_ms
+                            .map(ExecutorPhaseTiming::with_media_decode_ms),
                         asr_diagnostics: None,
                         error: None,
                     });
@@ -451,7 +460,7 @@ impl NativeExecutor {
             tokens_processed: request.num_prompt_tokens(),
             tokens_generated: (samples_len / 256).max(1),
             finished: true,
-            phase_timing_override: None,
+            phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
             asr_diagnostics,
             error: None,
         })

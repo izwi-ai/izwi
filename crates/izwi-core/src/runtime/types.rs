@@ -1,9 +1,39 @@
 //! Runtime request/response types.
 
 use crate::catalog::ModelVariant;
-use crate::engine::GenerationParams;
+use crate::engine::{GenerationParams, WorkloadClass};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Server-side scheduling and admission metadata carried with an inference request.
+///
+/// This is deliberately skipped by serde on public request payloads. API layers
+/// populate it after admission so clients cannot choose their own scheduler class.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeRequestContext {
+    pub workload_class: WorkloadClass,
+    pub admission_ms: Option<f64>,
+}
+
+impl RuntimeRequestContext {
+    pub fn new(workload_class: WorkloadClass) -> Self {
+        Self {
+            workload_class,
+            admission_ms: None,
+        }
+    }
+
+    pub fn with_admission_ms(mut self, admission_ms: f64) -> Self {
+        self.admission_ms = Some(admission_ms.max(0.0));
+        self
+    }
+}
+
+impl Default for RuntimeRequestContext {
+    fn default() -> Self {
+        Self::new(WorkloadClass::Online)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AsrTranscription {
@@ -175,6 +205,10 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub correlation_id: Option<String>,
 
+    /// Internal scheduling context populated by the server after admission.
+    #[serde(skip)]
+    pub runtime_context: RuntimeRequestContext,
+
     /// Text to synthesize
     pub text: String,
 
@@ -209,6 +243,7 @@ impl GenerationRequest {
             id: generate_request_id(),
             model_variant: None,
             correlation_id: None,
+            runtime_context: RuntimeRequestContext::default(),
             text: text.into(),
             config: GenerationConfig::default(),
             language: None,
@@ -225,6 +260,11 @@ impl GenerationRequest {
 
     pub fn with_model_variant(mut self, model_variant: ModelVariant) -> Self {
         self.model_variant = Some(model_variant);
+        self
+    }
+
+    pub fn with_runtime_context(mut self, runtime_context: RuntimeRequestContext) -> Self {
+        self.runtime_context = runtime_context;
         self
     }
 

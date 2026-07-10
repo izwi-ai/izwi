@@ -7,21 +7,21 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{Extension, Json, Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::pagination::{CursorPagination, CursorPaginationQuery, encode_cursor};
+use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_long_form::{expand_generation_requests_for_long_form, generate_long_form_tts};
 use crate::batch_runtime::{
     store::{
-        BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset, NewRuntimeArtifact,
-        NewRuntimeJob, NewTextAsset, sha256_hex,
+        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewMediaAsset,
+        NewRuntimeArtifact, NewRuntimeJob, NewTextAsset,
     },
     types::{
         ClaimedStage, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind, RuntimeJobStatus,
@@ -36,11 +36,12 @@ use crate::speech_history_store::{
     SpeechRouteKind, StoredSpeechAudio,
 };
 use crate::state::AppState;
-use izwi_core::audio::{AudioEncoder, AudioFormat, inspect_audio_bytes};
+use izwi_core::audio::{inspect_audio_bytes, AudioEncoder, AudioFormat};
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
-    AudioChunk, GenerationConfig, GenerationRequest, ModelVariant, parse_tts_model_variant,
+    parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
+    WorkloadClass,
 };
 use izwi_hooks::Principal;
 
@@ -377,8 +378,6 @@ async fn create_record(
     validate_reference_voice_selection(&req)?;
     req = resolve_saved_voice_selection(&state, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
-    state.runtime.load_model(variant).await?;
-
     if req.stream.unwrap_or(false) && route_kind != SpeechRouteKind::TextToSpeech {
         return Err(ApiError::bad_request(
             "Streaming is currently supported only on text-to-speech generation resources",
@@ -437,7 +436,15 @@ async fn create_record(
     }
 
     let record = synthesize_record_internal(
-        &state, &ctx, req, route_kind, variant, model_id, input_text, None,
+        &state,
+        &ctx,
+        req,
+        route_kind,
+        variant,
+        model_id,
+        input_text,
+        None,
+        WorkloadClass::Online,
     )
     .await?;
 
@@ -503,8 +510,8 @@ async fn enqueue_batch_speech_job(
         input_text: input_text.clone(),
         request: req,
     };
-    let request_json =
-        serde_json::to_value(&request_snapshot).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let request_json = serde_json::to_value(&request_snapshot)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let request_hash = sha256_hex(
         serde_json::to_string(&request_json)
             .unwrap_or_default()
@@ -634,8 +641,6 @@ impl StageExecutor for BatchTtsStageExecutor {
             .context("Failed to decode TTS batch request")?;
         let variant = parse_tts_model_variant(request.model_id.as_str())
             .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
-        self.state.runtime.load_model(variant).await?;
-
         let ctx = RequestContext {
             correlation_id: claimed
                 .job
@@ -665,6 +670,7 @@ impl StageExecutor for BatchTtsStageExecutor {
             request.model_id,
             request.input_text,
             Some(record_id.clone()),
+            WorkloadClass::Batch,
         )
         .await
         {
@@ -775,10 +781,16 @@ pub(crate) async fn synthesize_record(
     validate_reference_voice_selection(&req)?;
     req = resolve_saved_voice_selection(state, req).await?;
     req = normalize_for_model_capabilities(route_kind, variant, req)?;
-    state.runtime.load_model(variant).await?;
-
     synthesize_record_internal(
-        state, ctx, req, route_kind, variant, model_id, input_text, None,
+        state,
+        ctx,
+        req,
+        route_kind,
+        variant,
+        model_id,
+        input_text,
+        None,
+        WorkloadClass::Online,
     )
     .await
 }
@@ -792,18 +804,20 @@ async fn synthesize_record_internal(
     model_id: String,
     input_text: String,
     target_record_id: Option<String>,
+    workload_class: WorkloadClass,
 ) -> Result<SpeechHistoryRecord, ApiError> {
-    let generation_request = build_generation_request(
+    let mut generation_request = build_generation_request(
         req.clone(),
         ctx.correlation_id.clone(),
         input_text.clone(),
         false,
         variant,
     );
+    let permit = state.acquire_workload_permit(workload_class).await;
+    state.runtime.load_model(variant).await?;
+    generation_request = generation_request.with_runtime_context(permit.runtime_context());
     let planned_request_count =
         expand_generation_requests_for_long_form(&generation_request, variant).len();
-
-    let _permit = state.acquire_permit().await;
     let timeout = Duration::from_secs(resolve_generation_timeout_secs(
         state.request_timeout_secs,
         variant,
@@ -899,13 +913,13 @@ async fn stream_record_creation(
         true,
         variant,
     );
-    let planned_requests = expand_generation_requests_for_long_form(&generation_request, variant);
+    let mut planned_requests = expand_generation_requests_for_long_form(&generation_request, variant);
     let stream_request_id = generation_request.id.clone();
     let placeholder_record_id = placeholder.id.clone();
 
     let runtime = state.runtime.clone();
     let speech_store = state.speech_history_store.clone();
-    let semaphore = state.request_semaphore.clone();
+    let admission_state = state.clone();
 
     let (event_tx, mut event_rx) = mpsc::channel::<String>(stream_event_queue_capacity());
     let _ = send_stream_event(
@@ -965,7 +979,10 @@ async fn stream_record_creation(
             }
         };
 
-        let _permit = match semaphore.acquire_owned().await {
+        let permit = match admission_state
+            .acquire_owned_workload_permit(WorkloadClass::Streaming)
+            .await
+        {
             Ok(permit) => permit,
             Err(_) => {
                 mark_failed("Server is shutting down".to_string()).await;
@@ -991,6 +1008,14 @@ async fn stream_record_creation(
                 return;
             }
         };
+        if let Err(err) = runtime.load_model(variant).await {
+            mark_failed(err.to_string()).await;
+            return;
+        }
+        let runtime_context = permit.runtime_context();
+        for request in &mut planned_requests {
+            request.runtime_context = runtime_context;
+        }
 
         let _ = speech_store
             .update_processing_status(
@@ -1386,6 +1411,7 @@ fn build_generation_request(
         id: uuid::Uuid::new_v4().to_string(),
         model_variant: Some(variant),
         correlation_id: Some(correlation_id),
+        runtime_context: Default::default(),
         text,
         config: generation_config,
         language: req.language,
@@ -1682,11 +1708,9 @@ mod tests {
         })
         .expect_err("expected mixed reference inputs to fail");
 
-        assert!(
-            err.message.contains(
-                "Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"
-            )
-        );
+        assert!(err
+            .message
+            .contains("Use either `saved_voice_id` or direct `reference_audio`/`reference_text`"));
     }
 
     #[test]
@@ -1697,10 +1721,9 @@ mod tests {
         })
         .expect_err("expected incomplete reference inputs to fail");
 
-        assert!(
-            err.message
-                .contains("Provide both `reference_audio` and `reference_text` together.")
-        );
+        assert!(err
+            .message
+            .contains("Provide both `reference_audio` and `reference_text` together."));
     }
 
     #[test]
@@ -1771,10 +1794,9 @@ mod tests {
         )
         .expect_err("expected missing reference source to fail");
 
-        assert!(
-            err.message
-                .contains("Voice cloning requests require `saved_voice_id` or both")
-        );
+        assert!(err
+            .message
+            .contains("Voice cloning requests require `saved_voice_id` or both"));
     }
 
     #[test]
@@ -1786,10 +1808,9 @@ mod tests {
         )
         .expect_err("expected base model to require reference input");
 
-        assert!(
-            err.message
-                .contains("requires `saved_voice_id` or direct reference audio/text")
-        );
+        assert!(err
+            .message
+            .contains("requires `saved_voice_id` or direct reference audio/text"));
     }
 
     #[test]
@@ -1801,10 +1822,9 @@ mod tests {
         )
         .expect_err("expected VibeVoice to require reference input");
 
-        assert!(
-            err.message
-                .contains("requires `saved_voice_id` or direct reference audio/text")
-        );
+        assert!(err
+            .message
+            .contains("requires `saved_voice_id` or direct reference audio/text"));
     }
 
     #[test]
@@ -1837,10 +1857,9 @@ mod tests {
         )
         .expect_err("expected voice-design model to require voice_description");
 
-        assert!(
-            err.message
-                .contains("requires `voice_description` on text-to-speech routes")
-        );
+        assert!(err
+            .message
+            .contains("requires `voice_description` on text-to-speech routes"));
     }
 
     #[test]

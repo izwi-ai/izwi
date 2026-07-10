@@ -17,21 +17,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_agent::{
+    planner::{PlanningMode, SimplePlanner},
     AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, MemoryMessage, MemoryMessageMeta,
     MemoryMessageRole, MemoryStore, ModelBackend, ModelOutput, ModelRequest, NoopTool, TimeTool,
     ToolRegistry, TurnInput,
-    planner::{PlanningMode, SimplePlanner},
 };
 use izwi_core::{
-    ChatMessage, ChatRole, GenerationConfig, GenerationParams, GenerationRequest, RuntimeService,
-    VoiceSession,
     audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
+    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
+    GenerationConfig, GenerationParams, GenerationRequest, RuntimeRequestContext, RuntimeService,
+    VoiceSession, WorkloadClass,
 };
 use izwi_vad::{
-    DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS, DEFAULT_SILENCE_MS,
-    DEFAULT_SPEECH_THRESHOLD, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
-    VAD_FRAME_MS, VAD_SAMPLE_RATE, VadScorer, sanitize_score_threshold,
+    sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
+    VadScorer, DEFAULT_MAX_UTTERANCE_MS, DEFAULT_MIN_SPEECH_MS, DEFAULT_PRE_ROLL_MS,
+    DEFAULT_SILENCE_MS, DEFAULT_SPEECH_THRESHOLD, VAD_FRAME_MS, VAD_SAMPLE_RATE,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -1180,12 +1180,11 @@ fn spawn_turn_task(
         let timeout = Duration::from_secs(timeout_secs);
 
         let turn_future = async {
-            let _permit = state
-                .request_semaphore
-                .clone()
-                .acquire_owned()
+            let permit = state
+                .acquire_owned_workload_permit(WorkloadClass::Realtime)
                 .await
                 .map_err(|_| "Server is shutting down".to_string())?;
+            let runtime_context = permit.runtime_context();
 
             send_json(
                 &out_tx,
@@ -1215,11 +1214,14 @@ fn spawn_turn_task(
                         let asr_language = config.asr_language.clone();
                         state
                             .runtime
-                            .asr_transcribe_streaming_bytes_with_correlation(
+                            .asr_transcribe_streaming_bytes_with_runtime_context(
                                 audio_bytes.as_slice(),
                                 Some(&asr_model_id),
                                 asr_language.as_deref(),
+                                None,
+                                None,
                                 Some(&correlation_id),
+                                runtime_context,
                                 move |delta| {
                                     if delta.is_empty() {
                                         return;
@@ -1300,6 +1302,7 @@ fn spawn_turn_task(
                         config.max_output_tokens,
                         voice_profile_id.as_deref(),
                         &correlation_id,
+                        runtime_context,
                     )
                     .await?;
                     let assistant_text = strip_think_tags(&assistant_raw);
@@ -1351,6 +1354,7 @@ fn spawn_turn_task(
                         &config.tts_model_id,
                         config.speaker.clone(),
                         assistant_text.as_str(),
+                        runtime_context,
                     )
                     .await?;
                     state
@@ -1413,6 +1417,7 @@ fn spawn_turn_task(
                         history_messages,
                         config.max_output_tokens,
                         audio_bytes.as_slice(),
+                        runtime_context,
                     )
                     .await?;
 
@@ -1563,6 +1568,7 @@ async fn stream_tts_to_socket(
     tts_model_id: &str,
     speaker: Option<String>,
     text: &str,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<(), String> {
     let tts_variant = parse_tts_model_variant(tts_model_id)
         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
@@ -1596,6 +1602,7 @@ async fn stream_tts_to_socket(
         id: uuid::Uuid::new_v4().to_string(),
         model_variant: Some(tts_variant),
         correlation_id: Some(correlation_id.to_string()),
+        runtime_context,
         text: text.to_string(),
         config: gen_config,
         language: None,
@@ -1697,6 +1704,7 @@ async fn stream_unified_s2s_to_socket(
     history_messages: Vec<ChatMessage>,
     max_output_tokens: usize,
     audio_bytes: &[u8],
+    runtime_context: RuntimeRequestContext,
 ) -> Result<izwi_core::SpeechToSpeechGeneration, String> {
     let variant = parse_model_variant(s2s_model_id)
         .map_err(|err| format!("Unsupported unified audio model: {err}"))?;
@@ -1731,13 +1739,14 @@ async fn stream_unified_s2s_to_socket(
 
     let generation = state
         .runtime
-        .speech_to_speech_generate_streaming_bytes_with_variant(
+        .speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context(
             variant,
             audio_bytes,
             history_messages,
             params,
             Some(system_prompt),
             Some(correlation_id),
+            runtime_context,
             {
                 let out_tx = out_tx.clone();
                 let utterance_id = utterance_id.to_string();
@@ -1879,6 +1888,7 @@ async fn run_agent_turn(
     max_output_tokens: usize,
     voice_profile_id: Option<&str>,
     correlation_id: &str,
+    runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
     let session_record = {
         let store = state.agent_session_store.read().await;
@@ -1928,6 +1938,7 @@ async fn run_agent_turn(
     let backend = IzwiRuntimeBackend {
         runtime: state.runtime.clone(),
         correlation_id: correlation_id.to_string(),
+        runtime_context,
     };
     let planner = SimplePlanner;
     let mut tools = ToolRegistry::new();
@@ -2175,6 +2186,7 @@ impl MemoryStore for VoiceContextMemoryStore {
 struct IzwiRuntimeBackend {
     runtime: Arc<izwi_core::RuntimeService>,
     correlation_id: String,
+    runtime_context: RuntimeRequestContext,
 }
 
 #[async_trait::async_trait]
@@ -2198,11 +2210,12 @@ impl ModelBackend for IzwiRuntimeBackend {
 
         let generation = self
             .runtime
-            .chat_generate_with_correlation(
+            .chat_generate_with_correlation_and_runtime_context(
                 variant,
                 runtime_messages,
                 request.max_output_tokens.clamp(1, 4096),
                 Some(&self.correlation_id),
+                self.runtime_context,
             )
             .await
             .map_err(|err| izwi_agent::AgentError::Model(err.to_string()))?;
