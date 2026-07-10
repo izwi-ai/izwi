@@ -11,8 +11,9 @@
 //! - streaming assistant audio/text events
 //! - interruption / barge-in cancellation
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -36,7 +37,7 @@ use izwi_vad::{
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
@@ -48,6 +49,7 @@ use crate::voice_memory::extract_observation_candidates;
 use crate::voice_store::CreateVoiceTurnRequest;
 const DEFAULT_CHAT_MODEL: &str = "Qwen3-1.7B-GGUF";
 const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";
 const WS_BIN_VERSION: u8 = 1;
 const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
@@ -60,6 +62,8 @@ const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
 const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
 const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 struct OutboundTx {
@@ -223,6 +227,7 @@ struct StreamingActiveUtterance {
     voiced_ms: f32,
     total_ms: f32,
     silence_ms: f32,
+    started_at: Instant,
 }
 
 struct StreamingInputState {
@@ -232,8 +237,9 @@ struct StreamingInputState {
     next_utterance_seq: u64,
     frame_seq_last: Option<u32>,
     current_sample_rate: Option<u32>,
-    pre_roll: Vec<i16>,
+    pre_roll: VecDeque<i16>,
     active: Option<StreamingActiveUtterance>,
+    last_frame_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -249,6 +255,7 @@ enum BinaryMessageKind {
 enum UtteranceEndReason {
     Silence,
     MaxDuration,
+    ClientPause,
     StreamStopped,
 }
 
@@ -257,6 +264,7 @@ impl UtteranceEndReason {
         match self {
             Self::Silence => "silence",
             Self::MaxDuration => "max_duration",
+            Self::ClientPause => "client_pause",
             Self::StreamStopped => "stream_stopped",
         }
     }
@@ -383,6 +391,7 @@ struct SpeechStartEvent {
 
 #[derive(Debug)]
 struct StreamingFrameResult {
+    sequence_gap: Option<(u32, u32)>,
     speech_start: Option<SpeechStartEvent>,
     speech_rejected: Option<SpeechStartEvent>,
     finalized_utterance: Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>,
@@ -398,8 +407,9 @@ impl StreamingInputState {
             next_utterance_seq: 0,
             frame_seq_last: None,
             current_sample_rate: None,
-            pre_roll: Vec::new(),
+            pre_roll: VecDeque::new(),
             active: None,
+            last_frame_at: None,
         }
     }
 
@@ -412,8 +422,22 @@ impl StreamingInputState {
         if sample_rate < 8_000 || sample_rate > 192_000 {
             return Err(format!("Invalid input sample_rate {sample_rate}"));
         }
+        let sequence_gap = if let Some(last) = self.frame_seq_last {
+            if frame_seq <= last {
+                return Err(format!(
+                    "Stale or duplicate input frame sequence {frame_seq}; last accepted was {last}"
+                ));
+            }
+            (frame_seq > last.saturating_add(1)).then_some((last.saturating_add(1), frame_seq))
+        } else {
+            None
+        };
+        self.frame_seq_last = Some(frame_seq);
+        self.last_frame_at = Some(Instant::now());
+
         if payload.is_empty() {
             return Ok(StreamingFrameResult {
+                sequence_gap,
                 speech_start: None,
                 speech_rejected: None,
                 finalized_utterance: None,
@@ -422,13 +446,6 @@ impl StreamingInputState {
         if payload.len() % 2 != 0 {
             return Err("PCM16 payload length must be even".to_string());
         }
-
-        if let Some(last) = self.frame_seq_last {
-            if frame_seq <= last {
-                debug!("voice ws input frame sequence non-increasing: {frame_seq} <= {last}");
-            }
-        }
-        self.frame_seq_last = Some(frame_seq);
 
         if let Some(current_sr) = self.current_sample_rate {
             if current_sr != sample_rate {
@@ -443,6 +460,7 @@ impl StreamingInputState {
         let samples = pcm16_bytes_to_i16(payload);
         if samples.is_empty() {
             return Ok(StreamingFrameResult {
+                sequence_gap,
                 speech_start: None,
                 speech_rejected: None,
                 finalized_utterance: None,
@@ -476,6 +494,7 @@ impl StreamingInputState {
         }
 
         let mut result = StreamingFrameResult {
+            sequence_gap,
             speech_start: None,
             speech_rejected: None,
             finalized_utterance: None,
@@ -493,9 +512,14 @@ impl StreamingInputState {
                 voiced_ms: 0.0,
                 total_ms: 0.0,
                 silence_ms: 0.0,
+                started_at: Instant::now(),
             };
             if !self.pre_roll.is_empty() {
-                capture.samples_i16.extend_from_slice(&self.pre_roll);
+                capture.samples_i16.extend(self.pre_roll.iter().copied());
+            }
+            if capture.samples_i16.len().saturating_add(samples.len()) > MAX_UTTERANCE_PCM16_SAMPLES
+            {
+                return Err("Streamed utterance exceeded the PCM16 buffer limit".to_string());
             }
             capture.samples_i16.extend_from_slice(&samples);
             self.active = Some(capture);
@@ -505,6 +529,10 @@ impl StreamingInputState {
                 utterance_seq,
             });
         } else if let Some(active) = self.active.as_mut() {
+            if active.samples_i16.len().saturating_add(samples.len()) > MAX_UTTERANCE_PCM16_SAMPLES
+            {
+                return Err("Streamed utterance exceeded the PCM16 buffer limit".to_string());
+            }
             active.samples_i16.extend_from_slice(&samples);
         } else {
             self.push_pre_roll(&samples, sample_rate);
@@ -557,6 +585,27 @@ impl StreamingInputState {
         }
     }
 
+    fn on_tick(
+        &mut self,
+    ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(None);
+        };
+        if active.started_at.elapsed() >= Duration::from_millis(self.config.max_utterance_ms as u64)
+        {
+            return self.finalize_active_utterance(UtteranceEndReason::MaxDuration);
+        }
+
+        let pause_limit = Duration::from_millis(self.config.silence_duration_ms.max(250) as u64);
+        if self
+            .last_frame_at
+            .is_some_and(|last_frame| last_frame.elapsed() >= pause_limit)
+        {
+            return self.finalize_active_utterance(UtteranceEndReason::ClientPause);
+        }
+        Ok(None)
+    }
+
     fn finalize_active_utterance(
         &mut self,
         reason: UtteranceEndReason,
@@ -564,6 +613,7 @@ impl StreamingInputState {
         let Some(active) = self.active.take() else {
             return Ok(None);
         };
+        self.endpoint = EndpointDetector::new(self.config.endpoint_config());
         let sample_rate = self
             .current_sample_rate
             .or(self.config.input_sample_rate_hint)
@@ -598,7 +648,7 @@ impl StreamingInputState {
             return;
         }
 
-        self.pre_roll.extend_from_slice(samples);
+        self.pre_roll.extend(samples.iter().copied());
         if self.pre_roll.len() > max_samples {
             let drain = self.pre_roll.len() - max_samples;
             self.pre_roll.drain(0..drain);
@@ -763,7 +813,13 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
 
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
-            if ws_tx.send(message).await.is_err() {
+            if tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if ws_tx.flush().await.is_err() {
                 break;
             }
         }
@@ -779,7 +835,51 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, correlation_id: S
         }),
     );
 
-    while let Some(result) = ws_rx.next().await {
+    let mut actor_tick = tokio::time::interval(SESSION_ACTOR_TICK);
+    actor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    actor_tick.tick().await;
+    loop {
+        let result = tokio::select! {
+            result = ws_rx.next() => result,
+            _ = actor_tick.tick() => {
+                let timed_utterance = match conn.streaming_input.as_mut() {
+                    Some(streaming) => streaming.on_tick(),
+                    None => Ok(None),
+                };
+                match timed_utterance {
+                    Ok(Some((commit, wav_bytes, end_reason))) => {
+                        send_json(
+                            &out_tx,
+                            json!({
+                                "type": "user_speech_end",
+                                "utterance_id": commit.utterance_id,
+                                "utterance_seq": commit.utterance_seq,
+                                "reason": end_reason.as_str(),
+                            }),
+                        );
+                        if let Err(err) = finalize_stream_vad_utterance(
+                            &state,
+                            &correlation_id,
+                            &out_tx,
+                            &mut conn,
+                            commit,
+                            wav_bytes,
+                            end_reason,
+                        )
+                        .await
+                        {
+                            send_error(&out_tx, None, None, err);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => send_error(&out_tx, None, None, err),
+                }
+                continue;
+            }
+        };
+        let Some(result) = result else {
+            break;
+        };
         let message = match result {
             Ok(message) => message,
             Err(err) => {
@@ -1108,6 +1208,19 @@ async fn handle_binary_message(
             };
 
             let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
+
+            if let Some((expected, received)) = frame_result.sequence_gap {
+                send_json(
+                    out_tx,
+                    json!({
+                        "type": "input_sequence_gap",
+                        "expected_frame_sequence": expected,
+                        "received_frame_sequence": received,
+                        "missing_frames": received.saturating_sub(expected),
+                        "action": "continue",
+                    }),
+                );
+            }
 
             if let Some(evt) = frame_result.speech_start {
                 if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
@@ -2238,6 +2351,22 @@ mod tests {
 
     use super::*;
 
+    fn test_streaming_input() -> StreamingInputState {
+        StreamingInputState::new(StreamingInputConfig {
+            turn_config: VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
+                s2s_model_id: "LFM2.5-Audio-1.5B".to_string(),
+                speaker: None,
+                max_output_tokens: 32,
+            }),
+            vad_threshold: DEFAULT_STREAM_VAD_THRESHOLD,
+            min_speech_ms: 50,
+            silence_duration_ms: 200,
+            max_utterance_ms: 10_000,
+            pre_roll_ms: 100,
+            input_sample_rate_hint: Some(16_000),
+        })
+    }
+
     #[tokio::test]
     async fn outbound_tx_drops_full_queue_and_records_backpressure() {
         let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
@@ -2274,5 +2403,33 @@ mod tests {
     #[test]
     fn stream_vad_threshold_accepts_score_values_directly() {
         assert_eq!(normalize_stream_vad_threshold(Some(0.62)), 0.62);
+    }
+
+    #[test]
+    fn streaming_input_rejects_stale_frames_and_reports_gaps() {
+        let mut input = test_streaming_input();
+        let silence = vec![0_u8; 640];
+
+        let first = input
+            .handle_pcm16_frame(1, 16_000, &silence)
+            .expect("first frame");
+        assert_eq!(first.sequence_gap, None);
+        let gap = input
+            .handle_pcm16_frame(3, 16_000, &silence)
+            .expect("gap frame");
+        assert_eq!(gap.sequence_gap, Some((2, 3)));
+        assert!(input
+            .handle_pcm16_frame(3, 16_000, &silence)
+            .expect_err("duplicate frame must fail")
+            .contains("Stale or duplicate"));
+    }
+
+    #[test]
+    fn streaming_pre_roll_is_a_bounded_ring() {
+        let mut input = test_streaming_input();
+        input.push_pre_roll(&vec![1_i16; 8_000], 16_000);
+
+        assert_eq!(input.pre_roll.len(), 1_600);
+        assert!(input.pre_roll.iter().all(|sample| *sample == 1));
     }
 }
