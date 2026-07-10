@@ -75,7 +75,10 @@ const TRANSCRIPTION_WS_BIN_KIND_CLIENT_PCM16 = 1;
 const TRANSCRIPTION_WS_BIN_CLIENT_HEADER_LEN = 16;
 export const LIVE_MIC_PCM_FRAME_SIZE = 2048;
 
-export type TranscriptionRealtimeServerEvent =
+export const TRANSCRIPTION_REALTIME_PROTOCOL = "transcription_realtime" as const;
+export const TRANSCRIPTION_REALTIME_VERSION = 3 as const;
+
+export type LegacyTranscriptionRealtimeServerEvent =
   | { type: "session_ready"; protocol?: string }
   | { type: "session_started" }
   | {
@@ -87,6 +90,107 @@ export type TranscriptionRealtimeServerEvent =
   | { type: "error"; message?: string }
   | { type: "session_done" }
   | { type: "pong"; timestamp_ms?: number | null };
+
+type TranscriptionRealtimeV3Payload =
+  | {
+      type: "session_ready";
+      data: {
+        accepted_version: number;
+        owner_instance_id: string;
+        resumable: false;
+        resume_window_ms: 0;
+      };
+    }
+  | { type: "session_started" }
+  | {
+      type: "audio_accepted";
+      data: {
+        frame_sequence: number;
+        buffer_depth_samples: number;
+        ingress_queue_depth: number;
+      };
+    }
+  | {
+      type: "audio_gap";
+      data: {
+        expected_frame_sequence: number;
+        received_frame_sequence: number;
+        missing_frames: number;
+        action: "continue" | "reset_segment" | "close_session";
+      };
+    }
+  | {
+      type: "transcript_partial";
+      data: { text: string; revision: number; language?: string | null };
+    }
+  | {
+      type: "transcript_stable";
+      data: { text: string; revision: number; stable_prefix_chars: number };
+    }
+  | {
+      type: "transcript_correction";
+      data: {
+        text: string;
+        revision: number;
+        replaces_revision: number;
+        reason: string;
+      };
+    }
+  | {
+      type: "transcript_final";
+      data: { text: string; revision: number; language?: string | null };
+    }
+  | {
+      type: "recoverable_error";
+      data: { code: string; message: string; retry_after_ms?: number };
+    }
+  | {
+      type: "fatal_error";
+      data: { code: string; message: string; close: RealtimeClosePayload };
+    }
+  | { type: "closing"; data: { close: RealtimeClosePayload } }
+  | { type: "closed"; data: { close: RealtimeClosePayload } }
+  | {
+      type: "pong";
+      data: { client_timestamp_ms?: number; server_timestamp_ms: number };
+    };
+
+interface RealtimeClosePayload {
+  code: string;
+  reason: string;
+  message: string;
+  retryable: boolean;
+}
+
+export type TranscriptionRealtimeV3ServerEnvelope = {
+  protocol: typeof TRANSCRIPTION_REALTIME_PROTOCOL;
+  version: typeof TRANSCRIPTION_REALTIME_VERSION;
+  event_id: number;
+  sequence: number;
+  session_id: string;
+  connection_epoch: number;
+  timestamp_ms: number;
+  utterance_id?: string;
+  turn_id?: string;
+  segment_id?: string;
+} & TranscriptionRealtimeV3Payload;
+
+export type TranscriptionRealtimeServerEvent =
+  | LegacyTranscriptionRealtimeServerEvent
+  | TranscriptionRealtimeV3ServerEnvelope;
+
+export function buildTranscriptionRealtimeV3SessionStart(
+  modelId: string | null,
+  language: string,
+) {
+  return {
+    type: "session_start" as const,
+    protocol: TRANSCRIPTION_REALTIME_PROTOCOL,
+    version: TRANSCRIPTION_REALTIME_VERSION,
+    model_id: modelId || undefined,
+    language,
+  };
+}
 
 export function buildTranscriptionRealtimeWebSocketUrl(
   apiBaseUrl: string,
@@ -102,11 +206,170 @@ export function buildTranscriptionRealtimeWebSocketUrl(
 export function isTranscriptionRealtimeServerEvent(
   value: unknown,
 ): value is TranscriptionRealtimeServerEvent {
+  if (!isRecord(value) || typeof value.type !== "string") return false;
+  if (
+    value.protocol === TRANSCRIPTION_REALTIME_PROTOCOL ||
+    value.version === TRANSCRIPTION_REALTIME_VERSION
+  ) {
+    return isTranscriptionRealtimeV3ServerEnvelope(value);
+  }
+  return [
+    "session_ready",
+    "session_started",
+    "transcript_partial",
+    "error",
+    "session_done",
+    "pong",
+  ].includes(value.type);
+}
+
+export function isTranscriptionRealtimeV3ServerEnvelope(
+  value: unknown,
+): value is TranscriptionRealtimeV3ServerEnvelope {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  const validEnvelope =
+    candidate.protocol === TRANSCRIPTION_REALTIME_PROTOCOL &&
+    candidate.version === TRANSCRIPTION_REALTIME_VERSION &&
+    isNonNegativeSafeInteger(candidate.event_id) &&
+    isNonNegativeSafeInteger(candidate.sequence) &&
+    typeof candidate.session_id === "string" &&
+    candidate.session_id.length > 0 &&
+    isNonNegativeSafeInteger(candidate.connection_epoch) &&
+    typeof candidate.timestamp_ms === "number" &&
+    Number.isFinite(candidate.timestamp_ms) &&
+    typeof candidate.type === "string";
+  if (!validEnvelope) return false;
+
+  const data = isRecord(candidate.data) ? candidate.data : null;
+  switch (candidate.type) {
+    case "session_started":
+      return candidate.data === undefined;
+    case "session_ready":
+      return (
+        data !== null &&
+        data.accepted_version === TRANSCRIPTION_REALTIME_VERSION &&
+        typeof data.owner_instance_id === "string" &&
+        data.owner_instance_id.length > 0 &&
+        data.resumable === false &&
+        data.resume_window_ms === 0
+      );
+    case "audio_accepted":
+      return (
+        data !== null &&
+        isNonNegativeSafeInteger(data.frame_sequence) &&
+        isNonNegativeSafeInteger(data.buffer_depth_samples) &&
+        isNonNegativeSafeInteger(data.ingress_queue_depth)
+      );
+    case "audio_gap":
+      return (
+        data !== null &&
+        isNonNegativeSafeInteger(data.expected_frame_sequence) &&
+        isNonNegativeSafeInteger(data.received_frame_sequence) &&
+        isNonNegativeSafeInteger(data.missing_frames) &&
+        ["continue", "reset_segment", "close_session"].includes(
+          String(data.action),
+        )
+      );
+    case "transcript_partial":
+    case "transcript_final":
+      return (
+        data !== null &&
+        typeof data.text === "string" &&
+        isNonNegativeSafeInteger(data.revision) &&
+        (data.language === undefined ||
+          data.language === null ||
+          typeof data.language === "string")
+      );
+    case "transcript_stable":
+      return (
+        data !== null &&
+        typeof data.text === "string" &&
+        isNonNegativeSafeInteger(data.revision) &&
+        isNonNegativeSafeInteger(data.stable_prefix_chars)
+      );
+    case "transcript_correction":
+      return (
+        data !== null &&
+        typeof data.text === "string" &&
+        isNonNegativeSafeInteger(data.revision) &&
+        isNonNegativeSafeInteger(data.replaces_revision) &&
+        typeof data.reason === "string"
+      );
+    case "recoverable_error":
+      return (
+        data !== null &&
+        typeof data.code === "string" &&
+        typeof data.message === "string" &&
+        (data.retry_after_ms === undefined ||
+          isNonNegativeSafeInteger(data.retry_after_ms))
+      );
+    case "fatal_error":
+      return (
+        data !== null &&
+        typeof data.code === "string" &&
+        typeof data.message === "string" &&
+        isRealtimeClosePayload(data.close)
+      );
+    case "closing":
+    case "closed":
+      return data !== null && isRealtimeClosePayload(data.close);
+    case "pong":
+      return (
+        data !== null &&
+        (data.client_timestamp_ms === undefined ||
+          isNonNegativeSafeInteger(data.client_timestamp_ms)) &&
+        isNonNegativeSafeInteger(data.server_timestamp_ms)
+      );
+    default:
+      return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
   return (
-    !!value &&
-    typeof value === "object" &&
-    "type" in value &&
-    typeof (value as { type?: unknown }).type === "string"
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+  );
+}
+
+function isRealtimeClosePayload(value: unknown): value is RealtimeClosePayload {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.code === "string" &&
+    typeof value.reason === "string" &&
+    typeof value.message === "string" &&
+    typeof value.retryable === "boolean"
+  );
+}
+
+export function isValidTranscriptionRealtimeV3Successor(
+  previous: TranscriptionRealtimeV3ServerEnvelope | null,
+  current: TranscriptionRealtimeV3ServerEnvelope,
+): boolean {
+  if (!previous) {
+    return (
+      current.event_id === 1 &&
+      current.sequence === 0 &&
+      current.connection_epoch === 0
+    );
+  }
+  if (
+    current.session_id !== previous.session_id ||
+    current.event_id <= previous.event_id ||
+    current.connection_epoch < previous.connection_epoch
+  ) {
+    return false;
+  }
+  if (current.connection_epoch === previous.connection_epoch) {
+    return current.sequence === previous.sequence + 1;
+  }
+  return (
+    current.connection_epoch === previous.connection_epoch + 1 &&
+    current.sequence === 0
   );
 }
 

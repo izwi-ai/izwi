@@ -36,6 +36,11 @@ pub struct VoiceRuntimeTelemetrySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RealtimeRuntimeTelemetrySnapshot {
+    pub transcription_stream_backpressure_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InferenceBrokerRuntimeTelemetrySnapshot {
     pub shadow_requests: u64,
     pub execution_requests: u64,
@@ -301,6 +306,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub engine: EngineRuntimeTelemetrySnapshot,
     pub models: Vec<LoadedModelDiagnostics>,
     pub voice: VoiceRuntimeTelemetrySnapshot,
+    pub realtime: RealtimeRuntimeTelemetrySnapshot,
     pub broker: InferenceBrokerRuntimeTelemetrySnapshot,
     pub pipelines: PipelineRuntimeTelemetrySnapshot,
     pub observability: RuntimeObservabilityTelemetrySnapshot,
@@ -335,6 +341,7 @@ pub(crate) struct RuntimeTelemetryCollector {
     voice_interruptions: AtomicU64,
     voice_barge_ins: AtomicU64,
     voice_stream_backpressure: AtomicU64,
+    transcription_stream_backpressure: AtomicU64,
     broker_shadow_requests: AtomicU64,
     broker_execution_requests: AtomicU64,
     broker_route_decisions: AtomicU64,
@@ -372,6 +379,7 @@ impl RuntimeTelemetryCollector {
             voice_interruptions: AtomicU64::new(0),
             voice_barge_ins: AtomicU64::new(0),
             voice_stream_backpressure: AtomicU64::new(0),
+            transcription_stream_backpressure: AtomicU64::new(0),
             broker_shadow_requests: AtomicU64::new(0),
             broker_execution_requests: AtomicU64::new(0),
             broker_route_decisions: AtomicU64::new(0),
@@ -480,6 +488,11 @@ impl RuntimeTelemetryCollector {
 
     pub(crate) fn record_voice_stream_backpressure(&self) {
         self.voice_stream_backpressure
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_transcription_stream_backpressure(&self) {
+        self.transcription_stream_backpressure
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -602,6 +615,11 @@ impl RuntimeTelemetryCollector {
                 interruptions: self.voice_interruptions.load(Ordering::Relaxed),
                 barge_ins: self.voice_barge_ins.load(Ordering::Relaxed),
                 stream_backpressure_total: self.voice_stream_backpressure.load(Ordering::Relaxed),
+            },
+            realtime: RealtimeRuntimeTelemetrySnapshot {
+                transcription_stream_backpressure_total: self
+                    .transcription_stream_backpressure
+                    .load(Ordering::Relaxed),
             },
             broker: InferenceBrokerRuntimeTelemetrySnapshot {
                 shadow_requests: self.broker_shadow_requests.load(Ordering::Relaxed),
@@ -730,6 +748,12 @@ impl RuntimeTelemetryCollector {
             "Runtime stream backpressure events.",
             snapshot.voice.stream_backpressure_total,
         );
+        payload.push_str(&format!(
+            "# HELP izwi_realtime_transcription_stream_backpressure_total Realtime transcription websocket backpressure events.\n\
+# TYPE izwi_realtime_transcription_stream_backpressure_total counter\n\
+izwi_realtime_transcription_stream_backpressure_total {}\n",
+            snapshot.realtime.transcription_stream_backpressure_total
+        ));
         payload.push_str(&format!(
             "# TYPE izwi_inference_broker_shadow_requests_total counter\nizwi_inference_broker_shadow_requests_total {}\n\
 # TYPE izwi_inference_broker_execution_requests_total counter\nizwi_inference_broker_execution_requests_total {}\n\
@@ -1081,6 +1105,7 @@ mod tests {
         telemetry.record_voice_interruption();
         telemetry.record_voice_barge_in();
         telemetry.record_voice_stream_backpressure();
+        telemetry.record_transcription_stream_backpressure();
 
         let snapshot = telemetry.snapshot().await;
         assert_eq!(snapshot.voice.sessions_started, 1);
@@ -1088,6 +1113,7 @@ mod tests {
         assert_eq!(snapshot.voice.interruptions, 1);
         assert_eq!(snapshot.voice.barge_ins, 1);
         assert_eq!(snapshot.voice.stream_backpressure_total, 1);
+        assert_eq!(snapshot.realtime.transcription_stream_backpressure_total, 1);
         assert!(snapshot
             .voice_metrics
             .iter()
@@ -1097,6 +1123,7 @@ mod tests {
         assert!(payload.contains("izwi_voice_session_started_total 1"));
         assert!(payload.contains("izwi_voice_session_closed_total 1"));
         assert!(payload.contains("izwi_voice_stream_backpressure_total 1"));
+        assert!(payload.contains("izwi_realtime_transcription_stream_backpressure_total 1"));
         assert!(payload.contains("izwi_voice_session_interruptions_total 1"));
         assert!(payload.contains("izwi_voice_barge_in_events_total 1"));
         assert!(payload.contains("izwi_voice_metric_contract_info"));
@@ -1229,9 +1256,7 @@ mod tests {
         assert!(payload.contains(
             "izwi_runtime_workload_admission_ms{workload_class=\"interactive\",quantile=\"avg\"} 3.000000"
         ));
-        assert!(!payload.contains(
-            "izwi_runtime_workload_queue_wait_ms{workload_class=\"batch\""
-        ));
+        assert!(!payload.contains("izwi_runtime_workload_queue_wait_ms{workload_class=\"batch\""));
         assert!(
             payload.contains("izwi_runtime_workload_stage_failures{workload_class=\"batch\"} 1")
         );
