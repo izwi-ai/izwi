@@ -41,9 +41,9 @@ concurrency:
 
 jobs:
   cargo-cpu:
-    name: Cargo Check (CPU)
+    name: Cargo Validation (CPU)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -65,13 +65,13 @@ jobs:
           workspaces: |
             . -> target
 
-      - name: Run CPU cargo checks
+      - name: Run CPU backend validation
         run: scripts/ci/check-backend-truth.sh cargo-cpu
 
   cargo-cuda:
-    name: Cargo Check (CUDA)
+    name: Cargo Validation (CUDA)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CUDA_COMPUTE_CAP: "80"
       IZWI_CUDA_FEATURES: "cuda,cudnn"
@@ -100,13 +100,13 @@ jobs:
             --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Run CUDA cargo checks
+      - name: Run CUDA backend validation
         run: scripts/ci/check-backend-truth.sh cargo-cuda
 
   cargo-metal:
-    name: Cargo Check (Metal)
+    name: Cargo Validation (Metal)
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -121,7 +121,7 @@ jobs:
           workspaces: |
             . -> target
 
-      - name: Run Metal cargo checks
+      - name: Run Metal backend validation
         run: scripts/ci/check-backend-truth.sh cargo-metal
 
   docker-cpu:

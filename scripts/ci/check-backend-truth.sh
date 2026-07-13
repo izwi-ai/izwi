@@ -7,9 +7,9 @@ usage() {
 Usage: scripts/ci/check-backend-truth.sh <command>
 
 Commands:
-  cargo-cpu     Run CPU-focused cargo checks for the CLI and server
-  cargo-metal   Run Metal-focused cargo checks for core and CLI on macOS
-  cargo-cuda    Run CUDA-focused cargo checks for the CLI and server
+  cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
+  cargo-metal   Run Metal-focused cargo checks and core scheduler regressions on macOS
+  cargo-cuda    Run CUDA-focused checks, portable regressions, and a device smoke when available
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
   docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
 EOF
@@ -32,6 +32,97 @@ resolve_cuda_compute_cap() {
 
 resolve_cuda_features() {
     echo "${IZWI_CUDA_FEATURES:-cuda,cudnn}"
+}
+
+run_core_scheduler_regressions() {
+    local features="${1:-}"
+    local cargo_args=(--locked -p izwi-core)
+    local suites=(
+        engine::scheduler
+        engine::resources
+        engine::core
+        runtime::coordinator
+        runtime::service
+        runtime::rollout
+        engine::executor
+        engine::execution
+        engine::output
+    )
+
+    if [[ -n "${features}" ]]; then
+        cargo_args+=(--features "${features}")
+    fi
+
+    for suite in "${suites[@]}"; do
+        echo "Running ${suite} regressions"
+        cargo test "${cargo_args[@]}" "${suite}" --lib
+    done
+}
+
+smoke_cuda_device_if_available() {
+    local cuda_features="$1"
+
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+        echo "No usable NVIDIA device exposed; portable CUDA regressions completed."
+        return
+    fi
+
+    require_command curl
+
+    local port="${IZWI_CUDA_SMOKE_PORT:-18081}"
+    local health_url="http://127.0.0.1:${port}/internal/health"
+    local log_path="${RUNNER_TEMP:-/tmp}/izwi-cuda-device-smoke.log"
+    local server_binary="${CARGO_TARGET_DIR:-target}/debug/izwi-server"
+    local server_pid
+    local health_payload=""
+
+    echo "Smoke-checking the CUDA device through izwi-server"
+    cargo build --locked -p izwi-server --features "${cuda_features}"
+    IZWI_MODELS_DIR="${RUNNER_TEMP:-/tmp}/izwi-cuda-smoke-models" \
+    IZWI_PRELOAD_MODELS= \
+    IZWI_WARMUP_PRELOADED_MODELS=0 \
+    "${server_binary}" \
+        --host 127.0.0.1 \
+        --port "${port}" \
+        --backend cuda >"${log_path}" 2>&1 &
+    server_pid=$!
+    trap 'kill '"${server_pid}"' >/dev/null 2>&1 || true; wait '"${server_pid}"' >/dev/null 2>&1 || true' EXIT
+
+    for _ in {1..60}; do
+        if ! kill -0 "${server_pid}" >/dev/null 2>&1; then
+            echo "CUDA smoke server exited before becoming healthy:" >&2
+            sed -n '1,240p' "${log_path}" >&2
+            return 1
+        fi
+        if health_payload="$(curl -fsS "${health_url}" 2>/dev/null)"; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ -z "${health_payload}" ]]; then
+        echo "CUDA smoke server did not become healthy:" >&2
+        sed -n '1,240p' "${log_path}" >&2
+        return 1
+    fi
+
+    for expected in \
+        '"requested_backend":"cuda"' \
+        '"requested_backend_available":true' \
+        '"selected_backend":"cuda"' \
+        '"cuda":true' \
+        '"driver_available":true' \
+        '"device_usable":true'; do
+        if ! grep -Fq "${expected}" <<<"${health_payload}"; then
+            echo "CUDA health response is missing ${expected}:" >&2
+            printf '%s\n' "${health_payload}" >&2
+            return 1
+        fi
+    done
+
+    kill "${server_pid}" >/dev/null 2>&1 || true
+    wait "${server_pid}" >/dev/null 2>&1 || true
+    trap - EXIT
 }
 
 smoke_docker_server() {
@@ -149,9 +240,7 @@ run_cargo_cpu() {
 
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
-    cargo test --locked -p izwi-core engine::execution --lib
-    cargo test --locked -p izwi-core engine::executor::tests --lib
-    cargo test --locked -p izwi-core runtime::rollout --lib
+    run_core_scheduler_regressions
 }
 
 run_cargo_metal() {
@@ -164,10 +253,7 @@ run_cargo_metal() {
 
     cargo check --locked -p izwi-core --features metal
     cargo check --locked -p izwi-cli --features metal
-    cargo test --locked -p izwi-core --features metal runtime::coordinator --lib
-    cargo test --locked -p izwi-core --features metal engine::execution --lib
-    cargo test --locked -p izwi-core --features metal engine::executor::tests --lib
-    cargo test --locked -p izwi-core --features metal runtime::rollout --lib
+    run_core_scheduler_regressions metal
 }
 
 run_cargo_cuda() {
@@ -185,9 +271,8 @@ run_cargo_cuda() {
 
     cargo check --locked -p izwi-cli --features "${cuda_features}"
     cargo check --locked -p izwi-server --features "${cuda_features}"
-    cargo test --locked -p izwi-core --features "${cuda_features}" engine::execution --lib --no-run
-    cargo test --locked -p izwi-core --features "${cuda_features}" engine::executor::tests --lib --no-run
-    cargo test --locked -p izwi-core --features "${cuda_features}" runtime::rollout --lib --no-run
+    run_core_scheduler_regressions "${cuda_features}"
+    smoke_cuda_device_if_available "${cuda_features}"
 }
 
 run_docker_cpu() {
