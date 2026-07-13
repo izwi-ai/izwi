@@ -33,6 +33,15 @@ pub struct TalkerCache {
 }
 
 impl TalkerCache {
+    pub fn storage_bytes(&self) -> usize {
+        self.k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+            .map(KvPage::storage_bytes)
+            .sum()
+    }
+
     /// Create a new cache for the specified number of layers
     pub fn new(num_layers: usize) -> Self {
         Self::with_page_size_and_quantization(

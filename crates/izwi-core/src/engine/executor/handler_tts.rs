@@ -2,18 +2,109 @@ use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
-    SpeakerReference, TtsGenerationParams, TtsStreamingConfig,
+    BatchedSpeakerRequest, SpeakerReference, TtsGenerationParams, TtsStreamingConfig,
 };
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::state::ActiveQwenTtsDecode;
-use super::{
-    decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, NativeExecutor,
-};
+use super::{decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
 
 impl NativeExecutor {
+    pub(super) fn try_qwen_tts_batch(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Option<Result<Vec<ExecutorOutput>>> {
+        if scheduled.len() < 2 || scheduled.iter().any(|item| !item.is_prefill) {
+            return None;
+        }
+        let mut ordered = Vec::with_capacity(scheduled.len());
+        for item in scheduled {
+            let request = requests
+                .iter()
+                .copied()
+                .find(|request| request.id == item.request_id)?;
+            if request.streaming
+                || request.reference_audio.is_some()
+                || request.reference_text.is_some()
+                || request.model_variant.map(|v| v.family())
+                    != Some(crate::catalog::ModelFamily::Qwen3Tts)
+                || !request
+                    .model_variant
+                    .and_then(|variant| variant.speech_capabilities())
+                    .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+            {
+                return None;
+            }
+            ordered.push(request);
+        }
+        let variant = ordered[0].model_variant;
+        if ordered
+            .iter()
+            .any(|request| request.model_variant != variant)
+        {
+            return None;
+        }
+        let max_batch_size =
+            <NativeExecutor as super::ModelExecutor>::execution_capabilities(self, ordered[0])
+                .max_batch_size;
+        if scheduled.len() > max_batch_size {
+            return None;
+        }
+
+        Some(self.with_qwen_model(variant, |model| {
+            let speakers = model.available_speakers();
+            if speakers.is_empty() {
+                return Err(Error::InvalidInput(
+                    "Qwen TTS native batching requires a preset-speaker model".to_string(),
+                ));
+            }
+            let batch = ordered
+                .iter()
+                .map(|request| BatchedSpeakerRequest {
+                    text: request.text.clone().unwrap_or_default(),
+                    speaker: request
+                        .params
+                        .speaker
+                        .clone()
+                        .or_else(|| request.params.voice.clone())
+                        .filter(|speaker| !speaker.trim().is_empty())
+                        .unwrap_or_else(|| speakers[0].clone()),
+                    language: request.language.clone(),
+                    instruct: request.voice_description.clone(),
+                    params: Self::to_tts_params(request),
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            let generated =
+                Self::run_blocking(|| model.generate_with_speaker_params_batch(&batch))?;
+            let per_request_ms = started.elapsed().as_secs_f64() * 1000.0 / generated.len() as f64;
+            Ok(ordered
+                .iter()
+                .zip(scheduled)
+                .zip(generated)
+                .map(|((request, scheduled), output)| ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput::new(output.samples, 24_000)),
+                    text: None,
+                    input_transcription: None,
+                    tokens_processed: scheduled.num_tokens,
+                    tokens_generated: output.frames_generated,
+                    finished: true,
+                    phase_timing_override: Some(ExecutorPhaseTiming {
+                        decode_ms: Some(per_request_ms),
+                        decode_steps: Some(output.frames_generated as u32),
+                        ..Default::default()
+                    }),
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .collect())
+        }))
+    }
+
     pub(super) fn to_tts_params(request: &EngineCoreRequest) -> TtsGenerationParams {
         let model_max_frames = request
             .model_variant
@@ -199,9 +290,8 @@ impl NativeExecutor {
 
                 if !step.samples.is_empty() {
                     if active_state.first_output_ms_since_start.is_none() {
-                        active_state.first_output_ms_since_start = Some(
-                            active_state.execution_started.elapsed().as_secs_f64() * 1000.0,
-                        );
+                        active_state.first_output_ms_since_start =
+                            Some(active_state.execution_started.elapsed().as_secs_f64() * 1000.0);
                     }
                     active_state
                         .audio_samples_accum
@@ -233,14 +323,13 @@ impl NativeExecutor {
                 }
             }
 
-            let mut tokens_processed = if scheduled.is_prefill {
+            let tokens_processed = if scheduled.is_prefill {
                 scheduled.num_tokens.max(1)
             } else {
                 decode_steps_ran.max(1)
             };
             if !active_state.prompt_accounted {
                 active_state.prompt_accounted = true;
-                tokens_processed = tokens_processed.saturating_add(request.num_prompt_tokens());
             }
 
             let postprocess_started = Instant::now();

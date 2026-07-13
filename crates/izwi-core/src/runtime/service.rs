@@ -19,8 +19,8 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, ResourceVector, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    EngineOutput, ResourceAmount, ResourceVector, StreamingOutput, TaskType, WorkerConfig,
+    WorkloadClass, ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
     ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
     ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
@@ -762,14 +762,36 @@ impl RuntimeService {
         self.telemetry.record_stage_observation(observation);
     }
 
-    fn coordinator_job_for_request(request: &EngineCoreRequest) -> JobSpec {
+    fn coordinator_job_for_request(&self, request: &EngineCoreRequest) -> JobSpec {
+        let input_bytes = request
+            .audio_bytes
+            .as_ref()
+            .map(Vec::len)
+            .or_else(|| request.audio_input.as_ref().map(String::len))
+            .or_else(|| request.text.as_ref().map(String::len))
+            .or_else(|| {
+                request.chat_messages.as_ref().map(|messages| {
+                    messages
+                        .iter()
+                        .map(|message| message.content.len())
+                        .sum::<usize>()
+                })
+            })
+            .unwrap_or_default() as u64;
+        let estimated_bytes = (64 * 1024 * 1024u64).saturating_add(input_bytes.saturating_mul(8));
+        let mut resources = ResourceVector::zero();
+        match self.backend_router.context().backend_kind {
+            BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(estimated_bytes),
+            BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(estimated_bytes),
+            BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(estimated_bytes),
+        }
         JobSpec {
             request_id: request.id.clone(),
             lane: CoordinatorLane::Resumable,
             priority: request.priority,
             workload_class: request.workload_class,
             deadline: request.deadline,
-            resources: ResourceVector::default(),
+            resources,
         }
     }
 
@@ -777,7 +799,7 @@ impl RuntimeService {
         self.observe_broker_request(&request)?;
         let _job = self
             .coordinator
-            .admit(Self::coordinator_job_for_request(&request))
+            .admit(self.coordinator_job_for_request(&request))
             .await?;
         let observation_request = request.clone();
         let _residency_lease = request
@@ -875,7 +897,7 @@ impl RuntimeService {
         }
         let _job = self
             .coordinator
-            .admit(Self::coordinator_job_for_request(&request))
+            .admit(self.coordinator_job_for_request(&request))
             .await?;
         let observation_request = request.clone();
         let _residency_lease = request

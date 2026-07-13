@@ -382,6 +382,36 @@ impl NativeExecutor {
 }
 
 impl ModelExecutor for NativeExecutor {
+    fn execution_capabilities(&self, request: &EngineCoreRequest) -> ExecutionCapabilities {
+        let native_batch = !request.streaming
+            && request.reference_audio.is_none()
+            && request.reference_text.is_none()
+            && request
+                .model_variant
+                .and_then(|variant| variant.speech_capabilities())
+                .is_some_and(|capabilities| capabilities.supports_builtin_voices);
+        ExecutionCapabilities {
+            incremental_prefill: matches!(request.task_type, super::types::TaskType::Chat),
+            incremental_decode: matches!(
+                request.task_type,
+                super::types::TaskType::Chat | super::types::TaskType::TTS
+            ),
+            native_batch,
+            mixed_phase_batch: false,
+            cancellable_between_steps: true,
+            recompute_safe: false,
+            physical_cache: false,
+            max_batch_size: if native_batch {
+                match self.config.backend {
+                    BackendKind::Cpu | BackendKind::Metal => 2,
+                    BackendKind::Cuda => self.config.request_parallelism.max(1),
+                }
+            } else {
+                1
+            },
+        }
+    }
+
     fn execute_prefill(
         &self,
         requests: &[&EngineCoreRequest],
@@ -728,6 +758,24 @@ mod tests {
 
         let params = NativeExecutor::to_tts_params(&request);
         assert_eq!(params.max_frames, ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+    }
+
+    #[test]
+    fn native_batch_capability_is_truthful_and_backend_limited() {
+        let mut config = WorkerConfig::default();
+        config.backend = BackendKind::Metal;
+        let executor = NativeExecutor::new(config);
+        let mut request = EngineCoreRequest::tts("batch me");
+        request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+
+        let capability = executor.execution_capabilities(&request);
+        assert!(capability.native_batch);
+        assert_eq!(capability.max_batch_size, 2);
+        request.streaming = true;
+        assert!(!executor.execution_capabilities(&request).native_batch);
+        request.streaming = false;
+        request.reference_audio = Some("reference".to_string());
+        assert!(!executor.execution_capabilities(&request).native_batch);
     }
 
     #[test]

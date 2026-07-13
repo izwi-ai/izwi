@@ -202,15 +202,13 @@ impl NativeExecutor {
                         }
                     }
 
-                    let mut tokens_processed = if scheduled.is_prefill {
+                    let tokens_processed = if scheduled.is_prefill {
                         scheduled.num_tokens.max(1)
                     } else {
                         decode_steps_ran.max(1)
                     };
                     if !active_state.prompt_accounted {
                         active_state.prompt_accounted = true;
-                        tokens_processed =
-                            tokens_processed.saturating_add(request.num_prompt_tokens());
                     }
 
                     let input_sample_rate = active_state.input_sample_rate;

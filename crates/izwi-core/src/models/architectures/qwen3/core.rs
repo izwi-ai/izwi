@@ -114,6 +114,15 @@ struct Qwen3RopeCacheEntry {
 }
 
 impl Qwen3Cache {
+    pub fn paged_storage_bytes(&self) -> usize {
+        self.k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+            .map(KvPage::storage_bytes)
+            .sum()
+    }
+
     pub fn new(num_layers: usize) -> Self {
         Self::with_page_size_and_quantization(
             num_layers,

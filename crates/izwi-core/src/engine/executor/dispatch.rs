@@ -206,6 +206,9 @@ impl NativeExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ExecutorOutput>> {
+        if let Some(result) = self.try_qwen_tts_batch(requests, scheduled) {
+            return result;
+        }
         if self.can_parallelize_requests(scheduled.len()) {
             return self.execute_requests_parallel(requests, scheduled);
         }

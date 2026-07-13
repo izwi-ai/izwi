@@ -151,6 +151,12 @@ pub struct BatchedSpeakerRequest {
     pub params: TtsGenerationParams,
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchedSpeakerOutput {
+    pub samples: Vec<f32>,
+    pub frames_generated: usize,
+}
+
 impl TtsGenerationParams {
     /// Convert external generation config to TTS sampling params.
     pub fn from_generation_config(cfg: &crate::runtime::GenerationConfig) -> Self {
@@ -528,7 +534,7 @@ impl Qwen3TtsModel {
     pub fn generate_with_speaker_params_batch(
         &self,
         requests: &[BatchedSpeakerRequest],
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<Vec<BatchedSpeakerOutput>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -613,7 +619,7 @@ impl Qwen3TtsModel {
             groups.entry(item.prefill_len).or_default().push(item);
         }
 
-        let mut outputs: Vec<Option<Vec<f32>>> = vec![None; requests.len()];
+        let mut outputs: Vec<Option<BatchedSpeakerOutput>> = vec![None; requests.len()];
 
         for (_prefill_len, group) in groups {
             let batch_size = group.len();
@@ -772,7 +778,10 @@ impl Qwen3TtsModel {
 
             for state in states {
                 let samples = self.codec_to_audio(&state.all_code_groups)?;
-                outputs[state.index] = Some(samples);
+                outputs[state.index] = Some(BatchedSpeakerOutput {
+                    samples,
+                    frames_generated: state.all_code_groups[0].len(),
+                });
             }
         }
 

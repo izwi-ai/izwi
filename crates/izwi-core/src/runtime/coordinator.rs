@@ -2,13 +2,16 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::backends::BackendKind;
-use crate::engine::{Priority, ResourceEstimate, WorkloadClass};
+use crate::engine::{
+    Priority, ReservationId, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceVector,
+    WorkloadClass,
+};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,6 +37,7 @@ pub struct CoordinatorSnapshot {
     pub capacity: usize,
     pub active_jobs: usize,
     pub active_executions: usize,
+    pub reserved_memory_bytes: u64,
     pub admitted_total: u64,
     pub rejected_total: u64,
     pub expired_total: u64,
@@ -43,8 +47,10 @@ pub struct CoordinatorSnapshot {
 #[derive(Debug)]
 pub struct InferenceCoordinator {
     capacity: usize,
+    backend: BackendKind,
     jobs: Arc<Semaphore>,
     execution: Arc<Semaphore>,
+    resources: Mutex<ResourceLedger>,
     active_jobs: AtomicUsize,
     active_executions: AtomicUsize,
     admitted_total: AtomicU64,
@@ -61,8 +67,10 @@ impl InferenceCoordinator {
         };
         Self {
             capacity,
+            backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             execution: Arc::new(Semaphore::new(capacity)),
+            resources: Mutex::new(ResourceLedger::new(resource_capacity(backend))),
             active_jobs: AtomicUsize::new(0),
             active_executions: AtomicUsize::new(0),
             admitted_total: AtomicU64::new(0),
@@ -73,10 +81,17 @@ impl InferenceCoordinator {
     }
 
     pub fn snapshot(&self) -> CoordinatorSnapshot {
+        let reserved_memory_bytes = self
+            .resources
+            .lock()
+            .ok()
+            .map(|ledger| memory_bytes(ledger.used(), self.backend))
+            .unwrap_or_default();
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
             active_executions: self.active_executions.load(Ordering::Relaxed),
+            reserved_memory_bytes,
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
@@ -104,11 +119,18 @@ impl InferenceCoordinator {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             Error::Overloaded("global inference queue is full".to_string())
         })?;
+        let effective_resources = effective_resources(spec.resources, self.backend);
+        let reservation = self
+            .resources
+            .lock()
+            .map_err(|_| Error::InferenceError("resource ledger mutex poisoned".to_string()))?
+            .reserve(effective_resources)?;
         self.active_jobs.fetch_add(1, Ordering::Relaxed);
         self.admitted_total.fetch_add(1, Ordering::Relaxed);
         Ok(JobLease {
             coordinator: self.clone(),
             _permit: permit,
+            reservation: reservation.id,
             spec,
         })
     }
@@ -157,12 +179,82 @@ impl InferenceCoordinator {
 pub struct JobLease {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
+    reservation: ReservationId,
     pub spec: JobSpec,
 }
 
 impl Drop for JobLease {
     fn drop(&mut self) {
+        if let Ok(mut resources) = self.coordinator.resources.lock() {
+            let _ = resources.release(self.reservation);
+        }
         self.coordinator.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+const FALLBACK_JOB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+fn env_budget(name: &str, fallback: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn resource_capacity(backend: BackendKind) -> ResourceVector {
+    let mut capacity = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            capacity.host_bytes = ResourceAmount::Known(env_budget(
+                "IZWI_CPU_MEMORY_BUDGET_BYTES",
+                8 * 1024 * 1024 * 1024,
+            ));
+        }
+        BackendKind::Metal => {
+            capacity.unified_bytes = ResourceAmount::Known(env_budget(
+                "IZWI_METAL_MEMORY_BUDGET_BYTES",
+                6 * 1024 * 1024 * 1024,
+            ));
+        }
+        BackendKind::Cuda => {
+            capacity.device_bytes = ResourceAmount::Known(env_budget(
+                "IZWI_CUDA_MEMORY_BUDGET_BYTES",
+                8 * 1024 * 1024 * 1024,
+            ));
+        }
+    }
+    capacity
+}
+
+fn effective_resources(requested: ResourceVector, backend: BackendKind) -> ResourceVector {
+    let requested_memory = match backend {
+        BackendKind::Cpu => requested.host_bytes,
+        BackendKind::Metal => requested.unified_bytes,
+        BackendKind::Cuda => requested.device_bytes,
+    };
+    let effective_memory = match requested_memory {
+        ResourceAmount::Known(value) => ResourceAmount::Known(value),
+        ResourceAmount::Unknown => ResourceAmount::Known(FALLBACK_JOB_MEMORY_BYTES),
+    };
+    let mut effective = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => effective.host_bytes = effective_memory,
+        BackendKind::Metal => effective.unified_bytes = effective_memory,
+        BackendKind::Cuda => effective.device_bytes = effective_memory,
+    }
+    effective
+}
+
+fn memory_bytes(resources: ResourceVector, backend: BackendKind) -> u64 {
+    let amount = match backend {
+        BackendKind::Cpu => resources.host_bytes,
+        BackendKind::Metal => resources.unified_bytes,
+        BackendKind::Cuda => resources.device_bytes,
+    };
+    match amount {
+        ResourceAmount::Known(value) => value,
+        ResourceAmount::Unknown => 0,
     }
 }
 
@@ -200,6 +292,10 @@ mod tests {
     async fn queue_is_bounded_and_raii_reconciles_counts() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 8, 1));
         let lease = coordinator.admit(job("first")).await.unwrap();
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            FALLBACK_JOB_MEMORY_BYTES
+        );
         assert!(matches!(
             coordinator.admit(job("second")).await,
             Err(Error::Overloaded(_))
@@ -209,6 +305,7 @@ mod tests {
         assert_eq!(coordinator.snapshot().active_jobs, 1);
         drop(second);
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
     }
 
     #[tokio::test]
