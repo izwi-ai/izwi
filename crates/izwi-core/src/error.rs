@@ -25,6 +25,18 @@ pub enum Error {
     #[error("Inference error: {0}")]
     InferenceError(String),
 
+    #[error("Request timed out: {0}")]
+    Timeout(String),
+
+    #[error("Request cancelled: {0}")]
+    Cancelled(String),
+
+    #[error("Inference capacity unavailable: {0}")]
+    Overloaded(String),
+
+    #[error("Streaming backpressure: {0}")]
+    Backpressure(String),
+
     #[error("Audio encoding error: {0}")]
     AudioError(String),
 

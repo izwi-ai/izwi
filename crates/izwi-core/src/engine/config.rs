@@ -153,7 +153,7 @@ fn default_max_blocks() -> usize {
     1024
 }
 fn default_chunked_prefill() -> bool {
-    true
+    false
 }
 fn default_chunked_prefill_threshold() -> usize {
     192
@@ -182,10 +182,10 @@ fn default_num_threads() -> usize {
         .min(8)
 }
 fn default_enable_preemption() -> bool {
-    true
+    false
 }
 fn default_enable_adaptive_batching() -> bool {
-    true
+    false
 }
 fn default_min_tokens_per_step() -> usize {
     96
@@ -215,7 +215,7 @@ fn default_low_sla_ms() -> u64 {
     2_500
 }
 fn default_enable_power_adaptive() -> bool {
-    true
+    false
 }
 fn default_thermal_pressure_hint() -> f64 {
     std::env::var("IZWI_THERMAL_PRESSURE")
@@ -234,13 +234,13 @@ fn default_power_save_mode() -> bool {
         .unwrap_or(false)
 }
 fn default_enable_decode_quanta() -> bool {
-    true
+    false
 }
 fn default_max_decode_tokens_per_request() -> usize {
     2
 }
 fn default_enable_kv_tiering() -> bool {
-    true
+    false
 }
 
 impl Default for EngineCoreConfig {

@@ -211,6 +211,8 @@ pub struct EngineCoreRequest {
     pub admission_ms: Option<f64>,
     /// Arrival timestamp
     pub arrival_time: Instant,
+    /// Optional absolute end-to-end deadline supplied by the ingress layer.
+    pub deadline: Option<Instant>,
     /// Prompt token IDs (set by processor)
     pub prompt_tokens: Vec<TokenId>,
     /// Enable streaming output
@@ -320,6 +322,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            deadline: None,
             prompt_tokens: Vec::new(),
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
@@ -357,6 +360,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            deadline: None,
             prompt_tokens: Vec::new(),
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
@@ -394,6 +398,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            deadline: None,
             prompt_tokens: Vec::new(),
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
@@ -430,6 +435,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            deadline: None,
             prompt_tokens: Vec::new(),
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
@@ -467,6 +473,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            deadline: None,
             prompt_tokens: Vec::new(),
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
@@ -504,6 +511,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            deadline: None,
             prompt_tokens: Vec::new(),
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
@@ -526,6 +534,12 @@ impl EngineCoreRequest {
     /// Set priority.
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Set an absolute end-to-end deadline.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
         self
     }
 

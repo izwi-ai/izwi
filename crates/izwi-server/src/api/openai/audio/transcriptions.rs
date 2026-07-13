@@ -11,8 +11,9 @@ use axum::{
     Json, RequestExt,
 };
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
@@ -308,7 +309,9 @@ async fn transcriptions_stream(
     let max_tokens = req.max_tokens;
     let audio_bytes = audio.bytes;
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
+    const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_STREAM_CAPACITY);
+    let cancelled = Arc::new(Notify::new());
     let engine = state.runtime.clone();
     let admission_state = state.clone();
 
@@ -319,39 +322,53 @@ async fn transcriptions_stream(
         {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(transcript_error_event_payload("Server is shutting down"));
+                let _ = event_tx
+                    .send(transcript_error_event_payload("Server is shutting down"))
+                    .await;
                 return;
             }
         };
 
         let delta_tx = event_tx.clone();
-        // Keep transcription streaming unbounded by wall-clock timeout so valid
-        // long jobs are not cut off mid-flight.
-        let result = engine
-            .asr_transcribe_streaming_bytes_with_runtime_context(
-                audio_bytes.as_slice(),
-                model.as_deref(),
-                language.as_deref(),
-                prompt.as_deref(),
-                max_tokens,
-                Some(correlation_id.as_str()),
-                permit.runtime_context(),
-                move |delta| {
-                    let _ = delta_tx.send(transcript_delta_event_payload(delta));
-                },
-            )
-            .await;
+        let delta_cancelled = cancelled.clone();
+        let generation = engine.asr_transcribe_streaming_bytes_with_runtime_context(
+            audio_bytes.as_slice(),
+            model.as_deref(),
+            language.as_deref(),
+            prompt.as_deref(),
+            max_tokens,
+            Some(correlation_id.as_str()),
+            permit.runtime_context(),
+            move |delta| {
+                if delta_tx
+                    .try_send(transcript_delta_event_payload(delta))
+                    .is_err()
+                {
+                    delta_cancelled.notify_one();
+                }
+            },
+        );
+        tokio::pin!(generation);
+        let result = tokio::select! {
+            result = &mut generation => result,
+            _ = event_tx.closed() => return,
+            _ = cancelled.notified() => return,
+        };
 
         match result {
             Ok(output) => {
-                let _ = event_tx.send(transcript_done_event_payload(
-                    output.text,
-                    output.language,
-                    output.duration_secs,
-                ));
+                let _ = event_tx
+                    .send(transcript_done_event_payload(
+                        output.text,
+                        output.language,
+                        output.duration_secs,
+                    ))
+                    .await;
             }
             Err(err) => {
-                let _ = event_tx.send(transcript_error_event_payload(&err.to_string()));
+                let _ = event_tx
+                    .send(transcript_error_event_payload(&err.to_string()))
+                    .await;
             }
         }
     });

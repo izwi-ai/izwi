@@ -110,11 +110,11 @@ impl Default for SchedulerConfig {
             max_batch_size: 8,
             max_tokens_per_step: 384,
             policy: SchedulingPolicy::FCFS,
-            enable_chunked_prefill: true,
+            enable_chunked_prefill: false,
             chunked_prefill_threshold: 192,
-            enable_preemption: true,
+            enable_preemption: false,
             enable_vad_preemption: true,
-            enable_adaptive_batching: true,
+            enable_adaptive_batching: false,
             min_tokens_per_step: 96,
             target_ttft_ms: 250.0,
             target_decode_tpot_ms: 40.0,
@@ -124,12 +124,12 @@ impl Default for SchedulerConfig {
             high_sla_ms: 400,
             normal_sla_ms: 1_000,
             low_sla_ms: 2_500,
-            enable_power_adaptive: true,
+            enable_power_adaptive: false,
             thermal_pressure_hint: 0.0,
             power_save_mode: false,
-            enable_decode_quanta: true,
+            enable_decode_quanta: false,
             max_decode_tokens_per_request: 2,
-            enable_kv_tiering: true,
+            enable_kv_tiering: false,
         }
     }
 }
@@ -398,8 +398,9 @@ impl Scheduler {
             (_, 0) => 2048,
             (_, value) => value,
         };
-        let deadline_at =
-            arrival_time + self.deadline_for_request(request.priority, request.workload_class);
+        let deadline_at = request.deadline.unwrap_or_else(|| {
+            arrival_time + self.deadline_for_request(request.priority, request.workload_class)
+        });
 
         let metadata = RequestMetadata {
             request_id: request.id.clone(),
@@ -1111,9 +1112,19 @@ impl Scheduler {
         self.waiting_members.iter().cloned().max_by(|a, b| {
             let score_a = self.adaptive_waiting_score(a);
             let score_b = self.adaptive_waiting_score(b);
-            score_a
-                .partial_cmp(&score_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            score_a.total_cmp(&score_b).then_with(|| {
+                let sequence_a = self
+                    .requests
+                    .get(a)
+                    .map(|m| m.sequence_id)
+                    .unwrap_or(u64::MAX);
+                let sequence_b = self
+                    .requests
+                    .get(b)
+                    .map(|m| m.sequence_id)
+                    .unwrap_or(u64::MAX);
+                sequence_b.cmp(&sequence_a)
+            })
         })
     }
 
@@ -1124,7 +1135,7 @@ impl Scheduler {
 
         if self.config.enable_adaptive_batching {
             let next = self.select_next_waiting_request()?;
-            self.waiting_members.remove(&next);
+            self.remove_from_waiting(&next);
             return Some(next);
         }
 
@@ -1150,6 +1161,10 @@ impl Scheduler {
 
     fn remove_from_waiting(&mut self, request_id: &RequestId) {
         self.waiting_members.remove(request_id);
+        self.waiting_fcfs
+            .retain(|candidate| candidate != request_id);
+        self.waiting_priority
+            .retain(|candidate| &candidate.request_id != request_id);
     }
 
     fn enqueue_waiting_request(&mut self, request_id: RequestId) {
@@ -2134,5 +2149,55 @@ mod tests {
             .decode_requests
             .iter()
             .all(|request| request.num_tokens == 1));
+    }
+
+    #[test]
+    fn adaptive_queue_cleanup_is_deterministic_and_bounded() {
+        let config = SchedulerConfig {
+            enable_adaptive_batching: true,
+            enable_preemption: false,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut kv_cache = KVCacheManager::new(Default::default());
+
+        for index in 0..256 {
+            let mut request = EngineCoreRequest::tts("same workload");
+            request.id = format!("request-{index:03}");
+            scheduler.add_request(&request);
+        }
+
+        assert_eq!(
+            scheduler.select_next_waiting_request().as_deref(),
+            Some("request-000")
+        );
+        for index in 0..256 {
+            scheduler.abort_request(&format!("request-{index:03}"), &mut kv_cache);
+        }
+        assert!(scheduler.waiting_members.is_empty());
+        assert!(scheduler.waiting_fcfs.is_empty());
+        assert!(scheduler.waiting_priority.is_empty());
+    }
+
+    #[test]
+    fn explicit_request_deadline_overrides_synthetic_sla() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let request = EngineCoreRequest::tts("deadline").with_deadline(Some(deadline));
+        let request_id = request.id.clone();
+        scheduler.add_request(&request);
+
+        assert_eq!(scheduler.requests[&request_id].deadline_at, deadline);
+    }
+
+    #[test]
+    fn production_defaults_only_enable_physically_enforced_features() {
+        let config = SchedulerConfig::default();
+        assert!(!config.enable_chunked_prefill);
+        assert!(!config.enable_preemption);
+        assert!(!config.enable_adaptive_batching);
+        assert!(!config.enable_power_adaptive);
+        assert!(!config.enable_decode_quanta);
+        assert!(!config.enable_kv_tiering);
     }
 }

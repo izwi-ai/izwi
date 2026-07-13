@@ -95,6 +95,7 @@ struct PendingRequestGuard {
     request_id: String,
     core_engine: Arc<CoreEngine>,
     completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
+    telemetry: Arc<RuntimeTelemetryCollector>,
     active: bool,
 }
 
@@ -103,11 +104,13 @@ impl PendingRequestGuard {
         request_id: String,
         core_engine: Arc<CoreEngine>,
         completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
+        telemetry: Arc<RuntimeTelemetryCollector>,
     ) -> Self {
         Self {
             request_id,
             core_engine,
             completion_waiters,
+            telemetry,
             active: true,
         }
     }
@@ -126,6 +129,7 @@ impl Drop for PendingRequestGuard {
         let request_id = self.request_id.clone();
         let engine = self.core_engine.clone();
         let waiters = self.completion_waiters.clone();
+        let telemetry = self.telemetry.clone();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -134,6 +138,7 @@ impl Drop for PendingRequestGuard {
                 drop(guard);
 
                 let _ = engine.abort_request(&request_id).await;
+                telemetry.record_request_cancelled(&request_id).await;
             });
         }
     }
@@ -564,7 +569,10 @@ impl RuntimeService {
                         let mut w = waiters.lock().await;
                         let pending: Vec<_> = w.drain().collect();
                         drop(w);
-                        telemetry.record_forced_failures(pending.len());
+                        let request_ids: Vec<_> =
+                            pending.iter().map(|(id, _)| id.as_str()).collect();
+                        telemetry.record_forced_failures(request_ids).await;
+                        let _ = engine.abort_all_requests().await;
                         for (_, tx) in pending {
                             let _ = tx.send(Err(Error::InferenceError(err.to_string())));
                         }
@@ -576,7 +584,10 @@ impl RuntimeService {
                         let mut w = waiters.lock().await;
                         let pending: Vec<_> = w.drain().collect();
                         drop(w);
-                        telemetry.record_forced_failures(pending.len());
+                        let request_ids: Vec<_> =
+                            pending.iter().map(|(id, _)| id.as_str()).collect();
+                        telemetry.record_forced_failures(request_ids).await;
+                        let _ = engine.abort_all_requests().await;
                         for (_, tx) in pending {
                             let _ = tx.send(Err(Error::InferenceError(format!(
                                 "Engine worker panicked: {}",
@@ -613,13 +624,22 @@ impl RuntimeService {
         &self,
         request_id: &str,
         rx: oneshot::Receiver<Result<EngineOutput>>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<EngineOutput> {
-        rx.await.map_err(|_| {
-            Error::InferenceError(format!(
-                "Request {} completion channel closed unexpectedly",
-                request_id
-            ))
-        })?
+        let completion = async {
+            rx.await.map_err(|_| {
+                Error::InferenceError(format!(
+                    "Request {} completion channel closed unexpectedly",
+                    request_id
+                ))
+            })?
+        };
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), completion)
+                .await
+                .map_err(|_| Error::Timeout(request_id.to_string()))?,
+            None => completion.await,
+        }
     }
 
     fn engine_observation_context(
@@ -741,15 +761,18 @@ impl RuntimeService {
             self.record_engine_error_observation(&observation_request, false, err.to_string());
             return Err(err);
         }
-        self.telemetry.record_request_queued().await;
+        self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
 
         let mut guard = PendingRequestGuard::new(
             request_id.clone(),
             self.core_engine.clone(),
             self.completion_waiters.clone(),
+            self.telemetry.clone(),
         );
-        let completion = self.await_completion(&request_id, completion_rx).await;
+        let completion = self
+            .await_completion(&request_id, completion_rx, observation_request.deadline)
+            .await;
         match completion.as_ref() {
             Ok(output) => {
                 self.record_engine_output_observation(&observation_request, output, false)
@@ -838,15 +861,24 @@ impl RuntimeService {
                 return Err(err);
             }
         };
-        self.telemetry.record_request_queued().await;
+        self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
         debug_assert_eq!(stream_request_id, request_id);
         let mut guard = PendingRequestGuard::new(
             stream_request_id.clone(),
             self.core_engine.clone(),
             self.completion_waiters.clone(),
+            self.telemetry.clone(),
         );
         let mut completion_result: Option<EngineOutput> = None;
+        let deadline = observation_request.deadline;
+        let deadline_wait = async move {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(deadline_wait);
 
         loop {
             tokio::select! {
@@ -895,6 +927,14 @@ impl RuntimeService {
                         }
                     }
                 }
+                _ = &mut deadline_wait => {
+                    self.record_engine_error_observation(
+                        &observation_request,
+                        true,
+                        "request deadline exceeded",
+                    );
+                    return Err(Error::Timeout(stream_request_id));
+                }
             }
         }
 
@@ -902,7 +942,11 @@ impl RuntimeService {
             output
         } else {
             match self
-                .await_completion(&stream_request_id, completion_rx)
+                .await_completion(
+                    &stream_request_id,
+                    completion_rx,
+                    observation_request.deadline,
+                )
                 .await
             {
                 Ok(output) => output,

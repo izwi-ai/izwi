@@ -65,7 +65,8 @@ pub use request::{
 };
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{
-    AudioOutput, EngineMetrics, EngineOutput, GenerationParams, RequestId, SequenceId, TaskType,
+    AudioOutput, EngineMetrics, EngineOutput, GenerationParams, Priority, RequestId, SequenceId,
+    TaskType,
 };
 
 use crate::error::Result;
@@ -312,6 +313,12 @@ impl Engine {
     pub async fn abort_requests_for_variant(&self, variant: ModelVariant) -> Vec<RequestId> {
         let mut core = self.core.write().await;
         core.abort_requests_for_variant(variant).await
+    }
+
+    /// Abort every request currently tracked by the engine.
+    pub async fn abort_all_requests(&self) -> Vec<RequestId> {
+        let mut core = self.core.write().await;
+        core.abort_all_requests().await
     }
 
     /// Check if a request is still tracked by the engine core.

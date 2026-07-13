@@ -1,7 +1,9 @@
 #[cfg(test)]
-use std::{future::Future, sync::Arc};
+use std::future::Future;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -59,6 +61,8 @@ pub enum ChatStreamEvent {
     ShuttingDown,
 }
 
+const CHAT_STREAM_CAPACITY: usize = 64;
+
 pub fn max_new_tokens(
     _variant: ModelVariant,
     max_completion_tokens: Option<usize>,
@@ -103,7 +107,7 @@ pub async fn generate_chat(
 pub fn spawn_chat_stream(
     state: AppState,
     request: ChatExecutionRequest,
-) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+) -> mpsc::Receiver<ChatStreamEvent> {
     let runtime = state.runtime.clone();
     let params = request.resolved_generation_params();
     let chat_config = request.resolved_chat_config();
@@ -111,7 +115,8 @@ pub fn spawn_chat_stream(
     let messages = request.messages;
     let correlation_id = request.correlation_id;
 
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
+    let cancelled = Arc::new(Notify::new());
     tokio::spawn(async move {
         let permit = match state
             .acquire_owned_workload_permit(WorkloadClass::Streaming)
@@ -119,35 +124,47 @@ pub fn spawn_chat_stream(
         {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(ChatStreamEvent::ShuttingDown);
+                let _ = event_tx.send(ChatStreamEvent::ShuttingDown).await;
                 return;
             }
         };
 
-        let _ = event_tx.send(ChatStreamEvent::Started);
+        if event_tx.send(ChatStreamEvent::Started).await.is_err() {
+            return;
+        }
 
-        match runtime
-            .chat_generate_streaming_with_runtime_context(
-                variant,
-                messages,
-                params,
-                chat_config,
-                correlation_id.as_deref(),
-                permit.runtime_context(),
-                {
-                    let event_tx = event_tx.clone();
-                    move |delta| {
-                        let _ = event_tx.send(ChatStreamEvent::Delta(delta));
+        let generation = runtime.chat_generate_streaming_with_runtime_context(
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id.as_deref(),
+            permit.runtime_context(),
+            {
+                let event_tx = event_tx.clone();
+                let cancelled = cancelled.clone();
+                move |delta| {
+                    if event_tx.try_send(ChatStreamEvent::Delta(delta)).is_err() {
+                        cancelled.notify_one();
                     }
-                },
-            )
-            .await
-        {
+                }
+            },
+        );
+        tokio::pin!(generation);
+        let result: izwi_core::Result<ChatGeneration> = tokio::select! {
+            result = &mut generation => result,
+            _ = event_tx.closed() => return,
+            _ = cancelled.notified() => return,
+        };
+
+        match result {
             Ok(generation) => {
-                let _ = event_tx.send(ChatStreamEvent::Completed(generation));
+                let _ = event_tx.send(ChatStreamEvent::Completed(generation)).await;
             }
             Err(err) => {
-                let _ = event_tx.send(ChatStreamEvent::Failed(err.to_string()));
+                let _ = event_tx
+                    .send(ChatStreamEvent::Failed(err.to_string()))
+                    .await;
             }
         }
     });

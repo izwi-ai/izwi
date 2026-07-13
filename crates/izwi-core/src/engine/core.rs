@@ -818,6 +818,18 @@ impl EngineCore {
         aborted
     }
 
+    /// Abort every request tracked by the core and release executor state.
+    pub async fn abort_all_requests(&mut self) -> Vec<RequestId> {
+        let request_ids: Vec<_> = self.requests.keys().cloned().collect();
+        let mut aborted = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            if self.abort_request(&request_id).await {
+                aborted.push(request_id);
+            }
+        }
+        aborted
+    }
+
     /// Get number of pending (waiting) requests.
     pub fn pending_request_count(&self) -> usize {
         self.scheduler.waiting_count()

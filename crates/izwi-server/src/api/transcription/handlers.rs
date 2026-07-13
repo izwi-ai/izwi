@@ -325,8 +325,9 @@ async fn create_record_stream(
     placeholder: TranscriptionRecord,
     correlation_id: String,
 ) -> Result<Response, ApiError> {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
-    let _ = event_tx.send(
+    const TRANSCRIPTION_EVENT_CAPACITY: usize = 64;
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_EVENT_CAPACITY);
+    let _ = event_tx.try_send(
         serde_json::to_string(&StreamCreatedEvent {
             event: "created",
             record: placeholder.clone(),
@@ -805,7 +806,7 @@ fn spawn_transcription_processing_task(
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
-    event_tx: Option<mpsc::UnboundedSender<String>>,
+    event_tx: Option<mpsc::Sender<String>>,
 ) {
     tokio::spawn(async move {
         let result = process_transcription_record(
@@ -834,8 +835,8 @@ fn spawn_transcription_processing_task(
                 })
                 .unwrap_or_default(),
             };
-            let _ = tx.send(payload);
-            let _ = tx.send(
+            let _ = tx.try_send(payload);
+            let _ = tx.try_send(
                 serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
             );
         }
@@ -848,7 +849,7 @@ async fn process_transcription_record(
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
-    event_tx: Option<mpsc::UnboundedSender<String>>,
+    event_tx: Option<mpsc::Sender<String>>,
     audio_override: Option<Vec<u8>>,
     attempt: Option<&StageExecutionContext>,
     projection_attempt: Option<&RuntimeProjectionAttempt>,
@@ -901,7 +902,7 @@ async fn process_transcription_record_inner(
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
-    event_tx: Option<mpsc::UnboundedSender<String>>,
+    event_tx: Option<mpsc::Sender<String>>,
     audio_override: Option<Vec<u8>>,
     attempt: Option<&StageExecutionContext>,
     projection_attempt: Option<&RuntimeProjectionAttempt>,
@@ -923,7 +924,7 @@ async fn process_transcription_record_inner(
     let transcription_store = state.transcription_store.clone();
     let send_event = |payload: String| {
         if let Some(tx) = &event_tx {
-            let _ = tx.send(payload);
+            let _ = tx.try_send(payload);
         }
     };
     let permit = state
@@ -1008,7 +1009,7 @@ async fn process_transcription_record_inner(
                 runtime_context,
                 move |delta| {
                     if let Some(tx) = &delta_tx {
-                        let _ = tx.send(
+                        let _ = tx.try_send(
                             serde_json::to_string(&StreamDeltaEvent {
                                 event: "delta",
                                 delta,
@@ -1019,7 +1020,7 @@ async fn process_transcription_record_inner(
                 },
                 move |progress| {
                     if let Some(tx) = &progress_tx {
-                        let _ = tx.send(progress_event_payload(progress.clone()));
+                        let _ = tx.try_send(progress_event_payload(progress.clone()));
                     }
                     let store = progress_store.clone();
                     let id = progress_record_id.clone();
@@ -1052,7 +1053,7 @@ async fn process_transcription_record_inner(
                 parsed.max_speakers,
                 move |progress| {
                     if let Some(tx) = &progress_tx {
-                        let _ = tx.send(progress_event_payload(progress.clone()));
+                        let _ = tx.try_send(progress_event_payload(progress.clone()));
                     }
                     let store = progress_store.clone();
                     let id = progress_record_id.clone();
