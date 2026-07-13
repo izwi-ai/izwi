@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
-use crate::engine::{AsrProgress, AsrProgressPhase, EngineCoreRequest, ResourceVector};
+use crate::engine::{AsrProgress, AsrProgressPhase, EngineCoreRequest};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
@@ -17,13 +17,14 @@ use crate::models::registry::{
 };
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_seconds_fast};
+use crate::runtime::coordinator::{InferenceCoordinator, JobLease};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
 };
-use crate::runtime::{CoordinatorLane, JobSpec};
+use crate::runtime::CoordinatorLane;
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 #[derive(Clone, Copy)]
@@ -126,6 +127,7 @@ pub struct RuntimeAsrRealtimeStream {
     model: Arc<NativeAsrModel>,
     state: NativeAsrRealtimeState,
     _lease: ModelResidencyLease,
+    _job: JobLease,
 }
 
 #[derive(Debug, Clone)]
@@ -159,8 +161,20 @@ impl RuntimeService {
             return Ok(None);
         };
 
-        self.load_model(variant).await?;
-        let lease = self.acquire_model_residency_lease(variant);
+        self.observe_broker_capability_request(CapabilityKind::RealtimeAsr, Some(variant), true)?;
+        let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Realtime);
+        let metadata_bytes =
+            language.map(str::len).unwrap_or_default() + prompt.map(str::len).unwrap_or_default();
+        let job = self
+            .coordinator
+            .admit(self.coordinator_job_for_input(
+                uuid::Uuid::new_v4().to_string(),
+                CoordinatorLane::Realtime,
+                context,
+                metadata_bytes,
+            ))
+            .await?;
+        let lease = self.load_model_for_inference(variant).await?;
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
                 Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -175,15 +189,20 @@ impl RuntimeService {
             model,
             state,
             _lease: lease,
+            _job: job,
         }))
     }
 
-    pub fn push_asr_realtime_samples(
+    pub async fn push_asr_realtime_samples(
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let _execution = self
+            .coordinator
+            .acquire_execution(stream._job.spec.deadline)
+            .await?;
         let events =
             stream
                 .model
@@ -191,10 +210,14 @@ impl RuntimeService {
         Ok(map_native_realtime_events(events))
     }
 
-    pub fn finish_asr_realtime_stream(
+    pub async fn finish_asr_realtime_stream(
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        let _execution = self
+            .coordinator
+            .acquire_execution(stream._job.spec.deadline)
+            .await?;
         let events = stream.model.finish_realtime_stream(&mut stream.state)?;
         Ok(map_native_realtime_events(events))
     }
@@ -214,8 +237,7 @@ impl RuntimeService {
     where
         F: FnMut(String),
     {
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
         let model = self
             .model_registry
             .get_audio_chat(variant)
@@ -365,8 +387,27 @@ impl RuntimeService {
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
+            let _residency_lease = self.load_model_for_inference(variant).await?;
+            let context = RuntimeRequestContext::default();
+            let job = self.coordinator_job_for_input(
+                correlation_id
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                CoordinatorLane::Atomic,
+                context,
+                audio_base64.len(),
+            );
             return self
-                .asr_transcribe_audio_chat_base64(variant, audio_base64, max_tokens, |_delta| {})
+                .coordinator
+                .run_direct(job, async {
+                    self.asr_transcribe_audio_chat_base64(
+                        variant,
+                        audio_base64,
+                        max_tokens,
+                        |_delta| {},
+                    )
+                    .await
+                })
                 .await;
         }
 
@@ -453,8 +494,27 @@ impl RuntimeService {
     {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
+            let _residency_lease = self.load_model_for_inference(variant).await?;
+            let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Streaming);
+            let job = self.coordinator_job_for_input(
+                correlation_id
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                CoordinatorLane::Atomic,
+                context,
+                audio_base64.len(),
+            );
             return self
-                .asr_transcribe_audio_chat_base64(variant, audio_base64, max_tokens, on_delta)
+                .coordinator
+                .run_direct(job, async {
+                    self.asr_transcribe_audio_chat_base64(
+                        variant,
+                        audio_base64,
+                        max_tokens,
+                        on_delta,
+                    )
+                    .await
+                })
                 .await;
         }
 
@@ -561,16 +621,15 @@ impl RuntimeService {
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-            let job = JobSpec {
-                request_id: correlation_id
+            let _residency_lease = self.load_model_for_inference(variant).await?;
+            let job = self.coordinator_job_for_input(
+                correlation_id
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                lane: CoordinatorLane::Atomic,
-                priority: runtime_context.priority,
-                workload_class: runtime_context.workload_class,
-                deadline: runtime_context.deadline,
-                resources: ResourceVector::default(),
-            };
+                CoordinatorLane::Atomic,
+                runtime_context,
+                audio_bytes.len(),
+            );
             return self
                 .coordinator
                 .run_direct(job, async {
@@ -737,16 +796,15 @@ impl RuntimeService {
                 Some(variant),
                 broker_streaming_required,
             )?;
-            let job = JobSpec {
-                request_id: correlation_id
+            let _residency_lease = self.load_model_for_inference(variant).await?;
+            let job = self.coordinator_job_for_input(
+                correlation_id
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                lane: CoordinatorLane::Atomic,
-                priority: runtime_context.priority,
-                workload_class: runtime_context.workload_class,
-                deadline: runtime_context.deadline,
-                resources: ResourceVector::default(),
-            };
+                CoordinatorLane::Atomic,
+                runtime_context,
+                audio_bytes.len(),
+            );
             return self
                 .coordinator
                 .run_direct(job, async {
@@ -1364,8 +1422,17 @@ impl RuntimeService {
     {
         let variant = resolve_speaker_attributed_asr_variant(model_id)?;
         self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Background);
+        let job = self
+            .coordinator
+            .admit(self.coordinator_job_for_input(
+                uuid::Uuid::new_v4().to_string(),
+                CoordinatorLane::Pipeline,
+                context,
+                audio_bytes.len(),
+            ))
+            .await?;
+        let _lease = self.load_model_for_inference(variant).await?;
         let model = self
             .model_registry
             .get_asr(variant)
@@ -1384,20 +1451,27 @@ impl RuntimeService {
             let task_samples = samples.clone();
             let task_model = model.clone();
             let max_new_tokens = granite_saa_max_new_tokens(&task_samples, sample_rate);
-            let transcription = tokio::task::spawn_blocking(move || {
-                granite_saa_transcribe_chunk(
-                    &task_model,
-                    &task_samples,
-                    sample_rate,
-                    language_owned.as_deref(),
-                    None,
-                    max_new_tokens,
-                )
-            })
-            .await
-            .map_err(|err| {
-                Error::InferenceError(format!("Granite speaker attributed ASR task failed: {err}"))
-            })??;
+            let transcription = self
+                .coordinator
+                .run_stage(&job, async move {
+                    tokio::task::spawn_blocking(move || {
+                        granite_saa_transcribe_chunk(
+                            &task_model,
+                            &task_samples,
+                            sample_rate,
+                            language_owned.as_deref(),
+                            None,
+                            max_new_tokens,
+                        )
+                    })
+                    .await
+                    .map_err(|err| {
+                        Error::InferenceError(format!(
+                            "Granite speaker attributed ASR task failed: {err}"
+                        ))
+                    })?
+                })
+                .await?;
 
             return Ok(speaker_attributed_asr_result_from_text_with_warnings(
                 transcription.text.as_str(),
@@ -1413,6 +1487,8 @@ impl RuntimeService {
 
         let language_owned = language.map(ToOwned::to_owned);
         let long_form = granite_saa_long_form_transcribe(
+            &self.coordinator,
+            &job,
             model,
             &samples,
             sample_rate,
@@ -1489,19 +1565,17 @@ impl RuntimeService {
             Some(variant),
             false,
         )?;
+        let _residency_lease = self.load_model_for_inference(variant).await?;
         let context = RuntimeRequestContext::default();
-        let job = JobSpec {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            lane: CoordinatorLane::Atomic,
-            priority: context.priority,
-            workload_class: context.workload_class,
-            deadline: context.deadline,
-            resources: ResourceVector::default(),
-        };
+        let job = self.coordinator_job_for_input(
+            uuid::Uuid::new_v4().to_string(),
+            CoordinatorLane::Atomic,
+            context,
+            audio_bytes.len().saturating_add(reference_text.len()),
+        );
         self.coordinator
             .run_direct(job, async {
-                self.load_model(variant).await?;
-                let _lease = self.acquire_model_residency_lease(variant);
+                let _lease = self.load_model_for_inference(variant).await?;
                 let model = self
                     .model_registry
                     .get_asr(variant)
@@ -1907,6 +1981,8 @@ fn json_usize(value: &serde_json::Value) -> Option<usize> {
 }
 
 async fn granite_saa_long_form_transcribe<P>(
+    coordinator: &Arc<InferenceCoordinator>,
+    job: &JobLease,
     model: Arc<NativeAsrModel>,
     samples: &[f32],
     sample_rate: u32,
@@ -1975,23 +2051,27 @@ where
             "starting Granite SAA chunk decode"
         );
         let chunk_started = Instant::now();
-        let transcription = tokio::task::spawn_blocking(move || {
-            granite_saa_transcribe_chunk(
-                &task_model,
-                &chunk_audio,
-                sample_rate,
-                language_owned.as_deref(),
-                prefix_text.as_deref(),
-                max_new_tokens,
-            )
-        })
-        .await
-        .map_err(|err| {
-            Error::InferenceError(format!(
-                "Granite speaker attributed ASR chunk {} failed: {err}",
-                idx + 1
-            ))
-        })??;
+        let transcription = coordinator
+            .run_stage(job, async move {
+                tokio::task::spawn_blocking(move || {
+                    granite_saa_transcribe_chunk(
+                        &task_model,
+                        &chunk_audio,
+                        sample_rate,
+                        language_owned.as_deref(),
+                        prefix_text.as_deref(),
+                        max_new_tokens,
+                    )
+                })
+                .await
+                .map_err(|err| {
+                    Error::InferenceError(format!(
+                        "Granite speaker attributed ASR chunk {} failed: {err}",
+                        idx + 1
+                    ))
+                })?
+            })
+            .await?;
         let decode_diagnostics = granite_saa_decode_diagnostics(transcription.diagnostics.as_ref());
         tracing::info!(
             chunk_index = idx + 1,

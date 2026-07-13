@@ -16,7 +16,7 @@ use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
 use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
 };
-use crate::catalog::{ModelInfo, ModelVariant};
+use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
@@ -50,6 +50,7 @@ use crate::runtime::telemetry::{
     RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
     RuntimeTelemetrySnapshot,
 };
+use crate::runtime::types::RuntimeRequestContext;
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
 use crate::tokenizer::Tokenizer;
 
@@ -68,6 +69,49 @@ fn reported_gpu_resident_blocks(backend_kind: BackendKind, logical_blocks: u64) 
         0
     } else {
         logical_blocks
+    }
+}
+
+fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
+    let input_bytes = input_bytes as u64;
+    let estimated_bytes = (64 * 1024 * 1024u64).saturating_add(input_bytes.saturating_mul(8));
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(estimated_bytes),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(estimated_bytes),
+        BackendKind::Cuda => {
+            resources.host_bytes =
+                ResourceAmount::Known((4 * 1024 * 1024u64).saturating_add(input_bytes));
+            resources.device_bytes = ResourceAmount::Known(estimated_bytes);
+        }
+    }
+    resources
+}
+
+fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
+    let sequence = request
+        .model_variant
+        .is_some_and(|variant| match request.task_type {
+            TaskType::Chat => {
+                matches!(variant.family(), ModelFamily::Qwen35Chat)
+                    || matches!(
+                        variant,
+                        ModelVariant::Qwen306B
+                            | ModelVariant::Qwen306B4Bit
+                            | ModelVariant::Qwen317B
+                            | ModelVariant::Qwen317B4Bit
+                    )
+            }
+            TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && request.streaming,
+            TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
+            TaskType::SpeechToSpeech => false,
+        });
+    if request.workload_class == WorkloadClass::Realtime {
+        CoordinatorLane::Realtime
+    } else if sequence {
+        CoordinatorLane::Resumable
+    } else {
+        CoordinatorLane::Atomic
     }
 }
 
@@ -794,6 +838,25 @@ impl RuntimeService {
         self.telemetry.record_stage_observation(observation);
     }
 
+    pub(crate) fn coordinator_job_for_input(
+        &self,
+        request_id: impl Into<String>,
+        lane: CoordinatorLane,
+        runtime_context: RuntimeRequestContext,
+        input_bytes: usize,
+    ) -> JobSpec {
+        let resources =
+            transient_resources(self.backend_router.context().backend_kind, input_bytes);
+        JobSpec {
+            request_id: request_id.into(),
+            lane,
+            priority: runtime_context.priority,
+            workload_class: runtime_context.workload_class,
+            deadline: runtime_context.deadline,
+            resources,
+        }
+    }
+
     fn coordinator_job_for_request(&self, request: &EngineCoreRequest) -> JobSpec {
         let input_bytes = request
             .audio_bytes
@@ -809,34 +872,31 @@ impl RuntimeService {
                         .sum::<usize>()
                 })
             })
-            .unwrap_or_default() as u64;
-        let estimated_bytes = (64 * 1024 * 1024u64).saturating_add(input_bytes.saturating_mul(8));
-        let mut resources = ResourceVector::zero();
-        match self.backend_router.context().backend_kind {
-            BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(estimated_bytes),
-            BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(estimated_bytes),
-            BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(estimated_bytes),
-        }
-        JobSpec {
-            request_id: request.id.clone(),
-            lane: CoordinatorLane::Resumable,
-            priority: request.priority,
-            workload_class: request.workload_class,
-            deadline: request.deadline,
-            resources,
-        }
+            .unwrap_or_default();
+        self.coordinator_job_for_input(
+            request.id.clone(),
+            coordinator_lane_for_request(request),
+            RuntimeRequestContext {
+                workload_class: request.workload_class,
+                admission_ms: request.admission_ms,
+                priority: request.priority,
+                deadline: request.deadline,
+            },
+            input_bytes,
+        )
     }
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
+        let _residency_lease = match request.model_variant {
+            Some(variant) => Some(self.load_model_for_inference(variant).await?),
+            None => None,
+        };
         let job = self
             .coordinator
             .admit(self.coordinator_job_for_request(&request))
             .await?;
         let observation_request = request.clone();
-        let _residency_lease = request
-            .model_variant
-            .map(|variant| self.acquire_model_residency_lease(variant));
         self.ensure_step_driver_started().await;
 
         let span = info_span!(
@@ -936,14 +996,15 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
+        let _residency_lease = match request.model_variant {
+            Some(variant) => Some(self.load_model_for_inference(variant).await?),
+            None => None,
+        };
         let job = self
             .coordinator
             .admit(self.coordinator_job_for_request(&request))
             .await?;
         let observation_request = request.clone();
-        let _residency_lease = request
-            .model_variant
-            .map(|variant| self.acquire_model_residency_lease(variant));
         self.ensure_step_driver_started().await;
 
         let span = info_span!(
@@ -1679,5 +1740,47 @@ mod tests {
         assert_eq!(snapshot.pipelines.batch_asr_transcriptions, 1);
         assert_eq!(snapshot.pipelines.batch_tts_speech, 1);
         assert_eq!(snapshot.pipelines.stages_recorded, 8);
+    }
+
+    #[test]
+    fn transient_estimates_are_fully_known_for_every_backend() {
+        let cpu = transient_resources(BackendKind::Cpu, 1024);
+        let metal = transient_resources(BackendKind::Metal, 1024);
+        let cuda = transient_resources(BackendKind::Cuda, 1024);
+
+        assert!(cpu.is_fully_known());
+        assert!(metal.is_fully_known());
+        assert!(cuda.is_fully_known());
+        assert!(matches!(cpu.host_bytes, ResourceAmount::Known(value) if value > 0));
+        assert!(matches!(metal.unified_bytes, ResourceAmount::Known(value) if value > 0));
+        assert!(matches!(cuda.device_bytes, ResourceAmount::Known(value) if value > 0));
+        assert!(matches!(cuda.host_bytes, ResourceAmount::Known(value) if value > 0));
+    }
+
+    #[test]
+    fn engine_requests_use_truthful_controller_lanes() {
+        let mut qwen_tts = EngineCoreRequest::tts("hello");
+        qwen_tts.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
+        assert_eq!(
+            coordinator_lane_for_request(&qwen_tts),
+            CoordinatorLane::Resumable
+        );
+
+        let mut offline_asr = EngineCoreRequest::asr("audio");
+        offline_asr.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
+        assert_eq!(
+            coordinator_lane_for_request(&offline_asr),
+            CoordinatorLane::Atomic
+        );
+        offline_asr.streaming = true;
+        assert_eq!(
+            coordinator_lane_for_request(&offline_asr),
+            CoordinatorLane::Resumable
+        );
+        offline_asr.workload_class = WorkloadClass::Realtime;
+        assert_eq!(
+            coordinator_lane_for_request(&offline_asr),
+            CoordinatorLane::Realtime
+        );
     }
 }

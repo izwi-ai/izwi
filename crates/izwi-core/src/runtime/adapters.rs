@@ -225,9 +225,13 @@ struct RealtimeAsrCapabilityAdapter;
 
 impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        // Native Voxtral realtime stays hidden until the Candle realtime runner exists.
-        let _ = model_variant;
-        None
+        (model_variant == ModelVariant::Nemotron35AsrStreaming06B).then_some(AdapterMetadata {
+            id: "builtin.realtime_asr",
+            capability: CapabilityKind::RealtimeAsr,
+            model_variant,
+            streaming_mode: StreamingMode::Realtime,
+            execution_target: ExecutionTargetKind::RealtimeRunner,
+        })
     }
 }
 
@@ -344,6 +348,9 @@ mod tests {
         }
         if model_variant.is_asr() || model_variant.is_voxtral() || model_variant.is_audio_chat() {
             expected.insert(CapabilityKind::Asr);
+        }
+        if model_variant == ModelVariant::Nemotron35AsrStreaming06B {
+            expected.insert(CapabilityKind::RealtimeAsr);
         }
         if model_variant.is_chat() {
             expected.insert(CapabilityKind::Chat);

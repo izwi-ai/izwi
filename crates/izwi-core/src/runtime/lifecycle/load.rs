@@ -166,15 +166,17 @@ impl RuntimeService {
         }
     }
 
-    /// Load a model for inference.
-    pub async fn load_model(&self, variant: ModelVariant) -> Result<()> {
+    pub(crate) async fn load_model_for_inference(
+        &self,
+        variant: ModelVariant,
+    ) -> Result<crate::model::ModelResidencyLease> {
         let resolved = self.resolve_model_load(variant).await?;
         let acquired = self.acquire_model_artifacts(resolved).await?;
 
         let _load_guard = self.model_load_lock.lock().await;
         if self.model_manager.is_ready(variant).await {
             self.touch_model_usage(variant).await;
-            return Ok(());
+            return Ok(self.acquire_model_residency_lease(variant));
         }
 
         self.ensure_model_budget_before_load(variant).await?;
@@ -187,6 +189,12 @@ impl RuntimeService {
             .insert(variant, resource_lease);
         self.touch_model_usage(variant).await;
 
+        Ok(self.acquire_model_residency_lease(variant))
+    }
+
+    /// Load a model without retaining an inference pin.
+    pub async fn load_model(&self, variant: ModelVariant) -> Result<()> {
+        drop(self.load_model_for_inference(variant).await?);
         Ok(())
     }
 }

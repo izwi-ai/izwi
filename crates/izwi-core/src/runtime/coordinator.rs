@@ -199,9 +199,11 @@ impl InferenceCoordinator {
         self.active_jobs.fetch_add(1, Ordering::Relaxed);
         self.admitted_total.fetch_add(1, Ordering::Relaxed);
         Ok(JobLease {
-            coordinator: self.clone(),
-            _permit: permit,
-            _reservation: reservation,
+            _inner: Arc::new(JobLeaseInner {
+                coordinator: self.clone(),
+                _permit: permit,
+                _reservation: reservation,
+            }),
             spec,
         })
     }
@@ -256,18 +258,22 @@ impl InferenceCoordinator {
     where
         F: Future<Output = Result<T>>,
     {
-        let deadline = spec.deadline;
-        let _job = self.admit(spec).await?;
+        let job = self.admit(spec).await?;
+        self.run_stage(&job, future).await
+    }
+
+    pub async fn run_stage<T, F>(self: &Arc<Self>, job: &JobLease, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let deadline = job.spec.deadline;
         let _execution = self.acquire_execution(deadline).await?;
-        match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), future)
-                .await
-                .map_err(|_| {
-                    self.expired_total.fetch_add(1, Ordering::Relaxed);
-                    Error::Timeout("direct inference job".to_string())
-                })?,
-            None => future.await,
+        let result = future.await;
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            self.expired_total.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Timeout("direct inference job".to_string()));
         }
+        result
     }
 }
 
@@ -289,15 +295,20 @@ fn shared_resource_authority(
     authority
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JobLease {
-    coordinator: Arc<InferenceCoordinator>,
-    _permit: OwnedSemaphorePermit,
-    _reservation: ResourceLease,
+    _inner: Arc<JobLeaseInner>,
     pub spec: JobSpec,
 }
 
-impl Drop for JobLease {
+#[derive(Debug)]
+struct JobLeaseInner {
+    coordinator: Arc<InferenceCoordinator>,
+    _permit: OwnedSemaphorePermit,
+    _reservation: ResourceLease,
+}
+
+impl Drop for JobLeaseInner {
     fn drop(&mut self) {
         if self.coordinator.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.coordinator.idle.notify_waiters();
@@ -328,7 +339,10 @@ fn effective_resources(requested: ResourceVector, backend: BackendKind) -> Resul
     match backend {
         BackendKind::Cpu => effective.host_bytes = effective_memory,
         BackendKind::Metal => effective.unified_bytes = effective_memory,
-        BackendKind::Cuda => effective.device_bytes = effective_memory,
+        BackendKind::Cuda => {
+            effective.host_bytes = ResourceAmount::Known(known_or_zero(requested.host_bytes)?);
+            effective.device_bytes = effective_memory;
+        }
     }
     Ok(effective)
 }
@@ -389,7 +403,7 @@ impl DeviceCapacityProvider {
             backend,
             device: Some(device),
             configured_cap,
-            test_capacity: None,
+            test_capacity: cfg!(test).then_some(1024 * 1024 * 1024 * 1024),
         })
     }
 
@@ -444,9 +458,22 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
             };
         };
         let (capacity, available) = self.apply_cap(total, available);
+        let mut capacity_vector = self.vector(ResourceAmount::Known(capacity));
+        let mut available_vector = self.vector(ResourceAmount::Known(available));
+        if self.backend == BackendKind::Cuda {
+            let Some((host_total, host_available)) = host_memory_snapshot() else {
+                return PhysicalCapacitySnapshot {
+                    capacity: self.vector(ResourceAmount::Unknown),
+                    available: self.vector(ResourceAmount::Unknown),
+                    source: CapacitySource::Unavailable,
+                };
+            };
+            capacity_vector.host_bytes = ResourceAmount::Known(host_total);
+            available_vector.host_bytes = ResourceAmount::Known(host_available);
+        }
         PhysicalCapacitySnapshot {
-            capacity: self.vector(ResourceAmount::Known(capacity)),
-            available: self.vector(ResourceAmount::Known(available)),
+            capacity: capacity_vector,
+            available: available_vector,
             source,
         }
     }
@@ -684,6 +711,47 @@ mod tests {
         assert_eq!(cuda.snapshot().active_executions, 1);
         drop(lease);
         assert_eq!(cuda.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn cloned_job_scope_keeps_one_admission_until_the_last_stage_releases() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let parent = coordinator.admit(job("pipeline")).await.unwrap();
+        let stage = parent.clone();
+        assert_eq!(coordinator.snapshot().active_jobs, 1);
+        assert_eq!(
+            coordinator.snapshot().reserved_memory_bytes,
+            64 * 1024 * 1024
+        );
+
+        drop(parent);
+        assert_eq!(coordinator.snapshot().active_jobs, 1);
+        drop(stage);
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_atomic_stage_retains_execution_until_physical_work_finishes() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let mut spec = job("atomic");
+        spec.deadline = Some(Instant::now() + std::time::Duration::from_millis(5));
+        let job = coordinator.admit(spec).await.unwrap();
+        let running = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .run_stage(&job, async {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(coordinator.snapshot().active_executions, 1);
+        assert!(matches!(running.await.unwrap(), Err(Error::Timeout(_))));
+        assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
     #[tokio::test]

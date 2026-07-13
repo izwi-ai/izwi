@@ -35,8 +35,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<EngineCoreRequest> {
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
 
         let prompt_config = Self::prompt_token_config(&params, &chat_config);
 

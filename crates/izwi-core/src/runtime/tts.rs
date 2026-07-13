@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams as CoreGenParams, ResourceVector};
+use crate::engine::GenerationParams as CoreGenParams;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
@@ -28,7 +28,7 @@ use crate::runtime::telemetry::{
 use crate::runtime::types::{
     AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult,
 };
-use crate::runtime::{CoordinatorLane, JobSpec};
+use crate::runtime::CoordinatorLane;
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 
@@ -223,8 +223,7 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
 
         let text = request.text.trim();
         if text.is_empty() {
@@ -293,8 +292,7 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -374,8 +372,7 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -447,8 +444,7 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -546,14 +542,13 @@ impl RuntimeService {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         if uses_direct_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, false);
-            let job = JobSpec {
-                request_id: request.id.clone(),
-                lane: CoordinatorLane::Atomic,
-                priority: request.runtime_context.priority,
-                workload_class: request.runtime_context.workload_class,
-                deadline: request.runtime_context.deadline,
-                resources: ResourceVector::default(),
-            };
+            let _residency_lease = self.load_model_for_inference(resolved_variant).await?;
+            let job = self.coordinator_job_for_input(
+                request.id.clone(),
+                CoordinatorLane::Atomic,
+                request.runtime_context,
+                request.text.len(),
+            );
             let result = self
                 .coordinator
                 .run_direct(job, async {
@@ -622,14 +617,13 @@ impl RuntimeService {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         if uses_direct_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
-            let job = JobSpec {
-                request_id: request.id.clone(),
-                lane: CoordinatorLane::Atomic,
-                priority: request.runtime_context.priority,
-                workload_class: request.runtime_context.workload_class,
-                deadline: request.runtime_context.deadline,
-                resources: ResourceVector::default(),
-            };
+            let _residency_lease = self.load_model_for_inference(resolved_variant).await?;
+            let job = self.coordinator_job_for_input(
+                request.id.clone(),
+                CoordinatorLane::Atomic,
+                request.runtime_context,
+                request.text.len(),
+            );
             let result = self
                 .coordinator
                 .run_direct(job, async {

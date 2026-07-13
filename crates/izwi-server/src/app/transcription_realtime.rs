@@ -1350,6 +1350,7 @@ async fn maybe_process_native_stream_frame(
     let events = state
         .runtime
         .push_asr_realtime_samples(stream, &samples, sample_rate)
+        .await
         .map_err(|err| err.to_string())?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);
@@ -1372,6 +1373,7 @@ async fn finish_native_stream_if_needed(
     let events = state
         .runtime
         .finish_asr_realtime_stream(&mut stream)
+        .await
         .map_err(|err| err.to_string())?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);

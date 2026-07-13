@@ -3,7 +3,6 @@
 use crate::catalog::{
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
 };
-use crate::engine::ResourceVector;
 use crate::error::{Error, Result};
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -15,7 +14,7 @@ use crate::runtime::types::{
     DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord,
 };
-use crate::runtime::{CoordinatorLane, JobSpec, RuntimeRequestContext};
+use crate::runtime::{CoordinatorLane, RuntimeRequestContext};
 use crate::ModelVariant;
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk, TranscriptAssembler};
 use std::collections::HashMap;
@@ -51,6 +50,22 @@ struct TranscribedChunk {
 }
 
 impl RuntimeService {
+    async fn diarize_samples_stage(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        variant: ModelVariant,
+        config: &DiarizationConfig,
+    ) -> Result<DiarizationResult> {
+        let _lease = self.load_model_for_inference(variant).await?;
+        let model = self
+            .model_registry
+            .get_diarization(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+        model.diarize(samples, sample_rate, config)
+    }
+
     async fn diarize_samples(
         &self,
         samples: &[f32],
@@ -60,26 +75,19 @@ impl RuntimeService {
     ) -> Result<DiarizationResult> {
         let variant = resolve_diarization_model_variant(model_id);
         self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
+        let _residency_lease = self.load_model_for_inference(variant).await?;
         let context = RuntimeRequestContext::default();
-        let job = JobSpec {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            lane: CoordinatorLane::Pipeline,
-            priority: context.priority,
-            workload_class: context.workload_class,
-            deadline: context.deadline,
-            resources: ResourceVector::default(),
-        };
+        let job = self.coordinator_job_for_input(
+            uuid::Uuid::new_v4().to_string(),
+            CoordinatorLane::Pipeline,
+            context,
+            samples.len().saturating_mul(std::mem::size_of::<f32>()),
+        );
         self.coordinator
-            .run_direct(job, async {
-                self.load_model(variant).await?;
-                let _lease = self.acquire_model_residency_lease(variant);
-                let model = self
-                    .model_registry
-                    .get_diarization(variant)
-                    .await
-                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-                model.diarize(samples, sample_rate, config)
-            })
+            .run_direct(
+                job,
+                self.diarize_samples_stage(samples, sample_rate, variant, config),
+            )
             .await
     }
 
@@ -100,13 +108,12 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let runtime_request =
-            DiarizationRuntimeRequest::from_bytes(
-                resolve_diarization_model_variant(model_id),
-                audio_bytes.to_vec(),
-                config.clone(),
-            )?
-            .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
+        let runtime_request = DiarizationRuntimeRequest::from_bytes(
+            resolve_diarization_model_variant(model_id),
+            audio_bytes.to_vec(),
+            config.clone(),
+        )?
+        .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
         self.diarize_samples(
             &audio.samples,
@@ -152,39 +159,50 @@ impl RuntimeService {
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
-        let runtime_request =
-            DiarizationRuntimeRequest::from_bytes(
-                diarization_variant,
-                audio_bytes.to_vec(),
-                config.clone(),
-            )?
-            .with_pipeline_models(
-                diarization_model_id.map(ToOwned::to_owned),
-                asr_model_id.map(ToOwned::to_owned),
-                aligner_model_id.map(ToOwned::to_owned),
-                llm_model_id.map(ToOwned::to_owned),
-            )
-            .with_llm_refinement(enable_llm_refinement);
+        let runtime_request = DiarizationRuntimeRequest::from_bytes(
+            diarization_variant,
+            audio_bytes.to_vec(),
+            config.clone(),
+        )?
+        .with_pipeline_models(
+            diarization_model_id.map(ToOwned::to_owned),
+            asr_model_id.map(ToOwned::to_owned),
+            aligner_model_id.map(ToOwned::to_owned),
+            llm_model_id.map(ToOwned::to_owned),
+        )
+        .with_llm_refinement(enable_llm_refinement);
         self.record_diarization_transcript_pipeline(runtime_request.enable_llm_refinement);
+        let pipeline_job = self
+            .coordinator
+            .admit(self.coordinator_job_for_input(
+                uuid::Uuid::new_v4().to_string(),
+                CoordinatorLane::Pipeline,
+                RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
+                audio_bytes.len(),
+            ))
+            .await?;
         let audio = decode_pipeline_audio_bytes(audio_bytes)?;
 
         let diarization = self
-            .diarize_samples(
-                &audio.samples,
-                audio.sample_rate,
-                runtime_request.diarization_model_id.as_deref(),
-                &runtime_request.config,
+            .coordinator
+            .run_stage(
+                &pipeline_job,
+                self.diarize_samples_stage(
+                    &audio.samples,
+                    audio.sample_rate,
+                    diarization_variant,
+                    &runtime_request.config,
+                ),
             )
             .await?;
 
         let asr_variant = resolve_asr_model_variant(runtime_request.asr_model_id.as_deref());
 
-        let aligner_variant =
-            crate::runtime::asr::resolve_forced_aligner_variant(
-                runtime_request.aligner_model_id.as_deref(),
-            )?;
-        let aligner_lease = match self.load_model(aligner_variant).await {
-            Ok(()) => Some(self.acquire_model_residency_lease(aligner_variant)),
+        let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
+            runtime_request.aligner_model_id.as_deref(),
+        )?;
+        let aligner_lease = match self.load_model_for_inference(aligner_variant).await {
+            Ok(lease) => Some(lease),
             Err(err) => {
                 warn!("Forced aligner load failed, using heuristic timings: {err}");
                 None
@@ -215,8 +233,7 @@ impl RuntimeService {
         );
 
         let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
-            self.load_model(asr_variant).await?;
-            let _asr_lease = self.acquire_model_residency_lease(asr_variant);
+            let _asr_lease = self.load_model_for_inference(asr_variant).await?;
             let asr_model = self
                 .model_registry
                 .get_asr(asr_variant)
@@ -224,26 +241,35 @@ impl RuntimeService {
                 .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
             let audio_samples = audio.samples.clone();
             let asr_model_for_task = asr_model.clone();
-            let transcription = tokio::task::spawn_blocking(move || {
-                asr_model_for_task.transcribe_with_details(
-                    &audio_samples,
-                    PIPELINE_SAMPLE_RATE,
-                    None,
-                )
-            })
-            .await
-            .map_err(|err| Error::InferenceError(format!("ASR task failed: {err}")))??;
+            let transcription = self
+                .coordinator
+                .run_stage(&pipeline_job, async move {
+                    tokio::task::spawn_blocking(move || {
+                        asr_model_for_task.transcribe_with_details(
+                            &audio_samples,
+                            PIPELINE_SAMPLE_RATE,
+                            None,
+                        )
+                    })
+                    .await
+                    .map_err(|err| Error::InferenceError(format!("ASR task failed: {err}")))?
+                })
+                .await?;
             (transcription.text, Vec::new(), transcription.language)
         } else {
-            self.load_model(asr_variant).await?;
-            let _asr_lease = self.acquire_model_residency_lease(asr_variant);
+            let _asr_lease = self.load_model_for_inference(asr_variant).await?;
             let asr_model = self
                 .model_registry
                 .get_asr(asr_variant)
                 .await
                 .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
-            let (text, chunks) =
-                transcribe_audio_chunks(asr_model, &audio, None, aligner_limit).await?;
+            let (text, chunks) = self
+                .coordinator
+                .run_stage(
+                    &pipeline_job,
+                    transcribe_audio_chunks(asr_model, &audio, None, aligner_limit),
+                )
+                .await?;
             (text, chunks, None)
         };
         let asr_words = extract_words(&asr_text);
@@ -273,8 +299,12 @@ impl RuntimeService {
         } else if use_single_pass_asr {
             fallback_word_timings_from_words(&asr_words, audio.duration_secs)
         } else if let Some(model) = aligner_model.as_ref() {
-            let (aligned, aligned_word_count) =
-                force_align_audio_chunks(model.clone(), &audio, &chunk_texts).await;
+            let (aligned, aligned_word_count) = self
+                .coordinator
+                .run_stage(&pipeline_job, async {
+                    Ok(force_align_audio_chunks(model.clone(), &audio, &chunk_texts).await)
+                })
+                .await?;
             model_aligned_words = aligned_word_count;
             aligned
         } else {

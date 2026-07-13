@@ -38,14 +38,13 @@ impl RuntimeService {
         Self::default_kokoro_variant()
     }
 
-    pub async fn kokoro_tts_generate(
+    pub(crate) async fn kokoro_tts_generate(
         &self,
         request: GenerationRequest,
     ) -> Result<GenerationResult> {
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), false)?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
         let model = self
             .model_registry
             .get_kokoro(variant)
@@ -74,7 +73,7 @@ impl RuntimeService {
         })
     }
 
-    pub async fn kokoro_tts_generate_streaming(
+    pub(crate) async fn kokoro_tts_generate_streaming(
         &self,
         request: GenerationRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
@@ -82,8 +81,7 @@ impl RuntimeService {
         let request_id = request.id.clone();
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), true)?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self.load_model_for_inference(variant).await?;
         let model = self
             .model_registry
             .get_kokoro(variant)
