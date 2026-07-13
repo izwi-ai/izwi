@@ -9,7 +9,10 @@ use crate::model::ModelVariant;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::TaskType;
-use super::{ExecutorOutput, ExecutorStepResult, ModelSessionResult, NativeExecutor};
+use super::{
+    unknown_cache_observation, ExecutorOutput, ExecutorStepResult, ModelExecutor,
+    ModelSessionResult, NativeExecutor,
+};
 use crate::engine::{BatchDispatch, BatchDispatchKind};
 
 type RouteHandler =
@@ -252,7 +255,37 @@ impl NativeExecutor {
             .iter()
             .zip(outputs)
             .map(|(scheduled, output)| {
-                ExecutorStepResult::from_session(scheduled, output).with_dispatch(dispatch)
+                let Some(request) = requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                else {
+                    return ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::atomic(ExecutorOutput::error(
+                            scheduled.request_id.clone(),
+                            "Scheduled request not found during cache reconciliation",
+                        )),
+                    )
+                    .with_dispatch(dispatch);
+                };
+                match self.reconcile_scheduled_cache(request, scheduled, &output.output) {
+                    Ok(observed) => ExecutorStepResult::from_session(scheduled, output)
+                        .with_dispatch(dispatch)
+                        .with_observed_resources(observed),
+                    Err(err) => {
+                        let _ = ModelExecutor::cleanup_session(self, &scheduled.session_key());
+                        ExecutorStepResult::from_session(
+                            scheduled,
+                            ModelSessionResult::atomic(ExecutorOutput::error(
+                                scheduled.request_id.clone(),
+                                format!("physical cache reconciliation failed: {err}"),
+                            )),
+                        )
+                        .with_dispatch(dispatch)
+                        .with_observed_resources(unknown_cache_observation())
+                    }
+                }
             })
             .collect())
     }
@@ -294,4 +327,5 @@ mod tests {
             crate::engine::ExecutionDisposition::Finished(crate::engine::FinishReason::Cancelled)
         );
     }
+
 }

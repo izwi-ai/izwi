@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, BatchKey, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
+    BatchDispatch, BatchKey, CacheMode, ExecutionDisposition, ExecutionFailure, ExecutionMode,
+    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
     FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode, RetryDisposition,
     WorkUnit,
 };
@@ -27,7 +27,7 @@ use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{Scheduler, SchedulerConfig};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
-use super::ResourceVector;
+use super::{ResourceAmount, ResourceVector};
 use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -240,6 +240,22 @@ impl EngineCore {
             WorkUnit::AtomicJob { kind } => kind.clone(),
             WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
         };
+        let estimate = if profile.cache_mode == CacheMode::None {
+            ResourceVector::zero()
+        } else {
+            let bytes_per_block =
+                self.config.kv_cache_memory_bytes() / self.config.max_blocks.max(1);
+            let estimated_bytes = scheduled
+                .block_ids
+                .len()
+                .checked_mul(bytes_per_block)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| Error::Overloaded("cache plan estimate overflow".to_string()))?;
+            ResourceVector {
+                kv_bytes: ResourceAmount::Known(estimated_bytes),
+                ..ResourceVector::zero()
+            }
+        };
         let plan = ExecutionPlan {
             plan_id: scheduled.plan_id,
             session: scheduled.session_key(),
@@ -262,7 +278,7 @@ impl EngineCore {
                 profile.decode_batch
             },
             max_batch_size: profile.max_batch_size.max(1),
-            estimate: ResourceVector::zero(),
+            estimate,
             reservation: None,
         };
 
@@ -311,7 +327,7 @@ impl EngineCore {
             session: result.session.clone(),
             input_consumed: output.tokens_processed,
             output_produced: output.tokens_generated,
-            observed_resources: ResourceVector::zero(),
+            observed_resources: result.observed_resources,
             dispatch: result.dispatch,
             elapsed: std::time::Duration::ZERO,
             safe_point: result.safe_point,
@@ -2496,6 +2512,62 @@ mod tests {
             core.scheduler.get_running_info(&scheduled.request_id),
             Some((16, 1))
         );
+    }
+
+    #[tokio::test]
+    async fn cache_plan_estimate_and_executor_observation_remain_distinct() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        )));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                block_size: 1,
+                max_blocks: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("cache contract");
+        request.id = "cache-contract".to_string();
+        request.prompt_tokens = vec![1, 2];
+        core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
+        let scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        assert!(matches!(
+            core.active_plans[&scheduled.plan_id].estimate.kv_bytes,
+            ResourceAmount::Known(bytes) if bytes > 0
+        ));
+
+        let observed = ResourceVector {
+            kv_bytes: ResourceAmount::Known(123),
+            ..ResourceVector::zero()
+        };
+        let result = ExecutorStepResult::new(
+            &scheduled,
+            ExecutorOutput {
+                request_id: scheduled.request_id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: scheduled.num_tokens,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+        )
+        .with_observed_resources(observed);
+        let report = EngineCore::report_from_result(&result);
+        assert_eq!(report.observed_resources, observed);
     }
 
     #[tokio::test]

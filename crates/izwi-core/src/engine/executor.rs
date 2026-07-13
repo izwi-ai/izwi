@@ -390,6 +390,9 @@ pub struct ExecutorStepResult {
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
     pub dispatch: BatchDispatch,
+    /// Physical model-owned cache retained after this safe point. Unknown is
+    /// reported explicitly when a backend/model cannot observe all storage.
+    pub observed_resources: ResourceVector,
     pub output: ExecutorOutput,
 }
 
@@ -412,12 +415,18 @@ impl ExecutorStepResult {
             disposition: session_result.disposition,
             safe_point: session_result.safe_point,
             dispatch: BatchDispatch::serial(),
+            observed_resources: ResourceVector::zero(),
             output: session_result.output,
         }
     }
 
     pub fn with_dispatch(mut self, dispatch: BatchDispatch) -> Self {
         self.dispatch = dispatch;
+        self
+    }
+
+    pub fn with_observed_resources(mut self, resources: ResourceVector) -> Self {
+        self.observed_resources = resources;
         self
     }
 }
@@ -529,7 +538,8 @@ impl CacheReleaseReport {
 #[derive(Debug, Default)]
 struct CacheResourceReservation {
     reserved_bytes: u64,
-    leases: Vec<ResourceLease>,
+    observed_blocks: usize,
+    lease: Option<ResourceLease>,
 }
 
 pub struct NativeExecutor {
@@ -619,9 +629,6 @@ impl NativeExecutor {
         let Some(authority) = self.config.resource_authority.as_ref() else {
             return Ok(());
         };
-        if self.config.logical_kv_block_bytes == 0 {
-            return Ok(());
-        }
 
         let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
             Error::InferenceError("cache resource reservation mutex poisoned".to_string())
@@ -642,27 +649,117 @@ impl NativeExecutor {
             {
                 continue;
             }
-            let desired_bytes = (item.block_ids.len() as u64)
+            let logical_bytes = (item.block_ids.len() as u64)
                 .checked_mul(self.config.logical_kv_block_bytes)
                 .ok_or_else(|| Error::Overloaded("cache reservation overflow".to_string()))?;
             let session = item.session_key();
             let reservation = reservations.entry(session.clone()).or_default();
+            let projected_bytes = if reservation.observed_blocks == 0 {
+                0
+            } else {
+                reservation
+                    .reserved_bytes
+                    .checked_mul(item.block_ids.len() as u64)
+                    .and_then(|bytes| bytes.checked_add(reservation.observed_blocks as u64 - 1))
+                    .map(|bytes| bytes / reservation.observed_blocks as u64)
+                    .ok_or_else(|| Error::Overloaded("cache projection overflow".to_string()))?
+            };
+            let desired_bytes = logical_bytes
+                .max(projected_bytes)
+                .max(reservation.reserved_bytes);
             let growth = desired_bytes.saturating_sub(reservation.reserved_bytes);
-            if growth == 0 {
-                continue;
+            if reservation.lease.is_none() {
+                reservation.lease = Some(authority.reserve(
+                    ReservationOwner::new(
+                        ReservationClass::Cache,
+                        format!("{}:{}", session.request_id, session.epoch),
+                    ),
+                    cache_resource_vector(self.config.backend, desired_bytes),
+                )?);
+            } else if growth > 0 {
+                reservation
+                    .lease
+                    .as_mut()
+                    .expect("cache lease checked above")
+                    .resize(cache_resource_vector(self.config.backend, desired_bytes))?;
             }
-            let resources = cache_resource_vector(self.config.backend, growth);
-            let lease = authority.reserve(
-                ReservationOwner::new(
-                    ReservationClass::Cache,
-                    format!("{}:{}", session.request_id, session.epoch),
-                ),
-                resources,
-            )?;
             reservation.reserved_bytes = desired_bytes;
-            reservation.leases.push(lease);
         }
         Ok(())
+    }
+
+    fn observed_session_cache_bytes(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        output: &ExecutorOutput,
+    ) -> Option<u64> {
+        if output.finished || output.error.is_some() {
+            return Some(0);
+        }
+        let session = scheduled.session_key();
+        match request.task_type {
+            super::types::TaskType::Chat => self
+                .chat_decode_states
+                .lock()
+                .ok()?
+                .get(&session)?
+                .state
+                .session_cache_bytes(),
+            super::types::TaskType::ASR => self
+                .asr_decode_states
+                .lock()
+                .ok()?
+                .get(&session)?
+                .state
+                .session_cache_bytes(),
+            super::types::TaskType::TTS => self
+                .qwen_tts_decode_states
+                .lock()
+                .ok()?
+                .get(&session)?
+                .state
+                .session_cache_bytes(),
+            super::types::TaskType::SpeechToSpeech => None,
+        }
+    }
+
+    fn reconcile_scheduled_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        output: &ExecutorOutput,
+    ) -> Result<ResourceVector> {
+        let Some(profile) = self.execution_profile(request) else {
+            return Ok(ResourceVector::zero());
+        };
+        if profile.cache_mode != CacheMode::OpaqueModelOwned || !profile.resolved_from_loaded_model
+        {
+            return Ok(ResourceVector::zero());
+        }
+        let Some(observed_bytes) = self.observed_session_cache_bytes(request, scheduled, output)
+        else {
+            return Ok(unknown_cache_observation());
+        };
+        let observation = cache_observation(observed_bytes);
+        if self.config.resource_authority.is_none() {
+            return Ok(observation);
+        }
+
+        let session = scheduled.session_key();
+        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
+            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+        })?;
+        let reservation = reservations.get_mut(&session).ok_or_else(|| {
+            Error::InferenceError("cache allocation has no exact-session reservation".to_string())
+        })?;
+        let lease = reservation.lease.as_mut().ok_or_else(|| {
+            Error::InferenceError("cache allocation has no physical resource lease".to_string())
+        })?;
+        lease.reconcile_materialized(cache_resource_vector(self.config.backend, observed_bytes))?;
+        reservation.reserved_bytes = observed_bytes;
+        reservation.observed_blocks = scheduled.block_ids.len();
+        Ok(observation)
     }
 }
 
@@ -674,6 +771,20 @@ fn cache_resource_vector(backend: BackendKind, bytes: u64) -> ResourceVector {
         BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
     }
     resources
+}
+
+fn cache_observation(bytes: u64) -> ResourceVector {
+    ResourceVector {
+        kv_bytes: ResourceAmount::Known(bytes),
+        ..ResourceVector::zero()
+    }
+}
+
+fn unknown_cache_observation() -> ResourceVector {
+    ResourceVector {
+        kv_bytes: ResourceAmount::Unknown,
+        ..ResourceVector::zero()
+    }
 }
 
 fn static_qwen_tts_batch_eligible(
@@ -1170,7 +1281,8 @@ mod tests {
                     session.clone(),
                     CacheResourceReservation {
                         reserved_bytes: 1024,
-                        leases: vec![lease],
+                        observed_blocks: 1,
+                        lease: Some(lease),
                     },
                 );
             assert_eq!(authority.snapshot().reservations, 1);

@@ -21,6 +21,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,16 @@ pub struct ChatDecodeState {
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
+}
+
+impl ChatDecodeState {
+    /// All Candle backing allocations retained by this incremental session.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.cache.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.embeds)?;
+        Some(accounting.bytes())
+    }
 }
 
 #[derive(Debug, Clone)]

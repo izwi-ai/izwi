@@ -29,6 +29,7 @@ use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
@@ -129,6 +130,33 @@ pub struct TtsDecodeState {
     emitted_samples: usize,
     decode_raw_token_scratch: Vec<Vec<u32>>,
     finished: bool,
+}
+
+impl TtsDecodeState {
+    /// Observable per-request allocations, excluding model-global RoPE caches.
+    pub fn allocated_session_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.talker_cache.account_storage(&mut accounting)?;
+        self.predictor_cache.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.trailing_text_hidden)?;
+        accounting.add_tensor(&self.tts_pad_embed)?;
+        accounting.add_tensor(&self.last_hidden)?;
+        accounting.add_tensor(&self.last_logits)?;
+        Some(accounting.bytes())
+    }
+
+    /// Complete scheduler accounting is available on CPU and Metal.
+    ///
+    /// CUDA uses model-global, growing RoPE caches in both the talker and code
+    /// predictor, so it must remain fail-closed until those allocations are
+    /// bounded or charged to the loaded-model lease.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        if self.last_hidden.device().is_cuda() {
+            None
+        } else {
+            self.allocated_session_bytes()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

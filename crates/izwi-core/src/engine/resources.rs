@@ -47,6 +47,17 @@ impl ResourceAmount {
             (Self::Known(_), Self::Unknown) => false,
         }
     }
+
+    fn positive_growth_over(self, current: Self) -> Result<Self> {
+        match (self, current) {
+            (Self::Known(next), Self::Known(current)) => {
+                Ok(Self::Known(next.saturating_sub(current)))
+            }
+            _ => Err(Error::InvalidInput(
+                "resource resize contains an unresolved quantity".to_string(),
+            )),
+        }
+    }
 }
 
 /// Resource vector used for estimates, capacity, and observed usage.
@@ -115,6 +126,25 @@ impl ResourceVector {
         .into_iter()
         .all(|amount| matches!(amount, ResourceAmount::Known(_)))
     }
+
+    fn positive_growth_over(self, current: Self) -> Result<Self> {
+        Ok(Self {
+            host_bytes: self.host_bytes.positive_growth_over(current.host_bytes)?,
+            device_bytes: self
+                .device_bytes
+                .positive_growth_over(current.device_bytes)?,
+            unified_bytes: self
+                .unified_bytes
+                .positive_growth_over(current.unified_bytes)?,
+            kv_bytes: self.kv_bytes.positive_growth_over(current.kv_bytes)?,
+            temporary_bytes: self
+                .temporary_bytes
+                .positive_growth_over(current.temporary_bytes)?,
+            compute_slots: self
+                .compute_slots
+                .positive_growth_over(current.compute_slots)?,
+        })
+    }
 }
 
 pub type ResourceEstimate = ResourceVector;
@@ -180,6 +210,30 @@ impl ResourceLedger {
         };
         self.used = self.used.checked_sub(resources)?;
         Ok(true)
+    }
+
+    pub fn resize(&mut self, id: ReservationId, resources: ResourceVector) -> Result<bool> {
+        if !resources.is_fully_known() {
+            return Err(Error::InvalidInput(
+                "resource reservation contains an unresolved quantity".to_string(),
+            ));
+        }
+        let Some(current) = self.reservations.get(&id).copied() else {
+            return Ok(false);
+        };
+        let candidate = self.used.checked_sub(current)?.checked_add(resources)?;
+        if !candidate.fits_within(self.capacity) {
+            return Err(Error::Overloaded(
+                "resized resources exceed available capacity".to_string(),
+            ));
+        }
+        self.reservations.insert(id, resources);
+        self.used = candidate;
+        Ok(true)
+    }
+
+    fn reservation(&self, id: ReservationId) -> Option<ResourceVector> {
+        self.reservations.get(&id).copied()
     }
 }
 
@@ -324,6 +378,41 @@ impl ResourceAuthority {
             let _ = state.ledger.release(id);
         }
     }
+
+    fn resize(
+        &self,
+        id: ReservationId,
+        resources: ResourceVector,
+        allocation_already_materialized: bool,
+    ) -> Result<()> {
+        if !resources.is_fully_known() {
+            return Err(Error::InvalidInput(
+                "resource resize contains an unresolved quantity".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        let current = state.ledger.reservation(id).ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        if !allocation_already_materialized {
+            let growth = resources.positive_growth_over(current)?;
+            let physical = self.provider.snapshot();
+            if !growth.fits_within(physical.available) {
+                return Err(Error::Overloaded(
+                    "insufficient live physical capacity for resource lease growth".to_string(),
+                ));
+            }
+        }
+        if !state.ledger.resize(id, resources)? {
+            return Err(Error::InferenceError(
+                "resource lease disappeared during resize".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -336,6 +425,31 @@ pub struct ResourceLease {
 impl ResourceLease {
     pub fn resources(&self) -> ResourceVector {
         self.resources
+    }
+
+    /// Resize before additional physical allocation. Only positive growth is
+    /// compared with current live headroom; the ledger still validates the
+    /// complete replacement against total capacity.
+    pub fn resize(&mut self, resources: ResourceVector) -> Result<()> {
+        let id = self.id.ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        self.authority.resize(id, resources, false)?;
+        self.resources = resources;
+        Ok(())
+    }
+
+    /// Reconcile a lease to a physical allocation that was just observed.
+    /// The allocation already contributes to the provider's used-memory
+    /// reading, so checking it again against live headroom would double-count
+    /// it. The total ledger ceiling remains enforced transactionally.
+    pub fn reconcile_materialized(&mut self, resources: ResourceVector) -> Result<()> {
+        let id = self.id.ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        self.authority.resize(id, resources, true)?;
+        self.resources = resources;
+        Ok(())
     }
 }
 
@@ -523,5 +637,35 @@ mod tests {
             Err(Error::Overloaded(_))
         ));
         assert_eq!(authority.snapshot().reserved, slots(6));
+    }
+
+    #[test]
+    fn lease_growth_and_materialized_reconciliation_use_distinct_headroom_rules() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 10,
+            available: AtomicU64::new(10),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let mut cache = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, "session"),
+                slots(2),
+            )
+            .unwrap();
+
+        provider.set_available(1);
+        assert!(matches!(cache.resize(slots(4)), Err(Error::Overloaded(_))));
+        assert_eq!(cache.resources(), slots(2));
+        assert_eq!(authority.snapshot().reserved, slots(2));
+
+        // The four units now represent an allocation already visible in the
+        // provider's one unit of live headroom, so reconciliation must not ask
+        // for the same physical capacity a second time.
+        cache.reconcile_materialized(slots(4)).unwrap();
+        assert_eq!(cache.resources(), slots(4));
+        assert_eq!(authority.snapshot().reserved, slots(4));
+
+        cache.resize(slots(3)).unwrap();
+        assert_eq!(authority.snapshot().reserved, slots(3));
     }
 }

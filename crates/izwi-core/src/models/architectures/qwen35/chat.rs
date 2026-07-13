@@ -16,6 +16,7 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::Tokenizer;
@@ -52,6 +53,21 @@ pub struct ChatDecodeState {
     next_text_position: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+}
+
+impl ChatDecodeState {
+    /// Observable per-request allocations, excluding model-global RoPE caches.
+    pub fn allocated_session_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.text_state.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.logits)?;
+        Some(accounting.bytes())
+    }
+
+    /// Complete scheduler accounting is unavailable while RoPE is model-global.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]

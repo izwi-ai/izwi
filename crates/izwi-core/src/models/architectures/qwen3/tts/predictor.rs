@@ -22,6 +22,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, repeat_kv, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 
 /// KV Cache for the code predictor
@@ -40,6 +41,24 @@ impl CodePredictorCache {
             .flat_map(|pages| pages.iter())
             .map(KvPage::storage_bytes)
             .sum()
+    }
+
+    pub fn allocated_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.account_storage(&mut accounting)?;
+        Some(accounting.bytes())
+    }
+
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        for page in self
+            .k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+        {
+            page.account_storage(accounting)?;
+        }
+        Some(())
     }
 
     /// Create a new cache

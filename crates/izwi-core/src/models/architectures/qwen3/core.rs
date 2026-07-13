@@ -22,6 +22,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
@@ -121,6 +122,46 @@ impl Qwen3Cache {
             .flat_map(|pages| pages.iter())
             .map(KvPage::storage_bytes)
             .sum()
+    }
+
+    /// Backing allocations currently retained by this session cache.
+    ///
+    /// Includes paged KV, dense Candle KV capacity, and session-local RoPE
+    /// windows. Returns `None` if a backend allocation cannot be observed or
+    /// the total cannot be represented as `u64`.
+    pub fn allocated_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.account_storage(&mut accounting)?;
+        Some(accounting.bytes())
+    }
+
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        for page in self
+            .k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+        {
+            page.account_storage(accounting)?;
+        }
+
+        for cache in self
+            .dense_k_cache_h
+            .iter()
+            .chain(self.dense_v_cache_h.iter())
+            .flatten()
+        {
+            if let Some(tensor) = cache.all_data().as_ref() {
+                accounting.add_tensor(tensor)?;
+            }
+        }
+
+        for entry in &self.rope_cache {
+            accounting.add_tensor(&entry.cos_half)?;
+            accounting.add_tensor(&entry.sin_half)?;
+        }
+
+        Some(())
     }
 
     pub fn new(num_layers: usize) -> Self {
@@ -2953,6 +2994,31 @@ mod tests {
             .cached_rope_pair(2, 5, head_dim, &device, DType::F32, false, &[], &inv_freqs)
             .expect("new rope window");
         assert_eq!(cache.rope_cache.len(), 2);
+    }
+
+    #[test]
+    fn qwen3_cache_accounting_includes_dense_capacity_and_rope() {
+        let device = Device::Cpu;
+        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
+            1,
+            4,
+            KvCacheQuantization::None,
+            8,
+        );
+        assert_eq!(cache.allocated_bytes(), Some(0));
+
+        let k = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("k");
+        let v = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("v");
+        cache.append(0, k, v).expect("append");
+        let dense_bytes = cache.allocated_bytes().expect("dense bytes");
+        assert!(dense_bytes >= 2 * 4 * 4 * 2);
+        assert_eq!(cache.paged_storage_bytes(), 0);
+
+        let inv_freqs = build_rope_inv_freqs(8, 10_000.0);
+        cache
+            .cached_rope_pair(3, 0, 8, &device, DType::F32, false, &[], &inv_freqs)
+            .expect("rope");
+        assert!(cache.allocated_bytes().expect("total bytes") > dense_bytes);
     }
 
     #[test]

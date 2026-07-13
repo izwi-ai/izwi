@@ -552,6 +552,18 @@ pub enum NativeAsrDecodeState {
     Nemotron(NemotronStreamingState),
 }
 
+impl NativeAsrDecodeState {
+    /// Complete model-owned session cache claim when it can be observed.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Qwen3(state) => state.session_cache_bytes(),
+            // Nemotron's streaming state has not exposed all persistent
+            // tensors yet, so undercounting is rejected.
+            Self::Nemotron(_) => None,
+        }
+    }
+}
+
 pub enum NativeAsrRealtimeState {
     Nemotron(NemotronStreamingState),
 }
@@ -1495,6 +1507,16 @@ pub enum NativeChatModel {
 pub enum NativeChatDecodeState {
     Qwen3(Qwen3ChatDecodeState),
     Qwen35(Qwen35ChatDecodeState),
+}
+
+impl NativeChatDecodeState {
+    /// Complete model-owned session cache claim when it can be observed.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Qwen3(state) => state.session_cache_bytes(),
+            Self::Qwen35(state) => state.session_cache_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

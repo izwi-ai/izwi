@@ -31,6 +31,7 @@ use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
@@ -84,6 +85,16 @@ pub struct AsrDecodeState {
     stop_tokens: Vec<u32>,
     max_new_tokens: usize,
     finished: bool,
+}
+
+impl AsrDecodeState {
+    /// All Candle backing allocations retained by this incremental session.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.cache.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.embeds)?;
+        Some(accounting.bytes())
+    }
 }
 
 #[derive(Debug, Clone)]

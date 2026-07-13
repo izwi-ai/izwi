@@ -3,6 +3,7 @@
 use candle_core::{DType, Tensor, D};
 
 use crate::error::{Error, Result};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
 const Q4_0_BLOCK_SIZE: usize = 32;
@@ -138,6 +139,24 @@ impl KvPage {
             Self::Q4_0 { values, scales, .. } => {
                 values.elem_count() * values.dtype().size_in_bytes()
                     + scales.elem_count() * scales.dtype().size_in_bytes()
+            }
+        }
+    }
+
+    /// Add the backing tensor allocations retained by this page.
+    ///
+    /// This differs from [`Self::storage_bytes`] when a dense page is a view:
+    /// the full shared backing allocation remains live and must be reserved.
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        match self {
+            Self::Dense(tensor) => accounting.add_tensor(tensor),
+            Self::Int8 { values, .. } => {
+                accounting.add_tensor(values)?;
+                accounting.add_bytes(std::mem::size_of::<f32>() as u64)
+            }
+            Self::Q4_0 { values, scales, .. } => {
+                accounting.add_tensor(values)?;
+                accounting.add_tensor(scales)
             }
         }
     }
