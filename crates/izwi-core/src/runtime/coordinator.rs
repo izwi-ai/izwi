@@ -512,19 +512,57 @@ fn host_memory_snapshot() -> Option<(u64, u64)> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/usr/sbin/sysctl")
+        let total_output = std::process::Command::new("/usr/sbin/sysctl")
             .args(["-n", "hw.memsize"])
             .output()
             .ok()?;
-        let total = std::str::from_utf8(&output.stdout)
+        if !total_output.status.success() {
+            return None;
+        }
+        let total = std::str::from_utf8(&total_output.stdout)
             .ok()?
             .trim()
             .parse::<u64>()
             .ok()?;
-        return Some((total, total));
+        let vm_output = std::process::Command::new("/usr/bin/vm_stat")
+            .output()
+            .ok()?;
+        if !vm_output.status.success() {
+            return None;
+        }
+        let available =
+            parse_macos_vm_stat_available(std::str::from_utf8(&vm_output.stdout).ok()?)?;
+        return Some((total, available.min(total)));
     }
     #[allow(unreachable_code)]
     None
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_vm_stat_available(contents: &str) -> Option<u64> {
+    let page_size = contents
+        .lines()
+        .next()?
+        .split_once("page size of ")?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    let pages = |label: &str| {
+        contents.lines().find_map(|line| {
+            let (key, raw) = line.split_once(':')?;
+            (key.trim() == label).then(|| raw.trim().trim_end_matches('.').parse::<u64>().ok())?
+        })
+    };
+
+    // Free, inactive, and speculative pages can be reclaimed without paging
+    // anonymous active memory. Purgeable pages are deliberately excluded
+    // because they may already be represented on one of those VM queues.
+    let reclaimable_pages = pages("Pages free")?
+        .checked_add(pages("Pages inactive")?)?
+        .checked_add(pages("Pages speculative").unwrap_or(0))?;
+    reclaimable_pages.checked_mul(page_size)
 }
 
 #[cfg(feature = "metal")]
@@ -595,6 +633,29 @@ mod tests {
             deadline: None,
             resources,
         }
+    }
+
+    #[test]
+    fn macos_vm_stat_parser_uses_reclaimable_pages() {
+        let snapshot = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free: 10.\n\
+Pages active: 50.\n\
+Pages inactive: 20.\n\
+Pages speculative: 5.\n\
+Pages purgeable: 7.\n";
+
+        assert_eq!(
+            parse_macos_vm_stat_available(snapshot),
+            Some((10 + 20 + 5) * 16_384)
+        );
+    }
+
+    #[test]
+    fn macos_vm_stat_parser_fails_closed_without_required_fields() {
+        let snapshot = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
+Pages free: 10.\n";
+
+        assert_eq!(parse_macos_vm_stat_available(snapshot), None);
     }
 
     #[tokio::test]

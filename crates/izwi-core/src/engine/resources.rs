@@ -217,7 +217,18 @@ pub enum CapacitySource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalCapacitySnapshot {
+    /// Total resource budget controlled by the authority. This is the ceiling
+    /// for the complete reservation ledger, independent of whether a lease has
+    /// materialized into a physical allocation yet.
     pub capacity: ResourceVector,
+    /// Live physical headroom available to a *new* allocation at the instant
+    /// the snapshot is taken. Providers backed by an OS or device driver must
+    /// report actual free/reclaimable capacity here; allocations belonging to
+    /// existing leases may therefore already be subtracted from this value.
+    ///
+    /// `ResourceAuthority` compares only the new reservation against this
+    /// vector. It separately compares the complete reservation ledger against
+    /// `capacity`, avoiding double-counting materialized leases.
     pub available: ResourceVector,
     pub source: CapacitySource,
 }
@@ -259,11 +270,11 @@ impl ResourceAuthority {
     }
 
     pub fn snapshot(&self) -> ResourceAuthoritySnapshot {
-        let physical = self.provider.snapshot();
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let physical = self.provider.snapshot();
         ResourceAuthoritySnapshot {
             physical,
             reserved: state.ledger.used(),
@@ -282,13 +293,17 @@ impl ResourceAuthority {
                 owner.key
             )));
         }
-        let physical = self.provider.snapshot();
         let mut state = self
             .state
             .lock()
             .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
-        let live_candidate = state.ledger.used().checked_add(resources)?;
-        if !live_candidate.fits_within(physical.available) {
+        // Serialize the observation with ledger mutation. `available` is live
+        // physical headroom, so existing reservations must not be added to the
+        // new request: providers already subtract any leases that have
+        // materialized. The ledger's own reserve call independently protects
+        // unmaterialized reservations against the total capacity ceiling.
+        let physical = self.provider.snapshot();
+        if !resources.fits_within(physical.available) {
             return Err(Error::Overloaded(format!(
                 "insufficient live physical capacity for {}",
                 owner.key
@@ -335,6 +350,7 @@ impl Drop for ResourceLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug)]
     struct TestProvider {
@@ -344,6 +360,28 @@ mod tests {
     impl PhysicalCapacityProvider for TestProvider {
         fn snapshot(&self) -> PhysicalCapacitySnapshot {
             self.snapshot
+        }
+    }
+
+    #[derive(Debug)]
+    struct LiveProvider {
+        capacity: u64,
+        available: AtomicU64,
+    }
+
+    impl LiveProvider {
+        fn set_available(&self, available: u64) {
+            self.available.store(available, Ordering::Release);
+        }
+    }
+
+    impl PhysicalCapacityProvider for LiveProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: slots(self.capacity),
+                available: slots(self.available.load(Ordering::Acquire)),
+                source: CapacitySource::Test,
+            }
         }
     }
 
@@ -432,5 +470,58 @@ mod tests {
             )
             .is_err());
         assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn materialized_reservation_is_not_counted_twice_against_live_headroom() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 10,
+            available: AtomicU64::new(10),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                slots(6),
+            )
+            .unwrap();
+
+        // Simulate the model allocation becoming visible to the provider. The
+        // six-unit model lease is already reflected in the four live units.
+        provider.set_available(4);
+        let request = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "request"),
+                slots(1),
+            )
+            .unwrap();
+
+        assert_eq!(authority.snapshot().reserved, slots(7));
+        drop((request, model));
+        assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn unmaterialized_reservations_remain_bounded_by_total_capacity() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 10,
+            available: AtomicU64::new(10),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let _first = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "first"),
+                slots(6),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Model, "second"),
+                slots(5),
+            ),
+            Err(Error::Overloaded(_))
+        ));
+        assert_eq!(authority.snapshot().reserved, slots(6));
     }
 }
