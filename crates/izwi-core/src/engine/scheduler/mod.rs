@@ -233,6 +233,12 @@ pub struct ExpiredRequest {
     pub sequence_id: SequenceId,
 }
 
+impl ExpiredRequest {
+    pub fn session_key(&self) -> SessionKey {
+        SessionKey::new(self.request_id.clone(), self.sequence_id)
+    }
+}
+
 impl ScheduleResult {
     pub fn empty() -> Self {
         Self {
@@ -350,6 +356,11 @@ pub struct Scheduler {
     running: HashMap<RequestId, RunningRequest>,
     /// Request metadata
     requests: HashMap<RequestId, RequestMetadata>,
+    /// Running sessions whose deadlines elapsed before their executor-owned
+    /// cache could be proven released. Their logical blocks remain allocated
+    /// and the public request ID remains fenced until exact-session cleanup is
+    /// confirmed.
+    expired_releases: HashMap<RequestId, SessionKey>,
     /// Next sequence ID
     next_sequence_id: SequenceId,
     /// Next execution plan identity.
@@ -457,6 +468,7 @@ impl Scheduler {
             waiting_members: HashSet::new(),
             running: HashMap::new(),
             requests: HashMap::new(),
+            expired_releases: HashMap::new(),
             next_sequence_id: 0,
             next_plan_id: 1,
             telemetry,
@@ -465,7 +477,13 @@ impl Scheduler {
     }
 
     /// Add a request to the waiting queue.
-    pub fn add_request(&mut self, request: &EngineCoreRequest) {
+    pub fn add_request(&mut self, request: &EngineCoreRequest) -> bool {
+        if self.requests.contains_key(&request.id)
+            || self.expired_releases.contains_key(&request.id)
+        {
+            return false;
+        }
+
         let sequence_id = self.next_sequence_id;
         self.next_sequence_id += 1;
         let arrival_time = request.arrival_time;
@@ -509,6 +527,7 @@ impl Scheduler {
             sequence_id,
             request.num_prompt_tokens()
         );
+        true
     }
 
     /// Install the loaded executor's cache contract for one exact scheduler
@@ -537,7 +556,7 @@ impl Scheduler {
     /// Schedule requests for the next step.
     pub fn schedule(&mut self, kv_cache: &mut KVCacheManager) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
-        result.expired_requests = self.expire_deadlines(kv_cache);
+        result.expired_requests = self.expire_deadlines();
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
         self.update_dynamic_budget();
@@ -914,7 +933,8 @@ impl Scheduler {
                     &metadata.prompt_prefix_tokens,
                     total_tokens_after,
                     existing_blocks,
-                    metadata.cache_policy.allows_external_prefix_reuse(),
+                    self.expired_releases.is_empty()
+                        && metadata.cache_policy.allows_external_prefix_reuse(),
                 );
 
                 if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
@@ -941,7 +961,8 @@ impl Scheduler {
                 }
 
                 let (block_ids, fresh_blocks) = if existing_blocks == 0 {
-                    let block_ids = if self.config.enable_prefix_caching
+                    let block_ids = if self.expired_releases.is_empty()
+                        && self.config.enable_prefix_caching
                         && metadata.cache_policy.allows_external_prefix_reuse()
                     {
                         kv_cache.allocate_with_prefix_tokens(
@@ -1092,7 +1113,8 @@ impl Scheduler {
                     &metadata.prompt_prefix_tokens,
                     num_tokens,
                     0,
-                    metadata.cache_policy.allows_external_prefix_reuse(),
+                    self.expired_releases.is_empty()
+                        && metadata.cache_policy.allows_external_prefix_reuse(),
                 );
 
                 if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
@@ -1117,7 +1139,8 @@ impl Scheduler {
                     break;
                 }
 
-                let block_ids = if self.config.enable_prefix_caching
+                let block_ids = if self.expired_releases.is_empty()
+                    && self.config.enable_prefix_caching
                     && metadata.cache_policy.allows_external_prefix_reuse()
                 {
                     kv_cache.allocate_with_prefix_tokens(
@@ -1342,6 +1365,30 @@ impl Scheduler {
         self.requests.remove(request_id);
     }
 
+    /// Release the logical cache for an expired running session only after
+    /// the executor has confirmed cleanup for that exact incarnation.
+    pub fn confirm_expired_session_cleanup(
+        &mut self,
+        session: &SessionKey,
+        kv_cache: &mut KVCacheManager,
+    ) -> bool {
+        if self.expired_releases.get(&session.request_id) != Some(session) {
+            return false;
+        }
+
+        self.expired_releases.remove(&session.request_id);
+        kv_cache.free(&session.request_id);
+        true
+    }
+
+    /// Exact expired sessions still waiting for physical cache cleanup. A
+    /// later engine step may retry them before admitting more cache work.
+    pub(crate) fn pending_expired_cleanup_sessions(&self) -> Vec<SessionKey> {
+        let mut sessions: Vec<_> = self.expired_releases.values().cloned().collect();
+        sessions.sort_by_key(|session| session.epoch);
+        sessions
+    }
+
     /// Abort a request.
     pub fn abort_request(&mut self, request_id: &RequestId, kv_cache: &mut KVCacheManager) -> bool {
         self.remove_from_waiting(request_id);
@@ -1403,6 +1450,19 @@ impl Scheduler {
     /// Adaptive scheduler telemetry.
     pub fn telemetry(&self) -> SchedulerTelemetry {
         self.telemetry.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_hard_deadline_for_test(
+        &mut self,
+        request_id: &RequestId,
+        deadline: Instant,
+    ) -> bool {
+        let Some(metadata) = self.requests.get_mut(request_id) else {
+            return false;
+        };
+        metadata.hard_deadline = Some(deadline);
+        true
     }
 
     // Helper methods
@@ -1611,7 +1671,7 @@ impl Scheduler {
         *service = service.saturating_add(tokens.max(1) as u64);
     }
 
-    fn expire_deadlines(&mut self, kv_cache: &mut KVCacheManager) -> Vec<ExpiredRequest> {
+    fn expire_deadlines(&mut self) -> Vec<ExpiredRequest> {
         let now = Instant::now();
         let mut expired: Vec<_> = self
             .requests
@@ -1628,7 +1688,26 @@ impl Scheduler {
             .collect();
         expired.sort_by_key(|request| request.sequence_id);
         for request in &expired {
-            self.abort_request(&request.request_id, kv_cache);
+            if self
+                .requests
+                .get(&request.request_id)
+                .map(|metadata| metadata.sequence_id)
+                != Some(request.sequence_id)
+            {
+                continue;
+            }
+
+            self.remove_from_waiting(&request.request_id);
+            if self
+                .running
+                .get(&request.request_id)
+                .is_some_and(|running| running.sequence_id == request.sequence_id)
+            {
+                self.running.remove(&request.request_id);
+                self.expired_releases
+                    .insert(request.request_id.clone(), request.session_key());
+            }
+            self.requests.remove(&request.request_id);
         }
         expired
     }
@@ -3137,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn expiring_running_request_releases_logical_kv_blocks() {
+    fn expiring_running_request_waits_for_exact_cleanup_before_releasing_blocks() {
         let mut scheduler = Scheduler::new(SchedulerConfig::default());
         let mut kv_cache = KVCacheManager::new(Default::default());
         let mut request = EngineCoreRequest::tts("running-deadline");
@@ -3155,8 +3234,22 @@ mod tests {
         let result = scheduler.schedule(&mut kv_cache);
 
         assert_eq!(result.expired_requests.len(), 1);
-        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert!(kv_cache.stats().allocated_blocks > 0);
         assert_eq!(scheduler.running_count(), 0);
+        let session = result.expired_requests[0].session_key();
+        assert_eq!(
+            scheduler.pending_expired_cleanup_sessions(),
+            vec![session.clone()]
+        );
+        let stale = SessionKey::new(session.request_id.clone(), session.epoch + 1);
+        assert!(!scheduler.confirm_expired_session_cleanup(&stale, &mut kv_cache));
+        assert!(kv_cache.stats().allocated_blocks > 0);
+        assert!(!scheduler.add_request(&request));
+
+        assert!(scheduler.confirm_expired_session_cleanup(&session, &mut kv_cache));
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert!(scheduler.pending_expired_cleanup_sessions().is_empty());
+        assert!(scheduler.add_request(&request));
     }
 
     #[test]

@@ -789,8 +789,15 @@ impl EngineCore {
             )));
         }
 
-        // Add to scheduler
-        self.scheduler.add_request(&request);
+        // Add to scheduler. A public ID remains unavailable while an expired
+        // incarnation has logical cache quarantined behind unconfirmed
+        // executor cleanup.
+        if !self.scheduler.add_request(&request) {
+            return Err(Error::InvalidInput(format!(
+                "Request {} already exists or is awaiting cache cleanup",
+                request_id
+            )));
+        }
 
         // Track request
         self.requests.insert(request_id.clone(), request);
@@ -806,6 +813,28 @@ impl EngineCore {
         );
 
         Ok(())
+    }
+
+    async fn reconcile_expired_session_cleanup(&mut self, session: &super::SessionKey) {
+        let release = self.executor.cleanup_session(session).await;
+        if release.confirmed {
+            self.scheduler
+                .confirm_expired_session_cleanup(session, self.kv_cache.inner_mut());
+        } else {
+            warn!(
+                request_id = %session.request_id,
+                session_epoch = session.epoch,
+                "Executor could not confirm physical cache release for expired session; logical cache remains quarantined"
+            );
+        }
+        if self
+            .execution_trackers
+            .get(&session.request_id)
+            .is_some_and(|tracker| tracker.session() == session)
+        {
+            self.execution_trackers.remove(&session.request_id);
+        }
+        self.active_plans.retain(|_, plan| plan.session != *session);
     }
 
     /// Execute one step of the inference loop.
@@ -827,7 +856,19 @@ impl EngineCore {
         if self.maintenance_steps % 64 == 0 {
             self.kv_cache.compact_shared_prefixes();
         }
+        for session in self.scheduler.pending_expired_cleanup_sessions() {
+            self.reconcile_expired_session_cleanup(&session).await;
+        }
         let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
+
+        // Deadline expiry removes a request from runnable scheduler state but
+        // deliberately retains its logical cache allocation. Reconcile the
+        // exact executor session before any newly scheduled work can execute;
+        // only a confirmed physical cleanup permits logical block reuse.
+        for expired in &schedule_result.expired_requests {
+            let session = expired.session_key();
+            self.reconcile_expired_session_cleanup(&session).await;
+        }
 
         let mut preemption_failures = Vec::new();
         for session in &schedule_result.preempted_requests {
@@ -1144,17 +1185,19 @@ impl EngineCore {
 
             // Update scheduler state
             if exec_output.finished {
-                if let Some(session) = self
-                    .execution_trackers
-                    .get(&request_id)
-                    .map(|tracker| tracker.session().clone())
-                {
-                    self.executor.cleanup_session(&session).await;
-                } else {
-                    self.executor.cleanup_request(&request_id).await;
+                if !expired_sequence_ids.contains_key(&request_id) {
+                    if let Some(session) = self
+                        .execution_trackers
+                        .get(&request_id)
+                        .map(|tracker| tracker.session().clone())
+                    {
+                        self.executor.cleanup_session(&session).await;
+                    } else {
+                        self.executor.cleanup_request(&request_id).await;
+                    }
+                    self.scheduler
+                        .finish_request(&request_id, self.kv_cache.inner_mut());
                 }
-                self.scheduler
-                    .finish_request(&request_id, self.kv_cache.inner_mut());
                 self.requests.remove(&request_id);
                 self.request_start_times.remove(&request_id);
                 self.request_phase_timings.remove(&request_id);
@@ -1434,6 +1477,109 @@ mod tests {
                 calls.push(request_id.to_string());
             }
             super::super::executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
+    struct DeadlineCleanupExecutor {
+        events: Arc<Mutex<Vec<String>>>,
+        confirm_cleanup: bool,
+    }
+
+    impl DeadlineCleanupExecutor {
+        fn new(events: Arc<Mutex<Vec<String>>>, confirm_cleanup: bool) -> Self {
+            Self {
+                events,
+                confirm_cleanup,
+            }
+        }
+
+        fn execute_phase(
+            &self,
+            phase: &str,
+            scheduled: &[ScheduledRequest],
+        ) -> Vec<ExecutorStepResult> {
+            let mut outputs = Vec::with_capacity(scheduled.len());
+            for entry in scheduled {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("execute-{phase}:{}", entry.request_id));
+                outputs.push(ExecutorStepResult::new(
+                    entry,
+                    ExecutorOutput {
+                        request_id: entry.request_id.clone(),
+                        audio: None,
+                        text: None,
+                        input_transcription: None,
+                        tokens_processed: entry.num_tokens,
+                        tokens_generated: 0,
+                        finished: false,
+                        phase_timing_override: None,
+                        asr_diagnostics: None,
+                        error: None,
+                    },
+                ));
+            }
+            outputs
+        }
+    }
+
+    impl ModelExecutor for DeadlineCleanupExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            profile.cache_mode = super::super::execution::CacheMode::ExternalPaged;
+            profile.cache_release_safe = true;
+            profile.prefix_reuse_safe = true;
+            profile.resolved_from_loaded_model = true;
+            Some(profile)
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.execute_phase("prefill", scheduled))
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.execute_phase("decode", scheduled))
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_session(
+            &self,
+            session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("cleanup:{}:{}", session.request_id, session.epoch));
+            if self.confirm_cleanup {
+                super::super::executor::CacheReleaseReport::confirmed(1)
+            } else {
+                super::super::executor::CacheReleaseReport::unconfirmed()
+            }
         }
     }
 
@@ -2524,6 +2670,128 @@ mod tests {
             1,
             "deadline cleanup must occur exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn deadline_cleanup_precedes_newly_scheduled_execution() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(
+            events.clone(),
+            true,
+        )));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                min_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 2,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut expired = EngineCoreRequest::tts("expires after prefill");
+        expired.id = "expired-running".to_string();
+        expired.prompt_tokens = vec![1];
+        core.add_request(expired).unwrap();
+        core.step().await.unwrap();
+        assert!(core.scheduler.set_hard_deadline_for_test(
+            &"expired-running".to_string(),
+            Instant::now() - std::time::Duration::from_millis(1),
+        ));
+
+        let mut next = EngineCoreRequest::tts("new work");
+        next.id = "new-work".to_string();
+        next.prompt_tokens = vec![2];
+        core.add_request(next).unwrap();
+        core.step().await.unwrap();
+
+        let events = events.lock().unwrap();
+        let cleanup_index = events
+            .iter()
+            .position(|event| event.starts_with("cleanup:expired-running:"))
+            .expect("expired session cleanup was not requested");
+        let execution_index = events
+            .iter()
+            .position(|event| event == "execute-prefill:new-work")
+            .expect("new work was not executed");
+        assert!(
+            cleanup_index < execution_index,
+            "new work executed before expired cache cleanup: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("cleanup:expired-running:"))
+                .count(),
+            1,
+            "expired cleanup must not be repeated during terminal processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_deadline_cleanup_quarantines_scarce_logical_block() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(
+            events.clone(),
+            false,
+        )));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                min_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_chunked_prefill: false,
+                enable_prefix_caching: true,
+                enable_adaptive_batching: false,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut expired = EngineCoreRequest::tts("owns the only block");
+        expired.id = "expired-running".to_string();
+        expired.prompt_tokens = vec![1];
+        core.add_request(expired).unwrap();
+        core.step().await.unwrap();
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+        assert!(core.scheduler.set_hard_deadline_for_test(
+            &"expired-running".to_string(),
+            Instant::now() - std::time::Duration::from_millis(1),
+        ));
+
+        let mut waiting = EngineCoreRequest::tts("waits for capacity");
+        waiting.id = "waiting".to_string();
+        waiting.prompt_tokens = vec![1];
+        core.add_request(waiting).unwrap();
+        let outputs = core.step().await.unwrap();
+
+        assert!(outputs.iter().any(|output| {
+            output.request_id == "expired-running"
+                && output.error.as_deref() == Some(REQUEST_DEADLINE_EXCEEDED)
+        }));
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+        assert_eq!(core.pending_request_count(), 1);
+        assert!(core.step().await.unwrap().is_empty());
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event != "execute-prefill:waiting"));
+
+        let mut reused = EngineCoreRequest::tts("must remain fenced");
+        reused.id = "expired-running".to_string();
+        reused.prompt_tokens = vec![3];
+        assert!(core.add_request(reused).is_err());
     }
 
     #[tokio::test]
