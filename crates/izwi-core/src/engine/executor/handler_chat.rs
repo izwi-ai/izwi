@@ -237,7 +237,6 @@ impl NativeExecutor {
             ActiveChatDecode {
                 variant,
                 state: decode_state,
-                prompt_accounted: false,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
             }
@@ -305,10 +304,6 @@ impl NativeExecutor {
         } else {
             decode_steps_ran.max(1)
         };
-        if !active_state.prompt_accounted {
-            active_state.prompt_accounted = true;
-        }
-
         if !finished {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {
                 Error::InferenceError("Chat decode state mutex poisoned".to_string())

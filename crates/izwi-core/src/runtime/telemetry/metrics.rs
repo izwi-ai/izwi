@@ -59,6 +59,9 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub kv_cache_allocated_blocks: u64,
     pub kv_cache_prefix_reuse_blocks_total: u64,
     pub stream_backpressure_total: u64,
+    pub tensor_batches_total: u64,
+    pub request_parallel_batches_total: u64,
+    pub tensor_batch_max_width: u64,
     pub kv_cache: EngineKvCacheRuntimeSnapshot,
 }
 

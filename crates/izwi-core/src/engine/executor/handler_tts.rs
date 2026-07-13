@@ -296,7 +296,6 @@ impl NativeExecutor {
                 ActiveQwenTtsDecode {
                     variant,
                     state: decode_state,
-                    prompt_accounted: false,
                     last_frames_generated: 0,
                     stream_sequence: 0,
                     audio_samples_accum: Vec::new(),
@@ -385,10 +384,6 @@ impl NativeExecutor {
             } else {
                 decode_steps_ran.max(1)
             };
-            if !active_state.prompt_accounted {
-                active_state.prompt_accounted = true;
-            }
-
             let postprocess_started = Instant::now();
             let finished_samples = if finished {
                 active_state.audio_samples_accum.clone()

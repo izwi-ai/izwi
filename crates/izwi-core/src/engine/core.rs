@@ -21,6 +21,7 @@ use super::executor::{
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
+use super::metrics::record_engine_batch_dispatch;
 use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{Scheduler, SchedulerConfig};
@@ -617,6 +618,11 @@ impl EngineCore {
         // internal one-token rounds makes completion fencing ambiguous. A future
         // continuous adapter must expose child quanta explicitly.
         let result = self.executor.execute_decode(request_refs, scheduled).await;
+        if let Ok(outputs) = &result {
+            if let Some(first) = outputs.first() {
+                record_engine_batch_dispatch(first.dispatch);
+            }
+        }
         Ok(Self::reconcile_executor_outputs(
             "decode", scheduled, result,
         ))
@@ -859,6 +865,11 @@ impl EngineCore {
             let mut outputs = Vec::new();
             for (refs, batch) in sub_batches {
                 let result = self.executor.execute_prefill(&refs, &batch).await;
+                if let Ok(executor_outputs) = &result {
+                    if let Some(first) = executor_outputs.first() {
+                        record_engine_batch_dispatch(first.dispatch);
+                    }
+                }
                 outputs.extend(Self::reconcile_executor_outputs("prefill", &batch, result));
             }
             Ok::<_, Error>((outputs, started.elapsed()))

@@ -1,6 +1,6 @@
 //! Model executor - handles forward pass execution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
@@ -84,6 +84,8 @@ pub struct WorkerConfig {
     pub logical_kv_block_bytes: u64,
     /// Maximum width of a model-native tensor batch on this backend.
     pub max_tensor_batch_size: usize,
+    /// Exact model variants enabled for static tensor execution on this worker.
+    pub static_tensor_batch_variants: Arc<HashSet<ModelVariant>>,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -107,6 +109,10 @@ impl std::fmt::Debug for WorkerConfig {
             )
             .field("logical_kv_block_bytes", &self.logical_kv_block_bytes)
             .field("max_tensor_batch_size", &self.max_tensor_batch_size)
+            .field(
+                "static_tensor_batch_variants",
+                &self.static_tensor_batch_variants.len(),
+            )
             .finish()
     }
 }
@@ -135,6 +141,7 @@ impl Default for WorkerConfig {
             resource_authority: None,
             logical_kv_block_bytes: 0,
             max_tensor_batch_size: 1,
+            static_tensor_batch_variants: Arc::new(HashSet::new()),
         }
     }
 }
@@ -162,6 +169,7 @@ impl From<&EngineCoreConfig> for WorkerConfig {
                 .max_batch_size
                 .min(Self::tensor_batch_cap(backend_kind))
                 .max(1),
+            static_tensor_batch_variants: Arc::new(HashSet::new()),
         }
     }
 }
@@ -662,7 +670,11 @@ fn cache_resource_vector(backend: BackendKind, bytes: u64) -> ResourceVector {
     resources
 }
 
-fn static_qwen_tts_batch_eligible(request: &EngineCoreRequest, loaded_has_speakers: bool) -> bool {
+fn static_qwen_tts_batch_eligible(
+    request: &EngineCoreRequest,
+    loaded_has_speakers: bool,
+    rollout_enabled: bool,
+) -> bool {
     matches!(request.task_type, super::types::TaskType::TTS)
         && !request.streaming
         && request.reference_audio.is_none()
@@ -672,6 +684,7 @@ fn static_qwen_tts_batch_eligible(request: &EngineCoreRequest, loaded_has_speake
             .and_then(|variant| variant.speech_capabilities())
             .is_some_and(|capabilities| capabilities.supports_builtin_voices)
         && loaded_has_speakers
+        && rollout_enabled
 }
 
 impl ModelExecutor for NativeExecutor {
@@ -733,7 +746,11 @@ impl ModelExecutor for NativeExecutor {
             .and_then(|registry| registry.try_get_qwen_tts(variant))
             .or_else(|| self.loaded_tts_model.clone())
             .is_some_and(|model| !model.available_speakers().is_empty());
-        let static_tts_batch = static_qwen_tts_batch_eligible(request, loaded_has_speakers);
+        let static_tts_batch = static_qwen_tts_batch_eligible(
+            request,
+            loaded_has_speakers,
+            self.config.static_tensor_batch_variants.contains(&variant),
+        );
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
         let implementation_incremental =
             loaded_incremental.unwrap_or_else(|| match request.task_type {
@@ -1108,19 +1125,20 @@ mod tests {
     fn static_tts_batch_eligibility_is_fail_closed() {
         let mut request = EngineCoreRequest::tts("hello")
             .with_model_variant(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
-        assert!(static_qwen_tts_batch_eligible(&request, true));
-        assert!(!static_qwen_tts_batch_eligible(&request, false));
+        assert!(static_qwen_tts_batch_eligible(&request, true, true));
+        assert!(!static_qwen_tts_batch_eligible(&request, true, false));
+        assert!(!static_qwen_tts_batch_eligible(&request, false, true));
 
         request.streaming = true;
-        assert!(!static_qwen_tts_batch_eligible(&request, true));
+        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
         request.streaming = false;
         request.reference_audio = Some("audio".to_string());
         request.reference_text = Some("reference".to_string());
-        assert!(!static_qwen_tts_batch_eligible(&request, true));
+        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
 
         let voice_design = EngineCoreRequest::tts("hello")
             .with_model_variant(ModelVariant::Qwen3Tts12Hz17BVoiceDesign);
-        assert!(!static_qwen_tts_batch_eligible(&voice_design, true));
+        assert!(!static_qwen_tts_batch_eligible(&voice_design, true, true));
     }
 
     #[test]

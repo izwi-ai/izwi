@@ -157,7 +157,6 @@ impl NativeExecutor {
                         ActiveAsrDecode {
                             variant,
                             state: decode_state,
-                            prompt_accounted: false,
                             last_tokens_generated: 0,
                             stream_sequence: 0,
                             input_sample_rate: sample_rate,
@@ -223,10 +222,6 @@ impl NativeExecutor {
                     } else {
                         decode_steps_ran.max(1)
                     };
-                    if !active_state.prompt_accounted {
-                        active_state.prompt_accounted = true;
-                    }
-
                     let input_sample_rate = active_state.input_sample_rate;
                     let input_sample_count = active_state.input_sample_count;
 

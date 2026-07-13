@@ -19,9 +19,12 @@ use crate::backends::{
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, ResourceAmount, ResourceLease, ResourceVector, SessionKey, StreamingOutput,
-    TaskType, WorkerConfig, WorkloadClass, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    engine_request_parallel_batches_total, engine_stream_backpressure_total,
+    engine_tensor_batch_max_width, engine_tensor_batches_total, Engine as CoreEngine,
+    EngineCoreConfig, EngineCoreRequest, EngineOutput, ResourceAmount, ResourceLease,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
     ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
     ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
@@ -43,6 +46,7 @@ use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobSpec,
 };
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
+use crate::runtime::rollout::ExecutionRolloutPolicy;
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
     push_engine_metric, push_engine_metric_f64, EngineKvCacheRuntimeSnapshot,
@@ -250,6 +254,18 @@ impl RuntimeService {
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
+        let execution_rollout = ExecutionRolloutPolicy::from_env();
+        worker_config.static_tensor_batch_variants = Arc::new(
+            ModelVariant::all()
+                .iter()
+                .copied()
+                .filter(|variant| {
+                    execution_rollout
+                        .mode_for(*variant, selected_backend_kind)
+                        .executes()
+                })
+                .collect(),
+        );
         let execution_parallelism = worker_config.request_parallelism;
         let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
@@ -1231,6 +1247,9 @@ impl RuntimeService {
             kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
             kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
             stream_backpressure_total,
+            tensor_batches_total: engine_tensor_batches_total(),
+            request_parallel_batches_total: engine_request_parallel_batches_total(),
+            tensor_batch_max_width: engine_tensor_batch_max_width(),
             kv_cache: kv_cache_snapshot,
         }
     }
@@ -1326,6 +1345,21 @@ impl RuntimeService {
             payload,
             ENGINE_STREAM_BACKPRESSURE_TOTAL,
             snapshot.stream_backpressure_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
+            snapshot.tensor_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
+            snapshot.request_parallel_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
+            snapshot.tensor_batch_max_width,
         );
     }
 
@@ -1562,6 +1596,9 @@ mod tests {
         assert!(payload.contains("allocated logical KV-cache blocks"));
         assert!(payload.contains("Estimated KV-cache bytes"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_request_parallel_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_batch_max_width"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));

@@ -247,4 +247,25 @@ mod tests {
 
         assert!(err.to_string().contains("Duplicate"));
     }
+
+    #[test]
+    fn static_tts_rollout_never_leaks_across_backends() {
+        let model = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let override_value = format!("{}@metal=static", model);
+        let policy = ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value))
+            .expect("valid exact rollout");
+
+        assert_eq!(
+            policy.mode_for(model, BackendKind::Metal),
+            ExecutionRolloutMode::Static
+        );
+        assert_eq!(
+            policy.mode_for(model, BackendKind::Cpu),
+            ExecutionRolloutMode::Off
+        );
+        assert_eq!(
+            policy.mode_for(model, BackendKind::Cuda),
+            ExecutionRolloutMode::Off
+        );
+    }
 }

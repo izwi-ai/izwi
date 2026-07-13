@@ -149,6 +149,9 @@ run_cargo_cpu() {
 
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
+    cargo test --locked -p izwi-core engine::execution --lib
+    cargo test --locked -p izwi-core engine::executor::tests --lib
+    cargo test --locked -p izwi-core runtime::rollout --lib
 }
 
 run_cargo_metal() {
@@ -162,6 +165,9 @@ run_cargo_metal() {
     cargo check --locked -p izwi-core --features metal
     cargo check --locked -p izwi-cli --features metal
     cargo test --locked -p izwi-core --features metal runtime::coordinator --lib
+    cargo test --locked -p izwi-core --features metal engine::execution --lib
+    cargo test --locked -p izwi-core --features metal engine::executor::tests --lib
+    cargo test --locked -p izwi-core --features metal runtime::rollout --lib
 }
 
 run_cargo_cuda() {
@@ -179,6 +185,9 @@ run_cargo_cuda() {
 
     cargo check --locked -p izwi-cli --features "${cuda_features}"
     cargo check --locked -p izwi-server --features "${cuda_features}"
+    cargo test --locked -p izwi-core --features "${cuda_features}" engine::execution --lib --no-run
+    cargo test --locked -p izwi-core --features "${cuda_features}" engine::executor::tests --lib --no-run
+    cargo test --locked -p izwi-core --features "${cuda_features}" runtime::rollout --lib --no-run
 }
 
 run_docker_cpu() {

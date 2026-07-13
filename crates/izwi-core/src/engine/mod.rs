@@ -58,9 +58,12 @@ pub use kv_cache::{
     PinnedBlockHandle,
 };
 pub use metrics::{
-    engine_metric_catalog, engine_stream_backpressure_total, prometheus_engine_metric_name,
+    engine_metric_catalog, engine_request_parallel_batches_total, engine_stream_backpressure_total,
+    engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
     prometheus_engine_metric_type, BenchmarkResult, EngineMetricDescriptor, MetricsCollector,
-    MetricsSnapshot, ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    MetricsSnapshot, ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
     ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
     ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
