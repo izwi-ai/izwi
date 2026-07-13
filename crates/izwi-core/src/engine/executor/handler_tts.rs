@@ -8,6 +8,7 @@ use crate::models::architectures::qwen3::tts::{
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
+use super::super::{ExecutionMode, NativeBatchMode};
 use super::state::ActiveQwenTtsDecode;
 use super::{
     decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult,
@@ -58,6 +59,21 @@ impl NativeExecutor {
             .iter()
             .any(|request| request.model_variant != variant)
         {
+            return None;
+        }
+        if ordered.iter().any(|request| {
+            <NativeExecutor as super::ModelExecutor>::execution_profile(self, request).is_none_or(
+                |profile| {
+                    profile.mode != ExecutionMode::Atomic
+                        || profile.prefill_batch != NativeBatchMode::Static
+                },
+            )
+        }) {
+            // The atomic tensor API is valid only when the exact model/backend
+            // rollout produced a static execution plan. In particular, an
+            // ordinary singleton Qwen request must stay on its incremental
+            // sequence adapter instead of generating a full utterance against
+            // a one-step sequence plan.
             return None;
         }
         let speakers = match self.with_qwen_model(variant, |model| {
@@ -425,5 +441,40 @@ impl NativeExecutor {
                 error: None,
             }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{InputRange, SequencePhase, WorkUnit};
+    use crate::model::ModelVariant;
+
+    #[test]
+    fn default_qwen_tts_profile_never_enters_atomic_batch_dispatch() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let mut request = EngineCoreRequest::tts("hello from the sequence adapter");
+        request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: request.num_prompt_tokens().max(1),
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange {
+                    start: 0,
+                    end: request.num_prompt_tokens(),
+                },
+                max_output_steps: 1,
+            },
+        };
+
+        assert!(executor
+            .try_qwen_tts_batch(&[&request], &[scheduled])
+            .is_none());
     }
 }

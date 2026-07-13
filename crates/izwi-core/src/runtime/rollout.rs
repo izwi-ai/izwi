@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+use tracing::warn;
 
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, ModelVariant};
@@ -31,7 +32,10 @@ impl ExecutionRolloutMode {
             "off" => Ok(Self::Off),
             "shadow" => Ok(Self::Shadow),
             "static" => Ok(Self::Static),
-            "continuous" => Ok(Self::Continuous),
+            "continuous" => Err(Error::InvalidInput(
+                "Continuous execution rollout is not implemented; use `off`, `shadow`, or an exact model@backend=static override"
+                    .to_string(),
+            )),
             value => Err(Error::InvalidInput(format!(
                 "Unsupported execution rollout mode `{value}`"
             ))),
@@ -43,7 +47,7 @@ impl ExecutionRolloutMode {
     }
 
     pub(crate) fn executes(self) -> bool {
-        matches!(self, Self::Static | Self::Continuous)
+        matches!(self, Self::Static)
     }
 
     pub(crate) fn continuous_batching(self) -> bool {
@@ -69,7 +73,13 @@ impl ExecutionRolloutPolicy {
     pub(crate) fn from_env() -> Self {
         let default = std::env::var(EXECUTION_ROLLOUT_ENV).ok();
         let overrides = std::env::var(EXECUTION_ROLLOUT_OVERRIDES_ENV).ok();
-        Self::try_from_raw(default.as_deref(), overrides.as_deref()).unwrap_or_default()
+        match Self::try_from_raw(default.as_deref(), overrides.as_deref()) {
+            Ok(policy) => policy,
+            Err(err) => {
+                warn!(error = %err, "Ignoring invalid execution rollout configuration");
+                Self::default()
+            }
+        }
     }
 
     pub(crate) fn try_from_raw(default: Option<&str>, overrides: Option<&str>) -> Result<Self> {
@@ -182,7 +192,7 @@ mod tests {
         assert!(!ExecutionRolloutMode::Static.continuous_batching());
 
         assert!(ExecutionRolloutMode::Continuous.observes());
-        assert!(ExecutionRolloutMode::Continuous.executes());
+        assert!(!ExecutionRolloutMode::Continuous.executes());
         assert!(ExecutionRolloutMode::Continuous.continuous_batching());
     }
 
@@ -190,7 +200,7 @@ mod tests {
     fn exact_model_backend_override_wins_over_default() {
         let policy = ExecutionRolloutPolicy::try_from_raw(
             Some("shadow"),
-            Some("Qwen3-0.6B@cuda=continuous,Qwen3-0.6B@metal=static"),
+            Some("Qwen3-0.6B@metal=static"),
         )
         .expect("valid rollout policy");
 
@@ -204,7 +214,7 @@ mod tests {
         );
         assert_eq!(
             policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cuda),
-            ExecutionRolloutMode::Continuous
+            ExecutionRolloutMode::Shadow
         );
     }
 
@@ -238,10 +248,21 @@ mod tests {
     }
 
     #[test]
+    fn continuous_override_is_rejected_until_an_adapter_exists() {
+        let err = ExecutionRolloutPolicy::try_from_raw(
+            Some("off"),
+            Some("Qwen3-0.6B@cuda=continuous"),
+        )
+        .expect_err("continuous batching must remain fail closed");
+
+        assert!(err.to_string().contains("not implemented"));
+    }
+
+    #[test]
     fn duplicate_override_is_rejected_instead_of_using_order() {
         let err = ExecutionRolloutPolicy::try_from_raw(
             Some("off"),
-            Some("Qwen3-0.6B@cpu=static,Qwen3-0.6B@cpu=continuous"),
+            Some("Qwen3-0.6B@cpu=static,Qwen3-0.6B@cpu=static"),
         )
         .expect_err("duplicate override must fail closed");
 
