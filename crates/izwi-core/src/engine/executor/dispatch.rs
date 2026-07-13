@@ -10,6 +10,7 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::TaskType;
 use super::{ExecutorOutput, ExecutorStepResult, ModelSessionResult, NativeExecutor};
+use crate::engine::{BatchDispatch, BatchDispatchKind};
 
 type RouteHandler =
     fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ModelSessionResult>;
@@ -217,23 +218,42 @@ impl NativeExecutor {
         // allocated. The lease remains attached to the exact session until
         // finish, abort, failure cleanup, or recompute preemption.
         self.reserve_scheduled_cache(requests, scheduled)?;
-        let outputs = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled) {
-            result?
-                .into_iter()
-                .map(ModelSessionResult::atomic)
-                .collect()
+        let (outputs, dispatch) = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled)
+        {
+            let result = result?;
+            let dispatch = if result.tensor_width > 1 {
+                BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width)
+            } else {
+                BatchDispatch::serial()
+            };
+            (
+                result
+                    .outputs
+                    .into_iter()
+                    .map(ModelSessionResult::atomic)
+                    .collect(),
+                dispatch,
+            )
         } else if self.can_parallelize_requests(scheduled.len()) {
-            self.execute_requests_parallel(requests, scheduled)?
+            (
+                self.execute_requests_parallel(requests, scheduled)?,
+                BatchDispatch::new(BatchDispatchKind::RequestParallel, scheduled.len()),
+            )
         } else {
-            scheduled
-                .iter()
-                .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
-                .collect()
+            (
+                scheduled
+                    .iter()
+                    .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
+                    .collect(),
+                BatchDispatch::serial(),
+            )
         };
         Ok(scheduled
             .iter()
             .zip(outputs)
-            .map(|(scheduled, output)| ExecutorStepResult::from_session(scheduled, output))
+            .map(|(scheduled, output)| {
+                ExecutorStepResult::from_session(scheduled, output).with_dispatch(dispatch)
+            })
             .collect())
     }
 }

@@ -157,6 +157,13 @@ pub struct BatchedSpeakerOutput {
     pub frames_generated: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchedSpeakerGeneration {
+    pub outputs: Vec<BatchedSpeakerOutput>,
+    /// Largest exact-shape group that actually entered a tensor batch.
+    pub max_tensor_batch_width: usize,
+}
+
 impl TtsGenerationParams {
     /// Convert external generation config to TTS sampling params.
     pub fn from_generation_config(cfg: &crate::runtime::GenerationConfig) -> Self {
@@ -534,9 +541,12 @@ impl Qwen3TtsModel {
     pub fn generate_with_speaker_params_batch(
         &self,
         requests: &[BatchedSpeakerRequest],
-    ) -> Result<Vec<BatchedSpeakerOutput>> {
+    ) -> Result<BatchedSpeakerGeneration> {
         if requests.is_empty() {
-            return Ok(Vec::new());
+            return Ok(BatchedSpeakerGeneration {
+                outputs: Vec::new(),
+                max_tensor_batch_width: 0,
+            });
         }
 
         #[derive(Debug)]
@@ -620,12 +630,14 @@ impl Qwen3TtsModel {
         }
 
         let mut outputs: Vec<Option<BatchedSpeakerOutput>> = vec![None; requests.len()];
+        let mut max_tensor_batch_width = 0usize;
 
         for (_prefill_len, group) in groups {
             let batch_size = group.len();
             if batch_size == 0 {
                 continue;
             }
+            max_tensor_batch_width = max_tensor_batch_width.max(batch_size);
 
             let embeds: Vec<Tensor> = group.iter().map(|req| req.prefill_embeds.clone()).collect();
             let batch_embeds = Tensor::cat(&embeds, 0)?;
@@ -785,14 +797,17 @@ impl Qwen3TtsModel {
             }
         }
 
-        Ok(outputs
-            .into_iter()
-            .map(|out| {
-                out.ok_or_else(|| {
-                    Error::InferenceError("Missing output for batched request".to_string())
+        Ok(BatchedSpeakerGeneration {
+            outputs: outputs
+                .into_iter()
+                .map(|out| {
+                    out.ok_or_else(|| {
+                        Error::InferenceError("Missing output for batched request".to_string())
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?)
+                .collect::<Result<Vec<_>>>()?,
+            max_tensor_batch_width,
+        })
     }
 
     /// Generate speech with voice cloning

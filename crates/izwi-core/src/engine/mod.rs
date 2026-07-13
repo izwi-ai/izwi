@@ -42,11 +42,12 @@ mod types;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
-    BatchKey, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
-    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan, ExecutionProfile,
-    ExecutionReport, ExecutionState, ExecutionTracker, FailureKind, FailureScope, FinishReason,
-    HealthImpact, InputRange, NativeBatchMode, PlanId, PrefillMode, RetryDisposition,
-    SequencePhase, SessionEpoch, SessionKey, TerminalOutcome, WorkUnit, YieldReason,
+    BatchDispatch, BatchDispatchKind, BatchKey, CacheMode, CancellationGranularity,
+    ConcurrencyClass, ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode,
+    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
+    FailureKind, FailureScope, FinishReason, HealthImpact, InputRange, NativeBatchMode, PlanId,
+    PrefillMode, RetryDisposition, SequencePhase, SessionEpoch, SessionKey, TerminalOutcome,
+    WorkUnit, YieldReason,
 };
 pub use executor::{
     ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, WorkerConfig,

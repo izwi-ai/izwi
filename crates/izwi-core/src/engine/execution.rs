@@ -115,6 +115,42 @@ pub enum NativeBatchMode {
     Continuous,
 }
 
+/// Observed dispatch mechanism for one executor report. Request-parallel work
+/// is intentionally distinct from a model tensor batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchDispatchKind {
+    #[default]
+    Serial,
+    RequestParallel,
+    TensorStatic,
+    TensorContinuous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchDispatch {
+    pub kind: BatchDispatchKind,
+    pub width: usize,
+}
+
+impl BatchDispatch {
+    pub const fn serial() -> Self {
+        Self {
+            kind: BatchDispatchKind::Serial,
+            width: 1,
+        }
+    }
+
+    pub const fn new(kind: BatchDispatchKind, width: usize) -> Self {
+        Self { kind, width }
+    }
+}
+
+impl Default for BatchDispatch {
+    fn default() -> Self {
+        Self::serial()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
@@ -414,6 +450,8 @@ pub struct ExecutionPlan {
     pub session: SessionKey,
     pub work: WorkUnit,
     pub batch_key: BatchKey,
+    pub batch_mode: NativeBatchMode,
+    pub max_batch_size: usize,
     pub estimate: ResourceEstimate,
     pub reservation: Option<ResourceReservation>,
 }
@@ -425,6 +463,7 @@ pub struct ExecutionReport {
     pub input_consumed: usize,
     pub output_produced: usize,
     pub observed_resources: ResourceVector,
+    pub dispatch: BatchDispatch,
     pub elapsed: Duration,
     pub safe_point: bool,
     pub disposition: ExecutionDisposition,
@@ -436,6 +475,26 @@ impl ExecutionReport {
             return Err(Error::InferenceError(
                 "execution report does not match its plan".to_string(),
             ));
+        }
+        if self.dispatch.width == 0 || self.dispatch.width > plan.max_batch_size.max(1) {
+            return Err(Error::InferenceError(
+                "execution report has an invalid dispatch width".to_string(),
+            ));
+        }
+        match self.dispatch.kind {
+            BatchDispatchKind::TensorStatic if plan.batch_mode != NativeBatchMode::Static => {
+                return Err(Error::InferenceError(
+                    "executor reported an undeclared static tensor batch".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorContinuous
+                if plan.batch_mode != NativeBatchMode::Continuous =>
+            {
+                return Err(Error::InferenceError(
+                    "executor reported an undeclared continuous tensor batch".to_string(),
+                ));
+            }
+            _ => {}
         }
         match plan.work {
             WorkUnit::SequenceStep {
@@ -599,6 +658,8 @@ mod tests {
                 cache_namespace: "none".to_string(),
                 adapter_id: None,
             },
+            batch_mode: NativeBatchMode::None,
+            max_batch_size: 1,
             estimate: ResourceVector::default(),
             reservation: None,
         };
@@ -608,10 +669,34 @@ mod tests {
             input_consumed: 5,
             output_produced: 0,
             observed_resources: ResourceVector::default(),
+            dispatch: BatchDispatch::serial(),
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition: ExecutionDisposition::Progress,
         };
+        assert!(report.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn tensor_dispatch_must_match_declared_batch_contract() {
+        let mut plan = plan_for(
+            SessionKey::new("batch".to_string(), 1),
+            WorkUnit::AtomicJob {
+                kind: "tts".to_string(),
+            },
+        );
+        plan.batch_mode = NativeBatchMode::Static;
+        plan.max_batch_size = 2;
+        let mut report = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::TensorStatic, 2);
+        assert!(report.validate_against(&plan).is_ok());
+
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::TensorContinuous, 2);
+        assert!(report.validate_against(&plan).is_err());
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::TensorStatic, 3);
         assert!(report.validate_against(&plan).is_err());
     }
 
@@ -630,6 +715,8 @@ mod tests {
                 cache_namespace: "none".to_string(),
                 adapter_id: None,
             },
+            batch_mode: NativeBatchMode::None,
+            max_batch_size: 1,
             estimate: ResourceVector::zero(),
             reservation: None,
         }
@@ -642,6 +729,7 @@ mod tests {
             input_consumed: 0,
             output_produced: 0,
             observed_resources: ResourceVector::zero(),
+            dispatch: BatchDispatch::serial(),
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition,

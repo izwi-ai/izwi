@@ -25,7 +25,7 @@ mod streaming;
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
+    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
     ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile, FailureKind,
     FailureScope, FinishReason, HealthImpact, NativeBatchMode, PlanId, PrefillMode,
     RetryDisposition, SessionKey, YieldReason,
@@ -82,6 +82,8 @@ pub struct WorkerConfig {
     pub resource_authority: Option<Arc<ResourceAuthority>>,
     /// Conservative bytes represented by one scheduler logical KV block.
     pub logical_kv_block_bytes: u64,
+    /// Maximum width of a model-native tensor batch on this backend.
+    pub max_tensor_batch_size: usize,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -104,6 +106,7 @@ impl std::fmt::Debug for WorkerConfig {
                 &self.resource_authority.as_ref().map(|_| "<shared>"),
             )
             .field("logical_kv_block_bytes", &self.logical_kv_block_bytes)
+            .field("max_tensor_batch_size", &self.max_tensor_batch_size)
             .finish()
     }
 }
@@ -131,6 +134,7 @@ impl Default for WorkerConfig {
             model_registry: None,
             resource_authority: None,
             logical_kv_block_bytes: 0,
+            max_tensor_batch_size: 1,
         }
     }
 }
@@ -154,11 +158,22 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             resource_authority: None,
             logical_kv_block_bytes: (config.kv_cache_memory_bytes() / config.max_blocks.max(1))
                 as u64,
+            max_tensor_batch_size: config
+                .max_batch_size
+                .min(Self::tensor_batch_cap(backend_kind))
+                .max(1),
         }
     }
 }
 
 impl WorkerConfig {
+    fn tensor_batch_cap(backend: BackendKind) -> usize {
+        match backend {
+            BackendKind::Cpu | BackendKind::Metal => 2,
+            BackendKind::Cuda => 8,
+        }
+    }
+
     fn request_parallelism_override() -> Option<usize> {
         std::env::var("IZWI_REQUEST_PARALLELISM")
             .ok()
@@ -360,6 +375,7 @@ pub struct ExecutorStepResult {
     pub session: SessionKey,
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
+    pub dispatch: BatchDispatch,
     pub output: ExecutorOutput,
 }
 
@@ -381,8 +397,14 @@ impl ExecutorStepResult {
             session: scheduled.session_key(),
             disposition: session_result.disposition,
             safe_point: session_result.safe_point,
+            dispatch: BatchDispatch::serial(),
             output: session_result.output,
         }
+    }
+
+    pub fn with_dispatch(mut self, dispatch: BatchDispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 }
 
@@ -640,6 +662,18 @@ fn cache_resource_vector(backend: BackendKind, bytes: u64) -> ResourceVector {
     resources
 }
 
+fn static_qwen_tts_batch_eligible(request: &EngineCoreRequest, loaded_has_speakers: bool) -> bool {
+    matches!(request.task_type, super::types::TaskType::TTS)
+        && !request.streaming
+        && request.reference_audio.is_none()
+        && request.reference_text.is_none()
+        && request
+            .model_variant
+            .and_then(|variant| variant.speech_capabilities())
+            .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+        && loaded_has_speakers
+}
+
 impl ModelExecutor for NativeExecutor {
     fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
         let variant = request.model_variant?;
@@ -692,6 +726,14 @@ impl ModelExecutor for NativeExecutor {
                 .and_then(|registry| registry.try_get_audio_chat(variant))
                 .map(|_| false),
         };
+        let loaded_has_speakers = self
+            .config
+            .model_registry
+            .as_ref()
+            .and_then(|registry| registry.try_get_qwen_tts(variant))
+            .or_else(|| self.loaded_tts_model.clone())
+            .is_some_and(|model| !model.available_speakers().is_empty());
+        let static_tts_batch = static_qwen_tts_batch_eligible(request, loaded_has_speakers);
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
         let implementation_incremental =
             loaded_incremental.unwrap_or_else(|| match request.task_type {
@@ -733,13 +775,25 @@ impl ModelExecutor for NativeExecutor {
             profile.cancellation = CancellationGranularity::OperationBoundary;
         }
 
-        // Full-generation TTS batching cannot share a sequence transaction yet:
-        // it may produce more frames than the scheduled decode quantum. Phase 8
-        // re-enables this only with atomic batch plans and tensor-batch reports.
-        profile.prefill_batch = NativeBatchMode::None;
-        profile.decode_batch = NativeBatchMode::None;
-        profile.concurrency = ConcurrencyClass::Exclusive;
-        profile.max_batch_size = 1;
+        if static_tts_batch {
+            // Preset-speaker Qwen TTS owns a real model tensor-batch API. It is
+            // an atomic full-generation operation, not a continuous sequence.
+            profile.mode = ExecutionMode::Atomic;
+            profile.prefill = PrefillMode::None;
+            profile.incremental_decode = false;
+            profile.cache_mode = CacheMode::None;
+            profile.recompute_safe = false;
+            profile.cache_release_safe = false;
+            profile.prefill_batch = NativeBatchMode::Static;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
+        } else {
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::None;
+            profile.concurrency = ConcurrencyClass::Exclusive;
+            profile.max_batch_size = 1;
+        }
         Some(profile)
     }
 
@@ -1044,6 +1098,32 @@ mod tests {
     }
 
     #[test]
+    fn tensor_batch_caps_are_backend_conservative() {
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 2);
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 2);
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 8);
+    }
+
+    #[test]
+    fn static_tts_batch_eligibility_is_fail_closed() {
+        let mut request = EngineCoreRequest::tts("hello")
+            .with_model_variant(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+        assert!(static_qwen_tts_batch_eligible(&request, true));
+        assert!(!static_qwen_tts_batch_eligible(&request, false));
+
+        request.streaming = true;
+        assert!(!static_qwen_tts_batch_eligible(&request, true));
+        request.streaming = false;
+        request.reference_audio = Some("audio".to_string());
+        request.reference_text = Some("reference".to_string());
+        assert!(!static_qwen_tts_batch_eligible(&request, true));
+
+        let voice_design = EngineCoreRequest::tts("hello")
+            .with_model_variant(ModelVariant::Qwen3Tts12Hz17BVoiceDesign);
+        assert!(!static_qwen_tts_batch_eligible(&voice_design, true));
+    }
+
+    #[test]
     fn exact_session_cleanup_releases_backend_cache_lease_once() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let capacity = cache_resource_vector(backend, 4096);
@@ -1213,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn native_batch_capability_stays_disabled_until_batch_plans_are_transactional() {
+    fn unloaded_models_cannot_claim_native_batch_capability() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let mut config = WorkerConfig::default();
             config.backend = backend;
@@ -1226,6 +1306,7 @@ mod tests {
             assert_eq!(profile.mode, ExecutionMode::Sequence);
             assert_eq!(profile.prefill, PrefillMode::Full);
             assert!(!profile.capabilities().native_batch);
+            assert_eq!(profile.decode_batch, NativeBatchMode::None);
             assert_eq!(profile.max_batch_size, 1);
             request.streaming = true;
             assert!(!executor.execution_capabilities(&request).native_batch);

@@ -13,7 +13,8 @@ use tracing::{debug, info, warn};
 use super::config::EngineCoreConfig;
 use super::execution::{
     BatchKey, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, PrefillMode, WorkUnit,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, NativeBatchMode,
+    PrefillMode, WorkUnit,
 };
 use super::executor::{
     ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
@@ -237,6 +238,12 @@ impl EngineCore {
                     .unwrap_or_else(|| "none".to_string()),
                 adapter_id: None,
             },
+            batch_mode: if scheduled.is_prefill {
+                profile.prefill_batch
+            } else {
+                profile.decode_batch
+            },
+            max_batch_size: profile.max_batch_size.max(1),
             estimate: ResourceVector::zero(),
             reservation: None,
         };
@@ -287,6 +294,7 @@ impl EngineCore {
             input_consumed: output.tokens_processed,
             output_produced: output.tokens_generated,
             observed_resources: ResourceVector::zero(),
+            dispatch: result.dispatch,
             elapsed: std::time::Duration::ZERO,
             safe_point: result.safe_point,
             disposition: result.disposition.clone(),
@@ -320,6 +328,7 @@ impl EngineCore {
                 input_consumed: 0,
                 output_produced: 0,
                 observed_resources: ResourceVector::zero(),
+                dispatch: result.dispatch,
                 elapsed: std::time::Duration::ZERO,
                 safe_point: true,
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
@@ -363,16 +372,25 @@ impl EngineCore {
             request_by_id.insert(req.id.as_str(), *req);
         }
 
-        let mut groups: Vec<(BatchKey, Vec<super::scheduler::ScheduledRequest>)> = Vec::new();
+        let mut groups: Vec<(
+            BatchKey,
+            NativeBatchMode,
+            usize,
+            Vec<super::scheduler::ScheduledRequest>,
+        )> = Vec::new();
 
         for item in scheduled {
             if !request_by_id.contains_key(item.request_id.as_str()) {
                 continue;
             }
-            let Some(key) = self
-                .active_plans
-                .get(&item.plan_id)
-                .map(|plan| plan.batch_key.clone())
+            let Some((key, batch_mode, max_batch_size)) =
+                self.active_plans.get(&item.plan_id).map(|plan| {
+                    (
+                        plan.batch_key.clone(),
+                        plan.batch_mode,
+                        plan.max_batch_size.max(1),
+                    )
+                })
             else {
                 warn!(
                     plan_id = item.plan_id,
@@ -381,15 +399,26 @@ impl EngineCore {
                 );
                 continue;
             };
-            if let Some((_, bucket)) = groups.iter_mut().find(|(group_key, _)| *group_key == key) {
+            if batch_mode == NativeBatchMode::None {
+                groups.push((key, batch_mode, 1, vec![item.clone()]));
+            } else if let Some((_, _, _, bucket)) =
+                groups
+                    .iter_mut()
+                    .find(|(group_key, group_mode, group_max, bucket)| {
+                        *group_key == key
+                            && *group_mode == batch_mode
+                            && *group_max == max_batch_size
+                            && bucket.len() < max_batch_size
+                    })
+            {
                 bucket.push(item.clone());
             } else {
-                groups.push((key, vec![item.clone()]));
+                groups.push((key, batch_mode, max_batch_size, vec![item.clone()]));
             }
         }
 
         let mut outputs = Vec::new();
-        for (_, bucket) in groups {
+        for (_, _, _, bucket) in groups {
             let mut bucket_refs = Vec::with_capacity(bucket.len());
             let mut seen = HashSet::new();
             for item in &bucket {
@@ -585,8 +614,8 @@ impl EngineCore {
         scheduled: &[super::scheduler::ScheduledRequest],
     ) -> Result<Vec<ExecutorStepResult>> {
         // A scheduler plan is dispatched exactly once. Reusing one plan ID for
-        // internal one-token rounds makes completion fencing ambiguous; native
-        // continuous batching will expose child quanta explicitly in Phase 8.
+        // internal one-token rounds makes completion fencing ambiguous. A future
+        // continuous adapter must expose child quanta explicitly.
         let result = self.executor.execute_decode(request_refs, scheduled).await;
         Ok(Self::reconcile_executor_outputs(
             "decode", scheduled, result,
@@ -1185,7 +1214,7 @@ mod tests {
         ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor,
     };
     use super::super::scheduler::ScheduledRequest;
-    use super::super::types::{AudioOutput, Priority};
+    use super::super::types::{AudioOutput, Priority, TaskType};
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -1680,6 +1709,75 @@ mod tests {
         assert_eq!(merged.tokens_processed, 2);
         assert_eq!(merged.tokens_generated, 2);
         assert!(merged.finished);
+    }
+
+    #[test]
+    fn compatible_subbatches_respect_declared_mode_and_width() {
+        fn install_plan(
+            core: &mut EngineCore,
+            scheduled: &ScheduledRequest,
+            mode: NativeBatchMode,
+            max_batch_size: usize,
+        ) {
+            core.active_plans.insert(
+                scheduled.plan_id,
+                ExecutionPlan {
+                    plan_id: scheduled.plan_id,
+                    session: scheduled.session_key(),
+                    work: scheduled.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::TTS,
+                        work_kind: "tts".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter_id: None,
+                    },
+                    batch_mode: mode,
+                    max_batch_size,
+                    estimate: ResourceVector::zero(),
+                    reservation: None,
+                },
+            );
+        }
+
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        let mut requests = Vec::new();
+        let mut scheduled = Vec::new();
+        for index in 0..3 {
+            let id = format!("batch-{index}");
+            let mut request = EngineCoreRequest::tts("hello");
+            request.id = id.clone();
+            requests.push(request);
+            scheduled.push(scheduled_prefill(&id, index));
+        }
+        let refs = requests.iter().collect::<Vec<_>>();
+
+        for item in &scheduled {
+            install_plan(&mut core, item, NativeBatchMode::None, 8);
+        }
+        let serial = core.build_compatible_subbatches(&refs, &scheduled);
+        assert_eq!(serial.len(), 3);
+        assert!(serial.iter().all(|(_, batch)| batch.len() == 1));
+
+        core.active_plans.clear();
+        for item in &scheduled {
+            install_plan(&mut core, item, NativeBatchMode::Static, 2);
+        }
+        let static_batches = core.build_compatible_subbatches(&refs, &scheduled);
+        assert_eq!(
+            static_batches
+                .iter()
+                .map(|(_, batch)| batch.len())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
     }
 
     #[test]

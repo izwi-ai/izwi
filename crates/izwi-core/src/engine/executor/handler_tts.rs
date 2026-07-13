@@ -14,13 +14,18 @@ use super::{
     NativeExecutor,
 };
 
+pub(super) struct QwenTtsBatchResult {
+    pub(super) outputs: Vec<ExecutorOutput>,
+    pub(super) tensor_width: usize,
+}
+
 impl NativeExecutor {
     pub(super) fn try_qwen_tts_batch(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Option<Result<Vec<ExecutorOutput>>> {
-        if scheduled.len() < 2 || scheduled.iter().any(|item| !item.is_prefill) {
+    ) -> Option<Result<QwenTtsBatchResult>> {
+        if scheduled.is_empty() || scheduled.iter().any(|item| !item.is_prefill) {
             return None;
         }
         let mut ordered = Vec::with_capacity(scheduled.len());
@@ -30,6 +35,11 @@ impl NativeExecutor {
                 .copied()
                 .find(|request| request.id == item.request_id)?;
             if request.streaming
+                || request.is_cancelled()
+                || request
+                    .text
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty())
                 || request.reference_audio.is_some()
                 || request.reference_text.is_some()
                 || request.model_variant.map(|v| v.family())
@@ -50,6 +60,35 @@ impl NativeExecutor {
         {
             return None;
         }
+        let speakers = match self.with_qwen_model(variant, |model| {
+            Ok(model
+                .available_speakers()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>())
+        }) {
+            Ok(speakers) => speakers,
+            Err(err) => return Some(Err(err)),
+        };
+        if speakers.is_empty()
+            || ordered.iter().any(|request| {
+                request
+                    .params
+                    .speaker
+                    .as_deref()
+                    .or(request.params.voice.as_deref())
+                    .filter(|speaker| !speaker.trim().is_empty())
+                    .is_some_and(|requested| {
+                        !speakers
+                            .iter()
+                            .any(|speaker| speaker.eq_ignore_ascii_case(requested))
+                    })
+            })
+        {
+            // Let the per-request path isolate invalid speaker errors instead
+            // of poisoning otherwise valid members of a tensor batch.
+            return None;
+        }
         let max_batch_size =
             <NativeExecutor as super::ModelExecutor>::execution_capabilities(self, ordered[0])
                 .max_batch_size;
@@ -58,12 +97,6 @@ impl NativeExecutor {
         }
 
         Some(self.with_qwen_model(variant, |model| {
-            let speakers = model.available_speakers();
-            if speakers.is_empty() {
-                return Err(Error::InvalidInput(
-                    "Qwen TTS native batching requires a preset-speaker model".to_string(),
-                ));
-            }
             let batch = ordered
                 .iter()
                 .map(|request| BatchedSpeakerRequest {
@@ -83,17 +116,18 @@ impl NativeExecutor {
             let started = Instant::now();
             let generated =
                 Self::run_blocking(|| model.generate_with_speaker_params_batch(&batch))?;
-            let per_request_ms = started.elapsed().as_secs_f64() * 1000.0 / generated.len() as f64;
-            Ok(ordered
+            let per_request_ms =
+                started.elapsed().as_secs_f64() * 1000.0 / generated.outputs.len().max(1) as f64;
+            let outputs = ordered
                 .iter()
                 .zip(scheduled)
-                .zip(generated)
-                .map(|((request, scheduled), output)| ExecutorOutput {
+                .zip(generated.outputs)
+                .map(|((request, _scheduled), output)| ExecutorOutput {
                     request_id: request.id.clone(),
                     audio: Some(AudioOutput::new(output.samples, 24_000)),
                     text: None,
                     input_transcription: None,
-                    tokens_processed: scheduled.num_tokens,
+                    tokens_processed: request.num_prompt_tokens(),
                     tokens_generated: output.frames_generated,
                     finished: true,
                     phase_timing_override: Some(ExecutorPhaseTiming {
@@ -104,7 +138,11 @@ impl NativeExecutor {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .collect())
+                .collect();
+            Ok(QwenTtsBatchResult {
+                outputs,
+                tensor_width: generated.max_tensor_batch_width,
+            })
         }))
     }
 
