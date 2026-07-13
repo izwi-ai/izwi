@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
-use crate::engine::{AsrProgress, AsrProgressPhase, EngineCoreRequest};
+use crate::engine::{AsrProgress, AsrProgressPhase, EngineCoreRequest, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
@@ -23,6 +23,7 @@ use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
 };
+use crate::runtime::{CoordinatorLane, JobSpec};
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 #[derive(Clone, Copy)]
@@ -560,8 +561,27 @@ impl RuntimeService {
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
+            let job = JobSpec {
+                request_id: correlation_id
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                lane: CoordinatorLane::Atomic,
+                priority: runtime_context.priority,
+                workload_class: runtime_context.workload_class,
+                deadline: runtime_context.deadline,
+                resources: ResourceVector::default(),
+            };
             return self
-                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, |_delta| {})
+                .coordinator
+                .run_direct(job, async {
+                    self.asr_transcribe_audio_chat_bytes(
+                        variant,
+                        audio_bytes,
+                        max_tokens,
+                        |_delta| {},
+                    )
+                    .await
+                })
                 .await;
         }
 
@@ -717,8 +737,22 @@ impl RuntimeService {
                 Some(variant),
                 broker_streaming_required,
             )?;
+            let job = JobSpec {
+                request_id: correlation_id
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                lane: CoordinatorLane::Atomic,
+                priority: runtime_context.priority,
+                workload_class: runtime_context.workload_class,
+                deadline: runtime_context.deadline,
+                resources: ResourceVector::default(),
+            };
             return self
-                .asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, on_delta)
+                .coordinator
+                .run_direct(job, async {
+                    self.asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, on_delta)
+                        .await
+                })
                 .await;
         }
 
@@ -1455,17 +1489,28 @@ impl RuntimeService {
             Some(variant),
             false,
         )?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
-
-        let model = self
-            .model_registry
-            .get_asr(variant)
+        let context = RuntimeRequestContext::default();
+        let job = JobSpec {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            lane: CoordinatorLane::Atomic,
+            priority: context.priority,
+            workload_class: context.workload_class,
+            deadline: context.deadline,
+            resources: ResourceVector::default(),
+        };
+        self.coordinator
+            .run_direct(job, async {
+                self.load_model(variant).await?;
+                let _lease = self.acquire_model_residency_lease(variant);
+                let model = self
+                    .model_registry
+                    .get_asr(variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+                let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
+                model.force_align(&samples, sample_rate, reference_text, language)
+            })
             .await
-            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-
-        let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
-        model.force_align(&samples, sample_rate, reference_text, language)
     }
 }
 

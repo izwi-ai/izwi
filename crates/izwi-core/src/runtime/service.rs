@@ -19,7 +19,7 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    EngineOutput, ResourceVector, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
     ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
     ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
     ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
@@ -37,6 +37,7 @@ use crate::runtime::adapters::RuntimeAdapterRegistry;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
+use crate::runtime::coordinator::{CoordinatorLane, InferenceCoordinator, JobSpec};
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
@@ -79,6 +80,7 @@ pub struct RuntimeService {
     #[allow(dead_code)]
     pub(crate) streaming_config: StreamingConfig,
     pub(crate) core_engine: Arc<CoreEngine>,
+    pub(crate) coordinator: Arc<InferenceCoordinator>,
     telemetry: Arc<RuntimeTelemetryCollector>,
     completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
     step_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -193,7 +195,13 @@ impl RuntimeService {
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
+        let execution_parallelism = worker_config.request_parallelism;
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
+        let coordinator = Arc::new(InferenceCoordinator::new(
+            selected_backend_kind,
+            execution_parallelism,
+            config.max_batch_size.max(1).saturating_mul(16).max(64),
+        ));
 
         Ok(Self {
             config,
@@ -206,6 +214,7 @@ impl RuntimeService {
             codec: RwLock::new(AudioCodec::new()),
             streaming_config: StreamingConfig::default(),
             core_engine,
+            coordinator,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
             step_driver_task: Mutex::new(None),
@@ -518,12 +527,30 @@ impl RuntimeService {
         }
 
         let engine = self.core_engine.clone();
+        let coordinator = self.coordinator.clone();
         let waiters = self.completion_waiters.clone();
         let telemetry = self.telemetry.clone();
         let wakeup = self.step_driver_wakeup.clone();
         let task = tokio::spawn(async move {
             let mut idle_backoff_ms = 1u64;
             loop {
+                if !engine.has_pending_work().await {
+                    let sleep_for = tokio::time::Duration::from_millis(idle_backoff_ms);
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep_for) => {}
+                        _ = wakeup.notified() => {}
+                    }
+                    idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
+                    continue;
+                }
+                let _execution = match coordinator.acquire_execution(None).await {
+                    Ok(lease) => lease,
+                    Err(err) => {
+                        error!("Inference coordinator closed: {err}");
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                };
                 let step_result = std::panic::AssertUnwindSafe(engine.step())
                     .catch_unwind()
                     .await;
@@ -735,8 +762,23 @@ impl RuntimeService {
         self.telemetry.record_stage_observation(observation);
     }
 
+    fn coordinator_job_for_request(request: &EngineCoreRequest) -> JobSpec {
+        JobSpec {
+            request_id: request.id.clone(),
+            lane: CoordinatorLane::Resumable,
+            priority: request.priority,
+            workload_class: request.workload_class,
+            deadline: request.deadline,
+            resources: ResourceVector::default(),
+        }
+    }
+
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
+        let _job = self
+            .coordinator
+            .admit(Self::coordinator_job_for_request(&request))
+            .await?;
         let observation_request = request.clone();
         let _residency_lease = request
             .model_variant
@@ -831,6 +873,10 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
+        let _job = self
+            .coordinator
+            .admit(Self::coordinator_job_for_request(&request))
+            .await?;
         let observation_request = request.clone();
         let _residency_lease = request
             .model_variant

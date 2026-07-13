@@ -3,6 +3,7 @@
 use crate::catalog::{
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
 };
+use crate::engine::ResourceVector;
 use crate::error::{Error, Result};
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -14,6 +15,7 @@ use crate::runtime::types::{
     DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord,
 };
+use crate::runtime::{CoordinatorLane, JobSpec, RuntimeRequestContext};
 use crate::ModelVariant;
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk, TranscriptAssembler};
 use std::collections::HashMap;
@@ -58,16 +60,27 @@ impl RuntimeService {
     ) -> Result<DiarizationResult> {
         let variant = resolve_diarization_model_variant(model_id);
         self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
-        self.load_model(variant).await?;
-        let _lease = self.acquire_model_residency_lease(variant);
-
-        let model = self
-            .model_registry
-            .get_diarization(variant)
+        let context = RuntimeRequestContext::default();
+        let job = JobSpec {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            lane: CoordinatorLane::Pipeline,
+            priority: context.priority,
+            workload_class: context.workload_class,
+            deadline: context.deadline,
+            resources: ResourceVector::default(),
+        };
+        self.coordinator
+            .run_direct(job, async {
+                self.load_model(variant).await?;
+                let _lease = self.acquire_model_residency_lease(variant);
+                let model = self
+                    .model_registry
+                    .get_diarization(variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+                model.diarize(samples, sample_rate, config)
+            })
             .await
-            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-
-        model.diarize(samples, sample_rate, config)
     }
 
     /// Run speaker diarization over a single audio input.
