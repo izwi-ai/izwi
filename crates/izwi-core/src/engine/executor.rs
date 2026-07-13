@@ -167,6 +167,8 @@ impl WorkerConfig {
 }
 
 /// Output from the executor after a forward pass.
+pub const REQUEST_DEADLINE_EXCEEDED: &str = "request deadline exceeded";
+
 #[derive(Debug, Clone)]
 pub struct ExecutorOutput {
     /// Request ID

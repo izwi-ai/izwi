@@ -23,6 +23,7 @@ use crate::runtime::voice_metrics::{
     VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
     VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
 };
+use crate::runtime::CoordinatorSnapshot;
 use crate::runtime_models::LoadedModelDiagnostics;
 use crate::KernelPathTelemetrySnapshot;
 
@@ -305,6 +306,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub end_to_end_ms_p95: f64,
     pub kernel_path: KernelPathTelemetrySnapshot,
     pub engine: EngineRuntimeTelemetrySnapshot,
+    pub coordinator: CoordinatorSnapshot,
     pub models: Vec<LoadedModelDiagnostics>,
     pub voice: VoiceRuntimeTelemetrySnapshot,
     pub realtime: RealtimeRuntimeTelemetrySnapshot,
@@ -641,6 +643,7 @@ impl RuntimeTelemetryCollector {
             end_to_end_ms_p95: percentile(&end_to_end, 0.95),
             kernel_path: kernel_path_telemetry_snapshot(),
             engine: EngineRuntimeTelemetrySnapshot::default(),
+            coordinator: CoordinatorSnapshot::default(),
             models: Vec::new(),
             voice: VoiceRuntimeTelemetrySnapshot {
                 sessions_started: self.voice_sessions_started.load(Ordering::Relaxed),

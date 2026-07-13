@@ -103,6 +103,27 @@ jobs:
       - name: Run CUDA cargo checks
         run: scripts/ci/check-backend-truth.sh cargo-cuda
 
+  cargo-metal:
+    name: Cargo Check (Metal)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Run Metal cargo checks
+        run: scripts/ci/check-backend-truth.sh cargo-metal
+
   docker-cpu:
     name: Docker Build (CPU)
     runs-on: ubuntu-latest

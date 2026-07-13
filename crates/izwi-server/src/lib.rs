@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tracing::{info, warn};
 
@@ -598,6 +598,7 @@ async fn shutdown_signal(state: AppState, batch_worker_drain: BatchWorkerDrain) 
     }
 
     state.lifecycle.mark_draining();
+    state.runtime.begin_drain();
     batch_worker_drain.begin();
 
     drop(state);
@@ -605,7 +606,18 @@ async fn shutdown_signal(state: AppState, batch_worker_drain: BatchWorkerDrain) 
 
 async fn cleanup_runtime_for_shutdown(state: &AppState) {
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
-    match tokio::time::timeout(CLEANUP_TIMEOUT, state.runtime.unload_all_models()).await {
+    let started = Instant::now();
+    if let Err(err) = state.runtime.wait_for_drain(CLEANUP_TIMEOUT).await {
+        let snapshot = state.runtime.coordinator_snapshot();
+        warn!(
+            active_jobs = snapshot.active_jobs,
+            active_executions = snapshot.active_executions,
+            "Runtime drain failed: {err}; skipping model unload"
+        );
+        return;
+    }
+    let remaining = CLEANUP_TIMEOUT.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, state.runtime.unload_all_models()).await {
         Ok(Ok(unloaded)) => {
             info!(
                 "Runtime shutdown cleanup completed; unloaded {} model(s)",

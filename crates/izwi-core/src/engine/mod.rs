@@ -45,7 +45,7 @@ pub use execution::{
     BatchKey, ExecutionCapabilities, ExecutionPlan, ExecutionReport, ExecutionState,
     ExecutionTracker, InputRange, PlanId, SequencePhase, TerminalOutcome, WorkUnit,
 };
-pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig};
+pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED};
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
     PinnedBlockHandle,

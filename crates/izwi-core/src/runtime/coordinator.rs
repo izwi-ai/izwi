@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use tokio::sync::Notify;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use serde::Serialize;
 
 use crate::backends::BackendKind;
 use crate::engine::{
@@ -32,7 +35,7 @@ pub struct JobSpec {
     pub resources: ResourceEstimate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct CoordinatorSnapshot {
     pub capacity: usize,
     pub active_jobs: usize,
@@ -51,6 +54,8 @@ pub struct InferenceCoordinator {
     jobs: Arc<Semaphore>,
     execution: Arc<Semaphore>,
     resources: Mutex<ResourceLedger>,
+    admission_gate: Mutex<()>,
+    idle: Notify,
     active_jobs: AtomicUsize,
     active_executions: AtomicUsize,
     admitted_total: AtomicU64,
@@ -71,6 +76,8 @@ impl InferenceCoordinator {
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             execution: Arc::new(Semaphore::new(capacity)),
             resources: Mutex::new(ResourceLedger::new(resource_capacity(backend))),
+            admission_gate: Mutex::new(()),
+            idle: Notify::new(),
             active_jobs: AtomicUsize::new(0),
             active_executions: AtomicUsize::new(0),
             admitted_total: AtomicU64::new(0),
@@ -100,10 +107,36 @@ impl InferenceCoordinator {
     }
 
     pub fn begin_drain(&self) {
+        let _gate = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.draining.store(true, Ordering::Release);
     }
 
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_idle(&self, deadline: Instant) -> Result<()> {
+        loop {
+            let notified = self.idle.notified();
+            if self.active_jobs.load(Ordering::Acquire) == 0
+                && self.active_executions.load(Ordering::Acquire) == 0
+            {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline.into(), notified)
+                .await
+                .map_err(|_| Error::Timeout("inference coordinator drain".to_string()))?;
+        }
+    }
+
     pub async fn admit(self: &Arc<Self>, spec: JobSpec) -> Result<JobLease> {
+        let _gate = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if self.draining.load(Ordering::Acquire) {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Overloaded("runtime is draining".to_string()));
@@ -124,7 +157,11 @@ impl InferenceCoordinator {
             .resources
             .lock()
             .map_err(|_| Error::InferenceError("resource ledger mutex poisoned".to_string()))?
-            .reserve(effective_resources)?;
+            .reserve(effective_resources)
+            .map_err(|err| {
+                self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                err
+            })?;
         self.active_jobs.fetch_add(1, Ordering::Relaxed);
         self.admitted_total.fetch_add(1, Ordering::Relaxed);
         Ok(JobLease {
@@ -146,7 +183,10 @@ impl InferenceCoordinator {
         let permit = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
                 .await
-                .map_err(|_| Error::Timeout("device execution capacity".to_string()))?
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout("device execution capacity".to_string())
+                })?
                 .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
             None => acquire
                 .await
@@ -169,7 +209,10 @@ impl InferenceCoordinator {
         match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), future)
                 .await
-                .map_err(|_| Error::Timeout("direct inference job".to_string()))?,
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout("direct inference job".to_string())
+                })?,
             None => future.await,
         }
     }
@@ -188,7 +231,9 @@ impl Drop for JobLease {
         if let Ok(mut resources) = self.coordinator.resources.lock() {
             let _ = resources.release(self.reservation);
         }
-        self.coordinator.active_jobs.fetch_sub(1, Ordering::Relaxed);
+        if self.coordinator.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.coordinator.idle.notify_waiters();
+        }
     }
 }
 
@@ -266,9 +311,14 @@ pub struct ExecutionLease {
 
 impl Drop for ExecutionLease {
     fn drop(&mut self) {
-        self.coordinator
+        if self
+            .coordinator
             .active_executions
-            .fetch_sub(1, Ordering::Relaxed);
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.coordinator.idle.notify_waiters();
+        }
     }
 }
 
@@ -332,5 +382,49 @@ mod tests {
             coordinator.admit(job("late")).await,
             Err(Error::Overloaded(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_active_jobs_to_release() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let lease = coordinator.admit(job("active")).await.unwrap();
+        coordinator.begin_drain();
+        let waiting = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .wait_for_idle(Instant::now() + std::time::Duration::from_secs(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        drop(lease);
+
+        waiting.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_deadline_is_counted() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let _held = coordinator.acquire_execution(None).await.unwrap();
+
+        let result = coordinator
+            .acquire_execution(Some(Instant::now() + std::time::Duration::from_millis(5)))
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert_eq!(coordinator.snapshot().expired_total, 1);
+    }
+
+    #[tokio::test]
+    async fn resource_rejection_is_counted() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let mut oversized = job("oversized");
+        oversized.resources.host_bytes = ResourceAmount::Known(u64::MAX);
+
+        assert!(coordinator.admit(oversized).await.is_err());
+        assert_eq!(coordinator.snapshot().rejected_total, 1);
     }
 }

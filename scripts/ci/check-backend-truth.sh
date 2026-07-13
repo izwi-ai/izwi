@@ -8,6 +8,7 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 
 Commands:
   cargo-cpu     Run CPU-focused cargo checks for the CLI and server
+  cargo-metal   Run Metal-focused cargo checks for core and CLI on macOS
   cargo-cuda    Run CUDA-focused cargo checks for the CLI and server
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
   docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
@@ -150,6 +151,19 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-server
 }
 
+run_cargo_metal() {
+    require_command cargo
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "Metal checks require macOS." >&2
+        exit 1
+    fi
+
+    cargo check --locked -p izwi-core --features metal
+    cargo check --locked -p izwi-cli --features metal
+    cargo test --locked -p izwi-core --features metal runtime::coordinator --lib
+}
+
 run_cargo_cuda() {
     require_command cargo
     require_command nvcc
@@ -205,6 +219,9 @@ main() {
     case "$1" in
         cargo-cpu)
             run_cargo_cpu
+            ;;
+        cargo-metal)
+            run_cargo_metal
             ;;
         cargo-cuda)
             run_cargo_cuda

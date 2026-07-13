@@ -8,11 +8,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
 use super::execution::BatchKey;
-use super::executor::{ExecutorOutput, UnifiedExecutor, WorkerConfig};
+use super::executor::{ExecutorOutput, UnifiedExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED};
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::output::OutputProcessor;
@@ -299,13 +299,79 @@ impl EngineCore {
                 .is_some_and(|audio| !audio.samples.is_empty())
     }
 
+    fn reconcile_executor_outputs(
+        phase: &str,
+        scheduled: &[super::scheduler::ScheduledRequest],
+        result: Result<Vec<ExecutorOutput>>,
+    ) -> Vec<ExecutorOutput> {
+        let expected: HashSet<_> = scheduled
+            .iter()
+            .map(|entry| entry.request_id.as_str())
+            .collect();
+        let outputs = match result {
+            Ok(outputs) => outputs,
+            Err(err) => {
+                return scheduled
+                    .iter()
+                    .map(|entry| {
+                        ExecutorOutput::error(
+                            entry.request_id.clone(),
+                            format!("{phase} executor failed: {err}"),
+                        )
+                    })
+                    .collect();
+            }
+        };
+
+        let mut by_request = HashMap::new();
+        let mut duplicates = HashSet::new();
+        for mut output in outputs {
+            if !expected.contains(output.request_id.as_str()) {
+                warn!(
+                    phase,
+                    request_id = %output.request_id,
+                    "Ignoring executor output for an unscheduled request"
+                );
+                continue;
+            }
+            if output.error.is_some() {
+                output.finished = true;
+            }
+            let request_id = output.request_id.clone();
+            if by_request.insert(request_id.clone(), output).is_some() {
+                duplicates.insert(request_id);
+            }
+        }
+
+        scheduled
+            .iter()
+            .map(|entry| {
+                if duplicates.contains(&entry.request_id) {
+                    return ExecutorOutput::error(
+                        entry.request_id.clone(),
+                        format!("{phase} executor returned duplicate outputs"),
+                    );
+                }
+                by_request.remove(&entry.request_id).unwrap_or_else(|| {
+                    ExecutorOutput::error(
+                        entry.request_id.clone(),
+                        format!("{phase} executor did not return a scheduled output"),
+                    )
+                })
+            })
+            .collect()
+    }
+
     async fn execute_decode_subbatch(
         &self,
         request_refs: &[&EngineCoreRequest],
         scheduled: &[super::scheduler::ScheduledRequest],
     ) -> Result<Vec<ExecutorOutput>> {
         if !Self::should_microbatch_decode(scheduled) {
-            return self.executor.execute_decode(request_refs, scheduled).await;
+            let result = self.executor.execute_decode(request_refs, scheduled).await;
+            return Ok(Self::reconcile_executor_outputs(
+                "decode", scheduled, result,
+            ));
         }
 
         let mut remaining_tokens: Vec<usize> = scheduled
@@ -338,10 +404,15 @@ impl EngineCore {
                 break;
             }
 
-            let round_outputs = self
+            let round_result = self
                 .executor
                 .execute_decode(request_refs, &round_schedule)
-                .await?;
+                .await;
+            let round_outputs = Self::reconcile_executor_outputs(
+                "decode micro-batch",
+                &round_schedule,
+                round_result,
+            );
             let mut seen = vec![false; scheduled.len()];
 
             for output in round_outputs {
@@ -515,6 +586,19 @@ impl EngineCore {
                 .insert(request_id.clone(), RequestPhaseTiming::default());
         }
 
+        let expired_sequence_ids: HashMap<_, _> = schedule_result
+            .expired_requests
+            .iter()
+            .map(|request| (request.request_id.clone(), request.sequence_id))
+            .collect();
+        let mut terminal_outputs = Vec::with_capacity(schedule_result.expired_requests.len());
+        for request in &schedule_result.expired_requests {
+            terminal_outputs.push(ExecutorOutput::error(
+                request.request_id.clone(),
+                REQUEST_DEADLINE_EXCEEDED,
+            ));
+        }
+
         if !schedule_result.has_work() {
             return Ok(Vec::new());
         }
@@ -553,7 +637,10 @@ impl EngineCore {
             .filter_map(|s| self.requests.get(&s.request_id))
             .collect();
 
-        if prefill_request_refs.is_empty() && decode_request_refs.is_empty() {
+        if prefill_request_refs.is_empty()
+            && decode_request_refs.is_empty()
+            && terminal_outputs.is_empty()
+        {
             return Ok(Vec::new());
         }
 
@@ -581,7 +668,8 @@ impl EngineCore {
                 self.build_compatible_subbatches(&prefill_request_refs, &prefill_scheduled);
             let mut outputs = Vec::new();
             for (refs, batch) in sub_batches {
-                outputs.extend(self.executor.execute_prefill(&refs, &batch).await?);
+                let result = self.executor.execute_prefill(&refs, &batch).await;
+                outputs.extend(Self::reconcile_executor_outputs("prefill", &batch, result));
             }
             Ok::<_, Error>((outputs, started.elapsed()))
         };
@@ -640,6 +728,7 @@ impl EngineCore {
         }
 
         decode_outputs.append(&mut prefill_outputs);
+        decode_outputs.append(&mut terminal_outputs);
         let executor_outputs = decode_outputs;
 
         // Phase 3: Process outputs
@@ -657,7 +746,11 @@ impl EngineCore {
             let generation_time_ms = generation_time.as_secs_f64() * 1000.0;
 
             // Get sequence ID from scheduler
-            let sequence_id = self.scheduler.get_sequence_id(&request_id).unwrap_or(0);
+            let sequence_id = expired_sequence_ids
+                .get(&request_id)
+                .copied()
+                .or_else(|| self.scheduler.get_sequence_id(&request_id))
+                .unwrap_or(0);
 
             let step_time_ms = if decode_ids.contains(&request_id) {
                 decode_step_ms
@@ -910,6 +1003,23 @@ mod tests {
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::sync::{Arc, Mutex};
 
+    fn scheduled_prefill(request_id: &str, sequence_id: u64) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id: sequence_id + 1,
+            request_id: request_id.to_string(),
+            sequence_id,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Prefill,
+                input: crate::engine::InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        }
+    }
+
     struct MockExecutor {
         initialized: bool,
         cleanup_calls: Arc<Mutex<Vec<String>>>,
@@ -1072,6 +1182,55 @@ mod tests {
                     text: Some(format!("done-{}", entry.request_id)),
                     input_transcription: None,
                     tokens_processed: entry.num_tokens.max(1),
+                    tokens_generated: 1,
+                    finished: true,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .collect())
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorOutput>> {
+            Ok(Vec::new())
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SelectiveFailureExecutor;
+
+    impl ModelExecutor for SelectiveFailureExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorOutput>> {
+            if scheduled.iter().any(|entry| entry.request_id == "bad") {
+                return Err(Error::InferenceError("isolated failure".to_string()));
+            }
+            Ok(scheduled
+                .iter()
+                .map(|entry| ExecutorOutput {
+                    request_id: entry.request_id.clone(),
+                    audio: None,
+                    text: Some("ok".to_string()),
+                    input_transcription: None,
+                    tokens_processed: entry.num_tokens,
                     tokens_generated: 1,
                     finished: true,
                     phase_timing_override: None,
@@ -1284,6 +1443,41 @@ mod tests {
         assert!(merged.finished);
     }
 
+    #[test]
+    fn executor_output_reconciliation_rejects_duplicates_unknowns_and_missing_ids() {
+        let scheduled = vec![scheduled_prefill("req-a", 0), scheduled_prefill("req-b", 1)];
+        let mut executor_outputs = MockExecutor::build_outputs(&scheduled[..1]);
+        executor_outputs.push(executor_outputs[0].clone());
+        let mut unknown = executor_outputs[0].clone();
+        unknown.request_id = "unknown".to_string();
+        executor_outputs.push(unknown);
+
+        let reconciled =
+            EngineCore::reconcile_executor_outputs("prefill", &scheduled, Ok(executor_outputs));
+
+        assert_eq!(
+            reconciled
+                .iter()
+                .map(|output| output.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-a", "req-b"]
+        );
+        assert!(reconciled.iter().all(|output| output.finished));
+        assert!(reconciled
+            .iter()
+            .all(|output| output.error.as_deref().is_some()));
+        assert!(reconciled[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("duplicate"));
+        assert!(reconciled[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("did not return"));
+    }
+
     #[tokio::test]
     async fn test_execute_decode_subbatch_round_robins_multi_token_requests() {
         let decode_calls = Arc::new(Mutex::new(Vec::new()));
@@ -1353,6 +1547,75 @@ mod tests {
             vec![("req-a".to_string(), 1), ("req-b".to_string(), 1)]
         );
         assert_eq!(calls[2], vec![("req-a".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn executor_subbatch_failure_is_isolated_and_reconciled() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(SelectiveFailureExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 2,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut bad = EngineCoreRequest::tts("bad");
+        bad.id = "bad".to_string();
+        bad.prompt_tokens = vec![1];
+        bad.model_variant = Some(ModelVariant::Qwen34BGguf);
+        let mut good = EngineCoreRequest::tts("good");
+        good.id = "good".to_string();
+        good.prompt_tokens = vec![1];
+        good.model_variant = Some(ModelVariant::Qwen38BGguf);
+        core.add_request(bad).unwrap();
+        core.add_request(good).unwrap();
+
+        let outputs = core.step().await.unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs
+            .iter()
+            .any(|output| output.request_id == "bad" && output.error.is_some()));
+        assert!(outputs
+            .iter()
+            .any(|output| output.request_id == "good" && output.error.is_none()));
+        assert!(!core.has_request(&"bad".to_string()));
+        assert!(!core.has_request(&"good".to_string()));
+    }
+
+    #[tokio::test]
+    async fn hard_deadline_returns_one_terminal_output_with_original_sequence() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut request = EngineCoreRequest::tts("expired")
+            .with_deadline(Some(Instant::now() - std::time::Duration::from_millis(1)));
+        request.id = "expired".to_string();
+        core.add_request(request).unwrap();
+
+        let outputs = core.step().await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].request_id, "expired");
+        assert_eq!(outputs[0].sequence_id, 0);
+        assert!(outputs[0].is_finished);
+        assert_eq!(outputs[0].num_tokens, 0);
+        assert_eq!(outputs[0].error.as_deref(), Some(REQUEST_DEADLINE_EXCEEDED));
+        assert!(!core.has_request(&"expired".to_string()));
+        assert_eq!(
+            cleanup_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| id.as_str() == "expired")
+                .count(),
+            1,
+            "deadline cleanup must occur exactly once"
+        );
     }
 
     #[tokio::test]

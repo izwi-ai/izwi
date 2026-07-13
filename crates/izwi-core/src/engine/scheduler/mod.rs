@@ -28,6 +28,8 @@ pub enum SchedulingPolicy {
     FCFS,
     /// Priority-based scheduling (higher priority first)
     Priority,
+    /// Weighted workload-class service with priority ordering inside each class.
+    WeightedFair,
 }
 
 /// Configuration for the scheduler.
@@ -216,10 +218,18 @@ pub struct ScheduleResult {
     pub prefill_requests: Vec<ScheduledRequest>,
     /// Requests that were preempted to make room
     pub preempted_requests: Vec<RequestId>,
+    /// Requests rejected before execution because their caller deadline elapsed.
+    pub expired_requests: Vec<ExpiredRequest>,
     /// Total tokens to process this step
     pub total_tokens: usize,
     /// Number of blocks allocated
     pub blocks_allocated: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredRequest {
+    pub request_id: RequestId,
+    pub sequence_id: SequenceId,
 }
 
 impl ScheduleResult {
@@ -228,6 +238,7 @@ impl ScheduleResult {
             decode_requests: Vec::new(),
             prefill_requests: Vec::new(),
             preempted_requests: Vec::new(),
+            expired_requests: Vec::new(),
             total_tokens: 0,
             blocks_allocated: 0,
         }
@@ -235,6 +246,10 @@ impl ScheduleResult {
 
     /// Check if there's any work to do
     pub fn has_work(&self) -> bool {
+        self.has_execution_work() || !self.expired_requests.is_empty()
+    }
+
+    pub fn has_execution_work(&self) -> bool {
         !self.decode_requests.is_empty() || !self.prefill_requests.is_empty()
     }
 
@@ -333,6 +348,8 @@ pub struct Scheduler {
     next_plan_id: PlanId,
     /// Adaptive scheduling telemetry.
     telemetry: SchedulerTelemetry,
+    /// Completed scheduling quanta by workload class for weighted service.
+    class_service: HashMap<WorkloadClass, u64>,
 }
 
 /// Metadata for a request in the scheduler.
@@ -346,6 +363,7 @@ struct RequestMetadata {
     workload_class: WorkloadClass,
     arrival_time: Instant,
     deadline_at: Instant,
+    hard_deadline: Option<Instant>,
     total_prompt_tokens: usize,
     max_tokens: usize,
     prompt_prefix_tokens: Vec<u32>,
@@ -396,6 +414,7 @@ impl Scheduler {
             next_sequence_id: 0,
             next_plan_id: 1,
             telemetry,
+            class_service: HashMap::new(),
         }
     }
 
@@ -423,6 +442,7 @@ impl Scheduler {
             workload_class: request.workload_class,
             arrival_time,
             deadline_at,
+            hard_deadline: request.deadline,
             total_prompt_tokens: request.num_prompt_tokens(),
             // TTS uses max_tokens=0 to indicate "auto". Keep scheduler decode budget
             // effectively unbounded so model-level stop criteria can terminate naturally.
@@ -447,6 +467,7 @@ impl Scheduler {
     /// Schedule requests for the next step.
     pub fn schedule(&mut self, kv_cache: &mut KVCacheManager) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
+        result.expired_requests = self.expire_deadlines(kv_cache);
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
         self.update_dynamic_budget();
@@ -491,6 +512,12 @@ impl Scheduler {
             reserved_prefill_budget = ((total_budget as f64) * prefill_share) as usize;
             reserved_prefill_budget = reserved_prefill_budget.clamp(1, total_budget);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
+        } else if self.config.policy == SchedulingPolicy::WeightedFair
+            && !self.waiting_members.is_empty()
+            && total_budget > 0
+        {
+            reserved_prefill_budget = total_budget.min(32).max(1);
+            decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
         }
         let mut remaining_decode_budget = decode_budget;
 
@@ -522,7 +549,9 @@ impl Scheduler {
             })
             .collect();
 
-        if self.config.enable_adaptive_batching {
+        if self.config.enable_adaptive_batching
+            && self.config.policy != SchedulingPolicy::WeightedFair
+        {
             // Favor overdue requests first, then requests close to completion.
             decode_candidates.sort_by(|a, b| {
                 b.9.partial_cmp(&a.9)
@@ -536,6 +565,38 @@ impl Scheduler {
                     .then_with(|| a.5.cmp(&b.5))
                     .then_with(|| b.2.cmp(&a.2))
                     .then_with(|| a.6.cmp(&b.6))
+            });
+        } else if self.config.policy == SchedulingPolicy::WeightedFair {
+            let mut simulated_service = self.class_service.clone();
+            let mut fair_order = Vec::with_capacity(decode_candidates.len());
+            while !decode_candidates.is_empty() {
+                let next_index = (0..decode_candidates.len())
+                    .min_by(|left, right| {
+                        let a = &decode_candidates[*left];
+                        let b = &decode_candidates[*right];
+                        Self::compare_class_service_with(&simulated_service, a.8, b.8)
+                            .then_with(|| b.2.cmp(&a.2))
+                            .then_with(|| {
+                                b.9.partial_cmp(&a.9).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .then_with(|| a.1.cmp(&b.1))
+                    })
+                    .unwrap_or(0);
+                let candidate = decode_candidates.remove(next_index);
+                let next_service = simulated_service
+                    .get(&candidate.8)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                simulated_service.insert(candidate.8, next_service);
+                fair_order.push(candidate);
+            }
+            decode_candidates = fair_order;
+        } else {
+            decode_candidates.sort_by(|a, b| match self.config.policy {
+                SchedulingPolicy::FCFS => a.1.cmp(&b.1),
+                SchedulingPolicy::Priority => b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)),
+                SchedulingPolicy::WeightedFair => Ordering::Equal,
             });
         }
         let has_decode_demand = !decode_candidates.is_empty();
@@ -566,6 +627,12 @@ impl Scheduler {
                 continue;
             }
             if remaining_batch == 0 || remaining_decode_budget == 0 {
+                break;
+            }
+            if self.config.policy == SchedulingPolicy::WeightedFair
+                && !self.waiting_members.is_empty()
+                && remaining_batch <= 1
+            {
                 break;
             }
 
@@ -683,10 +750,13 @@ impl Scheduler {
             remaining_decode_budget = remaining_decode_budget.saturating_sub(num_tokens);
             remaining_batch -= 1;
             result.total_tokens += num_tokens;
+            self.record_class_service(workload_class, num_tokens);
         }
 
         // Phase 2: schedule prefill requests.
-        let mut remaining_prefill_budget = if self.config.enable_adaptive_batching {
+        let mut remaining_prefill_budget = if self.config.enable_adaptive_batching
+            || self.config.policy == SchedulingPolicy::WeightedFair
+        {
             reserved_prefill_budget.saturating_add(remaining_decode_budget)
         } else {
             remaining_decode_budget
@@ -872,6 +942,7 @@ impl Scheduler {
             remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
             remaining_batch -= 1;
             result.total_tokens += num_tokens;
+            self.record_class_service(metadata.workload_class, num_tokens);
         }
 
         let mut deferred_waiting = Vec::new();
@@ -1024,6 +1095,7 @@ impl Scheduler {
             remaining_batch -= 1;
             prefill_admissions = prefill_admissions.saturating_add(1);
             result.total_tokens += num_tokens;
+            self.record_class_service(metadata.workload_class, num_tokens);
         }
 
         for request_id in deferred_waiting {
@@ -1175,12 +1247,16 @@ impl Scheduler {
         if self.waiting_members.is_empty() {
             return None;
         }
+        if self.config.policy == SchedulingPolicy::WeightedFair {
+            return self.select_weighted_waiting_request();
+        }
         if !self.config.enable_adaptive_batching {
             return match self.config.policy {
                 SchedulingPolicy::FCFS => self.waiting_fcfs.front().cloned(),
                 SchedulingPolicy::Priority => {
                     self.waiting_priority.peek().map(|r| r.request_id.clone())
                 }
+                SchedulingPolicy::WeightedFair => unreachable!("weighted policy handled above"),
             };
         }
 
@@ -1208,6 +1284,12 @@ impl Scheduler {
             return None;
         }
 
+        if self.config.policy == SchedulingPolicy::WeightedFair {
+            let next = self.select_weighted_waiting_request()?;
+            self.remove_from_waiting(&next);
+            return Some(next);
+        }
+
         if self.config.enable_adaptive_batching {
             let next = self.select_next_waiting_request()?;
             self.remove_from_waiting(&next);
@@ -1231,6 +1313,7 @@ impl Scheduler {
                 }
                 None
             }
+            SchedulingPolicy::WeightedFair => unreachable!("weighted policy handled above"),
         }
     }
 
@@ -1257,7 +1340,133 @@ impl Scheduler {
                 workload_class: metadata.workload_class,
                 arrival_time: metadata.arrival_time,
             }),
+            SchedulingPolicy::WeightedFair => self.waiting_fcfs.push_back(request_id),
         }
+    }
+
+    fn select_weighted_waiting_request(&self) -> Option<RequestId> {
+        let selected_class = self
+            .waiting_members
+            .iter()
+            .filter_map(|id| {
+                self.requests
+                    .get(id)
+                    .map(|metadata| metadata.workload_class)
+            })
+            .min_by(|a, b| self.compare_class_service(*a, *b))?;
+
+        let candidates = self.waiting_members.iter().filter(|id| {
+            self.requests
+                .get(*id)
+                .is_some_and(|metadata| metadata.workload_class == selected_class)
+        });
+        match self.config.policy {
+            SchedulingPolicy::WeightedFair | SchedulingPolicy::Priority => {
+                candidates.cloned().max_by(|a, b| {
+                    let metadata_a = self.requests.get(a);
+                    let metadata_b = self.requests.get(b);
+                    metadata_a
+                        .map(|m| m.priority)
+                        .cmp(&metadata_b.map(|m| m.priority))
+                        .then_with(|| {
+                            metadata_b
+                                .map(|m| m.deadline_at)
+                                .cmp(&metadata_a.map(|m| m.deadline_at))
+                        })
+                        .then_with(|| self.compare_arrival_for_max(a, b))
+                })
+            }
+            SchedulingPolicy::FCFS => candidates.cloned().min_by_key(|id| {
+                self.requests
+                    .get(id)
+                    .map(|m| m.sequence_id)
+                    .unwrap_or(u64::MAX)
+            }),
+        }
+    }
+
+    fn compare_arrival_for_max(&self, a: &RequestId, b: &RequestId) -> Ordering {
+        let sequence_a = self
+            .requests
+            .get(a)
+            .map(|metadata| metadata.sequence_id)
+            .unwrap_or(u64::MAX);
+        let sequence_b = self
+            .requests
+            .get(b)
+            .map(|metadata| metadata.sequence_id)
+            .unwrap_or(u64::MAX);
+        sequence_b.cmp(&sequence_a)
+    }
+
+    fn compare_class_service(&self, a: WorkloadClass, b: WorkloadClass) -> Ordering {
+        Self::compare_class_service_with(&self.class_service, a, b)
+    }
+
+    fn compare_class_service_with(
+        service: &HashMap<WorkloadClass, u64>,
+        a: WorkloadClass,
+        b: WorkloadClass,
+    ) -> Ordering {
+        let service_a = service.get(&a).copied().unwrap_or_default();
+        let service_b = service.get(&b).copied().unwrap_or_default();
+        let weighted_a = service_a.saturating_mul(Self::workload_weight(b));
+        let weighted_b = service_b.saturating_mul(Self::workload_weight(a));
+        weighted_a
+            .cmp(&weighted_b)
+            .then_with(|| Self::workload_order(a).cmp(&Self::workload_order(b)))
+    }
+
+    fn workload_weight(workload_class: WorkloadClass) -> u64 {
+        match workload_class {
+            WorkloadClass::Realtime => 8,
+            WorkloadClass::Interactive => 6,
+            WorkloadClass::Streaming => 5,
+            WorkloadClass::Online => 4,
+            WorkloadClass::Batch => 2,
+            WorkloadClass::Background => 1,
+        }
+    }
+
+    fn workload_order(workload_class: WorkloadClass) -> u8 {
+        match workload_class {
+            WorkloadClass::Realtime => 0,
+            WorkloadClass::Interactive => 1,
+            WorkloadClass::Streaming => 2,
+            WorkloadClass::Online => 3,
+            WorkloadClass::Batch => 4,
+            WorkloadClass::Background => 5,
+        }
+    }
+
+    fn record_class_service(&mut self, workload_class: WorkloadClass, tokens: usize) {
+        if self.config.policy != SchedulingPolicy::WeightedFair {
+            return;
+        }
+        let service = self.class_service.entry(workload_class).or_default();
+        *service = service.saturating_add(tokens.max(1) as u64);
+    }
+
+    fn expire_deadlines(&mut self, kv_cache: &mut KVCacheManager) -> Vec<ExpiredRequest> {
+        let now = Instant::now();
+        let mut expired: Vec<_> = self
+            .requests
+            .values()
+            .filter(|metadata| {
+                metadata
+                    .hard_deadline
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|metadata| ExpiredRequest {
+                request_id: metadata.request_id.clone(),
+                sequence_id: metadata.sequence_id,
+            })
+            .collect();
+        expired.sort_by_key(|request| request.sequence_id);
+        for request in &expired {
+            self.abort_request(&request.request_id, kv_cache);
+        }
+        expired
     }
 
     fn deadline_for_request(&self, priority: Priority, workload_class: WorkloadClass) -> Duration {
@@ -2329,8 +2538,108 @@ mod tests {
     }
 
     #[test]
+    fn hard_deadlines_expire_in_sequence_order_without_execution() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let mut kv_cache = KVCacheManager::new(Default::default());
+        for id in ["expired-a", "expired-b"] {
+            let mut request = EngineCoreRequest::tts(id)
+                .with_deadline(Some(Instant::now() - Duration::from_millis(1)));
+            request.id = id.to_string();
+            scheduler.add_request(&request);
+        }
+
+        let result = scheduler.schedule(&mut kv_cache);
+
+        assert_eq!(
+            result
+                .expired_requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expired-a", "expired-b"]
+        );
+        assert!(!result.has_execution_work());
+        assert_eq!(scheduler.waiting_count(), 0);
+        assert_eq!(scheduler.running_count(), 0);
+    }
+
+    #[test]
+    fn synthetic_sla_is_a_soft_priority_signal_not_a_hard_deadline() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let mut kv_cache = KVCacheManager::new(Default::default());
+        let mut request = EngineCoreRequest::tts("soft-sla");
+        request.id = "soft-sla".to_string();
+        request.prompt_tokens = vec![1];
+        scheduler.add_request(&request);
+        scheduler.requests.get_mut(&request.id).unwrap().deadline_at =
+            Instant::now() - Duration::from_secs(1);
+
+        let result = scheduler.schedule(&mut kv_cache);
+
+        assert!(result.expired_requests.is_empty());
+        assert_eq!(result.prefill_requests.len(), 1);
+    }
+
+    #[test]
+    fn expiring_running_request_releases_logical_kv_blocks() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let mut kv_cache = KVCacheManager::new(Default::default());
+        let mut request = EngineCoreRequest::tts("running-deadline");
+        request.id = "running-deadline".to_string();
+        request.prompt_tokens = vec![1];
+        scheduler.add_request(&request);
+        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        assert!(kv_cache.stats().allocated_blocks > 0);
+        scheduler
+            .requests
+            .get_mut(&request.id)
+            .unwrap()
+            .hard_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        let result = scheduler.schedule(&mut kv_cache);
+
+        assert_eq!(result.expired_requests.len(), 1);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert_eq!(scheduler.running_count(), 0);
+    }
+
+    #[test]
+    fn weighted_fair_policy_gives_background_bounded_service() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            policy: SchedulingPolicy::WeightedFair,
+            ..Default::default()
+        });
+        let mut kv_cache = KVCacheManager::new(Default::default());
+        for index in 0..8 {
+            let mut request = EngineCoreRequest::tts("realtime");
+            request.id = format!("realtime-{index}");
+            request.prompt_tokens = vec![1];
+            request.workload_class = WorkloadClass::Realtime;
+            scheduler.add_request(&request);
+        }
+        let mut background = EngineCoreRequest::tts("background");
+        background.id = "background".to_string();
+        background.prompt_tokens = vec![1];
+        background.workload_class = WorkloadClass::Background;
+        scheduler.add_request(&background);
+
+        let mut selected = Vec::new();
+        for _ in 0..3 {
+            let result = scheduler.schedule(&mut kv_cache);
+            let request_id = result.prefill_requests[0].request_id.clone();
+            selected.push(request_id.clone());
+            scheduler.finish_request(&request_id, &mut kv_cache);
+        }
+
+        assert!(selected.iter().any(|id| id == "background"));
+    }
+
+    #[test]
     fn production_defaults_only_enable_physically_enforced_features() {
         let config = SchedulerConfig::default();
+        assert_eq!(config.policy, SchedulingPolicy::FCFS);
         assert!(!config.enable_chunked_prefill);
         assert!(!config.enable_preemption);
         assert!(!config.enable_adaptive_batching);

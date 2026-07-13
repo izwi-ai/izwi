@@ -165,6 +165,7 @@ fn default_chunked_prefill_threshold() -> usize {
 fn default_sample_rate() -> u32 {
     24000
 }
+
 fn default_num_codebooks() -> usize {
     8
 }

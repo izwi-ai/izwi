@@ -166,7 +166,8 @@ impl OutputProcessor {
         sequence_id: SequenceId,
         generation_time: Duration,
     ) -> EngineOutput {
-        let finish_reason = if executor_output.error.is_some() {
+        let had_error = executor_output.error.is_some();
+        let finish_reason = if had_error {
             Some(FinishReason::Error)
         } else if executor_output.finished {
             Some(FinishReason::StopToken)
@@ -177,10 +178,14 @@ impl OutputProcessor {
         let audio = executor_output
             .audio
             .unwrap_or_else(|| AudioOutput::empty(self.sample_rate));
-        let num_tokens = executor_output.tokens_generated.max(
-            // Estimate tokens from audio length if not provided
-            (audio.samples.len() / 256).max(1),
-        );
+        let num_tokens = if had_error {
+            executor_output.tokens_generated
+        } else {
+            executor_output.tokens_generated.max(
+                // Estimate tokens from audio length if not provided
+                (audio.samples.len() / 256).max(1),
+            )
+        };
 
         let token_stats = TokenStats {
             prompt_tokens: executor_output.tokens_processed,
@@ -397,6 +402,22 @@ mod tests {
     fn test_output_processor() {
         let processor = OutputProcessor::new(24000);
         assert_eq!(processor.sample_rate, 24000);
+    }
+
+    #[test]
+    fn executor_error_does_not_invent_generated_tokens() {
+        let mut processor = OutputProcessor::new(24_000);
+
+        let output = processor.process(
+            ExecutorOutput::error("failed".to_string(), "boom"),
+            7,
+            Duration::from_millis(1),
+        );
+
+        assert!(output.is_finished);
+        assert_eq!(output.finish_reason, Some(FinishReason::Error));
+        assert_eq!(output.num_tokens, 0);
+        assert_eq!(output.token_stats.generated_tokens, 0);
     }
 
     #[test]

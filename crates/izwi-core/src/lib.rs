@@ -75,7 +75,8 @@ pub use runtime::{
     GenerationRequest, GenerationResult,
 };
 pub use runtime::{
-    AudioChunk, EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
+    AudioChunk, CoordinatorSnapshot, EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot,
+    GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
     ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeLatencyStats,
     RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,

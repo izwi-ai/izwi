@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
@@ -28,7 +29,7 @@ use crate::engine::{
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
     ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO,
     ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -37,7 +38,9 @@ use crate::runtime::adapters::RuntimeAdapterRegistry;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
-use crate::runtime::coordinator::{CoordinatorLane, InferenceCoordinator, JobSpec};
+use crate::runtime::coordinator::{
+    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec,
+};
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
@@ -585,7 +588,12 @@ impl RuntimeService {
 
                             if let Some(tx) = waiter {
                                 if let Some(err) = output.error.clone() {
-                                    let _ = tx.send(Err(Error::InferenceError(err)));
+                                    let runtime_error = if err == REQUEST_DEADLINE_EXCEEDED {
+                                        Error::Timeout(output.request_id.clone())
+                                    } else {
+                                        Error::InferenceError(err)
+                                    };
+                                    let _ = tx.send(Err(runtime_error));
                                 } else {
                                     let _ = tx.send(Ok(output));
                                 }
@@ -1039,6 +1047,7 @@ impl RuntimeService {
     pub async fn telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
         let mut snapshot = self.telemetry.snapshot().await;
         snapshot.engine = self.engine_telemetry_snapshot().await;
+        snapshot.coordinator = self.coordinator.snapshot();
         snapshot.models = self.loaded_model_diagnostics().await;
         snapshot
     }
@@ -1047,7 +1056,28 @@ impl RuntimeService {
     pub async fn telemetry_prometheus(&self) -> String {
         let mut payload = self.telemetry.prometheus().await;
         self.push_engine_prometheus_metrics(&mut payload).await;
+        self.push_coordinator_prometheus_metrics(&mut payload);
         payload
+    }
+
+    pub fn coordinator_snapshot(&self) -> CoordinatorSnapshot {
+        self.coordinator.snapshot()
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.coordinator.is_draining()
+    }
+
+    pub fn begin_drain(&self) {
+        self.coordinator.begin_drain();
+        self.step_driver_wakeup.notify_waiters();
+    }
+
+    pub async fn wait_for_drain(&self, timeout: Duration) -> Result<()> {
+        self.begin_drain();
+        self.coordinator
+            .wait_for_idle(Instant::now() + timeout)
+            .await
     }
 
     async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {
@@ -1192,6 +1222,36 @@ impl RuntimeService {
             ENGINE_STREAM_BACKPRESSURE_TOTAL,
             snapshot.stream_backpressure_total,
         );
+    }
+
+    fn push_coordinator_prometheus_metrics(&self, payload: &mut String) {
+        let snapshot = self.coordinator.snapshot();
+        payload.push_str(&format!(
+            "# TYPE izwi_inference_coordinator_capacity gauge\n\
+izwi_inference_coordinator_capacity {}\n\
+# TYPE izwi_inference_coordinator_active_jobs gauge\n\
+izwi_inference_coordinator_active_jobs {}\n\
+# TYPE izwi_inference_coordinator_active_executions gauge\n\
+izwi_inference_coordinator_active_executions {}\n\
+# TYPE izwi_inference_coordinator_reserved_memory_bytes gauge\n\
+izwi_inference_coordinator_reserved_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_admitted_total counter\n\
+izwi_inference_coordinator_admitted_total {}\n\
+# TYPE izwi_inference_coordinator_rejected_total counter\n\
+izwi_inference_coordinator_rejected_total {}\n\
+# TYPE izwi_inference_coordinator_expired_total counter\n\
+izwi_inference_coordinator_expired_total {}\n\
+# TYPE izwi_inference_coordinator_draining gauge\n\
+izwi_inference_coordinator_draining {}\n",
+            snapshot.capacity,
+            snapshot.active_jobs,
+            snapshot.active_executions,
+            snapshot.reserved_memory_bytes,
+            snapshot.admitted_total,
+            snapshot.rejected_total,
+            snapshot.expired_total,
+            u8::from(snapshot.draining),
+        ));
     }
 
     pub fn record_voice_session_started(&self) {
@@ -1377,8 +1437,13 @@ mod tests {
         assert!(payload.contains("allocated logical KV-cache blocks"));
         assert!(payload.contains("Estimated KV-cache bytes"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+        assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
+        assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
+        assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_draining 0"));
 
         let snapshot = runtime.telemetry_snapshot().await;
+        assert_eq!(snapshot.coordinator, runtime.coordinator_snapshot());
         assert!(snapshot.engine.kv_cache.total_blocks > 0);
         assert!(snapshot.engine.kv_cache.block_size > 0);
         assert_eq!(snapshot.engine.kv_cache.block_accounting, "logical");
@@ -1386,6 +1451,23 @@ mod tests {
             snapshot.engine.kv_cache.memory_accounting,
             "estimated_from_config"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_drain_is_observable_and_completes_when_idle() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+
+        runtime
+            .wait_for_drain(Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert!(runtime.is_draining());
+        assert!(runtime.telemetry_snapshot().await.coordinator.draining);
+        assert!(runtime
+            .telemetry_prometheus()
+            .await
+            .contains("izwi_inference_coordinator_draining 1"));
     }
 
     #[test]
