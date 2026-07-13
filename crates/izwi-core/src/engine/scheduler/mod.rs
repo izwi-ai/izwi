@@ -413,6 +413,8 @@ struct RunningRequest {
     block_ids: Vec<BlockId>,
     /// Whether prefill is complete
     prefill_complete: bool,
+    /// Whether a prefill quantum has been scheduled but not yet committed.
+    prefill_in_flight: bool,
     /// Priority of this request
     priority: Priority,
     /// Coarse latency/throughput class for this request.
@@ -824,11 +826,13 @@ impl Scheduler {
         };
         let mut prefill_admissions = 0usize;
 
-        // Phase 2a: resume preempted prefill requests before admitting new waiting requests.
-        let mut paused_prefill_candidates: Vec<_> = self
+        // Phase 2a: continue incomplete prefills before admitting new waiting requests.
+        // An in-flight quantum is excluded until update_after_step commits its
+        // progress, preventing duplicate plans when schedule is polled again.
+        let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| r.paused && !r.prefill_complete)
+            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight)
             .map(|(id, r)| {
                 (
                     id.clone(),
@@ -838,9 +842,10 @@ impl Scheduler {
                 )
             })
             .collect();
-        paused_prefill_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
+        incomplete_prefill_candidates
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
 
-        for (request_id, priority, sequence_id, num_computed) in paused_prefill_candidates {
+        for (request_id, priority, sequence_id, num_computed) in incomplete_prefill_candidates {
             if remaining_batch == 0 || remaining_prefill_budget == 0 {
                 break;
             }
@@ -854,6 +859,7 @@ impl Scheduler {
             if remaining_prompt == 0 {
                 if let Some(running) = self.running.get_mut(&request_id) {
                     running.prefill_complete = true;
+                    running.prefill_in_flight = false;
                     running.paused = false;
                 }
                 continue;
@@ -971,6 +977,7 @@ impl Scheduler {
             self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             if let Some(running) = self.running.get_mut(&request_id) {
+                running.prefill_in_flight = true;
                 running.paused = false;
                 running.block_ids = block_ids.clone();
             }
@@ -1122,6 +1129,7 @@ impl Scheduler {
                 num_tokens_generated: 0,
                 block_ids: block_ids.clone(),
                 prefill_complete: num_tokens >= metadata.total_prompt_tokens,
+                prefill_in_flight: true,
                 priority: metadata.priority,
                 workload_class: metadata.workload_class,
                 first_token_emitted: false,
@@ -1200,6 +1208,7 @@ impl Scheduler {
         step_time_ms: f64,
     ) {
         if let Some(running) = self.running.get_mut(request_id) {
+            running.prefill_in_flight = false;
             running.paused = false;
             running.num_tokens_processed += tokens_processed;
             running.num_tokens_generated += tokens_generated;
@@ -1930,6 +1939,7 @@ impl Scheduler {
                 running.num_tokens_processed = 0;
                 running.num_tokens_generated = 0;
                 running.prefill_complete = false;
+                running.prefill_in_flight = false;
                 running.first_token_emitted = false;
                 running.paused = true;
             }
@@ -2467,6 +2477,60 @@ mod tests {
         assert_eq!(
             scheduled.prefill_requests[0].num_tokens, 4,
             "Scheduler should back off prefill chunk to fit KV capacity"
+        );
+    }
+
+    #[test]
+    fn incremental_prefill_continues_after_committed_partial_step() {
+        let config = SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 4,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: true,
+            enable_preemption: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 8,
+            block_size: 4,
+            ..Default::default()
+        });
+
+        let request_id = "incremental-prefill".to_string();
+        let mut request = EngineCoreRequest::tts("incremental prompt");
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![7; 8];
+        scheduler.add_request(&request);
+
+        let first = scheduler.schedule(&mut kv_cache);
+        assert_eq!(first.prefill_requests.len(), 1);
+        assert_eq!(first.prefill_requests[0].num_tokens, 4);
+        assert_eq!(first.prefill_requests[0].num_computed_tokens, 0);
+
+        let duplicate = scheduler.schedule(&mut kv_cache);
+        assert!(
+            !duplicate.has_work(),
+            "an in-flight prefill quantum must not be scheduled twice"
+        );
+
+        scheduler.update_after_step(&request_id, 4, 0, Vec::new(), 1.0);
+
+        let second = scheduler.schedule(&mut kv_cache);
+        assert!(second.preempted_requests.is_empty());
+        assert_eq!(second.prefill_requests.len(), 1);
+        assert_eq!(second.prefill_requests[0].request_id, request_id);
+        assert_eq!(second.prefill_requests[0].num_computed_tokens, 4);
+        assert_eq!(second.prefill_requests[0].num_tokens, 4);
+        assert_eq!(
+            second.prefill_requests[0].work,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 4, end: 8 },
+                max_output_steps: 4,
+            }
         );
     }
 
