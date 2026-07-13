@@ -290,6 +290,12 @@ impl ExecutorOutput {
     }
 
     pub fn cancelled(request_id: String) -> Self {
+        Self::terminal(request_id)
+    }
+
+    /// Construct a terminal payload whose precise outcome is carried by the
+    /// authoritative execution disposition.
+    pub fn terminal(request_id: String) -> Self {
         Self {
             request_id,
             audio: None,

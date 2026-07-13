@@ -85,6 +85,7 @@ pub use resources::{
     ResourceEstimate, ResourceLease, ResourceLedger, ResourceReservation, ResourceVector,
 };
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
+pub use types::FinishReason as OutputFinishReason;
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, Priority, RequestId, SequenceId,
     TaskType,
@@ -101,6 +102,12 @@ use tracing::{debug, info, warn};
 ///
 /// The engine orchestrates all components and provides both synchronous
 /// and asynchronous interfaces for inference.
+struct RequestControl {
+    session_epoch: SequenceId,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
+    model_variant: Option<ModelVariant>,
+}
+
 pub struct Engine {
     /// Engine core handles the actual inference loop
     core: Arc<RwLock<EngineCore>>,
@@ -117,8 +124,7 @@ pub struct Engine {
     /// Event-driven wakeup for run-loop when new requests arrive.
     wake_notify: Arc<Notify>,
     /// Session-fenced cooperative cancellation signals available without the core lock.
-    request_controls:
-        std::sync::Mutex<HashMap<RequestId, (SequenceId, Arc<std::sync::atomic::AtomicBool>)>>,
+    request_controls: std::sync::Mutex<HashMap<RequestId, RequestControl>>,
 }
 
 impl Engine {
@@ -189,6 +195,7 @@ impl Engine {
         // Validate and preprocess
         let mut processed = self.request_processor.process(request)?;
         let request_id = processed.id.clone();
+        let model_variant = processed.model_variant;
         let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
         processed.set_cancellation_signal(cancellation.clone());
 
@@ -203,7 +210,14 @@ impl Engine {
         self.request_controls
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(request_id.clone(), (session.epoch, cancellation));
+            .insert(
+                request_id.clone(),
+                RequestControl {
+                    session_epoch: session.epoch,
+                    cancellation,
+                    model_variant,
+                },
+            );
         self.wake_notify.notify_one();
 
         debug!("Added request {} to engine", request_id);
@@ -222,6 +236,9 @@ impl Engine {
 
             for output in outputs {
                 if output.request_id == request_id && output.is_finished {
+                    if output.finish_reason == Some(types::FinishReason::Aborted) {
+                        return Err(crate::error::Error::Cancelled(request_id));
+                    }
                     if let Some(err) = output.error.clone() {
                         return Err(crate::error::Error::InferenceError(err));
                     }
@@ -352,13 +369,15 @@ impl Engine {
 
     /// Abort a specific request.
     pub async fn abort_request(&self, request_id: &RequestId) -> Result<bool> {
-        if let Some((_, signal)) = self
+        if let Some(control) = self
             .request_controls
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .get(request_id)
         {
-            signal.store(true, std::sync::atomic::Ordering::Release);
+            control
+                .cancellation
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         let mut core = self.core.write().await;
         let aborted = core.abort_request(request_id).await;
@@ -378,14 +397,16 @@ impl Engine {
 
     /// Abort only the request incarnation named by `session`.
     pub async fn abort_request_session(&self, session: &SessionKey) -> Result<bool> {
-        if let Some((epoch, signal)) = self
+        if let Some(control) = self
             .request_controls
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&session.request_id)
         {
-            if *epoch == session.epoch {
-                signal.store(true, std::sync::atomic::Ordering::Release);
+            if control.session_epoch == session.epoch {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
         let mut core = self.core.write().await;
@@ -401,14 +422,48 @@ impl Engine {
 
     /// Abort all requests currently routed to a specific model variant.
     pub async fn abort_requests_for_variant(&self, variant: ModelVariant) -> Vec<RequestId> {
+        {
+            let controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for control in controls.values() {
+                if control.model_variant == Some(variant) {
+                    control
+                        .cancellation
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
         let mut core = self.core.write().await;
-        core.abort_requests_for_variant(variant).await
+        let aborted = core.abort_requests_for_variant(variant).await;
+        self.request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|_, control| control.model_variant != Some(variant));
+        aborted
     }
 
     /// Abort every request currently tracked by the engine.
     pub async fn abort_all_requests(&self) -> Vec<RequestId> {
+        {
+            let controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for control in controls.values() {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let mut core = self.core.write().await;
-        core.abort_all_requests().await
+        let aborted = core.abort_all_requests().await;
+        self.request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        aborted
     }
 
     /// Check if a request is still tracked by the engine core.
@@ -475,5 +530,59 @@ mod tests {
     fn asr_streaming_queue_default_handles_character_level_deltas() {
         let asr_request = EngineCoreRequest::asr("audio");
         assert_eq!(Engine::streaming_queue_capacity(&asr_request), 4096);
+    }
+
+    #[tokio::test]
+    async fn bulk_abort_signals_and_removes_matching_request_controls() {
+        use std::sync::atomic::Ordering;
+
+        let engine = Engine::new(EngineCoreConfig::default()).unwrap();
+        let mut first = EngineCoreRequest::tts("first");
+        first.id = "first".to_string();
+        first.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BBase);
+        let mut second = EngineCoreRequest::tts("second");
+        second.id = "second".to_string();
+        second.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+        engine.add_request(first).await.unwrap();
+        engine.add_request(second).await.unwrap();
+
+        let (first_signal, second_signal) = {
+            let controls = engine
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            (
+                controls["first"].cancellation.clone(),
+                controls["second"].cancellation.clone(),
+            )
+        };
+
+        assert_eq!(
+            engine
+                .abort_requests_for_variant(ModelVariant::Qwen3Tts12Hz06BBase)
+                .await,
+            vec!["first".to_string()]
+        );
+        assert!(first_signal.load(Ordering::Acquire));
+        assert!(!second_signal.load(Ordering::Acquire));
+        {
+            let controls = engine
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            assert!(!controls.contains_key("first"));
+            assert!(controls.contains_key("second"));
+        }
+
+        assert_eq!(
+            engine.abort_all_requests().await,
+            vec!["second".to_string()]
+        );
+        assert!(second_signal.load(Ordering::Acquire));
+        assert!(engine
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_empty());
     }
 }

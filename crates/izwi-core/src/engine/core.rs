@@ -12,13 +12,14 @@ use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchKey, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, NativeBatchMode,
-    PrefillMode, WorkUnit,
+    BatchDispatch, BatchKey, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
+    FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode, RetryDisposition,
+    WorkUnit,
 };
-use super::executor::{
-    ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
-};
+#[cfg(test)]
+use super::executor::REQUEST_DEADLINE_EXCEEDED;
+use super::executor::{ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig};
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::metrics::record_engine_batch_dispatch;
@@ -111,6 +112,12 @@ struct RequestPhaseTiming {
     decode_steps: u32,
 }
 
+#[derive(Debug)]
+struct CommittedExecutorOutput {
+    output: ExecutorOutput,
+    disposition: ExecutionDisposition,
+}
+
 fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
     if let Some(value) = value {
         let value = value.max(0.0);
@@ -196,6 +203,16 @@ impl EngineCore {
                     ExecutionMode::Atomic,
                 )
             });
+        if scheduled.is_prefill
+            && profile.prefill == PrefillMode::Full
+            && (scheduled.num_computed_tokens != 0
+                || scheduled.num_tokens < request.num_prompt_tokens())
+        {
+            return Err(Error::InferenceError(format!(
+                "full-prefill request {} was scheduled as a partial prompt quantum",
+                scheduled.request_id
+            )));
+        }
         let work = match profile.mode {
             ExecutionMode::Sequence | ExecutionMode::Realtime
                 if scheduled.is_prefill && profile.prefill == PrefillMode::Full =>
@@ -299,19 +316,24 @@ impl EngineCore {
             elapsed: std::time::Duration::ZERO,
             safe_point: result.safe_point,
             disposition: result.disposition.clone(),
+            output_finished: output.finished,
+            output_has_error: output.error.is_some(),
         }
     }
 
-    fn commit_executor_result(
+    async fn commit_executor_result(
         &mut self,
         mut result: ExecutorStepResult,
         step_time_ms: f64,
-    ) -> ExecutorOutput {
+    ) -> Option<CommittedExecutorOutput> {
         let Some(plan) = self.active_plans.remove(&result.plan_id) else {
-            return ExecutorOutput::error(
-                result.session.request_id,
-                "executor returned an inactive or already committed plan",
+            warn!(
+                plan_id = result.plan_id,
+                request_id = %result.session.request_id,
+                session_epoch = result.session.epoch,
+                "Ignoring executor result for an inactive or already committed plan"
             );
+            return None;
         };
         let report = Self::report_from_result(&result);
         let commit_result = self
@@ -329,31 +351,93 @@ impl EngineCore {
                 input_consumed: 0,
                 output_produced: 0,
                 observed_resources: ResourceVector::zero(),
-                dispatch: result.dispatch,
+                dispatch: BatchDispatch::serial(),
                 elapsed: std::time::Duration::ZERO,
                 safe_point: true,
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                     err.to_string(),
                 )),
+                output_finished: true,
+                output_has_error: true,
             };
             if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
                 let _ = tracker.commit(&plan, &failure_report);
             }
-            return ExecutorOutput::error(
-                plan.session.request_id,
-                format!("invalid executor result: {err}"),
-            );
+            let message = format!("invalid executor result: {err}");
+            return Some(CommittedExecutorOutput {
+                output: ExecutorOutput::error(plan.session.request_id, message.clone()),
+                disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                    message,
+                )),
+            });
         }
 
-        self.scheduler.update_after_step(
-            &plan.session.request_id,
-            result.output.tokens_processed,
-            result.output.tokens_generated,
-            Vec::new(),
-            step_time_ms,
-        );
+        match &result.disposition {
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::RetrySameSession =>
+            {
+                if self
+                    .scheduler
+                    .release_execution_quantum_for_retry(&plan.session)
+                {
+                    return None;
+                }
+                let message = "scheduler rejected a same-session execution retry";
+                return Some(CommittedExecutorOutput {
+                    output: ExecutorOutput::error(plan.session.request_id, message.to_string()),
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        message,
+                    )),
+                });
+            }
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::Recompute =>
+            {
+                let release = self.executor.cleanup_session(&plan.session).await;
+                if release.confirmed
+                    && self
+                        .scheduler
+                        .restart_request_for_recompute(&plan.session, self.kv_cache.inner_mut())
+                {
+                    self.execution_trackers.remove(&plan.session.request_id);
+                    self.active_plans
+                        .retain(|_, active| active.session != plan.session);
+                    self.request_phase_timings
+                        .entry(plan.session.request_id)
+                        .and_modify(|timing| *timing = RequestPhaseTiming::default());
+                    return None;
+                }
+
+                let message = if release.confirmed {
+                    "scheduler rejected an execution recompute retry"
+                } else {
+                    "executor could not confirm physical cache release for recompute retry"
+                };
+                return Some(CommittedExecutorOutput {
+                    output: ExecutorOutput::error(plan.session.request_id, message.to_string()),
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        message,
+                    )),
+                });
+            }
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::Finished(_) => {
+                self.scheduler.update_after_step(
+                    &plan.session.request_id,
+                    result.output.tokens_processed,
+                    result.output.tokens_generated,
+                    Vec::new(),
+                    step_time_ms,
+                );
+            }
+            ExecutionDisposition::Failed(_) => {}
+        }
         result.output.request_id = plan.session.request_id;
-        result.output
+        Some(CommittedExecutorOutput {
+            output: result.output,
+            disposition: result.disposition,
+        })
     }
 
     fn build_compatible_subbatches<'a>(
@@ -581,8 +665,6 @@ impl EngineCore {
                     result.session.request_id.clone(),
                     format!("{phase} executor output request ID did not match its session"),
                 );
-            } else if result.output.error.is_some() {
-                result.output.finished = true;
             }
             if by_transaction.insert(key.clone(), result).is_some() {
                 duplicates.insert(key);
@@ -759,10 +841,13 @@ impl EngineCore {
                 self.requests.remove(&session.request_id);
                 self.request_start_times.remove(&session.request_id);
                 self.request_phase_timings.remove(&session.request_id);
-                preemption_failures.push(ExecutorOutput::error(
-                    session.request_id.clone(),
-                    "executor could not confirm physical cache release during preemption",
-                ));
+                let message = "executor could not confirm physical cache release during preemption";
+                preemption_failures.push(CommittedExecutorOutput {
+                    output: ExecutorOutput::error(session.request_id.clone(), message),
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        message,
+                    )),
+                });
             }
             if self
                 .execution_trackers
@@ -786,10 +871,10 @@ impl EngineCore {
             Vec::with_capacity(schedule_result.expired_requests.len() + preemption_failures.len());
         terminal_outputs.extend(preemption_failures);
         for request in &schedule_result.expired_requests {
-            terminal_outputs.push(ExecutorOutput::error(
-                request.request_id.clone(),
-                REQUEST_DEADLINE_EXCEEDED,
-            ));
+            terminal_outputs.push(CommittedExecutorOutput {
+                output: ExecutorOutput::terminal(request.request_id.clone()),
+                disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+            });
         }
 
         if !schedule_result.has_work() {
@@ -938,14 +1023,20 @@ impl EngineCore {
             } else {
                 prefill_step_ms
             };
-            executor_outputs.push(self.commit_executor_result(result, step_time_ms));
+            if let Some(committed) = self.commit_executor_result(result, step_time_ms).await {
+                executor_outputs.push(committed);
+            }
         }
         executor_outputs.append(&mut terminal_outputs);
 
         // Phase 3: Process outputs
         let mut outputs = Vec::new();
 
-        for exec_output in executor_outputs {
+        for committed in executor_outputs {
+            let CommittedExecutorOutput {
+                output: exec_output,
+                disposition,
+            } = committed;
             let request_id = exec_output.request_id.clone();
 
             // Get timing info
@@ -1004,9 +1095,12 @@ impl EngineCore {
             }
 
             // Process output
-            let mut engine_output =
-                self.output_processor
-                    .process(exec_output.clone(), sequence_id, generation_time);
+            let mut engine_output = self.output_processor.process_execution(
+                exec_output.clone(),
+                &disposition,
+                sequence_id,
+                generation_time,
+            );
             engine_output.token_stats.prompt_tokens = self
                 .requests
                 .get(&request_id)
@@ -1468,6 +1562,58 @@ mod tests {
         }
     }
 
+    struct CancelledExecutor;
+
+    impl ModelExecutor for CancelledExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            Some(profile)
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(scheduled
+                .iter()
+                .map(|entry| {
+                    ExecutorStepResult::from_session(
+                        entry,
+                        super::super::executor::ModelSessionResult::cancelled(
+                            ExecutorOutput::cancelled(entry.request_id.clone()),
+                        ),
+                    )
+                })
+                .collect())
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(Vec::new())
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     struct SelectiveFailureExecutor;
 
     impl ModelExecutor for SelectiveFailureExecutor {
@@ -1662,6 +1808,27 @@ mod tests {
         let calls = cleanup_calls.lock().unwrap().clone();
         assert!(calls.iter().any(|id| id == "req-a"));
         assert!(!calls.iter().any(|id| id == "req-b"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_execution_surfaces_aborted_terminal_output() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(CancelledExecutor));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut request = EngineCoreRequest::tts("cancelled");
+        request.id = "cancelled".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+
+        let outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_finished);
+        assert_eq!(
+            outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert_eq!(outputs[0].error.as_deref(), Some("request cancelled"));
+        assert!(!core.has_request(&"cancelled".to_string()));
     }
 
     #[tokio::test]
@@ -1939,7 +2106,11 @@ mod tests {
             },
         );
         invalid.disposition = ExecutionDisposition::Progress;
-        let output = core.commit_executor_result(invalid, 1.0);
+        let output = core
+            .commit_executor_result(invalid, 1.0)
+            .await
+            .expect("invalid result must emit a terminal output")
+            .output;
 
         assert!(output.finished);
         assert!(output
@@ -1951,6 +2122,163 @@ mod tests {
             Some((0, 0)),
             "invalid progress must not reach scheduler accounting"
         );
+    }
+
+    fn retryable_step_result(
+        scheduled: &ScheduledRequest,
+        retry: RetryDisposition,
+    ) -> ExecutorStepResult {
+        ExecutorStepResult::from_session(
+            scheduled,
+            super::super::executor::ModelSessionResult {
+                output: ExecutorOutput {
+                    request_id: scheduled.request_id.clone(),
+                    audio: None,
+                    text: None,
+                    input_transcription: None,
+                    tokens_processed: 0,
+                    tokens_generated: 0,
+                    finished: false,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: Some("transient backend failure".to_string()),
+                },
+                disposition: ExecutionDisposition::Failed(ExecutionFailure {
+                    kind: super::super::execution::FailureKind::Backend,
+                    scope: super::super::execution::FailureScope::Request,
+                    retry,
+                    health: super::super::execution::HealthImpact::Degraded,
+                    message: "transient backend failure".to_string(),
+                }),
+                safe_point: true,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn same_session_retry_releases_quantum_without_committing_progress() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("retry");
+        request.id = "same-session-retry".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
+        let scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        let session = scheduled.session_key();
+        core.begin_execution_plan(&scheduled).await.unwrap();
+
+        let emitted = core
+            .commit_executor_result(
+                retryable_step_result(&scheduled, RetryDisposition::RetrySameSession),
+                1.0,
+            )
+            .await;
+        assert!(
+            emitted.is_none(),
+            "a retry must not terminalize the request"
+        );
+        assert_eq!(
+            core.scheduler.get_running_info(&scheduled.request_id),
+            Some((0, 0))
+        );
+
+        let mut retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+        assert_eq!(
+            retry_schedule.prefill_requests.len(),
+            1,
+            "same-session retry was not rescheduled: {retry_schedule:?}"
+        );
+        let retry = retry_schedule.prefill_requests.remove(0);
+        assert_eq!(retry.session_key(), session);
+        assert_ne!(retry.plan_id, scheduled.plan_id);
+    }
+
+    #[tokio::test]
+    async fn recompute_retry_releases_physical_and_logical_session_state() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("recompute");
+        request.id = "recompute-retry".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
+
+        let prefill = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        let session = prefill.session_key();
+        core.begin_execution_plan(&prefill).await.unwrap();
+        core.commit_executor_result(
+            ExecutorStepResult::new(
+                &prefill,
+                MockExecutor::build_outputs(std::slice::from_ref(&prefill)).remove(0),
+            ),
+            1.0,
+        )
+        .await
+        .expect("prefill progress must be emitted");
+
+        let decode = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .decode_requests
+            .remove(0);
+        core.begin_execution_plan(&decode).await.unwrap();
+        let emitted = core
+            .commit_executor_result(
+                retryable_step_result(&decode, RetryDisposition::Recompute),
+                1.0,
+            )
+            .await;
+        assert!(
+            emitted.is_none(),
+            "recompute must not terminalize the request"
+        );
+        assert!(cleanup_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request_id| request_id == "recompute-retry"));
+        assert_eq!(
+            core.scheduler.get_running_info(&decode.request_id),
+            Some((0, 0))
+        );
+        assert!(!core.execution_trackers.contains_key(&decode.request_id));
+
+        let retry = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        assert_eq!(retry.session_key(), session);
+        assert_ne!(retry.plan_id, decode.plan_id);
     }
 
     #[tokio::test]
@@ -1971,12 +2299,21 @@ mod tests {
         request.id = "full-prefill".to_string();
         request.prompt_tokens = (0..16).collect();
         core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
         let scheduled = core
             .scheduler
             .schedule(core.kv_cache.inner_mut())
             .prefill_requests
             .remove(0);
-        assert!(scheduled.num_tokens < 16);
+        assert_eq!(scheduled.num_computed_tokens, 0);
+        assert_eq!(scheduled.num_tokens, 16);
+        assert_eq!(
+            scheduled.block_ids.len(),
+            core.kv_cache.inner().blocks_for_tokens(16)
+        );
+        let mut partial = scheduled.clone();
+        partial.num_tokens = 4;
+        assert!(core.begin_execution_plan(&partial).await.is_err());
         core.begin_execution_plan(&scheduled).await.unwrap();
         let plan = core.active_plans.get(&scheduled.plan_id).unwrap();
         assert!(matches!(
@@ -2003,7 +2340,11 @@ mod tests {
                 error: None,
             },
         );
-        let output = core.commit_executor_result(result, 1.0);
+        let output = core
+            .commit_executor_result(result, 1.0)
+            .await
+            .expect("valid progress must emit an output")
+            .output;
         assert!(output.error.is_none());
         assert_eq!(
             core.scheduler.get_running_info(&scheduled.request_id),
@@ -2039,18 +2380,18 @@ mod tests {
             MockExecutor::build_outputs(std::slice::from_ref(&scheduled)).remove(0),
         );
 
-        let output = core.commit_executor_result(result.clone(), 1.0);
+        let output = core
+            .commit_executor_result(result.clone(), 1.0)
+            .await
+            .expect("valid progress must emit an output")
+            .output;
         assert!(output.error.is_none());
         assert_eq!(
             core.scheduler.get_running_info(&scheduled.request_id),
             Some((scheduled.num_tokens, 0))
         );
 
-        let duplicate = core.commit_executor_result(result, 1.0);
-        assert!(duplicate
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("already committed")));
+        assert!(core.commit_executor_result(result, 1.0).await.is_none());
         assert_eq!(
             core.scheduler.get_running_info(&scheduled.request_id),
             Some((scheduled.num_tokens, 0)),
@@ -2101,7 +2442,11 @@ mod tests {
                 error: None,
             },
         );
-        let output = core.commit_executor_result(result, 1.0);
+        let output = core
+            .commit_executor_result(result, 1.0)
+            .await
+            .expect("invalid atomic result must emit an error")
+            .output;
         assert!(output
             .error
             .as_deref()

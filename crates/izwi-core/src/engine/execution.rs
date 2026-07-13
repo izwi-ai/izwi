@@ -418,7 +418,7 @@ impl ExecutionState {
                     Prefilling,
                     Prefilling | Decoding | Cancelling | PreemptedRecompute
                 )
-                | (Decoding, Decoding | Cancelling)
+                | (Decoding, Decoding | Cancelling | PreemptedRecompute)
                 | (AtomicRunning, Cancelling)
                 | (PipelineRunning, PipelineRunning | Cancelling)
                 | (PreemptedRecompute, Admitted | Prefilling | Cancelling)
@@ -467,6 +467,11 @@ pub struct ExecutionReport {
     pub elapsed: Duration,
     pub safe_point: bool,
     pub disposition: ExecutionDisposition,
+    /// Terminal/error flags carried by the executor payload. These are
+    /// validated together with `disposition` so the payload cannot claim a
+    /// different lifecycle outcome than the execution transaction.
+    pub output_finished: bool,
+    pub output_has_error: bool,
 }
 
 impl ExecutionReport {
@@ -533,6 +538,52 @@ impl ExecutionReport {
             return Err(Error::InferenceError(
                 "executor may only yield at a declared safe point".to_string(),
             ));
+        }
+        match &self.disposition {
+            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
+                if self.output_finished || self.output_has_error {
+                    return Err(Error::InferenceError(
+                        "non-terminal execution returned a terminal or errored payload".to_string(),
+                    ));
+                }
+            }
+            ExecutionDisposition::Finished(_) => {
+                if !self.output_finished || self.output_has_error {
+                    return Err(Error::InferenceError(
+                        "finished execution must return a terminal payload without an executor error"
+                            .to_string(),
+                    ));
+                }
+            }
+            ExecutionDisposition::Failed(failure) => {
+                if self.input_consumed != 0 || self.output_produced != 0 {
+                    return Err(Error::InferenceError(
+                        "failed execution cannot also report committed progress".to_string(),
+                    ));
+                }
+                let terminal = failure.retry == RetryDisposition::Never;
+                if self.output_finished != terminal || !self.output_has_error {
+                    return Err(Error::InferenceError(if terminal {
+                        "non-retryable execution failure must return a terminal errored payload"
+                            .to_string()
+                    } else {
+                        "retryable execution failure must return a non-terminal errored payload"
+                            .to_string()
+                    }));
+                }
+                if failure.retry != RetryDisposition::Never && !self.safe_point {
+                    return Err(Error::InferenceError(
+                        "executor may only retry from a declared safe point".to_string(),
+                    ));
+                }
+                if failure.retry == RetryDisposition::Recompute
+                    && !matches!(plan.work, WorkUnit::SequenceStep { .. })
+                {
+                    return Err(Error::InferenceError(
+                        "recompute retry is only valid for sequence execution".to_string(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -605,6 +656,11 @@ impl ExecutionTracker {
             ExecutionDisposition::Failed(failure) if failure.retry == RetryDisposition::Never => {
                 Some(ExecutionState::Terminal(TerminalOutcome::Failed))
             }
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::Recompute =>
+            {
+                Some(ExecutionState::PreemptedRecompute)
+            }
             ExecutionDisposition::Progress
             | ExecutionDisposition::Yielded(_)
             | ExecutionDisposition::Failed(_) => None,
@@ -673,6 +729,8 @@ mod tests {
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition: ExecutionDisposition::Progress,
+            output_finished: false,
+            output_has_error: false,
         };
         assert!(report.validate_against(&plan).is_err());
     }
@@ -723,6 +781,13 @@ mod tests {
     }
 
     fn report_for(plan: &ExecutionPlan, disposition: ExecutionDisposition) -> ExecutionReport {
+        let (output_finished, output_has_error) = match &disposition {
+            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => (false, false),
+            ExecutionDisposition::Finished(_) => (true, false),
+            ExecutionDisposition::Failed(failure) => {
+                (failure.retry == RetryDisposition::Never, true)
+            }
+        };
         ExecutionReport {
             plan_id: plan.plan_id,
             session: plan.session.clone(),
@@ -733,6 +798,8 @@ mod tests {
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition,
+            output_finished,
+            output_has_error,
         }
     }
 
@@ -881,6 +948,70 @@ mod tests {
             tracker.state(),
             ExecutionState::Terminal(TerminalOutcome::Failed)
         );
+    }
+
+    #[test]
+    fn disposition_and_payload_terminal_state_cannot_disagree() {
+        let plan = plan_for(
+            SessionKey::new("request".to_string(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+
+        let mut completed = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        completed.output_finished = false;
+        assert!(completed.validate_against(&plan).is_err());
+
+        let retry = ExecutionFailure {
+            kind: FailureKind::Backend,
+            scope: FailureScope::Request,
+            retry: RetryDisposition::RetrySameSession,
+            health: HealthImpact::Degraded,
+            message: "transient".to_string(),
+        };
+        let mut retryable = report_for(&plan, ExecutionDisposition::Failed(retry));
+        retryable.output_finished = true;
+        assert!(retryable.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn recompute_failure_moves_tracker_to_recompute_state() {
+        let session = SessionKey::new("request".to_string(), 1);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let mut tracker = ExecutionTracker::new(session);
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::Decoding).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+
+        let recompute = ExecutionFailure {
+            kind: FailureKind::Backend,
+            scope: FailureScope::Request,
+            retry: RetryDisposition::Recompute,
+            health: HealthImpact::Degraded,
+            message: "cache invalidated".to_string(),
+        };
+        tracker
+            .commit(
+                &plan,
+                &report_for(&plan, ExecutionDisposition::Failed(recompute)),
+            )
+            .unwrap();
+
+        assert_eq!(tracker.state(), ExecutionState::PreemptedRecompute);
+        assert_eq!(tracker.active_plan_id(), None);
     }
 
     #[test]
