@@ -387,7 +387,6 @@ impl RuntimeService {
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-            let _residency_lease = self.load_model_for_inference(variant).await?;
             let context = RuntimeRequestContext::default();
             let job = self.coordinator_job_for_input(
                 correlation_id
@@ -494,7 +493,6 @@ impl RuntimeService {
     {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
-            let _residency_lease = self.load_model_for_inference(variant).await?;
             let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Streaming);
             let job = self.coordinator_job_for_input(
                 correlation_id
@@ -621,7 +619,6 @@ impl RuntimeService {
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-            let _residency_lease = self.load_model_for_inference(variant).await?;
             let job = self.coordinator_job_for_input(
                 correlation_id
                     .map(ToOwned::to_owned)
@@ -796,7 +793,6 @@ impl RuntimeService {
                 Some(variant),
                 broker_streaming_required,
             )?;
-            let _residency_lease = self.load_model_for_inference(variant).await?;
             let job = self.coordinator_job_for_input(
                 correlation_id
                     .map(ToOwned::to_owned)
@@ -1565,7 +1561,6 @@ impl RuntimeService {
             Some(variant),
             false,
         )?;
-        let _residency_lease = self.load_model_for_inference(variant).await?;
         let context = RuntimeRequestContext::default();
         let job = self.coordinator_job_for_input(
             uuid::Uuid::new_v4().to_string(),

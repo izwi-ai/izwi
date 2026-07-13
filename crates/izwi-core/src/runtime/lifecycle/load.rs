@@ -170,14 +170,17 @@ impl RuntimeService {
         &self,
         variant: ModelVariant,
     ) -> Result<crate::model::ModelResidencyLease> {
-        let resolved = self.resolve_model_load(variant).await?;
-        let acquired = self.acquire_model_artifacts(resolved).await?;
-
         let _load_guard = self.model_load_lock.lock().await;
         if self.model_manager.is_ready(variant).await {
             self.touch_model_usage(variant).await;
             return Ok(self.acquire_model_residency_lease(variant));
         }
+
+        let _coordinator_load = self
+            .coordinator
+            .begin_model_load(format!("model-load:{variant}"))?;
+        let resolved = self.resolve_model_load(variant).await?;
+        let acquired = self.acquire_model_artifacts(resolved).await?;
 
         self.ensure_model_budget_before_load(variant).await?;
         let resource_lease = self.reserve_model_resources(variant).await?;
@@ -204,6 +207,7 @@ mod tests {
     use super::{residency_budget_has_capacity, select_lru_eviction_candidate};
     use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
+    use crate::error::Error;
     use crate::model::ModelVariant;
     use crate::runtime::service::RuntimeService;
     use std::collections::{HashMap, HashSet};
@@ -278,6 +282,30 @@ mod tests {
             .unwrap();
 
         assert!(runtime.model_manager.resident_variants().await.is_empty());
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_model_load_is_rejected_before_artifact_work_during_drain() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-load-drain-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime.coordinator.begin_drain();
+
+        assert!(matches!(
+            runtime
+                .load_model_for_inference(ModelVariant::Kokoro82M)
+                .await,
+            Err(Error::Overloaded(_))
+        ));
+        assert!(runtime.model_manager.resident_variants().await.is_empty());
+
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 }

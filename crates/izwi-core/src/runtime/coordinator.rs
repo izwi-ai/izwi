@@ -41,6 +41,7 @@ pub struct JobSpec {
 pub struct CoordinatorSnapshot {
     pub capacity: usize,
     pub active_jobs: usize,
+    pub active_model_loads: usize,
     pub active_executions: usize,
     pub reserved_memory_bytes: u64,
     pub admitted_total: u64,
@@ -59,6 +60,7 @@ pub struct InferenceCoordinator {
     admission_gate: Mutex<()>,
     idle: Notify,
     active_jobs: AtomicUsize,
+    active_model_loads: AtomicUsize,
     active_executions: AtomicUsize,
     admitted_total: AtomicU64,
     rejected_total: AtomicU64,
@@ -113,6 +115,7 @@ impl InferenceCoordinator {
             admission_gate: Mutex::new(()),
             idle: Notify::new(),
             active_jobs: AtomicUsize::new(0),
+            active_model_loads: AtomicUsize::new(0),
             active_executions: AtomicUsize::new(0),
             admitted_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
@@ -130,6 +133,7 @@ impl InferenceCoordinator {
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
+            active_model_loads: self.active_model_loads.load(Ordering::Relaxed),
             active_executions: self.active_executions.load(Ordering::Relaxed),
             reserved_memory_bytes,
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
@@ -155,6 +159,7 @@ impl InferenceCoordinator {
         loop {
             let notified = self.idle.notified();
             if self.active_jobs.load(Ordering::Acquire) == 0
+                && self.active_model_loads.load(Ordering::Acquire) == 0
                 && self.active_executions.load(Ordering::Acquire) == 0
             {
                 return Ok(());
@@ -205,6 +210,28 @@ impl InferenceCoordinator {
                 _reservation: reservation,
             }),
             spec,
+        })
+    }
+
+    /// Admit one cold model-load lifecycle operation. Model loads do not take
+    /// an execution permit, but drain must wait for artifact acquisition,
+    /// instantiation, and publication to finish before unloading residency.
+    pub fn begin_model_load(
+        self: &Arc<Self>,
+        model_key: impl Into<String>,
+    ) -> Result<ModelLoadLease> {
+        let _gate = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.draining.load(Ordering::Acquire) {
+            self.rejected_total.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Overloaded("runtime is draining".to_string()));
+        }
+        self.active_model_loads.fetch_add(1, Ordering::AcqRel);
+        Ok(ModelLoadLease {
+            coordinator: self.clone(),
+            _model_key: model_key.into(),
         })
     }
 
@@ -299,6 +326,25 @@ fn shared_resource_authority(
 pub struct JobLease {
     _inner: Arc<JobLeaseInner>,
     pub spec: JobSpec,
+}
+
+#[derive(Debug)]
+pub struct ModelLoadLease {
+    coordinator: Arc<InferenceCoordinator>,
+    _model_key: String,
+}
+
+impl Drop for ModelLoadLease {
+    fn drop(&mut self) {
+        if self
+            .coordinator
+            .active_model_loads
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.coordinator.idle.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -723,6 +769,33 @@ Pages free: 10.\n";
         drop(lease);
 
         waiting.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_cold_model_load_and_rejects_new_loads() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let load = coordinator
+            .begin_model_load("model-load:test")
+            .expect("model load admitted before drain");
+        assert_eq!(coordinator.snapshot().active_model_loads, 1);
+
+        coordinator.begin_drain();
+        let short_deadline = Instant::now() + std::time::Duration::from_millis(5);
+        assert!(matches!(
+            coordinator.wait_for_idle(short_deadline).await,
+            Err(Error::Timeout(_))
+        ));
+        assert!(matches!(
+            coordinator.begin_model_load("model-load:late"),
+            Err(Error::Overloaded(_))
+        ));
+
+        drop(load);
+        coordinator
+            .wait_for_idle(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .expect("load release must unblock drain");
+        assert_eq!(coordinator.snapshot().active_model_loads, 0);
     }
 
     #[tokio::test]

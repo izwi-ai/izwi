@@ -75,7 +75,6 @@ impl RuntimeService {
     ) -> Result<DiarizationResult> {
         let variant = resolve_diarization_model_variant(model_id);
         self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
-        let _residency_lease = self.load_model_for_inference(variant).await?;
         let context = RuntimeRequestContext::default();
         let job = self.coordinator_job_for_input(
             uuid::Uuid::new_v4().to_string(),

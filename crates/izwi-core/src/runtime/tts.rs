@@ -542,16 +542,19 @@ impl RuntimeService {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         if uses_direct_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, false);
+            let job = self
+                .coordinator
+                .admit(self.coordinator_job_for_input(
+                    request.id.clone(),
+                    CoordinatorLane::Atomic,
+                    request.runtime_context,
+                    request.text.len(),
+                ))
+                .await?;
             let _residency_lease = self.load_model_for_inference(resolved_variant).await?;
-            let job = self.coordinator_job_for_input(
-                request.id.clone(),
-                CoordinatorLane::Atomic,
-                request.runtime_context,
-                request.text.len(),
-            );
             let result = self
                 .coordinator
-                .run_direct(job, async {
+                .run_stage(&job, async {
                     match resolved_variant.family() {
                         ModelFamily::KokoroTts => self.kokoro_tts_generate(request).await,
                         ModelFamily::Lfm25Audio => {
@@ -577,8 +580,6 @@ impl RuntimeService {
             self.record_direct_tts_observation(observation, result.as_ref().map(Some));
             return result;
         }
-        self.load_model(resolved_variant).await?;
-
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
@@ -617,16 +618,19 @@ impl RuntimeService {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
         if uses_direct_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
+            let job = self
+                .coordinator
+                .admit(self.coordinator_job_for_input(
+                    request.id.clone(),
+                    CoordinatorLane::Atomic,
+                    request.runtime_context,
+                    request.text.len(),
+                ))
+                .await?;
             let _residency_lease = self.load_model_for_inference(resolved_variant).await?;
-            let job = self.coordinator_job_for_input(
-                request.id.clone(),
-                CoordinatorLane::Atomic,
-                request.runtime_context,
-                request.text.len(),
-            );
             let result = self
                 .coordinator
-                .run_direct(job, async {
+                .run_stage(&job, async {
                     match resolved_variant.family() {
                         ModelFamily::KokoroTts => {
                             self.kokoro_tts_generate_streaming(request, chunk_tx).await
@@ -669,8 +673,6 @@ impl RuntimeService {
         ) {
             return self.qwen_tts_final_only_streaming(request, chunk_tx).await;
         }
-        self.load_model(resolved_variant).await?;
-
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);

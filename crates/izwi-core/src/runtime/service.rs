@@ -21,13 +21,13 @@ use crate::config::EngineConfig;
 use crate::engine::{
     engine_request_parallel_batches_total, engine_stream_backpressure_total,
     engine_tensor_batch_max_width, engine_tensor_batches_total, Engine as CoreEngine,
-    EngineCoreConfig, EngineCoreRequest, EngineOutput, ResourceAmount, ResourceLease,
-    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
-    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-    ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
-    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    EngineCoreConfig, EngineCoreRequest, EngineOutput, OutputFinishReason, ResourceAmount,
+    ResourceLease, ResourceVector, SessionKey, StreamingOutput, TaskType, WorkerConfig,
+    WorkloadClass, ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
@@ -66,6 +66,20 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
         return msg.clone();
     }
     "unknown panic payload".to_string()
+}
+
+fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
+    if output.finish_reason == Some(OutputFinishReason::Aborted) {
+        return Err(Error::Cancelled(output.request_id));
+    }
+    if let Some(err) = output.error.clone() {
+        return Err(if err == REQUEST_DEADLINE_EXCEEDED {
+            Error::Timeout(output.request_id)
+        } else {
+            Error::InferenceError(err)
+        });
+    }
+    Ok(output)
 }
 
 fn reported_gpu_resident_blocks(_backend_kind: BackendKind, _logical_blocks: u64) -> u64 {
@@ -658,16 +672,7 @@ impl RuntimeService {
                             };
 
                             if let Some(tx) = waiter {
-                                if let Some(err) = output.error.clone() {
-                                    let runtime_error = if err == REQUEST_DEADLINE_EXCEEDED {
-                                        Error::Timeout(output.request_id.clone())
-                                    } else {
-                                        Error::InferenceError(err)
-                                    };
-                                    let _ = tx.send(Err(runtime_error));
-                                } else {
-                                    let _ = tx.send(Ok(output));
-                                }
+                                let _ = tx.send(runtime_completion(output));
                             }
                         }
                     }
@@ -903,14 +908,14 @@ impl RuntimeService {
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
-        let _residency_lease = match request.model_variant {
-            Some(variant) => Some(self.load_model_for_inference(variant).await?),
-            None => None,
-        };
         let job = self
             .coordinator
             .admit(self.coordinator_job_for_request(&request))
             .await?;
+        let _residency_lease = match request.model_variant {
+            Some(variant) => Some(self.load_model_for_inference(variant).await?),
+            None => None,
+        };
         let observation_request = request.clone();
         self.ensure_step_driver_started().await;
 
@@ -1011,14 +1016,14 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
-        let _residency_lease = match request.model_variant {
-            Some(variant) => Some(self.load_model_for_inference(variant).await?),
-            None => None,
-        };
         let job = self
             .coordinator
             .admit(self.coordinator_job_for_request(&request))
             .await?;
+        let _residency_lease = match request.model_variant {
+            Some(variant) => Some(self.load_model_for_inference(variant).await?),
+            None => None,
+        };
         let observation_request = request.clone();
         self.ensure_step_driver_started().await;
 
@@ -1537,7 +1542,32 @@ fn requested_backend_unavailable_message(
 mod tests {
     use super::*;
     use crate::backends::{BackendCapabilities, BackendContext, BackendSelectionSource};
+    use crate::engine::{
+        ExecutionDisposition, ExecutorOutput, FinishReason as ExecutionFinishReason,
+        OutputProcessor,
+    };
     use crate::runtime::broker::{InferenceBroker, InferenceBrokerMode};
+
+    fn terminal_output(reason: ExecutionFinishReason) -> EngineOutput {
+        OutputProcessor::new(24_000).process_execution(
+            ExecutorOutput::terminal("terminal-request".to_string()),
+            &ExecutionDisposition::Finished(reason),
+            7,
+            std::time::Duration::ZERO,
+        )
+    }
+
+    #[test]
+    fn runtime_completion_preserves_typed_terminal_failures() {
+        assert!(matches!(
+            runtime_completion(terminal_output(ExecutionFinishReason::Cancelled)),
+            Err(Error::Cancelled(request_id)) if request_id == "terminal-request"
+        ));
+        assert!(matches!(
+            runtime_completion(terminal_output(ExecutionFinishReason::TimedOut)),
+            Err(Error::Timeout(request_id)) if request_id == "terminal-request"
+        ));
+    }
 
     #[tokio::test]
     async fn duplicate_waiter_registration_preserves_original_owner() {
