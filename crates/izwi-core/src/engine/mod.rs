@@ -48,7 +48,9 @@ pub use execution::{
     HealthImpact, InputRange, NativeBatchMode, PlanId, PrefillMode, RetryDisposition,
     SequencePhase, SessionEpoch, SessionKey, TerminalOutcome, WorkUnit, YieldReason,
 };
-pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED};
+pub use executor::{
+    ExecutorOutput, ExecutorStepResult, ModelExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
+};
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
     PinnedBlockHandle,
@@ -84,7 +86,7 @@ pub use types::{
 
 use crate::error::Result;
 use crate::model::ModelVariant;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, info, warn};
@@ -108,6 +110,9 @@ pub struct Engine {
     metrics: Arc<RwLock<EngineMetrics>>,
     /// Event-driven wakeup for run-loop when new requests arrive.
     wake_notify: Arc<Notify>,
+    /// Session-fenced cooperative cancellation signals available without the core lock.
+    request_controls:
+        std::sync::Mutex<HashMap<RequestId, (SequenceId, Arc<std::sync::atomic::AtomicBool>)>>,
 }
 
 impl Engine {
@@ -166,6 +171,7 @@ impl Engine {
             running: std::sync::atomic::AtomicBool::new(false),
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             wake_notify: Arc::new(Notify::new()),
+            request_controls: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -175,12 +181,23 @@ impl Engine {
     /// waiting queue. Returns a request ID that can be used to track the request.
     pub async fn add_request(&self, request: EngineCoreRequest) -> Result<RequestId> {
         // Validate and preprocess
-        let processed = self.request_processor.process(request)?;
+        let mut processed = self.request_processor.process(request)?;
         let request_id = processed.id.clone();
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        processed.set_cancellation_signal(cancellation.clone());
 
         // Add to engine core
         let mut core = self.core.write().await;
         core.add_request(processed)?;
+        let session = core.get_session_key(&request_id).ok_or_else(|| {
+            crate::error::Error::InferenceError(format!(
+                "request {request_id} is missing its scheduler session"
+            ))
+        })?;
+        self.request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(request_id.clone(), (session.epoch, cancellation));
         self.wake_notify.notify_one();
 
         debug!("Added request {} to engine", request_id);
@@ -249,6 +266,17 @@ impl Engine {
     pub async fn step(&self) -> Result<Vec<EngineOutput>> {
         let mut core = self.core.write().await;
         let outputs = core.step().await?;
+        if outputs.iter().any(|output| output.is_finished) {
+            let mut controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for output in &outputs {
+                if output.is_finished {
+                    controls.remove(&output.request_id);
+                }
+            }
+        }
 
         // Update metrics
         {
@@ -318,8 +346,51 @@ impl Engine {
 
     /// Abort a specific request.
     pub async fn abort_request(&self, request_id: &RequestId) -> Result<bool> {
+        if let Some((_, signal)) = self
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(request_id)
+        {
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        }
         let mut core = self.core.write().await;
-        Ok(core.abort_request(request_id).await)
+        let aborted = core.abort_request(request_id).await;
+        if aborted {
+            self.request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(request_id);
+        }
+        Ok(aborted)
+    }
+
+    /// Read the session-fenced identity for the active request ID.
+    pub async fn request_session_key(&self, request_id: &RequestId) -> Option<SessionKey> {
+        self.core.read().await.get_session_key(request_id)
+    }
+
+    /// Abort only the request incarnation named by `session`.
+    pub async fn abort_request_session(&self, session: &SessionKey) -> Result<bool> {
+        if let Some((epoch, signal)) = self
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&session.request_id)
+        {
+            if *epoch == session.epoch {
+                signal.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let mut core = self.core.write().await;
+        let aborted = core.abort_request_session(session).await;
+        if aborted {
+            self.request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&session.request_id);
+        }
+        Ok(aborted)
     }
 
     /// Abort all requests currently routed to a specific model variant.

@@ -25,8 +25,9 @@ mod streaming;
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    CacheMode, ConcurrencyClass, ExecutionCapabilities, ExecutionMode, ExecutionProfile,
-    NativeBatchMode, PrefillMode,
+    CacheMode, ConcurrencyClass, ExecutionCapabilities, ExecutionDisposition, ExecutionFailure,
+    ExecutionMode, ExecutionProfile, FailureKind, FailureScope, FinishReason, HealthImpact,
+    NativeBatchMode, PlanId, PrefillMode, RetryDisposition, SessionKey, YieldReason,
 };
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
@@ -247,6 +248,45 @@ impl ExecutorOutput {
     }
 }
 
+/// Executor payload fenced to the exact scheduler transaction that produced it.
+#[derive(Debug, Clone)]
+pub struct ExecutorStepResult {
+    pub plan_id: PlanId,
+    pub session: SessionKey,
+    pub disposition: ExecutionDisposition,
+    pub safe_point: bool,
+    pub output: ExecutorOutput,
+}
+
+impl ExecutorStepResult {
+    pub fn new(scheduled: &ScheduledRequest, output: ExecutorOutput) -> Self {
+        let disposition = if let Some(message) = output.error.as_ref() {
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::Executor,
+                scope: FailureScope::Request,
+                retry: RetryDisposition::Never,
+                health: HealthImpact::None,
+                message: message.clone(),
+            })
+        } else if output.finished {
+            ExecutionDisposition::Finished(FinishReason::Completed)
+        } else if output.tokens_processed > 0 || output.tokens_generated > 0 {
+            ExecutionDisposition::Progress
+        } else {
+            // Compatibility for existing adapters. Phase 4 replaces this with
+            // model-session-owned yield reasons at every safe point.
+            ExecutionDisposition::Yielded(YieldReason::AwaitingInput)
+        };
+        Self {
+            plan_id: scheduled.plan_id,
+            session: scheduled.session_key(),
+            disposition,
+            safe_point: true,
+            output,
+        }
+    }
+}
+
 /// Model executor trait - abstracts the model inference backend.
 pub trait ModelExecutor: Send + Sync {
     /// Effective loaded-model/request/backend execution profile. Executors
@@ -269,14 +309,14 @@ pub trait ModelExecutor: Send + Sync {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>>;
+    ) -> Result<Vec<ExecutorStepResult>>;
 
     /// Execute decode pass for running requests.
     fn execute_decode(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>>;
+    ) -> Result<Vec<ExecutorStepResult>>;
 
     /// Execute forward pass for scheduled requests.
     /// Compatibility helper that executes decode and prefill paths.
@@ -284,7 +324,7 @@ pub trait ModelExecutor: Send + Sync {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         for req in scheduled {
@@ -503,7 +543,7 @@ impl ModelExecutor for NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         if !self.initialized {
             return Err(Error::InferenceError("Executor not initialized".into()));
         }
@@ -514,7 +554,7 @@ impl ModelExecutor for NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         if !self.initialized {
             return Err(Error::InferenceError("Executor not initialized".into()));
         }
@@ -525,7 +565,7 @@ impl ModelExecutor for NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         if !self.initialized {
             return Err(Error::InferenceError("Executor not initialized".into()));
         }
@@ -612,7 +652,7 @@ impl UnifiedExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         let executor = self.inner.read().await;
         executor.execute(requests, scheduled)
     }
@@ -622,7 +662,7 @@ impl UnifiedExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         let executor = self.inner.read().await;
         executor.execute_prefill(requests, scheduled)
     }
@@ -632,9 +672,14 @@ impl UnifiedExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ExecutorStepResult>> {
         let executor = self.inner.read().await;
         executor.execute_decode(requests, scheduled)
+    }
+
+    pub async fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+        let executor = self.inner.read().await;
+        executor.execution_profile(request)
     }
 
     /// Check if ready.

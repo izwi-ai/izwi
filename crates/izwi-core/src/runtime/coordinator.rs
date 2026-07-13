@@ -176,10 +176,29 @@ impl InferenceCoordinator {
         self: &Arc<Self>,
         deadline: Option<Instant>,
     ) -> Result<ExecutionLease> {
-        let acquire = self
-            .execution
-            .clone()
-            .acquire_many_owned(self.capacity as u32);
+        self.acquire_execution_units(1, deadline).await
+    }
+
+    pub async fn acquire_execution_units(
+        self: &Arc<Self>,
+        units: usize,
+        deadline: Option<Instant>,
+    ) -> Result<ExecutionLease> {
+        if units == 0 {
+            return Err(Error::InvalidInput(
+                "execution units must be greater than zero".to_string(),
+            ));
+        }
+        if units > self.capacity {
+            return Err(Error::InvalidInput(format!(
+                "requested {units} execution units exceeds coordinator capacity {}",
+                self.capacity
+            )));
+        }
+        let units = u32::try_from(units).map_err(|_| {
+            Error::InvalidInput("execution unit request exceeds supported range".to_string())
+        })?;
+        let acquire = self.execution.clone().acquire_many_owned(units);
         let permit = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
                 .await
@@ -416,6 +435,42 @@ mod tests {
 
         assert!(matches!(result, Err(Error::Timeout(_))));
         assert_eq!(coordinator.snapshot().expired_total, 1);
+    }
+
+    #[tokio::test]
+    async fn cuda_execution_uses_configured_concurrency() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 3, 4));
+        let first = coordinator.acquire_execution(None).await.unwrap();
+        let second = coordinator.acquire_execution(None).await.unwrap();
+        let third = coordinator.acquire_execution(None).await.unwrap();
+
+        assert_eq!(coordinator.snapshot().active_executions, 3);
+        let blocked = coordinator
+            .acquire_execution(Some(Instant::now() + std::time::Duration::from_millis(5)))
+            .await;
+        assert!(matches!(blocked, Err(Error::Timeout(_))));
+
+        drop((first, second, third));
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_unit_requests_are_bounded_by_backend_capacity() {
+        let cpu = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 8, 8));
+        assert!(matches!(
+            cpu.acquire_execution_units(0, None).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cpu.acquire_execution_units(2, None).await,
+            Err(Error::InvalidInput(_))
+        ));
+
+        let cuda = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
+        let lease = cuda.acquire_execution_units(4, None).await.unwrap();
+        assert_eq!(cuda.snapshot().active_executions, 1);
+        drop(lease);
+        assert_eq!(cuda.snapshot().active_executions, 0);
     }
 
     #[tokio::test]

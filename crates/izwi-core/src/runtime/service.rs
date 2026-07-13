@@ -20,8 +20,8 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, ResourceAmount, ResourceVector, StreamingOutput, TaskType, WorkerConfig,
-    WorkloadClass, ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    EngineOutput, ResourceAmount, ResourceVector, SessionKey, StreamingOutput, TaskType,
+    WorkerConfig, WorkloadClass, ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
     ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
     ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
@@ -39,7 +39,7 @@ use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
 use crate::runtime::coordinator::{
-    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec,
+    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobSpec,
 };
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
@@ -97,31 +97,35 @@ pub struct RuntimeService {
 }
 
 struct PendingRequestGuard {
-    request_id: String,
+    session: SessionKey,
     core_engine: Arc<CoreEngine>,
     completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
     telemetry: Arc<RuntimeTelemetryCollector>,
+    job: Option<JobLease>,
     active: bool,
 }
 
 impl PendingRequestGuard {
     fn new(
-        request_id: String,
+        session: SessionKey,
         core_engine: Arc<CoreEngine>,
         completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
         telemetry: Arc<RuntimeTelemetryCollector>,
+        job: JobLease,
     ) -> Self {
         Self {
-            request_id,
+            session,
             core_engine,
             completion_waiters,
             telemetry,
+            job: Some(job),
             active: true,
         }
     }
 
     fn disarm(&mut self) {
         self.active = false;
+        self.job.take();
     }
 }
 
@@ -131,19 +135,23 @@ impl Drop for PendingRequestGuard {
             return;
         }
 
-        let request_id = self.request_id.clone();
+        let session = self.session.clone();
         let engine = self.core_engine.clone();
         let waiters = self.completion_waiters.clone();
         let telemetry = self.telemetry.clone();
+        let job = self.job.take();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let mut guard = waiters.lock().await;
-                guard.remove(&request_id);
+                guard.remove(&session.request_id);
                 drop(guard);
 
-                let _ = engine.abort_request(&request_id).await;
-                telemetry.record_request_cancelled(&request_id).await;
+                let _ = engine.abort_request_session(&session).await;
+                telemetry
+                    .record_request_cancelled(&session.request_id)
+                    .await;
+                drop(job);
             });
         }
     }
@@ -643,11 +651,23 @@ impl RuntimeService {
         self.step_driver_started.store(true, Ordering::Release);
     }
 
-    async fn register_waiter(&self, request_id: &str) -> oneshot::Receiver<Result<EngineOutput>> {
+    async fn register_waiter(
+        &self,
+        request_id: &str,
+    ) -> Result<oneshot::Receiver<Result<EngineOutput>>> {
+        use std::collections::hash_map::Entry;
+
         let (tx, rx) = oneshot::channel();
         let mut waiters = self.completion_waiters.lock().await;
-        waiters.insert(request_id.to_string(), tx);
-        rx
+        match waiters.entry(request_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(tx);
+                Ok(rx)
+            }
+            Entry::Occupied(_) => Err(Error::InvalidInput(format!(
+                "request {request_id} already has a completion waiter"
+            ))),
+        }
     }
 
     async fn remove_waiter(&self, request_id: &str) {
@@ -805,7 +825,7 @@ impl RuntimeService {
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
-        let _job = self
+        let job = self
             .coordinator
             .admit(self.coordinator_job_for_request(&request))
             .await?;
@@ -826,7 +846,7 @@ impl RuntimeService {
         let _entered = span.enter();
 
         let request_id = request.id.clone();
-        let completion_rx = self.register_waiter(&request_id).await;
+        let completion_rx = self.register_waiter(&request_id).await?;
 
         if let Err(err) = self.core_engine.add_request(request).await {
             self.remove_waiter(&request_id).await;
@@ -836,11 +856,20 @@ impl RuntimeService {
         self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
 
+        let Some(session) = self.core_engine.request_session_key(&request_id).await else {
+            self.remove_waiter(&request_id).await;
+            let _ = self.core_engine.abort_request(&request_id).await;
+            return Err(Error::InferenceError(format!(
+                "request {request_id} is missing its scheduler session"
+            )));
+        };
+
         let mut guard = PendingRequestGuard::new(
-            request_id.clone(),
+            session,
             self.core_engine.clone(),
             self.completion_waiters.clone(),
             self.telemetry.clone(),
+            job,
         );
         let completion = self
             .await_completion(&request_id, completion_rx, observation_request.deadline)
@@ -903,7 +932,7 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
-        let _job = self
+        let job = self
             .coordinator
             .admit(self.coordinator_job_for_request(&request))
             .await?;
@@ -924,7 +953,7 @@ impl RuntimeService {
         let _entered = span.enter();
 
         let request_id = request.id.clone();
-        let mut completion_rx = self.register_waiter(&request_id).await;
+        let mut completion_rx = self.register_waiter(&request_id).await?;
         let (stream_request_id, mut stream_rx) = match self
             .core_engine
             .generate_streaming(request)
@@ -940,11 +969,23 @@ impl RuntimeService {
         self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
         debug_assert_eq!(stream_request_id, request_id);
+        let Some(session) = self
+            .core_engine
+            .request_session_key(&stream_request_id)
+            .await
+        else {
+            self.remove_waiter(&stream_request_id).await;
+            let _ = self.core_engine.abort_request(&stream_request_id).await;
+            return Err(Error::InferenceError(format!(
+                "request {stream_request_id} is missing its scheduler session"
+            )));
+        };
         let mut guard = PendingRequestGuard::new(
-            stream_request_id.clone(),
+            session,
             self.core_engine.clone(),
             self.completion_waiters.clone(),
             self.telemetry.clone(),
+            job,
         );
         let mut completion_result: Option<EngineOutput> = None;
         let deadline = observation_request.deadline;
@@ -1400,6 +1441,26 @@ mod tests {
     use crate::backends::{BackendCapabilities, BackendContext, BackendSelectionSource};
     use crate::runtime::broker::{InferenceBroker, InferenceBrokerMode};
 
+    #[tokio::test]
+    async fn duplicate_waiter_registration_preserves_original_owner() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let original = runtime
+            .register_waiter("same-request")
+            .await
+            .expect("first waiter");
+        let duplicate = runtime.register_waiter("same-request").await;
+
+        assert!(matches!(duplicate, Err(Error::InvalidInput(_))));
+        assert_eq!(runtime.completion_waiters.lock().await.len(), 1);
+        assert!(runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key("same-request"));
+        drop(original);
+        runtime.remove_waiter("same-request").await;
+    }
+
     #[test]
     fn explicit_cuda_mismatch_gets_cuda_specific_error() {
         let context = BackendContext::new(
@@ -1531,7 +1592,7 @@ mod tests {
                 .context
                 .execution_target
                 .as_deref(),
-            Some("BatchRunner")
+            Some("TokenEngine")
         );
         assert_eq!(
             snapshot.observability.recent_stage_samples[0]

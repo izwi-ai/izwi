@@ -11,14 +11,20 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
-use super::execution::BatchKey;
-use super::executor::{ExecutorOutput, UnifiedExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED};
+use super::execution::{
+    BatchKey, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, WorkUnit,
+};
+use super::executor::{
+    ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
+};
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{Scheduler, SchedulerConfig};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
+use super::ResourceVector;
 use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -128,6 +134,10 @@ pub struct EngineCore {
     request_start_times: HashMap<RequestId, Instant>,
     /// Per-request phase timing accumulated by scheduler steps.
     request_phase_timings: HashMap<RequestId, RequestPhaseTiming>,
+    /// Per-session lifecycle and active-plan fence.
+    execution_trackers: HashMap<RequestId, ExecutionTracker>,
+    /// Plans prepared under the core lock and awaiting one validated result.
+    active_plans: HashMap<u64, ExecutionPlan>,
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
@@ -135,6 +145,171 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
+    async fn begin_execution_plan(
+        &mut self,
+        scheduled: &super::scheduler::ScheduledRequest,
+    ) -> Result<()> {
+        let request = self
+            .requests
+            .get(&scheduled.request_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "scheduled request {} is missing from the engine",
+                    scheduled.request_id
+                ))
+            })?;
+        let profile = self
+            .executor
+            .execution_profile(&request)
+            .await
+            .unwrap_or_else(|| {
+                ExecutionProfile::fail_closed(
+                    self.config.backend,
+                    request.model_variant,
+                    ExecutionMode::Atomic,
+                )
+            });
+        let work = match profile.mode {
+            ExecutionMode::Sequence | ExecutionMode::Realtime => scheduled.work.clone(),
+            ExecutionMode::Atomic | ExecutionMode::Artifact => WorkUnit::AtomicJob {
+                kind: format!("{:?}", request.task_type).to_ascii_lowercase(),
+            },
+            ExecutionMode::Pipeline => WorkUnit::PipelineStage {
+                name: format!("{:?}", request.task_type).to_ascii_lowercase(),
+                ordinal: 0,
+            },
+        };
+        let work_kind = match &work {
+            WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
+            WorkUnit::AtomicJob { kind } => kind.clone(),
+            WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
+        };
+        let plan = ExecutionPlan {
+            plan_id: scheduled.plan_id,
+            session: scheduled.session_key(),
+            work,
+            batch_key: BatchKey {
+                backend: profile.backend,
+                model_variant: profile.model_variant,
+                task_type: request.task_type,
+                work_kind,
+                compute_dtype: profile.compute_dtype,
+                kv_dtype: profile.kv_dtype,
+                cache_namespace: profile
+                    .cache_namespace
+                    .unwrap_or_else(|| "none".to_string()),
+                adapter_id: None,
+            },
+            estimate: ResourceVector::zero(),
+            reservation: None,
+        };
+
+        let tracker = self
+            .execution_trackers
+            .entry(scheduled.request_id.clone())
+            .or_insert_with(|| ExecutionTracker::new(plan.session.clone()));
+        if tracker.session() != &plan.session {
+            return Err(Error::InferenceError(format!(
+                "request {} already has a different active session",
+                scheduled.request_id
+            )));
+        }
+        if tracker.state() == ExecutionState::Queued {
+            tracker.transition(ExecutionState::Admitted)?;
+        }
+        let running_state = match plan.work {
+            WorkUnit::SequenceStep {
+                phase: super::SequencePhase::Prefill,
+                ..
+            } => ExecutionState::Prefilling,
+            WorkUnit::SequenceStep {
+                phase: super::SequencePhase::Decode,
+                ..
+            } => ExecutionState::Decoding,
+            WorkUnit::AtomicJob { .. } => ExecutionState::AtomicRunning,
+            WorkUnit::PipelineStage { .. } => ExecutionState::PipelineRunning,
+        };
+        if tracker.state() != running_state {
+            tracker.transition(running_state)?;
+        }
+        tracker.begin_plan(&plan)?;
+        if self.active_plans.insert(plan.plan_id, plan).is_some() {
+            return Err(Error::InferenceError(format!(
+                "execution plan {} was prepared twice",
+                scheduled.plan_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn report_from_result(result: &ExecutorStepResult) -> ExecutionReport {
+        let output = &result.output;
+        ExecutionReport {
+            plan_id: result.plan_id,
+            session: result.session.clone(),
+            input_consumed: output.tokens_processed,
+            output_produced: output.tokens_generated,
+            observed_resources: ResourceVector::zero(),
+            elapsed: std::time::Duration::ZERO,
+            safe_point: result.safe_point,
+            disposition: result.disposition.clone(),
+        }
+    }
+
+    fn commit_executor_result(
+        &mut self,
+        mut result: ExecutorStepResult,
+        step_time_ms: f64,
+    ) -> ExecutorOutput {
+        let Some(plan) = self.active_plans.remove(&result.plan_id) else {
+            return ExecutorOutput::error(
+                result.session.request_id,
+                "executor returned an inactive or already committed plan",
+            );
+        };
+        let report = Self::report_from_result(&result);
+        let commit_result = self
+            .execution_trackers
+            .get_mut(&plan.session.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError("execution tracker is missing for active plan".to_string())
+            })
+            .and_then(|tracker| tracker.commit(&plan, &report));
+
+        if let Err(err) = commit_result {
+            let failure_report = ExecutionReport {
+                plan_id: plan.plan_id,
+                session: plan.session.clone(),
+                input_consumed: 0,
+                output_produced: 0,
+                observed_resources: ResourceVector::zero(),
+                elapsed: std::time::Duration::ZERO,
+                safe_point: true,
+                disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                    err.to_string(),
+                )),
+            };
+            if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
+                let _ = tracker.commit(&plan, &failure_report);
+            }
+            return ExecutorOutput::error(
+                plan.session.request_id,
+                format!("invalid executor result: {err}"),
+            );
+        }
+
+        self.scheduler.update_after_step(
+            &plan.session.request_id,
+            result.output.tokens_processed,
+            result.output.tokens_generated,
+            Vec::new(),
+            step_time_ms,
+        );
+        result.output.request_id = plan.session.request_id;
+        result.output
+    }
+
     fn build_compatible_subbatches<'a>(
         &self,
         request_refs: &'a [&'a EngineCoreRequest],
@@ -155,25 +330,20 @@ impl EngineCore {
         let mut groups: Vec<(BatchKey, Vec<super::scheduler::ScheduledRequest>)> = Vec::new();
 
         for item in scheduled {
-            let Some(req) = request_by_id.get(item.request_id.as_str()) else {
+            if !request_by_id.contains_key(item.request_id.as_str()) {
                 continue;
-            };
-            let work_kind = if item.is_prefill { "prefill" } else { "decode" };
-            let key = BatchKey {
-                backend: self.config.backend,
-                model_variant: req.model_variant,
-                task_type: req.task_type,
-                work_kind: work_kind.to_string(),
-                compute_dtype: "executor-default".to_string(),
-                kv_dtype: self.config.kv_cache_dtype.clone(),
-                cache_namespace: format!(
-                    "{:?}:{:?}:{}:{}",
-                    req.model_variant,
-                    req.task_type,
-                    self.config.backend.as_str(),
-                    self.config.kv_cache_dtype
-                ),
-                adapter_id: None,
+            }
+            let Some(key) = self
+                .active_plans
+                .get(&item.plan_id)
+                .map(|plan| plan.batch_key.clone())
+            else {
+                warn!(
+                    plan_id = item.plan_id,
+                    request_id = %item.request_id,
+                    "Skipping scheduled work without an active execution plan"
+                );
+                continue;
             };
             if let Some((_, bucket)) = groups.iter_mut().find(|(group_key, _)| *group_key == key) {
                 bucket.push(item.clone());
@@ -198,10 +368,6 @@ impl EngineCore {
         }
 
         outputs
-    }
-
-    fn should_microbatch_decode(scheduled: &[super::scheduler::ScheduledRequest]) -> bool {
-        scheduled.len() > 1 && scheduled.iter().any(|entry| entry.num_tokens > 1)
     }
 
     fn merge_audio_output(
@@ -299,14 +465,24 @@ impl EngineCore {
                 .is_some_and(|audio| !audio.samples.is_empty())
     }
 
+    fn failed_step_result(
+        scheduled: &super::scheduler::ScheduledRequest,
+        message: impl Into<String>,
+    ) -> ExecutorStepResult {
+        ExecutorStepResult::new(
+            scheduled,
+            ExecutorOutput::error(scheduled.request_id.clone(), message),
+        )
+    }
+
     fn reconcile_executor_outputs(
         phase: &str,
         scheduled: &[super::scheduler::ScheduledRequest],
-        result: Result<Vec<ExecutorOutput>>,
-    ) -> Vec<ExecutorOutput> {
+        result: Result<Vec<ExecutorStepResult>>,
+    ) -> Vec<ExecutorStepResult> {
         let expected: HashSet<_> = scheduled
             .iter()
-            .map(|entry| entry.request_id.as_str())
+            .map(|entry| (entry.plan_id, entry.session_key()))
             .collect();
         let outputs = match result {
             Ok(outputs) => outputs,
@@ -314,47 +490,52 @@ impl EngineCore {
                 return scheduled
                     .iter()
                     .map(|entry| {
-                        ExecutorOutput::error(
-                            entry.request_id.clone(),
-                            format!("{phase} executor failed: {err}"),
-                        )
+                        Self::failed_step_result(entry, format!("{phase} executor failed: {err}"))
                     })
                     .collect();
             }
         };
 
-        let mut by_request = HashMap::new();
+        let mut by_transaction = HashMap::new();
         let mut duplicates = HashSet::new();
-        for mut output in outputs {
-            if !expected.contains(output.request_id.as_str()) {
+        for mut result in outputs {
+            let key = (result.plan_id, result.session.clone());
+            if !expected.contains(&key) {
                 warn!(
                     phase,
-                    request_id = %output.request_id,
-                    "Ignoring executor output for an unscheduled request"
+                    plan_id = result.plan_id,
+                    request_id = %result.session.request_id,
+                    session_epoch = result.session.epoch,
+                    "Ignoring executor output for an unknown or stale transaction"
                 );
                 continue;
             }
-            if output.error.is_some() {
-                output.finished = true;
+            if result.output.request_id != result.session.request_id {
+                result.output = ExecutorOutput::error(
+                    result.session.request_id.clone(),
+                    format!("{phase} executor output request ID did not match its session"),
+                );
+            } else if result.output.error.is_some() {
+                result.output.finished = true;
             }
-            let request_id = output.request_id.clone();
-            if by_request.insert(request_id.clone(), output).is_some() {
-                duplicates.insert(request_id);
+            if by_transaction.insert(key.clone(), result).is_some() {
+                duplicates.insert(key);
             }
         }
 
         scheduled
             .iter()
             .map(|entry| {
-                if duplicates.contains(&entry.request_id) {
-                    return ExecutorOutput::error(
-                        entry.request_id.clone(),
+                let key = (entry.plan_id, entry.session_key());
+                if duplicates.contains(&key) {
+                    return Self::failed_step_result(
+                        entry,
                         format!("{phase} executor returned duplicate outputs"),
                     );
                 }
-                by_request.remove(&entry.request_id).unwrap_or_else(|| {
-                    ExecutorOutput::error(
-                        entry.request_id.clone(),
+                by_transaction.remove(&key).unwrap_or_else(|| {
+                    Self::failed_step_result(
+                        entry,
                         format!("{phase} executor did not return a scheduled output"),
                     )
                 })
@@ -366,102 +547,14 @@ impl EngineCore {
         &self,
         request_refs: &[&EngineCoreRequest],
         scheduled: &[super::scheduler::ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
-        if !Self::should_microbatch_decode(scheduled) {
-            let result = self.executor.execute_decode(request_refs, scheduled).await;
-            return Ok(Self::reconcile_executor_outputs(
-                "decode", scheduled, result,
-            ));
-        }
-
-        let mut remaining_tokens: Vec<usize> = scheduled
-            .iter()
-            .map(|entry| entry.num_tokens.max(1))
-            .collect();
-        let mut merged_outputs: Vec<Option<ExecutorOutput>> = vec![None; scheduled.len()];
-
-        let request_idx_by_id: HashMap<&str, usize> = scheduled
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| (entry.request_id.as_str(), idx))
-            .collect();
-
-        while remaining_tokens.iter().any(|remaining| *remaining > 0) {
-            let mut round_indices = Vec::new();
-            let mut round_schedule = Vec::new();
-
-            for (idx, entry) in scheduled.iter().enumerate() {
-                if remaining_tokens[idx] == 0 {
-                    continue;
-                }
-                let mut single = entry.clone();
-                single.num_tokens = 1;
-                round_indices.push(idx);
-                round_schedule.push(single);
-            }
-
-            if round_schedule.is_empty() {
-                break;
-            }
-
-            let round_result = self
-                .executor
-                .execute_decode(request_refs, &round_schedule)
-                .await;
-            let round_outputs = Self::reconcile_executor_outputs(
-                "decode micro-batch",
-                &round_schedule,
-                round_result,
-            );
-            let mut seen = vec![false; scheduled.len()];
-
-            for output in round_outputs {
-                let Some(&idx) = request_idx_by_id.get(output.request_id.as_str()) else {
-                    continue;
-                };
-                if remaining_tokens[idx] == 0 {
-                    continue;
-                }
-
-                seen[idx] = true;
-                let combined = Self::merge_executor_output(merged_outputs[idx].take(), output);
-                if combined.finished || combined.error.is_some() {
-                    remaining_tokens[idx] = 0;
-                } else {
-                    remaining_tokens[idx] = remaining_tokens[idx].saturating_sub(1);
-                }
-                merged_outputs[idx] = Some(combined);
-            }
-
-            for idx in round_indices {
-                if seen[idx] {
-                    continue;
-                }
-
-                remaining_tokens[idx] = 0;
-                let fallback = ExecutorOutput::error(
-                    scheduled[idx].request_id.clone(),
-                    "Decode micro-batch round did not return an output for a scheduled request",
-                );
-                merged_outputs[idx] = Some(Self::merge_executor_output(
-                    merged_outputs[idx].take(),
-                    fallback,
-                ));
-            }
-        }
-
-        Ok(merged_outputs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, output)| {
-                output.unwrap_or_else(|| {
-                    ExecutorOutput::error(
-                        scheduled[idx].request_id.clone(),
-                        "Decode micro-batch did not produce any output",
-                    )
-                })
-            })
-            .collect())
+    ) -> Result<Vec<ExecutorStepResult>> {
+        // A scheduler plan is dispatched exactly once. Reusing one plan ID for
+        // internal one-token rounds makes completion fencing ambiguous; native
+        // continuous batching will expose child quanta explicitly in Phase 8.
+        let result = self.executor.execute_decode(request_refs, scheduled).await;
+        Ok(Self::reconcile_executor_outputs(
+            "decode", scheduled, result,
+        ))
     }
 
     /// Create a new engine core.
@@ -499,6 +592,8 @@ impl EngineCore {
             requests: HashMap::new(),
             request_start_times: HashMap::new(),
             request_phase_timings: HashMap::new(),
+            execution_trackers: HashMap::new(),
+            active_plans: HashMap::new(),
             initialized: false,
             maintenance_steps: 0,
         })
@@ -582,6 +677,9 @@ impl EngineCore {
 
         for request_id in &schedule_result.preempted_requests {
             self.executor.cleanup_request(request_id).await;
+            self.execution_trackers.remove(request_id);
+            self.active_plans
+                .retain(|_, plan| plan.session.request_id != *request_id);
             self.request_phase_timings
                 .insert(request_id.clone(), RequestPhaseTiming::default());
         }
@@ -611,6 +709,9 @@ impl EngineCore {
 
         let prefill_scheduled = schedule_result.prefill_requests.clone();
         let decode_scheduled = schedule_result.decode_requests.clone();
+        for scheduled in decode_scheduled.iter().chain(prefill_scheduled.iter()) {
+            self.begin_execution_plan(scheduled).await?;
+        }
         let now = Instant::now();
 
         // Capture queue wait for first scheduling event.
@@ -728,8 +829,18 @@ impl EngineCore {
         }
 
         decode_outputs.append(&mut prefill_outputs);
-        decode_outputs.append(&mut terminal_outputs);
-        let executor_outputs = decode_outputs;
+        let executor_results = decode_outputs;
+        let mut executor_outputs =
+            Vec::with_capacity(executor_results.len() + terminal_outputs.len());
+        for result in executor_results {
+            let step_time_ms = if decode_ids.contains(&result.session.request_id) {
+                decode_step_ms
+            } else {
+                prefill_step_ms
+            };
+            executor_outputs.push(self.commit_executor_result(result, step_time_ms));
+        }
+        executor_outputs.append(&mut terminal_outputs);
 
         // Phase 3: Process outputs
         let mut outputs = Vec::new();
@@ -751,20 +862,6 @@ impl EngineCore {
                 .copied()
                 .or_else(|| self.scheduler.get_sequence_id(&request_id))
                 .unwrap_or(0);
-
-            let step_time_ms = if decode_ids.contains(&request_id) {
-                decode_step_ms
-            } else {
-                prefill_step_ms
-            };
-
-            self.scheduler.update_after_step(
-                &request_id,
-                exec_output.tokens_processed,
-                exec_output.tokens_generated,
-                Vec::new(),
-                step_time_ms,
-            );
 
             if let Some(override_timing) = exec_output.phase_timing_override.as_ref() {
                 let phase = self
@@ -859,6 +956,9 @@ impl EngineCore {
                 self.requests.remove(&request_id);
                 self.request_start_times.remove(&request_id);
                 self.request_phase_timings.remove(&request_id);
+                self.execution_trackers.remove(&request_id);
+                self.active_plans
+                    .retain(|_, plan| plan.session.request_id != request_id);
                 debug!("Finished request {}", request_id);
             }
 
@@ -891,6 +991,21 @@ impl EngineCore {
         self.scheduler.get_status(request_id)
     }
 
+    /// Return the current scheduler incarnation for a public request ID.
+    pub fn get_session_key(&self, request_id: &RequestId) -> Option<super::SessionKey> {
+        self.scheduler
+            .get_sequence_id(request_id)
+            .map(|epoch| super::SessionKey::new(request_id.clone(), epoch))
+    }
+
+    /// Abort only if the caller still owns the exact request incarnation.
+    pub async fn abort_request_session(&mut self, session: &super::SessionKey) -> bool {
+        if self.scheduler.get_sequence_id(&session.request_id) != Some(session.epoch) {
+            return false;
+        }
+        self.abort_request(&session.request_id).await
+    }
+
     /// Abort a request.
     pub async fn abort_request(&mut self, request_id: &RequestId) -> bool {
         let existed = self.scheduler.has_request(request_id);
@@ -902,6 +1017,9 @@ impl EngineCore {
             self.requests.remove(request_id);
             self.request_start_times.remove(request_id);
             self.request_phase_timings.remove(request_id);
+            self.execution_trackers.remove(request_id);
+            self.active_plans
+                .retain(|_, plan| plan.session.request_id != *request_id);
             debug!("Aborted request {}", request_id);
             true
         } else {
@@ -995,7 +1113,9 @@ impl Drop for EngineCore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::executor::{ExecutorOutput, ExecutorPhaseTiming, ModelExecutor};
+    use super::super::executor::{
+        ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor,
+    };
     use super::super::scheduler::ScheduledRequest;
     use super::super::types::{AudioOutput, Priority};
     use super::*;
@@ -1018,6 +1138,18 @@ mod tests {
                 max_output_steps: 1,
             },
         }
+    }
+
+    fn wrap_outputs(
+        scheduled: &[ScheduledRequest],
+        outputs: Vec<ExecutorOutput>,
+    ) -> Vec<ExecutorStepResult> {
+        assert_eq!(scheduled.len(), outputs.len());
+        scheduled
+            .iter()
+            .zip(outputs)
+            .map(|(scheduled, output)| ExecutorStepResult::new(scheduled, output))
+            .collect()
     }
 
     struct MockExecutor {
@@ -1053,20 +1185,28 @@ mod tests {
     }
 
     impl ModelExecutor for MockExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            Some(ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            ))
+        }
+
         fn execute_prefill(
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
-            Ok(Self::build_outputs(scheduled))
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(wrap_outputs(scheduled, Self::build_outputs(scheduled)))
         }
 
         fn execute_decode(
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
-            Ok(Self::build_outputs(scheduled))
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(wrap_outputs(scheduled, Self::build_outputs(scheduled)))
         }
 
         fn is_ready(&self) -> bool {
@@ -1105,8 +1245,8 @@ mod tests {
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
-            Ok(scheduled
+        ) -> Result<Vec<ExecutorStepResult>> {
+            let outputs = scheduled
                 .iter()
                 .map(|entry| ExecutorOutput {
                     request_id: entry.request_id.clone(),
@@ -1120,14 +1260,15 @@ mod tests {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .collect())
+                .collect();
+            Ok(wrap_outputs(scheduled, outputs))
         }
 
         fn execute_decode(
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
+        ) -> Result<Vec<ExecutorStepResult>> {
             if let Ok(mut calls) = self.decode_calls.lock() {
                 calls.push(
                     scheduled
@@ -1136,7 +1277,7 @@ mod tests {
                         .collect(),
                 );
             }
-            Ok(scheduled
+            let outputs = scheduled
                 .iter()
                 .map(|entry| ExecutorOutput {
                     request_id: entry.request_id.clone(),
@@ -1150,7 +1291,8 @@ mod tests {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .collect())
+                .collect();
+            Ok(wrap_outputs(scheduled, outputs))
         }
 
         fn is_ready(&self) -> bool {
@@ -1173,8 +1315,8 @@ mod tests {
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
-            Ok(scheduled
+        ) -> Result<Vec<ExecutorStepResult>> {
+            let outputs = scheduled
                 .iter()
                 .map(|entry| ExecutorOutput {
                     request_id: entry.request_id.clone(),
@@ -1188,14 +1330,15 @@ mod tests {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .collect())
+                .collect();
+            Ok(wrap_outputs(scheduled, outputs))
         }
 
         fn execute_decode(
             &self,
             _requests: &[&EngineCoreRequest],
             _scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
+        ) -> Result<Vec<ExecutorStepResult>> {
             Ok(Vec::new())
         }
 
@@ -1219,11 +1362,11 @@ mod tests {
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
+        ) -> Result<Vec<ExecutorStepResult>> {
             if scheduled.iter().any(|entry| entry.request_id == "bad") {
                 return Err(Error::InferenceError("isolated failure".to_string()));
             }
-            Ok(scheduled
+            let outputs = scheduled
                 .iter()
                 .map(|entry| ExecutorOutput {
                     request_id: entry.request_id.clone(),
@@ -1237,14 +1380,15 @@ mod tests {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .collect())
+                .collect();
+            Ok(wrap_outputs(scheduled, outputs))
         }
 
         fn execute_decode(
             &self,
             _requests: &[&EngineCoreRequest],
             _scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
+        ) -> Result<Vec<ExecutorStepResult>> {
             Ok(Vec::new())
         }
 
@@ -1268,8 +1412,8 @@ mod tests {
             &self,
             _requests: &[&EngineCoreRequest],
             scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
-            Ok(scheduled
+        ) -> Result<Vec<ExecutorStepResult>> {
+            let outputs = scheduled
                 .iter()
                 .map(|entry| ExecutorOutput {
                     request_id: entry.request_id.clone(),
@@ -1287,14 +1431,15 @@ mod tests {
                     asr_diagnostics: None,
                     error: None,
                 })
-                .collect())
+                .collect();
+            Ok(wrap_outputs(scheduled, outputs))
         }
 
         fn execute_decode(
             &self,
             _requests: &[&EngineCoreRequest],
             _scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorOutput>> {
+        ) -> Result<Vec<ExecutorStepResult>> {
             Ok(Vec::new())
         }
 
@@ -1406,6 +1551,27 @@ mod tests {
         assert!(!calls.iter().any(|id| id == "req-b"));
     }
 
+    #[tokio::test]
+    async fn stale_session_cannot_abort_reused_request_id() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls)));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut first = EngineCoreRequest::tts("first");
+        first.id = "reused".to_string();
+        core.add_request(first).unwrap();
+        let first_session = core.get_session_key(&"reused".to_string()).unwrap();
+        assert!(core.abort_request_session(&first_session).await);
+
+        let mut second = EngineCoreRequest::tts("second");
+        second.id = "reused".to_string();
+        core.add_request(second).unwrap();
+        let second_session = core.get_session_key(&"reused".to_string()).unwrap();
+        assert_ne!(first_session.epoch, second_session.epoch);
+        assert!(!core.abort_request_session(&first_session).await);
+        assert!(core.has_request(&"reused".to_string()));
+    }
+
     #[test]
     fn test_merge_executor_output_replaces_cumulative_audio_snapshots() {
         let first = ExecutorOutput {
@@ -1446,10 +1612,15 @@ mod tests {
     #[test]
     fn executor_output_reconciliation_rejects_duplicates_unknowns_and_missing_ids() {
         let scheduled = vec![scheduled_prefill("req-a", 0), scheduled_prefill("req-b", 1)];
-        let mut executor_outputs = MockExecutor::build_outputs(&scheduled[..1]);
+        let mut executor_outputs = wrap_outputs(
+            &scheduled[..1],
+            MockExecutor::build_outputs(&scheduled[..1]),
+        );
         executor_outputs.push(executor_outputs[0].clone());
         let mut unknown = executor_outputs[0].clone();
-        unknown.request_id = "unknown".to_string();
+        unknown.plan_id = 999;
+        unknown.session = crate::engine::SessionKey::new("unknown".to_string(), 999);
+        unknown.output.request_id = "unknown".to_string();
         executor_outputs.push(unknown);
 
         let reconciled =
@@ -1458,20 +1629,22 @@ mod tests {
         assert_eq!(
             reconciled
                 .iter()
-                .map(|output| output.request_id.as_str())
+                .map(|result| result.output.request_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["req-a", "req-b"]
         );
-        assert!(reconciled.iter().all(|output| output.finished));
+        assert!(reconciled.iter().all(|result| result.output.finished));
         assert!(reconciled
             .iter()
-            .all(|output| output.error.as_deref().is_some()));
+            .all(|result| result.output.error.as_deref().is_some()));
         assert!(reconciled[0]
+            .output
             .error
             .as_deref()
             .unwrap()
             .contains("duplicate"));
         assert!(reconciled[1]
+            .output
             .error
             .as_deref()
             .unwrap()
@@ -1479,7 +1652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_decode_subbatch_round_robins_multi_token_requests() {
+    async fn test_execute_decode_subbatch_dispatches_each_plan_exactly_once() {
         let decode_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(TraceDecodeExecutor::new(decode_calls.clone())));
@@ -1529,24 +1702,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].request_id, "req-a");
-        assert_eq!(outputs[0].tokens_processed, 3);
-        assert_eq!(outputs[0].tokens_generated, 3);
-        assert_eq!(outputs[1].request_id, "req-b");
-        assert_eq!(outputs[1].tokens_processed, 2);
-        assert_eq!(outputs[1].tokens_generated, 2);
+        assert_eq!(outputs[0].output.request_id, "req-a");
+        assert_eq!(outputs[0].output.tokens_processed, 3);
+        assert_eq!(outputs[0].output.tokens_generated, 3);
+        assert_eq!(outputs[1].output.request_id, "req-b");
+        assert_eq!(outputs[1].output.tokens_processed, 2);
+        assert_eq!(outputs[1].output.tokens_generated, 2);
 
         let calls = decode_calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0],
-            vec![("req-a".to_string(), 1), ("req-b".to_string(), 1)]
+            vec![("req-a".to_string(), 3), ("req-b".to_string(), 2)]
         );
+    }
+
+    #[tokio::test]
+    async fn executor_progress_is_validated_before_scheduler_mutation() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("transaction");
+        request.id = "transaction".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        let scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        core.begin_execution_plan(&scheduled).await.unwrap();
+
+        let mut invalid = ExecutorStepResult::new(
+            &scheduled,
+            ExecutorOutput {
+                request_id: scheduled.request_id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: scheduled.num_tokens + 1,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+        );
+        invalid.disposition = ExecutionDisposition::Progress;
+        let output = core.commit_executor_result(invalid, 1.0);
+
+        assert!(output.finished);
+        assert!(output
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("beyond the scheduled quantum")));
         assert_eq!(
-            calls[1],
-            vec![("req-a".to_string(), 1), ("req-b".to_string(), 1)]
+            core.scheduler.get_running_info(&scheduled.request_id),
+            Some((0, 0)),
+            "invalid progress must not reach scheduler accounting"
         );
-        assert_eq!(calls[2], vec![("req-a".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn valid_executor_progress_commits_exactly_once() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("transaction");
+        request.id = "valid-transaction".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        let scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        let result = ExecutorStepResult::new(
+            &scheduled,
+            MockExecutor::build_outputs(std::slice::from_ref(&scheduled)).remove(0),
+        );
+
+        let output = core.commit_executor_result(result.clone(), 1.0);
+        assert!(output.error.is_none());
+        assert_eq!(
+            core.scheduler.get_running_info(&scheduled.request_id),
+            Some((scheduled.num_tokens, 0))
+        );
+
+        let duplicate = core.commit_executor_result(result, 1.0);
+        assert!(duplicate
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("already committed")));
+        assert_eq!(
+            core.scheduler.get_running_info(&scheduled.request_id),
+            Some((scheduled.num_tokens, 0)),
+            "duplicate results must not advance progress twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_executor_is_planned_as_atomic_and_must_finish() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("atomic");
+        request.id = "atomic".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        let scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        assert!(matches!(
+            core.active_plans
+                .get(&scheduled.plan_id)
+                .map(|plan| &plan.work),
+            Some(WorkUnit::AtomicJob { .. })
+        ));
+
+        let result = ExecutorStepResult::new(
+            &scheduled,
+            ExecutorOutput {
+                request_id: scheduled.request_id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 1,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+        );
+        let output = core.commit_executor_result(result, 1.0);
+        assert!(output
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("atomic execution must finish")));
+        assert_eq!(
+            core.scheduler.get_running_info(&scheduled.request_id),
+            Some((0, 0))
+        );
     }
 
     #[tokio::test]

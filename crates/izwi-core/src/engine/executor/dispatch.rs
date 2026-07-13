@@ -9,7 +9,7 @@ use crate::model::ModelVariant;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::TaskType;
-use super::{ExecutorOutput, NativeExecutor};
+use super::{ExecutorOutput, ExecutorStepResult, NativeExecutor};
 
 type RouteHandler =
     fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ExecutorOutput>;
@@ -102,6 +102,10 @@ impl NativeExecutor {
                 "Scheduled request not found in batch",
             );
         };
+
+        if request.is_cancelled() {
+            return ExecutorOutput::error(request.id.clone(), "request cancelled before dispatch");
+        }
 
         let Some(route) = Self::resolve_route(request.task_type, request.model_variant) else {
             return ExecutorOutput::error(
@@ -205,18 +209,58 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
-        if let Some(result) = self.try_qwen_tts_batch(requests, scheduled) {
-            return result;
-        }
-        if self.can_parallelize_requests(scheduled.len()) {
-            return self.execute_requests_parallel(requests, scheduled);
-        }
-
-        let outputs = scheduled
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let outputs = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled) {
+            result?
+        } else if self.can_parallelize_requests(scheduled.len()) {
+            self.execute_requests_parallel(requests, scheduled)?
+        } else {
+            scheduled
+                .iter()
+                .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
+                .collect()
+        };
+        Ok(scheduled
             .iter()
-            .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
-            .collect();
-        Ok(outputs)
+            .zip(outputs)
+            .map(|(scheduled, output)| ExecutorStepResult::new(scheduled, output))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    #[test]
+    fn cancelled_request_is_rejected_before_model_dispatch() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let mut request = EngineCoreRequest::tts("cancelled");
+        request.id = "cancelled".to_string();
+        let signal = Arc::new(AtomicBool::new(true));
+        request.set_cancellation_signal(signal);
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Prefill,
+                input: crate::engine::InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        };
+
+        let output = executor.execute_single_request(&[&request], &scheduled);
+        assert!(output.finished);
+        assert!(output
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("cancelled before dispatch")));
     }
 }

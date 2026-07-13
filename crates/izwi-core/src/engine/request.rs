@@ -1,6 +1,8 @@
 //! Request types and processing for the inference engine.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -222,6 +224,8 @@ pub struct EngineCoreRequest {
     /// Channel for streaming output (internal use)
     #[allow(dead_code)]
     pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
+    /// Cooperative cancellation signal set without waiting for the core write lock.
+    pub(crate) cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl EngineCoreRequest {
@@ -327,6 +331,7 @@ impl EngineCoreRequest {
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
+            cancellation: None,
         }
     }
 
@@ -365,6 +370,7 @@ impl EngineCoreRequest {
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
+            cancellation: None,
         }
     }
 
@@ -403,6 +409,7 @@ impl EngineCoreRequest {
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
+            cancellation: None,
         }
     }
 
@@ -440,6 +447,7 @@ impl EngineCoreRequest {
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
+            cancellation: None,
         }
     }
 
@@ -478,6 +486,7 @@ impl EngineCoreRequest {
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
+            cancellation: None,
         }
     }
 
@@ -516,7 +525,18 @@ impl EngineCoreRequest {
             streaming: false,
             stream_policy: EngineStreamPolicy::default(),
             streaming_tx: None,
+            cancellation: None,
         }
+    }
+
+    pub(crate) fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
+        self.cancellation = Some(signal);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|signal| signal.load(Ordering::Acquire))
     }
 
     /// Set model variant.
@@ -633,7 +653,7 @@ impl EngineCoreRequest {
                 .map(|message| message.content.len())
                 .sum::<usize>()
                 / 4)
-                .max(1)
+            .max(1)
         } else {
             // Estimate from text length (rough approximation)
             self.text.as_ref().map(|t| t.len() / 4).unwrap_or(0).max(1)
