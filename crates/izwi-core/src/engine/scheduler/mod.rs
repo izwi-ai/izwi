@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::config::EngineCoreConfig;
+use super::execution::{CacheMode, ExecutionProfile};
 use super::kv_cache::{CacheResidency, KVCacheManager};
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{BlockId, Priority, RequestId, SequenceId, TaskType};
@@ -217,7 +218,7 @@ pub struct ScheduleResult {
     /// Requests scheduled for prefill (new requests)
     pub prefill_requests: Vec<ScheduledRequest>,
     /// Requests that were preempted to make room
-    pub preempted_requests: Vec<RequestId>,
+    pub preempted_requests: Vec<SessionKey>,
     /// Requests rejected before execution because their caller deadline elapsed.
     pub expired_requests: Vec<ExpiredRequest>,
     /// Total tokens to process this step
@@ -374,6 +375,29 @@ struct RequestMetadata {
     total_prompt_tokens: usize,
     max_tokens: usize,
     prompt_prefix_tokens: Vec<u32>,
+    cache_policy: RequestCachePolicy,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RequestCachePolicy {
+    mode: Option<CacheMode>,
+    recompute_safe: bool,
+    cache_release_safe: bool,
+    prefix_reuse_safe: bool,
+}
+
+impl RequestCachePolicy {
+    fn allows_recompute_preemption(&self) -> bool {
+        self.recompute_safe && self.cache_release_safe
+    }
+
+    fn allows_external_prefix_reuse(&self) -> bool {
+        self.mode == Some(CacheMode::ExternalPaged) && self.prefix_reuse_safe
+    }
+
+    fn has_external_physical_cache(&self) -> bool {
+        self.mode == Some(CacheMode::ExternalPaged)
+    }
 }
 
 /// State for a running request.
@@ -457,6 +481,7 @@ impl Scheduler {
             // validation is ever bypassed.
             max_tokens,
             prompt_prefix_tokens: request.prompt_tokens.clone(),
+            cache_policy: RequestCachePolicy::default(),
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -469,6 +494,28 @@ impl Scheduler {
             sequence_id,
             request.num_prompt_tokens()
         );
+    }
+
+    /// Install the loaded executor's cache contract for one exact scheduler
+    /// incarnation. Stale profiles cannot mutate a reused public request ID.
+    pub fn update_execution_profile(
+        &mut self,
+        session: &SessionKey,
+        profile: &ExecutionProfile,
+    ) -> bool {
+        let Some(metadata) = self.requests.get_mut(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch {
+            return false;
+        }
+        metadata.cache_policy = RequestCachePolicy {
+            mode: Some(profile.cache_mode),
+            recompute_safe: profile.recompute_safe,
+            cache_release_safe: profile.cache_release_safe,
+            prefix_reuse_safe: profile.prefix_reuse_safe,
+        };
+        true
     }
 
     /// Schedule requests for the next step.
@@ -840,6 +887,7 @@ impl Scheduler {
                     &metadata.prompt_prefix_tokens,
                     total_tokens_after,
                     existing_blocks,
+                    metadata.cache_policy.allows_external_prefix_reuse(),
                 );
 
                 if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
@@ -866,7 +914,9 @@ impl Scheduler {
                 }
 
                 let (block_ids, fresh_blocks) = if existing_blocks == 0 {
-                    let block_ids = if self.config.enable_prefix_caching {
+                    let block_ids = if self.config.enable_prefix_caching
+                        && metadata.cache_policy.allows_external_prefix_reuse()
+                    {
                         kv_cache.allocate_with_prefix_tokens(
                             &request_id,
                             plan.total_blocks_needed,
@@ -1004,6 +1054,7 @@ impl Scheduler {
                     &metadata.prompt_prefix_tokens,
                     num_tokens,
                     0,
+                    metadata.cache_policy.allows_external_prefix_reuse(),
                 );
 
                 if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
@@ -1028,7 +1079,9 @@ impl Scheduler {
                     break;
                 }
 
-                let block_ids = if self.config.enable_prefix_caching {
+                let block_ids = if self.config.enable_prefix_caching
+                    && metadata.cache_policy.allows_external_prefix_reuse()
+                {
                     kv_cache.allocate_with_prefix_tokens(
                         &request_id,
                         plan.total_blocks_needed,
@@ -1119,6 +1172,13 @@ impl Scheduler {
                 hot.insert(req.request_id.clone());
             }
             for request_id in self.running.keys() {
+                let physical = self
+                    .requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.has_external_physical_cache());
+                if !physical {
+                    continue;
+                }
                 if hot.contains(request_id) {
                     kv_cache.set_request_residency(request_id, CacheResidency::Gpu);
                 } else {
@@ -1513,13 +1573,15 @@ impl Scheduler {
         prompt_tokens: &[u32],
         total_tokens_after: usize,
         existing_blocks: usize,
+        allow_prefix_reuse: bool,
     ) -> PrefillAllocationPlan {
         let total_blocks_needed = kv_cache.blocks_for_tokens(total_tokens_after);
-        let reusable_blocks = if self.config.enable_prefix_caching && existing_blocks == 0 {
-            kv_cache.estimate_prefix_reuse_blocks(prompt_tokens, total_blocks_needed)
-        } else {
-            0
-        };
+        let reusable_blocks =
+            if self.config.enable_prefix_caching && allow_prefix_reuse && existing_blocks == 0 {
+                kv_cache.estimate_prefix_reuse_blocks(prompt_tokens, total_blocks_needed)
+            } else {
+                0
+            };
         let additional_blocks =
             total_blocks_needed.saturating_sub(existing_blocks.saturating_add(reusable_blocks));
         PrefillAllocationPlan {
@@ -1770,48 +1832,51 @@ impl Scheduler {
 
     /// Try to preempt running requests to free up the required number of blocks.
     /// Only preempts requests with lower priority than the requesting priority.
-    /// Returns the list of preempted request IDs.
+    /// Returns exact preempted scheduler incarnations.
     fn try_preempt_for_blocks(
         &mut self,
         blocks_needed: usize,
         requesting_priority: Priority,
         protected_requests: &HashSet<RequestId>,
         kv_cache: &mut KVCacheManager,
-    ) -> Vec<RequestId> {
+    ) -> Vec<SessionKey> {
         // Collect candidates for preemption and score them by expected user impact.
-        let mut candidates: Vec<_> = self
-            .running
-            .iter()
-            .filter(|(_, r)| {
-                r.priority < requesting_priority
-                    && !r.paused
-                    && !r.first_token_emitted
-                    && !r.block_ids.is_empty()
-                    && !protected_requests.contains(&r.request_id)
-            })
-            .map(|(id, r)| {
-                let (overdue_ms, age_ms, remaining_decode) =
-                    if let Some(metadata) = self.requests.get(id) {
-                        (
-                            self.request_overdue_ms(metadata),
-                            metadata.arrival_time.elapsed().as_secs_f64() * 1000.0,
-                            metadata.max_tokens.saturating_sub(r.num_tokens_generated),
-                        )
-                    } else {
-                        (0.0, 0.0, usize::MAX)
-                    };
-                (
-                    id.clone(),
-                    r.priority,
-                    kv_cache.reclaimable_blocks(id),
-                    r.num_tokens_generated,
-                    r.first_token_emitted,
-                    overdue_ms,
-                    age_ms,
-                    remaining_decode,
-                )
-            })
-            .collect();
+        let mut candidates: Vec<_> =
+            self.running
+                .iter()
+                .filter(|(_, r)| {
+                    r.priority < requesting_priority
+                        && !r.paused
+                        && !r.first_token_emitted
+                        && !r.block_ids.is_empty()
+                        && !protected_requests.contains(&r.request_id)
+                        && self.requests.get(&r.request_id).is_some_and(|metadata| {
+                            metadata.cache_policy.allows_recompute_preemption()
+                        })
+                })
+                .map(|(id, r)| {
+                    let (overdue_ms, age_ms, remaining_decode) =
+                        if let Some(metadata) = self.requests.get(id) {
+                            (
+                                self.request_overdue_ms(metadata),
+                                metadata.arrival_time.elapsed().as_secs_f64() * 1000.0,
+                                metadata.max_tokens.saturating_sub(r.num_tokens_generated),
+                            )
+                        } else {
+                            (0.0, 0.0, usize::MAX)
+                        };
+                    (
+                        id.clone(),
+                        r.priority,
+                        kv_cache.reclaimable_blocks(id),
+                        r.num_tokens_generated,
+                        r.first_token_emitted,
+                        overdue_ms,
+                        age_ms,
+                        remaining_decode,
+                    )
+                })
+                .collect();
         candidates.retain(|candidate| candidate.2 > 0);
 
         // Order by:
@@ -1852,6 +1917,11 @@ impl Scheduler {
         let mut preempted = Vec::with_capacity(selected.len());
         let mut blocks_freed = 0usize;
         for (request_id, _priority, _reclaimable, ..) in selected {
+            let running_epoch = self
+                .running
+                .get(&request_id)
+                .map(|running| running.sequence_id)
+                .expect("selected preemption victim must still be running");
             let freed = kv_cache.free_for_preemption(&request_id);
             debug_assert!(freed > 0, "validated preemption victim reclaimed no blocks");
             blocks_freed = blocks_freed.saturating_add(freed);
@@ -1863,7 +1933,7 @@ impl Scheduler {
                 running.first_token_emitted = false;
                 running.paused = true;
             }
-            preempted.push(request_id);
+            preempted.push(SessionKey::new(request_id, running_epoch));
         }
         debug_assert!(blocks_freed >= blocks_needed);
         preempted
@@ -1874,6 +1944,8 @@ impl Scheduler {
 mod tests {
     use super::super::types::TaskType;
     use super::*;
+    use crate::backends::BackendKind;
+    use crate::engine::ExecutionMode;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::time::Duration;
 
@@ -1912,6 +1984,30 @@ mod tests {
         request.id = id.to_string();
         request.prompt_tokens = vec![1];
         request
+    }
+
+    fn allow_recompute(scheduler: &mut Scheduler, request_id: &str) {
+        let epoch = scheduler
+            .get_sequence_id(&request_id.to_string())
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.recompute_safe = true;
+        profile.cache_release_safe = true;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
+    }
+
+    fn allow_external_prefix_reuse(scheduler: &mut Scheduler, request_id: &str) {
+        let epoch = scheduler
+            .get_sequence_id(&request_id.to_string())
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.prefix_reuse_safe = true;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
     }
 
     #[test]
@@ -2102,6 +2198,7 @@ mod tests {
             let high_id = format!("high-{task_type:?}");
             let low = build_request(task_type, &low_id, Priority::Low);
             scheduler.add_request(&low);
+            allow_recompute(&mut scheduler, &low_id);
 
             let first = scheduler.schedule(&mut kv_cache);
             assert_eq!(
@@ -2117,7 +2214,10 @@ mod tests {
 
             let second = scheduler.schedule(&mut kv_cache);
             assert!(
-                second.preempted_requests.iter().any(|id| id == &low_id),
+                second
+                    .preempted_requests
+                    .iter()
+                    .any(|session| session.request_id == low_id),
                 "expected low-priority {task_type:?} request to be preempted"
             );
             assert_eq!(
@@ -2435,6 +2535,7 @@ mod tests {
         req1.id = req1_id.clone();
         req1.prompt_tokens = vec![10, 11, 12, 13];
         scheduler.add_request(&req1);
+        allow_external_prefix_reuse(&mut scheduler, &req1_id);
 
         let first = scheduler.schedule(&mut kv_cache);
         assert_eq!(first.prefill_requests.len(), 1);
@@ -2445,6 +2546,7 @@ mod tests {
         req2.id = req2_id.clone();
         req2.prompt_tokens = vec![10, 11, 12, 13];
         scheduler.add_request(&req2);
+        allow_external_prefix_reuse(&mut scheduler, &req2_id);
 
         let second = scheduler.schedule(&mut kv_cache);
         assert!(

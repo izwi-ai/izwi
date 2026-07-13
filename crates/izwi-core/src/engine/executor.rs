@@ -31,6 +31,10 @@ use super::execution::{
     RetryDisposition, SessionKey, YieldReason,
 };
 use super::request::EngineCoreRequest;
+use super::resources::{
+    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
+    ResourceVector,
+};
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
 use crate::backends::{
@@ -74,6 +78,10 @@ pub struct WorkerConfig {
     pub kv_page_size: usize,
     /// Optional shared model registry for loaded runtime models.
     pub model_registry: Option<Arc<ModelRegistry>>,
+    /// Shared physical resource authority used for model-owned cache lifetime.
+    pub resource_authority: Option<Arc<ResourceAuthority>>,
+    /// Conservative bytes represented by one scheduler logical KV block.
+    pub logical_kv_block_bytes: u64,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -91,6 +99,11 @@ impl std::fmt::Debug for WorkerConfig {
                 "model_registry",
                 &self.model_registry.as_ref().map(|_| "<shared>"),
             )
+            .field(
+                "resource_authority",
+                &self.resource_authority.as_ref().map(|_| "<shared>"),
+            )
+            .field("logical_kv_block_bytes", &self.logical_kv_block_bytes)
             .finish()
     }
 }
@@ -116,6 +129,8 @@ impl Default for WorkerConfig {
             request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
             kv_page_size: 64,
             model_registry: None,
+            resource_authority: None,
+            logical_kv_block_bytes: 0,
         }
     }
 }
@@ -136,6 +151,9 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
             kv_page_size: config.block_size.max(1),
             model_registry: None,
+            resource_authority: None,
+            logical_kv_block_bytes: (config.kv_cache_memory_bytes() / config.max_blocks.max(1))
+                as u64,
         }
     }
 }
@@ -436,13 +454,46 @@ pub trait ModelExecutor: Send + Sync {
     fn shutdown(&mut self) -> Result<()>;
 
     /// Cleanup transient per-request state held by the executor backend.
-    fn cleanup_request(&self, _request_id: &str) {}
+    fn cleanup_request(&self, _request_id: &str) -> CacheReleaseReport {
+        CacheReleaseReport::unconfirmed()
+    }
 
     /// Cleanup state for one exact request incarnation. Legacy executors may
     /// conservatively clear all state for the public request ID.
-    fn cleanup_session(&self, session: &SessionKey) {
-        self.cleanup_request(&session.request_id);
+    fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+        self.cleanup_request(&session.request_id)
     }
+}
+
+/// Proof returned after an executor cache cleanup request. Preemption may only
+/// recompute when the executor confirms that the exact session no longer owns
+/// tensor cache state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheReleaseReport {
+    pub confirmed: bool,
+    pub released_sessions: usize,
+}
+
+impl CacheReleaseReport {
+    pub const fn confirmed(released_sessions: usize) -> Self {
+        Self {
+            confirmed: true,
+            released_sessions,
+        }
+    }
+
+    pub const fn unconfirmed() -> Self {
+        Self {
+            confirmed: false,
+            released_sessions: 0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CacheResourceReservation {
+    reserved_bytes: u64,
+    leases: Vec<ResourceLease>,
 }
 
 pub struct NativeExecutor {
@@ -452,6 +503,7 @@ pub struct NativeExecutor {
     chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
     asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
     qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
+    cache_resource_leases: Mutex<HashMap<SessionKey, CacheResourceReservation>>,
 }
 
 impl NativeExecutor {
@@ -464,6 +516,7 @@ impl NativeExecutor {
             chat_decode_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
+            cache_resource_leases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -521,6 +574,70 @@ impl NativeExecutor {
             _ => run_catching_panic(),
         }
     }
+
+    fn reserve_scheduled_cache(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<()> {
+        let Some(authority) = self.config.resource_authority.as_ref() else {
+            return Ok(());
+        };
+        if self.config.logical_kv_block_bytes == 0 {
+            return Ok(());
+        }
+
+        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
+            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+        })?;
+        for item in scheduled {
+            let Some(request) = requests
+                .iter()
+                .copied()
+                .find(|request| request.id == item.request_id)
+            else {
+                continue;
+            };
+            let Some(profile) = self.execution_profile(request) else {
+                continue;
+            };
+            if profile.cache_mode != CacheMode::OpaqueModelOwned
+                || !profile.resolved_from_loaded_model
+            {
+                continue;
+            }
+            let desired_bytes = (item.block_ids.len() as u64)
+                .checked_mul(self.config.logical_kv_block_bytes)
+                .ok_or_else(|| Error::Overloaded("cache reservation overflow".to_string()))?;
+            let session = item.session_key();
+            let reservation = reservations.entry(session.clone()).or_default();
+            let growth = desired_bytes.saturating_sub(reservation.reserved_bytes);
+            if growth == 0 {
+                continue;
+            }
+            let resources = cache_resource_vector(self.config.backend, growth);
+            let lease = authority.reserve(
+                ReservationOwner::new(
+                    ReservationClass::Cache,
+                    format!("{}:{}", session.request_id, session.epoch),
+                ),
+                resources,
+            )?;
+            reservation.reserved_bytes = desired_bytes;
+            reservation.leases.push(lease);
+        }
+        Ok(())
+    }
+}
+
+fn cache_resource_vector(backend: BackendKind, bytes: u64) -> ResourceVector {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
+    }
+    resources
 }
 
 impl ModelExecutor for NativeExecutor {
@@ -604,6 +721,11 @@ impl ModelExecutor for NativeExecutor {
             profile.prefill = PrefillMode::Full;
             profile.incremental_decode = true;
             profile.cache_mode = CacheMode::OpaqueModelOwned;
+            // These adapters keep all mutable decode state inside the exact
+            // SessionKey maps below. Removing the entry drops every tensor
+            // reference and a fresh prefill can reconstruct it from input.
+            profile.recompute_safe = profile.resolved_from_loaded_model;
+            profile.cache_release_safe = profile.resolved_from_loaded_model;
         }
         if matches!(request.task_type, super::types::TaskType::ASR) {
             // Long audio can switch to a full chunk-plan operation after media
@@ -693,30 +815,51 @@ impl ModelExecutor for NativeExecutor {
         if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.cache_resource_leases.lock() {
+            guard.clear();
+        }
         Ok(())
     }
 
-    fn cleanup_request(&self, request_id: &str) {
-        if let Ok(mut guard) = self.chat_decode_states.lock() {
-            guard.retain(|session, _| session.request_id != request_id);
+    fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
+        let mut released = 0usize;
+        let mut confirmed = true;
+        for cleanup in [
+            retain_other_sessions(&self.chat_decode_states, request_id),
+            retain_other_sessions(&self.asr_decode_states, request_id),
+            retain_other_sessions(&self.qwen_tts_decode_states, request_id),
+            retain_other_sessions(&self.cache_resource_leases, request_id),
+        ] {
+            match cleanup {
+                Some(count) => released = released.saturating_add(count),
+                None => confirmed = false,
+            }
         }
-        if let Ok(mut guard) = self.asr_decode_states.lock() {
-            guard.retain(|session, _| session.request_id != request_id);
-        }
-        if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
-            guard.retain(|session, _| session.request_id != request_id);
+        if confirmed {
+            CacheReleaseReport::confirmed(released)
+        } else {
+            CacheReleaseReport::unconfirmed()
         }
     }
 
-    fn cleanup_session(&self, session: &SessionKey) {
-        if let Ok(mut guard) = self.chat_decode_states.lock() {
-            guard.remove(session);
+    fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+        let mut released = 0usize;
+        let mut confirmed = true;
+        for cleanup in [
+            remove_exact_session(&self.chat_decode_states, session),
+            remove_exact_session(&self.asr_decode_states, session),
+            remove_exact_session(&self.qwen_tts_decode_states, session),
+            remove_exact_session(&self.cache_resource_leases, session),
+        ] {
+            match cleanup {
+                Some(was_present) => released = released.saturating_add(usize::from(was_present)),
+                None => confirmed = false,
+            }
         }
-        if let Ok(mut guard) = self.asr_decode_states.lock() {
-            guard.remove(session);
-        }
-        if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
-            guard.remove(session);
+        if confirmed {
+            CacheReleaseReport::confirmed(released)
+        } else {
+            CacheReleaseReport::unconfirmed()
         }
     }
 }
@@ -795,15 +938,35 @@ impl UnifiedExecutor {
     }
 
     /// Cleanup transient backend state for a completed/aborted request.
-    pub async fn cleanup_request(&self, request_id: &str) {
+    pub async fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
         let executor = self.inner.read().await;
-        executor.cleanup_request(request_id);
+        executor.cleanup_request(request_id)
     }
 
-    pub async fn cleanup_session(&self, session: &SessionKey) {
+    pub async fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         let executor = self.inner.read().await;
-        executor.cleanup_session(session);
+        executor.cleanup_session(session)
     }
+}
+
+fn retain_other_sessions<T>(
+    states: &Mutex<HashMap<SessionKey, T>>,
+    request_id: &str,
+) -> Option<usize> {
+    let mut guard = states.lock().ok()?;
+    let before = guard.len();
+    guard.retain(|session, _| session.request_id != request_id);
+    Some(before.saturating_sub(guard.len()))
+}
+
+fn remove_exact_session<T>(
+    states: &Mutex<HashMap<SessionKey, T>>,
+    session: &SessionKey,
+) -> Option<bool> {
+    states
+        .lock()
+        .ok()
+        .map(|mut guard| guard.remove(session).is_some())
 }
 
 /// Decode base64-encoded audio to samples.
@@ -820,9 +983,25 @@ fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
 mod tests {
     use super::super::output::StreamingOutput;
     use super::*;
+    use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
     use crate::model::ModelVariant;
     use base64::Engine;
     use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    struct FixedCapacityProvider {
+        capacity: ResourceVector,
+    }
+
+    impl PhysicalCapacityProvider for FixedCapacityProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: self.capacity,
+                available: self.capacity,
+                source: CapacitySource::Test,
+            }
+        }
+    }
 
     #[test]
     fn test_worker_config_default() {
@@ -862,6 +1041,48 @@ mod tests {
             WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, Some(3)),
             3
         );
+    }
+
+    #[test]
+    fn exact_session_cleanup_releases_backend_cache_lease_once() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let capacity = cache_resource_vector(backend, 4096);
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity,
+            })));
+            let lease = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Cache, "session:7"),
+                    cache_resource_vector(backend, 1024),
+                )
+                .expect("cache lease");
+            let executor = NativeExecutor::new(WorkerConfig::default());
+            let session = SessionKey::new("session".to_string(), 7);
+            executor
+                .cache_resource_leases
+                .lock()
+                .expect("cache lease map")
+                .insert(
+                    session.clone(),
+                    CacheResourceReservation {
+                        reserved_bytes: 1024,
+                        leases: vec![lease],
+                    },
+                );
+            assert_eq!(authority.snapshot().reservations, 1);
+
+            let stale = SessionKey::new("session".to_string(), 6);
+            let stale_report = executor.cleanup_session(&stale);
+            assert!(stale_report.confirmed);
+            assert_eq!(stale_report.released_sessions, 0);
+            assert_eq!(authority.snapshot().reservations, 1);
+
+            let report = executor.cleanup_session(&session);
+            assert!(report.confirmed);
+            assert_eq!(report.released_sessions, 1);
+            assert_eq!(authority.snapshot().reservations, 0);
+            assert_eq!(executor.cleanup_session(&session).released_sessions, 0);
+        }
     }
 
     #[test]

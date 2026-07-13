@@ -213,6 +213,10 @@ impl NativeExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ExecutorStepResult>> {
+        // Reserve model-owned cache growth before any tensor state can be
+        // allocated. The lease remains attached to the exact session until
+        // finish, abort, failure cleanup, or recompute preemption.
+        self.reserve_scheduled_cache(requests, scheduled)?;
         let outputs = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled) {
             result?
                 .into_iter()

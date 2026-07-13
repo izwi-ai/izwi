@@ -145,6 +145,30 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
+    async fn refresh_scheduler_execution_profiles(&mut self) {
+        let requests: Vec<_> = self.requests.values().cloned().collect();
+        for request in requests {
+            let Some(epoch) = self.scheduler.get_sequence_id(&request.id) else {
+                continue;
+            };
+            let profile = self
+                .executor
+                .execution_profile(&request)
+                .await
+                .unwrap_or_else(|| {
+                    ExecutionProfile::fail_closed(
+                        self.config.backend,
+                        request.model_variant,
+                        ExecutionMode::Atomic,
+                    )
+                });
+            self.scheduler.update_execution_profile(
+                &super::SessionKey::new(request.id.clone(), epoch),
+                &profile,
+            );
+        }
+    }
+
     async fn begin_execution_plan(
         &mut self,
         scheduled: &super::scheduler::ScheduledRequest,
@@ -680,6 +704,7 @@ impl EngineCore {
         }
 
         // Phase 1: Schedule
+        self.refresh_scheduler_execution_profiles().await;
         self.kv_cache.maintenance()?;
         self.maintenance_steps = self.maintenance_steps.saturating_add(1);
         if self.maintenance_steps % 64 == 0 {
@@ -687,13 +712,34 @@ impl EngineCore {
         }
         let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
 
-        for request_id in &schedule_result.preempted_requests {
-            self.executor.cleanup_request(request_id).await;
-            self.execution_trackers.remove(request_id);
-            self.active_plans
-                .retain(|_, plan| plan.session.request_id != *request_id);
+        let mut preemption_failures = Vec::new();
+        for session in &schedule_result.preempted_requests {
+            let release = self.executor.cleanup_session(session).await;
+            if !release.confirmed {
+                // The scheduler already rolled logical progress back. If the
+                // executor cannot prove physical state release, abort this
+                // incarnation rather than risk stale-cache recomputation.
+                self.scheduler
+                    .abort_request(&session.request_id, self.kv_cache.inner_mut());
+                self.requests.remove(&session.request_id);
+                self.request_start_times.remove(&session.request_id);
+                self.request_phase_timings.remove(&session.request_id);
+                preemption_failures.push(ExecutorOutput::error(
+                    session.request_id.clone(),
+                    "executor could not confirm physical cache release during preemption",
+                ));
+            }
+            if self
+                .execution_trackers
+                .get(&session.request_id)
+                .is_some_and(|tracker| tracker.session() == session)
+            {
+                self.execution_trackers.remove(&session.request_id);
+            }
+            self.active_plans.retain(|_, plan| plan.session != *session);
             self.request_phase_timings
-                .insert(request_id.clone(), RequestPhaseTiming::default());
+                .entry(session.request_id.clone())
+                .and_modify(|timing| *timing = RequestPhaseTiming::default());
         }
 
         let expired_sequence_ids: HashMap<_, _> = schedule_result
@@ -701,7 +747,9 @@ impl EngineCore {
             .iter()
             .map(|request| (request.request_id.clone(), request.sequence_id))
             .collect();
-        let mut terminal_outputs = Vec::with_capacity(schedule_result.expired_requests.len());
+        let mut terminal_outputs =
+            Vec::with_capacity(schedule_result.expired_requests.len() + preemption_failures.len());
+        terminal_outputs.extend(preemption_failures);
         for request in &schedule_result.expired_requests {
             terminal_outputs.push(ExecutorOutput::error(
                 request.request_id.clone(),
@@ -1212,6 +1260,8 @@ mod tests {
                 ExecutionMode::Sequence,
             );
             profile.prefill = PrefillMode::Full;
+            profile.recompute_safe = true;
+            profile.cache_release_safe = true;
             Some(profile)
         }
 
@@ -1245,10 +1295,11 @@ mod tests {
             Ok(())
         }
 
-        fn cleanup_request(&self, request_id: &str) {
+        fn cleanup_request(&self, request_id: &str) -> super::super::executor::CacheReleaseReport {
             if let Ok(mut calls) = self.cleanup_calls.lock() {
                 calls.push(request_id.to_string());
             }
+            super::super::executor::CacheReleaseReport::confirmed(1)
         }
     }
 

@@ -79,6 +79,7 @@ pub struct ExecutionCapabilities {
     pub mixed_phase_batch: bool,
     pub cancellable_between_steps: bool,
     pub recompute_safe: bool,
+    pub cache_release_safe: bool,
     pub physical_cache: bool,
     pub max_batch_size: usize,
 }
@@ -156,6 +157,9 @@ pub struct ExecutionProfile {
     pub cancellation: CancellationGranularity,
     pub concurrency: ConcurrencyClass,
     pub recompute_safe: bool,
+    /// The executor can synchronously prove that all model-owned cache state
+    /// for an exact session has been released before recomputation or reuse.
+    pub cache_release_safe: bool,
     pub prefix_reuse_safe: bool,
     pub max_batch_size: usize,
     pub resolved_from_loaded_model: bool,
@@ -189,6 +193,7 @@ impl ExecutionProfile {
             },
             concurrency: ConcurrencyClass::Exclusive,
             recompute_safe: false,
+            cache_release_safe: false,
             prefix_reuse_safe: false,
             max_batch_size: 1,
             resolved_from_loaded_model: false,
@@ -211,6 +216,7 @@ impl ExecutionProfile {
                 CancellationGranularity::OperationBoundary
             ),
             recompute_safe: self.recompute_safe,
+            cache_release_safe: self.cache_release_safe,
             physical_cache: self.cache_mode == CacheMode::ExternalPaged,
             max_batch_size: if native_batch {
                 self.max_batch_size.max(1)
@@ -230,6 +236,7 @@ impl Default for ExecutionCapabilities {
             mixed_phase_batch: false,
             cancellable_between_steps: true,
             recompute_safe: false,
+            cache_release_safe: false,
             physical_cache: false,
             max_batch_size: 1,
         }

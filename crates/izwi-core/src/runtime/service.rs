@@ -64,12 +64,10 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
-fn reported_gpu_resident_blocks(backend_kind: BackendKind, logical_blocks: u64) -> u64 {
-    if backend_kind == BackendKind::Cpu {
-        0
-    } else {
-        logical_blocks
-    }
+fn reported_gpu_resident_blocks(_backend_kind: BackendKind, _logical_blocks: u64) -> u64 {
+    // Scheduler blocks are logical quotas until an ExternalPaged executor binds
+    // them to tensor pages and reports measured residency.
+    0
 }
 
 fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
@@ -253,13 +251,14 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         let execution_parallelism = worker_config.request_parallelism;
-        let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
         let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
             device.clone(),
             execution_parallelism,
             config.max_batch_size.max(1).saturating_mul(16).max(64),
         )?);
+        worker_config.resource_authority = Some(coordinator.resource_authority());
+        let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
 
         Ok(Self {
             config,
@@ -1597,9 +1596,10 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_never_reports_logical_blocks_as_gpu_resident() {
+    fn logical_blocks_are_never_reported_as_measured_gpu_residency() {
         assert_eq!(reported_gpu_resident_blocks(BackendKind::Cpu, 17), 0);
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cuda, 17), 17);
+        assert_eq!(reported_gpu_resident_blocks(BackendKind::Metal, 17), 0);
+        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cuda, 17), 0);
     }
 
     #[tokio::test]
