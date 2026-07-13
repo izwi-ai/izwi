@@ -242,6 +242,14 @@ impl InferenceCoordinator {
         self.acquire_execution_units(1, deadline).await
     }
 
+    /// Reserve the complete backend execution budget for one scheduler step.
+    /// A CUDA step may fan out across `request_parallelism` worker threads, so
+    /// holding a single permit would allow unrelated direct work to exceed the
+    /// configured device concurrency. CPU and Metal have capacity one.
+    pub async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
+        self.acquire_execution_units(self.capacity, None).await
+    }
+
     pub async fn acquire_execution_units(
         self: &Arc<Self>,
         units: usize,
@@ -845,6 +853,21 @@ Pages free: 10.\n";
         assert_eq!(cuda.snapshot().active_executions, 1);
         drop(lease);
         assert_eq!(cuda.snapshot().active_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_step_reserves_all_cuda_execution_units() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
+        let engine_step = coordinator.acquire_engine_step().await.unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 1);
+
+        let competing = coordinator
+            .acquire_execution(Some(Instant::now() + std::time::Duration::from_millis(5)))
+            .await;
+        assert!(matches!(competing, Err(Error::Timeout(_))));
+
+        drop(engine_step);
+        coordinator.acquire_execution(None).await.unwrap();
     }
 
     #[tokio::test]

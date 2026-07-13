@@ -500,7 +500,7 @@ impl EngineCore {
                 );
                 continue;
             };
-            if batch_mode == NativeBatchMode::None {
+            if batch_mode == NativeBatchMode::None && max_batch_size == 1 {
                 groups.push((key, batch_mode, 1, vec![item.clone()]));
             } else if let Some((_, _, _, bucket)) =
                 groups
@@ -2100,11 +2100,24 @@ mod tests {
         let refs = requests.iter().collect::<Vec<_>>();
 
         for item in &scheduled {
-            install_plan(&mut core, item, NativeBatchMode::None, 8);
+            install_plan(&mut core, item, NativeBatchMode::None, 1);
         }
         let serial = core.build_compatible_subbatches(&refs, &scheduled);
         assert_eq!(serial.len(), 3);
         assert!(serial.iter().all(|(_, batch)| batch.len() == 1));
+
+        core.active_plans.clear();
+        for item in &scheduled {
+            install_plan(&mut core, item, NativeBatchMode::None, 2);
+        }
+        let request_parallel = core.build_compatible_subbatches(&refs, &scheduled);
+        assert_eq!(
+            request_parallel
+                .iter()
+                .map(|(_, batch)| batch.len())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
 
         core.active_plans.clear();
         for item in &scheduled {

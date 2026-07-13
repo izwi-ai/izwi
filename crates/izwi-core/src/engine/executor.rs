@@ -38,7 +38,8 @@ use super::resources::{
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
 use crate::backends::{
-    BackendContext, BackendKind, BackendPreference, BackendRouter, BackendSelectionSource,
+    can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
+    BackendSelectionSource,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -923,10 +924,19 @@ impl ModelExecutor for NativeExecutor {
             profile.concurrency = ConcurrencyClass::Batchable;
             profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
         } else {
+            let request_parallel_width = if can_parallelize_requests(self.config.backend) {
+                self.config.request_parallelism.max(1)
+            } else {
+                1
+            };
             profile.prefill_batch = NativeBatchMode::None;
             profile.decode_batch = NativeBatchMode::None;
-            profile.concurrency = ConcurrencyClass::Exclusive;
-            profile.max_batch_size = 1;
+            profile.concurrency = if request_parallel_width > 1 {
+                ConcurrencyClass::Batchable
+            } else {
+                ConcurrencyClass::Exclusive
+            };
+            profile.max_batch_size = request_parallel_width;
         }
         Some(profile)
     }
@@ -1433,6 +1443,7 @@ mod tests {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let mut config = WorkerConfig::default();
             config.backend = backend;
+            config.request_parallelism = 4;
             let executor = NativeExecutor::new(config);
             let mut request = EngineCoreRequest::tts("batch me");
             request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
@@ -1443,7 +1454,16 @@ mod tests {
             assert_eq!(profile.prefill, PrefillMode::Full);
             assert!(!profile.capabilities().native_batch);
             assert_eq!(profile.decode_batch, NativeBatchMode::None);
-            assert_eq!(profile.max_batch_size, 1);
+            let expected_parallelism = if backend == BackendKind::Metal { 1 } else { 4 };
+            assert_eq!(profile.max_batch_size, expected_parallelism);
+            assert_eq!(
+                profile.concurrency,
+                if expected_parallelism > 1 {
+                    ConcurrencyClass::Batchable
+                } else {
+                    ConcurrencyClass::Exclusive
+                }
+            );
             request.streaming = true;
             assert!(!executor.execution_capabilities(&request).native_batch);
             request.streaming = false;

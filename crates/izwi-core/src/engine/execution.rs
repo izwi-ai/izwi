@@ -487,6 +487,19 @@ impl ExecutionReport {
             ));
         }
         match self.dispatch.kind {
+            BatchDispatchKind::Serial if self.dispatch.width != 1 => {
+                return Err(Error::InferenceError(
+                    "serial executor dispatch must have width one".to_string(),
+                ));
+            }
+            BatchDispatchKind::RequestParallel
+                if plan.batch_mode != NativeBatchMode::None || self.dispatch.width < 2 =>
+            {
+                return Err(Error::InferenceError(
+                    "request-parallel dispatch must be a multi-request non-tensor batch"
+                        .to_string(),
+                ));
+            }
             BatchDispatchKind::TensorStatic if plan.batch_mode != NativeBatchMode::Static => {
                 return Err(Error::InferenceError(
                     "executor reported an undeclared static tensor batch".to_string(),
@@ -755,6 +768,33 @@ mod tests {
         report.dispatch = BatchDispatch::new(BatchDispatchKind::TensorContinuous, 2);
         assert!(report.validate_against(&plan).is_err());
         report.dispatch = BatchDispatch::new(BatchDispatchKind::TensorStatic, 3);
+        assert!(report.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn request_parallel_dispatch_requires_declared_width_without_tensor_batching() {
+        let mut plan = plan_for(
+            SessionKey::new("parallel".to_string(), 1),
+            WorkUnit::AtomicJob {
+                kind: "chat".to_string(),
+            },
+        );
+        plan.max_batch_size = 4;
+        let mut report = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::RequestParallel, 4);
+        assert!(report.validate_against(&plan).is_ok());
+
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::RequestParallel, 1);
+        assert!(report.validate_against(&plan).is_err());
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::Serial, 2);
+        assert!(report.validate_against(&plan).is_err());
+
+        plan.batch_mode = NativeBatchMode::Static;
+        report.dispatch = BatchDispatch::new(BatchDispatchKind::RequestParallel, 2);
         assert!(report.validate_against(&plan).is_err());
     }
 

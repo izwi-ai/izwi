@@ -631,7 +631,7 @@ impl RuntimeService {
                     idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                     continue;
                 }
-                let _execution = match coordinator.acquire_execution(None).await {
+                let _execution = match coordinator.acquire_engine_step().await {
                     Ok(lease) => lease,
                     Err(err) => {
                         error!("Inference coordinator closed: {err}");

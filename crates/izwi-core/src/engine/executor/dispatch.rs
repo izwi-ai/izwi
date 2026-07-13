@@ -294,8 +294,27 @@ impl NativeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::BackendKind;
+    use crate::engine::{BatchDispatchKind, InputRange, SequencePhase, WorkUnit};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    fn scheduled(request_id: &str, plan_id: u64) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id,
+            request_id: request_id.to_string(),
+            sequence_id: plan_id,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        }
+    }
 
     #[test]
     fn cancelled_request_is_rejected_before_model_dispatch() {
@@ -328,4 +347,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backend_policy_controls_real_request_parallel_dispatch() {
+        for (backend, expected) in [
+            (BackendKind::Cpu, BatchDispatchKind::RequestParallel),
+            (BackendKind::Metal, BatchDispatchKind::Serial),
+            (BackendKind::Cuda, BatchDispatchKind::RequestParallel),
+        ] {
+            let mut config = super::super::WorkerConfig::default();
+            config.backend = backend;
+            config.request_parallelism = 2;
+            let executor = NativeExecutor::new(config);
+            let mut first = EngineCoreRequest::tts("first");
+            first.id = "parallel-first".to_string();
+            let mut second = EngineCoreRequest::tts("second");
+            second.id = "parallel-second".to_string();
+            let scheduled = vec![scheduled(&first.id, 1), scheduled(&second.id, 2)];
+
+            let outputs = executor
+                .execute_requests(&[&first, &second], &scheduled)
+                .expect("dispatch should return per-request results");
+
+            assert_eq!(outputs.len(), 2);
+            assert!(outputs
+                .iter()
+                .all(|output| output.dispatch.kind == expected));
+            let expected_width = if expected == BatchDispatchKind::RequestParallel {
+                2
+            } else {
+                1
+            };
+            assert!(outputs
+                .iter()
+                .all(|output| output.dispatch.width == expected_width));
+        }
+    }
 }
