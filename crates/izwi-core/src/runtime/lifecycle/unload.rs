@@ -74,6 +74,7 @@ impl RuntimeService {
         if !has_other_loaded_models {
             MetalPoolManager::global().clear_all();
         }
+        self.model_resource_leases.lock().await.remove(&variant);
 
         self.forget_model_usage(variant).await;
 

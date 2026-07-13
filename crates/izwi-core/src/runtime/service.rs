@@ -20,10 +20,11 @@ use crate::catalog::{ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_stream_backpressure_total, Engine as CoreEngine, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, ResourceAmount, ResourceVector, SessionKey, StreamingOutput, TaskType,
-    WorkerConfig, WorkloadClass, ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
-    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    EngineOutput, ResourceAmount, ResourceLease, ResourceVector, SessionKey, StreamingOutput,
+    TaskType, WorkerConfig, WorkloadClass, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
@@ -93,6 +94,7 @@ pub struct RuntimeService {
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_last_used: Arc<Mutex<HashMap<ModelVariant, u64>>>,
     pub(crate) model_load_lock: Mutex<()>,
+    pub(crate) model_resource_leases: Mutex<HashMap<ModelVariant, ResourceLease>>,
     pub(crate) device: DeviceProfile,
 }
 
@@ -208,11 +210,12 @@ impl RuntimeService {
         worker_config.backend_context = backend_context.clone();
         let execution_parallelism = worker_config.request_parallelism;
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
-        let coordinator = Arc::new(InferenceCoordinator::new(
+        let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
+            device.clone(),
             execution_parallelism,
             config.max_batch_size.max(1).saturating_mul(16).max(64),
-        ));
+        )?);
 
         Ok(Self {
             config,
@@ -235,6 +238,7 @@ impl RuntimeService {
             max_loaded_models: positive_usize_env("IZWI_MAX_LOADED_MODELS"),
             model_last_used: Arc::new(Mutex::new(HashMap::new())),
             model_load_lock: Mutex::new(()),
+            model_resource_leases: Mutex::new(HashMap::new()),
             device,
         })
     }

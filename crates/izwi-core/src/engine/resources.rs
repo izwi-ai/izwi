@@ -1,6 +1,7 @@
 //! Backend-neutral resource estimates, reservations, and reconciliation.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 
@@ -101,6 +102,19 @@ impl ResourceVector {
             && self.temporary_bytes.fits(capacity.temporary_bytes)
             && self.compute_slots.fits(capacity.compute_slots)
     }
+
+    pub fn is_fully_known(self) -> bool {
+        [
+            self.host_bytes,
+            self.device_bytes,
+            self.unified_bytes,
+            self.kv_bytes,
+            self.temporary_bytes,
+            self.compute_slots,
+        ]
+        .into_iter()
+        .all(|amount| matches!(amount, ResourceAmount::Known(_)))
+    }
 }
 
 pub type ResourceEstimate = ResourceVector;
@@ -142,6 +156,11 @@ impl ResourceLedger {
     }
 
     pub fn reserve(&mut self, resources: ResourceVector) -> Result<ResourceReservation> {
+        if !resources.is_fully_known() {
+            return Err(Error::InvalidInput(
+                "resource reservation contains an unresolved quantity".to_string(),
+            ));
+        }
         let candidate = self.used.checked_add(resources)?;
         if !candidate.fits_within(self.capacity) {
             return Err(Error::Overloaded(
@@ -164,9 +183,169 @@ impl ResourceLedger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReservationClass {
+    Model,
+    Request,
+    Cache,
+    Pipeline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReservationOwner {
+    pub class: ReservationClass,
+    pub key: String,
+}
+
+impl ReservationOwner {
+    pub fn new(class: ReservationClass, key: impl Into<String>) -> Self {
+        Self {
+            class,
+            key: key.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacitySource {
+    OperatingSystem,
+    MetalWorkingSet,
+    CudaDriver,
+    Test,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalCapacitySnapshot {
+    pub capacity: ResourceVector,
+    pub available: ResourceVector,
+    pub source: CapacitySource,
+}
+
+pub trait PhysicalCapacityProvider: std::fmt::Debug + Send + Sync {
+    fn snapshot(&self) -> PhysicalCapacitySnapshot;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceAuthoritySnapshot {
+    pub physical: PhysicalCapacitySnapshot,
+    pub reserved: ResourceVector,
+    pub reservations: usize,
+}
+
+#[derive(Debug)]
+struct AuthorityState {
+    ledger: ResourceLedger,
+    owners: HashMap<ReservationId, ReservationOwner>,
+}
+
+/// One transactional authority for every physical-memory consumer on a backend.
+#[derive(Debug)]
+pub struct ResourceAuthority {
+    provider: Arc<dyn PhysicalCapacityProvider>,
+    state: Mutex<AuthorityState>,
+}
+
+impl ResourceAuthority {
+    pub fn new(provider: Arc<dyn PhysicalCapacityProvider>) -> Self {
+        let capacity = provider.snapshot().capacity;
+        Self {
+            provider,
+            state: Mutex::new(AuthorityState {
+                ledger: ResourceLedger::new(capacity),
+                owners: HashMap::new(),
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> ResourceAuthoritySnapshot {
+        let physical = self.provider.snapshot();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        ResourceAuthoritySnapshot {
+            physical,
+            reserved: state.ledger.used(),
+            reservations: state.owners.len(),
+        }
+    }
+
+    pub fn reserve(
+        self: &Arc<Self>,
+        owner: ReservationOwner,
+        resources: ResourceVector,
+    ) -> Result<ResourceLease> {
+        if !resources.is_fully_known() {
+            return Err(Error::InvalidInput(format!(
+                "resource reservation for {} contains an unresolved quantity",
+                owner.key
+            )));
+        }
+        let physical = self.provider.snapshot();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        let live_candidate = state.ledger.used().checked_add(resources)?;
+        if !live_candidate.fits_within(physical.available) {
+            return Err(Error::Overloaded(format!(
+                "insufficient live physical capacity for {}",
+                owner.key
+            )));
+        }
+        let reservation = state.ledger.reserve(resources)?;
+        state.owners.insert(reservation.id, owner);
+        Ok(ResourceLease {
+            authority: self.clone(),
+            id: Some(reservation.id),
+            resources,
+        })
+    }
+
+    fn release(&self, id: ReservationId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.owners.remove(&id);
+            let _ = state.ledger.release(id);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ResourceLease {
+    authority: Arc<ResourceAuthority>,
+    id: Option<ReservationId>,
+    resources: ResourceVector,
+}
+
+impl ResourceLease {
+    pub fn resources(&self) -> ResourceVector {
+        self.resources
+    }
+}
+
+impl Drop for ResourceLease {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.authority.release(id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct TestProvider {
+        snapshot: PhysicalCapacitySnapshot,
+    }
+
+    impl PhysicalCapacityProvider for TestProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            self.snapshot
+        }
+    }
 
     fn slots(value: u64) -> ResourceVector {
         ResourceVector {
@@ -191,5 +370,67 @@ mod tests {
         let mut ledger = ResourceLedger::new(ResourceVector::default());
         assert!(ledger.reserve(slots(1)).is_err());
         assert_eq!(ledger.used(), ResourceVector::zero());
+    }
+
+    #[test]
+    fn unresolved_reservation_is_rejected_without_poisoning_usage() {
+        let mut ledger = ResourceLedger::new(slots(2));
+        assert!(matches!(
+            ledger.reserve(ResourceVector::default()),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(ledger.used(), ResourceVector::zero());
+    }
+
+    #[test]
+    fn shared_authority_serializes_different_owner_classes() {
+        let provider = Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: slots(2),
+                available: slots(2),
+                source: CapacitySource::Test,
+            },
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                slots(1),
+            )
+            .unwrap();
+        let request = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "request"),
+                slots(1),
+            )
+            .unwrap();
+        assert!(authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, "cache"),
+                slots(1),
+            )
+            .is_err());
+        assert_eq!(authority.snapshot().reserved, slots(2));
+        drop((model, request));
+        assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn live_capacity_failure_is_transactional() {
+        let provider = Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: slots(2),
+                available: slots(0),
+                source: CapacitySource::Test,
+            },
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        assert!(authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "request"),
+                slots(1),
+            )
+            .is_err());
+        assert_eq!(authority.snapshot().reserved, slots(0));
     }
 }

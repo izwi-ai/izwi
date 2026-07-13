@@ -1,8 +1,9 @@
 //! Global inference admission and device-execution coordination.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use tokio::sync::Notify;
@@ -10,10 +11,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use serde::Serialize;
 
-use crate::backends::BackendKind;
+use crate::backends::{BackendKind, DeviceProfile};
 use crate::engine::{
-    Priority, ReservationId, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceVector,
-    WorkloadClass,
+    CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, Priority, ReservationClass,
+    ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate, ResourceLease,
+    ResourceVector, WorkloadClass,
 };
 use crate::error::{Error, Result};
 
@@ -53,7 +55,7 @@ pub struct InferenceCoordinator {
     backend: BackendKind,
     jobs: Arc<Semaphore>,
     execution: Arc<Semaphore>,
-    resources: Mutex<ResourceLedger>,
+    resources: Arc<ResourceAuthority>,
     admission_gate: Mutex<()>,
     idle: Notify,
     active_jobs: AtomicUsize,
@@ -65,7 +67,39 @@ pub struct InferenceCoordinator {
 }
 
 impl InferenceCoordinator {
+    #[cfg(test)]
     pub fn new(backend: BackendKind, execution_parallelism: usize, max_queued_jobs: usize) -> Self {
+        let provider = Arc::new(DeviceCapacityProvider::for_tests(backend));
+        Self::with_resource_authority(
+            backend,
+            execution_parallelism,
+            max_queued_jobs,
+            Arc::new(ResourceAuthority::new(provider)),
+        )
+    }
+
+    pub fn new_with_device(
+        backend: BackendKind,
+        device: DeviceProfile,
+        execution_parallelism: usize,
+        max_queued_jobs: usize,
+    ) -> Result<Self> {
+        let provider = Arc::new(DeviceCapacityProvider::new(backend, device)?);
+        let resources = shared_resource_authority(backend, provider);
+        Ok(Self::with_resource_authority(
+            backend,
+            execution_parallelism,
+            max_queued_jobs,
+            resources,
+        ))
+    }
+
+    fn with_resource_authority(
+        backend: BackendKind,
+        execution_parallelism: usize,
+        max_queued_jobs: usize,
+        resources: Arc<ResourceAuthority>,
+    ) -> Self {
         let capacity = match backend {
             BackendKind::Cpu | BackendKind::Metal => 1,
             BackendKind::Cuda => execution_parallelism.max(1),
@@ -75,7 +109,7 @@ impl InferenceCoordinator {
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             execution: Arc::new(Semaphore::new(capacity)),
-            resources: Mutex::new(ResourceLedger::new(resource_capacity(backend))),
+            resources,
             admission_gate: Mutex::new(()),
             idle: Notify::new(),
             active_jobs: AtomicUsize::new(0),
@@ -87,13 +121,12 @@ impl InferenceCoordinator {
         }
     }
 
+    pub fn resource_authority(&self) -> Arc<ResourceAuthority> {
+        self.resources.clone()
+    }
+
     pub fn snapshot(&self) -> CoordinatorSnapshot {
-        let reserved_memory_bytes = self
-            .resources
-            .lock()
-            .ok()
-            .map(|ledger| memory_bytes(ledger.used(), self.backend))
-            .unwrap_or_default();
+        let reserved_memory_bytes = memory_bytes(self.resources.snapshot().reserved, self.backend);
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
@@ -152,12 +185,13 @@ impl InferenceCoordinator {
             self.rejected_total.fetch_add(1, Ordering::Relaxed);
             Error::Overloaded("global inference queue is full".to_string())
         })?;
-        let effective_resources = effective_resources(spec.resources, self.backend);
+        let effective_resources = effective_resources(spec.resources, self.backend)?;
         let reservation = self
             .resources
-            .lock()
-            .map_err(|_| Error::InferenceError("resource ledger mutex poisoned".to_string()))?
-            .reserve(effective_resources)
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, spec.request_id.clone()),
+                effective_resources,
+            )
             .map_err(|err| {
                 self.rejected_total.fetch_add(1, Ordering::Relaxed);
                 err
@@ -167,7 +201,7 @@ impl InferenceCoordinator {
         Ok(JobLease {
             coordinator: self.clone(),
             _permit: permit,
-            reservation: reservation.id,
+            _reservation: reservation,
             spec,
         })
     }
@@ -237,77 +271,75 @@ impl InferenceCoordinator {
     }
 }
 
+fn shared_resource_authority(
+    backend: BackendKind,
+    provider: Arc<dyn PhysicalCapacityProvider>,
+) -> Arc<ResourceAuthority> {
+    static AUTHORITIES: OnceLock<Mutex<HashMap<BackendKind, Weak<ResourceAuthority>>>> =
+        OnceLock::new();
+    let mut authorities = AUTHORITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(authority) = authorities.get(&backend).and_then(Weak::upgrade) {
+        return authority;
+    }
+    let authority = Arc::new(ResourceAuthority::new(provider));
+    authorities.insert(backend, Arc::downgrade(&authority));
+    authority
+}
+
 #[derive(Debug)]
 pub struct JobLease {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
-    reservation: ReservationId,
+    _reservation: ResourceLease,
     pub spec: JobSpec,
 }
 
 impl Drop for JobLease {
     fn drop(&mut self) {
-        if let Ok(mut resources) = self.coordinator.resources.lock() {
-            let _ = resources.release(self.reservation);
-        }
         if self.coordinator.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.coordinator.idle.notify_waiters();
         }
     }
 }
 
-const FALLBACK_JOB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
-
-fn env_budget(name: &str, fallback: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(fallback)
-}
-
-fn resource_capacity(backend: BackendKind) -> ResourceVector {
-    let mut capacity = ResourceVector::zero();
-    match backend {
-        BackendKind::Cpu => {
-            capacity.host_bytes = ResourceAmount::Known(env_budget(
-                "IZWI_CPU_MEMORY_BUDGET_BYTES",
-                8 * 1024 * 1024 * 1024,
-            ));
-        }
-        BackendKind::Metal => {
-            capacity.unified_bytes = ResourceAmount::Known(env_budget(
-                "IZWI_METAL_MEMORY_BUDGET_BYTES",
-                6 * 1024 * 1024 * 1024,
-            ));
-        }
-        BackendKind::Cuda => {
-            capacity.device_bytes = ResourceAmount::Known(env_budget(
-                "IZWI_CUDA_MEMORY_BUDGET_BYTES",
-                8 * 1024 * 1024 * 1024,
-            ));
-        }
-    }
-    capacity
-}
-
-fn effective_resources(requested: ResourceVector, backend: BackendKind) -> ResourceVector {
+fn effective_resources(requested: ResourceVector, backend: BackendKind) -> Result<ResourceVector> {
     let requested_memory = match backend {
         BackendKind::Cpu => requested.host_bytes,
         BackendKind::Metal => requested.unified_bytes,
         BackendKind::Cuda => requested.device_bytes,
     };
-    let effective_memory = match requested_memory {
-        ResourceAmount::Known(value) => ResourceAmount::Known(value),
-        ResourceAmount::Unknown => ResourceAmount::Known(FALLBACK_JOB_MEMORY_BYTES),
+    let ResourceAmount::Known(memory) = requested_memory else {
+        return Err(Error::InvalidInput(
+            "request memory estimate is unresolved".to_string(),
+        ));
     };
+    let kv = known_or_zero(requested.kv_bytes)?;
+    let temporary = known_or_zero(requested.temporary_bytes)?;
+    let effective_memory = ResourceAmount::Known(
+        memory
+            .checked_add(kv)
+            .and_then(|value| value.checked_add(temporary))
+            .ok_or_else(|| Error::Overloaded("request memory estimate overflow".to_string()))?,
+    );
     let mut effective = ResourceVector::zero();
     match backend {
         BackendKind::Cpu => effective.host_bytes = effective_memory,
         BackendKind::Metal => effective.unified_bytes = effective_memory,
         BackendKind::Cuda => effective.device_bytes = effective_memory,
     }
-    effective
+    Ok(effective)
+}
+
+fn known_or_zero(amount: ResourceAmount) -> Result<u64> {
+    match amount {
+        ResourceAmount::Known(value) => Ok(value),
+        ResourceAmount::Unknown => Err(Error::InvalidInput(
+            "request resource estimate contains an unresolved quantity".to_string(),
+        )),
+    }
 }
 
 fn memory_bytes(resources: ResourceVector, backend: BackendKind) -> u64 {
@@ -320,6 +352,185 @@ fn memory_bytes(resources: ResourceVector, backend: BackendKind) -> u64 {
         ResourceAmount::Known(value) => value,
         ResourceAmount::Unknown => 0,
     }
+}
+
+#[derive(Debug)]
+struct DeviceCapacityProvider {
+    backend: BackendKind,
+    device: Option<DeviceProfile>,
+    configured_cap: Option<u64>,
+    test_capacity: Option<u64>,
+}
+
+impl DeviceCapacityProvider {
+    fn new(backend: BackendKind, device: DeviceProfile) -> Result<Self> {
+        let env_name = match backend {
+            BackendKind::Cpu => "IZWI_CPU_MEMORY_BUDGET_BYTES",
+            BackendKind::Metal => "IZWI_METAL_MEMORY_BUDGET_BYTES",
+            BackendKind::Cuda => "IZWI_CUDA_MEMORY_BUDGET_BYTES",
+        };
+        let configured_cap = match std::env::var(env_name) {
+            Ok(raw) => Some(
+                raw.parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        Error::ConfigError(format!("{env_name} must be a positive integer"))
+                    })?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(err) => {
+                return Err(Error::ConfigError(format!(
+                    "failed to read {env_name}: {err}"
+                )))
+            }
+        };
+        Ok(Self {
+            backend,
+            device: Some(device),
+            configured_cap,
+            test_capacity: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_tests(backend: BackendKind) -> Self {
+        Self {
+            backend,
+            device: None,
+            configured_cap: None,
+            test_capacity: Some(64 * 1024 * 1024 * 1024),
+        }
+    }
+
+    fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
+        match self.configured_cap {
+            Some(cap) => (total.min(cap), available.min(cap)),
+            None => (total, available),
+        }
+    }
+
+    fn vector(&self, amount: ResourceAmount) -> ResourceVector {
+        let mut vector = ResourceVector::zero();
+        match self.backend {
+            BackendKind::Cpu => vector.host_bytes = amount,
+            BackendKind::Metal => vector.unified_bytes = amount,
+            BackendKind::Cuda => vector.device_bytes = amount,
+        }
+        vector
+    }
+
+    fn observed_capacity(&self) -> Option<(u64, u64, CapacitySource)> {
+        if let Some(capacity) = self.test_capacity {
+            return Some((capacity, capacity, CapacitySource::Test));
+        }
+        let device = self.device.as_ref()?;
+        match self.backend {
+            BackendKind::Cpu => host_memory_snapshot()
+                .map(|(total, available)| (total, available, CapacitySource::OperatingSystem)),
+            BackendKind::Metal => metal_memory_snapshot(device),
+            BackendKind::Cuda => cuda_memory_snapshot(device),
+        }
+    }
+}
+
+impl PhysicalCapacityProvider for DeviceCapacityProvider {
+    fn snapshot(&self) -> PhysicalCapacitySnapshot {
+        let Some((total, available, source)) = self.observed_capacity() else {
+            return PhysicalCapacitySnapshot {
+                capacity: self.vector(ResourceAmount::Unknown),
+                available: self.vector(ResourceAmount::Unknown),
+                source: CapacitySource::Unavailable,
+            };
+        };
+        let (capacity, available) = self.apply_cap(total, available);
+        PhysicalCapacitySnapshot {
+            capacity: self.vector(ResourceAmount::Known(capacity)),
+            available: self.vector(ResourceAmount::Known(available)),
+            source,
+        }
+    }
+}
+
+fn host_memory_snapshot() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let value = |name: &str| {
+            contents.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key == name).then(|| {
+                    value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                        .map(|kb| kb.saturating_mul(1024))
+                })?
+            })
+        };
+        let mut total = value("MemTotal")?;
+        let mut available = value("MemAvailable")?;
+        if let (Ok(max), Ok(current)) = (
+            std::fs::read_to_string("/sys/fs/cgroup/memory.max"),
+            std::fs::read_to_string("/sys/fs/cgroup/memory.current"),
+        ) {
+            if let (Ok(max), Ok(current)) =
+                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
+            {
+                total = total.min(max);
+                available = available.min(max.saturating_sub(current));
+            }
+        }
+        return Some((total, available));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let total = std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        return Some((total, total));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+#[cfg(feature = "metal")]
+fn metal_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    let metal = device.device.as_metal_device().ok()?.metal_device();
+    let total = u64::try_from(metal.recommended_max_working_set_size()).ok()?;
+    let allocated = u64::try_from(metal.current_allocated_size()).ok()?;
+    Some((
+        total,
+        total.saturating_sub(allocated),
+        CapacitySource::MetalWorkingSet,
+    ))
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    let stream = device.device.as_cuda_device().ok()?.cuda_stream();
+    let (available, total) = stream.context().mem_get_info().ok()?;
+    Some((
+        u64::try_from(total).ok()?,
+        u64::try_from(available).ok()?,
+        CapacitySource::CudaDriver,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    None
 }
 
 #[derive(Debug)]
@@ -347,13 +558,15 @@ mod tests {
     use crate::engine::ResourceVector;
 
     fn job(id: &str) -> JobSpec {
+        let mut resources = ResourceVector::zero();
+        resources.host_bytes = ResourceAmount::Known(64 * 1024 * 1024);
         JobSpec {
             request_id: id.to_string(),
             lane: CoordinatorLane::Atomic,
             priority: Priority::Normal,
             workload_class: WorkloadClass::Online,
             deadline: None,
-            resources: ResourceVector::default(),
+            resources,
         }
     }
 
@@ -363,7 +576,7 @@ mod tests {
         let lease = coordinator.admit(job("first")).await.unwrap();
         assert_eq!(
             coordinator.snapshot().reserved_memory_bytes,
-            FALLBACK_JOB_MEMORY_BYTES
+            64 * 1024 * 1024
         );
         assert!(matches!(
             coordinator.admit(job("second")).await,

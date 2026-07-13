@@ -76,8 +76,9 @@ pub use request::{
     EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
-    ReservationId, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
-    ResourceVector,
+    CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
+    ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceAuthoritySnapshot,
+    ResourceEstimate, ResourceLease, ResourceLedger, ResourceReservation, ResourceVector,
 };
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{

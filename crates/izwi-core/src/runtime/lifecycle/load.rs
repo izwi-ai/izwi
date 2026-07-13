@@ -3,6 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::info;
 
+use crate::backends::BackendKind;
+use crate::engine::{
+    ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
+};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::runtime::service::RuntimeService;
@@ -103,6 +107,65 @@ impl RuntimeService {
         }
     }
 
+    fn model_resource_estimate(&self, variant: ModelVariant) -> ResourceVector {
+        let bytes = (variant.memory_required_gb() as f64 * 1024_f64.powi(3)).ceil() as u64;
+        let mut resources = ResourceVector::zero();
+        match self.backend_router.context().backend_kind {
+            BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
+            BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
+            BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
+        }
+        resources
+    }
+
+    async fn reserve_model_resources(
+        &self,
+        requested_variant: ModelVariant,
+    ) -> Result<ResourceLease> {
+        loop {
+            match self.coordinator.resource_authority().reserve(
+                ReservationOwner::new(ReservationClass::Model, requested_variant.to_string()),
+                self.model_resource_estimate(requested_variant),
+            ) {
+                Ok(lease) => return Ok(lease),
+                Err(resource_error @ Error::Overloaded(_)) => {
+                    let resident_variants = self.model_manager.resident_variants().await;
+                    let mut active_variants = self.core_engine.active_model_variants().await;
+                    active_variants.extend(
+                        resident_variants
+                            .iter()
+                            .copied()
+                            .filter(|variant| self.active_model_residency_leases(*variant) > 0),
+                    );
+                    let mut ready_variants = Vec::new();
+                    for variant in &resident_variants {
+                        if self.model_manager.is_ready(*variant).await {
+                            ready_variants.push(*variant);
+                        }
+                    }
+                    let last_used = self.model_last_used.lock().await.clone();
+                    let Some(victim) = select_lru_eviction_candidate(
+                        &ready_variants,
+                        requested_variant,
+                        &active_variants,
+                        &last_used,
+                    ) else {
+                        return Err(Error::ModelLoadError(format!(
+                            "Cannot reserve memory for {requested_variant}: {resource_error}"
+                        )));
+                    };
+                    info!(
+                        requested_variant = %requested_variant,
+                        victim = %victim,
+                        "Evicting idle model to satisfy the physical memory budget"
+                    );
+                    self.unload_model(victim).await?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Load a model for inference.
     pub async fn load_model(&self, variant: ModelVariant) -> Result<()> {
         let resolved = self.resolve_model_load(variant).await?;
@@ -115,8 +178,13 @@ impl RuntimeService {
         }
 
         self.ensure_model_budget_before_load(variant).await?;
+        let resource_lease = self.reserve_model_resources(variant).await?;
         let instantiated = self.instantiate_model(acquired).await?;
         self.publish_loaded_model(instantiated).await?;
+        self.model_resource_leases
+            .lock()
+            .await
+            .insert(variant, resource_lease);
         self.touch_model_usage(variant).await;
 
         Ok(())
