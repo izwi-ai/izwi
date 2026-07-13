@@ -46,12 +46,13 @@ pub use engine::{
     AsrEngineInput, AudioChatEngineInput, BatchKey, CacheResidency, ChatEngineInput, Engine,
     EngineAudioInput, AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig,
     EngineCoreRequest, EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities,
-    ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState,
-    GenerationParams, KVCacheManager,
+    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, FailureKind, FailureScope, FinishReason, GenerationParams,
+    HealthImpact, KVCacheManager,
     ModelExecutor, OutputProcessor, PinnedBlockHandle, Priority, RequestProcessor, RequestStatus,
     ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector,
-    Scheduler, SchedulerConfig, SchedulingPolicy, StreamingOutput, TerminalOutcome, TtsEngineInput,
-    WorkUnit, WorkloadClass,
+    RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey,
+    StreamingOutput, TerminalOutcome, TtsEngineInput, WorkUnit, WorkloadClass, YieldReason,
 };
 
 // Legacy re-exports for backward compatibility

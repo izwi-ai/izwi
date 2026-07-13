@@ -9,9 +9,24 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
 use super::resources::{ResourceEstimate, ResourceReservation, ResourceVector};
-use super::{RequestId, TaskType};
+use super::{RequestId, SequenceId, TaskType};
 
 pub type PlanId = u64;
+pub type SessionEpoch = SequenceId;
+
+/// Identity of one request incarnation. Public request IDs may be reused after
+/// completion, so executor transactions must also carry the scheduler epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub request_id: RequestId,
+    pub epoch: SessionEpoch,
+}
+
+impl SessionKey {
+    pub fn new(request_id: RequestId, epoch: SessionEpoch) -> Self {
+        Self { request_id, epoch }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InputRange {
@@ -243,6 +258,92 @@ pub enum TerminalOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YieldReason {
+    QuantumExhausted,
+    Backpressure,
+    AwaitingInput,
+    Preempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    Completed,
+    Cancelled,
+    TimedOut,
+    Rejected,
+}
+
+impl FinishReason {
+    fn terminal_outcome(self) -> TerminalOutcome {
+        match self {
+            Self::Completed => TerminalOutcome::Completed,
+            Self::Cancelled => TerminalOutcome::Cancelled,
+            Self::TimedOut => TerminalOutcome::TimedOut,
+            Self::Rejected => TerminalOutcome::Rejected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    InvalidOutput,
+    Executor,
+    Backend,
+    ResourceExhausted,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureScope {
+    Request,
+    Batch,
+    Worker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryDisposition {
+    Never,
+    RetrySameSession,
+    Recompute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthImpact {
+    None,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionFailure {
+    pub kind: FailureKind,
+    pub scope: FailureScope,
+    pub retry: RetryDisposition,
+    pub health: HealthImpact,
+    pub message: String,
+}
+
+impl ExecutionFailure {
+    pub fn invalid_output(message: impl Into<String>) -> Self {
+        Self {
+            kind: FailureKind::InvalidOutput,
+            scope: FailureScope::Request,
+            retry: RetryDisposition::Never,
+            health: HealthImpact::None,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionDisposition {
+    Progress,
+    Yielded(YieldReason),
+    Finished(FinishReason),
+    Failed(ExecutionFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionState {
     Queued,
     Admitted,
@@ -303,7 +404,7 @@ impl ExecutionState {
 #[derive(Debug, Clone)]
 pub struct ExecutionPlan {
     pub plan_id: PlanId,
-    pub request_id: RequestId,
+    pub session: SessionKey,
     pub work: WorkUnit,
     pub batch_key: BatchKey,
     pub estimate: ResourceEstimate,
@@ -313,18 +414,18 @@ pub struct ExecutionPlan {
 #[derive(Debug, Clone)]
 pub struct ExecutionReport {
     pub plan_id: PlanId,
-    pub request_id: RequestId,
+    pub session: SessionKey,
     pub input_consumed: usize,
     pub output_produced: usize,
     pub observed_resources: ResourceVector,
     pub elapsed: Duration,
     pub safe_point: bool,
-    pub terminal: Option<TerminalOutcome>,
+    pub disposition: ExecutionDisposition,
 }
 
 impl ExecutionReport {
     pub fn validate_against(&self, plan: &ExecutionPlan) -> Result<()> {
-        if self.plan_id != plan.plan_id || self.request_id != plan.request_id {
+        if self.plan_id != plan.plan_id || self.session != plan.session {
             return Err(Error::InferenceError(
                 "execution report does not match its plan".to_string(),
             ));
@@ -340,8 +441,32 @@ impl ExecutionReport {
                         "executor reported progress beyond the scheduled quantum".to_string(),
                     ));
                 }
+                if matches!(self.disposition, ExecutionDisposition::Progress)
+                    && self.input_consumed == 0
+                    && self.output_produced == 0
+                {
+                    return Err(Error::InferenceError(
+                        "executor reported progress without consuming or producing work"
+                            .to_string(),
+                    ));
+                }
             }
-            WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => {}
+            WorkUnit::AtomicJob { .. } => {
+                if !matches!(
+                    self.disposition,
+                    ExecutionDisposition::Finished(_) | ExecutionDisposition::Failed(_)
+                ) {
+                    return Err(Error::InferenceError(
+                        "atomic execution must finish or fail in one transaction".to_string(),
+                    ));
+                }
+            }
+            WorkUnit::PipelineStage { .. } => {}
+        }
+        if matches!(self.disposition, ExecutionDisposition::Yielded(_)) && !self.safe_point {
+            return Err(Error::InferenceError(
+                "executor may only yield at a declared safe point".to_string(),
+            ));
         }
         Ok(())
     }
@@ -349,22 +474,30 @@ impl ExecutionReport {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionTracker {
+    session: SessionKey,
     state: ExecutionState,
     active_plan: Option<PlanId>,
 }
 
-impl Default for ExecutionTracker {
-    fn default() -> Self {
+impl ExecutionTracker {
+    pub fn new(session: SessionKey) -> Self {
         Self {
+            session,
             state: ExecutionState::Queued,
             active_plan: None,
         }
     }
-}
 
-impl ExecutionTracker {
+    pub fn session(&self) -> &SessionKey {
+        &self.session
+    }
+
     pub fn state(&self) -> ExecutionState {
         self.state
+    }
+
+    pub fn active_plan_id(&self) -> Option<PlanId> {
+        self.active_plan
     }
 
     pub fn transition(&mut self, next: ExecutionState) -> Result<()> {
@@ -373,11 +506,22 @@ impl ExecutionTracker {
     }
 
     pub fn begin_plan(&mut self, plan: &ExecutionPlan) -> Result<()> {
-        if self.active_plan.replace(plan.plan_id).is_some() {
+        if plan.session != self.session {
+            return Err(Error::InferenceError(
+                "execution plan belongs to a different request session".to_string(),
+            ));
+        }
+        if self.state.is_terminal() {
+            return Err(Error::InferenceError(
+                "terminal request cannot begin another execution plan".to_string(),
+            ));
+        }
+        if self.active_plan.is_some() {
             return Err(Error::InferenceError(
                 "request already has an active execution plan".to_string(),
             ));
         }
+        self.active_plan = Some(plan.plan_id);
         Ok(())
     }
 
@@ -388,9 +532,23 @@ impl ExecutionTracker {
                 "execution report is missing or duplicates a committed plan".to_string(),
             ));
         }
-        self.active_plan = None;
-        if let Some(outcome) = report.terminal {
-            self.transition(ExecutionState::Terminal(outcome))?;
+        let next_state = match &report.disposition {
+            ExecutionDisposition::Finished(reason) => {
+                Some(ExecutionState::Terminal(reason.terminal_outcome()))
+            }
+            ExecutionDisposition::Failed(failure) if failure.retry == RetryDisposition::Never => {
+                Some(ExecutionState::Terminal(TerminalOutcome::Failed))
+            }
+            ExecutionDisposition::Progress
+            | ExecutionDisposition::Yielded(_)
+            | ExecutionDisposition::Failed(_) => None,
+        };
+        if let Some(next_state) = next_state {
+            let validated = self.state.transition(next_state)?;
+            self.active_plan = None;
+            self.state = validated;
+        } else {
+            self.active_plan = None;
         }
         Ok(())
     }
@@ -415,9 +573,10 @@ mod tests {
 
     #[test]
     fn report_cannot_exceed_sequence_plan() {
+        let session = SessionKey::new("request".to_string(), 11);
         let plan = ExecutionPlan {
             plan_id: 7,
-            request_id: "request".to_string(),
+            session: session.clone(),
             work: WorkUnit::SequenceStep {
                 phase: SequencePhase::Prefill,
                 input: InputRange::new(4, 8).unwrap(),
@@ -438,15 +597,195 @@ mod tests {
         };
         let report = ExecutionReport {
             plan_id: 7,
-            request_id: "request".to_string(),
+            session,
             input_consumed: 5,
             output_produced: 0,
             observed_resources: ResourceVector::default(),
             elapsed: Duration::ZERO,
             safe_point: true,
-            terminal: None,
+            disposition: ExecutionDisposition::Progress,
         };
         assert!(report.validate_against(&plan).is_err());
+    }
+
+    fn plan_for(session: SessionKey, work: WorkUnit) -> ExecutionPlan {
+        ExecutionPlan {
+            plan_id: 7,
+            session,
+            work,
+            batch_key: BatchKey {
+                backend: BackendKind::Cpu,
+                model_variant: None,
+                task_type: TaskType::Chat,
+                work_kind: "test".to_string(),
+                compute_dtype: "f32".to_string(),
+                kv_dtype: "f32".to_string(),
+                cache_namespace: "none".to_string(),
+                adapter_id: None,
+            },
+            estimate: ResourceVector::zero(),
+            reservation: None,
+        }
+    }
+
+    fn report_for(plan: &ExecutionPlan, disposition: ExecutionDisposition) -> ExecutionReport {
+        ExecutionReport {
+            plan_id: plan.plan_id,
+            session: plan.session.clone(),
+            input_consumed: 0,
+            output_produced: 0,
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            safe_point: true,
+            disposition,
+        }
+    }
+
+    #[test]
+    fn reports_are_fenced_by_session_epoch_and_plan_id() {
+        let session = SessionKey::new("same-id".to_string(), 3);
+        let plan = plan_for(
+            session,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let mut wrong_epoch = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::AwaitingInput),
+        );
+        wrong_epoch.session.epoch += 1;
+        assert!(wrong_epoch.validate_against(&plan).is_err());
+
+        let mut wrong_plan = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::AwaitingInput),
+        );
+        wrong_plan.plan_id += 1;
+        assert!(wrong_plan.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn sequence_progress_and_yields_have_explicit_semantics() {
+        let plan = plan_for(
+            SessionKey::new("request".to_string(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let no_progress = report_for(&plan, ExecutionDisposition::Progress);
+        assert!(no_progress.validate_against(&plan).is_err());
+
+        let mut yielded = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::AwaitingInput),
+        );
+        assert!(yielded.validate_against(&plan).is_ok());
+        yielded.safe_point = false;
+        assert!(yielded.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn atomic_work_must_finish_or_fail() {
+        let plan = plan_for(
+            SessionKey::new("request".to_string(), 1),
+            WorkUnit::AtomicJob {
+                kind: "chat".to_string(),
+            },
+        );
+        assert!(report_for(&plan, ExecutionDisposition::Progress)
+            .validate_against(&plan)
+            .is_err());
+        assert!(report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed)
+        )
+        .validate_against(&plan)
+        .is_ok());
+    }
+
+    #[test]
+    fn tracker_preserves_active_plan_after_invalid_or_duplicate_operations() {
+        let session = SessionKey::new("request".to_string(), 1);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let mut tracker = ExecutionTracker::new(session);
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::Decoding).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+        assert!(tracker.begin_plan(&plan).is_err());
+        assert_eq!(tracker.active_plan_id(), Some(plan.plan_id));
+
+        let mut wrong = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::AwaitingInput),
+        );
+        wrong.plan_id += 1;
+        assert!(tracker.commit(&plan, &wrong).is_err());
+        assert_eq!(tracker.active_plan_id(), Some(plan.plan_id));
+
+        let valid = report_for(
+            &plan,
+            ExecutionDisposition::Yielded(YieldReason::AwaitingInput),
+        );
+        tracker.commit(&plan, &valid).unwrap();
+        assert!(tracker.commit(&plan, &valid).is_err());
+    }
+
+    #[test]
+    fn retry_policy_controls_whether_failure_terminalizes_the_session() {
+        let session = SessionKey::new("request".to_string(), 1);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let mut tracker = ExecutionTracker::new(session);
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::Decoding).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+        let retryable = ExecutionFailure {
+            kind: FailureKind::Backend,
+            scope: FailureScope::Request,
+            retry: RetryDisposition::RetrySameSession,
+            health: HealthImpact::Degraded,
+            message: "transient".to_string(),
+        };
+        tracker
+            .commit(
+                &plan,
+                &report_for(&plan, ExecutionDisposition::Failed(retryable)),
+            )
+            .unwrap();
+        assert_eq!(tracker.state(), ExecutionState::Decoding);
+
+        tracker.begin_plan(&plan).unwrap();
+        tracker
+            .commit(
+                &plan,
+                &report_for(
+                    &plan,
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output("bad")),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker.state(),
+            ExecutionState::Terminal(TerminalOutcome::Failed)
+        );
     }
 
     #[test]

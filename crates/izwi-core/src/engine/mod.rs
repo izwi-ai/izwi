@@ -43,9 +43,10 @@ pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
     BatchKey, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
-    ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState,
-    ExecutionTracker, InputRange, NativeBatchMode, PlanId, PrefillMode, SequencePhase,
-    TerminalOutcome, WorkUnit,
+    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, ExecutionTracker, FailureKind, FailureScope, FinishReason,
+    HealthImpact, InputRange, NativeBatchMode, PlanId, PrefillMode, RetryDisposition,
+    SequencePhase, SessionEpoch, SessionKey, TerminalOutcome, WorkUnit, YieldReason,
 };
 pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED};
 pub use kv_cache::{

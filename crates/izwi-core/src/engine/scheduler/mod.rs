@@ -17,7 +17,7 @@ use super::config::EngineCoreConfig;
 use super::kv_cache::{CacheResidency, KVCacheManager};
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{BlockId, Priority, RequestId, SequenceId, TaskType};
-use super::{InputRange, PlanId, SequencePhase, WorkUnit};
+use super::{InputRange, PlanId, SequencePhase, SessionKey, WorkUnit};
 use crate::model::ModelVariant;
 
 /// Scheduling policy for the engine.
@@ -285,6 +285,13 @@ pub struct ScheduledRequest {
     pub num_computed_tokens: usize,
     /// Authoritative bounded unit of work for the executor.
     pub work: WorkUnit,
+}
+
+impl ScheduledRequest {
+    /// Stable identity for the public request ID's current scheduler incarnation.
+    pub fn session_key(&self) -> SessionKey {
+        SessionKey::new(self.request_id.clone(), self.sequence_id)
+    }
 }
 
 /// Runtime telemetry used by adaptive scheduling.
@@ -1913,6 +1920,42 @@ mod tests {
         let scheduler = Scheduler::new(config);
         assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(scheduler.running_count(), 0);
+    }
+
+    #[test]
+    fn reused_request_id_receives_a_new_session_epoch() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            ..Default::default()
+        });
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 16,
+            block_size: 16,
+            ..Default::default()
+        });
+        let request_id = "reused-id".to_string();
+
+        scheduler.add_request(&build_request(
+            TaskType::Chat,
+            &request_id,
+            Priority::Normal,
+        ));
+        let first = scheduler.schedule(&mut kv_cache).prefill_requests.remove(0);
+        let first_session = first.session_key();
+        scheduler.finish_request(&request_id, &mut kv_cache);
+
+        scheduler.add_request(&build_request(
+            TaskType::Chat,
+            &request_id,
+            Priority::Normal,
+        ));
+        let second = scheduler.schedule(&mut kv_cache).prefill_requests.remove(0);
+        let second_session = second.session_key();
+
+        assert_eq!(first_session.request_id, second_session.request_id);
+        assert_ne!(first_session.epoch, second_session.epoch);
+        assert_eq!(second_session.epoch, second.sequence_id);
     }
 
     #[test]
