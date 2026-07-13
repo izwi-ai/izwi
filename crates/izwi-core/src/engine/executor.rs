@@ -24,7 +24,10 @@ mod state;
 mod streaming;
 
 use super::config::EngineCoreConfig;
-use super::execution::ExecutionCapabilities;
+use super::execution::{
+    CacheMode, ConcurrencyClass, ExecutionCapabilities, ExecutionMode, ExecutionProfile,
+    NativeBatchMode, PrefillMode,
+};
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
@@ -34,6 +37,7 @@ use crate::backends::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
+use crate::models::registry::NativeChatModel;
 use crate::models::ModelRegistry;
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
@@ -245,10 +249,19 @@ impl ExecutorOutput {
 
 /// Model executor trait - abstracts the model inference backend.
 pub trait ModelExecutor: Send + Sync {
+    /// Effective loaded-model/request/backend execution profile. Executors
+    /// that cannot prove their behavior return `None` and therefore remain on
+    /// the conservative compatibility path.
+    fn execution_profile(&self, _request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+        None
+    }
+
     /// Effective capabilities. The default is deliberately conservative so an
     /// executor must opt in before the scheduler relies on incremental or batch behavior.
-    fn execution_capabilities(&self, _request: &EngineCoreRequest) -> ExecutionCapabilities {
-        ExecutionCapabilities::default()
+    fn execution_capabilities(&self, request: &EngineCoreRequest) -> ExecutionCapabilities {
+        self.execution_profile(request)
+            .map(|profile| profile.capabilities())
+            .unwrap_or_default()
     }
 
     /// Execute prefill pass for newly admitted or in-progress prefill requests.
@@ -384,34 +397,106 @@ impl NativeExecutor {
 }
 
 impl ModelExecutor for NativeExecutor {
-    fn execution_capabilities(&self, request: &EngineCoreRequest) -> ExecutionCapabilities {
+    fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+        let variant = request.model_variant?;
+        let mut profile = ExecutionProfile::fail_closed(
+            self.config.backend,
+            Some(variant),
+            ExecutionMode::Atomic,
+        );
+        profile.compute_dtype = self.config.dtype.clone();
+        profile.kv_dtype = self.config.kv_cache_dtype.clone();
+        profile.cache_namespace = Some(format!(
+            "{}:{}:{}:{}",
+            variant,
+            self.config.backend.as_str(),
+            self.config.dtype,
+            self.config.kv_cache_dtype
+        ));
+
+        let loaded_incremental = match request.task_type {
+            super::types::TaskType::Chat => self
+                .config
+                .model_registry
+                .as_ref()
+                .and_then(|registry| registry.try_get_chat(variant))
+                .map(|model| match model.as_ref() {
+                    NativeChatModel::Qwen3(model) => model.supports_incremental_decode(),
+                    NativeChatModel::Qwen35(model) => model.supports_incremental_decode(),
+                    NativeChatModel::Gemma3(_) | NativeChatModel::Lfm2(_) => false,
+                }),
+            super::types::TaskType::ASR => self
+                .config
+                .model_registry
+                .as_ref()
+                .and_then(|registry| registry.try_get_asr(variant))
+                .map(|model| model.supports_incremental_decode()),
+            super::types::TaskType::TTS => {
+                let loaded = self
+                    .config
+                    .model_registry
+                    .as_ref()
+                    .and_then(|registry| registry.try_get_qwen_tts(variant))
+                    .is_some()
+                    || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
+                loaded.then_some(variant.family() == crate::catalog::ModelFamily::Qwen3Tts)
+            }
+            super::types::TaskType::SpeechToSpeech => self
+                .config
+                .model_registry
+                .as_ref()
+                .and_then(|registry| registry.try_get_audio_chat(variant))
+                .map(|_| false),
+        };
+        profile.resolved_from_loaded_model = loaded_incremental.is_some();
+        let implementation_incremental =
+            loaded_incremental.unwrap_or_else(|| match request.task_type {
+                super::types::TaskType::Chat => {
+                    matches!(variant.family(), crate::catalog::ModelFamily::Qwen35Chat)
+                        || matches!(
+                            variant,
+                            ModelVariant::Qwen306B
+                                | ModelVariant::Qwen306B4Bit
+                                | ModelVariant::Qwen317B
+                                | ModelVariant::Qwen317B4Bit
+                        )
+                }
+                super::types::TaskType::ASR => {
+                    variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+                }
+                super::types::TaskType::TTS => {
+                    variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+                }
+                super::types::TaskType::SpeechToSpeech => false,
+            });
+
+        if implementation_incremental
+            && (!matches!(request.task_type, super::types::TaskType::ASR) || request.streaming)
+        {
+            profile.mode = ExecutionMode::Sequence;
+            profile.prefill = PrefillMode::Full;
+            profile.incremental_decode = true;
+            profile.cache_mode = CacheMode::OpaqueModelOwned;
+        }
+
         let native_batch = !request.streaming
             && request.reference_audio.is_none()
             && request.reference_text.is_none()
+            && implementation_incremental
+            && matches!(request.task_type, super::types::TaskType::TTS)
             && request
                 .model_variant
                 .and_then(|variant| variant.speech_capabilities())
                 .is_some_and(|capabilities| capabilities.supports_builtin_voices);
-        ExecutionCapabilities {
-            incremental_prefill: matches!(request.task_type, super::types::TaskType::Chat),
-            incremental_decode: matches!(
-                request.task_type,
-                super::types::TaskType::Chat | super::types::TaskType::TTS
-            ),
-            native_batch,
-            mixed_phase_batch: false,
-            cancellable_between_steps: true,
-            recompute_safe: false,
-            physical_cache: false,
-            max_batch_size: if native_batch {
-                match self.config.backend {
-                    BackendKind::Cpu | BackendKind::Metal => 2,
-                    BackendKind::Cuda => self.config.request_parallelism.max(1),
-                }
-            } else {
-                1
-            },
+        if native_batch {
+            profile.prefill_batch = NativeBatchMode::Static;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = match self.config.backend {
+                BackendKind::Cpu | BackendKind::Metal => 2,
+                BackendKind::Cuda => self.config.request_parallelism.max(1),
+            };
         }
+        Some(profile)
     }
 
     fn execute_prefill(

@@ -42,8 +42,10 @@ mod types;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
-    BatchKey, ExecutionCapabilities, ExecutionPlan, ExecutionReport, ExecutionState,
-    ExecutionTracker, InputRange, PlanId, SequencePhase, TerminalOutcome, WorkUnit,
+    BatchKey, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
+    ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState,
+    ExecutionTracker, InputRange, NativeBatchMode, PlanId, PrefillMode, SequencePhase,
+    TerminalOutcome, WorkUnit,
 };
 pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED};
 pub use kv_cache::{

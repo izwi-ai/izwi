@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -64,6 +66,144 @@ pub struct ExecutionCapabilities {
     pub recompute_safe: bool,
     pub physical_cache: bool,
     pub max_batch_size: usize,
+}
+
+/// The unit of work an executor actually exposes for this request.
+///
+/// This is intentionally separate from the public capability (chat, ASR,
+/// TTS, ...): two models serving the same capability can have very different
+/// execution and cancellation semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Sequence,
+    Atomic,
+    Realtime,
+    Pipeline,
+    Artifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefillMode {
+    None,
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeBatchMode {
+    None,
+    Static,
+    Continuous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheMode {
+    None,
+    OpaqueModelOwned,
+    ExternalPaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationGranularity {
+    OperationBoundary,
+    SequenceStep,
+    RealtimeChunk,
+    PipelineStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyClass {
+    Exclusive,
+    Batchable,
+}
+
+/// Effective execution behavior for one model/request/backend combination.
+///
+/// Profiles fail closed: advanced scheduling features stay disabled unless
+/// the loaded model implementation proves support. `resolved_from_loaded_model`
+/// distinguishes executor truth from catalog-only route planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionProfile {
+    pub backend: BackendKind,
+    pub model_variant: Option<ModelVariant>,
+    pub mode: ExecutionMode,
+    pub prefill: PrefillMode,
+    pub incremental_decode: bool,
+    pub prefill_batch: NativeBatchMode,
+    pub decode_batch: NativeBatchMode,
+    pub cache_mode: CacheMode,
+    pub cancellation: CancellationGranularity,
+    pub concurrency: ConcurrencyClass,
+    pub recompute_safe: bool,
+    pub prefix_reuse_safe: bool,
+    pub max_batch_size: usize,
+    pub resolved_from_loaded_model: bool,
+    pub compute_dtype: String,
+    pub kv_dtype: String,
+    pub cache_namespace: Option<String>,
+}
+
+impl ExecutionProfile {
+    pub fn fail_closed(
+        backend: BackendKind,
+        model_variant: Option<ModelVariant>,
+        mode: ExecutionMode,
+    ) -> Self {
+        Self {
+            backend,
+            model_variant,
+            mode,
+            prefill: PrefillMode::None,
+            incremental_decode: false,
+            prefill_batch: NativeBatchMode::None,
+            decode_batch: NativeBatchMode::None,
+            cache_mode: CacheMode::None,
+            cancellation: match mode {
+                ExecutionMode::Sequence => CancellationGranularity::SequenceStep,
+                ExecutionMode::Realtime => CancellationGranularity::RealtimeChunk,
+                ExecutionMode::Pipeline => CancellationGranularity::PipelineStage,
+                ExecutionMode::Atomic | ExecutionMode::Artifact => {
+                    CancellationGranularity::OperationBoundary
+                }
+            },
+            concurrency: ConcurrencyClass::Exclusive,
+            recompute_safe: false,
+            prefix_reuse_safe: false,
+            max_batch_size: 1,
+            resolved_from_loaded_model: false,
+            compute_dtype: "unknown".to_string(),
+            kv_dtype: "none".to_string(),
+            cache_namespace: None,
+        }
+    }
+
+    pub fn capabilities(&self) -> ExecutionCapabilities {
+        let native_batch = self.prefill_batch != NativeBatchMode::None
+            || self.decode_batch != NativeBatchMode::None;
+        ExecutionCapabilities {
+            incremental_prefill: self.prefill == PrefillMode::Incremental,
+            incremental_decode: self.incremental_decode,
+            native_batch,
+            mixed_phase_batch: false,
+            cancellable_between_steps: !matches!(
+                self.cancellation,
+                CancellationGranularity::OperationBoundary
+            ),
+            recompute_safe: self.recompute_safe,
+            physical_cache: self.cache_mode == CacheMode::ExternalPaged,
+            max_batch_size: if native_batch {
+                self.max_batch_size.max(1)
+            } else {
+                1
+            },
+        }
+    }
 }
 
 impl Default for ExecutionCapabilities {
@@ -307,5 +447,49 @@ mod tests {
             terminal: None,
         };
         assert!(report.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn execution_profiles_fail_closed_until_features_are_proven() {
+        let profile = ExecutionProfile::fail_closed(
+            BackendKind::Cuda,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Atomic,
+        );
+        let capabilities = profile.capabilities();
+
+        assert_eq!(profile.prefill, PrefillMode::None);
+        assert_eq!(profile.cache_mode, CacheMode::None);
+        assert_eq!(profile.concurrency, ConcurrencyClass::Exclusive);
+        assert!(!profile.resolved_from_loaded_model);
+        assert!(!capabilities.incremental_prefill);
+        assert!(!capabilities.incremental_decode);
+        assert!(!capabilities.native_batch);
+        assert!(!capabilities.cancellable_between_steps);
+        assert!(!capabilities.recompute_safe);
+        assert!(!capabilities.physical_cache);
+        assert_eq!(capabilities.max_batch_size, 1);
+    }
+
+    #[test]
+    fn profile_capabilities_only_expose_declared_features() {
+        let mut profile = ExecutionProfile::fail_closed(
+            BackendKind::Metal,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Sequence,
+        );
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Static;
+        profile.cache_mode = CacheMode::OpaqueModelOwned;
+        profile.max_batch_size = 4;
+
+        let capabilities = profile.capabilities();
+        assert!(!capabilities.incremental_prefill);
+        assert!(capabilities.incremental_decode);
+        assert!(capabilities.native_batch);
+        assert!(capabilities.cancellable_between_steps);
+        assert!(!capabilities.physical_cache);
+        assert_eq!(capabilities.max_batch_size, 4);
     }
 }
