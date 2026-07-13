@@ -24,6 +24,7 @@ mod state;
 mod streaming;
 
 use super::config::EngineCoreConfig;
+use super::execution::ExecutionCapabilities;
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
@@ -242,6 +243,12 @@ impl ExecutorOutput {
 
 /// Model executor trait - abstracts the model inference backend.
 pub trait ModelExecutor: Send + Sync {
+    /// Effective capabilities. The default is deliberately conservative so an
+    /// executor must opt in before the scheduler relies on incremental or batch behavior.
+    fn execution_capabilities(&self, _request: &EngineCoreRequest) -> ExecutionCapabilities {
+        ExecutionCapabilities::default()
+    }
+
     /// Execute prefill pass for newly admitted or in-progress prefill requests.
     fn execute_prefill(
         &self,

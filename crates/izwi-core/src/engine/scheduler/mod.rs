@@ -17,6 +17,7 @@ use super::config::EngineCoreConfig;
 use super::kv_cache::{CacheResidency, KVCacheManager};
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{BlockId, Priority, RequestId, SequenceId, TaskType};
+use super::{InputRange, PlanId, SequencePhase, WorkUnit};
 use crate::model::ModelVariant;
 
 /// Scheduling policy for the engine.
@@ -249,6 +250,8 @@ impl ScheduleResult {
 /// A request that has been scheduled for processing.
 #[derive(Debug, Clone)]
 pub struct ScheduledRequest {
+    /// Monotonic identity for this exact scheduling decision.
+    pub plan_id: PlanId,
     /// Request ID
     pub request_id: RequestId,
     /// Sequence ID
@@ -261,6 +264,8 @@ pub struct ScheduledRequest {
     pub block_ids: Vec<BlockId>,
     /// Number of tokens already computed (for chunked prefill)
     pub num_computed_tokens: usize,
+    /// Authoritative bounded unit of work for the executor.
+    pub work: WorkUnit,
 }
 
 /// Runtime telemetry used by adaptive scheduling.
@@ -320,6 +325,8 @@ pub struct Scheduler {
     requests: HashMap<RequestId, RequestMetadata>,
     /// Next sequence ID
     next_sequence_id: SequenceId,
+    /// Next execution plan identity.
+    next_plan_id: PlanId,
     /// Adaptive scheduling telemetry.
     telemetry: SchedulerTelemetry,
 }
@@ -383,6 +390,7 @@ impl Scheduler {
             running: HashMap::new(),
             requests: HashMap::new(),
             next_sequence_id: 0,
+            next_plan_id: 1,
             telemetry,
         }
     }
@@ -632,13 +640,24 @@ impl Scheduler {
                 running.block_ids = block_ids.clone();
             }
 
+            let plan_id = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.saturating_add(1);
             result.decode_requests.push(ScheduledRequest {
+                plan_id,
                 request_id: request_id.clone(),
                 sequence_id,
                 num_tokens,
                 is_prefill: false,
                 block_ids,
                 num_computed_tokens: num_computed,
+                work: WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    input: InputRange {
+                        start: num_computed,
+                        end: num_computed.saturating_add(num_tokens),
+                    },
+                    max_output_steps: num_tokens,
+                },
             });
 
             remaining_decode_budget = remaining_decode_budget.saturating_sub(num_tokens);
@@ -800,13 +819,24 @@ impl Scheduler {
                 running.block_ids = block_ids.clone();
             }
 
+            let plan_id = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.saturating_add(1);
             result.prefill_requests.push(ScheduledRequest {
+                plan_id,
                 request_id: request_id.clone(),
                 sequence_id,
                 num_tokens,
                 is_prefill: true,
                 block_ids,
                 num_computed_tokens: num_computed,
+                work: WorkUnit::SequenceStep {
+                    phase: SequencePhase::Prefill,
+                    input: InputRange {
+                        start: num_computed,
+                        end: num_computed.saturating_add(num_tokens),
+                    },
+                    max_output_steps: num_tokens.max(1),
+                },
             });
 
             result.blocks_allocated += fresh_allocated_blocks;
@@ -933,13 +963,24 @@ impl Scheduler {
                 paused: false,
             };
 
+            let plan_id = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.saturating_add(1);
             result.prefill_requests.push(ScheduledRequest {
+                plan_id,
                 request_id: request_id.clone(),
                 sequence_id: metadata.sequence_id,
                 num_tokens,
                 is_prefill: true,
                 block_ids,
                 num_computed_tokens: 0,
+                work: WorkUnit::SequenceStep {
+                    phase: SequencePhase::Prefill,
+                    input: InputRange {
+                        start: 0,
+                        end: num_tokens,
+                    },
+                    max_output_steps: num_tokens.max(1),
+                },
             });
 
             self.running.insert(request_id.clone(), running);

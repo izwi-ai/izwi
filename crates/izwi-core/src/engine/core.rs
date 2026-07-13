@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::{debug, info};
 
 use super::config::EngineCoreConfig;
+use super::execution::BatchKey;
 use super::executor::{ExecutorOutput, UnifiedExecutor, WorkerConfig};
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
@@ -135,6 +136,7 @@ pub struct EngineCore {
 
 impl EngineCore {
     fn build_compatible_subbatches<'a>(
+        &self,
         request_refs: &'a [&'a EngineCoreRequest],
         scheduled: &[super::scheduler::ScheduledRequest],
     ) -> Vec<(
@@ -150,16 +152,29 @@ impl EngineCore {
             request_by_id.insert(req.id.as_str(), *req);
         }
 
-        let mut groups: Vec<(
-            (super::types::TaskType, Option<crate::model::ModelVariant>),
-            Vec<super::scheduler::ScheduledRequest>,
-        )> = Vec::new();
+        let mut groups: Vec<(BatchKey, Vec<super::scheduler::ScheduledRequest>)> = Vec::new();
 
         for item in scheduled {
             let Some(req) = request_by_id.get(item.request_id.as_str()) else {
                 continue;
             };
-            let key = (req.task_type, req.model_variant);
+            let work_kind = if item.is_prefill { "prefill" } else { "decode" };
+            let key = BatchKey {
+                backend: self.config.backend,
+                model_variant: req.model_variant,
+                task_type: req.task_type,
+                work_kind: work_kind.to_string(),
+                compute_dtype: "executor-default".to_string(),
+                kv_dtype: self.config.kv_cache_dtype.clone(),
+                cache_namespace: format!(
+                    "{:?}:{:?}:{}:{}",
+                    req.model_variant,
+                    req.task_type,
+                    self.config.backend.as_str(),
+                    self.config.kv_cache_dtype
+                ),
+                adapter_id: None,
+            };
             if let Some((_, bucket)) = groups.iter_mut().find(|(group_key, _)| *group_key == key) {
                 bucket.push(item.clone());
             } else {
@@ -544,7 +559,7 @@ impl EngineCore {
             }
             let started = Instant::now();
             let sub_batches =
-                Self::build_compatible_subbatches(&decode_request_refs, &decode_scheduled);
+                self.build_compatible_subbatches(&decode_request_refs, &decode_scheduled);
             let mut outputs = Vec::new();
             for (refs, batch) in sub_batches {
                 outputs.extend(self.execute_decode_subbatch(&refs, &batch).await?);
@@ -557,7 +572,7 @@ impl EngineCore {
             }
             let started = Instant::now();
             let sub_batches =
-                Self::build_compatible_subbatches(&prefill_request_refs, &prefill_scheduled);
+                self.build_compatible_subbatches(&prefill_request_refs, &prefill_scheduled);
             let mut outputs = Vec::new();
             for (refs, batch) in sub_batches {
                 outputs.extend(self.executor.execute_prefill(&refs, &batch).await?);
@@ -1280,20 +1295,32 @@ mod tests {
 
         let scheduled = vec![
             ScheduledRequest {
+                plan_id: 1,
                 request_id: req_a.id.clone(),
                 sequence_id: 0,
                 num_tokens: 3,
                 is_prefill: false,
                 block_ids: Vec::new(),
                 num_computed_tokens: 0,
+                work: crate::engine::WorkUnit::SequenceStep {
+                    phase: crate::engine::SequencePhase::Decode,
+                    input: crate::engine::InputRange { start: 0, end: 3 },
+                    max_output_steps: 3,
+                },
             },
             ScheduledRequest {
+                plan_id: 2,
                 request_id: req_b.id.clone(),
                 sequence_id: 1,
                 num_tokens: 2,
                 is_prefill: false,
                 block_ids: Vec::new(),
                 num_computed_tokens: 0,
+                work: crate::engine::WorkUnit::SequenceStep {
+                    phase: crate::engine::SequencePhase::Decode,
+                    input: crate::engine::InputRange { start: 0, end: 2 },
+                    max_output_steps: 2,
+                },
             },
         ];
 

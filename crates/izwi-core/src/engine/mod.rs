@@ -27,18 +27,24 @@
 mod cache;
 mod config;
 mod core;
+pub mod execution;
 mod executor;
 mod kv_cache;
 mod metal_kv_cache;
 pub mod metrics;
 mod output;
 mod request;
+pub mod resources;
 mod scheduler;
 pub mod signal_frontend;
 mod types;
 
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
+pub use execution::{
+    BatchKey, ExecutionCapabilities, ExecutionPlan, ExecutionReport, ExecutionState,
+    ExecutionTracker, InputRange, PlanId, SequencePhase, TerminalOutcome, WorkUnit,
+};
 pub use executor::{ExecutorOutput, ModelExecutor, WorkerConfig};
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
@@ -62,6 +68,10 @@ pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
     EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
+};
+pub use resources::{
+    ReservationId, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
+    ResourceVector,
 };
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::{

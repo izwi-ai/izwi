@@ -43,11 +43,14 @@ pub mod tokenizer;
 
 // Re-export main types from the new engine module
 pub use engine::{
-    AsrEngineInput, AudioChatEngineInput, CacheResidency, ChatEngineInput, Engine, EngineAudioInput,
-    AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics,
-    EngineOutput, EngineTask, GenerationParams, KVCacheManager, ModelExecutor, OutputProcessor,
-    PinnedBlockHandle, RequestProcessor, RequestStatus, Scheduler, SchedulerConfig,
-    SchedulingPolicy, StreamingOutput, TtsEngineInput, WorkloadClass,
+    AsrEngineInput, AudioChatEngineInput, BatchKey, CacheResidency, ChatEngineInput, Engine,
+    EngineAudioInput, AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig,
+    EngineCoreRequest, EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities,
+    ExecutionPlan, ExecutionReport, ExecutionState, GenerationParams, KVCacheManager,
+    ModelExecutor, OutputProcessor, PinnedBlockHandle, Priority, RequestProcessor, RequestStatus,
+    ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector,
+    Scheduler, SchedulerConfig, SchedulingPolicy, StreamingOutput, TerminalOutcome, TtsEngineInput,
+    WorkUnit, WorkloadClass,
 };
 
 // Legacy re-exports for backward compatibility
