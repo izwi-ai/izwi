@@ -651,8 +651,34 @@ impl KVCacheManager {
 
     /// Free all blocks for a request.
     pub fn free(&mut self, request_id: &RequestId) {
+        self.free_internal(request_id, true);
+    }
+
+    /// Free blocks for recompute preemption without retaining a prefix snapshot.
+    pub fn free_for_preemption(&mut self, request_id: &RequestId) -> usize {
+        self.free_internal(request_id, false)
+    }
+
+    /// Blocks that would become genuinely free if this request were released.
+    pub fn reclaimable_blocks(&self, request_id: &RequestId) -> usize {
+        self.request_blocks
+            .get(request_id)
+            .into_iter()
+            .flatten()
+            .filter(|block_id| {
+                self.allocator
+                    .get_block(**block_id)
+                    .is_some_and(|block| block.ref_count == 1 && block.pin_count == 0)
+            })
+            .count()
+    }
+
+    fn free_internal(&mut self, request_id: &RequestId, persist_prefix: bool) -> usize {
         let released_blocks = self.request_blocks.remove(request_id).unwrap_or_default();
-        self.persist_request_prefix_snapshot(request_id, &released_blocks);
+        if persist_prefix {
+            self.persist_request_prefix_snapshot(request_id, &released_blocks);
+        }
+        let mut freed = 0;
         if !released_blocks.is_empty() {
             let allocated_before = self.allocator.num_allocated();
             debug!(
@@ -662,7 +688,7 @@ impl KVCacheManager {
                 released_blocks
             );
             self.allocator.free_blocks(&released_blocks);
-            let freed = allocated_before.saturating_sub(self.allocator.num_allocated());
+            freed = allocated_before.saturating_sub(self.allocator.num_allocated());
             self.telemetry.total_frees += freed as u64;
         }
         self.cleanup_prefix_levels_for_request(request_id);
@@ -677,6 +703,7 @@ impl KVCacheManager {
         }
         self.block_table.remove(request_id);
         self.maybe_tune_soft_limit();
+        freed
     }
 
     fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
@@ -1728,5 +1755,32 @@ mod tests {
         assert_eq!(blocks2.len(), 2);
         assert_eq!(blocks2, blocks1);
         assert!(manager.stats().telemetry.shared_prefix_hits >= 1);
+    }
+
+    #[test]
+    fn preemption_free_does_not_retain_prefix_snapshot() {
+        let mut manager = KVCacheManager::new(KVCacheConfig {
+            max_blocks: 4,
+            block_size: 2,
+            ..Default::default()
+        });
+        let source = "preempt-source".to_string();
+        let tokens = vec![10, 11, 12, 13];
+        assert_eq!(
+            manager
+                .allocate_with_prefix_tokens(&source, 2, &tokens)
+                .len(),
+            2
+        );
+        assert_eq!(manager.free_for_preemption(&source), 2);
+
+        let reuser = "preempt-reuser".to_string();
+        assert_eq!(
+            manager
+                .allocate_with_prefix_tokens(&reuser, 2, &tokens)
+                .len(),
+            2
+        );
+        assert_eq!(manager.stats().telemetry.shared_prefix_blocks_reused, 0);
     }
 }

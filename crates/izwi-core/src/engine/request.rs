@@ -627,6 +627,13 @@ impl EngineCoreRequest {
             self.prompt_tokens.len()
         } else if let Some(prompt) = &self.asr_prompt {
             (prompt.len() / 4).max(1)
+        } else if let Some(messages) = &self.chat_messages {
+            (messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>()
+                / 4)
+                .max(1)
         } else {
             // Estimate from text length (rough approximation)
             self.text.as_ref().map(|t| t.len() / 4).unwrap_or(0).max(1)
@@ -696,21 +703,8 @@ impl RequestProcessor {
             &mut request.params,
         )?;
 
-        // Preserve exact prompt tokens when the caller already computed them.
-        if request.prompt_tokens.is_empty() {
-            // Tokenize text input (simplified - actual tokenization would be more complex)
-            if let Some(text) = &request.text {
-                let estimated_tokens = (text.len() / 4).max(1);
-                request.prompt_tokens = (0..estimated_tokens as u32).collect();
-            } else if let Some(prompt) = &request.asr_prompt {
-                let estimated_tokens = (prompt.len() / 4).max(1);
-                request.prompt_tokens = (0..estimated_tokens as u32).collect();
-            } else if let Some(messages) = &request.chat_messages {
-                let estimated_tokens =
-                    (messages.iter().map(|m| m.content.len()).sum::<usize>() / 4).max(1);
-                request.prompt_tokens = (0..estimated_tokens as u32).collect();
-            }
-        }
+        // Empty prompt_tokens means the runtime only has an estimate. Never invent
+        // placeholder IDs: equal-length unrelated prompts would become false prefix hits.
 
         request.sync_task_from_fields();
         Ok(request)

@@ -41,6 +41,10 @@ pub struct EngineCoreConfig {
     #[serde(default)]
     pub scheduling_policy: SchedulingPolicy,
 
+    /// Enable prefix reuse only for executor-backed physical cache snapshots.
+    #[serde(default)]
+    pub enable_prefix_caching: bool,
+
     /// Enable chunked prefill for long prompts
     #[serde(default = "default_chunked_prefill")]
     pub enable_chunked_prefill: bool,
@@ -254,6 +258,7 @@ impl Default for EngineCoreConfig {
             kv_cache_dtype: default_kv_cache_dtype(),
             max_blocks: default_max_blocks(),
             scheduling_policy: SchedulingPolicy::default(),
+            enable_prefix_caching: false,
             enable_chunked_prefill: default_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),

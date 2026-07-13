@@ -509,6 +509,12 @@ impl EngineCore {
         }
         let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
 
+        for request_id in &schedule_result.preempted_requests {
+            self.executor.cleanup_request(request_id).await;
+            self.request_phase_timings
+                .insert(request_id.clone(), RequestPhaseTiming::default());
+        }
+
         if !schedule_result.has_work() {
             return Ok(Vec::new());
         }
@@ -1165,7 +1171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_step_preserves_executor_state_for_preempted_request() {
+    async fn test_step_clears_executor_state_for_recompute_preemption() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
@@ -1201,8 +1207,8 @@ mod tests {
 
         let calls = cleanup_calls.lock().unwrap().clone();
         assert!(
-            !calls.iter().any(|id| id == "low-priority"),
-            "preempted request should preserve executor decode state for resume"
+            calls.iter().any(|id| id == "low-priority"),
+            "recompute preemption must clear stale executor decode state"
         );
         assert_eq!(
             core.get_request_status(&"low-priority".to_string()),

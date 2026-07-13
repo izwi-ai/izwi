@@ -41,6 +41,8 @@ pub struct SchedulerConfig {
     pub policy: SchedulingPolicy,
     /// Enable chunked prefill
     pub enable_chunked_prefill: bool,
+    /// Enable prefix reuse backed by an executor-owned physical cache.
+    pub enable_prefix_caching: bool,
     /// Threshold for chunked prefill
     pub chunked_prefill_threshold: usize,
     /// Enable preemption when KV cache is full
@@ -112,6 +114,7 @@ impl Default for SchedulerConfig {
             max_tokens_per_step: 384,
             policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: false,
+            enable_prefix_caching: false,
             chunked_prefill_threshold: 192,
             enable_preemption: false,
             enable_vad_preemption: true,
@@ -142,6 +145,7 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             max_tokens_per_step: config.max_tokens_per_step,
             policy: config.scheduling_policy,
             enable_chunked_prefill: config.enable_chunked_prefill,
+            enable_prefix_caching: config.enable_prefix_caching,
             chunked_prefill_threshold: config.chunked_prefill_threshold,
             enable_preemption: config.enable_preemption,
             enable_vad_preemption: true, // Default to enabled for audio apps
@@ -535,6 +539,11 @@ impl Scheduler {
             });
         }
         let has_decode_demand = !decode_candidates.is_empty();
+        let highest_waiting_priority = self
+            .waiting_members
+            .iter()
+            .filter_map(|request_id| self.requests.get(request_id).map(|m| m.priority))
+            .max();
         let effective_prefill_chunk_threshold =
             self.effective_prefill_chunk_threshold(kv_utilization, has_decode_demand);
 
@@ -551,6 +560,11 @@ impl Scheduler {
             overdue_ms,
         ) in decode_candidates
         {
+            if self.config.enable_preemption
+                && highest_waiting_priority.is_some_and(|waiting| waiting > priority)
+            {
+                continue;
+            }
             if remaining_batch == 0 || remaining_decode_budget == 0 {
                 break;
             }
@@ -577,8 +591,13 @@ impl Scheduler {
                 if additional_blocks > 0 && !kv_cache.can_allocate(additional_blocks) {
                     // Try preemption if enabled
                     if self.config.enable_preemption {
-                        let preempted =
-                            self.try_preempt_for_blocks(additional_blocks, priority, kv_cache);
+                        let protected = result.all_request_ids().into_iter().collect();
+                        let preempted = self.try_preempt_for_blocks(
+                            additional_blocks,
+                            priority,
+                            &protected,
+                            kv_cache,
+                        );
                         if !preempted.is_empty() {
                             result.preempted_requests.extend(preempted);
                         }
@@ -621,7 +640,8 @@ impl Scheduler {
             // Shared-prefix blocks must be detached before appending decode tokens.
             if !block_ids.is_empty() && kv_cache.ensure_writable_last_block(&request_id).is_none() {
                 if self.config.enable_preemption {
-                    let preempted = self.try_preempt_for_blocks(1, priority, kv_cache);
+                    let protected = result.all_request_ids().into_iter().collect();
+                    let preempted = self.try_preempt_for_blocks(1, priority, &protected, kv_cache);
                     if !preempted.is_empty() {
                         result.preempted_requests.extend(preempted);
                     }
@@ -747,8 +767,13 @@ impl Scheduler {
 
                 if plan.additional_blocks > 0 && !kv_cache.can_allocate(plan.additional_blocks) {
                     if self.config.enable_preemption {
-                        let preempted =
-                            self.try_preempt_for_blocks(plan.additional_blocks, priority, kv_cache);
+                        let protected = result.all_request_ids().into_iter().collect();
+                        let preempted = self.try_preempt_for_blocks(
+                            plan.additional_blocks,
+                            priority,
+                            &protected,
+                            kv_cache,
+                        );
                         if !preempted.is_empty() {
                             result.preempted_requests.extend(preempted);
                         }
@@ -764,11 +789,15 @@ impl Scheduler {
                 }
 
                 let (block_ids, fresh_blocks) = if existing_blocks == 0 {
-                    let block_ids = kv_cache.allocate_with_prefix_tokens(
-                        &request_id,
-                        plan.total_blocks_needed,
-                        &metadata.prompt_prefix_tokens,
-                    );
+                    let block_ids = if self.config.enable_prefix_caching {
+                        kv_cache.allocate_with_prefix_tokens(
+                            &request_id,
+                            plan.total_blocks_needed,
+                            &metadata.prompt_prefix_tokens,
+                        )
+                    } else {
+                        kv_cache.allocate(&request_id, plan.total_blocks_needed)
+                    };
                     if block_ids.len() < plan.total_blocks_needed {
                         kv_cache.free(&request_id);
                         if self.should_backoff_prefill_chunk(num_tokens) {
@@ -904,6 +933,7 @@ impl Scheduler {
                         let preempted = self.try_preempt_for_blocks(
                             plan.additional_blocks,
                             metadata.priority,
+                            &result.all_request_ids().into_iter().collect(),
                             kv_cache,
                         );
                         if !preempted.is_empty() {
@@ -920,11 +950,15 @@ impl Scheduler {
                     break;
                 }
 
-                let block_ids = kv_cache.allocate_with_prefix_tokens(
-                    &request_id,
-                    plan.total_blocks_needed,
-                    &metadata.prompt_prefix_tokens,
-                );
+                let block_ids = if self.config.enable_prefix_caching {
+                    kv_cache.allocate_with_prefix_tokens(
+                        &request_id,
+                        plan.total_blocks_needed,
+                        &metadata.prompt_prefix_tokens,
+                    )
+                } else {
+                    kv_cache.allocate(&request_id, plan.total_blocks_needed)
+                };
                 if block_ids.len() < plan.total_blocks_needed {
                     debug!("Failed to allocate required blocks for {}", request_id);
                     kv_cache.free(&request_id);
@@ -1265,7 +1299,7 @@ impl Scheduler {
         existing_blocks: usize,
     ) -> PrefillAllocationPlan {
         let total_blocks_needed = kv_cache.blocks_for_tokens(total_tokens_after);
-        let reusable_blocks = if existing_blocks == 0 {
+        let reusable_blocks = if self.config.enable_prefix_caching && existing_blocks == 0 {
             kv_cache.estimate_prefix_reuse_blocks(prompt_tokens, total_blocks_needed)
         } else {
             0
@@ -1525,17 +1559,19 @@ impl Scheduler {
         &mut self,
         blocks_needed: usize,
         requesting_priority: Priority,
+        protected_requests: &HashSet<RequestId>,
         kv_cache: &mut KVCacheManager,
     ) -> Vec<RequestId> {
-        let mut preempted = Vec::new();
-        let mut blocks_freed = 0;
-
         // Collect candidates for preemption and score them by expected user impact.
         let mut candidates: Vec<_> = self
             .running
             .iter()
             .filter(|(_, r)| {
-                r.priority < requesting_priority && !r.paused && !r.block_ids.is_empty()
+                r.priority < requesting_priority
+                    && !r.paused
+                    && !r.first_token_emitted
+                    && !r.block_ids.is_empty()
+                    && !protected_requests.contains(&r.request_id)
             })
             .map(|(id, r)| {
                 let (overdue_ms, age_ms, remaining_decode) =
@@ -1551,7 +1587,7 @@ impl Scheduler {
                 (
                     id.clone(),
                     r.priority,
-                    r.block_ids.len(),
+                    kv_cache.reclaimable_blocks(id),
                     r.num_tokens_generated,
                     r.first_token_emitted,
                     overdue_ms,
@@ -1560,6 +1596,7 @@ impl Scheduler {
                 )
             })
             .collect();
+        candidates.retain(|candidate| candidate.2 > 0);
 
         // Order by:
         // 1) lowest priority first
@@ -1579,41 +1616,40 @@ impl Scheduler {
                 .then_with(|| b.2.cmp(&a.2))
         });
 
-        // Preempt until we have enough blocks
-        for (request_id, _priority, num_blocks, ..) in candidates {
-            if blocks_freed >= blocks_needed {
+        let mut selected = Vec::new();
+        let mut reclaimable = 0usize;
+        for candidate in candidates {
+            reclaimable = reclaimable.saturating_add(candidate.2);
+            selected.push(candidate);
+            if reclaimable >= blocks_needed {
                 break;
             }
+        }
+        if reclaimable < blocks_needed {
+            debug!(
+                "Preemption plan rejected transactionally: reclaimable {} but needed {}",
+                reclaimable, blocks_needed
+            );
+            return Vec::new();
+        }
 
-            // Mark as paused and free blocks while keeping decode progress metadata.
+        let mut preempted = Vec::with_capacity(selected.len());
+        let mut blocks_freed = 0usize;
+        for (request_id, _priority, _reclaimable, ..) in selected {
+            let freed = kv_cache.free_for_preemption(&request_id);
+            debug_assert!(freed > 0, "validated preemption victim reclaimed no blocks");
+            blocks_freed = blocks_freed.saturating_add(freed);
             if let Some(running) = self.running.get_mut(&request_id) {
-                kv_cache.free(&request_id);
-                blocks_freed += num_blocks;
-                preempted.push(request_id.clone());
                 running.block_ids.clear();
+                running.num_tokens_processed = 0;
+                running.num_tokens_generated = 0;
+                running.prefill_complete = false;
+                running.first_token_emitted = false;
                 running.paused = true;
-
-                debug!(
-                    "Preempted request {} (freed {} blocks, total freed: {})",
-                    request_id, num_blocks, blocks_freed
-                );
             }
+            preempted.push(request_id);
         }
-
-        if blocks_freed >= blocks_needed {
-            debug!(
-                "Successfully preempted {} requests, freed {} blocks (needed {})",
-                preempted.len(),
-                blocks_freed,
-                blocks_needed
-            );
-        } else {
-            debug!(
-                "Could not free enough blocks: freed {} but needed {}",
-                blocks_freed, blocks_needed
-            );
-        }
-
+        debug_assert!(blocks_freed >= blocks_needed);
         preempted
     }
 }
@@ -1847,13 +1883,73 @@ mod tests {
 
             let third = scheduler.schedule(&mut kv_cache);
             assert_eq!(
-                third.decode_requests.len(),
+                third.prefill_requests.len(),
                 1,
-                "preempted {task_type:?} request should resume decode from preserved state"
+                "preempted {task_type:?} request should restart from prefill"
             );
-            assert_eq!(third.decode_requests[0].request_id, low_id);
-            assert!(!third.decode_requests[0].is_prefill);
+            assert_eq!(third.prefill_requests[0].request_id, low_id);
+            assert!(third.prefill_requests[0].is_prefill);
+            assert_eq!(third.prefill_requests[0].num_computed_tokens, 0);
         }
+    }
+
+    #[test]
+    fn preemption_is_transactional_when_victims_cannot_satisfy_demand() {
+        let config = SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 8,
+            policy: SchedulingPolicy::Priority,
+            enable_preemption: true,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 2,
+            block_size: 1,
+            ..Default::default()
+        });
+        for id in ["low-a", "low-b"] {
+            let mut request = EngineCoreRequest::tts(id).with_priority(Priority::Low);
+            request.id = id.to_string();
+            request.prompt_tokens = vec![1];
+            scheduler.add_request(&request);
+        }
+        let first = scheduler.schedule(&mut kv_cache);
+        assert_eq!(first.prefill_requests.len(), 2);
+        for id in ["low-a", "low-b"] {
+            scheduler.update_after_step(&id.to_string(), 1, 0, Vec::new(), 1.0);
+        }
+        let mut high = EngineCoreRequest::tts("high").with_priority(Priority::High);
+        high.id = "high".to_string();
+        high.prompt_tokens = vec![2, 2, 2];
+        scheduler.add_request(&high);
+
+        let second = scheduler.schedule(&mut kv_cache);
+        assert!(second.preempted_requests.is_empty());
+        assert_eq!(kv_cache.stats().allocated_blocks, 2);
+        assert!(kv_cache.get_block_table(&"low-a".to_string()).is_some());
+        assert!(kv_cache.get_block_table(&"low-b".to_string()).is_some());
+    }
+
+    #[test]
+    fn preemption_never_discards_user_visible_output() {
+        let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
+        let low_id = "visible-low".to_string();
+        let mut low = EngineCoreRequest::tts("low").with_priority(Priority::Low);
+        low.id = low_id.clone();
+        low.prompt_tokens = vec![1];
+        scheduler.add_request(&low);
+        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        scheduler.update_after_step(&low_id, 1, 1, Vec::new(), 1.0);
+
+        let mut high = EngineCoreRequest::tts("high").with_priority(Priority::High);
+        high.id = "visible-high".to_string();
+        high.prompt_tokens = vec![2];
+        scheduler.add_request(&high);
+        let result = scheduler.schedule(&mut kv_cache);
+
+        assert!(result.preempted_requests.is_empty());
+        assert!(kv_cache.get_block_table(&low_id).is_some());
     }
 
     #[test]
@@ -2070,6 +2166,7 @@ mod tests {
             min_tokens_per_step: 1,
             policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: false,
+            enable_prefix_caching: true,
             enable_preemption: false,
             enable_adaptive_batching: false,
             ..Default::default()
