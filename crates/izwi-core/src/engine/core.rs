@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use super::config::EngineCoreConfig;
 use super::execution::{
     BatchKey, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, WorkUnit,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, PrefillMode, WorkUnit,
 };
 use super::executor::{
     ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
@@ -171,6 +171,18 @@ impl EngineCore {
                 )
             });
         let work = match profile.mode {
+            ExecutionMode::Sequence | ExecutionMode::Realtime
+                if scheduled.is_prefill && profile.prefill == PrefillMode::Full =>
+            {
+                WorkUnit::SequenceStep {
+                    phase: super::SequencePhase::Prefill,
+                    input: super::InputRange {
+                        start: 0,
+                        end: request.num_prompt_tokens(),
+                    },
+                    max_output_steps: 1,
+                }
+            }
             ExecutionMode::Sequence | ExecutionMode::Realtime => scheduled.work.clone(),
             ExecutionMode::Atomic | ExecutionMode::Artifact => WorkUnit::AtomicJob {
                 kind: format!("{:?}", request.task_type).to_ascii_lowercase(),
@@ -950,7 +962,15 @@ impl EngineCore {
 
             // Update scheduler state
             if exec_output.finished {
-                self.executor.cleanup_request(&request_id).await;
+                if let Some(session) = self
+                    .execution_trackers
+                    .get(&request_id)
+                    .map(|tracker| tracker.session().clone())
+                {
+                    self.executor.cleanup_session(&session).await;
+                } else {
+                    self.executor.cleanup_request(&request_id).await;
+                }
                 self.scheduler
                     .finish_request(&request_id, self.kv_cache.inner_mut());
                 self.requests.remove(&request_id);
@@ -1186,11 +1206,13 @@ mod tests {
 
     impl ModelExecutor for MockExecutor {
         fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
-            Some(ExecutionProfile::fail_closed(
+            let mut profile = ExecutionProfile::fail_closed(
                 BackendKind::Cpu,
                 request.model_variant,
                 ExecutionMode::Sequence,
-            ))
+            );
+            profile.prefill = PrefillMode::Full;
+            Some(profile)
         }
 
         fn execute_prefill(
@@ -1768,6 +1790,64 @@ mod tests {
             core.scheduler.get_running_info(&scheduled.request_id),
             Some((0, 0)),
             "invalid progress must not reach scheduler accounting"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_prefill_plan_covers_the_model_owned_prompt_operation() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 4,
+                enable_chunked_prefill: true,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::tts("full prefill");
+        request.id = "full-prefill".to_string();
+        request.prompt_tokens = (0..16).collect();
+        core.add_request(request).unwrap();
+        let scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        assert!(scheduled.num_tokens < 16);
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        let plan = core.active_plans.get(&scheduled.plan_id).unwrap();
+        assert!(matches!(
+            plan.work,
+            WorkUnit::SequenceStep {
+                input: super::super::InputRange { start: 0, end: 16 },
+                max_output_steps: 1,
+                ..
+            }
+        ));
+
+        let result = ExecutorStepResult::new(
+            &scheduled,
+            ExecutorOutput {
+                request_id: scheduled.request_id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 16,
+                tokens_generated: 1,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+        );
+        let output = core.commit_executor_result(result, 1.0);
+        assert!(output.error.is_none());
+        assert_eq!(
+            core.scheduler.get_running_info(&scheduled.request_id),
+            Some((16, 1))
         );
     }
 

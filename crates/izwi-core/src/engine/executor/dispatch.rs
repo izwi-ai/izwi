@@ -9,10 +9,10 @@ use crate::model::ModelVariant;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::TaskType;
-use super::{ExecutorOutput, ExecutorStepResult, NativeExecutor};
+use super::{ExecutorOutput, ExecutorStepResult, ModelSessionResult, NativeExecutor};
 
 type RouteHandler =
-    fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ExecutorOutput>;
+    fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ModelSessionResult>;
 type VariantMatcher = fn(ModelVariant) -> bool;
 
 struct DispatchRoute {
@@ -95,26 +95,26 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled_req: &ScheduledRequest,
-    ) -> ExecutorOutput {
+    ) -> ModelSessionResult {
         let Some(request) = Self::find_request(requests, scheduled_req) else {
-            return ExecutorOutput::error(
+            return ModelSessionResult::atomic(ExecutorOutput::error(
                 scheduled_req.request_id.clone(),
                 "Scheduled request not found in batch",
-            );
+            ));
         };
 
         if request.is_cancelled() {
-            return ExecutorOutput::error(request.id.clone(), "request cancelled before dispatch");
+            return ModelSessionResult::cancelled(ExecutorOutput::cancelled(request.id.clone()));
         }
 
         let Some(route) = Self::resolve_route(request.task_type, request.model_variant) else {
-            return ExecutorOutput::error(
+            return ModelSessionResult::atomic(ExecutorOutput::error(
                 request.id.clone(),
                 format!(
                     "No executor route for task {:?} (variant {:?})",
                     request.task_type, request.model_variant
                 ),
-            );
+            ));
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -139,7 +139,10 @@ impl NativeExecutor {
 
         match result {
             Ok(output) => output,
-            Err(err) => ExecutorOutput::error(request.id.clone(), err.to_string()),
+            Err(err) => ModelSessionResult::atomic(ExecutorOutput::error(
+                request.id.clone(),
+                err.to_string(),
+            )),
         }
     }
 
@@ -155,14 +158,14 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ModelSessionResult>> {
         let worker_count = self.config.request_parallelism.min(scheduled.len()).max(1);
         let mut partitions: Vec<Vec<(usize, ScheduledRequest)>> = vec![Vec::new(); worker_count];
         for (idx, item) in scheduled.iter().enumerate() {
             partitions[idx % worker_count].push((idx, item.clone()));
         }
 
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, ExecutorOutput)>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, ModelSessionResult)>>();
         thread::scope(|scope| {
             for chunk in partitions {
                 if chunk.is_empty() {
@@ -181,7 +184,7 @@ impl NativeExecutor {
         });
         drop(tx);
 
-        let mut ordered: Vec<Option<ExecutorOutput>> = vec![None; scheduled.len()];
+        let mut ordered: Vec<Option<ModelSessionResult>> = vec![None; scheduled.len()];
         while let Ok(batch_outputs) = rx.recv() {
             for (idx, output) in batch_outputs {
                 if idx < ordered.len() {
@@ -195,10 +198,10 @@ impl NativeExecutor {
             .enumerate()
             .map(|(idx, output)| {
                 output.unwrap_or_else(|| {
-                    ExecutorOutput::error(
+                    ModelSessionResult::atomic(ExecutorOutput::error(
                         scheduled[idx].request_id.clone(),
                         "Parallel executor worker failed to produce output",
-                    )
+                    ))
                 })
             })
             .collect();
@@ -212,6 +215,9 @@ impl NativeExecutor {
     ) -> Result<Vec<ExecutorStepResult>> {
         let outputs = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled) {
             result?
+                .into_iter()
+                .map(ModelSessionResult::atomic)
+                .collect()
         } else if self.can_parallelize_requests(scheduled.len()) {
             self.execute_requests_parallel(requests, scheduled)?
         } else {
@@ -223,7 +229,7 @@ impl NativeExecutor {
         Ok(scheduled
             .iter()
             .zip(outputs)
-            .map(|(scheduled, output)| ExecutorStepResult::new(scheduled, output))
+            .map(|(scheduled, output)| ExecutorStepResult::from_session(scheduled, output))
             .collect())
     }
 }
@@ -256,11 +262,12 @@ mod tests {
             },
         };
 
-        let output = executor.execute_single_request(&[&request], &scheduled);
-        assert!(output.finished);
-        assert!(output
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("cancelled before dispatch")));
+        let result = executor.execute_single_request(&[&request], &scheduled);
+        assert!(result.output.finished);
+        assert!(result.output.error.is_none());
+        assert_eq!(
+            result.disposition,
+            crate::engine::ExecutionDisposition::Finished(crate::engine::FinishReason::Cancelled)
+        );
     }
 }

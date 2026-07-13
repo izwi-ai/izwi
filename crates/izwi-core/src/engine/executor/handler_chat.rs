@@ -8,7 +8,7 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::state::ActiveChatDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
+use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
@@ -91,13 +91,14 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-    ) -> Result<ExecutorOutput> {
+    ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let messages = Self::chat_messages(request)?;
         let max_new_tokens = request.params.max_tokens.max(1);
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         let generation_config = Self::chat_generation_config(request);
+        let session = scheduled.session_key();
 
         let model = self.with_registry(|registry| {
             registry
@@ -191,7 +192,7 @@ impl NativeExecutor {
                 Ok(output)
             })?;
 
-            return Ok(ExecutorOutput {
+            return Ok(ModelSessionResult::atomic(ExecutorOutput {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::empty(24_000)),
                 text: Some(output.text),
@@ -202,19 +203,16 @@ impl NativeExecutor {
                 phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
-            });
+            }));
         }
 
         let mut active_state = {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {
                 Error::InferenceError("Chat decode state mutex poisoned".to_string())
             })?;
-            if scheduled.is_prefill {
-                // Prefill scheduling can happen after preemption; reset stale state.
-                guard.remove(&request.id)
-            } else {
-                guard.remove(&request.id)
-            }
+            // Prefill scheduling can happen after preemption; only recover state
+            // owned by this exact request incarnation.
+            guard.remove(&session)
         };
 
         if active_state
@@ -228,6 +226,11 @@ impl NativeExecutor {
         let mut active_state = if let Some(state) = active_state {
             state
         } else {
+            if request.is_cancelled() {
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
             let decode_state = Self::run_blocking(|| {
                 model.start_decode_state_with_config(messages, max_new_tokens, &generation_config)
             })?;
@@ -251,7 +254,17 @@ impl NativeExecutor {
         let mut finished = false;
 
         for _ in 0..decode_iterations {
+            if request.is_cancelled() {
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
             let step = Self::run_blocking(|| model.decode_step(&mut active_state.state))?;
+            if request.is_cancelled() {
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
             decode_steps_ran = decode_steps_ran.saturating_add(1);
 
             let step_tokens_generated = step
@@ -288,7 +301,7 @@ impl NativeExecutor {
         }
 
         let tokens_processed = if scheduled.is_prefill {
-            scheduled.num_tokens.max(1)
+            request.num_prompt_tokens()
         } else {
             decode_steps_ran.max(1)
         };
@@ -300,10 +313,10 @@ impl NativeExecutor {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {
                 Error::InferenceError("Chat decode state mutex poisoned".to_string())
             })?;
-            guard.insert(request.id.clone(), active_state);
+            guard.insert(session, active_state);
         }
 
-        Ok(ExecutorOutput {
+        Ok(ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput::empty(24_000)),
             text: Some(final_text),
@@ -314,7 +327,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        })
+        }))
     }
 }
 

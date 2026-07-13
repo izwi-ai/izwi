@@ -25,9 +25,10 @@ mod streaming;
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    CacheMode, ConcurrencyClass, ExecutionCapabilities, ExecutionDisposition, ExecutionFailure,
-    ExecutionMode, ExecutionProfile, FailureKind, FailureScope, FinishReason, HealthImpact,
-    NativeBatchMode, PlanId, PrefillMode, RetryDisposition, SessionKey, YieldReason,
+    CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
+    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile, FailureKind,
+    FailureScope, FinishReason, HealthImpact, NativeBatchMode, PlanId, PrefillMode,
+    RetryDisposition, SessionKey, YieldReason,
 };
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
@@ -246,6 +247,92 @@ impl ExecutorOutput {
             error: Some(error.into()),
         }
     }
+
+    pub fn cancelled(request_id: String) -> Self {
+        Self {
+            request_id,
+            audio: None,
+            text: None,
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        }
+    }
+}
+
+/// Backend-neutral result produced by one model-owned session safe point.
+/// Native handlers must choose sequence, yield, or atomic semantics explicitly.
+#[derive(Debug, Clone)]
+pub struct ModelSessionResult {
+    pub output: ExecutorOutput,
+    pub disposition: ExecutionDisposition,
+    pub safe_point: bool,
+}
+
+impl ModelSessionResult {
+    fn executor_failure(message: String) -> ExecutionDisposition {
+        ExecutionDisposition::Failed(ExecutionFailure {
+            kind: FailureKind::Executor,
+            scope: FailureScope::Request,
+            retry: RetryDisposition::Never,
+            health: HealthImpact::None,
+            message,
+        })
+    }
+
+    pub fn sequence(output: ExecutorOutput) -> Self {
+        let disposition = if let Some(message) = output.error.as_ref() {
+            Self::executor_failure(message.clone())
+        } else if output.finished {
+            ExecutionDisposition::Finished(FinishReason::Completed)
+        } else {
+            ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
+        };
+        Self {
+            output,
+            disposition,
+            safe_point: true,
+        }
+    }
+
+    pub fn yielded(output: ExecutorOutput, reason: YieldReason) -> Self {
+        Self {
+            output,
+            disposition: ExecutionDisposition::Yielded(reason),
+            safe_point: true,
+        }
+    }
+
+    pub fn cancelled(mut output: ExecutorOutput) -> Self {
+        output.finished = true;
+        Self {
+            output,
+            disposition: ExecutionDisposition::Finished(FinishReason::Cancelled),
+            safe_point: true,
+        }
+    }
+
+    pub fn atomic(mut output: ExecutorOutput) -> Self {
+        let disposition = if let Some(message) = output.error.as_ref() {
+            Self::executor_failure(message.clone())
+        } else if output.finished {
+            ExecutionDisposition::Finished(FinishReason::Completed)
+        } else {
+            let message = "atomic model session returned before reaching a terminal state";
+            output.error = Some(message.to_string());
+            output.finished = true;
+            ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message))
+        };
+        Self {
+            output,
+            disposition,
+            safe_point: true,
+        }
+    }
 }
 
 /// Executor payload fenced to the exact scheduler transaction that produced it.
@@ -260,29 +347,23 @@ pub struct ExecutorStepResult {
 
 impl ExecutorStepResult {
     pub fn new(scheduled: &ScheduledRequest, output: ExecutorOutput) -> Self {
-        let disposition = if let Some(message) = output.error.as_ref() {
-            ExecutionDisposition::Failed(ExecutionFailure {
-                kind: FailureKind::Executor,
-                scope: FailureScope::Request,
-                retry: RetryDisposition::Never,
-                health: HealthImpact::None,
-                message: message.clone(),
-            })
-        } else if output.finished {
-            ExecutionDisposition::Finished(FinishReason::Completed)
-        } else if output.tokens_processed > 0 || output.tokens_generated > 0 {
-            ExecutionDisposition::Progress
+        let session_result = if output.finished || output.error.is_some() {
+            ModelSessionResult::atomic(output)
         } else {
-            // Compatibility for existing adapters. Phase 4 replaces this with
-            // model-session-owned yield reasons at every safe point.
-            ExecutionDisposition::Yielded(YieldReason::AwaitingInput)
+            // Compatibility for third-party/test executors. Native production
+            // handlers use `from_session` with an explicit session result.
+            ModelSessionResult::sequence(output)
         };
+        Self::from_session(scheduled, session_result)
+    }
+
+    pub fn from_session(scheduled: &ScheduledRequest, session_result: ModelSessionResult) -> Self {
         Self {
             plan_id: scheduled.plan_id,
             session: scheduled.session_key(),
-            disposition,
-            safe_point: true,
-            output,
+            disposition: session_result.disposition,
+            safe_point: session_result.safe_point,
+            output: session_result.output,
         }
     }
 }
@@ -356,15 +437,21 @@ pub trait ModelExecutor: Send + Sync {
 
     /// Cleanup transient per-request state held by the executor backend.
     fn cleanup_request(&self, _request_id: &str) {}
+
+    /// Cleanup state for one exact request incarnation. Legacy executors may
+    /// conservatively clear all state for the public request ID.
+    fn cleanup_session(&self, session: &SessionKey) {
+        self.cleanup_request(&session.request_id);
+    }
 }
 
 pub struct NativeExecutor {
     config: WorkerConfig,
     initialized: bool,
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
-    chat_decode_states: Mutex<HashMap<String, ActiveChatDecode>>,
-    asr_decode_states: Mutex<HashMap<String, ActiveAsrDecode>>,
-    qwen_tts_decode_states: Mutex<HashMap<String, ActiveQwenTtsDecode>>,
+    chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
+    asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
+    qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
 }
 
 impl NativeExecutor {
@@ -518,24 +605,19 @@ impl ModelExecutor for NativeExecutor {
             profile.incremental_decode = true;
             profile.cache_mode = CacheMode::OpaqueModelOwned;
         }
-
-        let native_batch = !request.streaming
-            && request.reference_audio.is_none()
-            && request.reference_text.is_none()
-            && implementation_incremental
-            && matches!(request.task_type, super::types::TaskType::TTS)
-            && request
-                .model_variant
-                .and_then(|variant| variant.speech_capabilities())
-                .is_some_and(|capabilities| capabilities.supports_builtin_voices);
-        if native_batch {
-            profile.prefill_batch = NativeBatchMode::Static;
-            profile.concurrency = ConcurrencyClass::Batchable;
-            profile.max_batch_size = match self.config.backend {
-                BackendKind::Cpu | BackendKind::Metal => 2,
-                BackendKind::Cuda => self.config.request_parallelism.max(1),
-            };
+        if matches!(request.task_type, super::types::TaskType::ASR) {
+            // Long audio can switch to a full chunk-plan operation after media
+            // decode, so cancellation is conservatively operation-boundary.
+            profile.cancellation = CancellationGranularity::OperationBoundary;
         }
+
+        // Full-generation TTS batching cannot share a sequence transaction yet:
+        // it may produce more frames than the scheduled decode quantum. Phase 8
+        // re-enables this only with atomic batch plans and tensor-batch reports.
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::None;
+        profile.concurrency = ConcurrencyClass::Exclusive;
+        profile.max_batch_size = 1;
         Some(profile)
     }
 
@@ -616,13 +698,25 @@ impl ModelExecutor for NativeExecutor {
 
     fn cleanup_request(&self, request_id: &str) {
         if let Ok(mut guard) = self.chat_decode_states.lock() {
-            guard.remove(request_id);
+            guard.retain(|session, _| session.request_id != request_id);
         }
         if let Ok(mut guard) = self.asr_decode_states.lock() {
-            guard.remove(request_id);
+            guard.retain(|session, _| session.request_id != request_id);
         }
         if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
-            guard.remove(request_id);
+            guard.retain(|session, _| session.request_id != request_id);
+        }
+    }
+
+    fn cleanup_session(&self, session: &SessionKey) {
+        if let Ok(mut guard) = self.chat_decode_states.lock() {
+            guard.remove(session);
+        }
+        if let Ok(mut guard) = self.asr_decode_states.lock() {
+            guard.remove(session);
+        }
+        if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
+            guard.remove(session);
         }
     }
 }
@@ -704,6 +798,11 @@ impl UnifiedExecutor {
     pub async fn cleanup_request(&self, request_id: &str) {
         let executor = self.inner.read().await;
         executor.cleanup_request(request_id);
+    }
+
+    pub async fn cleanup_session(&self, session: &SessionKey) {
+        let executor = self.inner.read().await;
+        executor.cleanup_session(session);
     }
 }
 
@@ -893,21 +992,76 @@ mod tests {
     }
 
     #[test]
-    fn native_batch_capability_is_truthful_and_backend_limited() {
-        let mut config = WorkerConfig::default();
-        config.backend = BackendKind::Metal;
-        let executor = NativeExecutor::new(config);
-        let mut request = EngineCoreRequest::tts("batch me");
-        request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+    fn native_batch_capability_stays_disabled_until_batch_plans_are_transactional() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let mut config = WorkerConfig::default();
+            config.backend = backend;
+            let executor = NativeExecutor::new(config);
+            let mut request = EngineCoreRequest::tts("batch me");
+            request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
 
-        let capability = executor.execution_capabilities(&request);
-        assert!(capability.native_batch);
-        assert_eq!(capability.max_batch_size, 2);
-        request.streaming = true;
-        assert!(!executor.execution_capabilities(&request).native_batch);
-        request.streaming = false;
-        request.reference_audio = Some("reference".to_string());
-        assert!(!executor.execution_capabilities(&request).native_batch);
+            let profile = executor.execution_profile(&request).unwrap();
+            assert_eq!(profile.backend, backend);
+            assert_eq!(profile.mode, ExecutionMode::Sequence);
+            assert_eq!(profile.prefill, PrefillMode::Full);
+            assert!(!profile.capabilities().native_batch);
+            assert_eq!(profile.max_batch_size, 1);
+            request.streaming = true;
+            assert!(!executor.execution_capabilities(&request).native_batch);
+            request.streaming = false;
+            request.reference_audio = Some("reference".to_string());
+            assert!(!executor.execution_capabilities(&request).native_batch);
+        }
+    }
+
+    #[test]
+    fn model_session_results_declare_safe_points_and_terminal_semantics() {
+        let sequence = ModelSessionResult::sequence(ExecutorOutput {
+            request_id: "sequence".to_string(),
+            audio: None,
+            text: None,
+            input_transcription: None,
+            tokens_processed: 1,
+            tokens_generated: 1,
+            finished: false,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        });
+        assert_eq!(
+            sequence.disposition,
+            ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
+        );
+        assert!(sequence.safe_point);
+
+        let atomic = ModelSessionResult::atomic(ExecutorOutput {
+            request_id: "atomic".to_string(),
+            audio: None,
+            text: None,
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: false,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        });
+        assert!(matches!(
+            atomic.disposition,
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::InvalidOutput,
+                ..
+            })
+        ));
+        assert!(atomic.output.finished);
+
+        let cancelled =
+            ModelSessionResult::cancelled(ExecutorOutput::cancelled("cancelled".to_string()));
+        assert_eq!(
+            cancelled.disposition,
+            ExecutionDisposition::Finished(FinishReason::Cancelled)
+        );
+        assert!(cancelled.output.error.is_none());
     }
 
     #[test]

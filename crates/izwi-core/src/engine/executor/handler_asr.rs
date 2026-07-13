@@ -10,7 +10,7 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
+use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
@@ -21,7 +21,7 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-    ) -> Result<ExecutorOutput> {
+    ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
         let language = request.language.as_deref();
@@ -29,6 +29,7 @@ impl NativeExecutor {
         let generation_options = Self::asr_generation_options(request);
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
+        let session = scheduled.session_key();
 
         if let Some(tx) = stream_tx.as_ref() {
             if !matches!(family, ModelFamily::Voxtral) {
@@ -43,7 +44,7 @@ impl NativeExecutor {
                         let mut guard = self.asr_decode_states.lock().map_err(|_| {
                             Error::InferenceError("ASR decode state mutex poisoned".to_string())
                         })?;
-                        guard.remove(&request.id)
+                        guard.remove(&session)
                     };
 
                     if active_state
@@ -58,6 +59,11 @@ impl NativeExecutor {
                     let mut active_state = if let Some(state) = active_state {
                         state
                     } else {
+                        if request.is_cancelled() {
+                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                                request.id.clone(),
+                            )));
+                        }
                         let audio_decode_started = Instant::now();
                         let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
                         let audio_decode_ms = audio_decode_started.elapsed().as_secs_f64() * 1000.0;
@@ -112,7 +118,7 @@ impl NativeExecutor {
                                 audio_decode_ms,
                             );
 
-                            return Ok(ExecutorOutput {
+                            return Ok(ModelSessionResult::atomic(ExecutorOutput {
                                 request_id: request.id.clone(),
                                 audio: Some(AudioOutput {
                                     samples: Vec::new(),
@@ -133,7 +139,7 @@ impl NativeExecutor {
                                 ),
                                 asr_diagnostics: diagnostics,
                                 error: None,
-                            });
+                            }));
                         }
 
                         // Keep ASR decode bounded. If EOS is missed, very high caps
@@ -170,8 +176,18 @@ impl NativeExecutor {
                     let mut finished = false;
 
                     for _ in 0..decode_iterations {
+                        if request.is_cancelled() {
+                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                                request.id.clone(),
+                            )));
+                        }
                         let step =
                             Self::run_blocking(|| model.decode_step(&mut active_state.state))?;
+                        if request.is_cancelled() {
+                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                                request.id.clone(),
+                            )));
+                        }
                         decode_steps_ran = decode_steps_ran.saturating_add(1);
                         let step_tokens_generated = step
                             .tokens_generated
@@ -203,7 +219,7 @@ impl NativeExecutor {
                     }
 
                     let tokens_processed = if scheduled.is_prefill {
-                        scheduled.num_tokens.max(1)
+                        request.num_prompt_tokens()
                     } else {
                         decode_steps_ran.max(1)
                     };
@@ -218,10 +234,10 @@ impl NativeExecutor {
                         let mut guard = self.asr_decode_states.lock().map_err(|_| {
                             Error::InferenceError("ASR decode state mutex poisoned".to_string())
                         })?;
-                        guard.insert(request.id.clone(), active_state);
+                        guard.insert(session, active_state);
                     }
 
-                    return Ok(ExecutorOutput {
+                    return Ok(ModelSessionResult::sequence(ExecutorOutput {
                         request_id: request.id.clone(),
                         audio: Some(AudioOutput {
                             samples: Vec::new(),
@@ -241,7 +257,7 @@ impl NativeExecutor {
                             .map(ExecutorPhaseTiming::with_media_decode_ms),
                         asr_diagnostics: None,
                         error: None,
-                    });
+                    }));
                 }
             }
         }
@@ -446,7 +462,7 @@ impl NativeExecutor {
         })?;
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);
 
-        Ok(ExecutorOutput {
+        Ok(ModelSessionResult::atomic(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput {
                 samples: Vec::new(),
@@ -461,7 +477,7 @@ impl NativeExecutor {
             phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
             asr_diagnostics,
             error: None,
-        })
+        }))
     }
 
     fn with_audio_decode_timing(

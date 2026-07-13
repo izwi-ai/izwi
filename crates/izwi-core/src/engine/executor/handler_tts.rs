@@ -9,7 +9,10 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::state::ActiveQwenTtsDecode;
-use super::{decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
+use super::{
+    decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult,
+    NativeExecutor,
+};
 
 impl NativeExecutor {
     pub(super) fn try_qwen_tts_batch(
@@ -163,20 +166,21 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-    ) -> Result<ExecutorOutput> {
+    ) -> Result<ModelSessionResult> {
         let execution_started = Instant::now();
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
         let variant = request.model_variant;
         let params = Self::to_tts_params(request);
         let language = request.language.as_deref();
+        let session = scheduled.session_key();
 
         self.with_qwen_model(variant, |model| {
             let mut active_state = {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
                     Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
                 })?;
-                guard.remove(&request.id)
+                guard.remove(&session)
             };
 
             if active_state
@@ -190,6 +194,11 @@ impl NativeExecutor {
             let mut active_state = if let Some(state) = active_state {
                 state
             } else {
+                if request.is_cancelled() {
+                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    )));
+                }
                 let normalization_started = Instant::now();
                 let text = request
                     .text
@@ -275,7 +284,17 @@ impl NativeExecutor {
             let mut finished = false;
 
             for _ in 0..decode_iterations {
+                if request.is_cancelled() {
+                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    )));
+                }
                 let step = Self::run_blocking(|| model.tts_decode_step(&mut active_state.state))?;
+                if request.is_cancelled() {
+                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    )));
+                }
                 active_state.sampling_ms += step.sampling_ms;
                 active_state.decode_ms += step.decode_ms;
                 active_state.codec_ms += step.codec_ms;
@@ -324,7 +343,7 @@ impl NativeExecutor {
             }
 
             let tokens_processed = if scheduled.is_prefill {
-                scheduled.num_tokens.max(1)
+                request.num_prompt_tokens()
             } else {
                 decode_steps_ran.max(1)
             };
@@ -357,10 +376,10 @@ impl NativeExecutor {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
                     Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
                 })?;
-                guard.insert(request.id.clone(), active_state);
+                guard.insert(session, active_state);
             }
 
-            Ok(ExecutorOutput {
+            Ok(ModelSessionResult::sequence(ExecutorOutput {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::new(finished_samples, 24_000)),
                 text: None,
@@ -371,7 +390,7 @@ impl NativeExecutor {
                 phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
-            })
+            }))
         })
     }
 }

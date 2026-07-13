@@ -48,7 +48,7 @@ pub use engine::{
     EngineCoreRequest, EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities,
     ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan, ExecutionProfile,
     ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind, FailureScope, FinishReason,
-    GenerationParams, HealthImpact, KVCacheManager,
+    GenerationParams, HealthImpact, KVCacheManager, ModelSessionResult,
     ModelExecutor, OutputProcessor, PinnedBlockHandle, Priority, RequestProcessor, RequestStatus,
     ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector,
     RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey,

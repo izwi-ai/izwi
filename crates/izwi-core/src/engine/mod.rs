@@ -49,7 +49,8 @@ pub use execution::{
     SequencePhase, SessionEpoch, SessionKey, TerminalOutcome, WorkUnit, YieldReason,
 };
 pub use executor::{
-    ExecutorOutput, ExecutorStepResult, ModelExecutor, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
+    ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, WorkerConfig,
+    REQUEST_DEADLINE_EXCEEDED,
 };
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,

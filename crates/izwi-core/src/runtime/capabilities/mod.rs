@@ -7,7 +7,10 @@
 
 use crate::backends::BackendKind;
 use crate::catalog::{ModelFamily, ModelVariant};
-use crate::engine::{CacheMode, ExecutionMode, ExecutionProfile, NativeBatchMode, PrefillMode};
+use crate::engine::{
+    CacheMode, CancellationGranularity, ExecutionMode, ExecutionProfile, NativeBatchMode,
+    PrefillMode,
+};
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{
     AdapterMetadata, CapabilityKind, ExecutionTargetKind, RuntimeAdapterRegistry, StreamingMode,
@@ -111,6 +114,9 @@ fn route_execution_profile(
         profile.prefill = PrefillMode::Full;
         profile.incremental_decode = true;
         profile.cache_mode = CacheMode::OpaqueModelOwned;
+    }
+    if metadata.capability == CapabilityKind::Asr {
+        profile.cancellation = CancellationGranularity::OperationBoundary;
     }
     // The existing Qwen TTS batch API is static and request-shape dependent;
     // the runtime route cannot prove those conditions, so it remains disabled

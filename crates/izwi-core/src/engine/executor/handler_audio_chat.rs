@@ -9,7 +9,7 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::decode_request_audio_with_rate;
-use super::{ExecutorOutput, NativeExecutor};
+use super::{ExecutorOutput, ModelSessionResult, NativeExecutor};
 
 impl NativeExecutor {
     fn audio_chat_generation_config(request: &EngineCoreRequest) -> Lfm25AudioGenerationConfig {
@@ -40,7 +40,7 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         _scheduled: &ScheduledRequest,
-    ) -> Result<ExecutorOutput> {
+    ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
@@ -149,7 +149,7 @@ impl NativeExecutor {
             }
         })?;
 
-        Ok(ExecutorOutput {
+        Ok(ModelSessionResult::atomic(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput::new(output.samples, output.sample_rate)),
             text: Some(output.text),
@@ -160,6 +160,6 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        })
+        }))
     }
 }
