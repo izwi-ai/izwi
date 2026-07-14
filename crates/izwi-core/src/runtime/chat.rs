@@ -1,12 +1,11 @@
 //! Chat runtime methods routed through the unified core engine.
 
-use crate::engine::EngineCoreRequest;
-use crate::engine::GenerationParams;
+use crate::engine::{GenerationParams, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
 use crate::runtime::request::ChatRuntimeRequest;
-use crate::runtime::service::RuntimeService;
+use crate::runtime::service::{AdmittedEngineRequest, RuntimeService};
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 
 impl RuntimeService {
@@ -34,65 +33,41 @@ impl RuntimeService {
         chat_config: ChatRequestConfig,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
-    ) -> Result<EngineCoreRequest> {
-        let _lease = self.load_model_for_inference(variant).await?;
-
-        let prompt_config = Self::prompt_token_config(&params, &chat_config);
-
-        let prompt_tokens = self
-            .model_registry
-            .get_chat(variant)
-            .await
-            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?
-            .prompt_token_ids_with_config(&messages, &prompt_config)?;
-
-        params.max_tokens = params.max_tokens.max(1);
-        Ok(ChatRuntimeRequest::from_messages(
+        streaming: bool,
+    ) -> Result<AdmittedEngineRequest> {
+        if messages.is_empty() {
+            return Err(Error::InvalidInput(
+                "Chat request missing messages".to_string(),
+            ));
+        }
+        let input_bytes = messages.iter().map(|message| message.content.len()).sum();
+        self.prepare_engine_request(
             variant,
-            messages,
-            params,
-            chat_config,
-            prompt_tokens,
-            correlation_id.map(ToOwned::to_owned),
+            TaskType::Chat,
+            streaming,
             runtime_context,
-        )?
-        .into_engine_request())
-    }
+            input_bytes,
+            move || async move {
+                let prompt_config = Self::prompt_token_config(&params, &chat_config);
+                let prompt_tokens = self
+                    .model_registry
+                    .get_chat(variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?
+                    .prompt_token_ids_with_config(&messages, &prompt_config)?;
 
-    async fn build_chat_request_with_params(
-        &self,
-        variant: ModelVariant,
-        messages: Vec<ChatMessage>,
-        params: GenerationParams,
-        correlation_id: Option<&str>,
-    ) -> Result<EngineCoreRequest> {
-        self.build_chat_request_with_params_and_config(
-            variant,
-            messages,
-            params,
-            ChatRequestConfig::default(),
-            correlation_id,
-            RuntimeRequestContext::default(),
-        )
-        .await
-    }
-
-    async fn build_chat_request(
-        &self,
-        variant: ModelVariant,
-        messages: Vec<ChatMessage>,
-        max_new_tokens: usize,
-        correlation_id: Option<&str>,
-    ) -> Result<EngineCoreRequest> {
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens.max(1);
-        self.build_chat_request_with_params_and_config(
-            variant,
-            messages,
-            params,
-            ChatRequestConfig::default(),
-            correlation_id,
-            RuntimeRequestContext::default(),
+                params.max_tokens = params.max_tokens.max(1);
+                Ok(ChatRuntimeRequest::from_messages(
+                    variant,
+                    messages,
+                    params,
+                    chat_config,
+                    prompt_tokens,
+                    correlation_id.map(ToOwned::to_owned),
+                    runtime_context,
+                )?
+                .into_engine_request())
+            },
         )
         .await
     }
@@ -134,7 +109,7 @@ impl RuntimeService {
     ) -> Result<ChatGeneration> {
         let mut params = GenerationParams::default();
         params.max_tokens = max_new_tokens.max(1);
-        let request = self
+        let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
                 messages,
@@ -142,9 +117,10 @@ impl RuntimeService {
                 ChatRequestConfig::default(),
                 correlation_id,
                 runtime_context,
+                false,
             )
             .await?;
-        let output = self.run_request(request).await?;
+        let output = self.run_admitted_request(admitted).await?;
         Ok(ChatGeneration {
             text: output.text.unwrap_or_default(),
             prompt_tokens: output.token_stats.prompt_tokens,
@@ -208,7 +184,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<ChatGeneration> {
-        let request = self
+        let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
                 messages,
@@ -216,9 +192,10 @@ impl RuntimeService {
                 chat_config,
                 correlation_id,
                 runtime_context,
+                false,
             )
             .await?;
-        let output = self.run_request(request).await?;
+        let output = self.run_admitted_request(admitted).await?;
         Ok(ChatGeneration {
             text: output.text.unwrap_or_default(),
             prompt_tokens: output.token_stats.prompt_tokens,
@@ -283,7 +260,7 @@ impl RuntimeService {
     {
         let mut params = GenerationParams::default();
         params.max_tokens = max_new_tokens.max(1);
-        let request = self
+        let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
                 messages,
@@ -291,11 +268,12 @@ impl RuntimeService {
                 ChatRequestConfig::default(),
                 correlation_id,
                 runtime_context,
+                true,
             )
             .await?;
         let mut streamed_text = String::new();
         let output = self
-            .run_streaming_request(request, |chunk| {
+            .run_admitted_streaming_request(admitted, |chunk| {
                 if let Some(delta) = chunk.text {
                     if !delta.is_empty() {
                         streamed_text.push_str(&delta);
@@ -390,7 +368,7 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        let request = self
+        let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
                 messages,
@@ -398,11 +376,12 @@ impl RuntimeService {
                 chat_config,
                 correlation_id,
                 runtime_context,
+                true,
             )
             .await?;
         let mut streamed_text = String::new();
         let output = self
-            .run_streaming_request(request, |chunk| {
+            .run_admitted_streaming_request(admitted, |chunk| {
                 if let Some(delta) = chunk.text {
                     if !delta.is_empty() {
                         streamed_text.push_str(&delta);

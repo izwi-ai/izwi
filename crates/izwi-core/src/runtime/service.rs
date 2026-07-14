@@ -104,10 +104,13 @@ fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVect
     resources
 }
 
-fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
-    let sequence = request
-        .model_variant
-        .is_some_and(|variant| match request.task_type {
+fn coordinator_lane_for_metadata(
+    task_type: TaskType,
+    model_variant: Option<ModelVariant>,
+    streaming: bool,
+    workload_class: WorkloadClass,
+) -> CoordinatorLane {
+    let sequence = model_variant.is_some_and(|variant| match task_type {
             TaskType::Chat => {
                 matches!(variant.family(), ModelFamily::Qwen35Chat)
                     || matches!(
@@ -118,17 +121,26 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
                             | ModelVariant::Qwen317B4Bit
                     )
             }
-            TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && request.streaming,
+            TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && streaming,
             TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
             TaskType::SpeechToSpeech => false,
         });
-    if request.workload_class == WorkloadClass::Realtime {
+    if workload_class == WorkloadClass::Realtime {
         CoordinatorLane::Realtime
     } else if sequence {
         CoordinatorLane::Resumable
     } else {
         CoordinatorLane::Atomic
     }
+}
+
+fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
+    coordinator_lane_for_metadata(
+        request.task_type,
+        request.model_variant,
+        request.streaming,
+        request.workload_class,
+    )
 }
 
 /// Main inference engine runtime.
@@ -156,6 +168,12 @@ pub struct RuntimeService {
     pub(crate) model_load_lock: Mutex<()>,
     pub(crate) model_resource_leases: Mutex<HashMap<ModelVariant, ResourceLease>>,
     pub(crate) device: DeviceProfile,
+}
+
+pub(crate) struct AdmittedEngineRequest {
+    request: EngineCoreRequest,
+    job: JobLease,
+    residency_lease: ModelResidencyLease,
 }
 
 struct PendingRequestGuard {
@@ -872,6 +890,61 @@ impl RuntimeService {
         }
     }
 
+    pub(crate) async fn prepare_engine_request<F, Fut>(
+        &self,
+        variant: ModelVariant,
+        task_type: TaskType,
+        streaming: bool,
+        runtime_context: RuntimeRequestContext,
+        input_bytes: usize,
+        build: F,
+    ) -> Result<AdmittedEngineRequest>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<EngineCoreRequest>>,
+    {
+        let mut effective_context = runtime_context;
+        if streaming && effective_context.workload_class == WorkloadClass::Online {
+            effective_context.workload_class = WorkloadClass::Streaming;
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let spec = self.coordinator_job_for_input(
+            request_id,
+            coordinator_lane_for_metadata(
+                task_type,
+                Some(variant),
+                streaming,
+                effective_context.workload_class,
+            ),
+            effective_context,
+            input_bytes,
+        );
+        let (job, (mut request, residency_lease)) = self
+            .coordinator
+            .admit_then_prepare(spec, move || async move {
+                let residency_lease = self.load_model_for_inference(variant).await?;
+                let request = build().await?;
+                Ok((request, residency_lease))
+            })
+            .await?;
+        if request.task_type != task_type || request.model_variant != Some(variant) {
+            return Err(Error::InvalidInput(
+                "prepared engine request does not match its admitted task/model".to_string(),
+            ));
+        }
+        request.id = job.spec.request_id.clone();
+        request.streaming = streaming;
+        request.workload_class = effective_context.workload_class;
+        request.priority = effective_context.priority;
+        request.admission_ms = effective_context.admission_ms;
+        request.deadline = effective_context.deadline;
+        Ok(AdmittedEngineRequest {
+            request,
+            job,
+            residency_lease,
+        })
+    }
+
     fn coordinator_job_for_request(&self, request: &EngineCoreRequest) -> JobSpec {
         let input_bytes = request
             .audio_bytes
@@ -911,6 +984,35 @@ impl RuntimeService {
             Some(variant) => Some(self.load_model_for_inference(variant).await?),
             None => None,
         };
+        self.run_request_after_admission(request, job, _residency_lease)
+            .await
+    }
+
+    pub(crate) async fn run_admitted_request(
+        &self,
+        admitted: AdmittedEngineRequest,
+    ) -> Result<EngineOutput> {
+        let AdmittedEngineRequest {
+            request,
+            job,
+            residency_lease,
+        } = admitted;
+        self.observe_broker_request(&request)?;
+        self.run_request_after_admission(request, job, Some(residency_lease))
+            .await
+    }
+
+    async fn run_request_after_admission(
+        &self,
+        request: EngineCoreRequest,
+        job: JobLease,
+        _residency_lease: Option<ModelResidencyLease>,
+    ) -> Result<EngineOutput> {
+        if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
+            return Err(Error::InvalidInput(
+                "engine request does not match its coordinator admission".to_string(),
+            ));
+        }
         let observation_request = request.clone();
         self.ensure_step_driver_started().await;
 
@@ -992,10 +1094,65 @@ impl RuntimeService {
             .await
     }
 
+    pub(crate) async fn run_admitted_streaming_request<F, Fut>(
+        &self,
+        admitted: AdmittedEngineRequest,
+        on_chunk: F,
+    ) -> Result<EngineOutput>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.run_admitted_streaming_request_with_broker_streaming(admitted, on_chunk, true)
+            .await
+    }
+
+    pub(crate) async fn run_admitted_transport_streaming_request<F, Fut>(
+        &self,
+        admitted: AdmittedEngineRequest,
+        on_chunk: F,
+    ) -> Result<EngineOutput>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.run_admitted_streaming_request_with_broker_streaming(admitted, on_chunk, false)
+            .await
+    }
+
+    async fn run_admitted_streaming_request_with_broker_streaming<F, Fut>(
+        &self,
+        admitted: AdmittedEngineRequest,
+        on_chunk: F,
+        broker_streaming_required: bool,
+    ) -> Result<EngineOutput>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let AdmittedEngineRequest {
+            request,
+            job,
+            residency_lease,
+        } = admitted;
+        if broker_streaming_required {
+            self.observe_broker_request(&request)?;
+        } else {
+            self.observe_broker_request_with_transport_streaming(&request)?;
+        }
+        self.run_streaming_request_after_admission(
+            request,
+            on_chunk,
+            job,
+            Some(residency_lease),
+        )
+        .await
+    }
+
     async fn run_streaming_request_with_broker_streaming<F, Fut>(
         &self,
         mut request: EngineCoreRequest,
-        mut on_chunk: F,
+        on_chunk: F,
         broker_streaming_required: bool,
     ) -> Result<EngineOutput>
     where
@@ -1019,6 +1176,26 @@ impl RuntimeService {
             Some(variant) => Some(self.load_model_for_inference(variant).await?),
             None => None,
         };
+        self.run_streaming_request_after_admission(request, on_chunk, job, _residency_lease)
+            .await
+    }
+
+    async fn run_streaming_request_after_admission<F, Fut>(
+        &self,
+        request: EngineCoreRequest,
+        mut on_chunk: F,
+        job: JobLease,
+        _residency_lease: Option<ModelResidencyLease>,
+    ) -> Result<EngineOutput>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
+            return Err(Error::InvalidInput(
+                "streaming engine request does not match its coordinator admission".to_string(),
+            ));
+        }
         let observation_request = request.clone();
         self.ensure_step_driver_started().await;
 

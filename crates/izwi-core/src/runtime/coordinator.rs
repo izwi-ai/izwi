@@ -297,6 +297,40 @@ impl InferenceCoordinator {
         self.run_stage(&job, future).await
     }
 
+    /// Admit a request before invoking its potentially expensive preparation
+    /// closure. The caller deadline covers model loading and preprocessing as
+    /// well as later execution, and a rejected request performs no preparation.
+    pub async fn admit_then_prepare<T, P, F>(
+        self: &Arc<Self>,
+        spec: JobSpec,
+        prepare: P,
+    ) -> Result<(JobLease, T)>
+    where
+        P: FnOnce() -> F,
+        F: Future<Output = Result<T>>,
+    {
+        let job = self.admit(spec).await?;
+        let request_id = job.spec.request_id.clone();
+        let prepared = match job.spec.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), prepare())
+                .await
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout(request_id.clone())
+                })??,
+            None => prepare().await?,
+        };
+        if job
+            .spec
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.expired_total.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Timeout(request_id));
+        }
+        Ok((job, prepared))
+    }
+
     pub async fn run_stage<T, F>(self: &Arc<Self>, job: &JobLease, future: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -753,6 +787,49 @@ Pages free: 10.\n";
         drop(second);
         assert_eq!(coordinator.snapshot().active_jobs, 0);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_admission_never_starts_expensive_preparation() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let active = coordinator.admit(job("active")).await.unwrap();
+        let preparation_calls = Arc::new(AtomicUsize::new(0));
+        let calls = preparation_calls.clone();
+
+        let result = coordinator
+            .admit_then_prepare(job("rejected"), move || async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::Overloaded(_))));
+        assert_eq!(preparation_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.snapshot().admitted_total, 1);
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn caller_deadline_covers_preparation_after_admission() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let preparation_calls = Arc::new(AtomicUsize::new(0));
+        let calls = preparation_calls.clone();
+        let mut spec = job("deadline-preparation");
+        spec.deadline = Some(Instant::now() + std::time::Duration::from_millis(5));
+
+        let result = coordinator
+            .admit_then_prepare(spec, move || async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
+        assert_eq!(preparation_calls.load(Ordering::Relaxed), 1);
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.active_jobs, 0);
+        assert_eq!(snapshot.expired_total, 1);
     }
 
     #[tokio::test]

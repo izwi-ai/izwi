@@ -49,6 +49,28 @@ struct TranscribedChunk {
     language: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum DiarizationAudioInput<'a> {
+    Base64(&'a str),
+    Bytes(&'a [u8]),
+}
+
+impl DiarizationAudioInput<'_> {
+    fn input_bytes(self) -> usize {
+        match self {
+            Self::Base64(audio) => audio.len(),
+            Self::Bytes(audio) => audio.len(),
+        }
+    }
+
+    fn decode_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Base64(audio) => base64_decode(audio),
+            Self::Bytes(audio) => Ok(audio.to_vec()),
+        }
+    }
+}
+
 impl RuntimeService {
     async fn diarize_samples_stage(
         &self,
@@ -66,26 +88,49 @@ impl RuntimeService {
         model.diarize(samples, sample_rate, config)
     }
 
-    async fn diarize_samples(
+    async fn diarize_input(
         &self,
-        samples: &[f32],
-        sample_rate: u32,
+        audio_input: DiarizationAudioInput<'_>,
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
+        if audio_input.input_bytes() == 0 {
+            return Err(Error::InvalidInput(
+                "diarization request missing audio input".to_string(),
+            ));
+        }
         let variant = resolve_diarization_model_variant(model_id);
         self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
         let context = RuntimeRequestContext::default();
-        let job = self.coordinator_job_for_input(
+        let spec = self.coordinator_job_for_input(
             uuid::Uuid::new_v4().to_string(),
             CoordinatorLane::Pipeline,
             context,
-            samples.len().saturating_mul(std::mem::size_of::<f32>()),
+            audio_input.input_bytes(),
         );
+        let (job, (runtime_request, audio)) = self
+            .coordinator
+            .admit_then_prepare(spec, move || async move {
+                let audio_bytes = audio_input.decode_bytes()?;
+                let runtime_request = DiarizationRuntimeRequest::from_bytes(
+                    variant,
+                    audio_bytes.clone(),
+                    config.clone(),
+                )?
+                .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
+                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
+                Ok((runtime_request, audio))
+            })
+            .await?;
         self.coordinator
-            .run_direct(
-                job,
-                self.diarize_samples_stage(samples, sample_rate, variant, config),
+            .run_stage(
+                &job,
+                self.diarize_samples_stage(
+                    &audio.samples,
+                    audio.sample_rate,
+                    variant,
+                    &runtime_request.config,
+                ),
             )
             .await
     }
@@ -97,8 +142,8 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let audio_bytes = base64_decode(audio_base64)?;
-        self.diarize_bytes(&audio_bytes, model_id, config).await
+        self.diarize_input(DiarizationAudioInput::Base64(audio_base64), model_id, config)
+            .await
     }
 
     pub async fn diarize_bytes(
@@ -107,20 +152,8 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let runtime_request = DiarizationRuntimeRequest::from_bytes(
-            resolve_diarization_model_variant(model_id),
-            audio_bytes.to_vec(),
-            config.clone(),
-        )?
-        .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
-        let audio = decode_pipeline_audio_bytes(audio_bytes)?;
-        self.diarize_samples(
-            &audio.samples,
-            audio.sample_rate,
-            runtime_request.diarization_model_id.as_deref(),
-            &runtime_request.config,
-        )
-        .await
+        self.diarize_input(DiarizationAudioInput::Bytes(audio_bytes), model_id, config)
+            .await
     }
 
     /// Run diarization and produce speaker-attributed transcript artifacts.
@@ -134,9 +167,8 @@ impl RuntimeService {
         config: &DiarizationConfig,
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
-        let audio_bytes = base64_decode(audio_base64)?;
-        self.diarize_with_transcript_bytes(
-            &audio_bytes,
+        self.diarize_with_transcript_input(
+            DiarizationAudioInput::Base64(audio_base64),
             diarization_model_id,
             asr_model_id,
             aligner_model_id,
@@ -157,30 +189,61 @@ impl RuntimeService {
         config: &DiarizationConfig,
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
-        let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
-        let runtime_request = DiarizationRuntimeRequest::from_bytes(
-            diarization_variant,
-            audio_bytes.to_vec(),
-            config.clone(),
-        )?
-        .with_pipeline_models(
-            diarization_model_id.map(ToOwned::to_owned),
-            asr_model_id.map(ToOwned::to_owned),
-            aligner_model_id.map(ToOwned::to_owned),
-            llm_model_id.map(ToOwned::to_owned),
+        self.diarize_with_transcript_input(
+            DiarizationAudioInput::Bytes(audio_bytes),
+            diarization_model_id,
+            asr_model_id,
+            aligner_model_id,
+            llm_model_id,
+            config,
+            enable_llm_refinement,
         )
-        .with_llm_refinement(enable_llm_refinement);
-        self.record_diarization_transcript_pipeline(runtime_request.enable_llm_refinement);
-        let pipeline_job = self
+        .await
+    }
+
+    async fn diarize_with_transcript_input(
+        &self,
+        audio_input: DiarizationAudioInput<'_>,
+        diarization_model_id: Option<&str>,
+        asr_model_id: Option<&str>,
+        aligner_model_id: Option<&str>,
+        llm_model_id: Option<&str>,
+        config: &DiarizationConfig,
+        enable_llm_refinement: bool,
+    ) -> Result<DiarizationTranscriptResult> {
+        if audio_input.input_bytes() == 0 {
+            return Err(Error::InvalidInput(
+                "diarization request missing audio input".to_string(),
+            ));
+        }
+        let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
+        self.record_diarization_transcript_pipeline(enable_llm_refinement);
+        let spec = self.coordinator_job_for_input(
+            uuid::Uuid::new_v4().to_string(),
+            CoordinatorLane::Pipeline,
+            RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
+            audio_input.input_bytes(),
+        );
+        let (pipeline_job, (runtime_request, audio_bytes, audio)) = self
             .coordinator
-            .admit(self.coordinator_job_for_input(
-                uuid::Uuid::new_v4().to_string(),
-                CoordinatorLane::Pipeline,
-                RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
-                audio_bytes.len(),
-            ))
+            .admit_then_prepare(spec, move || async move {
+                let audio_bytes = audio_input.decode_bytes()?;
+                let runtime_request = DiarizationRuntimeRequest::from_bytes(
+                    diarization_variant,
+                    audio_bytes.clone(),
+                    config.clone(),
+                )?
+                .with_pipeline_models(
+                    diarization_model_id.map(ToOwned::to_owned),
+                    asr_model_id.map(ToOwned::to_owned),
+                    aligner_model_id.map(ToOwned::to_owned),
+                    llm_model_id.map(ToOwned::to_owned),
+                )
+                .with_llm_refinement(enable_llm_refinement);
+                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
+                Ok((runtime_request, audio_bytes, audio))
+            })
             .await?;
-        let audio = decode_pipeline_audio_bytes(audio_bytes)?;
 
         let diarization = self
             .coordinator
@@ -279,7 +342,7 @@ impl RuntimeService {
         } else if use_single_pass_asr && aligner_model.is_some() {
             match self
                 .force_align_bytes_with_model_and_language(
-                    audio_bytes,
+                    &audio_bytes,
                     &asr_text,
                     detected_language.as_deref(),
                     runtime_request.aligner_model_id.as_deref(),

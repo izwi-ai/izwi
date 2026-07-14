@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
-use crate::engine::{AsrProgress, AsrProgressPhase, EngineCoreRequest};
+use crate::engine::{AsrProgress, AsrProgressPhase, TaskType};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
@@ -19,7 +19,7 @@ use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_seconds_fast};
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease};
 use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
-use crate::runtime::service::RuntimeService;
+use crate::runtime::service::{AdmittedEngineRequest, RuntimeService};
 use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
@@ -310,34 +310,55 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
-    ) -> Result<EngineCoreRequest> {
-        self.load_model(variant).await?;
-
-        let runtime_request = match audio_input {
-            AsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
-                audio_base64,
-                variant,
-                language.map(ToOwned::to_owned),
-                correlation_id.map(ToOwned::to_owned),
-                runtime_context,
-            )?,
-            AsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
-                audio_bytes.to_vec(),
-                variant,
-                language.map(ToOwned::to_owned),
-                correlation_id.map(ToOwned::to_owned),
-                runtime_context,
-            )?,
-        }
-        .with_prompt(prompt.map(ToOwned::to_owned));
-        let mut request = runtime_request.into_engine_request();
-        if let Some(max_tokens) = max_tokens {
-            request.params.max_tokens = max_tokens;
-        } else if let Some(auto_max_tokens) = granite_auto_asr_max_tokens(variant, audio_input)? {
-            request.params.max_tokens = auto_max_tokens;
-            request.asr_auto_max_tokens = true;
-        }
-        Ok(request)
+        streaming: bool,
+    ) -> Result<AdmittedEngineRequest> {
+        let input_bytes = match audio_input {
+            AsrAudioInput::Base64(audio) if audio.is_empty() => {
+                return Err(Error::InvalidInput("ASR request missing audio input".to_string()));
+            }
+            AsrAudioInput::Bytes(audio) if audio.is_empty() => {
+                return Err(Error::InvalidInput("ASR request missing audio bytes".to_string()));
+            }
+            AsrAudioInput::Base64(audio) => audio.len(),
+            AsrAudioInput::Bytes(audio) => audio.len(),
+        };
+        self.prepare_engine_request(
+            variant,
+            TaskType::ASR,
+            streaming,
+            runtime_context,
+            input_bytes,
+            move || async move {
+                let runtime_request = match audio_input {
+                    AsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
+                        audio_base64,
+                        variant,
+                        language.map(ToOwned::to_owned),
+                        correlation_id.map(ToOwned::to_owned),
+                        runtime_context,
+                    )?,
+                    AsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
+                        audio_bytes.to_vec(),
+                        variant,
+                        language.map(ToOwned::to_owned),
+                        correlation_id.map(ToOwned::to_owned),
+                        runtime_context,
+                    )?,
+                }
+                .with_prompt(prompt.map(ToOwned::to_owned));
+                let mut request = runtime_request.into_engine_request();
+                if let Some(max_tokens) = max_tokens {
+                    request.params.max_tokens = max_tokens;
+                } else if let Some(auto_max_tokens) =
+                    granite_auto_asr_max_tokens(variant, audio_input)?
+                {
+                    request.params.max_tokens = auto_max_tokens;
+                    request.asr_auto_max_tokens = true;
+                }
+                Ok(request)
+            },
+        )
+        .await
     }
 
     pub(crate) async fn asr_transcribe_with_variant(
@@ -410,7 +431,7 @@ impl RuntimeService {
                 .await;
         }
 
-        let request = self
+        let admitted = self
             .build_asr_request(
                 variant,
                 AsrAudioInput::Base64(audio_base64),
@@ -419,9 +440,10 @@ impl RuntimeService {
                 max_tokens,
                 correlation_id,
                 RuntimeRequestContext::default(),
+                false,
             )
             .await?;
-        let output = self.run_request(request).await?;
+        let output = self.run_admitted_request(admitted).await?;
         let text = output.text.unwrap_or_default();
 
         Ok(AsrTranscription {
@@ -516,7 +538,7 @@ impl RuntimeService {
                 .await;
         }
 
-        let request = self
+        let admitted = self
             .build_asr_request(
                 variant,
                 AsrAudioInput::Base64(audio_base64),
@@ -525,11 +547,12 @@ impl RuntimeService {
                 max_tokens,
                 correlation_id,
                 RuntimeRequestContext::default(),
+                true,
             )
             .await?;
         let mut streamed_text = String::new();
         let output = self
-            .run_streaming_request(request, |chunk| {
+            .run_admitted_streaming_request(admitted, |chunk| {
                 if let Some(delta) = chunk.text {
                     if !delta.is_empty() {
                         streamed_text.push_str(&delta);
@@ -641,7 +664,7 @@ impl RuntimeService {
                 .await;
         }
 
-        let request = self
+        let admitted = self
             .build_asr_request(
                 variant,
                 AsrAudioInput::Bytes(audio_bytes),
@@ -650,9 +673,10 @@ impl RuntimeService {
                 max_tokens,
                 correlation_id,
                 runtime_context,
+                false,
             )
             .await?;
-        let output = self.run_request(request).await?;
+        let output = self.run_admitted_request(admitted).await?;
         let text = output.text.unwrap_or_default();
 
         Ok(AsrTranscription {
@@ -810,7 +834,7 @@ impl RuntimeService {
                 .await;
         }
 
-        let request = self
+        let admitted = self
             .build_asr_request(
                 variant,
                 AsrAudioInput::Bytes(audio_bytes),
@@ -819,6 +843,7 @@ impl RuntimeService {
                 max_tokens,
                 correlation_id,
                 runtime_context,
+                true,
             )
             .await?;
         let mut streamed_text = String::new();
@@ -835,9 +860,10 @@ impl RuntimeService {
             std::future::ready(Ok(()))
         };
         let output = if broker_streaming_required {
-            self.run_streaming_request(request, handle_chunk).await?
+            self.run_admitted_streaming_request(admitted, handle_chunk)
+                .await?
         } else {
-            self.run_transport_streaming_request(request, handle_chunk)
+            self.run_admitted_transport_streaming_request(admitted, handle_chunk)
                 .await?
         };
         let text = output.text.unwrap_or(streamed_text);

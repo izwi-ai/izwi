@@ -1,12 +1,12 @@
 //! Speech-to-speech runtime methods routed through the unified core engine.
 
 use crate::catalog::parse_model_variant;
-use crate::engine::{EngineCoreRequest, GenerationParams, StreamingOutput};
+use crate::engine::{GenerationParams, StreamingOutput, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::ChatMessage;
 use crate::runtime::request::AudioChatRuntimeRequest;
-use crate::runtime::service::RuntimeService;
+use crate::runtime::service::{AdmittedEngineRequest, RuntimeService};
 use crate::runtime::types::{RuntimeRequestContext, SpeechToSpeechGeneration};
 
 enum SpeechAudioInput<'a> {
@@ -41,33 +41,61 @@ impl RuntimeService {
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
-    ) -> Result<EngineCoreRequest> {
-        self.load_model(variant).await?;
-
-        params.max_tokens = params.max_tokens.max(1);
-        let runtime_request = match audio_input {
-            SpeechAudioInput::Base64(audio_base64) => {
-                AudioChatRuntimeRequest::speech_to_speech_base64(
-                    variant,
-                    audio_base64,
-                    messages,
-                    params,
-                    system_prompt.map(ToOwned::to_owned),
-                    correlation_id.map(ToOwned::to_owned),
-                    runtime_context,
-                )?
+        streaming: bool,
+    ) -> Result<AdmittedEngineRequest> {
+        let audio_bytes = match audio_input {
+            SpeechAudioInput::Base64(audio) if audio.is_empty() => {
+                return Err(Error::InvalidInput(
+                    "speech-to-speech request missing audio input".to_string(),
+                ));
             }
-            SpeechAudioInput::Bytes(audio_bytes) => AudioChatRuntimeRequest::speech_to_speech_bytes(
-                variant,
-                audio_bytes.to_vec(),
-                messages,
-                params,
-                system_prompt.map(ToOwned::to_owned),
-                correlation_id.map(ToOwned::to_owned),
-                runtime_context,
-            )?,
+            SpeechAudioInput::Bytes(audio) if audio.is_empty() => {
+                return Err(Error::InvalidInput(
+                    "speech-to-speech request missing audio bytes".to_string(),
+                ));
+            }
+            SpeechAudioInput::Base64(audio) => audio.len(),
+            SpeechAudioInput::Bytes(audio) => audio.len(),
         };
-        Ok(runtime_request.into_engine_request())
+        let input_bytes = audio_bytes
+            .saturating_add(messages.iter().map(|message| message.content.len()).sum())
+            .saturating_add(system_prompt.map(str::len).unwrap_or_default());
+        self.prepare_engine_request(
+            variant,
+            TaskType::SpeechToSpeech,
+            streaming,
+            runtime_context,
+            input_bytes,
+            move || async move {
+                params.max_tokens = params.max_tokens.max(1);
+                let runtime_request = match audio_input {
+                    SpeechAudioInput::Base64(audio_base64) => {
+                        AudioChatRuntimeRequest::speech_to_speech_base64(
+                            variant,
+                            audio_base64,
+                            messages,
+                            params,
+                            system_prompt.map(ToOwned::to_owned),
+                            correlation_id.map(ToOwned::to_owned),
+                            runtime_context,
+                        )?
+                    }
+                    SpeechAudioInput::Bytes(audio_bytes) => {
+                        AudioChatRuntimeRequest::speech_to_speech_bytes(
+                            variant,
+                            audio_bytes.to_vec(),
+                            messages,
+                            params,
+                            system_prompt.map(ToOwned::to_owned),
+                            correlation_id.map(ToOwned::to_owned),
+                            runtime_context,
+                        )?
+                    }
+                };
+                Ok(runtime_request.into_engine_request())
+            },
+        )
+        .await
     }
 
     pub async fn speech_to_speech_generate_bytes_with_variant(
@@ -79,7 +107,7 @@ impl RuntimeService {
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<SpeechToSpeechGeneration> {
-        let request = self
+        let admitted = self
             .build_speech_to_speech_request(
                 variant,
                 SpeechAudioInput::Bytes(audio_bytes),
@@ -88,9 +116,10 @@ impl RuntimeService {
                 system_prompt,
                 correlation_id,
                 RuntimeRequestContext::default(),
+                false,
             )
             .await?;
-        let output = self.run_request(request).await?;
+        let output = self.run_admitted_request(admitted).await?;
         Ok(SpeechToSpeechGeneration {
             text: output.text.unwrap_or_default(),
             samples: output.audio.samples,
@@ -109,7 +138,7 @@ impl RuntimeService {
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
     ) -> Result<SpeechToSpeechGeneration> {
-        let request = self
+        let admitted = self
             .build_speech_to_speech_request(
                 variant,
                 SpeechAudioInput::Base64(audio_base64),
@@ -118,9 +147,10 @@ impl RuntimeService {
                 system_prompt,
                 correlation_id,
                 RuntimeRequestContext::default(),
+                false,
             )
             .await?;
-        let output = self.run_request(request).await?;
+        let output = self.run_admitted_request(admitted).await?;
         Ok(SpeechToSpeechGeneration {
             text: output.text.unwrap_or_default(),
             samples: output.audio.samples,
@@ -171,7 +201,7 @@ impl RuntimeService {
     where
         F: FnMut(StreamingOutput) + Send + 'static,
     {
-        let request = self
+        let admitted = self
             .build_speech_to_speech_request(
                 variant,
                 SpeechAudioInput::Bytes(audio_bytes),
@@ -180,13 +210,14 @@ impl RuntimeService {
                 system_prompt,
                 correlation_id,
                 runtime_context,
+                true,
             )
             .await?;
         let mut streamed_text = String::new();
         let mut streamed_samples = Vec::new();
         let mut streamed_sample_rate = 24_000u32;
         let output = self
-            .run_streaming_request(request, |chunk| {
+            .run_admitted_streaming_request(admitted, |chunk| {
                 if let Some(delta) = chunk.text.as_ref() {
                     streamed_text.push_str(delta);
                 }
