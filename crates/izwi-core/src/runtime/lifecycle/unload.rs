@@ -335,7 +335,7 @@ mod tests {
             .expect("loading slot");
         runtime
             .model_lifecycle
-            .reconcile_slot_materialized(variant, resources)
+            .finalize_slot_materialization(variant, resources)
             .expect("materialized slot");
         runtime
             .model_lifecycle
@@ -465,7 +465,7 @@ mod tests {
             .expect("loading slot");
         runtime
             .model_lifecycle
-            .reconcile_slot_materialized(variant, resources)
+            .finalize_slot_materialization(variant, resources)
             .expect("materialized slot");
         runtime.model_manager.mark_loaded(variant).await;
         runtime

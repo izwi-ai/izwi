@@ -130,6 +130,8 @@ pub(crate) struct ModelLifecycleController {
     pub(super) mutation_gate: Mutex<()>,
     state: StdMutex<LifecycleState>,
     #[cfg(test)]
+    load_test_panics: AtomicUsize,
+    #[cfg(test)]
     unload_test_barriers: StdMutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     #[cfg(test)]
     unload_test_panics: AtomicUsize,
@@ -161,6 +163,8 @@ impl ModelLifecycleController {
             model_last_used: Mutex::new(HashMap::new()),
             mutation_gate: Mutex::new(()),
             state: StdMutex::new(LifecycleState::default()),
+            #[cfg(test)]
+            load_test_panics: AtomicUsize::new(0),
             #[cfg(test)]
             unload_test_barriers: StdMutex::new(None),
             #[cfg(test)]
@@ -234,10 +238,10 @@ impl ModelLifecycleController {
         Ok(())
     }
 
-    pub(super) fn reconcile_slot_materialized(
+    pub(super) fn finalize_slot_materialization(
         &self,
         variant: ModelVariant,
-        resources: ResourceVector,
+        resident_resources: ResourceVector,
     ) -> Result<()> {
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
@@ -245,7 +249,15 @@ impl ModelLifecycleController {
                 "model {variant} lost its resource lease during physical instantiation"
             ))
         })?;
-        slot.resource_lease.reconcile_materialized(resources)
+        // Allocation was authorized by the immutable peak reservation before
+        // instantiation. Record the retained physical residency first, then
+        // shed only authorization that was transient to model construction.
+        slot.resource_lease
+            .reconcile_materialized(resident_resources)?;
+        if slot.resource_lease.resources() != resident_resources {
+            slot.resource_lease.resize(resident_resources)?;
+        }
+        Ok(())
     }
 
     pub(super) fn begin_unloading_slot(&self, variant: ModelVariant) -> Result<bool> {
@@ -336,7 +348,10 @@ impl ModelLifecycleController {
         )
     }
 
-    pub(super) fn finish_load(
+    /// Publish a terminal load outcome while the caller still owns the
+    /// lifecycle mutation gate. This prevents unload from separating the Ready
+    /// slot commit from the outcome observed by coalesced waiters.
+    pub(super) fn finish_load_locked(
         &self,
         variant: ModelVariant,
         generation: u64,
@@ -351,6 +366,24 @@ impl ModelLifecycleController {
             .is_some_and(|load| load.generation == generation)
         {
             state.loads.remove(&variant);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_load_test_panics(&self, count: usize) {
+        self.load_test_panics.store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn maybe_panic_during_load(&self) {
+        if self
+            .load_test_panics
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            panic!("injected model load panic");
         }
     }
 

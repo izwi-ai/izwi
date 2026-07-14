@@ -52,6 +52,42 @@ fn residency_budget_has_capacity(
     resident_variants.contains(&requested_variant) || resident_variants.len() < max_loaded_models
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelResourcePlan {
+    /// Maximum simultaneous memory authorized before physical instantiation.
+    load_authorization: ResourceVector,
+    /// Long-lived memory retained after publication completes.
+    resident_authorization: ResourceVector,
+}
+
+fn model_resource_plan(backend: BackendKind, bytes: u64) -> ModelResourcePlan {
+    let mut resident_authorization = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resident_authorization.host_bytes = ResourceAmount::Known(bytes);
+        }
+        BackendKind::Metal => {
+            resident_authorization.unified_bytes = ResourceAmount::Known(bytes);
+        }
+        BackendKind::Cuda => {
+            resident_authorization.device_bytes = ResourceAmount::Known(bytes);
+        }
+    }
+
+    let mut load_authorization = resident_authorization;
+    if backend == BackendKind::Cuda {
+        // CUDA loaders materialize host-side artifact/tensor state before or
+        // while copying the resident weights to the device. Authorize both
+        // peaks up front; the host component is shed after publication.
+        load_authorization.host_bytes = ResourceAmount::Known(bytes);
+    }
+
+    ModelResourcePlan {
+        load_authorization,
+        resident_authorization,
+    }
+}
+
 impl ModelLifecycleController {
     pub(super) async fn touch_model_usage(&self, variant: ModelVariant) {
         let mut last_used = self.model_last_used.lock().await;
@@ -128,25 +164,20 @@ impl ModelLifecycleController {
         }
     }
 
-    fn model_resource_estimate(&self, variant: ModelVariant) -> ResourceVector {
+    fn model_resource_plan(&self, variant: ModelVariant) -> ModelResourcePlan {
         let bytes = (variant.memory_required_gb() as f64 * 1024_f64.powi(3)).ceil() as u64;
-        let mut resources = ResourceVector::zero();
-        match self.backend_router.context().backend_kind {
-            BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
-            BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
-            BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
-        }
-        resources
+        model_resource_plan(self.backend_router.context().backend_kind, bytes)
     }
 
     async fn reserve_model_resources(
         &self,
         requested_variant: ModelVariant,
+        load_authorization: ResourceVector,
     ) -> Result<ResourceLease> {
         loop {
             match self.coordinator.resource_authority().reserve(
                 ReservationOwner::new(ReservationClass::Model, requested_variant.to_string()),
-                self.model_resource_estimate(requested_variant),
+                load_authorization,
             ) {
                 Ok(lease) => return Ok(lease),
                 Err(resource_error @ Error::Overloaded(_)) => {
@@ -187,37 +218,42 @@ impl ModelLifecycleController {
         }
     }
 
-    async fn run_load_transaction(
+    async fn run_load_transaction_locked(
         &self,
         variant: ModelVariant,
         max_loaded_models: Option<usize>,
     ) -> Result<()> {
-        let _mutation_guard = self.mutation_gate.lock().await;
         if self.resident_phase(variant)
             == Some(crate::runtime::lifecycle::controller::ResidentPhase::Ready)
         {
             return Ok(());
         }
+        #[cfg(test)]
+        self.maybe_panic_during_load();
 
-        let _coordinator_load = self
-            .coordinator
-            .begin_model_load(format!("model-load:{variant}"))?;
         let resolved = self.resolve_model_load(variant).await?;
         let acquired = self.acquire_model_artifacts(resolved).await?;
 
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
-        let resources = self.model_resource_estimate(variant);
-        let resource_lease = self.reserve_model_resources(variant).await?;
+        let resource_plan = self.model_resource_plan(variant);
+        let resource_lease = self
+            .reserve_model_resources(variant, resource_plan.load_authorization)
+            .await?;
         self.install_loading_slot(variant, resource_lease)?;
 
         let publication = async {
+            // This is the first operation allowed to allocate model tensors;
+            // the peak host/device authorization and authoritative Loading slot
+            // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
             self.publish_loaded_model(instantiated).await?;
             // The physical allocation is now visible to the live provider.
             // Reconcile before Ready publication so it is no longer counted as
-            // both pending ledger work and observed backend memory.
-            self.reconcile_slot_materialized(variant, resources)?;
+            // both pending ledger work and observed backend memory. CUDA drops
+            // its transient host-side authorization at this commit point while
+            // retaining the immutable device residency authorization.
+            self.finalize_slot_materialization(variant, resource_plan.resident_authorization)?;
             // Install the legacy manager projection before the authoritative
             // commit. Inference pins consult the slot, so no caller can observe
             // Ready while this await is still in progress.
@@ -251,8 +287,28 @@ impl ModelLifecycleController {
     ) {
         let controller = self.clone();
         tokio::spawn(async move {
+            // Publication of both the Ready slot and the shared terminal
+            // outcome is one mutation-gated transaction. Explicit unload can
+            // neither erase a successful load before waiters are notified nor
+            // observe a half-published failure rollback.
+            let _mutation_guard = controller.mutation_gate.lock().await;
+            let _coordinator_load = match controller
+                .coordinator
+                .begin_model_load(format!("model-load:{variant}"))
+            {
+                Ok(load) => load,
+                Err(error) => {
+                    controller.finish_load_locked(
+                        variant,
+                        leader.generation,
+                        &leader.completion,
+                        SharedLoadOutcome::Failed(SharedLoadFailure::from_error(error)),
+                    );
+                    return;
+                }
+            };
             let outcome = match AssertUnwindSafe(
-                controller.run_load_transaction(variant, max_loaded_models),
+                controller.run_load_transaction_locked(variant, max_loaded_models),
             )
             .catch_unwind()
             .await
@@ -267,7 +323,6 @@ impl ModelLifecycleController {
                     } else {
                         "unknown model load panic".to_string()
                     };
-                    let _mutation_guard = controller.mutation_gate.lock().await;
                     if let Err(error) = controller.rollback_model_after_panic_locked(variant).await
                     {
                         tracing::error!(model = %variant, %error, "Panicked model load rollback failed");
@@ -277,7 +332,7 @@ impl ModelLifecycleController {
                     )))
                 }
             };
-            controller.finish_load(variant, leader.generation, &leader.completion, outcome);
+            controller.finish_load_locked(variant, leader.generation, &leader.completion, outcome);
         });
     }
 }
@@ -321,8 +376,10 @@ impl RuntimeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{residency_budget_has_capacity, select_lru_eviction_candidate};
-    use crate::backends::BackendPreference;
+    use super::{
+        model_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
+    };
+    use crate::backends::{BackendKind, BackendPreference};
     use crate::config::EngineConfig;
     use crate::engine::{
         CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
@@ -330,13 +387,15 @@ mod tests {
     };
     use crate::error::Error;
     use crate::model::ModelVariant;
-    use crate::runtime::lifecycle::controller::{ResidentPhase, SharedLoadOutcome};
+    use crate::runtime::lifecycle::controller::{
+        ResidentPhase, SharedLoadFailure, SharedLoadOutcome,
+    };
     use crate::runtime::service::RuntimeService;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, Barrier};
     use uuid::Uuid;
 
     fn one_byte_host_reservation() -> ResourceVector {
@@ -361,6 +420,36 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct VectorCapacityProvider {
+        snapshot: PhysicalCapacitySnapshot,
+    }
+
+    impl PhysicalCapacityProvider for VectorCapacityProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            self.snapshot
+        }
+    }
+
+    fn all_memory_capacity(bytes: u64) -> ResourceVector {
+        ResourceVector {
+            host_bytes: ResourceAmount::Known(bytes),
+            device_bytes: ResourceAmount::Known(bytes),
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        }
+    }
+
+    fn vector_authority(capacity: ResourceVector) -> Arc<ResourceAuthority> {
+        Arc::new(ResourceAuthority::new(Arc::new(VectorCapacityProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity,
+                available: capacity,
+                source: CapacitySource::Test,
+            },
+        })))
     }
 
     fn isolated_resource_lease(key: &str) -> (Arc<ResourceAuthority>, ResourceLease) {
@@ -418,6 +507,257 @@ mod tests {
             ModelVariant::Qwen38BGguf,
             2,
         ));
+    }
+
+    #[test]
+    fn model_load_resource_plan_authorizes_backend_specific_peaks() {
+        let bytes = 64;
+
+        let cpu = model_resource_plan(BackendKind::Cpu, bytes);
+        assert_eq!(
+            cpu.load_authorization,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            }
+        );
+        assert_eq!(cpu.resident_authorization, cpu.load_authorization);
+
+        let metal = model_resource_plan(BackendKind::Metal, bytes);
+        assert_eq!(
+            metal.load_authorization,
+            ResourceVector {
+                unified_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            }
+        );
+        assert_eq!(metal.resident_authorization, metal.load_authorization);
+
+        let cuda = model_resource_plan(BackendKind::Cuda, bytes);
+        assert_eq!(
+            cuda.load_authorization,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(bytes),
+                device_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            }
+        );
+        assert_eq!(
+            cuda.resident_authorization,
+            ResourceVector {
+                device_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            }
+        );
+    }
+
+    #[test]
+    fn cuda_load_is_rejected_when_only_device_peak_has_capacity() {
+        let plan = model_resource_plan(BackendKind::Cuda, 64);
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(63),
+            device_bytes: ResourceAmount::Known(64),
+            ..ResourceVector::zero()
+        };
+        let authority = vector_authority(capacity);
+
+        assert!(matches!(
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Model, "cuda-host-peak"),
+                plan.load_authorization,
+            ),
+            Err(Error::Overloaded(_))
+        ));
+        assert_eq!(authority.snapshot().reservations, 0);
+        assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+    }
+
+    #[tokio::test]
+    async fn published_models_retain_only_backend_residency_authorization() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "izwi-runtime-resource-finalize-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let plan = model_resource_plan(backend, 64);
+            let authority = vector_authority(all_memory_capacity(1024));
+            let resource_lease = authority
+                .reserve(
+                    ReservationOwner::new(
+                        ReservationClass::Model,
+                        format!("{backend:?}-publication"),
+                    ),
+                    plan.load_authorization,
+                )
+                .expect("peak load authorization");
+            runtime
+                .model_lifecycle
+                .install_loading_slot(variant, resource_lease)
+                .expect("loading slot");
+
+            runtime
+                .model_lifecycle
+                .finalize_slot_materialization(variant, plan.resident_authorization)
+                .expect("publication resource finalization");
+            assert_eq!(
+                authority.snapshot().reserved,
+                plan.resident_authorization,
+                "{backend:?} retained the wrong resident authorization"
+            );
+
+            assert!(runtime.model_lifecycle.remove_resident_slot(variant));
+            assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+        }
+
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_outcome_is_published_before_explicit_unload_enters_the_gate() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "izwi-runtime-load-publication-race-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let resources = one_byte_host_reservation();
+        let (authority, resource_lease) = isolated_resource_lease("publication-race");
+        runtime
+            .model_lifecycle
+            .install_loading_slot(variant, resource_lease)
+            .expect("loading slot");
+        runtime
+            .model_lifecycle
+            .finalize_slot_materialization(variant, resources)
+            .expect("materialized slot");
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let leader = leader.expect("load leader");
+
+        let publication_reached = Arc::new(Barrier::new(2));
+        let publication_release = Arc::new(Barrier::new(2));
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let controller = runtime.model_lifecycle.clone();
+        let reached = publication_reached.clone();
+        let release = publication_release.clone();
+        let publication_events = events.clone();
+        let publisher = tokio::spawn(async move {
+            let _mutation_guard = controller.mutation_gate.lock().await;
+            controller.model_manager.mark_loaded(variant).await;
+            controller.mark_slot_ready(variant).expect("ready slot");
+            reached.wait().await;
+            release.wait().await;
+            controller.finish_load_locked(
+                variant,
+                leader.generation,
+                &leader.completion,
+                SharedLoadOutcome::Ready,
+            );
+            publication_events
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push("outcome");
+        });
+
+        publication_reached.wait().await;
+        let unload_controller = runtime.model_lifecycle.clone();
+        let unload_events = events.clone();
+        let mut unload = tokio::spawn(async move {
+            unload_controller
+                .unload_model_detached(variant)
+                .await
+                .expect("explicit unload");
+            unload_events
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push("unload");
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut unload)
+                .await
+                .is_err(),
+            "unload must not cross the gate before the load outcome is published"
+        );
+
+        publication_release.wait().await;
+        waiter.wait().await.expect("shared ready outcome");
+        publisher.await.expect("publisher task");
+        unload.await.expect("unload task");
+        assert_eq!(
+            *events.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec!["outcome", "unload"]
+        );
+        assert_eq!(runtime.model_lifecycle.resident_phase(variant), None);
+        assert_eq!(authority.snapshot().reservations, 0);
+
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_load_panic_rolls_back_before_publishing_failure() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-load-panic-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let (authority, resource_lease) = isolated_resource_lease("load-panic");
+        runtime
+            .model_lifecycle
+            .install_loading_slot(variant, resource_lease)
+            .expect("loading slot");
+        runtime.model_manager.mark_loaded(variant).await;
+        runtime.model_lifecycle.set_load_test_panics(1);
+
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        runtime.model_lifecycle.spawn_load_transaction(
+            variant,
+            runtime.max_loaded_models,
+            leader.expect("load leader"),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
+            .await
+            .expect("panic outcome timed out")
+            .expect_err("injected load panic must fail");
+        assert!(
+            matches!(error, Error::ModelLoadError(message) if message.contains("injected model load panic"))
+        );
+        assert_eq!(runtime.model_lifecycle.resident_phase(variant), None);
+        assert!(!runtime.model_manager.is_ready(variant).await);
+        assert_eq!(authority.snapshot().reservations, 0);
+
+        let (cleanup_waiter, cleanup_leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let cleanup_leader = cleanup_leader.expect("failed generation must be removable");
+        {
+            let _mutation_guard = runtime.model_lifecycle.mutation_gate.lock().await;
+            runtime.model_lifecycle.finish_load_locked(
+                variant,
+                cleanup_leader.generation,
+                &cleanup_leader.completion,
+                SharedLoadOutcome::Failed(SharedLoadFailure::ModelLoad("test cleanup".to_string())),
+            );
+        }
+        assert!(cleanup_waiter.wait().await.is_err());
+
+        std::fs::remove_dir_all(models_dir).unwrap();
     }
 
     #[tokio::test]
@@ -504,6 +844,7 @@ mod tests {
         let controller = runtime.model_lifecycle.clone();
         let calls = loader_calls.clone();
         let transaction = tokio::spawn(async move {
+            let _mutation_guard = controller.mutation_gate.lock().await;
             let _coordinator_load = controller
                 .coordinator
                 .begin_model_load("cancelled-shared-load")
@@ -512,11 +853,11 @@ mod tests {
             let _ = started_tx.send(());
             let _ = release_rx.await;
             controller
-                .reconcile_slot_materialized(variant, resources)
+                .finalize_slot_materialization(variant, resources)
                 .expect("materialized lease");
             controller.model_manager.mark_loaded(variant).await;
             controller.mark_slot_ready(variant).expect("ready slot");
-            controller.finish_load(
+            controller.finish_load_locked(
                 variant,
                 leader.generation,
                 &leader.completion,
