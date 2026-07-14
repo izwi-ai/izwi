@@ -649,12 +649,9 @@ mod tests {
             core_request.asr_prompt.as_deref(),
             Some("spell Izwi correctly")
         );
-        match core_request.task {
-            EngineTask::Asr(input) => {
-                assert_eq!(input.prompt.as_deref(), Some("spell Izwi correctly"));
-            }
-            other => panic!("unexpected task payload: {other:?}"),
-        }
+        // Large direct fields remain in their compatibility owner until the
+        // Engine/RequestProcessor preflight establishes the typed task view.
+        assert!(matches!(core_request.task, EngineTask::Asr(_)));
     }
 
     #[test]

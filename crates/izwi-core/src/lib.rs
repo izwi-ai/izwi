@@ -52,7 +52,7 @@ pub use engine::{
     ModelExecutor, OutputProcessor, PinnedBlockHandle, Priority, RequestProcessor, RequestStatus,
     ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector,
     RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey,
-    StreamingOutput, TerminalOutcome, TtsEngineInput, WorkUnit, WorkloadClass, YieldReason,
+    StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkUnit, WorkloadClass, YieldReason,
 };
 
 // Legacy re-exports for backward compatibility
@@ -112,8 +112,8 @@ pub use runtime_models::shared::chat::{
 pub use backends::{DeviceProfile, DeviceSelector};
 pub use runtime_models::{
     model_family_registrations, registration_for_variant, registrations_for_capability,
-    FamilyRegistration, LoadedModelDiagnostics, LoadedModelRegistry, ModelRegistry,
-    MODEL_FAMILY_REGISTRATIONS,
+    AsrModelLease, ChatModelLease, FamilyRegistration, LoadedModelDiagnostics, LoadedModelRegistry,
+    ModelRegistry, QwenTtsModelLease, MODEL_FAMILY_REGISTRATIONS,
 };
 
 #[cfg(test)]

@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use tokio::sync::{broadcast, oneshot, Mutex, Notify, RwLock};
 use tokio::task::yield_now;
-use tracing::{debug, error, info_span};
+use tracing::{debug, error, info_span, warn};
 
 use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
@@ -21,8 +21,9 @@ use crate::config::EngineConfig;
 use crate::engine::{
     engine_request_parallel_batches_total, engine_stream_backpressure_total,
     engine_tensor_batch_max_width, engine_tensor_batches_total, Engine as CoreEngine,
-    EngineCoreConfig, EngineCoreRequest, EngineOutput, OutputFinishReason, ResourceAmount,
-    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineTask,
+    GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
+    StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
     ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
@@ -37,13 +38,16 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
+use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::adapters::RuntimeAdapterRegistry;
+use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
 };
 use crate::runtime::coordinator::{
-    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobSpec,
+    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobResourceObservation,
+    JobSpec,
 };
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
@@ -83,6 +87,93 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
     Ok(output)
 }
 
+struct RuntimeCompletionWaiter {
+    registration_id: u64,
+    session_epoch: Option<u64>,
+    sender: oneshot::Sender<Result<EngineOutput>>,
+}
+
+type RuntimeCompletionWaiters = Mutex<HashMap<String, RuntimeCompletionWaiter>>;
+
+async fn remove_waiter_registration(
+    waiters: &RuntimeCompletionWaiters,
+    request_id: &str,
+    registration_id: u64,
+) -> bool {
+    let mut waiters = waiters.lock().await;
+    if waiters
+        .get(request_id)
+        .is_some_and(|waiter| waiter.registration_id == registration_id)
+    {
+        waiters.remove(request_id);
+        true
+    } else {
+        false
+    }
+}
+
+async fn bind_waiter_registration(
+    waiters: &RuntimeCompletionWaiters,
+    request_id: &str,
+    registration_id: u64,
+    session_epoch: u64,
+) -> bool {
+    let mut waiters = waiters.lock().await;
+    let Some(waiter) = waiters.get_mut(request_id) else {
+        return false;
+    };
+    if waiter.registration_id != registration_id || waiter.session_epoch.is_some() {
+        return false;
+    }
+    waiter.session_epoch = Some(session_epoch);
+    true
+}
+
+async fn route_terminal_output(
+    engine: &CoreEngine,
+    waiters: &RuntimeCompletionWaiters,
+    telemetry: &RuntimeTelemetryCollector,
+    output: EngineOutput,
+) {
+    debug_assert!(output.is_finished);
+
+    // Removing the waiter is the routing hand-off. A missing waiter or a
+    // dropped receiver still means there is no live runtime consumer left, so
+    // either case must release the exact-session delivery fence.
+    let waiter = loop {
+        let mut waiters = waiters.lock().await;
+        match waiters.get(&output.request_id) {
+            Some(waiter) if waiter.session_epoch == Some(output.sequence_id) => {
+                break waiters.remove(&output.request_id);
+            }
+            // A registration is installed before its engine session exists.
+            // Let admission bind it before deciding whether this terminal
+            // belongs to that waiter; otherwise an old output can steal a
+            // newly reused public request ID.
+            Some(waiter) if waiter.session_epoch.is_none() => {
+                drop(waiters);
+                tokio::task::yield_now().await;
+            }
+            // A waiter for a later exact session must remain registered.
+            Some(_) | None => break None,
+        }
+    };
+    if let Some(waiter) = waiter {
+        let _ = waiter.sender.send(runtime_completion(output.clone()));
+    }
+
+    // Do not make the public request ID reusable until the runtime has
+    // attempted terminal delivery to the waiter selected above.
+    if !engine.acknowledge_dispatched_terminal(&output).await {
+        warn!(
+            request_id = %output.request_id,
+            session_epoch = output.sequence_id,
+            "Runtime terminal output had no matching delivery fence"
+        );
+    }
+    telemetry.record_request_finished(&output).await;
+}
+
 fn reported_gpu_resident_blocks(_backend_kind: BackendKind, _logical_blocks: u64) -> u64 {
     // Scheduler blocks are logical quotas until an ExternalPaged executor binds
     // them to tensor pages and reports measured residency.
@@ -111,6 +202,420 @@ fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVect
     resources
 }
 
+const AUDIO_DECODE_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+const PREPARATION_COPY_QUANTUM_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn audio_decode_resources(backend: BackendKind) -> ResourceVector {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(AUDIO_DECODE_WORKSPACE_BYTES)
+        }
+        BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(AUDIO_DECODE_WORKSPACE_BYTES)
+        }
+        BackendKind::Cuda => {
+            // Audio parsing, decoder packets, and mono output are host-side
+            // even when inference itself runs on CUDA.
+            resources.host_bytes = ResourceAmount::Known(AUDIO_DECODE_WORKSPACE_BYTES)
+        }
+    }
+    resources
+}
+
+fn task_decodes_audio(task_type: TaskType) -> bool {
+    matches!(task_type, TaskType::ASR | TaskType::SpeechToSpeech)
+}
+
+fn add_retained_allocation(
+    total: &mut usize,
+    capacity: usize,
+    element_size: usize,
+    label: &str,
+) -> Result<()> {
+    let bytes = capacity
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::Overloaded(format!("{label} capacity overflow")))?;
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| Error::Overloaded(format!("{label} size overflow")))?;
+    Ok(())
+}
+
+fn add_owned_string_capacity(total: &mut usize, value: &String, label: &str) -> Result<()> {
+    add_retained_allocation(total, value.capacity(), std::mem::size_of::<u8>(), label)
+}
+
+fn add_optional_string_capacity(
+    total: &mut usize,
+    value: Option<&String>,
+    label: &str,
+) -> Result<()> {
+    if let Some(value) = value {
+        add_owned_string_capacity(total, value, label)?;
+    }
+    Ok(())
+}
+
+fn add_json_allocations(total: &mut usize, value: &serde_json::Value, label: &str) -> Result<()> {
+    match value {
+        serde_json::Value::String(value) => add_owned_string_capacity(total, value, label),
+        serde_json::Value::Array(values) => {
+            add_retained_allocation(
+                total,
+                values.capacity(),
+                std::mem::size_of::<serde_json::Value>(),
+                label,
+            )?;
+            for value in values {
+                add_json_allocations(total, value, label)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(values) => {
+            // serde_json does not expose the backing map capacity. Count only
+            // allocations whose capacities are observable; any map-node
+            // overhead remains pending instead of being falsely materialized.
+            for (key, value) in values {
+                add_owned_string_capacity(total, key, label)?;
+                add_json_allocations(total, value, label)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn add_chat_messages_allocations(
+    total: &mut usize,
+    messages: &[ChatMessage],
+    capacity: usize,
+) -> Result<()> {
+    add_retained_allocation(
+        total,
+        capacity,
+        std::mem::size_of::<ChatMessage>(),
+        "chat messages",
+    )?;
+    for message in messages {
+        add_owned_string_capacity(total, &message.content, "chat message content")?;
+    }
+    Ok(())
+}
+
+fn add_chat_config_allocations(total: &mut usize, config: &ChatRequestConfig) -> Result<()> {
+    add_retained_allocation(
+        total,
+        config.media_inputs.capacity(),
+        std::mem::size_of::<crate::models::shared::chat::ChatMediaInput>(),
+        "chat media inputs",
+    )?;
+    for media in &config.media_inputs {
+        add_owned_string_capacity(total, &media.source, "chat media source")?;
+    }
+    add_retained_allocation(
+        total,
+        config.tools.capacity(),
+        std::mem::size_of::<serde_json::Value>(),
+        "chat tools",
+    )?;
+    for tool in &config.tools {
+        add_json_allocations(total, tool, "chat tool")?;
+    }
+    Ok(())
+}
+
+fn add_generation_param_allocations(total: &mut usize, params: &GenerationParams) -> Result<()> {
+    add_optional_string_capacity(total, params.speaker.as_ref(), "generation speaker")?;
+    add_optional_string_capacity(total, params.voice.as_ref(), "generation voice")?;
+    add_retained_allocation(
+        total,
+        params.stop_sequences.capacity(),
+        std::mem::size_of::<String>(),
+        "generation stop sequences",
+    )?;
+    for sequence in &params.stop_sequences {
+        add_owned_string_capacity(total, sequence, "generation stop sequence")?;
+    }
+    add_retained_allocation(
+        total,
+        params.stop_token_ids.capacity(),
+        std::mem::size_of::<u32>(),
+        "generation stop token IDs",
+    )
+}
+
+pub(crate) fn retained_chat_preparation_input_bytes(
+    messages: &[ChatMessage],
+    messages_capacity: usize,
+    config: &ChatRequestConfig,
+    params: &GenerationParams,
+    correlation_id: Option<&String>,
+) -> Result<usize> {
+    let mut total = 0usize;
+    add_chat_messages_allocations(&mut total, messages, messages_capacity)?;
+    add_chat_config_allocations(&mut total, config)?;
+    add_generation_param_allocations(&mut total, params)?;
+    add_optional_string_capacity(&mut total, correlation_id, "chat correlation ID")?;
+    Ok(total)
+}
+
+pub(crate) fn retained_speech_to_speech_preparation_input_bytes(
+    audio_input_bytes: usize,
+    messages: &[ChatMessage],
+    messages_capacity: usize,
+    params: &GenerationParams,
+    system_prompt: Option<&str>,
+    correlation_id: Option<&str>,
+) -> Result<usize> {
+    let mut total = 0usize;
+    add_retained_allocation(
+        &mut total,
+        audio_input_bytes,
+        std::mem::size_of::<u8>(),
+        "speech-to-speech borrowed audio",
+    )?;
+    add_chat_messages_allocations(&mut total, messages, messages_capacity)?;
+    add_generation_param_allocations(&mut total, params)?;
+    add_retained_allocation(
+        &mut total,
+        system_prompt.map(str::len).unwrap_or_default(),
+        std::mem::size_of::<u8>(),
+        "speech-to-speech borrowed system prompt",
+    )?;
+    add_retained_allocation(
+        &mut total,
+        correlation_id.map(str::len).unwrap_or_default(),
+        std::mem::size_of::<u8>(),
+        "speech-to-speech borrowed correlation ID",
+    )?;
+    Ok(total)
+}
+
+fn add_audio_input_allocation(
+    total: &mut usize,
+    audio: &EngineAudioInput,
+    label: &str,
+) -> Result<()> {
+    match audio {
+        EngineAudioInput::Base64(value) => add_owned_string_capacity(total, value, label),
+        EngineAudioInput::Bytes(value) => {
+            add_retained_allocation(total, value.capacity(), std::mem::size_of::<u8>(), label)
+        }
+    }
+}
+
+fn retained_engine_request_input_bytes(request: &EngineCoreRequest) -> Result<usize> {
+    let mut total = 0usize;
+    add_owned_string_capacity(&mut total, &request.id, "request ID")?;
+    add_optional_string_capacity(&mut total, request.text.as_ref(), "request text")?;
+    if let Some(messages) = request.chat_messages.as_ref() {
+        add_chat_messages_allocations(&mut total, messages, messages.capacity())?;
+    }
+    add_chat_config_allocations(&mut total, &request.chat_config)?;
+    add_optional_string_capacity(&mut total, request.language.as_ref(), "request language")?;
+    add_optional_string_capacity(
+        &mut total,
+        request.correlation_id.as_ref(),
+        "request correlation ID",
+    )?;
+    add_optional_string_capacity(
+        &mut total,
+        request.audio_input.as_ref(),
+        "request base64 audio",
+    )?;
+    if let Some(audio) = request.audio_bytes.as_ref() {
+        add_retained_allocation(
+            &mut total,
+            audio.capacity(),
+            std::mem::size_of::<u8>(),
+            "request audio bytes",
+        )?;
+    }
+    for (value, label) in [
+        (request.asr_prompt.as_ref(), "request ASR prompt"),
+        (request.reference_audio.as_ref(), "request reference audio"),
+        (request.reference_text.as_ref(), "request reference text"),
+        (
+            request.voice_description.as_ref(),
+            "request voice description",
+        ),
+        (request.system_prompt.as_ref(), "request system prompt"),
+    ] {
+        add_optional_string_capacity(&mut total, value, label)?;
+    }
+    add_generation_param_allocations(&mut total, &request.params)?;
+    add_retained_allocation(
+        &mut total,
+        request.prompt_tokens.capacity(),
+        std::mem::size_of::<u32>(),
+        "request prompt tokens",
+    )?;
+
+    // The typed task owns separately cloned input buffers. Count them as
+    // distinct materialized allocations rather than assuming the broad
+    // compatibility fields share storage.
+    match &request.task {
+        EngineTask::Tts(input) => {
+            add_owned_string_capacity(&mut total, &input.text, "typed TTS text")?;
+            add_optional_string_capacity(
+                &mut total,
+                input.reference_audio.as_ref(),
+                "typed TTS reference audio",
+            )?;
+            add_optional_string_capacity(
+                &mut total,
+                input.reference_text.as_ref(),
+                "typed TTS reference text",
+            )?;
+            add_optional_string_capacity(
+                &mut total,
+                input.voice_description.as_ref(),
+                "typed TTS voice description",
+            )?;
+        }
+        EngineTask::Asr(input) => {
+            add_audio_input_allocation(&mut total, &input.audio, "typed ASR audio")?;
+            add_optional_string_capacity(
+                &mut total,
+                input.language.as_ref(),
+                "typed ASR language",
+            )?;
+            add_optional_string_capacity(&mut total, input.prompt.as_ref(), "typed ASR prompt")?;
+        }
+        EngineTask::Chat(input) => {
+            add_chat_messages_allocations(&mut total, &input.messages, input.messages.capacity())?;
+            add_chat_config_allocations(&mut total, &input.chat_config)?;
+            add_retained_allocation(
+                &mut total,
+                input.prompt_tokens.capacity(),
+                std::mem::size_of::<u32>(),
+                "typed chat prompt tokens",
+            )?;
+        }
+        EngineTask::SpeechToSpeech(input) => {
+            add_audio_input_allocation(&mut total, &input.audio, "typed speech-to-speech audio")?;
+            add_chat_messages_allocations(&mut total, &input.messages, input.messages.capacity())?;
+            add_optional_string_capacity(
+                &mut total,
+                input.system_prompt.as_ref(),
+                "typed speech-to-speech system prompt",
+            )?;
+        }
+    }
+
+    // Prepared multimodal tensors are deliberately excluded here. Their
+    // decoder/tensor authorization remains pending until preparation creates
+    // them; an already-prepared direct request is conservatively double-counted
+    // instead of falsely reporting accelerator bytes as materialized.
+    Ok(total)
+}
+
+fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> {
+    Ok(JobResourceObservation::host(
+        u64::try_from(input_bytes).map_err(|_| {
+            Error::InvalidInput("runtime retained input size exceeds u64".to_string())
+        })?,
+    ))
+}
+
+fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
+    if job
+        .spec
+        .deadline
+        .is_some_and(|deadline| deadline <= Instant::now())
+    {
+        return Err(Error::Timeout(job.spec.request_id.clone()));
+    }
+    Ok(())
+}
+
+pub(crate) async fn copy_preparation_bytes(
+    job: &JobLease,
+    input: &[u8],
+    label: &str,
+) -> Result<Vec<u8>> {
+    ensure_preparation_copy_deadline(job)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(input.len()).map_err(|_| {
+        Error::Overloaded(format!(
+            "unable to reserve {} bytes for {label}",
+            input.len()
+        ))
+    })?;
+    ensure_preparation_copy_deadline(job)?;
+    for chunk in input.chunks(PREPARATION_COPY_QUANTUM_BYTES) {
+        output.extend_from_slice(chunk);
+        ensure_preparation_copy_deadline(job)?;
+        tokio::task::yield_now().await;
+        ensure_preparation_copy_deadline(job)?;
+    }
+    Ok(output)
+}
+
+pub(crate) async fn copy_preparation_string(
+    job: &JobLease,
+    input: &str,
+    label: &str,
+) -> Result<String> {
+    ensure_preparation_copy_deadline(job)?;
+    let mut output = String::new();
+    output.try_reserve_exact(input.len()).map_err(|_| {
+        Error::Overloaded(format!(
+            "unable to reserve {} bytes for {label}",
+            input.len()
+        ))
+    })?;
+    ensure_preparation_copy_deadline(job)?;
+
+    let mut start = 0usize;
+    while start < input.len() {
+        let mut end = start
+            .saturating_add(PREPARATION_COPY_QUANTUM_BYTES)
+            .min(input.len());
+        while !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&input[start..end]);
+        start = end;
+        ensure_preparation_copy_deadline(job)?;
+        tokio::task::yield_now().await;
+        ensure_preparation_copy_deadline(job)?;
+    }
+    Ok(output)
+}
+
+pub(crate) async fn copy_optional_preparation_string(
+    job: &JobLease,
+    input: Option<&str>,
+    label: &str,
+) -> Result<Option<String>> {
+    match input {
+        Some(input) => copy_preparation_string(job, input, label).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn media_preparation_resources(
+    backend: BackendKind,
+    estimate: crate::models::architectures::qwen35::Qwen35MediaResourceEstimate,
+) -> Result<ResourceVector> {
+    let total_unified = estimate
+        .host_bytes
+        .checked_add(estimate.backend_tensor_bytes)
+        .ok_or_else(|| Error::Overloaded("Qwen3.5 media resource overflow".to_string()))?;
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(total_unified),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(total_unified),
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(estimate.host_bytes);
+            resources.device_bytes = ResourceAmount::Known(estimate.backend_tensor_bytes);
+        }
+    }
+    Ok(resources)
+}
+
 fn coordinator_lane_for_metadata(
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
@@ -118,20 +623,20 @@ fn coordinator_lane_for_metadata(
     workload_class: WorkloadClass,
 ) -> CoordinatorLane {
     let sequence = model_variant.is_some_and(|variant| match task_type {
-            TaskType::Chat => {
-                matches!(variant.family(), ModelFamily::Qwen35Chat)
-                    || matches!(
-                        variant,
-                        ModelVariant::Qwen306B
-                            | ModelVariant::Qwen306B4Bit
-                            | ModelVariant::Qwen317B
-                            | ModelVariant::Qwen317B4Bit
-                    )
-            }
-            TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && streaming,
-            TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
-            TaskType::SpeechToSpeech => false,
-        });
+        TaskType::Chat => {
+            matches!(variant.family(), ModelFamily::Qwen35Chat)
+                || matches!(
+                    variant,
+                    ModelVariant::Qwen306B
+                        | ModelVariant::Qwen306B4Bit
+                        | ModelVariant::Qwen317B
+                        | ModelVariant::Qwen317B4Bit
+                )
+        }
+        TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && streaming,
+        TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
+        TaskType::SpeechToSpeech => false,
+    });
     if workload_class == WorkloadClass::Realtime {
         CoordinatorLane::Realtime
     } else if sequence {
@@ -164,8 +669,10 @@ pub struct RuntimeService {
     pub(crate) streaming_config: StreamingConfig,
     pub(crate) core_engine: Arc<CoreEngine>,
     pub(crate) coordinator: Arc<InferenceCoordinator>,
+    pub(super) asr_realtime_sessions: RealtimeAsrSessionPolicy,
     telemetry: Arc<RuntimeTelemetryCollector>,
-    completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
+    completion_waiters: Arc<RuntimeCompletionWaiters>,
+    next_completion_waiter_registration: AtomicU64,
     step_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     step_driver_wakeup: Arc<Notify>,
     step_driver_started: AtomicBool,
@@ -181,29 +688,154 @@ pub(crate) struct AdmittedEngineRequest {
     residency_lease: ModelResidencyLease,
 }
 
+struct WaiterRegistrationGuard {
+    request_id: String,
+    registration_id: u64,
+    completion_waiters: Arc<RuntimeCompletionWaiters>,
+    active: bool,
+}
+
+impl WaiterRegistrationGuard {
+    fn new(
+        request_id: String,
+        registration_id: u64,
+        completion_waiters: Arc<RuntimeCompletionWaiters>,
+    ) -> Self {
+        Self {
+            request_id,
+            registration_id,
+            completion_waiters,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for WaiterRegistrationGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let request_id = self.request_id.clone();
+        let registration_id = self.registration_id;
+        let waiters = self.completion_waiters.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                remove_waiter_registration(waiters.as_ref(), &request_id, registration_id).await;
+            });
+        }
+    }
+}
+
 struct PendingRequestGuard {
     session: SessionKey,
     core_engine: Arc<CoreEngine>,
-    completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
+    completion_waiters: Arc<RuntimeCompletionWaiters>,
+    waiter_registration_id: u64,
     telemetry: Arc<RuntimeTelemetryCollector>,
     job: Option<JobLease>,
+    residency_lease: Option<ModelResidencyLease>,
     active: bool,
+}
+
+/// Owns cancellation-sensitive admission state after its request future is
+/// gone. Dropping the detached cleanup task (runtime shutdown, panic, or task
+/// abortion) deliberately leaks these leases instead of allowing a model or
+/// resource reservation to disappear underneath native work that was never
+/// proven stopped.
+struct DeferredRequestOwnership {
+    job: Option<JobLease>,
+    residency_lease: Option<ModelResidencyLease>,
+    release_confirmed: bool,
+}
+
+impl DeferredRequestOwnership {
+    fn new(job: Option<JobLease>, residency_lease: Option<ModelResidencyLease>) -> Self {
+        Self {
+            job,
+            residency_lease,
+            release_confirmed: false,
+        }
+    }
+
+    fn release(mut self) {
+        self.release_confirmed = true;
+    }
+}
+
+impl Drop for DeferredRequestOwnership {
+    fn drop(&mut self) {
+        if self.release_confirmed {
+            return;
+        }
+        if let Some(residency_lease) = self.residency_lease.take() {
+            std::mem::forget(residency_lease);
+        }
+        if let Some(job) = self.job.take() {
+            std::mem::forget(job);
+        }
+    }
+}
+
+async fn cleanup_pending_request(
+    session: SessionKey,
+    engine: Arc<CoreEngine>,
+    waiters: Arc<RuntimeCompletionWaiters>,
+    waiter_registration_id: u64,
+    telemetry: Arc<RuntimeTelemetryCollector>,
+    ownership: DeferredRequestOwnership,
+) {
+    remove_waiter_registration(
+        waiters.as_ref(),
+        &session.request_id,
+        waiter_registration_id,
+    )
+    .await;
+
+    let aborted = match engine.abort_request_session(&session).await {
+        Ok(aborted) => aborted,
+        Err(err) => {
+            warn!(
+                request_id = %session.request_id,
+                session_epoch = session.epoch,
+                error = %err,
+                "Exact-session cancellation cleanup failed; retaining request ownership"
+            );
+            return;
+        }
+    };
+    // The exact abort waits for any in-flight engine step and its first
+    // physical cleanup attempt. Only that successful hand-off permits the
+    // model and coordinator admission to be released.
+    ownership.release();
+    if aborted {
+        telemetry
+            .record_request_cancelled(&session.request_id)
+            .await;
+    }
 }
 
 impl PendingRequestGuard {
     fn new(
         session: SessionKey,
         core_engine: Arc<CoreEngine>,
-        completion_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<EngineOutput>>>>>,
+        completion_waiters: Arc<RuntimeCompletionWaiters>,
+        waiter_registration_id: u64,
         telemetry: Arc<RuntimeTelemetryCollector>,
         job: JobLease,
+        residency_lease: Option<ModelResidencyLease>,
     ) -> Self {
         Self {
             session,
             core_engine,
             completion_waiters,
+            waiter_registration_id,
             telemetry,
             job: Some(job),
+            residency_lease,
             active: true,
         }
     }
@@ -211,34 +843,46 @@ impl PendingRequestGuard {
     fn disarm(&mut self) {
         self.active = false;
         self.job.take();
+        self.residency_lease.take();
+    }
+
+    /// Transfer cancellation cleanup to a detached exact-session task without
+    /// waiting for the engine core lock. Streaming callbacks execute outside
+    /// the engine, so a failed or timed-out transport must be able to return
+    /// promptly even while a native step still owns that lock.
+    fn defer_cleanup(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+
+        let session = self.session.clone();
+        let engine = self.core_engine.clone();
+        let waiters = self.completion_waiters.clone();
+        let waiter_registration_id = self.waiter_registration_id;
+        let telemetry = self.telemetry.clone();
+        let job = self.job.take();
+        let residency_lease = self.residency_lease.take();
+        let ownership = DeferredRequestOwnership::new(job, residency_lease);
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(cleanup_pending_request(
+                session,
+                engine,
+                waiters,
+                waiter_registration_id,
+                telemetry,
+                ownership,
+            ));
+        } else {
+            drop(ownership);
+        }
     }
 }
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-
-        let session = self.session.clone();
-        let engine = self.core_engine.clone();
-        let waiters = self.completion_waiters.clone();
-        let telemetry = self.telemetry.clone();
-        let job = self.job.take();
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let mut guard = waiters.lock().await;
-                guard.remove(&session.request_id);
-                drop(guard);
-
-                let _ = engine.abort_request_session(&session).await;
-                telemetry
-                    .record_request_cancelled(&session.request_id)
-                    .await;
-                drop(job);
-            });
-        }
+        self.defer_cleanup();
     }
 }
 
@@ -310,6 +954,7 @@ impl RuntimeService {
             execution_parallelism,
             config.max_batch_size.max(1).saturating_mul(16).max(64),
         )?);
+        let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
         let backend_router = BackendRouter::from_context(backend_context);
@@ -340,8 +985,10 @@ impl RuntimeService {
             streaming_config: StreamingConfig::default(),
             core_engine,
             coordinator,
+            asr_realtime_sessions,
             telemetry: Arc::new(RuntimeTelemetryCollector::new(2048)),
             completion_waiters: Arc::new(Mutex::new(HashMap::new())),
+            next_completion_waiter_registration: AtomicU64::new(1),
             step_driver_task: Mutex::new(None),
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
@@ -663,7 +1310,7 @@ impl RuntimeService {
                         continue;
                     }
                 };
-                let step_result = std::panic::AssertUnwindSafe(engine.step())
+                let step_result = std::panic::AssertUnwindSafe(engine.step_for_dispatch())
                     .catch_unwind()
                     .await;
                 match step_result {
@@ -683,16 +1330,13 @@ impl RuntimeService {
                             if !output.is_finished {
                                 continue;
                             }
-                            telemetry.record_request_finished(&output).await;
-
-                            let waiter = {
-                                let mut w = waiters.lock().await;
-                                w.remove(&output.request_id)
-                            };
-
-                            if let Some(tx) = waiter {
-                                let _ = tx.send(runtime_completion(output));
-                            }
+                            route_terminal_output(
+                                engine.as_ref(),
+                                waiters.as_ref(),
+                                telemetry.as_ref(),
+                                output,
+                            )
+                            .await;
                         }
                     }
                     Ok(Err(err)) => {
@@ -703,8 +1347,10 @@ impl RuntimeService {
                             pending.iter().map(|(id, _)| id.as_str()).collect();
                         telemetry.record_forced_failures(request_ids).await;
                         let _ = engine.abort_all_requests().await;
-                        for (_, tx) in pending {
-                            let _ = tx.send(Err(Error::InferenceError(err.to_string())));
+                        for (_, waiter) in pending {
+                            let _ = waiter
+                                .sender
+                                .send(Err(Error::InferenceError(err.to_string())));
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
                     }
@@ -718,8 +1364,8 @@ impl RuntimeService {
                             pending.iter().map(|(id, _)| id.as_str()).collect();
                         telemetry.record_forced_failures(request_ids).await;
                         let _ = engine.abort_all_requests().await;
-                        for (_, tx) in pending {
-                            let _ = tx.send(Err(Error::InferenceError(format!(
+                        for (_, waiter) in pending {
+                            let _ = waiter.sender.send(Err(Error::InferenceError(format!(
                                 "Engine worker panicked: {}",
                                 panic_message
                             ))));
@@ -741,15 +1387,22 @@ impl RuntimeService {
     async fn register_waiter(
         &self,
         request_id: &str,
-    ) -> Result<oneshot::Receiver<Result<EngineOutput>>> {
+    ) -> Result<(u64, oneshot::Receiver<Result<EngineOutput>>)> {
         use std::collections::hash_map::Entry;
 
+        let registration_id = self
+            .next_completion_waiter_registration
+            .fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let mut waiters = self.completion_waiters.lock().await;
         match waiters.entry(request_id.to_string()) {
             Entry::Vacant(entry) => {
-                entry.insert(tx);
-                Ok(rx)
+                entry.insert(RuntimeCompletionWaiter {
+                    registration_id,
+                    session_epoch: None,
+                    sender: tx,
+                });
+                Ok((registration_id, rx))
             }
             Entry::Occupied(_) => Err(Error::InvalidInput(format!(
                 "request {request_id} already has a completion waiter"
@@ -757,9 +1410,35 @@ impl RuntimeService {
         }
     }
 
-    async fn remove_waiter(&self, request_id: &str) {
-        let mut waiters = self.completion_waiters.lock().await;
-        waiters.remove(request_id);
+    async fn remove_waiter(&self, request_id: &str, registration_id: u64) {
+        remove_waiter_registration(
+            self.completion_waiters.as_ref(),
+            request_id,
+            registration_id,
+        )
+        .await;
+    }
+
+    async fn bind_waiter(
+        &self,
+        request_id: &str,
+        registration_id: u64,
+        session_epoch: u64,
+    ) -> Result<()> {
+        if bind_waiter_registration(
+            self.completion_waiters.as_ref(),
+            request_id,
+            registration_id,
+            session_epoch,
+        )
+        .await
+        {
+            Ok(())
+        } else {
+            Err(Error::InferenceError(format!(
+                "request {request_id} lost its completion waiter before session binding"
+            )))
+        }
     }
 
     async fn await_completion(
@@ -896,25 +1575,71 @@ impl RuntimeService {
         }
     }
 
-    pub(crate) async fn prepare_engine_request<F, Fut>(
+    pub(crate) fn coordinator_job_for_audio_input(
+        &self,
+        request_id: impl Into<String>,
+        lane: CoordinatorLane,
+        runtime_context: RuntimeRequestContext,
+        input_bytes: usize,
+    ) -> Result<JobSpec> {
+        let mut spec =
+            self.coordinator_job_for_input(request_id, lane, runtime_context, input_bytes);
+        spec.resources = spec.resources.checked_add(audio_decode_resources(
+            self.backend_router.context().backend_kind,
+        ))?;
+        Ok(spec)
+    }
+
+    pub(crate) async fn prepare_engine_request_blocking<F>(
         &self,
         variant: ModelVariant,
         task_type: TaskType,
         streaming: bool,
         runtime_context: RuntimeRequestContext,
         input_bytes: usize,
+        additional_resources: ResourceVector,
         build: F,
     ) -> Result<AdmittedEngineRequest>
     where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<EngineCoreRequest>>,
+        F: FnOnce(Arc<ModelRegistry>) -> Result<EngineCoreRequest> + Send + 'static,
+    {
+        self.prepare_engine_request_blocking_with_input(
+            variant,
+            task_type,
+            streaming,
+            runtime_context,
+            input_bytes,
+            additional_resources,
+            |_job| async { Ok(()) },
+            move |registry, ()| build(registry),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_engine_request_blocking_with_input<P, PFut, T, F>(
+        &self,
+        variant: ModelVariant,
+        task_type: TaskType,
+        streaming: bool,
+        runtime_context: RuntimeRequestContext,
+        input_bytes: usize,
+        additional_resources: ResourceVector,
+        prepare_input: P,
+        build: F,
+    ) -> Result<AdmittedEngineRequest>
+    where
+        P: FnOnce(JobLease) -> PFut,
+        PFut: Future<Output = Result<T>>,
+        T: Send + 'static,
+        F: FnOnce(Arc<ModelRegistry>, T) -> Result<EngineCoreRequest> + Send + 'static,
     {
         let mut effective_context = runtime_context;
         if streaming && effective_context.workload_class == WorkloadClass::Online {
             effective_context.workload_class = WorkloadClass::Streaming;
         }
         let request_id = uuid::Uuid::new_v4().to_string();
-        let spec = self.coordinator_job_for_input(
+        let mut spec = self.coordinator_job_for_input(
             request_id,
             coordinator_lane_for_metadata(
                 task_type,
@@ -925,12 +1650,37 @@ impl RuntimeService {
             effective_context,
             input_bytes,
         );
-        let (job, (mut request, residency_lease)) = self
+        spec.resources = spec.resources.checked_add(additional_resources)?;
+        if task_decodes_audio(task_type) {
+            spec.resources = spec.resources.checked_add(audio_decode_resources(
+                self.backend_router.context().backend_kind,
+            ))?;
+        }
+        let job = self
             .coordinator
-            .admit_then_prepare(spec, move || async move {
-                let residency_lease = self.load_model_for_inference(variant).await?;
-                let request = build().await?;
-                Ok((request, residency_lease))
+            .admit_observed(spec, host_input_observation(input_bytes)?)
+            .await?;
+
+        let prepared_input = match job.spec.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), prepare_input(job.clone()))
+                .await
+                .map_err(|_| Error::Timeout(job.spec.request_id.clone()))??,
+            None => prepare_input(job.clone()).await?,
+        };
+        let residency_lease = match job.spec.deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline.into(), self.load_model_for_inference(variant))
+                    .await
+                    .map_err(|_| Error::Timeout(job.spec.request_id.clone()))??
+            }
+            None => self.load_model_for_inference(variant).await?,
+        };
+        let registry = self.model_registry.clone();
+        let (residency_lease, mut request) = self
+            .coordinator
+            .run_blocking_stage(&job, move || {
+                let request = build(registry, prepared_input)?;
+                Ok((residency_lease, request))
             })
             .await?;
         if request.task_type != task_type || request.model_variant != Some(variant) {
@@ -951,23 +1701,12 @@ impl RuntimeService {
         })
     }
 
-    fn coordinator_job_for_request(&self, request: &EngineCoreRequest) -> JobSpec {
-        let input_bytes = request
-            .audio_bytes
-            .as_ref()
-            .map(Vec::len)
-            .or_else(|| request.audio_input.as_ref().map(String::len))
-            .or_else(|| request.text.as_ref().map(String::len))
-            .or_else(|| {
-                request.chat_messages.as_ref().map(|messages| {
-                    messages
-                        .iter()
-                        .map(|message| message.content.len())
-                        .sum::<usize>()
-                })
-            })
-            .unwrap_or_default();
-        self.coordinator_job_for_input(
+    fn coordinator_job_for_request(
+        &self,
+        request: &EngineCoreRequest,
+    ) -> Result<(JobSpec, JobResourceObservation)> {
+        let input_bytes = retained_engine_request_input_bytes(request)?;
+        let mut spec = self.coordinator_job_for_input(
             request.id.clone(),
             coordinator_lane_for_request(request),
             RuntimeRequestContext {
@@ -977,17 +1716,80 @@ impl RuntimeService {
                 deadline: request.deadline,
             },
             input_bytes,
-        )
+        );
+        if task_decodes_audio(request.task_type)
+            || (request.task_type == TaskType::TTS && request.has_tts_reference_for_execution())
+        {
+            spec.resources = spec.resources.checked_add(audio_decode_resources(
+                self.backend_router.context().backend_kind,
+            ))?;
+        }
+        if request.task_type == TaskType::Chat && !request.chat_config.media_inputs.is_empty() {
+            if !request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::Qwen35Chat)
+            {
+                return Err(Error::InvalidInput(
+                    "Only Qwen3.5 chat requests may include media inputs".to_string(),
+                ));
+            }
+            let estimate = crate::models::architectures::qwen35::media_resource_estimate(
+                &request.chat_config.media_inputs,
+            )?;
+            spec.resources = spec.resources.checked_add(media_preparation_resources(
+                self.backend_router.context().backend_kind,
+                estimate,
+            )?)?;
+        }
+        Ok((spec, host_input_observation(input_bytes)?))
+    }
+
+    /// Load or pin a model under the admitted request's absolute deadline.
+    /// The detached lifecycle transaction remains cancellation-safe, while the
+    /// caller never waits beyond its end-to-end budget.
+    pub(crate) async fn load_model_for_job(
+        &self,
+        job: &JobLease,
+        variant: ModelVariant,
+    ) -> Result<ModelResidencyLease> {
+        match job.spec.deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline.into(), self.load_model_for_inference(variant))
+                    .await
+                    .map_err(|_| Error::Timeout(job.spec.request_id.clone()))?
+            }
+            None => self.load_model_for_inference(variant).await,
+        }
+    }
+
+    /// Bound the pre-session Engine admission transaction by the request's
+    /// absolute deadline. Cancelling this future before the core write lock is
+    /// acquired cannot create a scheduler session; once that lock is acquired,
+    /// Engine admission contains no further await point and returns its exact
+    /// session atomically.
+    async fn await_engine_admission_for_job<T, F>(&self, job: &JobLease, admission: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        match job.spec.deadline {
+            Some(deadline) => {
+                if deadline <= Instant::now() {
+                    return Err(Error::Timeout(job.spec.request_id.clone()));
+                }
+                tokio::time::timeout_at(deadline.into(), admission)
+                    .await
+                    .map_err(|_| Error::Timeout(job.spec.request_id.clone()))?
+            }
+            None => admission.await,
+        }
     }
 
     pub(crate) async fn run_request(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         self.observe_broker_request(&request)?;
-        let job = self
-            .coordinator
-            .admit(self.coordinator_job_for_request(&request))
-            .await?;
+        let (spec, observation) = self.coordinator_job_for_request(&request)?;
+        let job = self.coordinator.admit_observed(spec, observation).await?;
         let _residency_lease = match request.model_variant {
-            Some(variant) => Some(self.load_model_for_inference(variant).await?),
+            Some(variant) => Some(self.load_model_for_job(&job, variant).await?),
             None => None,
         };
         self.run_request_after_admission(request, job, _residency_lease)
@@ -1012,7 +1814,7 @@ impl RuntimeService {
         &self,
         request: EngineCoreRequest,
         job: JobLease,
-        _residency_lease: Option<ModelResidencyLease>,
+        residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
@@ -1033,31 +1835,62 @@ impl RuntimeService {
         let _entered = span.enter();
 
         let request_id = request.id.clone();
-        let completion_rx = self.register_waiter(&request_id).await?;
+        let (waiter_registration_id, completion_rx) = self.register_waiter(&request_id).await?;
+        let mut waiter_guard = WaiterRegistrationGuard::new(
+            request_id.clone(),
+            waiter_registration_id,
+            self.completion_waiters.clone(),
+        );
 
-        if let Err(err) = self.core_engine.add_request(request).await {
-            self.remove_waiter(&request_id).await;
-            self.record_engine_error_observation(&observation_request, false, err.to_string());
-            return Err(err);
-        }
-        self.telemetry.record_request_queued(&request_id).await;
-        self.step_driver_wakeup.notify_one();
-
-        let Some(session) = self.core_engine.request_session_key(&request_id).await else {
-            self.remove_waiter(&request_id).await;
-            let _ = self.core_engine.abort_request(&request_id).await;
-            return Err(Error::InferenceError(format!(
-                "request {request_id} is missing its scheduler session"
-            )));
+        let session = match self
+            .await_engine_admission_for_job(
+                &job,
+                self.core_engine.add_request_with_session(request),
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                self.remove_waiter(&request_id, waiter_registration_id)
+                    .await;
+                waiter_guard.disarm();
+                self.record_engine_error_observation(&observation_request, false, err.to_string());
+                return Err(err);
+            }
         };
-
+        // Establish exact-session cancellation ownership before the next await.
+        // A caller may drop this future while waiter binding is contended; the
+        // admitted request and its coordinator lease must still be reclaimed.
         let mut guard = PendingRequestGuard::new(
             session,
             self.core_engine.clone(),
             self.completion_waiters.clone(),
+            waiter_registration_id,
             self.telemetry.clone(),
             job,
+            residency_lease,
         );
+        // If Engine admission became ready in the same poll as the deadline,
+        // the exact session now exists. Establish cleanup ownership first, then
+        // fail the caller without leaving that session or its waiter behind.
+        if observation_request
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            let err = Error::Timeout(request_id.clone());
+            guard.defer_cleanup();
+            self.record_engine_error_observation(&observation_request, false, err.to_string());
+            return Err(err);
+        }
+        if let Err(err) = self
+            .bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
+            .await
+        {
+            return Err(err);
+        }
+        waiter_guard.disarm();
+        self.telemetry.record_request_queued(&request_id).await;
+        self.step_driver_wakeup.notify_one();
         let completion = self
             .await_completion(&request_id, completion_rx, observation_request.deadline)
             .await;
@@ -1072,6 +1905,62 @@ impl RuntimeService {
         let output = completion?;
         guard.disarm();
         Ok(output)
+    }
+
+    fn defer_streaming_failure(
+        &self,
+        guard: &mut PendingRequestGuard,
+        observation_request: &EngineCoreRequest,
+        err: Error,
+    ) -> Error {
+        // The exact abort may need the same core write lock held by a running
+        // native step. Hand cleanup off before returning to the transport;
+        // DeferredRequestOwnership retains admission and residency until that
+        // abort proves the exact session is no longer executing.
+        guard.defer_cleanup();
+        self.record_engine_error_observation(observation_request, true, err.to_string());
+        err
+    }
+
+    async fn deliver_streaming_chunk_before_deadline<F, Fut>(
+        &self,
+        on_chunk: &mut F,
+        chunk: StreamingOutput,
+        deadline: Option<Instant>,
+        stream_request_id: &str,
+        observation_request: &EngineCoreRequest,
+        guard: &mut PendingRequestGuard,
+    ) -> Result<()>
+    where
+        F: FnMut(StreamingOutput) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        // Calling `on_chunk` constructs the future and may itself perform
+        // synchronous transport work. Reject an expired request before that
+        // callback can observe or emit another chunk.
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            let err = Error::Timeout(stream_request_id.to_string());
+            return Err(self.defer_streaming_failure(guard, observation_request, err));
+        }
+        let delivery = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline.into(), on_chunk(chunk)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Timeout(stream_request_id.to_string())),
+                }
+            }
+            None => on_chunk(chunk).await,
+        };
+
+        delivery.map_err(|err| self.defer_streaming_failure(guard, observation_request, err))?;
+        // `timeout_at` and the callback can become ready in the same poll. Do
+        // not let select/poll ordering turn an already-expired absolute
+        // request deadline into a successful transport delivery.
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            let err = Error::Timeout(stream_request_id.to_string());
+            return Err(self.defer_streaming_failure(guard, observation_request, err));
+        }
+        Ok(())
     }
 
     pub(crate) async fn run_streaming_request<F, Fut>(
@@ -1146,13 +2035,8 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
-        self.run_streaming_request_after_admission(
-            request,
-            on_chunk,
-            job,
-            Some(residency_lease),
-        )
-        .await
+        self.run_streaming_request_after_admission(request, on_chunk, job, Some(residency_lease))
+            .await
     }
 
     async fn run_streaming_request_with_broker_streaming<F, Fut>(
@@ -1174,12 +2058,10 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
-        let job = self
-            .coordinator
-            .admit(self.coordinator_job_for_request(&request))
-            .await?;
+        let (spec, observation) = self.coordinator_job_for_request(&request)?;
+        let job = self.coordinator.admit_observed(spec, observation).await?;
         let _residency_lease = match request.model_variant {
-            Some(variant) => Some(self.load_model_for_inference(variant).await?),
+            Some(variant) => Some(self.load_model_for_job(&job, variant).await?),
             None => None,
         };
         self.run_streaming_request_after_admission(request, on_chunk, job, _residency_lease)
@@ -1191,7 +2073,7 @@ impl RuntimeService {
         request: EngineCoreRequest,
         mut on_chunk: F,
         job: JobLease,
-        _residency_lease: Option<ModelResidencyLease>,
+        residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput>
     where
         F: FnMut(StreamingOutput) -> Fut,
@@ -1216,40 +2098,63 @@ impl RuntimeService {
         let _entered = span.enter();
 
         let request_id = request.id.clone();
-        let mut completion_rx = self.register_waiter(&request_id).await?;
-        let (stream_request_id, mut stream_rx) = match self
-            .core_engine
-            .generate_streaming(request)
+        let (waiter_registration_id, mut completion_rx) = self.register_waiter(&request_id).await?;
+        let mut waiter_guard = WaiterRegistrationGuard::new(
+            request_id.clone(),
+            waiter_registration_id,
+            self.completion_waiters.clone(),
+        );
+        let (session, mut stream_rx) = match self
+            .await_engine_admission_for_job(
+                &job,
+                self.core_engine.generate_streaming_with_session(request),
+            )
             .await
         {
             Ok(v) => v,
             Err(err) => {
-                self.remove_waiter(&request_id).await;
+                self.remove_waiter(&request_id, waiter_registration_id)
+                    .await;
+                waiter_guard.disarm();
                 self.record_engine_error_observation(&observation_request, true, err.to_string());
                 return Err(err);
             }
         };
-        self.telemetry.record_request_queued(&request_id).await;
-        self.step_driver_wakeup.notify_one();
+        let stream_request_id = session.request_id.clone();
         debug_assert_eq!(stream_request_id, request_id);
-        let Some(session) = self
-            .core_engine
-            .request_session_key(&stream_request_id)
-            .await
-        else {
-            self.remove_waiter(&stream_request_id).await;
-            let _ = self.core_engine.abort_request(&stream_request_id).await;
-            return Err(Error::InferenceError(format!(
-                "request {stream_request_id} is missing its scheduler session"
-            )));
-        };
+        // Establish exact-session cancellation ownership before the next await.
         let mut guard = PendingRequestGuard::new(
             session,
             self.core_engine.clone(),
             self.completion_waiters.clone(),
+            waiter_registration_id,
             self.telemetry.clone(),
             job,
+            residency_lease,
         );
+        // As above, a session returned on the deadline boundary must be
+        // cancelled through exact-session ownership rather than treated as a
+        // pre-admission timeout.
+        if observation_request
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            let err = Error::Timeout(stream_request_id.clone());
+            return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
+        }
+        if let Err(err) = self
+            .bind_waiter(
+                &stream_request_id,
+                waiter_registration_id,
+                guard.session.epoch,
+            )
+            .await
+        {
+            return Err(err);
+        }
+        waiter_guard.disarm();
+        self.telemetry.record_request_queued(&request_id).await;
+        self.step_driver_wakeup.notify_one();
         let mut completion_result: Option<EngineOutput> = None;
         let deadline = observation_request.deadline;
         let deadline_wait = async move {
@@ -1271,24 +2176,34 @@ impl RuntimeService {
                         continue;
                     }
 
-                    if let Err(err) = on_chunk(chunk).await {
-                        self.remove_waiter(&stream_request_id).await;
-                        let _ = self.core_engine.abort_request(&stream_request_id).await;
-                        self.record_engine_error_observation(
+                    if let Err(err) = self
+                        .deliver_streaming_chunk_before_deadline(
+                            &mut on_chunk,
+                            chunk,
+                            deadline,
+                            &stream_request_id,
                             &observation_request,
-                            true,
-                            err.to_string(),
-                        );
+                            &mut guard,
+                        )
+                        .await
+                    {
                         return Err(err);
                     }
                 }
                 completion = &mut completion_rx, if completion_result.is_none() => {
-                    let completion = completion.map_err(|_| {
-                        Error::InferenceError(format!(
-                            "Request {} completion channel closed unexpectedly",
-                            stream_request_id
-                        ))
-                    })?;
+                    let completion = match completion {
+                        Ok(completion) => completion,
+                        Err(_) => {
+                            let err = Error::InferenceError(format!(
+                                "Request {stream_request_id} completion channel closed unexpectedly"
+                            ));
+                            return Err(self.defer_streaming_failure(
+                                &mut guard,
+                                &observation_request,
+                                err,
+                            ));
+                        }
+                    };
 
                     match completion {
                         Ok(output) => {
@@ -1297,23 +2212,21 @@ impl RuntimeService {
                         Err(err) => {
                             // If engine worker panics, fail fast so streaming callers
                             // don't hang waiting for a chunk channel that may never close.
-                            let _ = self.core_engine.abort_request(&stream_request_id).await;
-                            self.record_engine_error_observation(
+                            return Err(self.defer_streaming_failure(
+                                &mut guard,
                                 &observation_request,
-                                true,
-                                err.to_string(),
-                            );
-                            return Err(err);
+                                err,
+                            ));
                         }
                     }
                 }
                 _ = &mut deadline_wait => {
-                    self.record_engine_error_observation(
+                    let err = Error::Timeout(stream_request_id.clone());
+                    return Err(self.defer_streaming_failure(
+                        &mut guard,
                         &observation_request,
-                        true,
-                        "request deadline exceeded",
-                    );
-                    return Err(Error::Timeout(stream_request_id));
+                        err,
+                    ));
                 }
             }
         }
@@ -1331,15 +2244,21 @@ impl RuntimeService {
             {
                 Ok(output) => output,
                 Err(err) => {
-                    self.record_engine_error_observation(
+                    return Err(self.defer_streaming_failure(
+                        &mut guard,
                         &observation_request,
-                        true,
-                        err.to_string(),
-                    );
-                    return Err(err);
+                        err,
+                    ));
                 }
             }
         };
+        // Completion and stream closure can be ready in the same select poll
+        // as the deadline. Preserve an absolute end-to-end deadline regardless
+        // of which ready branch Tokio chooses first.
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            let err = Error::Timeout(stream_request_id.clone());
+            return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
+        }
         self.record_engine_output_observation(&observation_request, &output, true);
         guard.disarm();
         // Allow pending tasks to progress before returning to upper layers.
@@ -1557,6 +2476,12 @@ izwi_inference_coordinator_active_jobs {}\n\
 izwi_inference_coordinator_active_executions {}\n\
 # TYPE izwi_inference_coordinator_reserved_memory_bytes gauge\n\
 izwi_inference_coordinator_reserved_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_reserved_host_memory_bytes gauge\n\
+izwi_inference_coordinator_reserved_host_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_reserved_device_memory_bytes gauge\n\
+izwi_inference_coordinator_reserved_device_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_reserved_unified_memory_bytes gauge\n\
+izwi_inference_coordinator_reserved_unified_memory_bytes {}\n\
 # TYPE izwi_inference_coordinator_admitted_total counter\n\
 izwi_inference_coordinator_admitted_total {}\n\
 # TYPE izwi_inference_coordinator_rejected_total counter\n\
@@ -1569,6 +2494,9 @@ izwi_inference_coordinator_draining {}\n",
             snapshot.active_jobs,
             snapshot.active_executions,
             snapshot.reserved_memory_bytes,
+            snapshot.reserved_host_memory_bytes,
+            snapshot.reserved_device_memory_bytes,
+            snapshot.reserved_unified_memory_bytes,
             snapshot.admitted_total,
             snapshot.rejected_total,
             snapshot.expired_total,
@@ -1735,6 +2663,61 @@ mod tests {
         )
     }
 
+    async fn pending_streaming_guard_fixture(
+        runtime: &RuntimeService,
+        request_id: &str,
+        deadline: Option<Instant>,
+    ) -> (
+        EngineCoreRequest,
+        PendingRequestGuard,
+        oneshot::Receiver<Result<EngineOutput>>,
+        ModelVariant,
+    ) {
+        let residency_variant = ModelVariant::Kokoro82M;
+        let mut request = EngineCoreRequest::tts("streaming callback fixture")
+            .with_model_variant(residency_variant)
+            .with_deadline(deadline);
+        request.id = request_id.to_string();
+        request.prompt_tokens = vec![1];
+        request.streaming = true;
+        let observation_request = request.clone();
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("job shape");
+        let job = runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("job admission");
+        let (registration_id, receiver) = runtime
+            .register_waiter(request_id)
+            .await
+            .expect("waiter registration");
+        let session = runtime
+            .core_engine
+            .add_request_with_session(request)
+            .await
+            .expect("engine admission");
+        runtime
+            .bind_waiter(request_id, registration_id, session.epoch)
+            .await
+            .expect("waiter binding");
+        let residency_lease = runtime
+            .model_manager
+            .acquire_residency_lease(residency_variant);
+        let guard = PendingRequestGuard::new(
+            session,
+            runtime.core_engine.clone(),
+            runtime.completion_waiters.clone(),
+            registration_id,
+            runtime.telemetry.clone(),
+            job,
+            Some(residency_lease),
+        );
+
+        (observation_request, guard, receiver, residency_variant)
+    }
+
     #[test]
     fn runtime_completion_preserves_typed_terminal_failures() {
         assert!(matches!(
@@ -1750,7 +2733,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_waiter_registration_preserves_original_owner() {
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
-        let original = runtime
+        let (original_registration, original) = runtime
             .register_waiter("same-request")
             .await
             .expect("first waiter");
@@ -1764,7 +2747,1011 @@ mod tests {
             .await
             .contains_key("same-request"));
         drop(original);
-        runtime.remove_waiter("same-request").await;
+        runtime
+            .remove_waiter("same-request", original_registration)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_waiter_cleanup_cannot_remove_a_reused_request_registration() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let (old_registration, old_receiver) = runtime
+            .register_waiter("reused-request")
+            .await
+            .expect("old waiter");
+        runtime
+            .remove_waiter("reused-request", old_registration)
+            .await;
+        drop(old_receiver);
+
+        let (new_registration, _new_receiver) = runtime
+            .register_waiter("reused-request")
+            .await
+            .expect("new waiter");
+        assert_ne!(old_registration, new_registration);
+
+        assert!(
+            !remove_waiter_registration(
+                runtime.completion_waiters.as_ref(),
+                "reused-request",
+                old_registration,
+            )
+            .await
+        );
+        assert_eq!(
+            runtime
+                .completion_waiters
+                .lock()
+                .await
+                .get("reused-request")
+                .map(|waiter| waiter.registration_id),
+            Some(new_registration)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_waiter_guard_cleans_an_unbound_registration() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let (registration_id, receiver) = runtime
+            .register_waiter("cancelled-before-admission")
+            .await
+            .expect("waiter registration");
+        let guard = WaiterRegistrationGuard::new(
+            "cancelled-before-admission".to_string(),
+            registration_id,
+            runtime.completion_waiters.clone(),
+        );
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !runtime
+                    .completion_waiters
+                    .lock()
+                    .await
+                    .contains_key("cancelled-before-admission")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped guard did not remove its exact registration");
+        assert!(receiver.await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_pending_guard_reclaims_admitted_session_and_job() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        runtime.ensure_step_driver_started().await;
+        let mut request = EngineCoreRequest::tts("cancel between admission and waiter binding")
+            .with_model_variant(ModelVariant::Kokoro82M);
+        request.id = "cancel-during-waiter-binding".to_string();
+        request.prompt_tokens = vec![1];
+        let request_id = request.id.clone();
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("job shape");
+        let job = runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("job admission");
+        let (registration_id, receiver) = runtime
+            .register_waiter(&request_id)
+            .await
+            .expect("waiter registration");
+        let abandoned_session = runtime
+            .core_engine
+            .add_request_with_session(request)
+            .await
+            .expect("engine admission");
+        let residency_variant = ModelVariant::Kokoro82M;
+        let residency_lease = runtime
+            .model_manager
+            .acquire_residency_lease(residency_variant);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            1
+        );
+        let waiter_lock = runtime.completion_waiters.lock().await;
+        let guard = PendingRequestGuard::new(
+            abandoned_session.clone(),
+            runtime.core_engine.clone(),
+            runtime.completion_waiters.clone(),
+            registration_id,
+            runtime.telemetry.clone(),
+            job,
+            Some(residency_lease),
+        );
+
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            1,
+            "cancellation cleanup must retain the model residency lease"
+        );
+        drop(waiter_lock);
+        assert!(receiver.await.is_err());
+
+        let mut replacement = EngineCoreRequest::tts("reuse cancelled binding request id")
+            .with_model_variant(ModelVariant::Kokoro82M);
+        replacement.id = request_id.clone();
+        replacement.prompt_tokens = vec![2];
+        let replacement_session = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(session) = runtime
+                    .core_engine
+                    .add_request_with_session(replacement.clone())
+                    .await
+                {
+                    break session;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped pending guard kept the exact session fenced");
+        assert_ne!(replacement_session.epoch, abandoned_session.epoch);
+        assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            0
+        );
+        runtime.core_engine.abort_all_requests().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_pending_guard_retains_ownership_while_exact_abort_waits_for_core_step_lock() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request = EngineCoreRequest::tts("cancel during an in-flight engine step");
+        request.id = "cancel-during-engine-step".to_string();
+        request.prompt_tokens = vec![1];
+        request.model_variant = Some(ModelVariant::Kokoro82M);
+        let request_id = request.id.clone();
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("job shape");
+        let job = runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("job admission");
+        let (registration_id, receiver) = runtime
+            .register_waiter(&request_id)
+            .await
+            .expect("waiter registration");
+        let session = runtime
+            .core_engine
+            .add_request_with_session(request)
+            .await
+            .expect("engine admission");
+        let residency_variant = ModelVariant::Kokoro82M;
+        let residency_lease = runtime
+            .model_manager
+            .acquire_residency_lease(residency_variant);
+        let guard = PendingRequestGuard::new(
+            session,
+            runtime.core_engine.clone(),
+            runtime.completion_waiters.clone(),
+            registration_id,
+            runtime.telemetry.clone(),
+            job,
+            Some(residency_lease),
+        );
+
+        let (step_entered_tx, step_entered_rx) = oneshot::channel();
+        let (release_step_tx, release_step_rx) = oneshot::channel();
+        let engine = runtime.core_engine.clone();
+        let step_lock = tokio::spawn(async move {
+            engine
+                .hold_core_step_lock_for_test(step_entered_tx, release_step_rx)
+                .await;
+        });
+        step_entered_rx.await.expect("step lock was not acquired");
+
+        drop(guard);
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("cleanup did not remove its waiter before exact abort")
+            .is_err());
+        assert_eq!(runtime.coordinator_snapshot().active_jobs, 1);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            1,
+            "exact abort must retain residency while an engine step owns the core lock"
+        );
+
+        release_step_tx.send(()).expect("release step lock");
+        step_lock.await.expect("step-lock task");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.coordinator_snapshot().active_jobs == 0
+                    && runtime
+                        .model_manager
+                        .active_residency_leases(residency_variant)
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exact abort did not release request ownership after the core lock became safe");
+        runtime.core_engine.abort_all_requests().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonstreaming_engine_admission_returns_at_deadline_while_core_lock_is_held() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let (step_entered_tx, step_entered_rx) = oneshot::channel();
+        let (release_step_tx, release_step_rx) = oneshot::channel();
+        let engine = runtime.core_engine.clone();
+        let step_lock = tokio::spawn(async move {
+            engine
+                .hold_core_step_lock_for_test(step_entered_tx, release_step_rx)
+                .await;
+        });
+        step_entered_rx.await.expect("step lock was not acquired");
+
+        let request_id = "nonstreaming-admission-deadline".to_string();
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let residency_variant = ModelVariant::Kokoro82M;
+        let mut request = EngineCoreRequest::tts("bounded Engine admission")
+            .with_model_variant(residency_variant)
+            .with_deadline(Some(deadline));
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("job shape");
+        let job = runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("job admission");
+        let residency_lease = runtime
+            .model_manager
+            .acquire_residency_lease(residency_variant);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.run_request_after_admission(request, job, Some(residency_lease)),
+        )
+        .await
+        .expect("Engine admission waited for the core lock past its deadline")
+        .expect_err("expired Engine admission unexpectedly succeeded");
+        assert!(matches!(err, Error::Timeout(id) if id == request_id));
+        assert!(
+            !step_lock.is_finished(),
+            "the core lock was released too early"
+        );
+        assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            0
+        );
+        assert!(!runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key(&request_id));
+
+        release_step_tx.send(()).expect("release step lock");
+        step_lock.await.expect("step-lock task");
+        assert_eq!(
+            runtime.core_engine.request_session_key(&request_id).await,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_engine_admission_returns_at_deadline_while_core_lock_is_held() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let (step_entered_tx, step_entered_rx) = oneshot::channel();
+        let (release_step_tx, release_step_rx) = oneshot::channel();
+        let engine = runtime.core_engine.clone();
+        let step_lock = tokio::spawn(async move {
+            engine
+                .hold_core_step_lock_for_test(step_entered_tx, release_step_rx)
+                .await;
+        });
+        step_entered_rx.await.expect("step lock was not acquired");
+
+        let request_id = "streaming-admission-deadline".to_string();
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let residency_variant = ModelVariant::Kokoro82M;
+        let mut request = EngineCoreRequest::tts("bounded streaming Engine admission")
+            .with_model_variant(residency_variant)
+            .with_deadline(Some(deadline));
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        request.streaming = true;
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("job shape");
+        let job = runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("job admission");
+        let residency_lease = runtime
+            .model_manager
+            .acquire_residency_lease(residency_variant);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.run_streaming_request_after_admission(
+                request,
+                |_| std::future::ready(Ok(())),
+                job,
+                Some(residency_lease),
+            ),
+        )
+        .await
+        .expect("streaming Engine admission waited for the core lock past its deadline")
+        .expect_err("expired streaming Engine admission unexpectedly succeeded");
+        assert!(matches!(err, Error::Timeout(id) if id == request_id));
+        assert!(
+            !step_lock.is_finished(),
+            "the core lock was released too early"
+        );
+        assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            0
+        );
+        assert!(!runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key(&request_id));
+
+        release_step_tx.send(()).expect("release step lock");
+        step_lock.await.expect("step-lock task");
+        assert_eq!(
+            runtime.core_engine.request_session_key(&request_id).await,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_streaming_deadline_does_not_invoke_callback() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request_id = "expired-streaming-callback";
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let (observation_request, mut guard, receiver, residency_variant) =
+            pending_streaming_guard_fixture(&runtime, request_id, Some(deadline)).await;
+        tokio::time::sleep_until(deadline.into()).await;
+
+        let callback_invoked = Arc::new(AtomicBool::new(false));
+        let callback_observer = callback_invoked.clone();
+        let mut callback = move |_| {
+            callback_observer.store(true, Ordering::Release);
+            std::future::ready(Ok(()))
+        };
+        let chunk = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+
+        let err = runtime
+            .deliver_streaming_chunk_before_deadline(
+                &mut callback,
+                chunk,
+                Some(deadline),
+                request_id,
+                &observation_request,
+                &mut guard,
+            )
+            .await
+            .expect_err("expired callback unexpectedly ran");
+        assert!(matches!(err, Error::Timeout(id) if id == request_id));
+        assert!(
+            !callback_invoked.load(Ordering::Acquire),
+            "an expired request invoked synchronous callback code"
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("deadline cleanup did not remove its exact waiter")
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.coordinator_snapshot().active_jobs == 0
+                    && runtime
+                        .model_manager
+                        .active_residency_leases(residency_variant)
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deadline cleanup did not release request ownership");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hung_streaming_callback_is_bounded_by_absolute_request_deadline() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request_id = "hung-streaming-callback-deadline";
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let (observation_request, mut guard, receiver, residency_variant) =
+            pending_streaming_guard_fixture(&runtime, request_id, Some(deadline)).await;
+        let chunk = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+        let mut callback = |_| std::future::pending::<Result<()>>();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.deliver_streaming_chunk_before_deadline(
+                &mut callback,
+                chunk,
+                Some(deadline),
+                request_id,
+                &observation_request,
+                &mut guard,
+            ),
+        )
+        .await
+        .expect("hung callback outlived the absolute request deadline")
+        .expect_err("hung callback unexpectedly succeeded");
+        assert!(matches!(err, Error::Timeout(id) if id == request_id));
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("deadline cleanup did not remove its exact waiter")
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.coordinator_snapshot().active_jobs == 0
+                    && runtime
+                        .model_manager
+                        .active_residency_leases(residency_variant)
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deadline cleanup did not release request ownership");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_callback_failure_returns_while_exact_abort_waits_for_core_step_lock() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request_id = "streaming-callback-failure-during-step";
+        let (observation_request, mut guard, receiver, residency_variant) =
+            pending_streaming_guard_fixture(&runtime, request_id, None).await;
+        let chunk = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+        let (step_entered_tx, step_entered_rx) = oneshot::channel();
+        let (release_step_tx, release_step_rx) = oneshot::channel();
+        let engine = runtime.core_engine.clone();
+        let step_lock = tokio::spawn(async move {
+            engine
+                .hold_core_step_lock_for_test(step_entered_tx, release_step_rx)
+                .await;
+        });
+        step_entered_rx.await.expect("step lock was not acquired");
+        let mut callback = |_| {
+            std::future::ready(Err(Error::InferenceError(
+                "streaming callback failed".to_string(),
+            )))
+        };
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.deliver_streaming_chunk_before_deadline(
+                &mut callback,
+                chunk,
+                None,
+                request_id,
+                &observation_request,
+                &mut guard,
+            ),
+        )
+        .await
+        .expect("callback failure waited for the in-flight core step")
+        .expect_err("failing callback unexpectedly succeeded");
+        assert!(err.to_string().contains("streaming callback failed"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("detached cleanup did not remove its exact waiter")
+            .is_err());
+        assert_eq!(runtime.coordinator_snapshot().active_jobs, 1);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            1,
+            "detached exact abort released residency while the core lock was held"
+        );
+
+        release_step_tx.send(()).expect("release step lock");
+        step_lock.await.expect("step-lock task");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.coordinator_snapshot().active_jobs == 0
+                    && runtime
+                        .model_manager
+                        .active_residency_leases(residency_variant)
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exact abort did not release ownership after the core lock became safe");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_detached_cleanup_retains_request_ownership_fail_closed() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request = EngineCoreRequest::tts("abort detached cancellation cleanup");
+        request.id = "abort-detached-cleanup".to_string();
+        request.prompt_tokens = vec![1];
+        request.model_variant = Some(ModelVariant::Kokoro82M);
+        let request_id = request.id.clone();
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&request)
+            .expect("job shape");
+        let isolated_coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let job = isolated_coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("isolated job admission");
+        let (registration_id, receiver) = runtime
+            .register_waiter(&request_id)
+            .await
+            .expect("waiter registration");
+        let session = runtime
+            .core_engine
+            .add_request_with_session(request)
+            .await
+            .expect("engine admission");
+        let residency_variant = ModelVariant::Kokoro82M;
+        let residency_lease = runtime
+            .model_manager
+            .acquire_residency_lease(residency_variant);
+        let ownership = DeferredRequestOwnership::new(Some(job), Some(residency_lease));
+        let waiter_lock = runtime.completion_waiters.lock().await;
+        let cleanup = tokio::spawn(cleanup_pending_request(
+            session.clone(),
+            runtime.core_engine.clone(),
+            runtime.completion_waiters.clone(),
+            registration_id,
+            runtime.telemetry.clone(),
+            ownership,
+        ));
+
+        tokio::task::yield_now().await;
+        cleanup.abort();
+        assert!(cleanup
+            .await
+            .expect_err("cleanup task unexpectedly completed")
+            .is_cancelled());
+        assert_eq!(isolated_coordinator.snapshot().active_jobs, 1);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            1,
+            "aborting detached cleanup must retain model residency fail-closed"
+        );
+
+        drop(waiter_lock);
+        assert!(
+            remove_waiter_registration(
+                runtime.completion_waiters.as_ref(),
+                &request_id,
+                registration_id,
+            )
+            .await
+        );
+        assert!(receiver.await.is_err());
+        assert!(runtime
+            .core_engine
+            .abort_request_session(&session)
+            .await
+            .expect("manual exact abort"));
+        assert_eq!(isolated_coordinator.snapshot().active_jobs, 1);
+        assert_eq!(
+            runtime
+                .model_manager
+                .active_residency_leases(residency_variant),
+            1,
+            "cancelled cleanup ownership is intentionally unrecoverable"
+        );
+    }
+
+    #[test]
+    fn retained_chat_observation_uses_allocated_capacities_and_media_sources() {
+        use crate::models::shared::chat::{ChatMediaInput, ChatMediaKind, ChatRole};
+
+        let mut content = String::with_capacity(64);
+        content.push('x');
+        let mut messages = Vec::with_capacity(8);
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content,
+        });
+
+        let mut source = String::with_capacity(128);
+        source.push_str("image.png");
+        let mut media_inputs = Vec::with_capacity(3);
+        media_inputs.push(ChatMediaInput {
+            kind: ChatMediaKind::Image,
+            source,
+        });
+        let config = ChatRequestConfig {
+            media_inputs,
+            ..ChatRequestConfig::default()
+        };
+        let correlation_id = {
+            let mut value = String::with_capacity(32);
+            value.push_str("correlation");
+            value
+        };
+
+        let retained = retained_chat_preparation_input_bytes(
+            &messages,
+            messages.capacity(),
+            &config,
+            &GenerationParams::default(),
+            Some(&correlation_id),
+        )
+        .unwrap();
+        let minimum = messages.capacity() * std::mem::size_of::<ChatMessage>()
+            + 64
+            + config.media_inputs.capacity() * std::mem::size_of::<ChatMediaInput>()
+            + 128
+            + 32;
+
+        assert_eq!(retained, minimum);
+        assert!(retained > messages[0].content.len() + config.media_inputs[0].source.len());
+    }
+
+    #[test]
+    fn speech_to_speech_preparation_accounts_allocated_capacities() {
+        use crate::models::shared::chat::ChatRole;
+
+        let mut content = String::with_capacity(64);
+        content.push_str("hello");
+        let mut messages = Vec::with_capacity(8);
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content,
+        });
+        let mut speaker = String::with_capacity(32);
+        speaker.push_str("voice");
+        let params = GenerationParams {
+            speaker: Some(speaker),
+            ..GenerationParams::default()
+        };
+
+        let retained = retained_speech_to_speech_preparation_input_bytes(
+            4,
+            &messages,
+            messages.capacity(),
+            &params,
+            Some("system"),
+            Some("correlation"),
+        )
+        .expect("retained input");
+        let minimum = 4
+            + messages.capacity() * std::mem::size_of::<ChatMessage>()
+            + 64
+            + 32
+            + "system".len()
+            + "correlation".len();
+
+        assert_eq!(retained, minimum);
+    }
+
+    #[tokio::test]
+    async fn runtime_routes_terminal_before_releasing_exact_session_fence() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request = EngineCoreRequest::tts("expired terminal routing")
+            .with_model_variant(ModelVariant::Kokoro82M);
+        request.id = "runtime-terminal-routing".to_string();
+        request.prompt_tokens = vec![1];
+
+        let (registration, completion) = runtime
+            .register_waiter(&request.id)
+            .await
+            .expect("waiter registration");
+        runtime
+            .core_engine
+            .add_request(request.clone())
+            .await
+            .expect("request admission");
+        let session = runtime
+            .core_engine
+            .request_session_key(&request.id)
+            .await
+            .expect("request session");
+        runtime
+            .bind_waiter(&request.id, registration, session.epoch)
+            .await
+            .expect("waiter session binding");
+        assert!(
+            runtime
+                .core_engine
+                .set_request_hard_deadline_for_test(
+                    &request.id,
+                    Instant::now() - Duration::from_millis(1),
+                )
+                .await
+        );
+
+        let outputs = runtime
+            .core_engine
+            .step_for_dispatch()
+            .await
+            .expect("terminal step");
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_finished);
+        assert!(
+            runtime
+                .core_engine
+                .add_request(request.clone())
+                .await
+                .is_err(),
+            "the request ID must remain fenced while its terminal output awaits runtime routing"
+        );
+
+        route_terminal_output(
+            runtime.core_engine.as_ref(),
+            runtime.completion_waiters.as_ref(),
+            runtime.telemetry.as_ref(),
+            outputs.into_iter().next().unwrap(),
+        )
+        .await;
+        assert!(matches!(
+            completion.await.expect("completion channel"),
+            Err(Error::Timeout(request_id)) if request_id == request.id
+        ));
+
+        runtime
+            .core_engine
+            .add_request(request)
+            .await
+            .expect("the request ID must be reusable after routing acknowledgement");
+        runtime.core_engine.abort_all_requests().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_terminal_can_route_before_runtime_binds_atomic_admission_session() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request = EngineCoreRequest::tts("fast terminal waiter binding")
+            .with_model_variant(ModelVariant::Kokoro82M);
+        request.id = "runtime-fast-terminal-binding".to_string();
+        request.prompt_tokens = vec![1];
+
+        let (registration, completion) = runtime
+            .register_waiter(&request.id)
+            .await
+            .expect("waiter registration");
+        let session = runtime
+            .core_engine
+            .add_request_with_session(request.clone())
+            .await
+            .expect("atomic request admission");
+        assert!(
+            runtime
+                .core_engine
+                .set_request_hard_deadline_for_test(
+                    &request.id,
+                    Instant::now() - Duration::from_millis(1),
+                )
+                .await
+        );
+        let output = runtime
+            .core_engine
+            .step_for_dispatch()
+            .await
+            .expect("fast terminal step")
+            .into_iter()
+            .next()
+            .expect("terminal output");
+        assert_eq!(output.sequence_id, session.epoch);
+
+        let engine = runtime.core_engine.clone();
+        let waiters = runtime.completion_waiters.clone();
+        let telemetry = runtime.telemetry.clone();
+        let routing = tokio::spawn(async move {
+            route_terminal_output(
+                engine.as_ref(),
+                waiters.as_ref(),
+                telemetry.as_ref(),
+                output,
+            )
+            .await;
+        });
+        // Let routing observe the intentionally unbound registration first.
+        tokio::task::yield_now().await;
+        runtime
+            .bind_waiter(&request.id, registration, session.epoch)
+            .await
+            .expect("waiter session binding");
+        tokio::time::timeout(Duration::from_secs(1), routing)
+            .await
+            .expect("terminal routing waited forever for binding")
+            .expect("routing task panicked");
+        assert!(matches!(
+            completion.await.expect("completion channel"),
+            Err(Error::Timeout(request_id)) if request_id == request.id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_pending_guard_cleanup_cannot_abort_reused_session() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut old_request =
+            EngineCoreRequest::tts("old exact session").with_model_variant(ModelVariant::Kokoro82M);
+        old_request.id = "runtime-stale-pending-guard".to_string();
+        old_request.prompt_tokens = vec![1];
+        let request_id = old_request.id.clone();
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(&old_request)
+            .expect("job shape");
+        let job = runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("job admission");
+        let (registration, completion) = runtime
+            .register_waiter(&request_id)
+            .await
+            .expect("waiter registration");
+        let old_session = runtime
+            .core_engine
+            .add_request_with_session(old_request)
+            .await
+            .expect("old request admission");
+        runtime
+            .bind_waiter(&request_id, registration, old_session.epoch)
+            .await
+            .expect("old waiter binding");
+        let guard = PendingRequestGuard::new(
+            old_session.clone(),
+            runtime.core_engine.clone(),
+            runtime.completion_waiters.clone(),
+            registration,
+            runtime.telemetry.clone(),
+            job,
+            None,
+        );
+
+        assert!(runtime
+            .core_engine
+            .abort_request_session(&old_session)
+            .await
+            .expect("old exact abort"));
+        let old_terminal = runtime
+            .core_engine
+            .step_for_dispatch()
+            .await
+            .expect("old cancellation step")
+            .into_iter()
+            .next()
+            .expect("old cancellation output");
+        route_terminal_output(
+            runtime.core_engine.as_ref(),
+            runtime.completion_waiters.as_ref(),
+            runtime.telemetry.as_ref(),
+            old_terminal,
+        )
+        .await;
+        assert!(matches!(
+            completion.await.expect("completion channel"),
+            Err(Error::Cancelled(id)) if id == request_id
+        ));
+
+        let mut replacement = EngineCoreRequest::tts("replacement exact session")
+            .with_model_variant(ModelVariant::Kokoro82M);
+        replacement.id = request_id.clone();
+        replacement.prompt_tokens = vec![2];
+        let replacement_session = runtime
+            .core_engine
+            .add_request_with_session(replacement)
+            .await
+            .expect("replacement admission");
+        assert_ne!(replacement_session.epoch, old_session.epoch);
+
+        // The stale fallback runs after public-ID reuse. It must target only
+        // the old epoch and leave the replacement request untouched.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.coordinator_snapshot().active_jobs != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stale pending cleanup did not finish");
+        assert_eq!(
+            runtime.core_engine.request_session_key(&request_id).await,
+            Some(replacement_session)
+        );
+        runtime.core_engine.abort_all_requests().await;
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_output_cannot_steal_a_later_session_waiter() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request = EngineCoreRequest::tts("stale terminal routing")
+            .with_model_variant(ModelVariant::Kokoro82M);
+        request.id = "runtime-stale-terminal-routing".to_string();
+        request.prompt_tokens = vec![1];
+        runtime
+            .core_engine
+            .add_request(request.clone())
+            .await
+            .expect("old request admission");
+        assert!(
+            runtime
+                .core_engine
+                .set_request_hard_deadline_for_test(
+                    &request.id,
+                    Instant::now() - Duration::from_millis(1),
+                )
+                .await
+        );
+        let old_output = runtime
+            .core_engine
+            .step_for_dispatch()
+            .await
+            .expect("old terminal step")
+            .into_iter()
+            .next()
+            .expect("old terminal output");
+
+        let later_epoch = old_output
+            .sequence_id
+            .checked_add(1)
+            .expect("session epoch");
+        let (later_registration, mut later_completion) = runtime
+            .register_waiter(&request.id)
+            .await
+            .expect("later waiter registration");
+        runtime
+            .bind_waiter(&request.id, later_registration, later_epoch)
+            .await
+            .expect("later waiter binding");
+
+        route_terminal_output(
+            runtime.core_engine.as_ref(),
+            runtime.completion_waiters.as_ref(),
+            runtime.telemetry.as_ref(),
+            old_output,
+        )
+        .await;
+
+        assert!(matches!(
+            later_completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let waiters = runtime.completion_waiters.lock().await;
+        let later = waiters.get(&request.id).expect("later waiter retained");
+        assert_eq!(later.registration_id, later_registration);
+        assert_eq!(later.session_epoch, Some(later_epoch));
+        drop(waiters);
+        runtime.remove_waiter(&request.id, later_registration).await;
     }
 
     #[test]
@@ -1810,6 +3797,9 @@ mod tests {
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_reserved_host_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_reserved_device_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_reserved_unified_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_draining 0"));
 
         let snapshot = runtime.telemetry_snapshot().await;
@@ -2015,6 +4005,178 @@ mod tests {
             cuda.device_bytes,
             ResourceAmount::Known(BASE_WORKSPACE_BYTES)
         );
+    }
+
+    #[test]
+    fn media_preparation_estimates_map_to_physical_backend_domains() {
+        let estimate = crate::models::architectures::qwen35::Qwen35MediaResourceEstimate {
+            host_bytes: 300,
+            backend_tensor_bytes: 700,
+        };
+        let cpu = media_preparation_resources(BackendKind::Cpu, estimate).unwrap();
+        let metal = media_preparation_resources(BackendKind::Metal, estimate).unwrap();
+        let cuda = media_preparation_resources(BackendKind::Cuda, estimate).unwrap();
+
+        assert_eq!(cpu.host_bytes, ResourceAmount::Known(1_000));
+        assert_eq!(metal.unified_bytes, ResourceAmount::Known(1_000));
+        assert_eq!(cuda.host_bytes, ResourceAmount::Known(300));
+        assert_eq!(cuda.device_bytes, ResourceAmount::Known(700));
+        assert!(cpu.is_fully_known());
+        assert!(metal.is_fully_known());
+        assert!(cuda.is_fully_known());
+    }
+
+    #[test]
+    fn audio_decode_workspace_maps_to_host_or_unified_memory() {
+        let cpu = audio_decode_resources(BackendKind::Cpu);
+        let metal = audio_decode_resources(BackendKind::Metal);
+        let cuda = audio_decode_resources(BackendKind::Cuda);
+
+        assert_eq!(
+            cpu.host_bytes,
+            ResourceAmount::Known(AUDIO_DECODE_WORKSPACE_BYTES)
+        );
+        assert_eq!(
+            metal.unified_bytes,
+            ResourceAmount::Known(AUDIO_DECODE_WORKSPACE_BYTES)
+        );
+        assert_eq!(
+            cuda.host_bytes,
+            ResourceAmount::Known(AUDIO_DECODE_WORKSPACE_BYTES)
+        );
+        assert_eq!(cuda.device_bytes, ResourceAmount::Known(0));
+        assert!(task_decodes_audio(TaskType::ASR));
+        assert!(task_decodes_audio(TaskType::SpeechToSpeech));
+        assert!(!task_decodes_audio(TaskType::TTS));
+        assert!(!task_decodes_audio(TaskType::Chat));
+    }
+
+    #[test]
+    fn direct_audio_jobs_include_decoder_workspace_before_admission() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+        let input_bytes = 4096;
+        let context = RuntimeRequestContext::default();
+        let expected = transient_resources(backend, input_bytes)
+            .checked_add(audio_decode_resources(backend))
+            .expect("resource estimate");
+        let spec = runtime
+            .coordinator_job_for_audio_input(
+                "direct-asr-audio",
+                CoordinatorLane::Atomic,
+                context,
+                input_bytes,
+            )
+            .expect("direct audio job");
+
+        assert_eq!(spec.resources, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparation_copy_yields_between_bounded_quanta() {
+        use std::sync::atomic::AtomicBool;
+
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let input = vec![7_u8; PREPARATION_COPY_QUANTUM_BYTES * 3 + 17];
+        let spec = runtime
+            .coordinator_job_for_audio_input(
+                "yielding-audio-copy",
+                CoordinatorLane::Atomic,
+                RuntimeRequestContext::default(),
+                input.len(),
+            )
+            .expect("audio job");
+        let job = runtime.coordinator.admit(spec).await.expect("admission");
+        let peer_ran = Arc::new(AtomicBool::new(false));
+        let task_peer_ran = peer_ran.clone();
+        let peer = tokio::spawn(async move {
+            task_peer_ran.store(true, Ordering::Release);
+        });
+
+        let copied = copy_preparation_bytes(&job, &input, "test audio")
+            .await
+            .expect("copy");
+        assert!(
+            peer_ran.load(Ordering::Acquire),
+            "a multi-quantum copy must yield to another Tokio task"
+        );
+        let mut utf8_input = "x".repeat(PREPARATION_COPY_QUANTUM_BYTES - 1);
+        utf8_input.push('é');
+        let utf8_copy = copy_preparation_string(&job, &utf8_input, "test base64")
+            .await
+            .expect("UTF-8 copy");
+
+        assert_eq!(copied, input);
+        assert_eq!(utf8_copy, utf8_input);
+        peer.await.expect("peer task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparation_copy_stops_at_absolute_deadline() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let context = RuntimeRequestContext::default().with_deadline(deadline);
+        let spec = runtime
+            .coordinator_job_for_audio_input(
+                "expired-audio-copy",
+                CoordinatorLane::Atomic,
+                context,
+                8,
+            )
+            .expect("audio job");
+        let job = runtime.coordinator.admit(spec).await.expect("admission");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let error = copy_preparation_bytes(&job, &[0_u8; 8], "expired audio")
+            .await
+            .expect_err("copy must honor its absolute deadline");
+
+        assert!(matches!(error, Error::Timeout(request_id) if request_id == "expired-audio-copy"));
+    }
+
+    #[test]
+    fn core_audio_requests_include_decoder_workspace_in_job_authorization() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let backend = runtime.backend_context().backend_kind;
+
+        let asr = EngineCoreRequest::asr("AAAA");
+        let speech_to_speech = EngineCoreRequest::speech_to_speech("AAAA");
+        let plain_tts = EngineCoreRequest::tts("hello");
+        let mut reference_tts = EngineCoreRequest::tts("hello");
+        reference_tts.reference_audio = Some("AAAA".to_string());
+        reference_tts.reference_text = Some("reference transcript".to_string());
+        let mut canonical_reference_tts = reference_tts.clone();
+        canonical_reference_tts
+            .canonicalize_direct_payloads(runtime.config.max_sequence_length)
+            .expect("canonical TTS reference");
+        assert!(canonical_reference_tts.reference_audio.is_none());
+        assert!(canonical_reference_tts.has_tts_reference_for_execution());
+
+        for request in [
+            &asr,
+            &speech_to_speech,
+            &reference_tts,
+            &canonical_reference_tts,
+        ] {
+            let input_bytes =
+                retained_engine_request_input_bytes(request).expect("retained request input");
+            let expected = transient_resources(backend, input_bytes)
+                .checked_add(audio_decode_resources(backend))
+                .expect("resource estimate");
+            let (spec, _) = runtime
+                .coordinator_job_for_request(request)
+                .expect("coordinator job");
+
+            assert_eq!(spec.resources, expected);
+        }
+
+        let plain_tts_input =
+            retained_engine_request_input_bytes(&plain_tts).expect("retained request input");
+        let expected_plain_tts = transient_resources(backend, plain_tts_input);
+        let (plain_tts_spec, _) = runtime
+            .coordinator_job_for_request(&plain_tts)
+            .expect("coordinator job");
+        assert_eq!(plain_tts_spec.resources, expected_plain_tts);
     }
 
     #[test]

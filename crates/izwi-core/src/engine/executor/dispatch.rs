@@ -220,6 +220,7 @@ impl NativeExecutor {
         // allocated. The lease remains attached to the exact session until
         // finish, abort, failure cleanup, or recompute preemption.
         self.reserve_scheduled_cache(requests, scheduled)?;
+        self.prepare_scheduled_cache(scheduled)?;
         let (outputs, dispatch) = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled)
         {
             let result = result?;

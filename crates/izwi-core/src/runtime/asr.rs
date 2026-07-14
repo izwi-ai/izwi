@@ -1,8 +1,10 @@
 //! ASR runtime methods routed through the unified core engine.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
@@ -17,10 +19,16 @@ use crate::models::registry::{
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
 use crate::runtime::adapters::CapabilityKind;
-use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_seconds_fast};
-use crate::runtime::coordinator::{InferenceCoordinator, JobLease};
-use crate::runtime::request::{AlignmentRuntimeRequest, AsrRuntimeRequest};
-use crate::runtime::service::{AdmittedEngineRequest, RuntimeService};
+use crate::runtime::audio_io::{
+    base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
+    validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
+};
+use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
+use crate::runtime::request::AsrRuntimeRequest;
+use crate::runtime::service::{
+    copy_optional_preparation_string, copy_preparation_bytes, copy_preparation_string,
+    AdmittedEngineRequest, RuntimeService,
+};
 use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
@@ -32,6 +40,83 @@ use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 enum AsrAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
+}
+
+enum OwnedAsrAudioInput {
+    Base64(String),
+    Bytes(Vec<u8>),
+}
+
+impl AsrAudioInput<'_> {
+    fn input_bytes(self) -> usize {
+        match self {
+            Self::Base64(audio) => audio.len(),
+            Self::Bytes(audio) => audio.len(),
+        }
+    }
+
+    fn validate_retained_size(self) -> Result<()> {
+        match self {
+            Self::Base64(audio) => {
+                validate_base64_audio_retained_size(audio.len(), MAX_AUDIO_SOURCE_BYTES)
+            }
+            Self::Bytes(audio) if audio.is_empty() => Err(Error::InvalidInput(
+                "ASR request missing audio bytes".to_string(),
+            )),
+            Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "ASR encoded audio is {} bytes, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    audio.len()
+                )))
+            }
+            Self::Bytes(_) => Ok(()),
+        }
+    }
+
+    async fn into_owned_for_job(self, job: &JobLease) -> Result<OwnedAsrAudioInput> {
+        match self {
+            Self::Base64(audio) => Ok(OwnedAsrAudioInput::Base64(
+                copy_preparation_string(job, audio, "ASR base64 audio").await?,
+            )),
+            Self::Bytes(audio) => Ok(OwnedAsrAudioInput::Bytes(
+                copy_preparation_bytes(job, audio, "ASR encoded audio").await?,
+            )),
+        }
+    }
+}
+
+impl OwnedAsrAudioInput {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Base64(audio) => audio.capacity(),
+            Self::Bytes(audio) => audio.capacity(),
+        }
+    }
+
+    fn decode(&self) -> Result<(Vec<f32>, u32)> {
+        match self {
+            Self::Base64(audio) => {
+                let audio = base64_decode(audio)?;
+                decode_audio_bytes(&audio)
+            }
+            Self::Bytes(audio) => decode_audio_bytes(audio),
+        }
+    }
+
+    fn validate_source_size(&self) -> Result<()> {
+        match self {
+            Self::Base64(audio) => {
+                validate_base64_audio_source_size(audio, MAX_AUDIO_SOURCE_BYTES)
+            }
+            Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "ASR encoded audio is {} bytes, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    audio.len()
+                )))
+            }
+            Self::Bytes(_) => Ok(()),
+        }
+    }
 }
 
 const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 76;
@@ -52,6 +137,12 @@ const GRANITE_SAA_PREFIX_MAX_CHARS: usize = 6_000;
 const GRANITE_SAA_MIN_OVERLAP_WORDS: usize = 4;
 const GRANITE_SAA_MAX_OVERLAP_WORDS: usize = 80;
 const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
+const ASR_REALTIME_MAX_SESSIONS_ENV: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
+const ASR_REALTIME_MAX_LIFETIME_SECS_ENV: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
+const ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
+const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 16;
+const DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS: u64 = 10 * 60;
+const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraniteSaaPrefixMode {
@@ -97,38 +188,400 @@ pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> us
         .clamp(GRANITE_ASR_AUTO_MIN_TOKENS, GRANITE_ASR_AUTO_MAX_TOKENS)
 }
 
-fn granite_auto_asr_max_tokens(
-    variant: ModelVariant,
-    audio_input: AsrAudioInput<'_>,
-) -> Result<Option<usize>> {
-    if variant.family() != ModelFamily::GraniteSpeechAsr {
-        return Ok(None);
+fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
+    // The executor already derives the exact per-chunk budget after its
+    // admitted blocking audio decode. Reserving the production ceiling here
+    // avoids decoding compressed public input synchronously on a Tokio worker
+    // merely to construct the engine request.
+    (variant.family() == ModelFamily::GraniteSpeechAsr).then_some(GRANITE_ASR_AUTO_MAX_TOKENS)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RealtimeAsrSessionLimits {
+    max_sessions: usize,
+    max_lifetime: Duration,
+    idle_timeout: Duration,
+}
+
+impl RealtimeAsrSessionLimits {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            max_sessions: positive_usize_env_or_default(
+                ASR_REALTIME_MAX_SESSIONS_ENV,
+                DEFAULT_ASR_REALTIME_MAX_SESSIONS,
+            )?,
+            max_lifetime: Duration::from_secs(positive_u64_env_or_default(
+                ASR_REALTIME_MAX_LIFETIME_SECS_ENV,
+                DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS,
+            )?),
+            idle_timeout: Duration::from_secs(positive_u64_env_or_default(
+                ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV,
+                DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS,
+            )?),
+        })
     }
-    let audio_bytes = match audio_input {
-        AsrAudioInput::Base64(audio_base64) => base64_decode(audio_base64)?,
-        AsrAudioInput::Bytes(audio_bytes) => audio_bytes.to_vec(),
-    };
-    let audio_seconds = if let Some(duration) = wav_duration_seconds_fast(&audio_bytes) {
-        duration
-    } else {
-        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
-        if sample_rate > 0 {
-            samples.len() as f32 / sample_rate as f32
-        } else {
-            0.0
+}
+
+#[derive(Clone)]
+pub(super) struct RealtimeAsrSessionPolicy {
+    limits: RealtimeAsrSessionLimits,
+    permits: Arc<Semaphore>,
+}
+
+impl RealtimeAsrSessionPolicy {
+    pub(super) fn from_env() -> Result<Self> {
+        Self::new(RealtimeAsrSessionLimits::from_env()?)
+    }
+
+    fn new(limits: RealtimeAsrSessionLimits) -> Result<Self> {
+        if limits.max_sessions > Semaphore::MAX_PERMITS {
+            return Err(Error::ConfigError(format!(
+                "{ASR_REALTIME_MAX_SESSIONS_ENV} cannot exceed {}",
+                Semaphore::MAX_PERMITS
+            )));
         }
+        if Instant::now().checked_add(limits.max_lifetime).is_none() {
+            return Err(Error::ConfigError(format!(
+                "{ASR_REALTIME_MAX_LIFETIME_SECS_ENV} exceeds the platform clock range"
+            )));
+        }
+        Ok(Self {
+            permits: Arc::new(Semaphore::new(limits.max_sessions)),
+            limits,
+        })
+    }
+
+    fn try_acquire(&self) -> Result<Arc<RealtimeAsrSessionLease>> {
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Overloaded("realtime ASR session quota is full".to_string()))?;
+        Ok(Arc::new(RealtimeAsrSessionLease { _permit: permit }))
+    }
+}
+
+struct RealtimeAsrSessionLease {
+    _permit: OwnedSemaphorePermit,
+}
+
+fn positive_usize_env_or_default(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| Error::ConfigError(format!("{name} must be a positive integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::ConfigError(format!(
+            "{name} must contain valid UTF-8"
+        ))),
+    }
+}
+
+fn positive_u64_env_or_default(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| Error::ConfigError(format!("{name} must be a positive integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::ConfigError(format!(
+            "{name} must contain valid UTF-8"
+        ))),
+    }
+}
+
+struct RuntimeAsrRealtimeResources {
+    model: Option<Arc<NativeAsrModel>>,
+    state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    residency_lease: Option<ModelResidencyLease>,
+    job: Option<JobLease>,
+    session_lease: Option<Arc<RealtimeAsrSessionLease>>,
+    absolute_deadline: Instant,
+    idle_timeout: Duration,
+    last_activity: Instant,
+    active_operations: usize,
+    closed: bool,
+    timeout_reason: Option<&'static str>,
+}
+
+impl RuntimeAsrRealtimeResources {
+    fn idle_deadline(&self) -> Instant {
+        self.last_activity
+            .checked_add(self.idle_timeout)
+            .unwrap_or(self.absolute_deadline)
+            .min(self.absolute_deadline)
+    }
+
+    fn next_watchdog_deadline(&self) -> Option<Instant> {
+        if self.closed {
+            None
+        } else if self.active_operations > 0 {
+            Some(self.absolute_deadline)
+        } else {
+            Some(self.idle_deadline())
+        }
+    }
+
+    fn expiration(&self, now: Instant) -> Option<&'static str> {
+        realtime_asr_session_expiration(
+            now,
+            self.absolute_deadline,
+            self.idle_deadline(),
+            self.active_operations,
+        )
+    }
+
+    fn detach(&mut self) -> Option<RealtimeAsrDetachedResources> {
+        if self.closed {
+            return None;
+        }
+        self.closed = true;
+        Some(RealtimeAsrDetachedResources {
+            state: self.state.take(),
+            model: self.model.take(),
+            residency_lease: self.residency_lease.take(),
+            job: self.job.take(),
+            session_lease: self.session_lease.take(),
+        })
+    }
+
+    fn detach_expired(&mut self, reason: &'static str) -> Option<RealtimeAsrDetachedResources> {
+        self.timeout_reason = Some(reason);
+        self.detach()
+    }
+
+    fn closed_error(&self) -> Error {
+        match self.timeout_reason {
+            Some(reason) => Error::Timeout(reason.to_string()),
+            None => Error::InvalidInput("realtime ASR stream is closed".to_string()),
+        }
+    }
+}
+
+struct RealtimeAsrDetachedResources {
+    state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    model: Option<Arc<NativeAsrModel>>,
+    residency_lease: Option<ModelResidencyLease>,
+    job: Option<JobLease>,
+    session_lease: Option<Arc<RealtimeAsrSessionLease>>,
+}
+
+impl RealtimeAsrDetachedResources {
+    fn release(mut self) {
+        // Physical allocations must disappear before their immutable
+        // authorization and quota are released for another session.
+        self.state.take();
+        self.model.take();
+        self.residency_lease.take();
+        self.job.take();
+        self.session_lease.take();
+    }
+}
+
+fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) {
+    let Some(cleanup) = cleanup else {
+        return;
     };
-    Ok(Some(granite_auto_asr_max_tokens_for_duration(
-        audio_seconds,
-    )))
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || cleanup.release());
+    } else {
+        cleanup.release();
+    }
+}
+
+struct RealtimeAsrOperationHandles {
+    model: Arc<NativeAsrModel>,
+    state: Arc<StdMutex<NativeAsrRealtimeState>>,
+    job: JobLease,
+    session_lease: Arc<RealtimeAsrSessionLease>,
+    _guard: RealtimeAsrOperationGuard,
+}
+
+struct RealtimeAsrOperationGuard {
+    resources: Arc<StdMutex<RuntimeAsrRealtimeResources>>,
+    activity: Arc<Notify>,
+}
+
+impl Drop for RealtimeAsrOperationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut resources) = self.resources.lock() {
+            resources.active_operations = resources.active_operations.saturating_sub(1);
+            if !resources.closed {
+                resources.last_activity = Instant::now();
+            }
+        }
+        self.activity.notify_one();
+    }
 }
 
 pub struct RuntimeAsrRealtimeStream {
     variant: ModelVariant,
-    model: Arc<NativeAsrModel>,
-    state: NativeAsrRealtimeState,
-    _lease: ModelResidencyLease,
-    _job: JobLease,
+    resources: Arc<StdMutex<RuntimeAsrRealtimeResources>>,
+    activity: Arc<Notify>,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
+    max_samples: usize,
+}
+
+impl RuntimeAsrRealtimeStream {
+    fn begin_operation(&mut self, refresh_activity: bool) -> Result<RealtimeAsrOperationHandles> {
+        let now = Instant::now();
+        let mut resources = self.resources.lock().map_err(|_| {
+            Error::InferenceError("realtime ASR resource mutex poisoned".to_string())
+        })?;
+        if resources.closed {
+            return Err(resources.closed_error());
+        }
+        if let Some(reason) = resources.expiration(now) {
+            let cleanup = resources.detach_expired(reason);
+            drop(resources);
+            schedule_realtime_asr_cleanup(cleanup);
+            return Err(Error::Timeout(reason.to_string()));
+        }
+        let model = resources.model.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR stream model is unavailable".to_string())
+        })?;
+        let state = resources.state.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR stream state is unavailable".to_string())
+        })?;
+        let job = resources.job.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR stream job is unavailable".to_string())
+        })?;
+        let session_lease = resources.session_lease.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR session lease is unavailable".to_string())
+        })?;
+        let active_operations = resources.active_operations.checked_add(1).ok_or_else(|| {
+            Error::Overloaded("realtime ASR operation count overflowed".to_string())
+        })?;
+        if refresh_activity {
+            resources.last_activity = now;
+        }
+        resources.active_operations = active_operations;
+        drop(resources);
+        if refresh_activity {
+            self.activity.notify_one();
+        }
+        Ok(RealtimeAsrOperationHandles {
+            model,
+            state,
+            job,
+            session_lease,
+            _guard: RealtimeAsrOperationGuard {
+                resources: self.resources.clone(),
+                activity: self.activity.clone(),
+            },
+        })
+    }
+
+    fn ensure_open(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let mut resources = self.resources.lock().map_err(|_| {
+            Error::InferenceError("realtime ASR resource mutex poisoned".to_string())
+        })?;
+        if resources.closed {
+            return Err(resources.closed_error());
+        }
+        if let Some(reason) = resources.expiration(now) {
+            let cleanup = resources.detach_expired(reason);
+            drop(resources);
+            schedule_realtime_asr_cleanup(cleanup);
+            return Err(Error::Timeout(reason.to_string()));
+        }
+        Ok(())
+    }
+
+    fn close(&self) {
+        let cleanup = self
+            .resources
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .detach();
+        schedule_realtime_asr_cleanup(cleanup);
+        self.activity.notify_one();
+    }
+
+    fn close_due_to_timeout(&self) {
+        let mut resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let reason = resources
+            .expiration(Instant::now())
+            .unwrap_or("realtime ASR operation timed out");
+        let cleanup = resources.detach_expired(reason);
+        drop(resources);
+        schedule_realtime_asr_cleanup(cleanup);
+        self.activity.notify_one();
+    }
+}
+
+impl Drop for RuntimeAsrRealtimeStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn realtime_asr_session_expiration(
+    now: Instant,
+    absolute_deadline: Instant,
+    idle_deadline: Instant,
+    active_operations: usize,
+) -> Option<&'static str> {
+    if now >= absolute_deadline {
+        Some("realtime ASR stream exceeded its absolute lifetime")
+    } else if active_operations == 0 && now >= idle_deadline {
+        Some("realtime ASR stream exceeded its idle timeout")
+    } else {
+        None
+    }
+}
+
+fn spawn_realtime_asr_watchdog(
+    resources: &Arc<StdMutex<RuntimeAsrRealtimeResources>>,
+    activity: Arc<Notify>,
+) {
+    let weak_resources = Arc::downgrade(resources);
+    tokio::spawn(async move {
+        loop {
+            // Register before reading the deadline so activity between the
+            // state snapshot and select cannot be lost.
+            let notified = activity.notified();
+            let Some(resources) = weak_resources.upgrade() else {
+                return;
+            };
+            let deadline = match resources.lock() {
+                Ok(resources) => resources.next_watchdog_deadline(),
+                Err(_) => return,
+            };
+            drop(resources);
+            let Some(deadline) = deadline else {
+                return;
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    let Some(resources) = weak_resources.upgrade() else {
+                        return;
+                    };
+                    let mut resources = match resources.lock() {
+                        Ok(resources) => resources,
+                        Err(_) => return,
+                    };
+                    if let Some(reason) = resources.expiration(Instant::now()) {
+                        let cleanup = resources.detach_expired(reason);
+                        drop(resources);
+                        schedule_realtime_asr_cleanup(cleanup);
+                        return;
+                    }
+                }
+                _ = notified => {}
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +602,112 @@ fn map_native_realtime_events(events: Vec<NativeAsrRealtimeEvent>) -> Vec<Runtim
             chunk_index: event.chunk_index,
         })
         .collect()
+}
+
+fn realtime_state_observation(state: &NativeAsrRealtimeState) -> Result<JobResourceObservation> {
+    let (host_bytes, tensor_bytes) = state.resource_usage().ok_or_else(|| {
+        Error::InferenceError("realtime ASR state resource usage is unavailable".to_string())
+    })?;
+    Ok(JobResourceObservation::new(host_bytes, tensor_bytes))
+}
+
+fn realtime_state_with_input_observation(
+    state: &NativeAsrRealtimeState,
+    input_sample_capacity: usize,
+) -> Result<JobResourceObservation> {
+    let mut observation = realtime_state_observation(state)?;
+    let input_bytes = input_sample_capacity
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::Overloaded("realtime ASR input storage overflowed".to_string()))?;
+    observation.host_bytes = observation
+        .host_bytes
+        .checked_add(input_bytes)
+        .ok_or_else(|| Error::Overloaded("realtime ASR host usage overflowed".to_string()))?;
+    Ok(observation)
+}
+
+fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> {
+    Ok(JobResourceObservation::host(
+        u64::try_from(input_bytes)
+            .map_err(|_| Error::InvalidInput("runtime input size exceeds u64".to_string()))?,
+    ))
+}
+
+fn retained_host_observation(parts: &[usize]) -> Result<JobResourceObservation> {
+    let bytes = parts.iter().try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(*bytes)
+            .ok_or_else(|| Error::Overloaded("retained ASR storage overflowed".to_string()))
+    })?;
+    host_input_observation(bytes)
+}
+
+fn add_retained_host_bytes(
+    mut observation: JobResourceObservation,
+    retained_bytes: usize,
+) -> Result<JobResourceObservation> {
+    let retained_bytes = u64::try_from(retained_bytes)
+        .map_err(|_| Error::Overloaded("retained ASR storage exceeds u64".to_string()))?;
+    observation.host_bytes = observation
+        .host_bytes
+        .checked_add(retained_bytes)
+        .ok_or_else(|| Error::Overloaded("retained ASR storage overflowed".to_string()))?;
+    Ok(observation)
+}
+
+fn decoded_audio_observation(
+    input_bytes: usize,
+    sample_capacity: usize,
+) -> Result<JobResourceObservation> {
+    let sample_bytes = sample_capacity
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| bytes.checked_add(input_bytes))
+        .ok_or_else(|| Error::Overloaded("decoded audio storage overflowed".to_string()))?;
+    host_input_observation(sample_bytes)
+}
+
+fn decoded_audio_with_scratch_observation(
+    input_bytes: usize,
+    sample_count: usize,
+    scratch_sample_count: usize,
+) -> Result<JobResourceObservation> {
+    let samples = sample_count
+        .checked_add(scratch_sample_count)
+        .ok_or_else(|| Error::Overloaded("ASR sample storage overflowed".to_string()))?;
+    decoded_audio_observation(input_bytes, samples)
+}
+
+fn validate_realtime_input_copy(samples: usize, max_samples: usize) -> Result<()> {
+    if samples > max_samples {
+        return Err(Error::InvalidInput(format!(
+            "Realtime ASR input chunk of {samples} samples exceeds the stream reservation of {max_samples} samples"
+        )));
+    }
+    Ok(())
+}
+
+async fn run_realtime_blocking_operation<T, B, F>(
+    coordinator: &Arc<InferenceCoordinator>,
+    job: &JobLease,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
+    build_operation: B,
+) -> Result<T>
+where
+    T: Send + 'static,
+    B: FnOnce() -> Result<F> + Send,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let operation_gate = coordinator
+        .acquire_job_ordering(job, operation_gate)
+        .await?;
+    let operation = build_operation()?;
+    coordinator
+        .run_blocking_stage(job, move || {
+            let _operation_gate = operation_gate;
+            operation()
+        })
+        .await
 }
 
 fn realtime_stream_resource_vector(
@@ -202,7 +761,14 @@ impl RuntimeService {
         };
 
         self.observe_broker_capability_request(CapabilityKind::RealtimeAsr, Some(variant), true)?;
-        let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Realtime);
+        let started_at = Instant::now();
+        let limits = self.asr_realtime_sessions.limits;
+        let session_lease = self.asr_realtime_sessions.try_acquire()?;
+        let absolute_deadline = started_at.checked_add(limits.max_lifetime).ok_or_else(|| {
+            Error::ConfigError("realtime ASR absolute lifetime overflowed".to_string())
+        })?;
+        let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Realtime)
+            .with_deadline(absolute_deadline);
         let metadata_bytes =
             language.map(str::len).unwrap_or_default() + prompt.map(str::len).unwrap_or_default();
         let reservation = NativeAsrModel::conservative_realtime_stream_resource_reservation(
@@ -219,8 +785,11 @@ impl RuntimeService {
             self.backend_context().backend_kind,
             reservation,
         )?;
-        let job = self.coordinator.admit(job_spec).await?;
-        let lease = self.load_model_for_inference(variant).await?;
+        let job = self
+            .coordinator
+            .admit_observed(job_spec, host_input_observation(metadata_bytes)?)
+            .await?;
+        let lease = self.load_asr_model_for_job(&job, variant).await?;
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
                 Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -228,19 +797,67 @@ impl RuntimeService {
         if !model.supports_realtime_stream_decode() {
             return Ok(None);
         }
-        let state = model.start_realtime_stream_state_with_reservation(
-            language,
-            prompt,
-            None,
-            reservation,
-        )?;
+        let operation_lease = self
+            .model_lifecycle
+            .try_acquire_ready_lease(variant)
+            .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not resident")))?;
+        let task_model = model.clone();
+        let language = language.map(ToOwned::to_owned);
+        let prompt = prompt.map(ToOwned::to_owned);
+        let retained_metadata_bytes = metadata_bytes
+            .checked_add(language.as_ref().map_or(0, String::capacity))
+            .and_then(|bytes| bytes.checked_add(prompt.as_ref().map_or(0, String::capacity)))
+            .ok_or_else(|| Error::Overloaded("realtime ASR metadata overflowed".to_string()))?;
+        job.record_materialized_usage(retained_host_observation(&[
+            metadata_bytes,
+            language.as_ref().map_or(0, String::capacity),
+            prompt.as_ref().map_or(0, String::capacity),
+        ])?)?;
+        let task_session_lease = session_lease.clone();
+        let (state, language, prompt) = self
+            .coordinator
+            .run_blocking_stage(&job, move || {
+                let _operation_lease = operation_lease;
+                let _session_lease = task_session_lease;
+                let state = task_model.start_realtime_stream_state_with_reservation(
+                    language.as_deref(),
+                    prompt.as_deref(),
+                    None,
+                    reservation,
+                )?;
+                Ok((state, language, prompt))
+            })
+            .await?;
+        let steady_usage = realtime_state_observation(&state)?;
+        job.record_materialized_usage(add_retained_host_bytes(
+            steady_usage,
+            retained_metadata_bytes,
+        )?)?;
+        job.prepare_materialized_release(steady_usage)?;
+        drop((language, prompt));
+
+        let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
+            model: Some(model),
+            state: Some(Arc::new(StdMutex::new(state))),
+            residency_lease: Some(lease),
+            job: Some(job),
+            session_lease: Some(session_lease),
+            absolute_deadline,
+            idle_timeout: limits.idle_timeout,
+            last_activity: Instant::now(),
+            active_operations: 0,
+            closed: false,
+            timeout_reason: None,
+        }));
+        let activity = Arc::new(Notify::new());
+        spawn_realtime_asr_watchdog(&resources, activity.clone());
 
         Ok(Some(RuntimeAsrRealtimeStream {
             variant,
-            model,
-            state,
-            _lease: lease,
-            _job: job,
+            resources,
+            activity,
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            max_samples: reservation.max_samples(),
         }))
     }
 
@@ -250,14 +867,74 @@ impl RuntimeService {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
-        let _execution = self
-            .coordinator
-            .acquire_execution(stream._job.spec.deadline)
-            .await?;
-        let events =
-            stream
-                .model
-                .push_realtime_stream_samples(&mut stream.state, samples, sample_rate)?;
+        // Reject an impossible single packet before acquiring residency or
+        // allocating the owned copy needed by the blocking worker.
+        validate_realtime_input_copy(samples.len(), stream.max_samples)?;
+        if samples.is_empty() {
+            stream.ensure_open()?;
+            return Ok(Vec::new());
+        }
+        let handles = stream.begin_operation(true)?;
+        let operation_lease = self
+            .model_lifecycle
+            .try_acquire_ready_lease(stream.variant)
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
+            });
+        let operation_lease = match operation_lease {
+            Ok(lease) => lease,
+            Err(err) => {
+                stream.close();
+                return Err(err);
+            }
+        };
+        let operation_gate = stream.operation_gate.clone();
+        let RealtimeAsrOperationHandles {
+            model,
+            state,
+            job,
+            session_lease,
+            _guard: operation_guard,
+        } = handles;
+        let observation_job = job.clone();
+        let result =
+            run_realtime_blocking_operation(&self.coordinator, &job, operation_gate, || {
+                // The ordering guard is held before this allocation, bounding
+                // each stream to one owned packet even after caller timeout.
+                let samples = samples.to_vec();
+                Ok(move || {
+                    let _operation_lease = operation_lease;
+                    let _session_lease = session_lease;
+                    let _operation_guard = operation_guard;
+                    let mut state = state.lock().map_err(|_| {
+                        Error::InferenceError("realtime ASR state mutex poisoned".to_string())
+                    })?;
+                    // Streaming internals replace and release model-owned
+                    // tensors while decoding. Restore the full pending claim
+                    // before entering that transition so any physical frees
+                    // cannot be observed as unclaimed headroom.
+                    observation_job
+                        .prepare_materialized_release(JobResourceObservation::default())?;
+                    let events =
+                        model.push_realtime_stream_samples(&mut state, &samples, sample_rate);
+                    observation_job.record_materialized_usage(
+                        realtime_state_with_input_observation(&state, samples.capacity())?,
+                    )?;
+                    let steady_usage = realtime_state_observation(&state)?;
+                    observation_job.prepare_materialized_release(steady_usage)?;
+                    drop(samples);
+                    events
+                })
+            })
+            .await;
+        if let Err(err) = &result {
+            if matches!(err, Error::Timeout(_)) {
+                stream.close_due_to_timeout();
+            } else {
+                stream.close();
+            }
+        }
+        let events = result?;
         Ok(map_native_realtime_events(events))
     }
 
@@ -265,11 +942,50 @@ impl RuntimeService {
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
-        let _execution = self
-            .coordinator
-            .acquire_execution(stream._job.spec.deadline)
-            .await?;
-        let events = stream.model.finish_realtime_stream(&mut stream.state)?;
+        let handles = stream.begin_operation(false)?;
+        let operation_lease = self
+            .model_lifecycle
+            .try_acquire_ready_lease(stream.variant)
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
+            });
+        let operation_lease = match operation_lease {
+            Ok(lease) => lease,
+            Err(err) => {
+                stream.close();
+                return Err(err);
+            }
+        };
+        let operation_gate = stream.operation_gate.clone();
+        let RealtimeAsrOperationHandles {
+            model,
+            state,
+            job,
+            session_lease,
+            _guard: operation_guard,
+        } = handles;
+        let observation_job = job.clone();
+        let result =
+            run_realtime_blocking_operation(&self.coordinator, &job, operation_gate, || {
+                Ok(move || {
+                    let _operation_lease = operation_lease;
+                    let _session_lease = session_lease;
+                    let _operation_guard = operation_guard;
+                    let mut state = state.lock().map_err(|_| {
+                        Error::InferenceError("realtime ASR state mutex poisoned".to_string())
+                    })?;
+                    observation_job
+                        .prepare_materialized_release(JobResourceObservation::default())?;
+                    model.finish_realtime_stream(&mut state)
+                })
+            })
+            .await;
+        if matches!(&result, Err(Error::Timeout(_))) {
+            stream.close_due_to_timeout();
+        } else {
+            stream.close();
+        }
+        let events = result?;
         Ok(map_native_realtime_events(events))
     }
 
@@ -277,18 +993,61 @@ impl RuntimeService {
         stream.variant
     }
 
-    async fn asr_transcribe_audio_chat_samples<F>(
+    async fn load_asr_model_for_job(
+        &self,
+        job: &JobLease,
+        variant: ModelVariant,
+    ) -> Result<ModelResidencyLease> {
+        match job.spec.deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline.into(), self.load_model_for_inference(variant))
+                    .await
+                    .map_err(|_| Error::Timeout(job.spec.request_id.clone()))?
+            }
+            None => self.load_model_for_inference(variant).await,
+        }
+    }
+
+    async fn asr_transcribe_audio_chat<F>(
         &self,
         variant: ModelVariant,
-        samples: Vec<f32>,
-        sample_rate: u32,
+        audio_input: AsrAudioInput<'_>,
         max_tokens: Option<usize>,
-        mut on_delta: F,
+        on_delta: F,
+        request_id: String,
+        runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription>
     where
-        F: FnMut(String),
+        F: FnMut(String) + Send + 'static,
     {
-        let _lease = self.load_model_for_inference(variant).await?;
+        let input_bytes = audio_input.input_bytes();
+        if input_bytes == 0 {
+            return Err(Error::InvalidInput(
+                "ASR request missing audio input".to_string(),
+            ));
+        }
+        audio_input.validate_retained_size()?;
+        let spec = self.coordinator_job_for_audio_input(
+            request_id,
+            CoordinatorLane::Atomic,
+            runtime_context,
+            input_bytes,
+        )?;
+        let job = self
+            .coordinator
+            .admit_observed(spec, host_input_observation(input_bytes)?)
+            .await?;
+
+        // Establish an owned packet only after admission. The caller-owned
+        // allocation remains live while this future runs, so both allocations
+        // are reconciled until the blocking decoder consumes the owned copy.
+        let audio_input = audio_input.into_owned_for_job(&job).await?;
+        job.record_materialized_usage(retained_host_observation(&[
+            input_bytes,
+            audio_input.retained_bytes(),
+        ])?)?;
+
+        let residency_lease = self.load_asr_model_for_job(&job, variant).await?;
         let model = self
             .model_registry
             .get_audio_chat(variant)
@@ -296,59 +1055,44 @@ impl RuntimeService {
             .ok_or_else(|| {
                 Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))
             })?;
+        let observation_job = job.clone();
+        self.coordinator
+            .run_blocking_stage(&job, move || {
+                let _residency_lease = residency_lease;
+                let retained_audio_bytes = audio_input.retained_bytes();
+                let (samples, sample_rate) = audio_input.decode()?;
+                let steady_usage = decoded_audio_observation(input_bytes, samples.capacity())?;
+                observation_job.record_materialized_usage(add_retained_host_bytes(
+                    steady_usage,
+                    retained_audio_bytes,
+                )?)?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(audio_input);
+                let duration_secs = if sample_rate > 0 {
+                    samples.len() as f32 / sample_rate as f32
+                } else {
+                    0.0
+                };
+                let mut on_delta = on_delta;
+                let mut delta_sink = |delta: &str| {
+                    if !delta.is_empty() {
+                        on_delta(delta.to_string());
+                    }
+                };
+                let output = model.transcribe_with_callback_and_max_tokens(
+                    &samples,
+                    sample_rate,
+                    max_tokens,
+                    &mut delta_sink,
+                )?;
 
-        let mut delta_sink = |delta: &str| {
-            if !delta.is_empty() {
-                on_delta(delta.to_string());
-            }
-        };
-        let output = model.transcribe_with_callback_and_max_tokens(
-            &samples,
-            sample_rate,
-            max_tokens,
-            &mut delta_sink,
-        )?;
-
-        Ok(AsrTranscription {
-            text: output.text,
-            language: output.language,
-            duration_secs: if sample_rate > 0 {
-                samples.len() as f32 / sample_rate as f32
-            } else {
-                0.0
-            },
-            asr_diagnostics: output.diagnostics,
-        })
-    }
-
-    async fn asr_transcribe_audio_chat_base64<F>(
-        &self,
-        variant: ModelVariant,
-        audio_base64: &str,
-        max_tokens: Option<usize>,
-        on_delta: F,
-    ) -> Result<AsrTranscription>
-    where
-        F: FnMut(String),
-    {
-        let audio_bytes = base64_decode(audio_base64)?;
-        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes)?;
-        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, max_tokens, on_delta)
-            .await
-    }
-
-    async fn asr_transcribe_audio_chat_bytes<F>(
-        &self,
-        variant: ModelVariant,
-        audio_bytes: &[u8],
-        max_tokens: Option<usize>,
-        on_delta: F,
-    ) -> Result<AsrTranscription>
-    where
-        F: FnMut(String),
-    {
-        let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
-        self.asr_transcribe_audio_chat_samples(variant, samples, sample_rate, max_tokens, on_delta)
+                Ok(AsrTranscription {
+                    text: output.text,
+                    language: output.language,
+                    duration_secs,
+                    asr_diagnostics: output.diagnostics,
+                })
+            })
             .await
     }
 
@@ -363,46 +1107,86 @@ impl RuntimeService {
         runtime_context: RuntimeRequestContext,
         streaming: bool,
     ) -> Result<AdmittedEngineRequest> {
-        let input_bytes = match audio_input {
+        let audio_bytes = match audio_input {
             AsrAudioInput::Base64(audio) if audio.is_empty() => {
-                return Err(Error::InvalidInput("ASR request missing audio input".to_string()));
+                return Err(Error::InvalidInput(
+                    "ASR request missing audio input".to_string(),
+                ));
             }
             AsrAudioInput::Bytes(audio) if audio.is_empty() => {
-                return Err(Error::InvalidInput("ASR request missing audio bytes".to_string()));
+                return Err(Error::InvalidInput(
+                    "ASR request missing audio bytes".to_string(),
+                ));
             }
             AsrAudioInput::Base64(audio) => audio.len(),
             AsrAudioInput::Bytes(audio) => audio.len(),
         };
-        self.prepare_engine_request(
+        audio_input.validate_retained_size()?;
+        let input_bytes = audio_bytes
+            .checked_add(language.map(str::len).unwrap_or_default())
+            .and_then(|bytes| bytes.checked_add(prompt.map(str::len).unwrap_or_default()))
+            .and_then(|bytes| bytes.checked_add(correlation_id.map(str::len).unwrap_or_default()))
+            .ok_or_else(|| Error::Overloaded("ASR preparation input overflowed".to_string()))?;
+        self.prepare_engine_request_blocking_with_input(
             variant,
             TaskType::ASR,
             streaming,
             runtime_context,
             input_bytes,
-            move || async move {
+            ResourceVector::zero(),
+            move |job| async move {
+                let audio_input = audio_input.into_owned_for_job(&job).await?;
+                let language =
+                    copy_optional_preparation_string(&job, language, "ASR language metadata")
+                        .await?;
+                let prompt =
+                    copy_optional_preparation_string(&job, prompt, "ASR prompt metadata").await?;
+                let correlation_id = copy_optional_preparation_string(
+                    &job,
+                    correlation_id,
+                    "ASR correlation metadata",
+                )
+                .await?;
+                let retained_metadata_bytes = language
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .checked_add(prompt.as_ref().map_or(0, String::capacity))
+                    .and_then(|bytes| {
+                        bytes.checked_add(correlation_id.as_ref().map_or(0, String::capacity))
+                    })
+                    .ok_or_else(|| {
+                        Error::Overloaded("ASR retained metadata overflowed".to_string())
+                    })?;
+                job.record_materialized_usage(retained_host_observation(&[
+                    input_bytes,
+                    audio_input.retained_bytes(),
+                    retained_metadata_bytes,
+                ])?)?;
+                Ok((audio_input, language, prompt, correlation_id))
+            },
+            move |_registry, (audio_input, language, prompt, correlation_id)| {
+                audio_input.validate_source_size()?;
                 let runtime_request = match audio_input {
-                    AsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
+                    OwnedAsrAudioInput::Base64(audio_base64) => AsrRuntimeRequest::from_base64(
                         audio_base64,
                         variant,
-                        language.map(ToOwned::to_owned),
-                        correlation_id.map(ToOwned::to_owned),
+                        language,
+                        correlation_id,
                         runtime_context,
                     )?,
-                    AsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
-                        audio_bytes.to_vec(),
+                    OwnedAsrAudioInput::Bytes(audio_bytes) => AsrRuntimeRequest::from_bytes(
+                        audio_bytes,
                         variant,
-                        language.map(ToOwned::to_owned),
-                        correlation_id.map(ToOwned::to_owned),
+                        language,
+                        correlation_id,
                         runtime_context,
                     )?,
                 }
-                .with_prompt(prompt.map(ToOwned::to_owned));
+                .with_prompt(prompt);
                 let mut request = runtime_request.into_engine_request();
                 if let Some(max_tokens) = max_tokens {
                     request.params.max_tokens = max_tokens;
-                } else if let Some(auto_max_tokens) =
-                    granite_auto_asr_max_tokens(variant, audio_input)?
-                {
+                } else if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
                     request.params.max_tokens = auto_max_tokens;
                     request.asr_auto_max_tokens = true;
                 }
@@ -460,25 +1244,17 @@ impl RuntimeService {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
             let context = RuntimeRequestContext::default();
-            let job = self.coordinator_job_for_input(
-                correlation_id
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                CoordinatorLane::Atomic,
-                context,
-                audio_base64.len(),
-            );
             return self
-                .coordinator
-                .run_direct(job, async {
-                    self.asr_transcribe_audio_chat_base64(
-                        variant,
-                        audio_base64,
-                        max_tokens,
-                        |_delta| {},
-                    )
-                    .await
-                })
+                .asr_transcribe_audio_chat(
+                    variant,
+                    AsrAudioInput::Base64(audio_base64),
+                    max_tokens,
+                    |_delta| {},
+                    correlation_id
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    context,
+                )
                 .await;
         }
 
@@ -567,25 +1343,17 @@ impl RuntimeService {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), true)?;
             let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Streaming);
-            let job = self.coordinator_job_for_input(
-                correlation_id
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                CoordinatorLane::Atomic,
-                context,
-                audio_base64.len(),
-            );
             return self
-                .coordinator
-                .run_direct(job, async {
-                    self.asr_transcribe_audio_chat_base64(
-                        variant,
-                        audio_base64,
-                        max_tokens,
-                        on_delta,
-                    )
-                    .await
-                })
+                .asr_transcribe_audio_chat(
+                    variant,
+                    AsrAudioInput::Base64(audio_base64),
+                    max_tokens,
+                    on_delta,
+                    correlation_id
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    context,
+                )
                 .await;
         }
 
@@ -693,25 +1461,17 @@ impl RuntimeService {
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
-            let job = self.coordinator_job_for_input(
-                correlation_id
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                CoordinatorLane::Atomic,
-                runtime_context,
-                audio_bytes.len(),
-            );
             return self
-                .coordinator
-                .run_direct(job, async {
-                    self.asr_transcribe_audio_chat_bytes(
-                        variant,
-                        audio_bytes,
-                        max_tokens,
-                        |_delta| {},
-                    )
-                    .await
-                })
+                .asr_transcribe_audio_chat(
+                    variant,
+                    AsrAudioInput::Bytes(audio_bytes),
+                    max_tokens,
+                    |_delta| {},
+                    correlation_id
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    runtime_context,
+                )
                 .await;
         }
 
@@ -868,20 +1628,17 @@ impl RuntimeService {
                 Some(variant),
                 broker_streaming_required,
             )?;
-            let job = self.coordinator_job_for_input(
-                correlation_id
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                CoordinatorLane::Atomic,
-                runtime_context,
-                audio_bytes.len(),
-            );
             return self
-                .coordinator
-                .run_direct(job, async {
-                    self.asr_transcribe_audio_chat_bytes(variant, audio_bytes, max_tokens, on_delta)
-                        .await
-                })
+                .asr_transcribe_audio_chat(
+                    variant,
+                    AsrAudioInput::Bytes(audio_bytes),
+                    max_tokens,
+                    on_delta,
+                    correlation_id
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    runtime_context,
+                )
                 .await;
         }
 
@@ -1451,13 +2208,13 @@ impl RuntimeService {
         min_speakers: Option<usize>,
         max_speakers: Option<usize>,
     ) -> Result<SpeakerAttributedAsrResult> {
-        let audio_bytes = base64_decode(audio_base64)?;
-        self.speaker_attributed_asr_bytes(
-            &audio_bytes,
+        self.speaker_attributed_asr_input_with_progress(
+            AsrAudioInput::Base64(audio_base64),
             model_id,
             language,
             min_speakers,
             max_speakers,
+            |_| {},
         )
         .await
     }
@@ -1488,69 +2245,136 @@ impl RuntimeService {
         language: Option<&str>,
         min_speakers: Option<usize>,
         max_speakers: Option<usize>,
+        on_progress: P,
+    ) -> Result<SpeakerAttributedAsrResult>
+    where
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
+        self.speaker_attributed_asr_input_with_progress(
+            AsrAudioInput::Bytes(audio_bytes),
+            model_id,
+            language,
+            min_speakers,
+            max_speakers,
+            on_progress,
+        )
+        .await
+    }
+
+    async fn speaker_attributed_asr_input_with_progress<P>(
+        &self,
+        audio_input: AsrAudioInput<'_>,
+        model_id: Option<&str>,
+        language: Option<&str>,
+        min_speakers: Option<usize>,
+        max_speakers: Option<usize>,
         mut on_progress: P,
     ) -> Result<SpeakerAttributedAsrResult>
     where
         P: FnMut(AsrProgress) + Send + 'static,
     {
         let variant = resolve_speaker_attributed_asr_variant(model_id)?;
+        let audio_bytes = audio_input.input_bytes();
+        if audio_bytes == 0 {
+            return Err(Error::InvalidInput(
+                "ASR request missing audio input".to_string(),
+            ));
+        }
+        audio_input.validate_retained_size()?;
+        let input_bytes = audio_bytes
+            .checked_add(language.map(str::len).unwrap_or_default())
+            .ok_or_else(|| {
+                Error::Overloaded("speaker-attributed ASR input overflowed".to_string())
+            })?;
         self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
         let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Background);
+        let spec = self.coordinator_job_for_audio_input(
+            uuid::Uuid::new_v4().to_string(),
+            CoordinatorLane::Pipeline,
+            context,
+            input_bytes,
+        )?;
         let job = self
             .coordinator
-            .admit(self.coordinator_job_for_input(
-                uuid::Uuid::new_v4().to_string(),
-                CoordinatorLane::Pipeline,
-                context,
-                audio_bytes.len(),
-            ))
+            .admit_observed(spec, host_input_observation(input_bytes)?)
             .await?;
-        let _lease = self.load_model_for_inference(variant).await?;
+        let owned_audio = audio_input.into_owned_for_job(&job).await?;
+        let language_owned =
+            copy_optional_preparation_string(&job, language, "speaker-attributed ASR language")
+                .await?;
+        let language_bytes = language_owned.as_ref().map_or(0, String::capacity);
+        job.record_materialized_usage(retained_host_observation(&[
+            input_bytes,
+            owned_audio.retained_bytes(),
+            language_bytes,
+        ])?)?;
+        let residency_lease = self.load_asr_model_for_job(&job, variant).await?;
         let model = self
             .model_registry
             .get_asr(variant)
             .await
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
 
-        let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
+        let observation_job = job.clone();
+        let (residency_lease, samples, sample_rate) = self
+            .coordinator
+            .run_blocking_stage(&job, move || {
+                let retained_audio_bytes = owned_audio.retained_bytes();
+                let (samples, sample_rate) = owned_audio.decode()?;
+                let samples = Arc::<[f32]>::from(samples);
+                let steady_usage = decoded_audio_observation(
+                    input_bytes.checked_add(language_bytes).ok_or_else(|| {
+                        Error::Overloaded(
+                            "speaker-attributed ASR retained input overflowed".to_string(),
+                        )
+                    })?,
+                    samples.len(),
+                )?;
+                observation_job.record_materialized_usage(add_retained_host_bytes(
+                    steady_usage,
+                    retained_audio_bytes,
+                )?)?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(owned_audio);
+                Ok((residency_lease, samples, sample_rate))
+            })
+            .await?;
         let duration_secs = if sample_rate > 0 {
             samples.len() as f32 / sample_rate as f32
         } else {
             0.0
         };
+        let retained_input_bytes = input_bytes.checked_add(language_bytes).ok_or_else(|| {
+            Error::Overloaded("speaker-attributed ASR retained input overflowed".to_string())
+        })?;
         let model_limit_secs = model.max_audio_seconds_hint();
         if granite_saa_should_use_single_pass(duration_secs, model_limit_secs) {
-            let language_owned = language.map(ToOwned::to_owned);
-            let task_samples = samples.clone();
+            let task_language = language_owned.clone();
             let task_model = model.clone();
-            let max_new_tokens = granite_saa_max_new_tokens(&task_samples, sample_rate);
+            let max_new_tokens = granite_saa_max_new_tokens(&samples, sample_rate);
+            let observation_job = job.clone();
             let transcription = self
                 .coordinator
-                .run_stage(&job, async move {
-                    tokio::task::spawn_blocking(move || {
-                        granite_saa_transcribe_chunk(
-                            &task_model,
-                            &task_samples,
-                            sample_rate,
-                            language_owned.as_deref(),
-                            None,
-                            max_new_tokens,
-                        )
-                    })
-                    .await
-                    .map_err(|err| {
-                        Error::InferenceError(format!(
-                            "Granite speaker attributed ASR task failed: {err}"
-                        ))
-                    })?
+                .run_blocking_stage(&job, move || {
+                    let _residency_lease = residency_lease;
+                    observation_job.record_materialized_usage(decoded_audio_observation(
+                        retained_input_bytes,
+                        samples.len(),
+                    )?)?;
+                    granite_saa_transcribe_chunk(
+                        &task_model,
+                        &samples,
+                        sample_rate,
+                        task_language.as_deref(),
+                        None,
+                        max_new_tokens,
+                    )
                 })
                 .await?;
 
             return Ok(speaker_attributed_asr_result_from_text_with_warnings(
                 transcription.text.as_str(),
-                transcription
-                    .language
-                    .or_else(|| language.map(ToOwned::to_owned)),
+                transcription.language.or(language_owned),
                 duration_secs,
                 min_speakers,
                 max_speakers,
@@ -1558,15 +2382,16 @@ impl RuntimeService {
             ));
         }
 
-        let language_owned = language.map(ToOwned::to_owned);
         let long_form = granite_saa_long_form_transcribe(
             &self.coordinator,
             &job,
             model,
-            &samples,
+            samples,
             sample_rate,
             language_owned.as_deref(),
             model_limit_secs,
+            residency_lease,
+            retained_input_bytes,
             &mut on_progress,
         )
         .await?;
@@ -1609,9 +2434,8 @@ impl RuntimeService {
         language: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
-        let audio_bytes = base64_decode(audio_base64)?;
-        self.force_align_bytes_with_model_and_language(
-            &audio_bytes,
+        self.force_align_input(
+            AsrAudioInput::Base64(audio_base64),
             reference_text,
             language,
             model_id,
@@ -1626,35 +2450,99 @@ impl RuntimeService {
         language: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
-        let variant = resolve_forced_aligner_variant(model_id)?;
-        let _runtime_request = AlignmentRuntimeRequest::from_bytes(
-            variant,
-            audio_bytes.to_vec(),
+        self.force_align_input(
+            AsrAudioInput::Bytes(audio_bytes),
             reference_text,
-            language.map(ToOwned::to_owned),
-        )?;
+            language,
+            model_id,
+        )
+        .await
+    }
+
+    async fn force_align_input(
+        &self,
+        audio_input: AsrAudioInput<'_>,
+        reference_text: &str,
+        language: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<Vec<(String, u32, u32)>> {
+        let variant = resolve_forced_aligner_variant(model_id)?;
+        if audio_input.input_bytes() == 0 {
+            return Err(Error::InvalidInput(
+                "forced alignment request missing audio input".to_string(),
+            ));
+        }
+        audio_input.validate_retained_size()?;
+        if reference_text.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "Forced alignment request missing transcript".to_string(),
+            ));
+        }
         self.observe_broker_capability_request(
             CapabilityKind::ForcedAlignment,
             Some(variant),
             false,
         )?;
+        let input_bytes = audio_input
+            .input_bytes()
+            .checked_add(reference_text.len())
+            .and_then(|bytes| bytes.checked_add(language.map(str::len).unwrap_or_default()))
+            .ok_or_else(|| Error::Overloaded("forced alignment input overflowed".to_string()))?;
         let context = RuntimeRequestContext::default();
-        let job = self.coordinator_job_for_input(
+        let spec = self.coordinator_job_for_audio_input(
             uuid::Uuid::new_v4().to_string(),
             CoordinatorLane::Atomic,
             context,
-            audio_bytes.len().saturating_add(reference_text.len()),
-        );
+            input_bytes,
+        )?;
+        let job = self
+            .coordinator
+            .admit_observed(spec, host_input_observation(input_bytes)?)
+            .await?;
+        let audio_input = audio_input.into_owned_for_job(&job).await?;
+        let reference_text =
+            copy_preparation_string(&job, reference_text, "forced alignment transcript").await?;
+        let language =
+            copy_optional_preparation_string(&job, language, "forced alignment language").await?;
+        let owned_metadata_bytes = reference_text
+            .capacity()
+            .checked_add(language.as_ref().map(String::capacity).unwrap_or_default())
+            .ok_or_else(|| {
+                Error::Overloaded("forced alignment metadata storage overflowed".to_string())
+            })?;
+        job.record_materialized_usage(retained_host_observation(&[
+            input_bytes,
+            audio_input.retained_bytes(),
+            owned_metadata_bytes,
+        ])?)?;
+        let residency_lease = self.load_asr_model_for_job(&job, variant).await?;
+        let model = self
+            .model_registry
+            .get_asr(variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+        let observation_job = job.clone();
         self.coordinator
-            .run_direct(job, async {
-                let _lease = self.load_model_for_inference(variant).await?;
-                let model = self
-                    .model_registry
-                    .get_asr(variant)
-                    .await
-                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-                let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
-                model.force_align(&samples, sample_rate, reference_text, language)
+            .run_blocking_stage(&job, move || {
+                let _residency_lease = residency_lease;
+                let retained_audio_bytes = audio_input.retained_bytes();
+                let (samples, sample_rate) = audio_input.decode()?;
+                let retained_bytes =
+                    input_bytes
+                        .checked_add(owned_metadata_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded(
+                                "forced alignment retained storage overflowed".to_string(),
+                            )
+                        })?;
+                let steady_usage = decoded_audio_observation(retained_bytes, samples.capacity())?;
+                observation_job.record_materialized_usage(add_retained_host_bytes(
+                    steady_usage,
+                    retained_audio_bytes,
+                )?)?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(audio_input);
+                model.force_align(&samples, sample_rate, &reference_text, language.as_deref())
             })
             .await
     }
@@ -2056,16 +2944,31 @@ async fn granite_saa_long_form_transcribe<P>(
     coordinator: &Arc<InferenceCoordinator>,
     job: &JobLease,
     model: Arc<NativeAsrModel>,
-    samples: &[f32],
+    samples: Arc<[f32]>,
     sample_rate: u32,
     language: Option<&str>,
     model_limit_secs: Option<f32>,
+    residency_lease: ModelResidencyLease,
+    retained_input_bytes: usize,
     on_progress: &mut P,
 ) -> Result<GraniteSaaLongFormOutput>
 where
     P: FnMut(AsrProgress) + Send + 'static,
 {
-    let chunks = granite_saa_chunk_plan(samples, sample_rate, model_limit_secs);
+    let planning_samples = samples.clone();
+    let planning_job = job.clone();
+    let (mut residency_lease, chunks) = coordinator
+        .run_blocking_stage(job, move || {
+            planning_job.record_materialized_usage(decoded_audio_observation(
+                retained_input_bytes,
+                planning_samples.len(),
+            )?)?;
+            Ok((
+                residency_lease,
+                granite_saa_chunk_plan(&planning_samples, sample_rate, model_limit_secs),
+            ))
+        })
+        .await?;
     if chunks.is_empty() {
         return Err(Error::InvalidInput(
             "Granite SAA chunk planner produced no chunks".to_string(),
@@ -2100,8 +3003,11 @@ where
             sample_rate,
         ));
 
-        let chunk_audio = samples[chunk.start_sample..chunk.end_sample].to_vec();
+        let chunk_start = chunk.start_sample;
+        let chunk_end = chunk.end_sample;
         let task_model = model.clone();
+        let task_samples = samples.clone();
+        let observation_job = job.clone();
         let language_owned = language.map(ToOwned::to_owned);
         let prefix_mode = GraniteSaaPrefixMode::from_env();
         let prefix_text = granite_saa_chunk_prefix_text(&assembler, prefix_mode);
@@ -2109,8 +3015,10 @@ where
             .as_deref()
             .map(|text| text.chars().count())
             .unwrap_or(0);
-        let max_new_tokens = granite_saa_max_new_tokens(&chunk_audio, sample_rate);
-        let chunk_duration_secs = samples_to_seconds_f64(chunk_audio.len(), sample_rate);
+        let chunk_sample_count = chunk_end - chunk_start;
+        let max_new_tokens =
+            granite_saa_max_new_tokens(&samples[chunk_start..chunk_end], sample_rate);
+        let chunk_duration_secs = samples_to_seconds_f64(chunk_sample_count, sample_rate);
         tracing::info!(
             chunk_index = idx + 1,
             total_chunks = chunks.len(),
@@ -2123,27 +3031,32 @@ where
             "starting Granite SAA chunk decode"
         );
         let chunk_started = Instant::now();
-        let transcription = coordinator
-            .run_stage(job, async move {
-                tokio::task::spawn_blocking(move || {
-                    granite_saa_transcribe_chunk(
-                        &task_model,
-                        &chunk_audio,
-                        sample_rate,
-                        language_owned.as_deref(),
-                        prefix_text.as_deref(),
-                        max_new_tokens,
-                    )
-                })
-                .await
-                .map_err(|err| {
-                    Error::InferenceError(format!(
-                        "Granite speaker attributed ASR chunk {} failed: {err}",
-                        idx + 1
-                    ))
-                })?
+        let (returned_lease, transcription) = coordinator
+            .run_blocking_stage(job, move || {
+                let chunk_audio = task_samples[chunk_start..chunk_end].to_vec();
+                observation_job.record_materialized_usage(
+                    decoded_audio_with_scratch_observation(
+                        retained_input_bytes,
+                        task_samples.len(),
+                        chunk_audio.capacity(),
+                    )?,
+                )?;
+                let transcription = granite_saa_transcribe_chunk(
+                    &task_model,
+                    &chunk_audio,
+                    sample_rate,
+                    language_owned.as_deref(),
+                    prefix_text.as_deref(),
+                    max_new_tokens,
+                );
+                let steady_usage =
+                    decoded_audio_observation(retained_input_bytes, task_samples.len())?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(chunk_audio);
+                Ok((residency_lease, transcription?))
             })
             .await?;
+        residency_lease = returned_lease;
         let decode_diagnostics = granite_saa_decode_diagnostics(transcription.diagnostics.as_ref());
         tracing::info!(
             chunk_index = idx + 1,
@@ -2489,7 +3402,10 @@ mod tests {
     use super::*;
     use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
-    use std::sync::{Mutex, OnceLock};
+    use crate::engine::{Priority, WorkloadClass};
+    use crate::runtime::coordinator::JobSpec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
     use uuid::Uuid;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -2545,6 +3461,286 @@ mod tests {
     }
 
     #[test]
+    fn realtime_session_quota_is_held_until_all_in_flight_clones_exit() {
+        let policy = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10),
+        })
+        .expect("session policy");
+        let stream_lease = policy.try_acquire().expect("first session");
+        let in_flight_lease = stream_lease.clone();
+
+        drop(stream_lease);
+        assert!(matches!(policy.try_acquire(), Err(Error::Overloaded(_))));
+
+        drop(in_flight_lease);
+        assert!(policy.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn realtime_session_policy_rejects_quota_that_would_panic_semaphore() {
+        let result = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: Semaphore::MAX_PERMITS + 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10),
+        });
+
+        assert!(matches!(result, Err(Error::ConfigError(_))));
+    }
+
+    #[test]
+    fn realtime_session_expiration_distinguishes_idle_and_absolute_limits() {
+        let started_at = Instant::now();
+        let idle_deadline = started_at + Duration::from_secs(2);
+        let absolute_deadline = started_at + Duration::from_secs(10);
+
+        assert_eq!(
+            realtime_asr_session_expiration(idle_deadline, absolute_deadline, idle_deadline, 0,),
+            Some("realtime ASR stream exceeded its idle timeout")
+        );
+        assert_eq!(
+            realtime_asr_session_expiration(idle_deadline, absolute_deadline, idle_deadline, 1,),
+            None
+        );
+        assert_eq!(
+            realtime_asr_session_expiration(absolute_deadline, absolute_deadline, idle_deadline, 1,),
+            Some("realtime ASR stream exceeded its absolute lifetime")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn realtime_watchdog_releases_idle_session_quota() {
+        let policy = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_millis(1),
+        })
+        .expect("session policy");
+        let session_lease = policy.try_acquire().expect("first session");
+        let now = Instant::now();
+        let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
+            model: None,
+            state: None,
+            residency_lease: None,
+            job: None,
+            session_lease: Some(session_lease),
+            absolute_deadline: now + Duration::from_secs(60),
+            idle_timeout: Duration::from_millis(1),
+            last_activity: now - Duration::from_secs(1),
+            active_operations: 0,
+            closed: false,
+            timeout_reason: None,
+        }));
+        let activity = Arc::new(Notify::new());
+        spawn_realtime_asr_watchdog(&resources, activity);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let closed = resources.lock().expect("resource lock").closed;
+                if closed && policy.permits.available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watchdog cleanup");
+
+        let resources = resources.lock().expect("resource lock");
+        assert_eq!(
+            resources.timeout_reason,
+            Some("realtime ASR stream exceeded its idle timeout")
+        );
+        assert!(resources.session_lease.is_none());
+        drop(resources);
+        assert!(policy.try_acquire().is_ok());
+    }
+
+    fn realtime_test_job(id: &str, backend: BackendKind, deadline: Option<Instant>) -> JobSpec {
+        let mut resources = ResourceVector::zero();
+        match backend {
+            BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(1024 * 1024),
+            BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(1024 * 1024),
+            BackendKind::Cuda => {
+                resources.host_bytes = ResourceAmount::Known(64 * 1024);
+                resources.device_bytes = ResourceAmount::Known(1024 * 1024);
+            }
+        }
+        JobSpec {
+            request_id: id.to_string(),
+            lane: CoordinatorLane::Realtime,
+            priority: Priority::Normal,
+            workload_class: WorkloadClass::Realtime,
+            deadline,
+            resources,
+        }
+    }
+
+    #[test]
+    fn oversized_realtime_packet_is_rejected_before_copy_or_model_work() {
+        let side_effects = AtomicUsize::new(0);
+        let result = validate_realtime_input_copy(4_801, 4_800).and_then(|()| {
+            side_effects.fetch_add(1, Ordering::Relaxed);
+            let _owned = vec![0.0_f32; 4_801];
+            side_effects.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
+        assert_eq!(side_effects.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn realtime_blocking_work_respects_deadline_without_blocking_tokio() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let job = coordinator
+            .admit(realtime_test_job(
+                "realtime-blocking-deadline",
+                BackendKind::Cpu,
+                Some(Instant::now() + std::time::Duration::from_millis(200)),
+            ))
+            .await
+            .unwrap();
+        let runner_job = job.clone();
+        drop(job);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let runner = tokio::spawn(async move {
+            run_realtime_blocking_operation(&task_coordinator, &runner_job, gate, move || {
+                Ok(move || {
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*task_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        });
+
+        started_rx.await.unwrap();
+        let heartbeat = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tokio::time::sleep(std::time::Duration::from_millis(5)),
+        )
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), runner).await;
+        let while_blocked = coordinator.snapshot();
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while coordinator.snapshot().active_executions != 0
+                || coordinator.snapshot().active_jobs != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(heartbeat.is_ok());
+        assert!(matches!(
+            result,
+            Ok(Ok(Err(Error::Timeout(id)))) if id == "realtime-blocking-deadline"
+        ));
+        assert_eq!(while_blocked.active_executions, 1);
+        assert_eq!(while_blocked.active_jobs, 1);
+        assert_eq!(coordinator.snapshot().expired_total, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_realtime_call_retains_stream_operation_order() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 2, 4));
+        let job = coordinator
+            .admit(realtime_test_job(
+                "realtime-cancellation-order",
+                BackendKind::Cuda,
+                None,
+            ))
+            .await
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let stage = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first_coordinator = coordinator.clone();
+        let first_job = job.clone();
+        let first_gate = gate.clone();
+        let first_release = release.clone();
+        let first_stage = stage.clone();
+        let first = tokio::spawn(async move {
+            run_realtime_blocking_operation(&first_coordinator, &first_job, first_gate, move || {
+                Ok(move || {
+                    assert_eq!(first_stage.fetch_add(1, Ordering::SeqCst), 0);
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*first_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    assert_eq!(first_stage.fetch_add(1, Ordering::SeqCst), 1);
+                    Ok(())
+                })
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_coordinator = coordinator.clone();
+        let second_job = job.clone();
+        let second_gate = gate.clone();
+        let second_stage = stage.clone();
+        let second = tokio::spawn(async move {
+            run_realtime_blocking_operation(
+                &second_coordinator,
+                &second_job,
+                second_gate,
+                move || {
+                    Ok(move || {
+                        assert_eq!(second_stage.fetch_add(1, Ordering::SeqCst), 2);
+                        Ok(())
+                    })
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(stage.load(Ordering::SeqCst), 1);
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stage.load(Ordering::SeqCst), 3);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        drop(job);
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    #[test]
     fn granite_auto_asr_budget_scales_with_audio_duration() {
         assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 76);
         assert_eq!(granite_auto_asr_max_tokens_for_duration(3.6), 76);
@@ -2556,31 +3752,15 @@ mod tests {
     }
 
     #[test]
-    fn granite_auto_asr_budget_reads_wav_duration_without_full_decode() {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut wav_bytes = Vec::new();
-        {
-            let cursor = std::io::Cursor::new(&mut wav_bytes);
-            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
-            for _ in 0..960_000 {
-                writer.write_sample(0i16).unwrap();
-            }
-            writer.finalize().unwrap();
-        }
-
-        let budget = granite_auto_asr_max_tokens(
-            ModelVariant::GraniteSpeech412BPlus,
-            AsrAudioInput::Bytes(&wav_bytes),
-        )
-        .expect("auto budget")
-        .expect("granite budget");
-
-        assert_eq!(budget, 204);
+    fn granite_auto_asr_request_uses_executor_adjusted_ceiling() {
+        assert_eq!(
+            granite_auto_asr_token_ceiling(ModelVariant::GraniteSpeech412BPlus),
+            Some(GRANITE_ASR_AUTO_MAX_TOKENS)
+        );
+        assert_eq!(
+            granite_auto_asr_token_ceiling(ModelVariant::WhisperLargeV3Turbo),
+            None
+        );
     }
 
     #[test]
@@ -2871,6 +4051,78 @@ mod tests {
         let err = resolve_speaker_attributed_asr_variant(Some("Whisper-Large-v3-Turbo"))
             .expect_err("SAA should be Granite-only");
         assert!(err.to_string().contains("Granite-Speech-4.1-2B-Plus"));
+    }
+
+    #[test]
+    fn offline_asr_observations_include_owned_and_decoded_storage() {
+        let input = [1_u8, 2, 3, 4];
+        let owned = OwnedAsrAudioInput::Bytes(input.to_vec());
+        let owned_bytes = owned.retained_bytes();
+        assert!(owned_bytes >= input.len());
+
+        let copied = retained_host_observation(&[input.len(), owned_bytes]).unwrap();
+        assert_eq!(copied.host_bytes, (input.len() + owned_bytes) as u64);
+
+        let decoded = decoded_audio_with_scratch_observation(input.len(), 8, 4).unwrap();
+        assert_eq!(
+            decoded.host_bytes,
+            (input.len() + 12 * std::mem::size_of::<f32>()) as u64
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_offline_asr_stage_retains_job_and_execution_until_physical_exit() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let job = coordinator
+            .admit(realtime_test_job(
+                "offline-asr-cancel",
+                BackendKind::Cpu,
+                None,
+            ))
+            .await
+            .unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let task_job = job.clone();
+        drop(job);
+        let runner = tokio::spawn(async move {
+            task_coordinator
+                .run_blocking_stage(&task_job, move || {
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*task_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    Ok(())
+                })
+                .await
+        });
+
+        started_rx.await.unwrap();
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        assert_eq!(coordinator.snapshot().active_jobs, 1);
+        assert_eq!(coordinator.snapshot().active_executions, 1);
+
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while coordinator.snapshot().active_jobs != 0
+                || coordinator.snapshot().active_executions != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

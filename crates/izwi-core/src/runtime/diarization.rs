@@ -3,13 +3,20 @@
 use crate::catalog::{
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
 };
+use crate::engine::{ResourceAmount, ResourceVector};
 use crate::error::{Error, Result};
+use crate::models::architectures::sortformer::diarization::{
+    production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
+};
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::CapabilityKind;
-use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
-use crate::runtime::request::DiarizationRuntimeRequest;
-use crate::runtime::service::RuntimeService;
+use crate::runtime::audio_io::{
+    base64_decode, decode_audio_bytes, validate_base64_audio_retained_size, MAX_AUDIO_SOURCE_BYTES,
+};
+use crate::runtime::coordinator::{JobLease, JobResourceObservation};
+use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
+use crate::runtime::service::{copy_preparation_bytes, copy_preparation_string, RuntimeService};
 use crate::runtime::types::{
     DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord,
@@ -29,6 +36,18 @@ const ALIGNMENT_COLLAPSE_TAIL_MS: u32 = 250;
 const ALIGNMENT_PREFIX_CLUSTER_MS_CAP: u32 = 1_000;
 const MAX_REASONABLE_WORD_SPAN_MS: u32 = 2_500;
 const PIPELINE_SAMPLE_RATE: u32 = 16_000;
+const MAX_PIPELINE_DURATION_SECONDS: usize = 60 * 60;
+const MAX_PIPELINE_SAMPLES: usize = PIPELINE_SAMPLE_RATE as usize * MAX_PIPELINE_DURATION_SECONDS;
+// The shared decoder permits up to 256 MiB of mono output. During pipeline
+// normalization both that output and up to one hour of 16 kHz f32 audio may be
+// live, in addition to decoder/source copies. This floor is authorized before
+// any of those allocations occur; the generic input-shaped reservation adds
+// another 64 MiB plus eight times the retained source size.
+const DIARIZATION_AUDIO_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
+// Encoded audio length cannot safely bound decoded duration. The model module
+// derives a complete peak ceiling from the supported preprocessing,
+// Conv-subsampling, Conformer, and transformer topology. The loaded checkpoint
+// is checked against that immutable envelope before inference begins.
 const MAX_FRAGMENT_WORDS: usize = 3;
 const MAX_FRAGMENT_DURATION_SECS: f32 = 1.25;
 const FRAGMENT_CONFIDENCE_MARGIN: f32 = 0.08;
@@ -37,9 +56,132 @@ const PHRASE_HARD_GAP_SECS: f32 = 0.75;
 
 #[derive(Debug, Clone)]
 struct PipelineAudio {
-    samples: Vec<f32>,
+    samples: Arc<[f32]>,
     sample_rate: u32,
     duration_secs: f32,
+}
+
+fn diarization_input_observation(
+    retained_input_bytes: usize,
+    retained_audio_copies: &[usize],
+    audio: &PipelineAudio,
+) -> Result<JobResourceObservation> {
+    let sample_bytes = audio
+        .samples
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::Overloaded("diarization sample storage overflowed".to_string()))?;
+    let retained_audio_bytes = retained_audio_copies
+        .iter()
+        .try_fold(0usize, |total, bytes| {
+            total.checked_add(*bytes).ok_or_else(|| {
+                Error::Overloaded("diarization audio storage overflowed".to_string())
+            })
+        })?;
+    let host_bytes = retained_input_bytes
+        .checked_add(retained_audio_bytes)
+        .and_then(|total| total.checked_add(sample_bytes))
+        .ok_or_else(|| Error::Overloaded("diarization input storage overflowed".to_string()))?;
+    Ok(JobResourceObservation::host(
+        u64::try_from(host_bytes)
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?,
+    ))
+}
+
+fn diarization_workspace_observation(
+    steady_usage: JobResourceObservation,
+    workspace: SortformerWorkspaceEstimate,
+) -> Result<JobResourceObservation> {
+    Ok(JobResourceObservation::new(
+        steady_usage
+            .host_bytes
+            .checked_add(workspace.host_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("diarization materialized host workspace overflowed".to_string())
+            })?,
+        steady_usage
+            .accelerator_bytes
+            .checked_add(workspace.accelerator_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded(
+                    "diarization materialized accelerator workspace overflowed".to_string(),
+                )
+            })?,
+    ))
+}
+
+fn diarization_audio_resources(
+    backend: crate::backends::BackendKind,
+    sample_count: usize,
+) -> Result<ResourceVector> {
+    let workspace = production_workspace_authorization(
+        sample_count,
+        matches!(backend, crate::backends::BackendKind::Cuda),
+    )?;
+    let shared_workspace = workspace
+        .host_bytes
+        .checked_add(workspace.accelerator_bytes)
+        .ok_or_else(|| Error::Overloaded("diarization workspace overflowed".to_string()))?;
+    let mut resources = ResourceVector::zero();
+    match backend {
+        crate::backends::BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(
+                DIARIZATION_AUDIO_WORKSPACE_BYTES
+                    .checked_add(shared_workspace)
+                    .ok_or_else(|| {
+                        Error::Overloaded("diarization CPU workspace overflowed".to_string())
+                    })?,
+            )
+        }
+        crate::backends::BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(
+                DIARIZATION_AUDIO_WORKSPACE_BYTES
+                    .checked_add(shared_workspace)
+                    .ok_or_else(|| {
+                        Error::Overloaded("diarization Metal workspace overflowed".to_string())
+                    })?,
+            )
+        }
+        crate::backends::BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(
+                DIARIZATION_AUDIO_WORKSPACE_BYTES
+                    .checked_add(workspace.host_bytes)
+                    .ok_or_else(|| {
+                        Error::Overloaded("diarization CUDA host workspace overflowed".to_string())
+                    })?,
+            );
+            resources.device_bytes = ResourceAmount::Known(workspace.accelerator_bytes);
+        }
+    }
+    Ok(resources)
+}
+
+fn runtime_audio_bytes(audio: &RuntimeAudioInput) -> usize {
+    match audio {
+        RuntimeAudioInput::Base64(audio) => audio.capacity(),
+        RuntimeAudioInput::Bytes(audio) => audio.capacity(),
+    }
+}
+
+fn diarization_request_audio_observation(
+    retained_input_bytes: usize,
+    request: &DiarizationRuntimeRequest,
+    audio: &PipelineAudio,
+) -> Result<JobResourceObservation> {
+    diarization_input_observation(
+        retained_input_bytes,
+        &[runtime_audio_bytes(&request.audio)],
+        audio,
+    )
+}
+
+fn runtime_encoded_audio(audio: &RuntimeAudioInput) -> Result<&[u8]> {
+    match audio {
+        RuntimeAudioInput::Bytes(audio) => Ok(audio),
+        RuntimeAudioInput::Base64(_) => Err(Error::InferenceError(
+            "diarization runtime retained unexpected base64 audio".to_string(),
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +197,11 @@ enum DiarizationAudioInput<'a> {
     Bytes(&'a [u8]),
 }
 
+enum OwnedDiarizationAudioInput {
+    Base64(String),
+    Bytes(Vec<u8>),
+}
+
 impl DiarizationAudioInput<'_> {
     fn input_bytes(self) -> usize {
         match self {
@@ -63,10 +210,48 @@ impl DiarizationAudioInput<'_> {
         }
     }
 
-    fn decode_bytes(self) -> Result<Vec<u8>> {
+    fn validate_retained_size(self) -> Result<()> {
         match self {
-            Self::Base64(audio) => base64_decode(audio),
-            Self::Bytes(audio) => Ok(audio.to_vec()),
+            Self::Base64(audio) => {
+                validate_base64_audio_retained_size(audio.len(), MAX_AUDIO_SOURCE_BYTES)
+            }
+            Self::Bytes(audio) if audio.is_empty() => Err(Error::InvalidInput(
+                "diarization request missing audio bytes".to_string(),
+            )),
+            Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "diarization encoded audio is {} bytes, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    audio.len()
+                )))
+            }
+            Self::Bytes(_) => Ok(()),
+        }
+    }
+
+    async fn into_owned_for_job(self, job: &JobLease) -> Result<OwnedDiarizationAudioInput> {
+        match self {
+            Self::Base64(audio) => Ok(OwnedDiarizationAudioInput::Base64(
+                copy_preparation_string(job, audio, "diarization base64 audio").await?,
+            )),
+            Self::Bytes(audio) => Ok(OwnedDiarizationAudioInput::Bytes(
+                copy_preparation_bytes(job, audio, "diarization encoded audio").await?,
+            )),
+        }
+    }
+}
+
+impl OwnedDiarizationAudioInput {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Base64(audio) => audio.capacity(),
+            Self::Bytes(audio) => audio.capacity(),
+        }
+    }
+
+    fn decode_bytes(self) -> Result<(Vec<u8>, Option<String>)> {
+        match self {
+            Self::Base64(audio) => Ok((base64_decode(&audio)?, Some(audio))),
+            Self::Bytes(audio) => Ok((audio, None)),
         }
     }
 }
@@ -74,18 +259,65 @@ impl DiarizationAudioInput<'_> {
 impl RuntimeService {
     async fn diarize_samples_stage(
         &self,
-        samples: &[f32],
-        sample_rate: u32,
+        job: &JobLease,
+        audio: PipelineAudio,
+        steady_usage: JobResourceObservation,
         variant: ModelVariant,
-        config: &DiarizationConfig,
+        config: DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let _lease = self.load_model_for_inference(variant).await?;
+        let residency_lease = self.load_model_for_job(job, variant).await?;
         let model = self
             .model_registry
             .get_diarization(variant)
             .await
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-        model.diarize(samples, sample_rate, config)
+        let workspace = model.workspace_estimate(audio.samples.len())?;
+        let authorized_workspace = production_workspace_authorization(
+            MAX_PIPELINE_SAMPLES,
+            matches!(
+                self.backend_context().backend_kind,
+                crate::backends::BackendKind::Cuda
+            ),
+        )?;
+        if workspace.host_bytes > authorized_workspace.host_bytes
+            || workspace.accelerator_bytes > authorized_workspace.accelerator_bytes
+        {
+            return Err(Error::Overloaded(format!(
+                "Sortformer workspace {workspace:?} exceeds production authorization {authorized_workspace:?}"
+            )));
+        }
+        let expected_workspace = workspace;
+        let observation_job = job.clone();
+        self.coordinator
+            .run_blocking_stage(job, move || {
+                let _residency_lease = residency_lease;
+                model.diarize_with_workspace_observer(
+                    &audio.samples,
+                    audio.sample_rate,
+                    &config,
+                    move |event| match event {
+                        SortformerWorkspaceEvent::Materialized { workspace } => {
+                            if workspace != expected_workspace {
+                                return Err(Error::InferenceError(format!(
+                                    "Sortformer materialized workspace {workspace:?} after estimating {expected_workspace:?}"
+                                )));
+                            }
+                            observation_job.record_materialized_usage(
+                                diarization_workspace_observation(steady_usage, workspace)?,
+                            )
+                        }
+                        SortformerWorkspaceEvent::Releasing { workspace } => {
+                            if workspace != expected_workspace {
+                                return Err(Error::InferenceError(format!(
+                                    "Sortformer released workspace {workspace:?} after estimating {expected_workspace:?}"
+                                )));
+                            }
+                            observation_job.prepare_materialized_release(steady_usage)
+                        }
+                    },
+                )
+            })
+            .await
     }
 
     async fn diarize_input(
@@ -94,44 +326,71 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        if audio_input.input_bytes() == 0 {
+        let input_bytes = audio_input.input_bytes();
+        if input_bytes == 0 {
             return Err(Error::InvalidInput(
                 "diarization request missing audio input".to_string(),
             ));
         }
+        audio_input.validate_retained_size()?;
         let variant = resolve_diarization_model_variant(model_id);
         self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
         let context = RuntimeRequestContext::default();
-        let spec = self.coordinator_job_for_input(
+        let mut spec = self.coordinator_job_for_input(
             uuid::Uuid::new_v4().to_string(),
             CoordinatorLane::Pipeline,
             context,
-            audio_input.input_bytes(),
+            input_bytes,
         );
-        let (job, (runtime_request, audio)) = self
+        spec.resources = spec.resources.checked_add(diarization_audio_resources(
+            self.backend_context().backend_kind,
+            MAX_PIPELINE_SAMPLES,
+        )?)?;
+        let observed_input_bytes = u64::try_from(input_bytes)
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
+        let job = self
             .coordinator
-            .admit_then_prepare(spec, move || async move {
-                let audio_bytes = audio_input.decode_bytes()?;
-                let runtime_request = DiarizationRuntimeRequest::from_bytes(
-                    variant,
-                    audio_bytes.clone(),
-                    config.clone(),
-                )?
-                .with_pipeline_models(model_id.map(ToOwned::to_owned), None, None, None);
+            .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
+            .await?;
+        let owned_audio_input = audio_input.into_owned_for_job(&job).await?;
+        job.record_materialized_usage(JobResourceObservation::host(
+            u64::try_from(
+                input_bytes
+                    .checked_add(owned_audio_input.retained_bytes())
+                    .ok_or_else(|| {
+                        Error::Overloaded("diarization retained input overflowed".to_string())
+                    })?,
+            )
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?,
+        ))?;
+        let model_id = model_id.map(ToOwned::to_owned);
+        let config = config.clone();
+        let observation_job = job.clone();
+        let (runtime_request, audio, steady_usage) = self
+            .coordinator
+            .run_blocking_stage(&job, move || {
+                let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
                 let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
-                Ok((runtime_request, audio))
+                let runtime_request =
+                    DiarizationRuntimeRequest::from_bytes(variant, audio_bytes, config)?
+                        .with_pipeline_models(model_id, None, None, None);
+                let steady_usage =
+                    diarization_request_audio_observation(input_bytes, &runtime_request, &audio)?;
+                let peak_usage = diarization_input_observation(
+                    input_bytes,
+                    &[
+                        runtime_audio_bytes(&runtime_request.audio),
+                        retained_source.as_ref().map_or(0, String::capacity),
+                    ],
+                    &audio,
+                )?;
+                observation_job.record_materialized_usage(peak_usage)?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(retained_source);
+                Ok((runtime_request, audio, steady_usage))
             })
             .await?;
-        self.coordinator
-            .run_stage(
-                &job,
-                self.diarize_samples_stage(
-                    &audio.samples,
-                    audio.sample_rate,
-                    variant,
-                    &runtime_request.config,
-                ),
-            )
+        self.diarize_samples_stage(&job, audio, steady_usage, variant, runtime_request.config)
             .await
     }
 
@@ -142,8 +401,12 @@ impl RuntimeService {
         model_id: Option<&str>,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        self.diarize_input(DiarizationAudioInput::Base64(audio_base64), model_id, config)
-            .await
+        self.diarize_input(
+            DiarizationAudioInput::Base64(audio_base64),
+            model_id,
+            config,
+        )
+        .await
     }
 
     pub async fn diarize_bytes(
@@ -211,50 +474,89 @@ impl RuntimeService {
         config: &DiarizationConfig,
         enable_llm_refinement: bool,
     ) -> Result<DiarizationTranscriptResult> {
-        if audio_input.input_bytes() == 0 {
+        let input_bytes = audio_input.input_bytes();
+        if input_bytes == 0 {
             return Err(Error::InvalidInput(
                 "diarization request missing audio input".to_string(),
             ));
         }
+        audio_input.validate_retained_size()?;
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
         self.record_diarization_transcript_pipeline(enable_llm_refinement);
-        let spec = self.coordinator_job_for_input(
+        let mut spec = self.coordinator_job_for_input(
             uuid::Uuid::new_v4().to_string(),
             CoordinatorLane::Pipeline,
             RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
-            audio_input.input_bytes(),
+            input_bytes,
         );
-        let (pipeline_job, (runtime_request, audio_bytes, audio)) = self
+        spec.resources = spec.resources.checked_add(diarization_audio_resources(
+            self.backend_context().backend_kind,
+            MAX_PIPELINE_SAMPLES,
+        )?)?;
+        let observed_input_bytes = u64::try_from(input_bytes)
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
+        let pipeline_job = self
             .coordinator
-            .admit_then_prepare(spec, move || async move {
-                let audio_bytes = audio_input.decode_bytes()?;
+            .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
+            .await?;
+        let owned_audio_input = audio_input.into_owned_for_job(&pipeline_job).await?;
+        pipeline_job.record_materialized_usage(JobResourceObservation::host(
+            u64::try_from(
+                input_bytes
+                    .checked_add(owned_audio_input.retained_bytes())
+                    .ok_or_else(|| {
+                        Error::Overloaded("diarization retained input overflowed".to_string())
+                    })?,
+            )
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?,
+        ))?;
+        let diarization_model_id = diarization_model_id.map(ToOwned::to_owned);
+        let asr_model_id = asr_model_id.map(ToOwned::to_owned);
+        let aligner_model_id = aligner_model_id.map(ToOwned::to_owned);
+        let llm_model_id = llm_model_id.map(ToOwned::to_owned);
+        let config = config.clone();
+        let observation_job = pipeline_job.clone();
+        let (runtime_request, audio, steady_usage) = self
+            .coordinator
+            .run_blocking_stage(&pipeline_job, move || {
+                let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
+                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
                 let runtime_request = DiarizationRuntimeRequest::from_bytes(
                     diarization_variant,
-                    audio_bytes.clone(),
-                    config.clone(),
+                    audio_bytes,
+                    config,
                 )?
                 .with_pipeline_models(
-                    diarization_model_id.map(ToOwned::to_owned),
-                    asr_model_id.map(ToOwned::to_owned),
-                    aligner_model_id.map(ToOwned::to_owned),
-                    llm_model_id.map(ToOwned::to_owned),
+                    diarization_model_id,
+                    asr_model_id,
+                    aligner_model_id,
+                    llm_model_id,
                 )
                 .with_llm_refinement(enable_llm_refinement);
-                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
-                Ok((runtime_request, audio_bytes, audio))
+                let steady_usage =
+                    diarization_request_audio_observation(input_bytes, &runtime_request, &audio)?;
+                let peak_usage = diarization_input_observation(
+                    input_bytes,
+                    &[
+                        runtime_audio_bytes(&runtime_request.audio),
+                        retained_source.as_ref().map_or(0, String::capacity),
+                    ],
+                    &audio,
+                )?;
+                observation_job.record_materialized_usage(peak_usage)?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(retained_source);
+                Ok((runtime_request, audio, steady_usage))
             })
             .await?;
 
         let diarization = self
-            .coordinator
-            .run_stage(
+            .diarize_samples_stage(
                 &pipeline_job,
-                self.diarize_samples_stage(
-                    &audio.samples,
-                    audio.sample_rate,
-                    diarization_variant,
-                    &runtime_request.config,
-                ),
+                audio.clone(),
+                steady_usage,
+                diarization_variant,
+                runtime_request.config.clone(),
             )
             .await?;
 
@@ -263,7 +565,10 @@ impl RuntimeService {
         let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
             runtime_request.aligner_model_id.as_deref(),
         )?;
-        let aligner_lease = match self.load_model_for_inference(aligner_variant).await {
+        let aligner_lease = match self
+            .load_model_for_job(&pipeline_job, aligner_variant)
+            .await
+        {
             Ok(lease) => Some(lease),
             Err(err) => {
                 warn!("Forced aligner load failed, using heuristic timings: {err}");
@@ -295,42 +600,39 @@ impl RuntimeService {
         );
 
         let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
-            let _asr_lease = self.load_model_for_inference(asr_variant).await?;
+            let asr_lease = self.load_model_for_job(&pipeline_job, asr_variant).await?;
             let asr_model = self
                 .model_registry
                 .get_asr(asr_variant)
                 .await
                 .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
-            let audio_samples = audio.samples.clone();
-            let asr_model_for_task = asr_model.clone();
+            let audio_for_task = audio.clone();
             let transcription = self
                 .coordinator
-                .run_stage(&pipeline_job, async move {
-                    tokio::task::spawn_blocking(move || {
-                        asr_model_for_task.transcribe_with_details(
-                            &audio_samples,
-                            PIPELINE_SAMPLE_RATE,
-                            None,
-                        )
-                    })
-                    .await
-                    .map_err(|err| Error::InferenceError(format!("ASR task failed: {err}")))?
+                .run_blocking_stage(&pipeline_job, move || {
+                    let _asr_lease = asr_lease;
+                    asr_model.transcribe_with_details(
+                        &audio_for_task.samples,
+                        PIPELINE_SAMPLE_RATE,
+                        None,
+                    )
                 })
                 .await?;
             (transcription.text, Vec::new(), transcription.language)
         } else {
-            let _asr_lease = self.load_model_for_inference(asr_variant).await?;
+            let asr_lease = self.load_model_for_job(&pipeline_job, asr_variant).await?;
             let asr_model = self
                 .model_registry
                 .get_asr(asr_variant)
                 .await
                 .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
+            let audio_for_task = audio.clone();
             let (text, chunks) = self
                 .coordinator
-                .run_stage(
-                    &pipeline_job,
-                    transcribe_audio_chunks(asr_model, &audio, None, aligner_limit),
-                )
+                .run_blocking_stage(&pipeline_job, move || {
+                    let _asr_lease = asr_lease;
+                    transcribe_audio_chunks(asr_model, &audio_for_task, None, aligner_limit)
+                })
                 .await?;
             (text, chunks, None)
         };
@@ -342,7 +644,7 @@ impl RuntimeService {
         } else if use_single_pass_asr && aligner_model.is_some() {
             match self
                 .force_align_bytes_with_model_and_language(
-                    &audio_bytes,
+                    runtime_encoded_audio(&runtime_request.audio)?,
                     &asr_text,
                     detected_language.as_deref(),
                     runtime_request.aligner_model_id.as_deref(),
@@ -361,10 +663,18 @@ impl RuntimeService {
         } else if use_single_pass_asr {
             fallback_word_timings_from_words(&asr_words, audio.duration_secs)
         } else if let Some(model) = aligner_model.as_ref() {
+            let model_for_task = model.clone();
+            let audio_for_task = audio.clone();
+            let chunks_for_task = chunk_texts.clone();
             let (aligned, aligned_word_count) = self
                 .coordinator
-                .run_stage(&pipeline_job, async {
-                    Ok(force_align_audio_chunks(model.clone(), &audio, &chunk_texts).await)
+                .run_blocking_stage(&pipeline_job, move || {
+                    let _aligner_lease = aligner_lease;
+                    Ok(force_align_audio_chunks(
+                        model_for_task,
+                        &audio_for_task,
+                        &chunks_for_task,
+                    ))
                 })
                 .await?;
             model_aligned_words = aligned_word_count;
@@ -500,7 +810,7 @@ fn decode_pipeline_audio(audio_base64: &str) -> Result<PipelineAudio> {
 
 fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
     let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
-    let normalized = resample_linear(&samples, sample_rate, PIPELINE_SAMPLE_RATE);
+    let normalized = resample_linear(&samples, sample_rate, PIPELINE_SAMPLE_RATE)?;
     let duration_secs = if PIPELINE_SAMPLE_RATE > 0 {
         normalized.len() as f32 / PIPELINE_SAMPLE_RATE as f32
     } else {
@@ -508,7 +818,7 @@ fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
     };
 
     Ok(PipelineAudio {
-        samples: normalized,
+        samples: normalized.into(),
         sample_rate: PIPELINE_SAMPLE_RATE,
         duration_secs,
     })
@@ -559,7 +869,7 @@ fn should_use_single_pass_diarization_asr(
     }
 }
 
-async fn transcribe_audio_chunks(
+fn transcribe_audio_chunks(
     model: Arc<NativeAsrModel>,
     audio: &PipelineAudio,
     language: Option<&str>,
@@ -581,14 +891,12 @@ async fn transcribe_audio_chunks(
         if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.samples.len() {
             continue;
         }
-        let chunk_audio = audio.samples[chunk.start_sample..chunk.end_sample].to_vec();
-        let model = model.clone();
-        let language = language.clone();
-        let transcription = tokio::task::spawn_blocking(move || {
-            model.transcribe_with_details(&chunk_audio, PIPELINE_SAMPLE_RATE, language.as_deref())
-        })
-        .await
-        .map_err(|err| Error::InferenceError(format!("ASR task failed: {err}")))??;
+        let chunk_audio = &audio.samples[chunk.start_sample..chunk.end_sample];
+        let transcription = model.transcribe_with_details(
+            chunk_audio,
+            PIPELINE_SAMPLE_RATE,
+            language.as_deref(),
+        )?;
         assembler.push_chunk_text(&transcription.text);
         transcribed.push(TranscribedChunk {
             range: chunk,
@@ -600,7 +908,7 @@ async fn transcribe_audio_chunks(
     Ok((assembler.finish().trim().to_string(), transcribed))
 }
 
-async fn force_align_audio_chunks(
+fn force_align_audio_chunks(
     model: Arc<NativeAsrModel>,
     audio: &PipelineAudio,
     chunks: &[TranscribedChunk],
@@ -617,37 +925,25 @@ async fn force_align_audio_chunks(
             continue;
         }
 
-        let chunk_audio = audio.samples[chunk.range.start_sample..chunk.range.end_sample].to_vec();
+        let chunk_audio = &audio.samples[chunk.range.start_sample..chunk.range.end_sample];
         let chunk_duration_secs = chunk_audio.len() as f32 / audio.sample_rate.max(1) as f32;
         let chunk_start_ms = samples_to_ms(chunk.range.start_sample, audio.sample_rate);
-        let text = chunk.text.clone();
-        let language = chunk.language.clone();
-        let model_for_task = model.clone();
-
-        let aligned = match tokio::task::spawn_blocking(move || {
-            model_for_task.force_align(
-                &chunk_audio,
-                PIPELINE_SAMPLE_RATE,
-                &text,
-                language.as_deref(),
-            )
-        })
-        .await
-        {
-            Ok(Ok(aligned))
+        let aligned = match model.force_align(
+            chunk_audio,
+            PIPELINE_SAMPLE_RATE,
+            &chunk.text,
+            chunk.language.as_deref(),
+        ) {
+            Ok(aligned)
                 if !aligned.is_empty()
                     && !alignment_is_suspicious(&aligned, words.len(), chunk_duration_secs) =>
             {
                 model_aligned_words += aligned.len();
                 aligned
             }
-            Ok(Ok(_)) => fallback_word_timings_from_words(&words, chunk_duration_secs),
-            Ok(Err(err)) => {
-                warn!("Forced alignment failed for one chunk, using interval fallback: {err}");
-                fallback_word_timings_from_words(&words, chunk_duration_secs)
-            }
+            Ok(_) => fallback_word_timings_from_words(&words, chunk_duration_secs),
             Err(err) => {
-                warn!("Forced alignment task failed for one chunk, using interval fallback: {err}");
+                warn!("Forced alignment failed for one chunk, using interval fallback: {err}");
                 fallback_word_timings_from_words(&words, chunk_duration_secs)
             }
         };
@@ -1751,14 +2047,28 @@ fn is_seconds_token(token: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if audio.is_empty() || src_rate == 0 || dst_rate == 0 || src_rate == dst_rate {
-        return audio.to_vec();
+        let mut output = Vec::new();
+        output.try_reserve_exact(audio.len()).map_err(|_| {
+            Error::Overloaded("Unable to reserve bounded diarization audio".to_string())
+        })?;
+        output.extend_from_slice(audio);
+        return Ok(output);
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
     let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = vec![0.0f32; out_len];
+    if out_len > MAX_PIPELINE_SAMPLES {
+        return Err(Error::InvalidInput(format!(
+            "Resampled diarization audio would contain {out_len} samples, exceeding the {MAX_PIPELINE_SAMPLES}-sample production limit"
+        )));
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(out_len).map_err(|_| {
+        Error::Overloaded("Unable to reserve bounded resampled diarization audio".to_string())
+    })?;
+    out.resize(out_len, 0.0f32);
 
     for (idx, sample) in out.iter_mut().enumerate() {
         let src_pos = idx as f64 / ratio;
@@ -1768,7 +2078,7 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
         *sample = audio[left] * (1.0 - frac) + audio[right] * frac;
     }
 
-    out
+    Ok(out)
 }
 
 fn secs_to_ms(value: f32) -> u32 {
@@ -1782,6 +2092,200 @@ fn secs_to_ms(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn admitted_diarization_copy_job(
+        runtime: &RuntimeService,
+        request_id: &str,
+        input_bytes: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> JobLease {
+        let mut context = RuntimeRequestContext::default();
+        if let Some(deadline) = deadline {
+            context = context.with_deadline(deadline);
+        }
+        let mut spec = runtime.coordinator_job_for_input(
+            request_id,
+            CoordinatorLane::Pipeline,
+            context,
+            input_bytes,
+        );
+        spec.resources = spec
+            .resources
+            .checked_add(
+                diarization_audio_resources(
+                    runtime.backend_context().backend_kind,
+                    MAX_PIPELINE_SAMPLES,
+                )
+                .expect("diarization resources"),
+            )
+            .expect("combined resources");
+        runtime
+            .coordinator
+            .admit_observed(
+                spec,
+                JobResourceObservation::host(
+                    u64::try_from(input_bytes).expect("test input fits u64"),
+                ),
+            )
+            .await
+            .expect("diarization copy admission")
+    }
+
+    #[test]
+    fn diarization_decode_workspace_maps_to_physical_backend_memory() {
+        let sample_count = PIPELINE_SAMPLE_RATE as usize;
+        let shared = production_workspace_authorization(sample_count, false).unwrap();
+        let separate = production_workspace_authorization(sample_count, true).unwrap();
+        let cpu = diarization_audio_resources(crate::backends::BackendKind::Cpu, sample_count)
+            .expect("CPU workspace");
+        let metal = diarization_audio_resources(crate::backends::BackendKind::Metal, sample_count)
+            .expect("Metal workspace");
+        let cuda = diarization_audio_resources(crate::backends::BackendKind::Cuda, sample_count)
+            .expect("CUDA workspace");
+
+        assert_eq!(
+            cpu.host_bytes,
+            ResourceAmount::Known(
+                DIARIZATION_AUDIO_WORKSPACE_BYTES + shared.host_bytes + shared.accelerator_bytes
+            )
+        );
+        assert_eq!(
+            metal.unified_bytes,
+            ResourceAmount::Known(
+                DIARIZATION_AUDIO_WORKSPACE_BYTES + shared.host_bytes + shared.accelerator_bytes
+            )
+        );
+        assert_eq!(
+            cuda.host_bytes,
+            ResourceAmount::Known(DIARIZATION_AUDIO_WORKSPACE_BYTES + separate.host_bytes)
+        );
+        assert_eq!(
+            cuda.device_bytes,
+            ResourceAmount::Known(separate.accelerator_bytes)
+        );
+        assert_eq!(cpu.device_bytes, ResourceAmount::Known(0));
+        assert_eq!(cpu.unified_bytes, ResourceAmount::Known(0));
+        assert_eq!(metal.host_bytes, ResourceAmount::Known(0));
+        assert_eq!(metal.device_bytes, ResourceAmount::Known(0));
+        assert_eq!(cuda.unified_bytes, ResourceAmount::Known(0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn diarization_admitted_copy_yields_between_bounded_quanta() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = RuntimeService::new(crate::config::EngineConfig::default()).expect("runtime");
+        let input = vec![11_u8; 2 * 1024 * 1024 + 17];
+        let job =
+            admitted_diarization_copy_job(&runtime, "yielding-diarization-copy", input.len(), None)
+                .await;
+        let peer_ran = Arc::new(AtomicBool::new(false));
+        let task_peer_ran = peer_ran.clone();
+        let peer = tokio::spawn(async move {
+            task_peer_ran.store(true, Ordering::Release);
+        });
+
+        let owned = DiarizationAudioInput::Bytes(&input)
+            .into_owned_for_job(&job)
+            .await
+            .expect("admitted copy");
+        let OwnedDiarizationAudioInput::Bytes(copied) = owned else {
+            panic!("byte input must remain bytes");
+        };
+
+        assert_eq!(copied, input);
+        assert!(
+            peer_ran.load(Ordering::Acquire),
+            "a multi-quantum diarization copy must yield to another Tokio task"
+        );
+        peer.await.expect("peer task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn diarization_admitted_copy_stops_at_absolute_deadline() {
+        let runtime = RuntimeService::new(crate::config::EngineConfig::default()).expect("runtime");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let job =
+            admitted_diarization_copy_job(&runtime, "expired-diarization-copy", 8, Some(deadline))
+                .await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let result = DiarizationAudioInput::Bytes(&[0_u8; 8])
+            .into_owned_for_job(&job)
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("copy must honor its absolute deadline"),
+        };
+
+        assert!(
+            matches!(error, Error::Timeout(request_id) if request_id == "expired-diarization-copy")
+        );
+    }
+
+    #[test]
+    fn diarization_transcript_observation_retains_one_encoded_copy() {
+        let mut encoded = Vec::with_capacity(64);
+        encoded.extend_from_slice(&[1_u8, 2, 3, 4]);
+        let request = DiarizationRuntimeRequest::from_bytes(
+            ModelVariant::DiarStreamingSortformer4SpkV21,
+            encoded,
+            DiarizationConfig::default(),
+        )
+        .expect("runtime request");
+        let audio = PipelineAudio {
+            samples: Arc::from(vec![0.0_f32; 8]),
+            sample_rate: PIPELINE_SAMPLE_RATE,
+            duration_secs: 8.0 / PIPELINE_SAMPLE_RATE as f32,
+        };
+
+        let observation = diarization_request_audio_observation(10, &request, &audio)
+            .expect("steady observation");
+
+        assert_eq!(runtime_audio_bytes(&request.audio), 64);
+        assert_eq!(observation.host_bytes, 10 + 64 + 8 * 4);
+    }
+
+    #[test]
+    fn sortformer_workspace_authorization_bounds_all_supported_backends() {
+        let one_second = production_workspace_authorization(16_000, false).unwrap();
+        let production_limit = production_workspace_authorization(MAX_PIPELINE_SAMPLES, false)
+            .expect("production workspace");
+        let cuda_limit = production_workspace_authorization(MAX_PIPELINE_SAMPLES, true)
+            .expect("CUDA production workspace");
+
+        assert!(production_limit.host_bytes > one_second.host_bytes);
+        assert!(production_limit.accelerator_bytes >= one_second.accelerator_bytes);
+        assert!(cuda_limit.host_bytes > production_limit.host_bytes);
+        assert_eq!(
+            cuda_limit.accelerator_bytes,
+            production_limit.accelerator_bytes
+        );
+    }
+
+    #[test]
+    fn sortformer_workspace_observation_preserves_steady_usage() {
+        let steady = JobResourceObservation::new(123, 7);
+        let materialized = diarization_workspace_observation(
+            steady,
+            SortformerWorkspaceEstimate {
+                host_bytes: 20,
+                accelerator_bytes: 40,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(materialized, JobResourceObservation::new(143, 47));
+    }
+
+    #[test]
+    fn resampler_rejects_output_beyond_pipeline_duration_before_allocation() {
+        let input = vec![0.0f32; MAX_PIPELINE_DURATION_SECONDS + 1];
+        let error = resample_linear(&input, 1, PIPELINE_SAMPLE_RATE)
+            .expect_err("one sample beyond the one-hour contract must fail");
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert!(error.to_string().contains("production limit"));
+    }
 
     #[test]
     fn fallback_word_timings_generates_monotonic_ranges() {

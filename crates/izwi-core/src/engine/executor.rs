@@ -44,7 +44,7 @@ use crate::backends::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
-use crate::models::registry::NativeChatModel;
+use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::ModelRegistry;
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
@@ -576,26 +576,42 @@ impl NativeExecutor {
         }
     }
 
-    fn with_qwen_model<T>(
+    fn qwen_model_for_request(
         &self,
-        variant: Option<ModelVariant>,
-        f: impl FnOnce(&Qwen3TtsModel) -> Result<T>,
-    ) -> Result<T> {
+        request: &EngineCoreRequest,
+    ) -> Result<(Arc<Qwen3TtsModel>, Option<QwenTtsModelLease>)> {
+        if let Some(lease) = request.prepared_qwen_tts_model_lease_for_executor()? {
+            return Ok((lease.model_arc(), Some(lease)));
+        }
         if let Some(registry) = &self.config.model_registry {
-            let variant = variant.ok_or_else(|| {
+            let variant = request.model_variant.ok_or_else(|| {
                 Error::InferenceError("Qwen TTS request is missing model variant".to_string())
             })?;
-            let model = registry.try_get_qwen_tts(variant).ok_or_else(|| {
-                Error::InferenceError(format!("Qwen TTS model {variant} is not loaded"))
+            let lease = registry.try_get_qwen_tts_lease(variant).ok_or_else(|| {
+                Error::ModelNotFound(format!("Qwen TTS model {variant} is not loaded"))
             })?;
-            return f(model.as_ref());
+            return Ok((lease.model_arc(), Some(lease)));
         }
+        self.loaded_tts_model
+            .clone()
+            .map(|model| (model, None))
+            .ok_or_else(|| Error::InferenceError("Executor model not initialized".to_string()))
+    }
 
-        let model = self
-            .loaded_tts_model
-            .as_deref()
-            .ok_or_else(|| Error::InferenceError("Executor model not initialized".to_string()))?;
-        f(model)
+    fn asr_model_for_request(
+        &self,
+        request: &EngineCoreRequest,
+        variant: ModelVariant,
+    ) -> Result<(Arc<NativeAsrModel>, AsrModelLease)> {
+        if let Some(lease) = request.prepared_asr_model_lease_for_executor()? {
+            return Ok((lease.model_arc(), lease));
+        }
+        self.with_registry(|registry| {
+            let lease = registry.try_get_asr_lease(variant).ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
+            })?;
+            Ok((lease.model_arc(), lease))
+        })
     }
 
     fn with_registry<T>(&self, f: impl FnOnce(&ModelRegistry) -> Result<T>) -> Result<T> {
@@ -664,6 +680,31 @@ impl NativeExecutor {
         Ok(())
     }
 
+    /// Restore every scheduled model-owned cache lease to a pending claim
+    /// before model code can replace, release, or fail while mutating its
+    /// physical decode state. Successful non-terminal execution reconciles the
+    /// new positive observation afterwards.
+    fn prepare_scheduled_cache(&self, scheduled: &[ScheduledRequest]) -> Result<()> {
+        if self.config.resource_authority.is_none() {
+            return Ok(());
+        }
+        let reservations = self.cache_resource_leases.lock().map_err(|_| {
+            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+        })?;
+        let zero = cache_resource_vector(self.config.backend, 0);
+        for item in scheduled {
+            let session = item.session_key();
+            let Some(reservation) = reservations.get(&session) else {
+                continue;
+            };
+            let lease = reservation.lease.as_ref().ok_or_else(|| {
+                Error::InferenceError("cache allocation has no physical resource lease".to_string())
+            })?;
+            lease.prepare_materialized_release(zero)?;
+        }
+        Ok(())
+    }
+
     fn reserve_exact_session_cache(
         &self,
         authority: &Arc<ResourceAuthority>,
@@ -709,32 +750,21 @@ impl NativeExecutor {
         match request.task_type {
             super::types::TaskType::Chat => {
                 let prompt_tokens = request.prompt_tokens.len();
-                if prompt_tokens == 0 {
-                    return Err(Error::InvalidInput(format!(
-                        "Chat request {} is missing exact precomputed prompt tokens for cache authorization",
-                        request.id
-                    )));
-                }
-                self.with_registry(|registry| {
-                    let model = registry.try_get_chat(variant).ok_or_else(|| {
-                        Error::ModelNotFound(format!("Chat model {variant} is not loaded"))
-                    })?;
-                    model.session_cache_reservation_bytes(
+                request
+                    .prepared_chat_model_for_executor()?
+                    .session_cache_reservation_bytes(
                         prompt_tokens,
                         request.params.max_tokens.max(1),
                     )
-                })
             }
-            super::types::TaskType::ASR => self.with_registry(|registry| {
-                let model = registry.try_get_asr(variant).ok_or_else(|| {
-                    Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
-                })?;
+            super::types::TaskType::ASR => {
+                let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
                 model.session_cache_reservation_bytes(
-                    request.language.as_deref(),
-                    request.asr_prompt.as_deref(),
+                    request.asr_language_for_execution(),
+                    request.asr_prompt_for_execution(),
                     request.params.max_tokens.max(1),
                 )
-            }),
+            }
             super::types::TaskType::TTS => {
                 let params = Self::to_tts_params(request);
                 let text = request
@@ -742,15 +772,14 @@ impl NativeExecutor {
                     .as_deref()
                     .ok_or_else(|| Error::InvalidInput("TTS request missing text".to_string()))?;
                 let reference = Self::reference_from_request(request)?;
-                self.with_qwen_model(Some(variant), |model| {
-                    model.session_cache_reservation_bytes(TtsSessionCacheRequest {
-                        text,
-                        reference: reference.as_ref(),
-                        language: request.language.as_deref(),
-                        instruct: request.voice_description.as_deref(),
-                        uses_preset_speaker: !model.available_speakers().is_empty(),
-                        max_frames: params.max_frames,
-                    })
+                let (model, _model_lease) = self.qwen_model_for_request(request)?;
+                model.session_cache_reservation_bytes(TtsSessionCacheRequest {
+                    text,
+                    reference: reference.as_ref(),
+                    language: request.language.as_deref(),
+                    instruct: request.voice_description.as_deref(),
+                    uses_preset_speaker: !model.available_speakers().is_empty(),
+                    max_frames: params.max_frames,
                 })
             }
             super::types::TaskType::SpeechToSpeech => Err(Error::InvalidInput(
@@ -802,6 +831,13 @@ impl NativeExecutor {
         scheduled: &ScheduledRequest,
         output: &ExecutorOutput,
     ) -> Result<ResourceVector> {
+        // Every scheduled cache lease was restored to pending before dispatch.
+        // A terminal or failed operation must therefore remain pending until
+        // cleanup drops the exact physical state and its lease; never turn its
+        // zero observation into a post-operation materialization transition.
+        if output.finished || output.error.is_some() {
+            return Ok(cache_observation(0));
+        }
         let Some(profile) = self.execution_profile(request) else {
             return Ok(ResourceVector::zero());
         };
@@ -828,10 +864,12 @@ impl NativeExecutor {
         let lease = reservation.lease.as_ref().ok_or_else(|| {
             Error::InferenceError("cache allocation has no physical resource lease".to_string())
         })?;
-        lease.record_materialized_usage(cache_resource_vector(
-            self.config.backend,
-            observed_bytes,
-        ))?;
+        if observed_bytes > 0 {
+            lease.record_materialized_usage(cache_resource_vector(
+                self.config.backend,
+                observed_bytes,
+            ))?;
+        }
         reservation.observed_blocks = scheduled.block_ids.len();
         Ok(observation)
     }
@@ -885,8 +923,7 @@ fn static_qwen_tts_batch_eligible(
 ) -> bool {
     matches!(request.task_type, super::types::TaskType::TTS)
         && !request.streaming
-        && request.reference_audio.is_none()
-        && request.reference_text.is_none()
+        && !request.has_tts_reference_for_execution()
         && request
             .model_variant
             .and_then(|variant| variant.speech_capabilities())
@@ -914,28 +951,38 @@ impl ModelExecutor for NativeExecutor {
         ));
 
         let loaded_incremental = match request.task_type {
-            super::types::TaskType::Chat => self
-                .config
-                .model_registry
-                .as_ref()
-                .and_then(|registry| registry.try_get_chat(variant))
-                .map(|model| match model.as_ref() {
-                    NativeChatModel::Qwen3(model) => model.supports_incremental_decode(),
-                    NativeChatModel::Qwen35(model) => model.supports_incremental_decode(),
-                    NativeChatModel::Gemma3(_) | NativeChatModel::Lfm2(_) => false,
-                }),
-            super::types::TaskType::ASR => self
-                .config
-                .model_registry
-                .as_ref()
-                .and_then(|registry| registry.try_get_asr(variant))
+            super::types::TaskType::Chat => {
+                request
+                    .prepared_chat_model_for_executor()
+                    .ok()
+                    .map(|model| match model.as_ref() {
+                        NativeChatModel::Qwen3(model) => model.supports_incremental_decode(),
+                        NativeChatModel::Qwen35(model) => model.supports_incremental_decode(),
+                        NativeChatModel::Gemma3(_) | NativeChatModel::Lfm2(_) => false,
+                    })
+            }
+            super::types::TaskType::ASR => request
+                .prepared_asr_model_for_executor()
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    self.config
+                        .model_registry
+                        .as_ref()
+                        .and_then(|registry| registry.try_get_asr(variant))
+                })
                 .map(|model| model.supports_incremental_decode()),
             super::types::TaskType::TTS => {
-                let loaded = self
-                    .config
-                    .model_registry
-                    .as_ref()
-                    .and_then(|registry| registry.try_get_qwen_tts(variant))
+                let loaded = request
+                    .prepared_qwen_tts_model_for_executor()
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        self.config
+                            .model_registry
+                            .as_ref()
+                            .and_then(|registry| registry.try_get_qwen_tts(variant))
+                    })
                     .is_some()
                     || (self.config.model_registry.is_none() && self.loaded_tts_model.is_some());
                 loaded.then_some(variant.family() == crate::catalog::ModelFamily::Qwen3Tts)
@@ -947,11 +994,16 @@ impl ModelExecutor for NativeExecutor {
                 .and_then(|registry| registry.try_get_audio_chat(variant))
                 .map(|_| false),
         };
-        let loaded_has_speakers = self
-            .config
-            .model_registry
-            .as_ref()
-            .and_then(|registry| registry.try_get_qwen_tts(variant))
+        let loaded_has_speakers = request
+            .prepared_qwen_tts_model_for_executor()
+            .ok()
+            .flatten()
+            .or_else(|| {
+                self.config
+                    .model_registry
+                    .as_ref()
+                    .and_then(|registry| registry.try_get_qwen_tts(variant))
+            })
             .or_else(|| self.loaded_tts_model.clone())
             .is_some_and(|model| !model.available_speakers().is_empty());
         let static_tts_batch = static_qwen_tts_batch_eligible(
@@ -1092,63 +1144,94 @@ impl ModelExecutor for NativeExecutor {
 
     fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down native executor");
+        let mut chat = self
+            .chat_decode_states
+            .lock()
+            .map_err(|_| Error::InferenceError("chat decode state mutex poisoned".to_string()))?;
+        let mut asr = self
+            .asr_decode_states
+            .lock()
+            .map_err(|_| Error::InferenceError("ASR decode state mutex poisoned".to_string()))?;
+        let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
+            Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
+        })?;
+        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
+            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+        })?;
+        let zero = cache_resource_vector(self.config.backend, 0);
+        for reservation in reservations.values() {
+            let lease = reservation.lease.as_ref().ok_or_else(|| {
+                Error::InferenceError("cache allocation has no physical resource lease".to_string())
+            })?;
+            lease.prepare_materialized_release(zero)?;
+        }
+        chat.clear();
+        asr.clear();
+        tts.clear();
+        reservations.clear();
+        drop((chat, asr, tts, reservations));
         self.initialized = false;
         self.loaded_tts_model = None;
-        if let Ok(mut guard) = self.chat_decode_states.lock() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.asr_decode_states.lock() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.qwen_tts_decode_states.lock() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = self.cache_resource_leases.lock() {
-            guard.clear();
-        }
         Ok(())
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let mut released = 0usize;
-        let mut confirmed = true;
-        for cleanup in [
-            retain_other_sessions(&self.chat_decode_states, request_id),
-            retain_other_sessions(&self.asr_decode_states, request_id),
-            retain_other_sessions(&self.qwen_tts_decode_states, request_id),
-            retain_other_sessions(&self.cache_resource_leases, request_id),
-        ] {
-            match cleanup {
-                Some(count) => released = released.saturating_add(count),
-                None => confirmed = false,
+        let (Ok(mut chat), Ok(mut asr), Ok(mut tts), Ok(mut reservations)) = (
+            self.chat_decode_states.lock(),
+            self.asr_decode_states.lock(),
+            self.qwen_tts_decode_states.lock(),
+            self.cache_resource_leases.lock(),
+        ) else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        let zero = cache_resource_vector(self.config.backend, 0);
+        for (session, reservation) in reservations.iter() {
+            if session.request_id != request_id {
+                continue;
+            }
+            let Some(lease) = reservation.lease.as_ref() else {
+                return CacheReleaseReport::unconfirmed();
+            };
+            if lease.prepare_materialized_release(zero).is_err() {
+                return CacheReleaseReport::unconfirmed();
             }
         }
-        if confirmed {
-            CacheReleaseReport::confirmed(released)
-        } else {
-            CacheReleaseReport::unconfirmed()
-        }
+
+        let mut released = 0usize;
+        released = released.saturating_add(retain_other_sessions_locked(&mut chat, request_id));
+        released = released.saturating_add(retain_other_sessions_locked(&mut asr, request_id));
+        released = released.saturating_add(retain_other_sessions_locked(&mut tts, request_id));
+        released =
+            released.saturating_add(retain_other_sessions_locked(&mut reservations, request_id));
+        CacheReleaseReport::confirmed(released)
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
-        let mut released = 0usize;
-        let mut confirmed = true;
-        for cleanup in [
-            remove_exact_session(&self.chat_decode_states, session),
-            remove_exact_session(&self.asr_decode_states, session),
-            remove_exact_session(&self.qwen_tts_decode_states, session),
-            remove_exact_session(&self.cache_resource_leases, session),
-        ] {
-            match cleanup {
-                Some(was_present) => released = released.saturating_add(usize::from(was_present)),
-                None => confirmed = false,
+        let (Ok(mut chat), Ok(mut asr), Ok(mut tts), Ok(mut reservations)) = (
+            self.chat_decode_states.lock(),
+            self.asr_decode_states.lock(),
+            self.qwen_tts_decode_states.lock(),
+            self.cache_resource_leases.lock(),
+        ) else {
+            return CacheReleaseReport::unconfirmed();
+        };
+        if let Some(reservation) = reservations.get(session) {
+            let Some(lease) = reservation.lease.as_ref() else {
+                return CacheReleaseReport::unconfirmed();
+            };
+            if lease
+                .prepare_materialized_release(cache_resource_vector(self.config.backend, 0))
+                .is_err()
+            {
+                return CacheReleaseReport::unconfirmed();
             }
         }
-        if confirmed {
-            CacheReleaseReport::confirmed(released)
-        } else {
-            CacheReleaseReport::unconfirmed()
-        }
+
+        let released = usize::from(chat.remove(session).is_some())
+            .saturating_add(usize::from(asr.remove(session).is_some()))
+            .saturating_add(usize::from(tts.remove(session).is_some()))
+            .saturating_add(usize::from(reservations.remove(session).is_some()));
+        CacheReleaseReport::confirmed(released)
     }
 }
 
@@ -1237,24 +1320,10 @@ impl UnifiedExecutor {
     }
 }
 
-fn retain_other_sessions<T>(
-    states: &Mutex<HashMap<SessionKey, T>>,
-    request_id: &str,
-) -> Option<usize> {
-    let mut guard = states.lock().ok()?;
-    let before = guard.len();
-    guard.retain(|session, _| session.request_id != request_id);
-    Some(before.saturating_sub(guard.len()))
-}
-
-fn remove_exact_session<T>(
-    states: &Mutex<HashMap<SessionKey, T>>,
-    session: &SessionKey,
-) -> Option<bool> {
-    states
-        .lock()
-        .ok()
-        .map(|mut guard| guard.remove(session).is_some())
+fn retain_other_sessions_locked<T>(states: &mut HashMap<SessionKey, T>, request_id: &str) -> usize {
+    let before = states.len();
+    states.retain(|session, _| session.request_id != request_id);
+    before.saturating_sub(states.len())
 }
 
 /// Decode base64-encoded audio to samples.
@@ -1290,6 +1359,98 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct MutableCacheCapacityProvider {
+        capacity: ResourceVector,
+        available: std::sync::Mutex<ResourceVector>,
+    }
+
+    impl MutableCacheCapacityProvider {
+        fn new(capacity: ResourceVector, available: ResourceVector) -> Self {
+            Self {
+                capacity,
+                available: std::sync::Mutex::new(available),
+            }
+        }
+
+        fn set_available(&self, available: ResourceVector) {
+            *self
+                .available
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = available;
+        }
+    }
+
+    impl PhysicalCapacityProvider for MutableCacheCapacityProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: self.capacity,
+                available: *self
+                    .available
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+                source: CapacitySource::Test,
+            }
+        }
+    }
+
+    fn materialized_cache_fixture(
+        backend: BackendKind,
+        request_id: &str,
+    ) -> (
+        NativeExecutor,
+        Arc<ResourceAuthority>,
+        Arc<MutableCacheCapacityProvider>,
+        EngineCoreRequest,
+        ScheduledRequest,
+    ) {
+        let capacity = cache_resource_vector(backend, 200);
+        let live_headroom = cache_resource_vector(backend, 100);
+        let provider = Arc::new(MutableCacheCapacityProvider::new(capacity, live_headroom));
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, format!("{request_id}:7")),
+                cache_resource_vector(backend, 100),
+            )
+            .unwrap();
+        provider.set_available(cache_resource_vector(backend, 0));
+        lease
+            .record_materialized_usage(cache_resource_vector(backend, 100))
+            .unwrap();
+
+        let mut config = WorkerConfig::default();
+        config.backend = backend;
+        config.resource_authority = Some(authority.clone());
+        let executor = NativeExecutor::new(config);
+        let session = SessionKey::new(request_id.to_string(), 7);
+        executor.cache_resource_leases.lock().unwrap().insert(
+            session,
+            CacheResourceReservation {
+                reserved_bytes: 100,
+                observed_blocks: 1,
+                lease: Some(lease),
+            },
+        );
+        let mut request = EngineCoreRequest::tts("cache transition");
+        request.id = request_id.to_string();
+        let scheduled = ScheduledRequest {
+            plan_id: 7,
+            request_id: request_id.to_string(),
+            sequence_id: 7,
+            num_tokens: 1,
+            is_prefill: false,
+            block_ids: vec![1],
+            num_computed_tokens: 1,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Decode,
+                input: crate::engine::InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        };
+        (executor, authority, provider, request, scheduled)
     }
 
     #[test]
@@ -1407,6 +1568,82 @@ mod tests {
     }
 
     #[test]
+    fn terminal_incremental_cache_stays_pending_until_exact_cleanup() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let (executor, authority, provider, request, scheduled) =
+                materialized_cache_fixture(backend, "terminal-cache");
+            executor
+                .prepare_scheduled_cache(std::slice::from_ref(&scheduled))
+                .unwrap();
+
+            let observed = executor
+                .reconcile_scheduled_cache(
+                    &request,
+                    &scheduled,
+                    &ExecutorOutput::terminal(request.id.clone()),
+                )
+                .unwrap();
+            assert_eq!(observed, cache_observation(0));
+
+            // The model's terminal path has released its physical cache. The
+            // old lease still owns the same bytes as pending authorization, so
+            // another admission cannot spend that newly visible headroom.
+            provider.set_available(cache_resource_vector(backend, 100));
+            assert!(matches!(
+                authority.reserve(
+                    ReservationOwner::new(ReservationClass::Request, "terminal-racer"),
+                    cache_resource_vector(backend, 50),
+                ),
+                Err(Error::Overloaded(_))
+            ));
+
+            let report = executor.cleanup_session(&scheduled.session_key());
+            assert!(report.confirmed);
+            assert_eq!(authority.snapshot().reservations, 0);
+            let replacement = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Request, "terminal-replacement"),
+                    cache_resource_vector(backend, 50),
+                )
+                .unwrap();
+            drop(replacement);
+        }
+    }
+
+    #[test]
+    fn model_error_cache_cleanup_cannot_double_spend_materialized_release() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let (executor, authority, provider, request, scheduled) =
+                materialized_cache_fixture(backend, "error-cache");
+            executor
+                .prepare_scheduled_cache(std::slice::from_ref(&scheduled))
+                .unwrap();
+
+            let observed = executor
+                .reconcile_scheduled_cache(
+                    &request,
+                    &scheduled,
+                    &ExecutorOutput::error(request.id.clone(), "model failed"),
+                )
+                .unwrap();
+            assert_eq!(observed, cache_observation(0));
+
+            provider.set_available(cache_resource_vector(backend, 100));
+            assert!(matches!(
+                authority.reserve(
+                    ReservationOwner::new(ReservationClass::Request, "error-racer"),
+                    cache_resource_vector(backend, 50),
+                ),
+                Err(Error::Overloaded(_))
+            ));
+
+            let report = executor.cleanup_request(&request.id);
+            assert!(report.confirmed);
+            assert_eq!(authority.snapshot().reservations, 0);
+        }
+    }
+
+    #[test]
     fn cache_authorization_runs_once_per_exact_session_on_every_backend() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let capacity = cache_resource_vector(backend, 4096);
@@ -1462,17 +1699,17 @@ mod tests {
     }
 
     #[test]
-    fn chat_cache_authorization_requires_exact_precomputed_tokens() {
+    fn chat_cache_authorization_requires_private_exact_preparation() {
         let executor = NativeExecutor::new(WorkerConfig::default());
         let request =
             EngineCoreRequest::chat(Vec::new()).with_model_variant(ModelVariant::Qwen306B);
 
         let error = executor
             .authorized_session_cache_bytes(&request)
-            .expect_err("estimated prompt length must not authorize physical cache");
+            .expect_err("public prompt fields must not authorize physical cache");
         assert!(error
             .to_string()
-            .contains("missing exact precomputed prompt tokens"));
+            .contains("missing exact model prompt preparation"));
     }
 
     #[test]

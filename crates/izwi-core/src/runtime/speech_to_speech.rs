@@ -1,17 +1,81 @@
 //! Speech-to-speech runtime methods routed through the unified core engine.
 
 use crate::catalog::parse_model_variant;
-use crate::engine::{GenerationParams, StreamingOutput, TaskType};
+use crate::engine::{GenerationParams, ResourceVector, StreamingOutput, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::ChatMessage;
+use crate::runtime::audio_io::{
+    validate_base64_audio_retained_size, validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
+};
+use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::AudioChatRuntimeRequest;
-use crate::runtime::service::{AdmittedEngineRequest, RuntimeService};
+use crate::runtime::service::{
+    copy_optional_preparation_string, copy_preparation_bytes, copy_preparation_string,
+    retained_speech_to_speech_preparation_input_bytes, AdmittedEngineRequest, RuntimeService,
+};
 use crate::runtime::types::{RuntimeRequestContext, SpeechToSpeechGeneration};
 
 enum SpeechAudioInput<'a> {
     Base64(&'a str),
     Bytes(&'a [u8]),
+}
+
+enum OwnedSpeechAudioInput {
+    Base64(String),
+    Bytes(Vec<u8>),
+}
+
+impl SpeechAudioInput<'_> {
+    fn validate_retained_size(&self) -> Result<()> {
+        match self {
+            Self::Base64(audio) => {
+                validate_base64_audio_retained_size(audio.len(), MAX_AUDIO_SOURCE_BYTES)
+            }
+            Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "speech-to-speech encoded audio is {} bytes, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    audio.len()
+                )))
+            }
+            Self::Bytes(_) => Ok(()),
+        }
+    }
+
+    async fn into_owned_for_job(self, job: &JobLease) -> Result<OwnedSpeechAudioInput> {
+        match self {
+            Self::Base64(audio) => Ok(OwnedSpeechAudioInput::Base64(
+                copy_preparation_string(job, audio, "speech-to-speech base64 audio").await?,
+            )),
+            Self::Bytes(audio) => Ok(OwnedSpeechAudioInput::Bytes(
+                copy_preparation_bytes(job, audio, "speech-to-speech encoded audio").await?,
+            )),
+        }
+    }
+}
+
+impl OwnedSpeechAudioInput {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Base64(audio) => audio.capacity(),
+            Self::Bytes(audio) => audio.capacity(),
+        }
+    }
+
+    fn validate_source_size(&self) -> Result<()> {
+        match self {
+            Self::Base64(audio) => {
+                validate_base64_audio_source_size(audio, MAX_AUDIO_SOURCE_BYTES)
+            }
+            Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
+                Err(Error::InvalidInput(format!(
+                    "speech-to-speech encoded audio is {} bytes, exceeding the {MAX_AUDIO_SOURCE_BYTES}-byte source limit",
+                    audio.len()
+                )))
+            }
+            Self::Bytes(_) => Ok(()),
+        }
+    }
 }
 
 fn resolve_audio_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
@@ -57,37 +121,81 @@ impl RuntimeService {
             SpeechAudioInput::Base64(audio) => audio.len(),
             SpeechAudioInput::Bytes(audio) => audio.len(),
         };
-        let input_bytes = audio_bytes
-            .saturating_add(messages.iter().map(|message| message.content.len()).sum())
-            .saturating_add(system_prompt.map(str::len).unwrap_or_default());
-        self.prepare_engine_request(
+        audio_input.validate_retained_size()?;
+        let input_bytes = retained_speech_to_speech_preparation_input_bytes(
+            audio_bytes,
+            &messages,
+            messages.capacity(),
+            &params,
+            system_prompt,
+            correlation_id,
+        )?;
+        self.prepare_engine_request_blocking_with_input(
             variant,
             TaskType::SpeechToSpeech,
             streaming,
             runtime_context,
             input_bytes,
-            move || async move {
+            ResourceVector::zero(),
+            move |job| async move {
+                let audio_input = audio_input.into_owned_for_job(&job).await?;
+                let system_prompt = copy_optional_preparation_string(
+                    &job,
+                    system_prompt,
+                    "speech-to-speech system prompt",
+                )
+                .await?;
+                let correlation_id = copy_optional_preparation_string(
+                    &job,
+                    correlation_id,
+                    "speech-to-speech correlation metadata",
+                )
+                .await?;
+                let retained_metadata_bytes = system_prompt
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .checked_add(correlation_id.as_ref().map_or(0, String::capacity))
+                    .ok_or_else(|| {
+                        Error::Overloaded(
+                            "speech-to-speech retained metadata overflowed".to_string(),
+                        )
+                    })?;
+                let retained_bytes = input_bytes
+                    .checked_add(audio_input.retained_bytes())
+                    .and_then(|bytes| bytes.checked_add(retained_metadata_bytes))
+                    .ok_or_else(|| {
+                        Error::Overloaded("speech-to-speech retained input overflowed".to_string())
+                    })?;
+                job.record_materialized_usage(JobResourceObservation::host(
+                    u64::try_from(retained_bytes).map_err(|_| {
+                        Error::Overloaded("speech-to-speech retained input exceeds u64".to_string())
+                    })?,
+                ))?;
+                Ok((audio_input, system_prompt, correlation_id))
+            },
+            move |_registry, (audio_input, system_prompt, correlation_id)| {
+                audio_input.validate_source_size()?;
                 params.max_tokens = params.max_tokens.max(1);
                 let runtime_request = match audio_input {
-                    SpeechAudioInput::Base64(audio_base64) => {
+                    OwnedSpeechAudioInput::Base64(audio_base64) => {
                         AudioChatRuntimeRequest::speech_to_speech_base64(
                             variant,
                             audio_base64,
                             messages,
                             params,
-                            system_prompt.map(ToOwned::to_owned),
-                            correlation_id.map(ToOwned::to_owned),
+                            system_prompt,
+                            correlation_id,
                             runtime_context,
                         )?
                     }
-                    SpeechAudioInput::Bytes(audio_bytes) => {
+                    OwnedSpeechAudioInput::Bytes(audio_bytes) => {
                         AudioChatRuntimeRequest::speech_to_speech_bytes(
                             variant,
-                            audio_bytes.to_vec(),
+                            audio_bytes,
                             messages,
                             params,
-                            system_prompt.map(ToOwned::to_owned),
-                            correlation_id.map(ToOwned::to_owned),
+                            system_prompt,
+                            correlation_id,
                             runtime_context,
                         )?
                     }
@@ -308,5 +416,27 @@ mod tests {
         let err =
             resolve_audio_chat_variant(Some("Qwen3-1.7B-GGUF")).expect_err("expected rejection");
         assert!(err.to_string().contains("not an audio-chat model"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speech_to_speech_preparation_honors_deadline_before_model_lookup() {
+        let runtime = RuntimeService::new(crate::config::EngineConfig::default()).expect("runtime");
+        let deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let context = RuntimeRequestContext::default().with_deadline(deadline);
+
+        let result = runtime
+            .build_speech_to_speech_request(
+                ModelVariant::Lfm25Audio15BGguf,
+                SpeechAudioInput::Base64("AAAA"),
+                Vec::new(),
+                GenerationParams::default(),
+                None,
+                None,
+                context,
+                false,
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout(_))));
     }
 }

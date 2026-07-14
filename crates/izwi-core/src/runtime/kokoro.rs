@@ -8,9 +8,13 @@ use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::kokoro::{KokoroSynthesisResult, KokoroTtsModel};
+use crate::models::architectures::kokoro::{
+    kokoro_output_budget, KokoroSynthesisResult, KokoroTtsModel,
+};
 use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::service::RuntimeService;
+use crate::runtime::tts::direct_tts_retained_input_bytes;
 use crate::runtime::types::{AudioChunk, GenerationRequest, GenerationResult};
 
 const KOKORO_STREAM_TARGET_CHARS: usize = 180;
@@ -40,75 +44,130 @@ impl RuntimeService {
 
     pub(crate) async fn kokoro_tts_generate(
         &self,
+        job: &JobLease,
         request: GenerationRequest,
     ) -> Result<GenerationResult> {
+        let retained_input_bytes = u64::try_from(direct_tts_retained_input_bytes(&request)?)
+            .map_err(|_| Error::InvalidInput("Kokoro retained input exceeds u64".to_string()))?;
+        let output_budget =
+            kokoro_output_budget(&request.text, request.config.options.speed)?.max_samples;
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), false)?;
-        let _lease = self.load_model_for_inference(variant).await?;
+        let residency_lease = self.load_model_for_job(job, variant).await?;
         let model = self
             .model_registry
             .get_kokoro(variant)
             .await
             .ok_or_else(|| Error::InferenceError("Kokoro model not loaded".to_string()))?;
+        let observation_job = job.clone();
 
-        let opts = &request.config.options;
-        let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
-        let started = Instant::now();
-        let result = synthesize_kokoro_with_fallback(
-            model.clone(),
-            &request.text,
-            speaker,
-            request.language.as_deref(),
-            opts.speed,
-        )?;
-        let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+        self.coordinator
+            .run_blocking_stage(job, move || {
+                let _residency_lease = residency_lease;
+                let opts = &request.config.options;
+                let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
+                let started = Instant::now();
+                let result = synthesize_kokoro_with_fallback(
+                    model,
+                    &request.text,
+                    speaker,
+                    request.language.as_deref(),
+                    opts.speed,
+                    output_budget,
+                )?;
+                record_kokoro_materialized_output(
+                    &observation_job,
+                    retained_input_bytes,
+                    result.samples.capacity(),
+                    output_budget,
+                )?;
+                let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
-        Ok(GenerationResult {
-            request_id: request.id,
-            samples: result.samples,
-            sample_rate: result.sample_rate,
-            total_tokens: result.tokens_generated,
-            total_time_ms,
-            diagnostics: None,
-        })
+                Ok(GenerationResult {
+                    request_id: request.id,
+                    samples: result.samples,
+                    sample_rate: result.sample_rate,
+                    total_tokens: result.tokens_generated,
+                    total_time_ms,
+                    diagnostics: None,
+                })
+            })
+            .await
     }
 
     pub(crate) async fn kokoro_tts_generate_streaming(
         &self,
+        job: &JobLease,
         request: GenerationRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
+        let retained_input_bytes = u64::try_from(direct_tts_retained_input_bytes(&request)?)
+            .map_err(|_| Error::InvalidInput("Kokoro retained input exceeds u64".to_string()))?;
+        let output_budget = kokoro_output_budget(&request.text, request.config.options.speed)?;
         let request_id = request.id.clone();
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), true)?;
-        let _lease = self.load_model_for_inference(variant).await?;
+        let residency_lease = self.load_model_for_job(job, variant).await?;
         let model = self
             .model_registry
             .get_kokoro(variant)
             .await
             .ok_or_else(|| Error::InferenceError("Kokoro model not loaded".to_string()))?;
+        let text = request.text;
+        let speaker = request
+            .config
+            .options
+            .speaker
+            .or(request.config.options.voice);
+        let language = request.language;
+        let speed = request.config.options.speed;
+        let model_for_plan = model.clone();
+        let speaker_for_plan = speaker.clone();
+        let language_for_plan = language.clone();
 
-        let opts = &request.config.options;
-        let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
-        let language = request.language.as_deref();
-        let stream_chunks = plan_kokoro_streaming_chunks(
-            model.as_ref(),
-            &request.text,
-            speaker,
-            language,
-            opts.speed,
-        )?;
+        let (mut residency_lease, stream_chunks) = self
+            .coordinator
+            .run_blocking_stage(job, move || {
+                let stream_chunks = plan_kokoro_streaming_chunks(
+                    model_for_plan.as_ref(),
+                    &text,
+                    speaker_for_plan.as_deref(),
+                    language_for_plan.as_deref(),
+                    speed,
+                )?;
+                Ok((residency_lease, stream_chunks))
+            })
+            .await?;
         let total_chunks = stream_chunks.len();
+        if total_chunks > output_budget.max_chunks {
+            return Err(Error::InferenceError(format!(
+                "Kokoro streaming planner exceeded its hard chunk contract: {total_chunks} > {}",
+                output_budget.max_chunks
+            )));
+        }
         let mut expected_sample_rate: Option<u32> = None;
+        let mut emitted_samples = 0usize;
+        let mut materialized_output_capacity = 0usize;
 
         for (sequence, chunk_text) in stream_chunks.into_iter().enumerate() {
-            let synthesis = synthesize_kokoro_with_fallback(
-                model.clone(),
-                &chunk_text,
-                speaker,
-                language,
-                opts.speed,
-            )?;
+            let model_for_task = model.clone();
+            let speaker_for_task = speaker.clone();
+            let language_for_task = language.clone();
+            let (returned_lease, synthesis) = self
+                .coordinator
+                .run_blocking_stage(job, move || {
+                    let synthesis = synthesize_kokoro_with_fallback(
+                        model_for_task,
+                        &chunk_text,
+                        speaker_for_task.as_deref(),
+                        language_for_task.as_deref(),
+                        speed,
+                        output_budget.max_samples,
+                    )?;
+                    Ok((residency_lease, synthesis))
+                })
+                .await?;
+            residency_lease = returned_lease;
             let current_sample_rate = synthesis.sample_rate;
             match expected_sample_rate {
                 Some(expected) if expected != current_sample_rate => {
@@ -121,12 +180,39 @@ impl RuntimeService {
                 _ => {}
             }
 
+            emitted_samples = checked_kokoro_sample_growth(
+                emitted_samples,
+                synthesis.samples.len(),
+                output_budget.max_samples,
+                "streamed samples",
+            )?;
+            materialized_output_capacity = checked_kokoro_sample_growth(
+                materialized_output_capacity,
+                synthesis.samples.capacity(),
+                output_budget.max_samples,
+                "streamed sample capacity",
+            )?;
+            record_kokoro_materialized_output(
+                job,
+                retained_input_bytes,
+                materialized_output_capacity,
+                output_budget.max_samples,
+            )?;
+
             let mut chunk = AudioChunk::new(request_id.clone(), sequence, synthesis.samples)
                 .with_sample_rate(current_sample_rate);
             chunk.is_final = sequence + 1 == total_chunks;
-            chunk_tx.send(chunk).await.map_err(|_| {
-                Error::InferenceError("Streaming output channel closed".to_string())
-            })?;
+            match job.spec.deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline.into(), chunk_tx.send(chunk))
+                    .await
+                    .map_err(|_| Error::Timeout(job.spec.request_id.clone()))?
+                    .map_err(|_| {
+                        Error::InferenceError("Streaming output channel closed".to_string())
+                    })?,
+                None => chunk_tx.send(chunk).await.map_err(|_| {
+                    Error::InferenceError("Streaming output channel closed".to_string())
+                })?,
+            }
         }
         Ok(())
     }
@@ -138,12 +224,16 @@ fn synthesize_kokoro_with_fallback(
     speaker: Option<&str>,
     language: Option<&str>,
     speed: f32,
+    max_samples: usize,
 ) -> Result<KokoroSynthesisResult> {
     match model.generate(text, speaker, language, speed) {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            validate_kokoro_samples(&result.samples, max_samples, "synthesis")?;
+            Ok(result)
+        }
         Err(err) if is_kokoro_voice_pack_limit_error(&err) => {
             info!("Kokoro phoneme limit hit for request; retrying with adaptive chunking fallback");
-            generate_chunked_kokoro(model, text, speaker, language, speed)
+            generate_chunked_kokoro(model, text, speaker, language, speed, max_samples)
         }
         Err(err) => Err(err),
     }
@@ -158,12 +248,103 @@ fn is_kokoro_voice_pack_limit_error(err: &Error) -> bool {
     }
 }
 
+fn checked_kokoro_sample_growth(
+    current: usize,
+    additional: usize,
+    max_samples: usize,
+    label: &str,
+) -> Result<usize> {
+    let next = current
+        .checked_add(additional)
+        .ok_or_else(|| Error::Overloaded(format!("Kokoro {label} count overflowed")))?;
+    if next > max_samples {
+        return Err(Error::InferenceError(format!(
+            "Kokoro {label} exceeded the admitted hard sample contract: {next} > {max_samples}"
+        )));
+    }
+    Ok(next)
+}
+
+fn validate_kokoro_samples(samples: &Vec<f32>, max_samples: usize, label: &str) -> Result<()> {
+    checked_kokoro_sample_growth(0, samples.len(), max_samples, label)?;
+    checked_kokoro_sample_growth(
+        0,
+        samples.capacity(),
+        max_samples,
+        &format!("{label} capacity"),
+    )?;
+    Ok(())
+}
+
+fn append_kokoro_samples_bounded(
+    combined: &mut Vec<f32>,
+    chunk: Vec<f32>,
+    pause_samples: usize,
+    max_samples: usize,
+) -> Result<()> {
+    validate_kokoro_samples(&chunk, max_samples, "chunk synthesis")?;
+    let additional = chunk
+        .len()
+        .checked_add(pause_samples)
+        .ok_or_else(|| Error::Overloaded("Kokoro chunk append overflowed".to_string()))?;
+    let next_len = checked_kokoro_sample_growth(
+        combined.len(),
+        additional,
+        max_samples,
+        "accumulated samples",
+    )?;
+
+    combined.try_reserve_exact(additional).map_err(|_| {
+        Error::Overloaded(format!(
+            "Kokoro could not reserve {additional} additional output samples"
+        ))
+    })?;
+    if combined.capacity() > max_samples {
+        return Err(Error::InferenceError(format!(
+            "Kokoro accumulated sample capacity exceeded the admitted hard contract: {} > {max_samples}",
+            combined.capacity()
+        )));
+    }
+    combined.extend(chunk);
+    combined.resize(next_len, 0.0);
+    Ok(())
+}
+
+fn record_kokoro_materialized_output(
+    job: &JobLease,
+    retained_input_bytes: u64,
+    output_capacity_samples: usize,
+    max_samples: usize,
+) -> Result<()> {
+    checked_kokoro_sample_growth(
+        0,
+        output_capacity_samples,
+        max_samples,
+        "materialized sample capacity",
+    )?;
+    let output_bytes = u64::try_from(output_capacity_samples)
+        .ok()
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| Error::Overloaded("Kokoro materialized output overflowed".to_string()))?;
+    let materialized_host_bytes =
+        retained_input_bytes
+            .checked_add(output_bytes)
+            .ok_or_else(|| {
+                Error::Overloaded("Kokoro materialized host usage overflowed".to_string())
+            })?;
+    // The output ceiling is part of the job's immutable pre-admission
+    // reservation. This only reclassifies authorized pending bytes after the
+    // bounded Vec exists; it never grows the lease.
+    job.record_materialized_usage(JobResourceObservation::host(materialized_host_bytes))
+}
+
 fn generate_chunked_kokoro(
     model: Arc<KokoroTtsModel>,
     text: &str,
     speaker: Option<&str>,
     language: Option<&str>,
     speed: f32,
+    max_samples: usize,
 ) -> Result<KokoroSynthesisResult> {
     let chunks = plan_kokoro_text_chunks(model.as_ref(), text, speaker, language, speed)?;
     if chunks.is_empty() {
@@ -195,15 +376,24 @@ fn generate_chunked_kokoro(
             combined_phonemes.push(' ');
         }
         combined_phonemes.push_str(chunk.phonemes.trim());
-        total_tokens += chunk.tokens_generated;
-        combined_samples.extend(chunk.samples);
+        total_tokens = total_tokens
+            .checked_add(chunk.tokens_generated)
+            .ok_or_else(|| {
+                Error::Overloaded("Kokoro generated-token count overflowed".to_string())
+            })?;
 
-        if idx + 1 < chunks.len() {
+        let pause_samples = if idx + 1 < chunks.len() {
             let pause_samples = ((current_sample_rate as f32) * 0.04).round() as usize;
-            if pause_samples > 0 {
-                combined_samples.resize(combined_samples.len() + pause_samples, 0.0);
-            }
-        }
+            pause_samples
+        } else {
+            0
+        };
+        append_kokoro_samples_bounded(
+            &mut combined_samples,
+            chunk.samples,
+            pause_samples,
+            max_samples,
+        )?;
     }
 
     let sample_rate = sample_rate.ok_or_else(|| {
@@ -502,7 +692,7 @@ fn split_at_char_index(s: &str, n: usize) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_text_for_streaming;
+    use super::*;
 
     #[test]
     fn split_text_for_streaming_keeps_short_text_single_chunk() {
@@ -517,5 +707,22 @@ mod tests {
         let chunks = split_text_for_streaming(text, 30, 20);
         assert!(chunks.len() >= 2);
         assert!(chunks[0].ends_with('.'));
+    }
+
+    #[test]
+    fn chunk_accumulation_rejects_overflow_before_mutating_the_output() {
+        let mut combined = vec![0.1, 0.2];
+        let before = combined.clone();
+        let before_capacity = combined.capacity();
+
+        let result = append_kokoro_samples_bounded(&mut combined, vec![0.3, 0.4], 2, 5);
+
+        assert!(matches!(
+            result,
+            Err(Error::InferenceError(message))
+                if message.contains("hard sample contract")
+        ));
+        assert_eq!(combined, before);
+        assert_eq!(combined.capacity(), before_capacity);
     }
 }

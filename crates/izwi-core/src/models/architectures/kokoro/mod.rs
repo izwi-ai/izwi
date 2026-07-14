@@ -37,6 +37,50 @@ use self::voice::VoiceLibrary;
 const CHECKPOINT_FILE: &str = "kokoro-v1_0.pth";
 const CONFIG_FILE: &str = "config.json";
 const VOICES_DIR: &str = "voices";
+const KOKORO_MAX_PHONEMES_PER_INPUT_CHAR: usize = 16;
+const KOKORO_MAX_PHONEMES_PER_CHUNK: usize = 510;
+const KOKORO_MAX_CONTEXT_TOKENS: usize = KOKORO_MAX_PHONEMES_PER_CHUNK + 2;
+const KOKORO_MAX_DURATION_BINS: usize = 50;
+pub(super) const KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK: usize = 4_096;
+const KOKORO_DIM_IN: usize = 64;
+const KOKORO_HIDDEN_CHANNELS: usize = 512;
+const KOKORO_MAX_CONV_CHANNELS: usize = 512;
+const KOKORO_STYLE_CHANNELS: usize = 128;
+const KOKORO_DURATION_LAYERS: usize = 3;
+const KOKORO_MEL_CHANNELS: usize = 80;
+const KOKORO_TOKEN_COUNT: usize = 178;
+const KOKORO_TEXT_ENCODER_KERNEL: usize = 5;
+const KOKORO_PLBERT_HIDDEN_CHANNELS: usize = 768;
+const KOKORO_PLBERT_ATTENTION_HEADS: usize = 12;
+const KOKORO_PLBERT_INTERMEDIATE_CHANNELS: usize = 2_048;
+const KOKORO_PLBERT_LAYERS: usize = 12;
+const KOKORO_DECODER_TIME_EXPANSION: usize = 2;
+const KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS: usize = 512;
+const KOKORO_GENERATOR_UPSAMPLE_RATES: [usize; 2] = [10, 6];
+const KOKORO_GENERATOR_UPSAMPLE_KERNELS: [usize; 2] = [20, 12];
+const KOKORO_GENERATOR_ISTFT_HOP: usize = 5;
+const KOKORO_GENERATOR_ISTFT_N_FFT: usize = 20;
+const KOKORO_GENERATOR_RESBLOCK_KERNELS: [usize; 3] = [3, 7, 11];
+const KOKORO_GENERATOR_RESBLOCK_DILATIONS: [usize; 3] = [1, 3, 5];
+const KOKORO_GENERATOR_RESBLOCK_BRANCHES: usize = 3;
+const KOKORO_MAX_SAMPLES_PER_DURATION_FRAME: usize = KOKORO_DECODER_TIME_EXPANSION
+    * KOKORO_GENERATOR_UPSAMPLE_RATES[0]
+    * KOKORO_GENERATOR_UPSAMPLE_RATES[1]
+    * KOKORO_GENERATOR_ISTFT_HOP;
+const KOKORO_INTER_CHUNK_PAUSE_SAMPLES: usize = 960;
+const KOKORO_MIN_SPEED: f32 = 0.5;
+const KOKORO_MAX_SPEED: f32 = 2.0;
+const KOKORO_ACTIVATION_DTYPE_BYTES: u64 = std::mem::size_of::<f32>() as u64;
+// CPU evaluates all three generator resblock variants concurrently: one shared
+// input plus three live tensors per branch. Accelerators evaluate them in
+// sequence; nine buffers cover the accumulator and unfused CUDA AdaIN/Snake
+// intermediates without charging Metal/CUDA for CPU-only branch parallelism.
+const KOKORO_CPU_LIVE_STAGE_BUFFERS: u64 = 1 + KOKORO_GENERATOR_RESBLOCK_BRANCHES as u64 * 3;
+const KOKORO_ACCELERATOR_LIVE_STAGE_BUFFERS: u64 = 9;
+// `synth_harmonic_source_kokoro` retains the upsampled F0, nine harmonics,
+// voicing mask, phase/radian intermediates, and a collected sine buffer. Forty
+// f32 values per final-rate sample is a conservative bound over those vectors.
+const KOKORO_HARMONIC_HOST_F32_PER_SAMPLE: u64 = 40;
 const CHECKPOINT_SUBMODULE_KEYS: &[&str] = &[
     "bert",
     "bert_encoder",
@@ -44,6 +88,260 @@ const CHECKPOINT_SUBMODULE_KEYS: &[&str] = &[
     "text_encoder",
     "decoder",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KokoroOutputBudget {
+    pub max_model_tokens: usize,
+    pub max_chunks: usize,
+    pub max_chunk_expanded_frames: usize,
+    pub max_samples: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KokoroPeakWorkspace {
+    pub host_bytes: u64,
+    pub cpu_tensor_bytes: u64,
+    pub accelerator_tensor_bytes: u64,
+}
+
+pub(crate) fn kokoro_peak_workspace(max_chunk_expanded_frames: u64) -> Result<KokoroPeakWorkspace> {
+    let decoder_time_expansion = u64::try_from(KOKORO_DECODER_TIME_EXPANSION)
+        .map_err(|_| Error::Overloaded("Kokoro decoder time scale exceeds u64".to_string()))?;
+    let generator_time_scale = KOKORO_GENERATOR_UPSAMPLE_RATES
+        .iter()
+        .try_fold(decoder_time_expansion, |scale, rate| {
+            scale.checked_mul(u64::try_from(*rate).ok()?)
+        })
+        .ok_or_else(|| Error::Overloaded("Kokoro generator time scale overflowed".to_string()))?;
+    let final_stage_channels = KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS
+        .checked_shr(KOKORO_GENERATOR_UPSAMPLE_RATES.len() as u32)
+        .ok_or_else(|| {
+            Error::Overloaded("Kokoro generator channel topology overflowed".to_string())
+        })?;
+    let final_stage_elements_per_frame = generator_time_scale
+        .checked_mul(u64::try_from(final_stage_channels).map_err(|_| {
+            Error::Overloaded("Kokoro generator channel count exceeds u64".to_string())
+        })?)
+        .ok_or_else(|| Error::Overloaded("Kokoro generator stage shape overflowed".to_string()))?;
+    let harmonic_channels = u64::try_from(KOKORO_GENERATOR_ISTFT_N_FFT + 2)
+        .map_err(|_| Error::Overloaded("Kokoro harmonic channels exceed u64".to_string()))?;
+    let harmonic_elements_per_frame = generator_time_scale
+        .checked_mul(harmonic_channels)
+        .ok_or_else(|| Error::Overloaded("Kokoro harmonic shape overflowed".to_string()))?;
+    // ASR [512,F] and the retained F0/N curves [1,2F] remain live while the
+    // generator owns its stage tensors and harmonic features.
+    let retained_elements_per_frame = u64::try_from(KOKORO_HIDDEN_CHANNELS)
+        .ok()
+        .and_then(|channels| channels.checked_add(decoder_time_expansion * 2))
+        .ok_or_else(|| Error::Overloaded("Kokoro retained shape overflowed".to_string()))?;
+    let tensor_bytes = |live_stage_buffers: u64, domain: &str| -> Result<u64> {
+        let elements_per_frame = final_stage_elements_per_frame
+            .checked_mul(live_stage_buffers)
+            .and_then(|value| value.checked_add(harmonic_elements_per_frame))
+            .and_then(|value| value.checked_add(retained_elements_per_frame))
+            .ok_or_else(|| {
+                Error::Overloaded(format!("Kokoro {domain} workspace shape overflowed"))
+            })?;
+        max_chunk_expanded_frames
+            .checked_mul(elements_per_frame)
+            .and_then(|value| value.checked_mul(KOKORO_ACTIVATION_DTYPE_BYTES))
+            .ok_or_else(|| Error::Overloaded(format!("Kokoro {domain} workspace overflowed")))
+    };
+    let cpu_tensor_bytes = tensor_bytes(KOKORO_CPU_LIVE_STAGE_BUFFERS, "CPU tensor")?;
+    let accelerator_tensor_bytes =
+        tensor_bytes(KOKORO_ACCELERATOR_LIVE_STAGE_BUFFERS, "accelerator tensor")?;
+
+    let final_rate_samples_per_frame = generator_time_scale
+        .checked_mul(
+            u64::try_from(KOKORO_GENERATOR_ISTFT_HOP)
+                .map_err(|_| Error::Overloaded("Kokoro iSTFT hop exceeds u64".to_string()))?,
+        )
+        .ok_or_else(|| Error::Overloaded("Kokoro sample scale overflowed".to_string()))?;
+    let host_bytes = max_chunk_expanded_frames
+        .checked_mul(final_rate_samples_per_frame)
+        .and_then(|value| value.checked_mul(KOKORO_HARMONIC_HOST_F32_PER_SAMPLE))
+        .and_then(|value| value.checked_mul(KOKORO_ACTIVATION_DTYPE_BYTES))
+        .ok_or_else(|| Error::Overloaded("Kokoro host workspace overflowed".to_string()))?;
+
+    Ok(KokoroPeakWorkspace {
+        host_bytes,
+        cpu_tensor_bytes,
+        accelerator_tensor_bytes,
+    })
+}
+
+pub(crate) fn kokoro_output_budget(text: &str, speed: f32) -> Result<KokoroOutputBudget> {
+    let text_chars = text.trim().chars().count();
+    if text_chars == 0 {
+        return Err(Error::InvalidInput(
+            "Kokoro TTS input text is empty".to_string(),
+        ));
+    }
+    let speed = normalize_kokoro_speed(speed)?;
+
+    // Every successful chunk consumes at least one input character. The
+    // phonemizer contract below limits each chunk to at most 16 IPA symbols per
+    // input character, and the model adds one boundary token at each end.
+    let max_chunks = text_chars;
+    let max_phoneme_tokens = text_chars
+        .checked_mul(KOKORO_MAX_PHONEMES_PER_INPUT_CHAR)
+        .ok_or_else(|| Error::Overloaded("Kokoro phoneme budget overflowed".to_string()))?;
+    let boundary_tokens = max_chunks
+        .checked_mul(2)
+        .ok_or_else(|| Error::Overloaded("Kokoro chunk-token budget overflowed".to_string()))?;
+    let max_model_tokens = max_phoneme_tokens
+        .checked_add(boundary_tokens)
+        .ok_or_else(|| Error::Overloaded("Kokoro model-token budget overflowed".to_string()))?
+        .min(
+            max_chunks
+                .checked_mul(KOKORO_MAX_CONTEXT_TOKENS)
+                .ok_or_else(|| {
+                    Error::Overloaded("Kokoro context-token budget overflowed".to_string())
+                })?,
+        );
+    let max_duration_frames_per_token =
+        ((KOKORO_MAX_DURATION_BINS as f64) / f64::from(speed)).ceil() as usize;
+    let max_chunk_expanded_frames = max_model_tokens
+        .min(KOKORO_MAX_CONTEXT_TOKENS)
+        .checked_mul(max_duration_frames_per_token)
+        .ok_or_else(|| {
+            Error::Overloaded("Kokoro peak duration-frame budget overflowed".to_string())
+        })?
+        .min(KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
+    let theoretical_total_frames = max_model_tokens
+        .checked_mul(max_duration_frames_per_token)
+        .ok_or_else(|| Error::Overloaded("Kokoro duration-frame budget overflowed".to_string()))?;
+    let chunk_capped_total_frames = max_chunks
+        .checked_mul(KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK)
+        .ok_or_else(|| {
+            Error::Overloaded("Kokoro chunked duration-frame budget overflowed".to_string())
+        })?;
+    let max_samples = theoretical_total_frames
+        .min(chunk_capped_total_frames)
+        .checked_mul(KOKORO_MAX_SAMPLES_PER_DURATION_FRAME)
+        .and_then(|samples| {
+            samples.checked_add(
+                max_chunks
+                    .saturating_sub(1)
+                    .checked_mul(KOKORO_INTER_CHUNK_PAUSE_SAMPLES)?,
+            )
+        })
+        .ok_or_else(|| Error::Overloaded("Kokoro output-sample budget overflowed".to_string()))?;
+
+    Ok(KokoroOutputBudget {
+        max_model_tokens,
+        max_chunks,
+        max_chunk_expanded_frames,
+        max_samples,
+    })
+}
+
+fn normalize_kokoro_speed(speed: f32) -> Result<f32> {
+    if !speed.is_finite() {
+        return Err(Error::InvalidInput(
+            "Kokoro speed must be finite".to_string(),
+        ));
+    }
+    Ok(speed.clamp(KOKORO_MIN_SPEED, KOKORO_MAX_SPEED))
+}
+
+fn kokoro_samples_per_duration_frame(config: &KokoroConfig) -> Result<usize> {
+    if config.istftnet.gen_istft_hop_size == 0
+        || config.istftnet.upsample_rates.is_empty()
+        || config.istftnet.upsample_rates.contains(&0)
+    {
+        return Err(Error::ModelLoadError(
+            "Kokoro decoder sample scale must be nonzero".to_string(),
+        ));
+    }
+    if config.istftnet.upsample_kernel_sizes.len() != config.istftnet.upsample_rates.len()
+        || config
+            .istftnet
+            .upsample_kernel_sizes
+            .iter()
+            .zip(&config.istftnet.upsample_rates)
+            .any(|(kernel, rate)| kernel < rate || (kernel - rate) % 2 != 0)
+    {
+        return Err(Error::ModelLoadError(
+            "Kokoro decoder upsample kernels do not preserve the admitted sample scale".to_string(),
+        ));
+    }
+    let generator_scale = config
+        .istftnet
+        .upsample_rates
+        .iter()
+        .try_fold(config.istftnet.gen_istft_hop_size, |scale, rate| {
+            scale.checked_mul(*rate)
+        })
+        .ok_or_else(|| {
+            Error::ModelLoadError("Kokoro decoder sample scale overflowed".to_string())
+        })?;
+    generator_scale
+        .checked_mul(KOKORO_DECODER_TIME_EXPANSION)
+        .ok_or_else(|| Error::ModelLoadError("Kokoro decoder sample scale overflowed".to_string()))
+}
+
+fn validate_kokoro_output_contract(config: &KokoroConfig) -> Result<()> {
+    if config.context_length() == 0 || config.context_length() > KOKORO_MAX_CONTEXT_TOKENS {
+        return Err(Error::ModelLoadError(format!(
+            "Kokoro context length {} exceeds the admitted output contract ({KOKORO_MAX_CONTEXT_TOKENS})",
+            config.context_length()
+        )));
+    }
+    if config.max_dur == 0 || config.max_dur > KOKORO_MAX_DURATION_BINS {
+        return Err(Error::ModelLoadError(format!(
+            "Kokoro max_dur {} exceeds the admitted output contract ({KOKORO_MAX_DURATION_BINS})",
+            config.max_dur
+        )));
+    }
+    // The estimate above is for the one production Kokoro-82M topology loaded
+    // by this runtime. Widths alter live tensors, while convolution kernels can
+    // alter backend scratch even when padding preserves output length. Dropout
+    // values and vocab contents are deliberately excluded: neither changes an
+    // inference activation shape in this implementation.
+    if config.dim_in != KOKORO_DIM_IN
+        || config.hidden_dim != KOKORO_HIDDEN_CHANNELS
+        || config.max_conv_dim != KOKORO_MAX_CONV_CHANNELS
+        || config.style_dim != KOKORO_STYLE_CHANNELS
+        || config.max_dur != KOKORO_MAX_DURATION_BINS
+        || !config.multispeaker
+        || config.n_layer != KOKORO_DURATION_LAYERS
+        || config.n_mels != KOKORO_MEL_CHANNELS
+        || config.n_token != KOKORO_TOKEN_COUNT
+        || config.text_encoder_kernel_size != KOKORO_TEXT_ENCODER_KERNEL
+        || config.plbert.hidden_size != KOKORO_PLBERT_HIDDEN_CHANNELS
+        || config.plbert.num_attention_heads != KOKORO_PLBERT_ATTENTION_HEADS
+        || config.plbert.intermediate_size != KOKORO_PLBERT_INTERMEDIATE_CHANNELS
+        || config.plbert.max_position_embeddings != KOKORO_MAX_CONTEXT_TOKENS
+        || config.plbert.num_hidden_layers != KOKORO_PLBERT_LAYERS
+        || config.istftnet.upsample_initial_channel != KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS
+        || config.istftnet.upsample_rates.as_slice() != KOKORO_GENERATOR_UPSAMPLE_RATES.as_slice()
+        || config.istftnet.upsample_kernel_sizes.as_slice()
+            != KOKORO_GENERATOR_UPSAMPLE_KERNELS.as_slice()
+        || config.istftnet.gen_istft_hop_size != KOKORO_GENERATOR_ISTFT_HOP
+        || config.istftnet.gen_istft_n_fft != KOKORO_GENERATOR_ISTFT_N_FFT
+        || config.istftnet.resblock_kernel_sizes.as_slice()
+            != KOKORO_GENERATOR_RESBLOCK_KERNELS.as_slice()
+        || config.istftnet.resblock_dilation_sizes.len()
+            != config.istftnet.resblock_kernel_sizes.len()
+        || config
+            .istftnet
+            .resblock_dilation_sizes
+            .iter()
+            .any(|dilations| dilations.as_slice() != KOKORO_GENERATOR_RESBLOCK_DILATIONS.as_slice())
+    {
+        return Err(Error::ModelLoadError(
+            "Kokoro decoder topology does not match the admitted workspace contract".to_string(),
+        ));
+    }
+    let sample_scale = kokoro_samples_per_duration_frame(config)?;
+    if sample_scale > KOKORO_MAX_SAMPLES_PER_DURATION_FRAME {
+        return Err(Error::ModelLoadError(format!(
+            "Kokoro decoder sample scale {sample_scale} exceeds the admitted output contract ({KOKORO_MAX_SAMPLES_PER_DURATION_FRAME})"
+        )));
+    }
+    Ok(())
+}
 
 fn kokoro_profile_enabled() -> bool {
     std::env::var_os("IZWI_KOKORO_PROFILE").is_some()
@@ -148,6 +446,7 @@ impl KokoroTtsModel {
                     e
                 ))
             })?)?;
+        validate_kokoro_output_contract(&config)?;
 
         let dtype = DType::F32;
         let checkpoint_tensor_counts =
@@ -279,10 +578,18 @@ impl KokoroTtsModel {
                 "Kokoro phonemizer produced no phonemes".to_string(),
             ));
         }
-        if phoneme_len > 510 {
+        let input_chars = text.trim().chars().count();
+        let max_phonemes = input_chars
+            .checked_mul(KOKORO_MAX_PHONEMES_PER_INPUT_CHAR)
+            .ok_or_else(|| Error::InvalidInput("Kokoro input is too large".to_string()))?;
+        if phoneme_len > max_phonemes {
             return Err(Error::InvalidInput(format!(
-                "Kokoro phoneme sequence length {} exceeds supported voice-pack limit (510). Chunking is not implemented yet in the native runtime.",
-                phoneme_len
+                "Kokoro phoneme expansion {phoneme_len} exceeds the {KOKORO_MAX_PHONEMES_PER_INPUT_CHAR}-per-input-character contract ({max_phonemes})"
+            )));
+        }
+        if phoneme_len > KOKORO_MAX_PHONEMES_PER_CHUNK {
+            return Err(Error::InvalidInput(format!(
+                "Kokoro phoneme sequence length {phoneme_len} exceeds supported voice-pack limit ({KOKORO_MAX_PHONEMES_PER_CHUNK}). Chunking is not implemented yet in the native runtime."
             )));
         }
 
@@ -296,7 +603,7 @@ impl KokoroTtsModel {
         }
 
         let ref_style = self.voices.style_for_phoneme_len(&speaker, phoneme_len)?;
-        let speed = speed.clamp(0.5, 2.0);
+        let speed = normalize_kokoro_speed(speed)?;
 
         Ok(KokoroPreparedRequest {
             phonemes,
@@ -323,6 +630,7 @@ impl KokoroTtsModel {
             .ref_style
             .i((.., 0..self.config.style_dim))
             .map_err(Error::from)?;
+        let max_samples = self.output_sample_limit(predecoder.prosody.expanded_frames)?;
         let t2 = Instant::now();
         let samples = self.decoder.forward(
             &predecoder.asr,
@@ -330,6 +638,13 @@ impl KokoroTtsModel {
             &predecoder.prosody.n,
             &style,
         )?;
+        if samples.len() > max_samples || samples.capacity() > max_samples {
+            return Err(Error::InferenceError(format!(
+                "Kokoro decoder output exceeded its hard sample contract: len={}, capacity={}, max={max_samples}",
+                samples.len(),
+                samples.capacity()
+            )));
+        }
         log_kokoro_profile("tts.decoder", t2.elapsed());
         log_kokoro_profile("tts.total", t0.elapsed());
         Ok(KokoroSynthesisResult {
@@ -359,6 +674,7 @@ impl KokoroTtsModel {
             .ref_style
             .i((.., 0..self.config.style_dim))
             .map_err(Error::from)?;
+        let max_samples = self.output_sample_limit(predecoder.prosody.expanded_frames)?;
         let t2 = Instant::now();
         let samples = self.decoder.forward_with_seed(
             &predecoder.asr,
@@ -367,6 +683,13 @@ impl KokoroTtsModel {
             &style,
             Some(rng_seed),
         )?;
+        if samples.len() > max_samples || samples.capacity() > max_samples {
+            return Err(Error::InferenceError(format!(
+                "Kokoro decoder output exceeded its hard sample contract: len={}, capacity={}, max={max_samples}",
+                samples.len(),
+                samples.capacity()
+            )));
+        }
         log_kokoro_profile("tts.decoder", t2.elapsed());
         log_kokoro_profile("tts.total", t0.elapsed());
         Ok(KokoroSynthesisResult {
@@ -379,6 +702,17 @@ impl KokoroTtsModel {
 
     pub fn config(&self) -> &KokoroConfig {
         &self.config
+    }
+
+    fn output_sample_limit(&self, expanded_frames: usize) -> Result<usize> {
+        if expanded_frames > KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK {
+            return Err(Error::InferenceError(format!(
+                "Kokoro expanded-frame count exceeded its hard per-chunk contract: {expanded_frames} > {KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK}"
+            )));
+        }
+        expanded_frames
+            .checked_mul(kokoro_samples_per_duration_frame(&self.config)?)
+            .ok_or_else(|| Error::Overloaded("Kokoro output-sample limit overflowed".to_string()))
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -638,16 +972,15 @@ mod tests {
     use rustfft::FftPlanner;
     use std::path::Path;
 
-    #[test]
-    fn kokoro_config_context_length_uses_plbert_positions() {
-        let cfg = KokoroConfig {
+    fn canonical_config() -> KokoroConfig {
+        KokoroConfig {
             istftnet: config::KokoroIstftNetConfig {
                 upsample_kernel_sizes: vec![20, 12],
                 upsample_rates: vec![10, 6],
                 gen_istft_hop_size: 5,
                 gen_istft_n_fft: 20,
-                resblock_dilation_sizes: vec![vec![1, 3, 5]],
-                resblock_kernel_sizes: vec![3],
+                resblock_dilation_sizes: vec![vec![1, 3, 5]; 3],
+                resblock_kernel_sizes: vec![3, 7, 11],
                 upsample_initial_channel: 512,
             },
             dim_in: 64,
@@ -670,9 +1003,95 @@ mod tests {
                 dropout: 0.1,
             },
             vocab: HashMap::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn kokoro_config_context_length_uses_plbert_positions() {
+        let cfg = canonical_config();
 
         assert_eq!(cfg.context_length(), 512);
+        assert_eq!(kokoro_samples_per_duration_frame(&cfg).unwrap(), 600);
+        validate_kokoro_output_contract(&cfg).unwrap();
+    }
+
+    #[test]
+    fn kokoro_workspace_contract_rejects_unadmitted_decoder_topology() {
+        let mut cfg = canonical_config();
+        cfg.istftnet.upsample_rates = vec![8, 8];
+
+        assert!(matches!(
+            validate_kokoro_output_contract(&cfg),
+            Err(Error::ModelLoadError(message)) if message.contains("workspace contract")
+        ));
+    }
+
+    #[test]
+    fn kokoro_workspace_contract_rejects_every_shape_bearing_topology_change() {
+        let mutations: &[(&str, fn(&mut KokoroConfig))] = &[
+            ("dim_in", |cfg| cfg.dim_in += 1),
+            ("hidden_dim", |cfg| cfg.hidden_dim += 1),
+            ("max_conv_dim", |cfg| cfg.max_conv_dim += 1),
+            ("max_dur", |cfg| cfg.max_dur -= 1),
+            ("multispeaker", |cfg| cfg.multispeaker = false),
+            ("n_layer", |cfg| cfg.n_layer += 1),
+            ("n_mels", |cfg| cfg.n_mels += 1),
+            ("n_token", |cfg| cfg.n_token += 1),
+            ("style_dim", |cfg| cfg.style_dim += 1),
+            ("text_encoder_kernel_size", |cfg| {
+                cfg.text_encoder_kernel_size += 2
+            }),
+            ("plbert.hidden_size", |cfg| cfg.plbert.hidden_size += 1),
+            ("plbert.num_attention_heads", |cfg| {
+                cfg.plbert.num_attention_heads -= 1
+            }),
+            ("plbert.intermediate_size", |cfg| {
+                cfg.plbert.intermediate_size += 1
+            }),
+            ("plbert.max_position_embeddings", |cfg| {
+                cfg.plbert.max_position_embeddings -= 1
+            }),
+            ("plbert.num_hidden_layers", |cfg| {
+                cfg.plbert.num_hidden_layers += 1
+            }),
+            ("upsample_initial_channel", |cfg| {
+                cfg.istftnet.upsample_initial_channel += 1
+            }),
+            ("upsample_rates", |cfg| cfg.istftnet.upsample_rates[0] = 8),
+            ("upsample_kernel_sizes", |cfg| {
+                cfg.istftnet.upsample_kernel_sizes[0] += 2
+            }),
+            ("gen_istft_hop_size", |cfg| {
+                cfg.istftnet.gen_istft_hop_size += 1
+            }),
+            ("gen_istft_n_fft", |cfg| cfg.istftnet.gen_istft_n_fft += 2),
+            ("resblock_kernel_sizes", |cfg| {
+                cfg.istftnet.resblock_kernel_sizes[1] += 2
+            }),
+            ("resblock_dilation_sizes", |cfg| {
+                cfg.istftnet.resblock_dilation_sizes[0][1] += 1
+            }),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut cfg = canonical_config();
+            mutate(&mut cfg);
+            assert!(
+                matches!(
+                    validate_kokoro_output_contract(&cfg),
+                    Err(Error::ModelLoadError(message)) if message.contains("workspace contract")
+                ),
+                "topology mutation {field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn kokoro_peak_workspace_arithmetic_is_checked() {
+        assert!(matches!(
+            kokoro_peak_workspace(u64::MAX),
+            Err(Error::Overloaded(message)) if message.contains("workspace overflowed")
+        ));
     }
 
     #[test]

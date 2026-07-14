@@ -1131,7 +1131,10 @@ impl NemotronStreamingFeatureState {
         }
     }
 
-    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+    pub(super) fn account_host_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
         accounting.add_bytes(retained_vec_bytes::<f32>(self.preemphasized.capacity())?)
     }
 
@@ -1188,7 +1191,10 @@ impl NemotronStreamingPreEncodeState {
         }
     }
 
-    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+    pub(super) fn account_tensor_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
         if let Some(features) = &self.features {
             accounting.add_tensor(features)?;
         }
@@ -1244,7 +1250,10 @@ impl NemotronStreamingEncoderState {
         }
     }
 
-    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+    pub(super) fn account_tensor_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
         if let Some(pending) = &self.pending_pre_encoded {
             accounting.add_tensor(pending)?;
         }
@@ -1349,7 +1358,17 @@ impl NemotronRnntStreamState {
         &self.token_ids
     }
 
-    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+    pub(super) fn account_host_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
+        accounting.add_bytes(retained_vec_bytes::<usize>(self.token_ids.capacity())?)
+    }
+
+    pub(super) fn account_tensor_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
         accounting.add_tensor(&self.predictor_state.h0)?;
         accounting.add_tensor(&self.predictor_state.c0)?;
         accounting.add_tensor(&self.predictor_state.h1)?;
@@ -1358,7 +1377,7 @@ impl NemotronRnntStreamState {
         if let Some(projection) = &self.predictor_projection {
             accounting.add_tensor(projection)?;
         }
-        accounting.add_bytes(retained_vec_bytes::<usize>(self.token_ids.capacity())?)
+        Some(())
     }
 }
 

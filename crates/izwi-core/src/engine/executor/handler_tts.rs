@@ -4,16 +4,14 @@ use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
     BatchedSpeakerRequest, SpeakerReference, TtsGenerationParams, TtsStreamingConfig,
 };
+use crate::runtime::audio_io::decode_reference_audio_base64;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::{ExecutionMode, NativeBatchMode};
 use super::state::ActiveQwenTtsDecode;
-use super::{
-    decode_audio_base64_with_rate, ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult,
-    NativeExecutor,
-};
+use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
 pub(super) struct QwenTtsBatchResult {
     pub(super) outputs: Vec<ExecutorOutput>,
@@ -41,8 +39,7 @@ impl NativeExecutor {
                     .text
                     .as_deref()
                     .is_none_or(|text| text.trim().is_empty())
-                || request.reference_audio.is_some()
-                || request.reference_text.is_some()
+                || request.has_tts_reference_for_execution()
                 || request.model_variant.map(|v| v.family())
                     != Some(crate::catalog::ModelFamily::Qwen3Tts)
                 || !request
@@ -76,16 +73,29 @@ impl NativeExecutor {
             // a one-step sequence plan.
             return None;
         }
-        let speakers = match self.with_qwen_model(variant, |model| {
-            Ok(model
-                .available_speakers()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>())
-        }) {
-            Ok(speakers) => speakers,
+        let (model, model_lease) = match self.qwen_model_for_request(ordered[0]) {
+            Ok(model) => model,
             Err(err) => return Some(Err(err)),
         };
+        let mut model_leases = Vec::with_capacity(ordered.len());
+        model_leases.extend(model_lease);
+        for request in ordered.iter().skip(1) {
+            let (request_model, request_lease) = match self.qwen_model_for_request(request) {
+                Ok(model) => model,
+                Err(err) => return Some(Err(err)),
+            };
+            if !std::sync::Arc::ptr_eq(&model, &request_model) {
+                // Requests admitted on opposite sides of an unload/reload
+                // boundary must never share one native tensor batch.
+                return None;
+            }
+            model_leases.extend(request_lease);
+        }
+        let speakers = model
+            .available_speakers()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         if speakers.is_empty()
             || ordered.iter().any(|request| {
                 request
@@ -112,7 +122,8 @@ impl NativeExecutor {
             return None;
         }
 
-        Some(self.with_qwen_model(variant, |model| {
+        Some((|| {
+            let _model_leases = model_leases;
             let batch = ordered
                 .iter()
                 .map(|request| BatchedSpeakerRequest {
@@ -159,7 +170,7 @@ impl NativeExecutor {
                 outputs,
                 tensor_width: generated.max_tensor_batch_width,
             })
-        }))
+        })())
     }
 
     pub(super) fn to_tts_params(request: &EngineCoreRequest) -> TtsGenerationParams {
@@ -190,16 +201,16 @@ impl NativeExecutor {
     pub(super) fn reference_from_request(
         request: &EngineCoreRequest,
     ) -> Result<Option<SpeakerReference>> {
-        if request.reference_audio.is_none() && request.reference_text.is_none() {
+        if !request.has_tts_reference_for_execution() {
             return Ok(None);
         }
 
-        let ref_audio = request.reference_audio.as_deref().ok_or_else(|| {
+        let ref_audio = request.tts_reference_audio_for_execution().ok_or_else(|| {
             Error::InvalidInput(
                 "reference_audio and reference_text must both be provided".to_string(),
             )
         })?;
-        let ref_text = request.reference_text.as_deref().ok_or_else(|| {
+        let ref_text = request.tts_reference_text_for_execution().ok_or_else(|| {
             Error::InvalidInput(
                 "reference_audio and reference_text must both be provided".to_string(),
             )
@@ -210,7 +221,12 @@ impl NativeExecutor {
             ));
         }
 
-        let (audio_samples, sample_rate) = decode_audio_base64_with_rate(ref_audio)?;
+        // Reference conditioning has a deliberately tighter contract than
+        // inference audio (32 MiB decoded and 30 seconds). Keep decoding on
+        // the executor's blocking boundary so compressed input never stalls
+        // the async engine worker.
+        let (audio_samples, sample_rate) =
+            Self::run_blocking(|| decode_reference_audio_base64(ref_audio))?;
         Ok(Some(SpeakerReference {
             audio_samples,
             text: ref_text.to_string(),
@@ -231,7 +247,7 @@ impl NativeExecutor {
         let language = request.language.as_deref();
         let session = scheduled.session_key();
 
-        self.with_qwen_model(variant, |model| {
+        {
             let mut active_state = {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
                     Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
@@ -246,6 +262,14 @@ impl NativeExecutor {
             {
                 active_state = None;
             }
+            let (model, new_model_lease) = if let Some(state) = active_state.as_ref() {
+                (state.model.clone(), None)
+            } else {
+                let (model, lease) = self.qwen_model_for_request(request)?;
+                (model, lease)
+            };
+            let model_arc = model;
+            let model = model_arc.as_ref();
 
             let mut active_state = if let Some(state) = active_state {
                 state
@@ -313,6 +337,8 @@ impl NativeExecutor {
 
                 ActiveQwenTtsDecode {
                     variant,
+                    model: model_arc.clone(),
+                    _model_lease: new_model_lease,
                     state: decode_state,
                     last_frames_generated: 0,
                     stream_sequence: 0,
@@ -344,7 +370,9 @@ impl NativeExecutor {
                         request.id.clone(),
                     )));
                 }
-                let step = Self::run_blocking(|| model.tts_decode_step(&mut active_state.state))?;
+                let step = Self::run_blocking(|| {
+                    active_state.model.tts_decode_step(&mut active_state.state)
+                })?;
                 if request.is_cancelled() {
                     return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                         request.id.clone(),
@@ -442,7 +470,7 @@ impl NativeExecutor {
                 asr_diagnostics: None,
                 error: None,
             }))
-        })
+        }
     }
 }
 
@@ -451,6 +479,7 @@ mod tests {
     use super::*;
     use crate::engine::{InputRange, SequencePhase, WorkUnit};
     use crate::model::ModelVariant;
+    use base64::Engine;
 
     #[test]
     fn default_qwen_tts_profile_never_enters_atomic_batch_dispatch() {
@@ -478,5 +507,35 @@ mod tests {
         assert!(executor
             .try_qwen_tts_batch(&[&request], &[scheduled])
             .is_none());
+    }
+
+    #[test]
+    fn qwen_reference_audio_uses_the_thirty_second_decode_contract() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 1_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("WAV writer");
+            for _ in 0..30_001 {
+                writer.write_sample(0_i16).expect("WAV sample");
+            }
+            writer.finalize().expect("WAV finalize");
+        }
+
+        let mut request = EngineCoreRequest::tts("clone this voice");
+        request.reference_audio = Some(base64::engine::general_purpose::STANDARD.encode(wav));
+        request.reference_text = Some("reference transcript".to_string());
+
+        let error = NativeExecutor::reference_from_request(&request)
+            .expect_err("reference audio above thirty seconds must fail before model encoding");
+        assert!(
+            error.to_string().contains("production limit"),
+            "unexpected reference bound error: {error}"
+        );
     }
 }

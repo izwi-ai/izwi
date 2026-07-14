@@ -4,9 +4,11 @@ use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, TranscriptAssembler
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
 
 use crate::backends::{DTypeSelectionRequest, DeviceProfile};
@@ -40,9 +42,11 @@ use crate::models::architectures::qwen3::chat::{
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel,
+    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
 };
-use crate::models::architectures::sortformer::diarization::SortformerDiarizerModel;
+use crate::models::architectures::sortformer::diarization::{
+    SortformerDiarizerModel, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
+};
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
 };
@@ -565,6 +569,17 @@ impl NativeAsrDecodeState {
 
 pub enum NativeAsrRealtimeState {
     Nemotron(NemotronStreamingState),
+}
+
+impl NativeAsrRealtimeState {
+    pub fn resource_usage(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Nemotron(state) => {
+                let usage = state.session_resource_usage()?;
+                Some((usage.host_bytes, usage.tensor_bytes))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1600,6 +1615,32 @@ impl NativeDiarizationModel {
             Self::Sortformer(model) => model.diarize(audio, sample_rate, config),
         }
     }
+
+    pub fn workspace_estimate(
+        &self,
+        target_sample_count: usize,
+    ) -> Result<SortformerWorkspaceEstimate> {
+        match self {
+            Self::Sortformer(model) => model.workspace_estimate(target_sample_count),
+        }
+    }
+
+    pub fn diarize_with_workspace_observer<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        match self {
+            Self::Sortformer(model) => {
+                model.diarize_with_workspace_observer(audio, sample_rate, config, observer)
+            }
+        }
+    }
 }
 
 pub enum NativeChatModel {
@@ -1607,6 +1648,162 @@ pub enum NativeChatModel {
     Qwen35(Qwen35ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
+}
+
+#[derive(Default)]
+struct ModelUseState {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+impl ModelUseState {
+    fn acquire(self: &Arc<Self>) -> Option<Arc<ModelUseGuard>> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .ok()?;
+        Some(Arc::new(ModelUseGuard {
+            state: self.clone(),
+        }))
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ModelUseGuard {
+    state: Arc<ModelUseState>,
+}
+
+impl Drop for ModelUseGuard {
+    fn drop(&mut self) {
+        if self.state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // `notify_one` retains a permit when an unload waiter has not yet
+            // reached its await, avoiding a lost zero-use transition.
+            self.state.idle.notify_one();
+        }
+    }
+}
+
+struct TrackedModelEntry<T> {
+    model: OnceCell<Arc<T>>,
+    uses: Arc<ModelUseState>,
+}
+
+impl<T> Default for TrackedModelEntry<T> {
+    fn default() -> Self {
+        Self {
+            model: OnceCell::new(),
+            uses: Arc::new(ModelUseState::default()),
+        }
+    }
+}
+
+impl<T> TrackedModelEntry<T> {
+    fn acquire(&self) -> Option<TrackedModelLease<T>> {
+        let guard = self.uses.acquire()?;
+        let model = self.model.get()?.clone();
+        Some(TrackedModelLease {
+            model,
+            _guard: guard,
+        })
+    }
+}
+
+struct TrackedModelLease<T> {
+    model: Arc<T>,
+    _guard: Arc<ModelUseGuard>,
+}
+
+impl<T> Clone for TrackedModelLease<T> {
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            _guard: self._guard.clone(),
+        }
+    }
+}
+
+impl<T> Deref for TrackedModelLease<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.model.as_ref()
+    }
+}
+
+/// A loaded chat model handle that keeps lifecycle/resource residency active.
+///
+/// Clones share one use guard. The registry removes the model from discovery
+/// first during unload, then waits for the last lease clone before allowing the
+/// runtime's physical resource authorization to be released.
+#[derive(Clone)]
+pub struct ChatModelLease {
+    inner: TrackedModelLease<NativeChatModel>,
+}
+
+impl ChatModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<NativeChatModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for ChatModelLease {
+    type Target = NativeChatModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// A loaded ASR model handle that fences registry unload for its exact model
+/// instance until the final clone is dropped.
+#[derive(Clone)]
+pub struct AsrModelLease {
+    inner: TrackedModelLease<NativeAsrModel>,
+}
+
+impl AsrModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<NativeAsrModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for AsrModelLease {
+    type Target = NativeAsrModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// A loaded Qwen TTS model handle that fences registry unload for its exact
+/// model instance until the final clone is dropped.
+#[derive(Clone)]
+pub struct QwenTtsModelLease {
+    inner: TrackedModelLease<Qwen3TtsModel>,
+}
+
+impl QwenTtsModelLease {
+    pub(crate) fn model_arc(&self) -> Arc<Qwen3TtsModel> {
+        self.inner.model.clone()
+    }
+}
+
+impl Deref for QwenTtsModelLease {
+    type Target = Qwen3TtsModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 pub enum NativeChatDecodeState {
@@ -1633,6 +1830,22 @@ pub struct NativeChatDecodeStep {
 }
 
 impl NativeChatModel {
+    /// Prepare the exact prompt consumed by execution. Qwen3.5 returns its
+    /// reusable multimodal artifact; text-only families return token IDs only.
+    pub fn prepare_prompt_for_execution(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+    ) -> Result<(Vec<u32>, Option<Qwen35PreparedPrompt>)> {
+        match self {
+            Self::Qwen35(model) => {
+                let prepared = model.prepare_prompt_for_execution(messages, config)?;
+                Ok((prepared.prompt_ids().to_vec(), Some(prepared)))
+            }
+            _ => Ok((self.prompt_token_ids_with_config(messages, config)?, None)),
+        }
+    }
+
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         self.prompt_token_ids_with_config(messages, &ChatGenerationConfig::default())
     }
@@ -1779,15 +1992,38 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        _config: &ChatGenerationConfig,
+        config: &ChatGenerationConfig,
+    ) -> Result<NativeChatDecodeState> {
+        self.start_decode_state_with_prepared(messages, max_new_tokens, config, None)
+    }
+
+    pub fn start_decode_state_with_prepared(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared_qwen35: Option<&Qwen35PreparedPrompt>,
     ) -> Result<NativeChatDecodeState> {
         match self {
-            Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(
-                model.start_decode(messages, max_new_tokens)?,
-            )),
-            Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(
-                model.start_decode_state_with_config(messages, max_new_tokens, _config)?,
-            )),
+            Self::Qwen3(model) => {
+                if prepared_qwen35.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5 prepared prompt was routed to a Qwen3 model".to_string(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Qwen3(
+                    model.start_decode(messages, max_new_tokens)?,
+                ))
+            }
+            Self::Qwen35(model) => {
+                let state = model.start_decode_state_with_optional_prepared(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    prepared_qwen35,
+                )?;
+                Ok(NativeChatDecodeState::Qwen35(state))
+            }
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
             )),
@@ -1828,16 +2064,16 @@ impl NativeChatModel {
 pub struct ModelRegistry {
     models_dir: PathBuf,
     device: DeviceProfile,
-    asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAsrModel>>>>>>,
+    asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
     audio_chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeAudioChatModel>>>>>>,
     diarization_models:
         Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeDiarizationModel>>>>>>,
-    chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<NativeChatModel>>>>>>,
+    chat_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeChatModel>>>>>,
     voxtral_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralRealtimeModel>>>>>>,
     voxtral_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VoxtralTtsModel>>>>>>,
     vibevoice_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<VibeVoiceTtsModel>>>>>>,
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
-    qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<Qwen3TtsModel>>>>>>,
+    qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
 }
 
@@ -2060,12 +2296,11 @@ impl ModelRegistry {
 
         {
             let guard = self.asr_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
-                let (actual_runtime, family_diagnostics) =
-                    native_asr_runtime_diagnostics(model);
+                let (actual_runtime, family_diagnostics) = native_asr_runtime_diagnostics(model);
                 diagnostics.push(loaded_model_diagnostics_entry(
                     &self.device,
                     *variant,
@@ -2126,8 +2361,8 @@ impl ModelRegistry {
 
         {
             let guard = self.chat_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
                 diagnostics.push(loaded_model_diagnostics_entry(
@@ -2234,8 +2469,8 @@ impl ModelRegistry {
 
         {
             let guard = self.qwen_tts_models.read().await;
-            for (variant, cell) in guard.iter() {
-                let Some(model) = cell.get() else {
+            for (variant, entry) in guard.iter() {
+                let Some(model) = entry.model.get() else {
                     continue;
                 };
                 let model_diagnostics = model.diagnostics();
@@ -2293,12 +2528,18 @@ impl ModelRegistry {
             ))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.asr_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "ASR model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2306,7 +2547,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2323,7 +2565,19 @@ impl ModelRegistry {
             })
             .await?;
 
-        Ok(model.clone())
+        let model = {
+            let guard = self.asr_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "ASR model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_audio_chat(
@@ -2372,17 +2626,23 @@ impl ModelRegistry {
         &self,
         variant: ModelVariant,
         model_dir: &Path,
-    ) -> Result<Arc<NativeChatModel>> {
+    ) -> Result<ChatModelLease> {
         let registration = resolve_chat_loader_registration(variant).ok_or_else(|| {
             Error::InvalidInput(format!("Unsupported chat model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.chat_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Chat model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2390,7 +2650,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2407,7 +2668,23 @@ impl ModelRegistry {
             })
             .await?;
 
-        Ok(model.clone())
+        // Acquire the published handle while holding the registry read lock.
+        // If an unload removed or superseded this entry while loading, fail
+        // rather than returning an untracked model handle.
+        let lease = {
+            let guard = self.chat_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.acquire())
+                .map(|inner| ChatModelLease { inner })
+        };
+        drop(loading_guard);
+        lease.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Chat model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_diarization(
@@ -2502,12 +2779,18 @@ impl ModelRegistry {
             Error::InvalidInput(format!("Unsupported Qwen TTS model variant: {variant}"))
         })?;
 
-        let cell = {
+        let (entry, loading_guard) = {
             let mut guard = self.qwen_tts_models.write().await;
-            guard
+            let entry = guard
                 .entry(variant)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+                .or_insert_with(|| Arc::new(TrackedModelEntry::default()))
+                .clone();
+            let loading_guard = entry.uses.acquire().ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "Qwen TTS model {variant} exceeded its active-use accounting capacity"
+                ))
+            })?;
+            (entry, loading_guard)
         };
 
         info!(
@@ -2515,7 +2798,8 @@ impl ModelRegistry {
             registration.name
         );
 
-        let model = cell
+        entry
+            .model
             .get_or_try_init({
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
@@ -2538,7 +2822,19 @@ impl ModelRegistry {
             })
             .await?;
 
-        Ok(model.clone())
+        let model = {
+            let guard = self.qwen_tts_models.read().await;
+            guard
+                .get(&variant)
+                .filter(|current| Arc::ptr_eq(current, &entry))
+                .and_then(|current| current.model.get().cloned())
+        };
+        drop(loading_guard);
+        model.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Qwen TTS model {variant} load was superseded before publication"
+            ))
+        })
     }
 
     pub async fn load_voxtral_tts(
@@ -2701,12 +2997,32 @@ impl ModelRegistry {
 
     pub async fn get_asr(&self, variant: ModelVariant) -> Option<Arc<NativeAsrModel>> {
         let guard = self.asr_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
     }
 
     pub fn try_get_asr(&self, variant: ModelVariant) -> Option<Arc<NativeAsrModel>> {
         let guard = self.asr_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub async fn get_asr_lease(&self, variant: ModelVariant) -> Option<AsrModelLease> {
+        let guard = self.asr_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| AsrModelLease { inner })
+    }
+
+    pub fn try_get_asr_lease(&self, variant: ModelVariant) -> Option<AsrModelLease> {
+        let guard = self.asr_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| AsrModelLease { inner })
     }
 
     pub async fn get_diarization(
@@ -2725,9 +3041,25 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
-    pub async fn get_chat(&self, variant: ModelVariant) -> Option<Arc<NativeChatModel>> {
+    pub async fn get_chat(&self, variant: ModelVariant) -> Option<ChatModelLease> {
         let guard = self.chat_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| ChatModelLease { inner })
+    }
+
+    /// Resolve a loaded chat model from a dedicated blocking worker.
+    ///
+    /// Callers must not invoke this on an async runtime thread. Runtime prompt
+    /// preparation uses it from `spawn_blocking` so transient registry lock
+    /// contention cannot be misreported as a missing model.
+    pub(crate) fn blocking_get_chat(&self, variant: ModelVariant) -> Option<ChatModelLease> {
+        let guard = self.chat_models.blocking_read();
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| ChatModelLease { inner })
     }
 
     pub async fn get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
@@ -2735,9 +3067,12 @@ impl ModelRegistry {
         guard.get(&variant).and_then(|cell| cell.get().cloned())
     }
 
-    pub fn try_get_chat(&self, variant: ModelVariant) -> Option<Arc<NativeChatModel>> {
+    pub fn try_get_chat(&self, variant: ModelVariant) -> Option<ChatModelLease> {
         let guard = self.chat_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| ChatModelLease { inner })
     }
 
     pub fn try_get_audio_chat(&self, variant: ModelVariant) -> Option<Arc<NativeAudioChatModel>> {
@@ -2787,12 +3122,32 @@ impl ModelRegistry {
 
     pub async fn get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
         let guard = self.qwen_tts_models.read().await;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
     }
 
     pub fn try_get_qwen_tts(&self, variant: ModelVariant) -> Option<Arc<Qwen3TtsModel>> {
         let guard = self.qwen_tts_models.try_read().ok()?;
-        guard.get(&variant).and_then(|cell| cell.get().cloned())
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.model.get().cloned())
+    }
+
+    pub async fn get_qwen_tts_lease(&self, variant: ModelVariant) -> Option<QwenTtsModelLease> {
+        let guard = self.qwen_tts_models.read().await;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| QwenTtsModelLease { inner })
+    }
+
+    pub fn try_get_qwen_tts_lease(&self, variant: ModelVariant) -> Option<QwenTtsModelLease> {
+        let guard = self.qwen_tts_models.try_read().ok()?;
+        guard
+            .get(&variant)
+            .and_then(|entry| entry.acquire())
+            .map(|inner| QwenTtsModelLease { inner })
     }
 
     pub async fn get_kokoro(&self, variant: ModelVariant) -> Option<Arc<KokoroTtsModel>> {
@@ -2806,8 +3161,13 @@ impl ModelRegistry {
     }
 
     pub async fn unload_asr(&self, variant: ModelVariant) {
-        let mut guard = self.asr_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.asr_models.write().await;
+            guard.remove(&variant)
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_diarization(&self, variant: ModelVariant) {
@@ -2816,8 +3176,13 @@ impl ModelRegistry {
     }
 
     pub async fn unload_chat(&self, variant: ModelVariant) {
-        let mut guard = self.chat_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.chat_models.write().await;
+            guard.remove(&variant)
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_audio_chat(&self, variant: ModelVariant) {
@@ -2846,8 +3211,13 @@ impl ModelRegistry {
     }
 
     pub async fn unload_qwen_tts(&self, variant: ModelVariant) {
-        let mut guard = self.qwen_tts_models.write().await;
-        guard.remove(&variant);
+        let entry = {
+            let mut guard = self.qwen_tts_models.write().await;
+            guard.remove(&variant)
+        };
+        if let Some(entry) = entry {
+            entry.uses.wait_until_idle().await;
+        }
     }
 
     pub async fn unload_kokoro(&self, variant: ModelVariant) {
@@ -2916,6 +3286,83 @@ mod tests {
         let registry = ModelRegistry::new(PathBuf::from("/tmp/models"), DeviceProfile::cpu());
 
         assert!(registry.loaded_model_diagnostics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_use_state_fences_unload_until_last_shared_lease_drops() {
+        let state = Arc::new(ModelUseState::default());
+        let lease = state.acquire().expect("first model-use lease");
+        let lease_clone = lease.clone();
+        let waiter_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_state.wait_until_idle().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(lease);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "shared lease clone must retain usage"
+        );
+        drop(lease_clone);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("unload fence should observe the final lease drop")
+            .expect("unload fence task should complete");
+        assert_eq!(state.active.load(Ordering::Acquire), 0);
+    }
+
+    async fn assert_session_lease_survives_concurrent_reload(old: &'static str, new: &'static str) {
+        let models = Arc::new(RwLock::new(HashMap::<
+            &'static str,
+            Arc<TrackedModelEntry<&'static str>>,
+        >::new()));
+        let old_entry = Arc::new(TrackedModelEntry::default());
+        old_entry.model.set(Arc::new(old)).expect("seed old model");
+        models.write().await.insert("model", old_entry.clone());
+        let session_lease = old_entry.acquire().expect("acquire old session lease");
+
+        let (removed_tx, removed_rx) = tokio::sync::oneshot::channel();
+        let unload_models = models.clone();
+        let unload = tokio::spawn(async move {
+            let removed = unload_models
+                .write()
+                .await
+                .remove("model")
+                .expect("old entry remains discoverable until unload");
+            removed_tx.send(()).expect("signal registry removal");
+            removed.uses.wait_until_idle().await;
+        });
+        removed_rx.await.expect("observe registry removal");
+
+        let replacement = Arc::new(TrackedModelEntry::default());
+        replacement
+            .model
+            .set(Arc::new(new))
+            .expect("seed replacement model");
+        models.write().await.insert("model", replacement.clone());
+        let replacement_lease = replacement.acquire().expect("acquire replacement lease");
+
+        assert_eq!(*session_lease, old);
+        assert_eq!(*replacement_lease, new);
+        assert!(
+            !unload.is_finished(),
+            "old unload must wait for its session"
+        );
+        drop(session_lease);
+        tokio::time::timeout(std::time::Duration::from_secs(1), unload)
+            .await
+            .expect("old unload should finish after its exact session drops")
+            .expect("unload task should complete");
+    }
+
+    #[tokio::test]
+    async fn asr_and_qwen_tts_sessions_keep_exact_identity_across_unload_reload() {
+        assert_session_lease_survives_concurrent_reload("old-asr", "new-asr").await;
+        assert_session_lease_survives_concurrent_reload("old-qwen-tts", "new-qwen-tts").await;
     }
 
     #[test]

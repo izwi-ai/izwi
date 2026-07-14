@@ -121,6 +121,7 @@ pub struct KokoroProsodyPredictor {
     n_proj: Conv1d,
     hidden_dim: usize,
     style_dim: usize,
+    max_dur: usize,
 }
 
 impl KokoroProsodyPredictor {
@@ -199,6 +200,7 @@ impl KokoroProsodyPredictor {
             n_proj,
             hidden_dim,
             style_dim,
+            max_dur: cfg.max_dur,
         })
     }
 
@@ -233,7 +235,12 @@ impl KokoroProsodyPredictor {
         let duration_logits = self.duration_proj.forward(&x).map_err(Error::from)?; // [B,T,max_dur]
         let duration = ops::sigmoid(&duration_logits).map_err(Error::from)?;
         let duration = duration.sum_keepdim(2).map_err(Error::from)?; // [B,T,1]
-        let speed = (speed as f64).max(0.1);
+        let speed = f64::from(speed);
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(Error::InvalidInput(
+                "Kokoro speed must be finite and greater than zero".to_string(),
+            ));
+        }
         let duration = (duration / speed).map_err(Error::from)?;
         let duration = duration.squeeze(2).map_err(Error::from)?; // [B,T]
 
@@ -246,12 +253,14 @@ impl KokoroProsodyPredictor {
         }
         let duration_vec = duration.to_vec2::<f32>().map_err(Error::from)?;
         let dur_row = duration_vec.first().cloned().unwrap_or_default();
-        let mut pred_dur = Vec::with_capacity(t);
-        for v in dur_row {
-            let r = v.round().max(1.0) as u32;
-            pred_dur.push(r);
-        }
-        let expanded_frames: usize = pred_dur.iter().map(|&v| v as usize).sum();
+        let max_frames_per_token = ((self.max_dur as f64) / speed).ceil() as usize;
+        let max_expanded_frames = t
+            .checked_mul(max_frames_per_token)
+            .ok_or_else(|| {
+                Error::Overloaded("Kokoro duration-frame contract overflowed".to_string())
+            })?
+            .min(super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
+        let (pred_dur, expanded_frames) = bounded_duration_frames(dur_row, max_expanded_frames)?;
         let pred_aln = build_alignment_matrix(&pred_dur, d.device())?; // [1,T,frames]
 
         let d_t = d.transpose(1, 2).map_err(Error::from)?; // [B, hidden+style, T]
@@ -299,6 +308,34 @@ impl KokoroProsodyPredictor {
         let n = n.squeeze(1).map_err(Error::from)?;
         Ok((f0, n))
     }
+}
+
+fn bounded_duration_frames(
+    duration_values: Vec<f32>,
+    max_expanded_frames: usize,
+) -> Result<(Vec<u32>, usize)> {
+    let mut durations = Vec::with_capacity(duration_values.len());
+    let mut expanded_frames = 0usize;
+    for value in duration_values {
+        if !value.is_finite() {
+            return Err(Error::InferenceError(
+                "Kokoro duration predictor produced a non-finite value".to_string(),
+            ));
+        }
+        let duration = value.round().max(1.0) as u32;
+        expanded_frames = expanded_frames
+            .checked_add(duration as usize)
+            .ok_or_else(|| {
+                Error::Overloaded("Kokoro duration-frame count overflowed".to_string())
+            })?;
+        if expanded_frames > max_expanded_frames {
+            return Err(Error::InferenceError(format!(
+                "Kokoro duration predictor exceeded its hard frame contract: {expanded_frames} > {max_expanded_frames}"
+            )));
+        }
+        durations.push(duration);
+    }
+    Ok((durations, expanded_frames))
 }
 
 #[derive(Debug)]
@@ -1213,6 +1250,25 @@ pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_frame_ceiling_is_enforced_before_alignment_construction() {
+        let values = vec![100.0; 512];
+        assert!(matches!(
+            bounded_duration_frames(
+                values,
+                super::super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK,
+            ),
+            Err(Error::InferenceError(message)) if message.contains("hard frame contract")
+        ));
+
+        let values = vec![8.0; 512];
+        let (durations, expanded) =
+            bounded_duration_frames(values, super::super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK)
+                .unwrap();
+        assert_eq!(durations.len(), 512);
+        assert_eq!(expanded, super::super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
+    }
 
     #[test]
     fn adain1d_cpu_op_matches_candle_expression() {

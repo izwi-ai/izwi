@@ -902,7 +902,7 @@ impl EngineCore {
     }
 
     /// Add a request to the engine.
-    pub fn add_request(&mut self, request: EngineCoreRequest) -> Result<()> {
+    pub fn add_request(&mut self, mut request: EngineCoreRequest) -> Result<()> {
         let request_id = request.id.clone();
 
         if self.requests.contains_key(&request_id) {
@@ -911,6 +911,11 @@ impl EngineCore {
                 request_id
             )));
         }
+
+        // Chat prompt tokens drive scheduler/KV accounting and must come from
+        // exact model preparation, never from the public mutable request fields.
+        request.seal_execution_preparation()?;
+        request.enforce_chat_context_window(self.config.max_seq_len)?;
 
         // Add to scheduler. A public ID remains unavailable while an expired
         // incarnation has logical cache quarantined behind unconfirmed
@@ -1407,6 +1412,46 @@ impl EngineCore {
         self.scheduler.mark_terminal_delivered(session)
     }
 
+    /// Cancel a synchronous caller's exact session after its completion
+    /// receiver is abandoned. There is no consumer for the cancellation event,
+    /// so discard that exact terminal output and mark delivery complete while
+    /// retaining the scheduler quarantine until executor cleanup is confirmed.
+    pub(crate) async fn abandon_request_session(&mut self, session: &super::SessionKey) -> bool {
+        let aborted = self.abort_request_session(session).await;
+        let has_queued_terminal = self
+            .pending_terminal_outputs
+            .iter()
+            .any(|pending| pending.session == *session);
+        if !aborted && !has_queued_terminal {
+            return false;
+        }
+        self.pending_terminal_outputs
+            .retain(|pending| pending.session != *session);
+        self.acknowledge_terminal_output(session);
+        true
+    }
+
+    /// Retry cleanup for an abandoned exact session and return the bounded
+    /// delay before another attempt. `None` means the quarantine is gone.
+    pub(crate) async fn retry_abandoned_session_cleanup(
+        &mut self,
+        session: &super::SessionKey,
+    ) -> Option<Duration> {
+        self.attempt_pending_release_cleanup(session).await;
+        self.scheduler
+            .pending_cleanup_attempts(session)
+            .map(|attempt| self.retry_policy.cleanup_delay(attempt.max(1)))
+    }
+
+    pub(crate) fn abandoned_session_cleanup_delay(
+        &self,
+        session: &super::SessionKey,
+    ) -> Option<Duration> {
+        self.scheduler
+            .pending_cleanup_attempts(session)
+            .map(|attempt| self.retry_policy.cleanup_delay(attempt.max(1)))
+    }
+
     /// Check if there's pending work.
     pub fn has_pending_work(&self) -> bool {
         !self.pending_terminal_outputs.is_empty()
@@ -1443,6 +1488,16 @@ impl EngineCore {
         self.scheduler
             .get_sequence_id(request_id)
             .map(|epoch| super::SessionKey::new(request_id.clone(), epoch))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_hard_deadline_for_test(
+        &mut self,
+        request_id: &RequestId,
+        deadline: Instant,
+    ) -> bool {
+        self.scheduler
+            .set_hard_deadline_for_test(request_id, deadline)
     }
 
     /// Abort only if the caller still owns the exact request incarnation.
@@ -3390,7 +3445,10 @@ mod tests {
             content: "Hello".to_string(),
         }]);
         request.id = "chat-req".to_string();
-        request.prompt_tokens = vec![11, 22, 33, 44];
+        request.model_variant = Some(ModelVariant::Qwen306B);
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22, 33, 44], None)
+            .unwrap();
 
         core.add_request(request).unwrap();
         let outputs = core.step().await.unwrap();
@@ -3403,6 +3461,81 @@ mod tests {
             .expect("latency breakdown");
         assert!(latency.ttft_ms.is_some());
         assert!(latency.ttft_ms.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn core_rejects_unprepared_and_mismatched_chat_accounting() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.prompt_tokens = vec![11, 22, 33, 44];
+
+        let error = core
+            .add_request(request)
+            .expect_err("public prompt tokens must not authorize scheduler accounting");
+        assert!(error
+            .to_string()
+            .contains("missing exact model prompt preparation"));
+
+        let mut mismatched = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        mismatched
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22], None)
+            .unwrap();
+        mismatched.prompt_tokens[0] = 99;
+        let error = core
+            .add_request(mismatched)
+            .expect_err("mutated exact preparation must not reach the scheduler");
+        assert!(error
+            .to_string()
+            .contains("changed after exact prompt preparation"));
+    }
+
+    #[test]
+    fn core_enforces_exact_chat_context_after_preparation() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_seq_len: 4,
+                ..EngineCoreConfig::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut full = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "full".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4], None)
+            .unwrap();
+        assert!(core
+            .add_request(full)
+            .expect_err("a full context must leave no output allocation")
+            .to_string()
+            .contains("leaves no output capacity"));
+
+        let mut bounded = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "bounded".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        bounded.id = "bounded-context".to_string();
+        bounded.params.max_tokens = 100;
+        bounded
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None)
+            .unwrap();
+        core.add_request(bounded).unwrap();
+        assert_eq!(core.requests["bounded-context"].params.max_tokens, 2);
     }
 
     #[tokio::test]

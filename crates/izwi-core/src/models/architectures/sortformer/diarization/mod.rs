@@ -30,6 +30,91 @@ const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
 const TS_VAD_FRAME_LENGTH_SECS: f32 = 0.01;
 const TS_VAD_UNIT_FRAME_COUNT: usize = 8;
+const PRODUCTION_FEATURE_BINS: usize = 128;
+const PRODUCTION_N_FFT: usize = 512;
+const PRODUCTION_HOP_LENGTH: usize = 160;
+const PRODUCTION_CONV_CHANNELS: usize = 256;
+const PRODUCTION_CONFORMER_LAYERS: usize = 17;
+const PRODUCTION_CONFORMER_D_MODEL: usize = 512;
+const PRODUCTION_CONFORMER_FF_DIM: usize = 2048;
+const PRODUCTION_CONFORMER_HEADS: usize = 8;
+const PRODUCTION_TRANSFORMER_LAYERS: usize = 18;
+const PRODUCTION_TRANSFORMER_D_MODEL: usize = 192;
+const PRODUCTION_TRANSFORMER_INNER_DIM: usize = 768;
+const PRODUCTION_TRANSFORMER_HEADS: usize = 8;
+const PRODUCTION_MAX_CHUNK_LEN: usize = 340;
+const PRODUCTION_MAX_CHUNK_LEFT_CONTEXT: usize = 1;
+const PRODUCTION_MAX_CHUNK_RIGHT_CONTEXT: usize = 40;
+const PRODUCTION_MAX_SPKCACHE_LEN: usize = 188;
+const PRODUCTION_MAX_FIFO_LEN: usize = 188;
+// The formulas below explicitly count the largest live tensors in each
+// model stage. Keep a factor of two for allocator/kernel workspaces which are
+// backend implementation details rather than Candle tensors visible here.
+const SORTFORMER_TENSOR_SAFETY_FACTOR: u64 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortformerWorkspaceEstimate {
+    pub host_bytes: u64,
+    pub accelerator_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortformerWorkspaceEvent {
+    Materialized {
+        workspace: SortformerWorkspaceEstimate,
+    },
+    Releasing {
+        workspace: SortformerWorkspaceEstimate,
+    },
+}
+
+struct SortformerWorkspaceGuard<'a, F>
+where
+    F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+{
+    observer: &'a mut F,
+    workspace: SortformerWorkspaceEstimate,
+    active: bool,
+}
+
+impl<'a, F> SortformerWorkspaceGuard<'a, F>
+where
+    F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+{
+    fn new(observer: &'a mut F, workspace: SortformerWorkspaceEstimate) -> Result<Self> {
+        observer(SortformerWorkspaceEvent::Materialized { workspace })?;
+        Ok(Self {
+            observer,
+            workspace,
+            active: true,
+        })
+    }
+
+    fn release(mut self) -> Result<()> {
+        let result = (self.observer)(SortformerWorkspaceEvent::Releasing {
+            workspace: self.workspace,
+        });
+        if result.is_ok() {
+            self.active = false;
+        }
+        result
+    }
+}
+
+impl<F> Drop for SortformerWorkspaceGuard<'_, F>
+where
+    F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+{
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (self.observer)(SortformerWorkspaceEvent::Releasing {
+                    workspace: self.workspace,
+                })
+            }));
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct SortformerModelConfig {
@@ -121,6 +206,176 @@ impl SortformerStreamingConfig {
         }
         Ok(self)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortformerWorkspaceTopology {
+    feature_bins: usize,
+    n_fft: usize,
+    hop_length: usize,
+    conv_channels: usize,
+    conformer_layers: usize,
+    conformer_d_model: usize,
+    conformer_ff_dim: usize,
+    conformer_heads: usize,
+    transformer_layers: usize,
+    transformer_d_model: usize,
+    transformer_inner_dim: usize,
+    transformer_heads: usize,
+}
+
+impl SortformerWorkspaceTopology {
+    const fn production() -> Self {
+        Self {
+            feature_bins: PRODUCTION_FEATURE_BINS,
+            n_fft: PRODUCTION_N_FFT,
+            hop_length: PRODUCTION_HOP_LENGTH,
+            conv_channels: PRODUCTION_CONV_CHANNELS,
+            conformer_layers: PRODUCTION_CONFORMER_LAYERS,
+            conformer_d_model: PRODUCTION_CONFORMER_D_MODEL,
+            conformer_ff_dim: PRODUCTION_CONFORMER_FF_DIM,
+            conformer_heads: PRODUCTION_CONFORMER_HEADS,
+            transformer_layers: PRODUCTION_TRANSFORMER_LAYERS,
+            transformer_d_model: PRODUCTION_TRANSFORMER_D_MODEL,
+            transformer_inner_dim: PRODUCTION_TRANSFORMER_INNER_DIM,
+            transformer_heads: PRODUCTION_TRANSFORMER_HEADS,
+        }
+    }
+
+    fn validate_production(self, cfg: SortformerStreamingConfig) -> Result<()> {
+        let expected = Self::production();
+        if self != expected {
+            return Err(Error::ModelLoadError(format!(
+                "unsupported Sortformer workspace topology {self:?}; production requires {expected:?}"
+            )));
+        }
+        if cfg.fc_d_model != PRODUCTION_CONFORMER_D_MODEL
+            || cfg.subsampling_factor != TS_VAD_UNIT_FRAME_COUNT
+            || cfg.chunk_len > PRODUCTION_MAX_CHUNK_LEN
+            || cfg.chunk_left_context > PRODUCTION_MAX_CHUNK_LEFT_CONTEXT
+            || cfg.chunk_right_context > PRODUCTION_MAX_CHUNK_RIGHT_CONTEXT
+            || cfg.spkcache_len > PRODUCTION_MAX_SPKCACHE_LEN
+            || cfg.fifo_len > PRODUCTION_MAX_FIFO_LEN
+        {
+            return Err(Error::ModelLoadError(format!(
+                "unsupported Sortformer streaming workspace configuration: {cfg:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn production_workspace_streaming_config() -> SortformerStreamingConfig {
+    SortformerStreamingConfig {
+        fc_d_model: PRODUCTION_CONFORMER_D_MODEL,
+        subsampling_factor: TS_VAD_UNIT_FRAME_COUNT,
+        spkcache_len: PRODUCTION_MAX_SPKCACHE_LEN,
+        fifo_len: PRODUCTION_MAX_FIFO_LEN,
+        chunk_len: PRODUCTION_MAX_CHUNK_LEN,
+        spkcache_update_period: 300,
+        chunk_left_context: PRODUCTION_MAX_CHUNK_LEFT_CONTEXT,
+        chunk_right_context: PRODUCTION_MAX_CHUNK_RIGHT_CONTEXT,
+        spkcache_sil_frames_per_spk: 3,
+        pred_score_threshold: 0.25,
+        scores_boost_latest: 0.05,
+        sil_threshold: 0.2,
+        strong_boost_rate: 0.75,
+        weak_boost_rate: 1.5,
+        min_pos_scores_rate: 0.5,
+    }
+}
+
+/// Immutable pre-admission ceiling for the supported production checkpoint.
+/// The estimate uses the largest supported streaming profile, while the
+/// loaded model later reports its exact profile-shaped peak.
+pub fn production_workspace_authorization(
+    target_sample_count: usize,
+    separate_device_memory: bool,
+) -> Result<SortformerWorkspaceEstimate> {
+    workspace_estimate_for(
+        SortformerWorkspaceTopology::production(),
+        production_workspace_streaming_config(),
+        target_sample_count,
+        separate_device_memory,
+    )
+}
+
+fn workspace_estimate_for(
+    topology: SortformerWorkspaceTopology,
+    cfg: SortformerStreamingConfig,
+    target_sample_count: usize,
+    separate_device_memory: bool,
+) -> Result<SortformerWorkspaceEstimate> {
+    topology.validate_production(cfg)?;
+    let feature_frames = target_sample_count / topology.hop_length;
+    let chunk_feature_cap = cfg
+        .chunk_len
+        .checked_add(cfg.chunk_left_context)
+        .and_then(|frames| frames.checked_add(cfg.chunk_right_context))
+        .and_then(|frames| frames.checked_mul(cfg.subsampling_factor))
+        .ok_or_else(|| Error::Overloaded("Sortformer chunk shape overflowed".to_string()))?;
+    let chunk_feature_frames = feature_frames.min(chunk_feature_cap);
+    let chunk_encoded_frames = subsampled_len_3x(chunk_feature_frames);
+    let composite_frames = chunk_encoded_frames
+        .checked_add(cfg.spkcache_len)
+        .and_then(|frames| frames.checked_add(cfg.fifo_len))
+        .ok_or_else(|| Error::Overloaded("Sortformer composite shape overflowed".to_string()))?;
+
+    let u = |value: usize| value as u128;
+    let f32_bytes = u(DType::F32.size_in_bytes());
+    let feature_elements = u(chunk_feature_frames) * u(topology.feature_bins);
+    let feature_bytes = feature_elements * f32_bytes;
+
+    // Direct chunk preprocessing retains one feature matrix plus a single FFT
+    // and spectrum row. Duration-shaped probability rows and the cache/row
+    // copies used by the streaming state are host allocations.
+    let fft_scratch_bytes = (u(topology.n_fft) * 2 + u(topology.n_fft / 2 + 1)) * f32_bytes;
+    let streaming_row_bytes = u(composite_frames) * u(topology.conformer_d_model) * f32_bytes * 32;
+    let output_bytes = u(feature_frames) * u(MAX_SUPPORTED_SPEAKERS) * f32_bytes;
+    let staging_bytes = if separate_device_memory {
+        feature_bytes
+    } else {
+        0
+    };
+    let host_bytes = (fft_scratch_bytes + streaming_row_bytes + output_bytes + staging_bytes) * 2;
+
+    // Conv subsampling's first output is its largest duration/frequency
+    // activation. The remaining terms count live residual/FFN/QKV/relative
+    // attention tensors for one Conformer layer and one Sortformer transformer
+    // layer. Layers execute sequentially; checkpoint weights are covered by
+    // the model residency lease rather than this job workspace.
+    let conv_t = u(chunk_feature_frames.div_ceil(2));
+    let conv_f = u(topology.feature_bins.div_ceil(2));
+    let conv_elements = conv_t * conv_f * u(topology.conv_channels);
+    let conformer_linear = u(composite_frames) * u(topology.conformer_d_model);
+    let conformer_ff = u(composite_frames) * u(topology.conformer_ff_dim);
+    let conformer_scores = u(topology.conformer_heads)
+        * u(composite_frames)
+        * u(composite_frames.saturating_mul(2).saturating_sub(1));
+    let conformer_elements = conformer_linear * 24 + conformer_ff * 4 + conformer_scores * 6;
+    let transformer_linear = u(composite_frames) * u(topology.transformer_d_model);
+    let transformer_ff = u(composite_frames) * u(topology.transformer_inner_dim);
+    let transformer_scores =
+        u(topology.transformer_heads) * u(composite_frames) * u(composite_frames);
+    let transformer_elements =
+        transformer_linear * 20 + transformer_ff * 4 + transformer_scores * 4;
+    let accelerator_bytes = (feature_elements
+        + conv_elements * 8
+        + conformer_elements
+        + transformer_elements
+        + conformer_linear * 8)
+        * f32_bytes
+        * u(SORTFORMER_TENSOR_SAFETY_FACTOR as usize);
+
+    let to_u64 = |bytes: u128, domain: &str| {
+        u64::try_from(bytes).map_err(|_| {
+            Error::Overloaded(format!("Sortformer {domain} workspace estimate overflowed"))
+        })
+    };
+    Ok(SortformerWorkspaceEstimate {
+        host_bytes: to_u64(host_bytes, "host")?,
+        accelerator_bytes: to_u64(accelerator_bytes, "accelerator")?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +513,7 @@ impl SortformerDiarizerModel {
             config.encoder.clone(),
             modules_cfg.clone(),
             device.clone(),
+            device_profile.kind.is_cuda(),
         )?;
 
         Ok(Self {
@@ -274,6 +530,28 @@ impl SortformerDiarizerModel {
         sample_rate: u32,
         config: &DiarizationConfig,
     ) -> Result<DiarizationResult> {
+        self.diarize_with_workspace_observer(audio, sample_rate, config, |_| Ok(()))
+    }
+
+    /// Complete peak job workspace for the loaded streaming topology.
+    /// `target_sample_count` describes 16 kHz audio after runtime decoding.
+    pub fn workspace_estimate(
+        &self,
+        target_sample_count: usize,
+    ) -> Result<SortformerWorkspaceEstimate> {
+        self.model.workspace_estimate(target_sample_count)
+    }
+
+    pub fn diarize_with_workspace_observer<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        mut observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -281,10 +559,12 @@ impl SortformerDiarizerModel {
             return Err(Error::InvalidInput("Invalid sample rate: 0".to_string()));
         }
 
+        let resampled_samples;
         let samples = if sample_rate == TARGET_SAMPLE_RATE {
-            audio.to_vec()
+            audio
         } else {
-            resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE)
+            resampled_samples = resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE);
+            &resampled_samples
         };
 
         let duration_secs = samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
@@ -295,15 +575,19 @@ impl SortformerDiarizerModel {
                 speaker_count: 0,
             });
         }
+        let workspace_estimate = self.model.workspace_estimate(samples.len())?;
+        let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
 
         let (speaker_probs, frame_stride_samples) =
-            self.model.infer_speaker_probabilities(&samples)?;
+            self.model.infer_speaker_probabilities(samples)?;
         if speaker_probs.is_empty() {
-            return Ok(DiarizationResult {
+            let result = DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
-            });
+            };
+            workspace.release()?;
+            return Ok(result);
         }
 
         let explicit_min_speech_ms = config
@@ -425,11 +709,16 @@ impl SortformerDiarizerModel {
         }
 
         if raw_segments.is_empty() {
-            return Ok(DiarizationResult {
+            let result = DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
-            });
+            };
+            drop(speaker_stats);
+            drop(vad_mask);
+            drop(gated_probs);
+            workspace.release()?;
+            return Ok(result);
         }
 
         if limit_speaker_channels {
@@ -500,11 +789,19 @@ impl SortformerDiarizerModel {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
 
-        Ok(DiarizationResult {
+        drop(speaker_labels);
+        drop(speaker_remap);
+        drop(ordered);
+        drop(speaker_stats);
+        drop(vad_mask);
+        drop(gated_probs);
+        let result = DiarizationResult {
             segments,
             duration_secs,
             speaker_count,
-        })
+        };
+        workspace.release()?;
+        Ok(result)
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -553,6 +850,7 @@ struct PostProcessingParams {
 
 struct SortformerInferenceModel {
     device: Device,
+    separate_device_memory: bool,
     preprocessor: SortformerPreprocessor,
     encoder: SortformerConformerEncoder,
     encoder_proj: Linear,
@@ -570,7 +868,13 @@ impl SortformerInferenceModel {
         encoder_cfg: Option<SortformerEncoderConfig>,
         modules_cfg: SortformerModulesConfig,
         device: Device,
+        separate_device_memory: bool,
     ) -> Result<Self> {
+        if !streaming_mode {
+            return Err(Error::ModelLoadError(
+                "offline Sortformer is not supported by the bounded production runtime".to_string(),
+            ));
+        }
         let preprocessor = SortformerPreprocessor::load(vb, preprocessor_cfg)?;
         let encoder = SortformerConformerEncoder::load(
             vb.pp("encoder"),
@@ -586,64 +890,126 @@ impl SortformerInferenceModel {
 
         let transformer = SortformerTransformerEncoder::load(vb.pp("transformer_encoder"))?;
         let head = SortformerSpeakerHead::load(vb.pp("sortformer_modules"))?;
-        let streaming = if streaming_mode {
-            Some(resolve_streaming_config(
-                variant,
-                &modules_cfg,
-                encoder.d_model(),
-            )?)
-        } else {
-            None
-        };
+        let streaming = resolve_streaming_config(variant, &modules_cfg, encoder.d_model())?;
 
-        Ok(Self {
+        let model = Self {
             device,
+            separate_device_memory,
             preprocessor,
             encoder,
             encoder_proj,
             transformer,
             head,
-            streaming,
+            streaming: Some(streaming),
+        };
+        model.validate_production_topology(proj_in, proj_out)?;
+        Ok(model)
+    }
+
+    fn workspace_topology(&self) -> Result<SortformerWorkspaceTopology> {
+        let conformer_layer = self.encoder.layers.first().ok_or_else(|| {
+            Error::ModelLoadError("Sortformer Conformer encoder has no layers".to_string())
+        })?;
+        if self.encoder.layers.iter().any(|layer| {
+            layer.d_model != conformer_layer.d_model
+                || layer.ff_dim != conformer_layer.ff_dim
+                || layer.self_attn.num_heads != conformer_layer.self_attn.num_heads
+                || layer.self_attn.head_dim != conformer_layer.self_attn.head_dim
+        }) {
+            return Err(Error::ModelLoadError(
+                "non-uniform Sortformer Conformer layers are not supported by the production workspace envelope"
+                    .to_string(),
+            ));
+        }
+        let transformer_layer = self.transformer.layers.first().ok_or_else(|| {
+            Error::ModelLoadError("Sortformer transformer encoder has no layers".to_string())
+        })?;
+        if self.transformer.layers.iter().any(|layer| {
+            layer.d_model != transformer_layer.d_model
+                || layer.inner_size != transformer_layer.inner_size
+                || layer.num_heads != transformer_layer.num_heads
+                || layer.head_dim != transformer_layer.head_dim
+        }) {
+            return Err(Error::ModelLoadError(
+                "non-uniform Sortformer transformer layers are not supported by the production workspace envelope"
+                    .to_string(),
+            ));
+        }
+        Ok(SortformerWorkspaceTopology {
+            feature_bins: self.preprocessor.n_mels,
+            n_fft: self.preprocessor.n_fft,
+            hop_length: self.preprocessor.hop_length,
+            conv_channels: self.encoder.pre_encode.out_channels,
+            conformer_layers: self.encoder.layers.len(),
+            conformer_d_model: self.encoder.d_model,
+            conformer_ff_dim: conformer_layer.ff_dim,
+            conformer_heads: conformer_layer.self_attn.num_heads,
+            transformer_layers: self.transformer.layers.len(),
+            transformer_d_model: transformer_layer.d_model,
+            transformer_inner_dim: transformer_layer.inner_size,
+            transformer_heads: transformer_layer.num_heads,
         })
+    }
+
+    fn validate_production_topology(
+        &self,
+        projection_in: usize,
+        projection_out: usize,
+    ) -> Result<()> {
+        if self.preprocessor.sample_rate != TARGET_SAMPLE_RATE as usize
+            || self.preprocessor.normalize != SortformerFeatureNormalize::None
+            || projection_in != PRODUCTION_CONFORMER_D_MODEL
+            || projection_out != PRODUCTION_TRANSFORMER_D_MODEL
+            || self.head.hidden_dim != PRODUCTION_TRANSFORMER_D_MODEL
+        {
+            return Err(Error::ModelLoadError(format!(
+                "unsupported Sortformer preprocessing/projection topology: sample_rate={}, normalize={:?}, projection=[{}, {}]",
+                self.preprocessor.sample_rate,
+                self.preprocessor.normalize,
+                projection_out,
+                projection_in
+            )));
+        }
+        let streaming = self.streaming.ok_or_else(|| {
+            Error::ModelLoadError(
+                "offline Sortformer is not supported by the bounded production runtime".to_string(),
+            )
+        })?;
+        self.workspace_topology()?.validate_production(streaming)
+    }
+
+    fn workspace_estimate(
+        &self,
+        target_sample_count: usize,
+    ) -> Result<SortformerWorkspaceEstimate> {
+        let streaming = self.streaming.ok_or_else(|| {
+            Error::ModelLoadError(
+                "offline Sortformer is not supported by the bounded production runtime".to_string(),
+            )
+        })?;
+        workspace_estimate_for(
+            self.workspace_topology()?,
+            streaming,
+            target_sample_count,
+            self.separate_device_memory,
+        )
     }
 
     fn infer_speaker_probabilities(
         &self,
         samples: &[f32],
     ) -> Result<(Vec<[f32; MAX_SUPPORTED_SPEAKERS]>, usize)> {
-        let normalized_storage;
-        let feature_input = if self.streaming.is_some() {
-            samples
-        } else {
-            normalized_storage = {
-                let mut normalized = samples.to_vec();
-                let max_abs = normalized
-                    .iter()
-                    .copied()
-                    .map(f32::abs)
-                    .fold(0.0f32, f32::max)
-                    .max(1e-6);
-                for sample in &mut normalized {
-                    *sample /= max_abs;
-                }
-                normalized
-            };
-            &normalized_storage
-        };
-
-        let (features, feature_frames) = self.preprocessor.compute_features(feature_input)?;
+        let feature_frames = self.preprocessor.feature_frame_count(samples.len());
         if feature_frames == 0 {
             return Ok((Vec::new(), self.encoder.frame_stride_samples()));
         }
-        let features = features
-            .narrow(2, 0, feature_frames)?
-            .to_device(&self.device)?;
-
-        let out = if let Some(streaming_cfg) = self.streaming {
-            self.infer_speaker_probabilities_streaming(&features, feature_frames, streaming_cfg)?
-        } else {
-            self.infer_speaker_probabilities_offline(&features, feature_frames)?
-        };
+        let streaming_cfg = self.streaming.ok_or_else(|| {
+            Error::InferenceError(
+                "offline Sortformer reached the bounded production path".to_string(),
+            )
+        })?;
+        let out =
+            self.infer_speaker_probabilities_streaming(samples, feature_frames, streaming_cfg)?;
 
         Ok((out, self.encoder.frame_stride_samples()))
     }
@@ -663,15 +1029,17 @@ impl SortformerInferenceModel {
 
     fn infer_speaker_probabilities_streaming(
         &self,
-        features: &Tensor,
+        samples: &[f32],
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
     ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         let mut total_preds = Vec::new();
         for plan in plan_streaming_feature_chunks(feature_frames, cfg) {
-            let chunk = features
-                .i((.., .., plan.feature_start..plan.feature_end))?
+            let chunk = self
+                .preprocessor
+                .compute_feature_range(samples, plan.feature_start, plan.feature_end)?
+                .to_device(&self.device)?
                 .transpose(1, 2)?
                 .contiguous()?;
             let (chunk_pre_encoded, chunk_pre_encoded_len) =
@@ -1242,6 +1610,90 @@ impl SortformerPreprocessor {
         })
     }
 
+    fn feature_frame_count(&self, sample_count: usize) -> usize {
+        sample_count / self.hop_length
+    }
+
+    /// Compute only the feature frames needed by one streaming inference
+    /// window. This is algebraically identical to slicing `compute_features`,
+    /// but never materializes duration-shaped sample, padding, spectrum, or
+    /// mel buffers.
+    fn compute_feature_range(
+        &self,
+        audio: &[f32],
+        feature_start: usize,
+        feature_end: usize,
+    ) -> Result<Tensor> {
+        let feature_frames = self.feature_frame_count(audio.len());
+        if feature_start > feature_end || feature_end > feature_frames {
+            return Err(Error::InferenceError(format!(
+                "Sortformer feature range {feature_start}..{feature_end} exceeds {feature_frames} frames"
+            )));
+        }
+        if self.normalize != SortformerFeatureNormalize::None {
+            return Err(Error::InferenceError(
+                "normalized Sortformer features reached the bounded streaming path".to_string(),
+            ));
+        }
+
+        let range_frames = feature_end - feature_start;
+        if range_frames == 0 {
+            return Tensor::zeros((1, self.n_mels, 0), DType::F32, &Device::Cpu)
+                .map_err(Error::from);
+        }
+        let mel_elements = self
+            .n_mels
+            .checked_mul(range_frames)
+            .ok_or_else(|| Error::Overloaded("Sortformer feature shape overflowed".to_string()))?;
+        let mut mel = vec![0.0f32; mel_elements];
+        let center_pad = self.n_fft / 2;
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(self.n_fft);
+        let mut buffer = vec![Complex::<f32>::new(0.0, 0.0); self.n_fft];
+        let mut spectrum = vec![0.0f32; self.n_freqs];
+
+        for (local_frame, frame_idx) in (feature_start..feature_end).enumerate() {
+            let padded_start = frame_idx.checked_mul(self.hop_length).ok_or_else(|| {
+                Error::Overloaded("Sortformer feature frame offset overflowed".to_string())
+            })?;
+            for (window_idx, value) in buffer.iter_mut().enumerate() {
+                let padded_index = padded_start.checked_add(window_idx).ok_or_else(|| {
+                    Error::Overloaded("Sortformer FFT window offset overflowed".to_string())
+                })?;
+                let sample = if padded_index < center_pad {
+                    0.0
+                } else {
+                    let sample_idx = padded_index - center_pad;
+                    if sample_idx >= audio.len() {
+                        0.0
+                    } else if sample_idx == 0 {
+                        audio[0]
+                    } else {
+                        audio[sample_idx] - PREEMPH * audio[sample_idx - 1]
+                    }
+                };
+                value.re = sample * self.padded_window[window_idx];
+                value.im = 0.0;
+            }
+            fft.process(&mut buffer);
+            for (bin, power) in spectrum.iter_mut().enumerate() {
+                let magnitude =
+                    (buffer[bin].re * buffer[bin].re + buffer[bin].im * buffer[bin].im).sqrt();
+                *power = magnitude * magnitude;
+            }
+            for mel_idx in 0..self.n_mels {
+                let fb_row = &self.fb[mel_idx * self.n_freqs..(mel_idx + 1) * self.n_freqs];
+                let mut acc = 0.0f32;
+                for bin in 0..self.n_freqs {
+                    acc += spectrum[bin] * fb_row[bin];
+                }
+                mel[mel_idx * range_frames + local_frame] = (acc + LOG_GUARD).ln();
+            }
+        }
+
+        Tensor::from_vec(mel, (1, self.n_mels, range_frames), &Device::Cpu).map_err(Error::from)
+    }
+
     fn compute_features(&self, audio: &[f32]) -> Result<(Tensor, usize)> {
         if audio.is_empty() {
             return Ok((
@@ -1408,6 +1860,7 @@ struct ConvSubsamplingDw {
     conv5: Conv2d,
     conv6: Conv2d,
     out: Linear,
+    out_channels: usize,
 }
 
 impl ConvSubsamplingDw {
@@ -1446,6 +1899,7 @@ impl ConvSubsamplingDw {
             conv5,
             conv6,
             out,
+            out_channels,
         })
     }
 
@@ -1491,6 +1945,7 @@ struct ConformerLayer {
     ff2: FeedForward,
     norm_out: LayerNorm,
     d_model: usize,
+    ff_dim: usize,
 }
 
 impl ConformerLayer {
@@ -1531,6 +1986,7 @@ impl ConformerLayer {
             ff2,
             norm_out,
             d_model,
+            ff_dim,
         })
     }
 
@@ -1809,6 +2265,7 @@ struct SortformerTransformerLayer {
     dense_in: Linear,
     dense_out: Linear,
     d_model: usize,
+    inner_size: usize,
     num_heads: usize,
     head_dim: usize,
 }
@@ -1858,6 +2315,7 @@ impl SortformerTransformerLayer {
             dense_in: mlx::load_linear(d_model, inner_size, vb.pp("second_sub_layer.dense_in"))?,
             dense_out: mlx::load_linear(inner_size, d_model, vb.pp("second_sub_layer.dense_out"))?,
             d_model,
+            inner_size,
             num_heads,
             head_dim,
         })
@@ -1911,6 +2369,7 @@ impl SortformerTransformerLayer {
 struct SortformerSpeakerHead {
     first_hidden_to_hidden: Linear,
     single_hidden_to_spks: Linear,
+    hidden_dim: usize,
 }
 
 impl SortformerSpeakerHead {
@@ -1947,6 +2406,7 @@ impl SortformerSpeakerHead {
         Ok(Self {
             first_hidden_to_hidden,
             single_hidden_to_spks,
+            hidden_dim: first_out,
         })
     }
 
@@ -2632,6 +3092,80 @@ mod tests {
         assert!(!sortformer_uses_selected_model_device(DeviceKind::Cpu));
         assert!(!sortformer_uses_selected_model_device(DeviceKind::Metal));
         assert!(sortformer_uses_selected_model_device(DeviceKind::Cuda));
+    }
+
+    #[test]
+    fn streaming_feature_ranges_match_full_preprocessing_slices() {
+        let n_fft = 8;
+        let n_mels = 3;
+        let n_freqs = n_fft / 2 + 1;
+        let padded_window = hann_window(n_fft);
+        let preprocessor = SortformerPreprocessor {
+            sample_rate: TARGET_SAMPLE_RATE as usize,
+            n_fft,
+            win_length: n_fft,
+            hop_length: 4,
+            _window: padded_window.clone(),
+            padded_window,
+            fb: (0..n_mels * n_freqs)
+                .map(|idx| (idx + 1) as f32 / 17.0)
+                .collect(),
+            n_mels,
+            n_freqs,
+            normalize: SortformerFeatureNormalize::None,
+        };
+        let audio = (0..41)
+            .map(|idx| ((idx as f32) * 0.31).sin() * 0.7)
+            .collect::<Vec<_>>();
+        let (full, valid_frames) = preprocessor.compute_features(&audio).unwrap();
+
+        for (start, end) in [(0, 5), (3, valid_frames), (valid_frames - 1, valid_frames)] {
+            let expected = full
+                .i((0, .., start..end))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            let chunk = preprocessor
+                .compute_feature_range(&audio, start, end)
+                .unwrap()
+                .i(0)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            assert_eq!(chunk, expected, "feature range {start}..{end}");
+        }
+    }
+
+    #[test]
+    fn production_workspace_is_chunk_bounded_and_topology_checked() {
+        let topology = SortformerWorkspaceTopology::production();
+        let cfg = production_workspace_streaming_config();
+        topology.validate_production(cfg).unwrap();
+
+        let chunk_sized_samples = (PRODUCTION_MAX_CHUNK_LEN
+            + PRODUCTION_MAX_CHUNK_LEFT_CONTEXT
+            + PRODUCTION_MAX_CHUNK_RIGHT_CONTEXT)
+            * TS_VAD_UNIT_FRAME_COUNT
+            * PRODUCTION_HOP_LENGTH;
+        let chunk = workspace_estimate_for(topology, cfg, chunk_sized_samples, false).unwrap();
+        let hour = workspace_estimate_for(topology, cfg, 60 * 60 * 16_000, false).unwrap();
+        assert_eq!(hour.accelerator_bytes, chunk.accelerator_bytes);
+        assert!(hour.host_bytes > chunk.host_bytes);
+        assert!(hour.accelerator_bytes < 3 * 1024 * 1024 * 1024);
+
+        let mut unsupported = topology;
+        unsupported.conv_channels += 1;
+        assert!(matches!(
+            workspace_estimate_for(unsupported, cfg, chunk_sized_samples, false),
+            Err(Error::ModelLoadError(_))
+        ));
+
+        let mut oversized_profile = cfg;
+        oversized_profile.chunk_len = PRODUCTION_MAX_CHUNK_LEN + 1;
+        assert!(matches!(
+            workspace_estimate_for(topology, oversized_profile, chunk_sized_samples, false),
+            Err(Error::ModelLoadError(_))
+        ));
     }
 
     #[test]

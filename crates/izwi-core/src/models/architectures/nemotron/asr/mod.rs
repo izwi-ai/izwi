@@ -72,6 +72,12 @@ pub struct NemotronRealtimeResourceReservation {
     max_text_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NemotronRealtimeResourceUsage {
+    pub host_bytes: u64,
+    pub tensor_bytes: u64,
+}
+
 pub struct NemotronAsrModel {
     variant: ModelVariant,
     artifacts: NemotronArtifacts,
@@ -783,24 +789,34 @@ impl NemotronStreamingState {
 
     /// Complete retained backing allocation for this exact stream session.
     pub fn session_cache_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        accounting.add_bytes(retained_capacity_bytes::<f32>(self.samples.capacity())?)?;
-        accounting.add_bytes(retained_capacity_bytes::<u8>(
+        let usage = self.session_resource_usage()?;
+        usage.host_bytes.checked_add(usage.tensor_bytes)
+    }
+
+    pub fn session_resource_usage(&self) -> Option<NemotronRealtimeResourceUsage> {
+        let mut host = TensorStorageAccounting::default();
+        host.add_bytes(retained_capacity_bytes::<f32>(self.samples.capacity())?)?;
+        host.add_bytes(retained_capacity_bytes::<u8>(
             self.assembled_text.capacity(),
         )?)?;
-        accounting.add_bytes(retained_capacity_bytes::<u8>(
+        host.add_bytes(retained_capacity_bytes::<u8>(
             self.prompt.target_lang.capacity(),
         )?)?;
         if let Some(prompt) = &self.prompt.context_prompt {
-            accounting.add_bytes(retained_capacity_bytes::<u8>(prompt.capacity())?)?;
+            host.add_bytes(retained_capacity_bytes::<u8>(prompt.capacity())?)?;
         }
-        self.feature_state.account_storage(&mut accounting)?;
-        self.pre_encode_state.account_storage(&mut accounting)?;
-        self.encoder_state.account_storage(&mut accounting)?;
+        self.feature_state.account_host_storage(&mut host)?;
+        let mut tensors = TensorStorageAccounting::default();
+        self.pre_encode_state.account_tensor_storage(&mut tensors)?;
+        self.encoder_state.account_tensor_storage(&mut tensors)?;
         if let Some(rnnt_state) = &self.rnnt_state {
-            rnnt_state.account_storage(&mut accounting)?;
+            rnnt_state.account_host_storage(&mut host)?;
+            rnnt_state.account_tensor_storage(&mut tensors)?;
         }
-        Some(accounting.bytes())
+        Some(NemotronRealtimeResourceUsage {
+            host_bytes: host.bytes(),
+            tensor_bytes: tensors.bytes(),
+        })
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
@@ -980,10 +996,15 @@ fn estimate_realtime_resource_reservation(
         8,
     )?;
 
+    let audio_capacity_bytes = checked_element_bytes(audio_capacity, std::mem::size_of::<f32>())?;
     let mut host_bytes = REALTIME_HOST_FIXED_OVERHEAD_BYTES;
+    // One conservative capacity covers retained target-rate stream audio. The
+    // second covers the ordered owned input packet plus transient resampling
+    // output, so moving packet work onto a blocking worker cannot exceed the
+    // immutable job authorization.
     host_bytes = checked_add_bytes(
         host_bytes,
-        checked_element_bytes(audio_capacity, std::mem::size_of::<f32>())?
+        audio_capacity_bytes
             .checked_mul(2)
             .ok_or_else(realtime_reservation_overflow)?,
     )?;
@@ -2448,6 +2469,12 @@ mod tests {
         assert_eq!(reservation.max_text_bytes, 4_160);
         assert_eq!(reservation.host_bytes, 357_946);
         assert_eq!(reservation.tensor_bytes, 6_411_264);
+        let retained_and_worker_audio_bytes =
+            16_000_u64 * 2 * std::mem::size_of::<f32>() as u64 * 2;
+        assert!(
+            reservation.host_bytes
+                >= REALTIME_HOST_FIXED_OVERHEAD_BYTES + retained_and_worker_audio_bytes
+        );
     }
 
     #[test]
@@ -2638,15 +2665,23 @@ mod tests {
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
         let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096, true);
         let empty_bytes = state.session_cache_bytes().unwrap();
+        let empty_usage = state.session_resource_usage().unwrap();
 
         state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
         state.push_samples(&[0.4]).unwrap();
+        let usage = state.session_resource_usage().unwrap();
 
         assert_eq!(state.buffered_samples(), 4);
         assert_eq!(state.samples, vec![0.1, 0.2, 0.3, 0.4]);
         assert_eq!(state.text(), "");
         assert_eq!(state.emitted_tokens(), 0);
         assert!(state.session_cache_bytes().unwrap() >= empty_bytes + 4 * 4);
+        assert!(usage.host_bytes >= empty_usage.host_bytes + 4 * 4);
+        assert_eq!(usage.tensor_bytes, 0);
+        assert_eq!(
+            state.session_cache_bytes(),
+            usage.host_bytes.checked_add(usage.tensor_bytes)
+        );
         assert_eq!(
             state.diagnostics()["supports_realtime_stream_decode"],
             false

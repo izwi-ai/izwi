@@ -1,8 +1,12 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::model::ModelVariant;
+use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen3::tts::TtsDecodeState as QwenTtsDecodeState;
-use crate::models::registry::{NativeAsrDecodeState, NativeChatDecodeState};
+use crate::models::registry::{
+    AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
+};
 
 pub(super) struct ActiveChatDecode {
     pub(super) variant: ModelVariant,
@@ -13,6 +17,8 @@ pub(super) struct ActiveChatDecode {
 
 pub(super) struct ActiveAsrDecode {
     pub(super) variant: ModelVariant,
+    pub(super) model: Arc<NativeAsrModel>,
+    pub(super) _model_lease: AsrModelLease,
     pub(super) state: NativeAsrDecodeState,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
@@ -22,6 +28,8 @@ pub(super) struct ActiveAsrDecode {
 
 pub(super) struct ActiveQwenTtsDecode {
     pub(super) variant: Option<ModelVariant>,
+    pub(super) model: Arc<Qwen3TtsModel>,
+    pub(super) _model_lease: Option<QwenTtsModelLease>,
     pub(super) state: QwenTtsDecodeState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,

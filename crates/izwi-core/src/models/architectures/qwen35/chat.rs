@@ -27,12 +27,33 @@ use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 
-#[derive(Debug)]
-struct PreparedPrompt {
+/// Fully prepared Qwen3.5 prefill input. The runtime carries this exact
+/// artifact into the executor so media loading and vision encoding happen once.
+#[derive(Debug, Clone)]
+pub struct Qwen35PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
     vision_inputs: Option<PreparedVisionInputs>,
+}
+
+impl Qwen35PreparedPrompt {
+    pub fn prompt_ids(&self) -> &[u32] {
+        &self.prompt_ids
+    }
+}
+
+fn resolve_prepared_prompt<F>(
+    prepared: Option<&Qwen35PreparedPrompt>,
+    prepare: F,
+) -> Result<Qwen35PreparedPrompt>
+where
+    F: FnOnce() -> Result<Qwen35PreparedPrompt>,
+{
+    match prepared {
+        Some(prepared) => Ok(prepared.clone()),
+        None => prepare(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -408,7 +429,17 @@ impl Qwen35ChatModel {
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
     ) -> Result<Vec<u32>> {
-        Ok(self.prepare_prompt(messages, config)?.prompt_ids)
+        Ok(self
+            .prepare_prompt_for_execution(messages, config)?
+            .prompt_ids)
+    }
+
+    pub fn prepare_prompt_for_execution(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+    ) -> Result<Qwen35PreparedPrompt> {
+        self.prepare_prompt(messages, config)
     }
 
     /// Model-derived authorization for all retained incremental decode tensors.
@@ -502,7 +533,27 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
     ) -> Result<ChatDecodeState> {
-        let prepared_prompt = self.prepare_prompt(messages, config)?;
+        self.start_decode_state_with_optional_prepared(messages, max_new_tokens, config, None)
+    }
+
+    pub fn start_decode_state_with_optional_prepared(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+    ) -> Result<ChatDecodeState> {
+        let prepared_prompt =
+            resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        self.start_decode_state_with_prepared(&prepared_prompt, max_new_tokens, config)
+    }
+
+    pub fn start_decode_state_with_prepared(
+        &self,
+        prepared_prompt: &Qwen35PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatDecodeState> {
         if prepared_prompt.prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one tokenizable message".to_string(),
@@ -604,7 +655,7 @@ impl Qwen35ChatModel {
 
     fn prefill_prompt(
         &self,
-        prepared_prompt: &PreparedPrompt,
+        prepared_prompt: &Qwen35PreparedPrompt,
         text_state: &mut Qwen35TextRuntimeState,
     ) -> Result<Tensor> {
         let mut logits: Option<Tensor> = None;
@@ -695,7 +746,7 @@ impl Qwen35ChatModel {
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-    ) -> Result<PreparedPrompt> {
+    ) -> Result<Qwen35PreparedPrompt> {
         let prompt = render_prompt(messages, config, self.default_enable_thinking())?;
         let image_placeholders = prompt.matches(IMAGE_PAD_PLACEHOLDER).count();
         let video_placeholders = prompt.matches(VIDEO_PAD_PLACEHOLDER).count();
@@ -716,7 +767,7 @@ impl Qwen35ChatModel {
             }
             let prompt_ids = self.tokenizer.encode_text(&prompt)?;
             let prompt_positions = build_text_positions(prompt_ids.len());
-            return Ok(PreparedPrompt {
+            return Ok(Qwen35PreparedPrompt {
                 next_text_position: prompt_positions.len(),
                 prompt_ids,
                 prompt_positions,
@@ -746,7 +797,7 @@ impl Qwen35ChatModel {
             self.tokenizer.specials.video_pad,
             self.vision_model.spatial_merge_size(),
         )?;
-        Ok(PreparedPrompt {
+        Ok(Qwen35PreparedPrompt {
             prompt_ids,
             prompt_positions,
             next_text_position,
@@ -1595,12 +1646,34 @@ mod tests {
     use crate::backends::{DeviceKind, DeviceProfile, DeviceSelector};
     use crate::models::shared::chat::{ChatMediaInput, ChatMediaKind, ChatRequestConfig};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn local_model_dir(name: &str) -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home)
             .join("Library/Application Support/izwi/models")
             .join(name)
+    }
+
+    #[test]
+    fn prepared_prompt_reuse_skips_fetch_and_vision_encode_builder() {
+        let prepared = Qwen35PreparedPrompt {
+            prompt_ids: vec![1, 2, 3],
+            prompt_positions: build_text_positions(3),
+            next_text_position: 3,
+            vision_inputs: None,
+        };
+        let preparation_calls = AtomicUsize::new(0);
+        let resolved = resolve_prepared_prompt(Some(&prepared), || {
+            preparation_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(Error::InferenceError(
+                "fetch/vision encode should not run".to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
+        assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]

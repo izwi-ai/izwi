@@ -363,9 +363,33 @@ impl ResourceAuthority {
         owner: ReservationOwner,
         resources: ResourceVector,
     ) -> Result<ResourceLease> {
+        self.reserve_with_initial_materialized(owner, resources, ResourceVector::zero())
+    }
+
+    /// Atomically establish immutable authorization for a resource claim whose
+    /// initial physical allocation is already reflected by the provider.
+    /// Live headroom is charged only for future, unmaterialized growth.
+    pub fn reserve_with_initial_materialized(
+        self: &Arc<Self>,
+        owner: ReservationOwner,
+        resources: ResourceVector,
+        materialized: ResourceVector,
+    ) -> Result<ResourceLease> {
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(format!(
                 "resource reservation for {} contains an unresolved quantity",
+                owner.key
+            )));
+        }
+        if !materialized.is_fully_known() {
+            return Err(Error::InvalidInput(format!(
+                "initial materialized usage for {} contains an unresolved quantity",
+                owner.key
+            )));
+        }
+        if !materialized.fits_within(resources) {
+            return Err(Error::InvalidInput(format!(
+                "initial materialized usage for {} exceeds its authorization",
                 owner.key
             )));
         }
@@ -378,7 +402,8 @@ impl ResourceAuthority {
         // that have not allocated yet. Charge every pending claim against live
         // headroom so concurrent reservations cannot spend it more than once.
         let physical = self.provider.snapshot();
-        let live_claim = state.pending_resources()?.checked_add(resources)?;
+        let pending = resources.positive_growth_over(materialized)?;
+        let live_claim = state.pending_resources()?.checked_add(pending)?;
         if !live_claim.fits_within(physical.available) {
             return Err(Error::Overloaded(format!(
                 "insufficient live physical capacity for {}",
@@ -387,9 +412,7 @@ impl ResourceAuthority {
         }
         let reservation = state.ledger.reserve(resources)?;
         state.owners.insert(reservation.id, owner);
-        state
-            .materialized
-            .insert(reservation.id, ResourceVector::zero());
+        state.materialized.insert(reservation.id, materialized);
         Ok(ResourceLease {
             authority: self.clone(),
             id: Some(reservation.id),
@@ -463,11 +486,63 @@ impl ResourceAuthority {
         let reserved = state.ledger.reservation(id).ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
+        let current = state
+            .materialized
+            .get(&id)
+            .copied()
+            .unwrap_or_else(ResourceVector::zero);
         if !resources.fits_within(reserved) {
             return Err(Error::InferenceError(
                 "materialized resource usage exceeds its authorized reservation".to_string(),
             ));
         }
+        if !current.fits_within(resources) {
+            return Err(Error::InvalidInput(
+                "materialized resource usage cannot decrease through post-allocation observation; the owning runtime must restore its pending claim before freeing physical memory"
+                    .to_string(),
+            ));
+        }
+        state.materialized.insert(id, resources);
+        Ok(())
+    }
+
+    fn prepare_materialized_release(
+        &self,
+        id: ReservationId,
+        resources: ResourceVector,
+    ) -> Result<()> {
+        if !resources.is_fully_known() {
+            return Err(Error::InvalidInput(
+                "materialized resource release contains an unresolved quantity".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        let reserved = state.ledger.reservation(id).ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        let current = state
+            .materialized
+            .get(&id)
+            .copied()
+            .unwrap_or_else(ResourceVector::zero);
+        if !resources.fits_within(reserved) {
+            return Err(Error::InferenceError(
+                "materialized resource usage exceeds its authorized reservation".to_string(),
+            ));
+        }
+        if !resources.fits_within(current) {
+            return Err(Error::InvalidInput(
+                "ordered materialized release cannot increase physical usage".to_string(),
+            ));
+        }
+
+        // Convert the allocation back into a pending claim before making the
+        // physical bytes visible as live headroom. A racing admission after
+        // this transition sees the restored claim; an admission before it
+        // still sees the allocation excluded from physical headroom.
         state.materialized.insert(id, resources);
         Ok(())
     }
@@ -500,7 +575,7 @@ impl ResourceLease {
     /// Record a physical allocation that was just observed without changing
     /// the authorization established before allocation. Observed usage must
     /// fit within that authorization; callers must use `resize` before any
-    /// physical growth.
+    /// physical growth. Observations are monotonic for the lease lifetime.
     pub fn reconcile_materialized(&self, resources: ResourceVector) -> Result<()> {
         let id = self.id.ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
@@ -510,11 +585,24 @@ impl ResourceLease {
 
     /// Record the portion of this reservation that is physically allocated
     /// without relinquishing any of the capacity authorized for future growth.
+    /// This public post-allocation observation is monotonic. The internal
+    /// resource owner restores pending claims before releasing allocations.
     pub fn record_materialized_usage(&self, resources: ResourceVector) -> Result<()> {
         let id = self.id.ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
         self.authority.record_materialized_usage(id, resources)
+    }
+
+    /// Move physical usage back into the lease's pending claim. Callers must
+    /// complete this transition before dropping or replacing the corresponding
+    /// allocation. It can temporarily overcharge physical capacity, but it
+    /// cannot expose released headroom without its retained future claim.
+    pub(crate) fn prepare_materialized_release(&self, resources: ResourceVector) -> Result<()> {
+        let id = self.id.ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        self.authority.prepare_materialized_release(id, resources)
     }
 }
 
@@ -906,5 +994,72 @@ mod tests {
             Err(Error::InferenceError(_))
         ));
         assert_eq!(authority.snapshot().reserved, slots(8));
+    }
+
+    #[test]
+    fn post_allocation_observation_rejects_materialized_decrease() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 200,
+            available: AtomicU64::new(100),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Pipeline, "retained-growth"),
+                slots(100),
+            )
+            .unwrap();
+
+        provider.set_available(0);
+        lease.record_materialized_usage(slots(100)).unwrap();
+        provider.set_available(50);
+
+        assert!(matches!(
+            lease.record_materialized_usage(slots(50)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(authority.snapshot().reserved, slots(100));
+    }
+
+    #[test]
+    fn ordered_materialized_release_cannot_double_spend_external_headroom() {
+        use std::sync::Barrier;
+
+        let provider = Arc::new(LiveProvider {
+            capacity: 200,
+            // The other hundred units are owned outside this authority.
+            available: AtomicU64::new(100),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let retained = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Pipeline, "retained-growth"),
+                slots(100),
+            )
+            .unwrap();
+        provider.set_available(0);
+        retained.record_materialized_usage(slots(100)).unwrap();
+
+        let release_started = Arc::new(Barrier::new(2));
+        let racing_authority = authority.clone();
+        let racing_barrier = release_started.clone();
+        let racing_admission = std::thread::spawn(move || {
+            racing_barrier.wait();
+            racing_authority.reserve(
+                ReservationOwner::new(ReservationClass::Request, "racing-admission"),
+                slots(50),
+            )
+        });
+
+        retained.prepare_materialized_release(slots(50)).unwrap();
+        provider.set_available(50);
+        release_started.wait();
+
+        assert!(matches!(
+            racing_admission.join().unwrap(),
+            Err(Error::Overloaded(_))
+        ));
+        assert_eq!(authority.snapshot().reserved, slots(100));
+        assert_eq!(authority.snapshot().reservations, 1);
     }
 }

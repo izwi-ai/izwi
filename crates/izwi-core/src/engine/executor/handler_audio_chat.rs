@@ -33,7 +33,7 @@ impl NativeExecutor {
     }
 
     fn audio_chat_messages(request: &EngineCoreRequest) -> &[ChatMessage] {
-        request.chat_messages.as_deref().unwrap_or(&[])
+        request.speech_messages_for_execution()
     }
 
     pub(super) fn audio_chat_request(
@@ -54,11 +54,12 @@ impl NativeExecutor {
             .as_deref()
             .or(request.params.voice.as_deref());
         let system_prompt = lfm25_audio_interleaved_system_prompt(
-            request.system_prompt.as_deref(),
+            request.speech_system_prompt_for_execution(),
             requested_speaker,
         );
 
-        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
+        let (samples, sample_rate) =
+            Self::run_blocking(|| decode_request_audio_with_rate(request))?;
         let model = self.with_registry(|registry| {
             registry.try_get_audio_chat(variant).ok_or_else(|| {
                 Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))

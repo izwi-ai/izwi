@@ -1,11 +1,16 @@
 //! Chat runtime methods routed through the unified core engine.
 
+use crate::catalog::ModelFamily;
 use crate::engine::{GenerationParams, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::qwen35::media_resource_estimate;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
 use crate::runtime::request::ChatRuntimeRequest;
-use crate::runtime::service::{AdmittedEngineRequest, RuntimeService};
+use crate::runtime::service::{
+    media_preparation_resources, retained_chat_preparation_input_bytes, AdmittedEngineRequest,
+    RuntimeService,
+};
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 
 impl RuntimeService {
@@ -40,33 +45,58 @@ impl RuntimeService {
                 "Chat request missing messages".to_string(),
             ));
         }
-        let input_bytes = messages.iter().map(|message| message.content.len()).sum();
-        self.prepare_engine_request(
+        if !chat_config.media_inputs.is_empty() && variant.family() != ModelFamily::Qwen35Chat {
+            return Err(Error::InvalidInput(format!(
+                "Chat model {variant} does not support Qwen3.5 media inputs"
+            )));
+        }
+        let correlation_id = correlation_id.map(ToOwned::to_owned);
+        let input_bytes = retained_chat_preparation_input_bytes(
+            &messages,
+            messages.capacity(),
+            &chat_config,
+            &params,
+            correlation_id.as_ref(),
+        )?;
+        let media_estimate = media_resource_estimate(&chat_config.media_inputs)?;
+        let media_resources = media_preparation_resources(
+            self.backend_router.context().backend_kind,
+            media_estimate,
+        )?;
+        self.prepare_engine_request_blocking(
             variant,
             TaskType::Chat,
             streaming,
             runtime_context,
             input_bytes,
-            move || async move {
+            media_resources,
+            move |registry| {
                 let prompt_config = Self::prompt_token_config(&params, &chat_config);
-                let prompt_tokens = self
-                    .model_registry
-                    .get_chat(variant)
-                    .await
-                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?
-                    .prompt_token_ids_with_config(&messages, &prompt_config)?;
+                let model = registry
+                    .blocking_get_chat(variant)
+                    .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+                let (prompt_tokens, prepared_qwen35_prompt) =
+                    model.prepare_prompt_for_execution(&messages, &prompt_config)?;
 
                 params.max_tokens = params.max_tokens.max(1);
-                Ok(ChatRuntimeRequest::from_messages(
+                let mut request = ChatRuntimeRequest::from_messages(
                     variant,
                     messages,
                     params,
                     chat_config,
                     prompt_tokens,
-                    correlation_id.map(ToOwned::to_owned),
+                    correlation_id,
                     runtime_context,
                 )?
-                .into_engine_request())
+                .into_engine_request();
+                let exact_prompt_tokens = std::mem::take(&mut request.prompt_tokens);
+                request.install_chat_execution_preparation_with_model(
+                    variant,
+                    exact_prompt_tokens,
+                    prepared_qwen35_prompt,
+                    model,
+                )?;
+                Ok(request)
             },
         )
         .await

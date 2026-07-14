@@ -56,28 +56,11 @@ impl StreamDeltaBatch {
 
 impl NativeExecutor {
     pub(super) fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
-        ChatGenerationConfig {
-            temperature: request.params.temperature.max(0.0),
-            top_p: request.params.top_p.clamp(0.0, 1.0),
-            top_k: request.params.top_k,
-            repetition_penalty: request.params.repetition_penalty.max(1.0),
-            presence_penalty: request.params.presence_penalty.clamp(-2.0, 2.0),
-            stop_token_ids: request.params.stop_token_ids.clone(),
-            seed: Self::chat_request_seed(&request.id),
-            request: request.chat_config.clone(),
-        }
+        request.chat_generation_config()
     }
 
     pub(super) fn chat_request_seed(request_id: &str) -> u64 {
-        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-
-        let mut hash = FNV_OFFSET_BASIS;
-        for byte in request_id.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-        hash
+        EngineCoreRequest::chat_request_seed(request_id)
     }
 
     fn chat_messages(request: &EngineCoreRequest) -> Result<&[ChatMessage]> {
@@ -92,6 +75,7 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
+        let prepared_qwen35_prompt = request.prepared_qwen35_prompt_for_executor()?;
         let variant = Self::resolve_variant(request)?;
         let messages = Self::chat_messages(request)?;
         let max_new_tokens = request.params.max_tokens.max(1);
@@ -99,12 +83,7 @@ impl NativeExecutor {
         let stream_policy = request.stream_policy;
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
-
-        let model = self.with_registry(|registry| {
-            registry
-                .try_get_chat(variant)
-                .ok_or_else(|| Error::ModelNotFound(format!("Chat model {variant} is not loaded")))
-        })?;
+        let model = request.prepared_chat_model_for_executor()?;
 
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
@@ -232,7 +211,12 @@ impl NativeExecutor {
                 )));
             }
             let decode_state = Self::run_blocking(|| {
-                model.start_decode_state_with_config(messages, max_new_tokens, &generation_config)
+                model.start_decode_state_with_prepared(
+                    messages,
+                    max_new_tokens,
+                    &generation_config,
+                    prepared_qwen35_prompt,
+                )
             })?;
             ActiveChatDecode {
                 variant,
@@ -329,8 +313,52 @@ impl NativeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::GenerationParams;
+    use crate::engine::{GenerationParams, InputRange, SequencePhase, WorkUnit};
+    use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+
+    #[test]
+    fn chat_handler_rejects_unprepared_public_prompt_tokens() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hello".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.prompt_tokens = vec![1, 2, 3];
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: 3,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 3 },
+                max_output_steps: 1,
+            },
+        };
+
+        let error = executor
+            .chat_request(&request, &scheduled)
+            .expect_err("chat execution must require the private preparation marker");
+        assert!(error
+            .to_string()
+            .contains("missing exact model prompt preparation"));
+
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None)
+            .unwrap();
+        request.prompt_tokens[0] = 99;
+        let error = executor
+            .chat_request(&request, &scheduled)
+            .expect_err("mutated preparation must fail before model lookup");
+        assert!(error
+            .to_string()
+            .contains("changed after exact prompt preparation"));
+    }
 
     #[test]
     fn chat_generation_config_preserves_request_sampling_controls() {
