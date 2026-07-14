@@ -60,26 +60,66 @@ struct ModelResourcePlan {
     resident_authorization: ResourceVector,
 }
 
-fn model_resource_plan(backend: BackendKind, bytes: u64) -> ModelResourcePlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelMemoryEstimate {
+    /// Maximum model-owned memory while tensors are being instantiated.
+    load_peak_bytes: u64,
+    /// Long-lived model-owned memory after publication.
+    resident_bytes: u64,
+}
+
+fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
+    match variant {
+        // The 5 GiB catalog value describes total inference memory, including
+        // request-scoped activations and audio workspace that the coordinator
+        // reserves separately. The GGUF loader retains about 2.25 GiB of
+        // quantized/dequantized tensors; 3 GiB covers model-owned load overlap,
+        // tokenizer metadata, allocator alignment, and steady residency.
+        ModelVariant::Lfm25Audio15BGguf => ModelMemoryEstimate {
+            load_peak_bytes: 3 * GIB,
+            resident_bytes: 3 * GIB,
+        },
+        _ => ModelMemoryEstimate {
+            load_peak_bytes: inference_bytes,
+            resident_bytes: inference_bytes,
+        },
+    }
+}
+
+fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> ModelResourcePlan {
     let mut resident_authorization = ResourceVector::zero();
     match backend {
         BackendKind::Cpu => {
-            resident_authorization.host_bytes = ResourceAmount::Known(bytes);
+            resident_authorization.host_bytes = ResourceAmount::Known(estimate.resident_bytes);
         }
         BackendKind::Metal => {
-            resident_authorization.unified_bytes = ResourceAmount::Known(bytes);
+            resident_authorization.unified_bytes = ResourceAmount::Known(estimate.resident_bytes);
         }
         BackendKind::Cuda => {
-            resident_authorization.device_bytes = ResourceAmount::Known(bytes);
+            resident_authorization.device_bytes = ResourceAmount::Known(estimate.resident_bytes);
         }
     }
 
-    let mut load_authorization = resident_authorization;
+    let mut load_authorization = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            load_authorization.host_bytes = ResourceAmount::Known(estimate.load_peak_bytes);
+        }
+        BackendKind::Metal => {
+            load_authorization.unified_bytes = ResourceAmount::Known(estimate.load_peak_bytes);
+        }
+        BackendKind::Cuda => {
+            load_authorization.device_bytes = ResourceAmount::Known(estimate.load_peak_bytes);
+        }
+    }
     if backend == BackendKind::Cuda {
         // CUDA loaders materialize host-side artifact/tensor state before or
         // while copying the resident weights to the device. Authorize both
         // peaks up front; the host component is shed after publication.
-        load_authorization.host_bytes = ResourceAmount::Known(bytes);
+        load_authorization.host_bytes = ResourceAmount::Known(estimate.load_peak_bytes);
     }
 
     ModelResourcePlan {
@@ -165,8 +205,10 @@ impl ModelLifecycleController {
     }
 
     fn model_resource_plan(&self, variant: ModelVariant) -> ModelResourcePlan {
-        let bytes = (variant.memory_required_gb() as f64 * 1024_f64.powi(3)).ceil() as u64;
-        model_resource_plan(self.backend_router.context().backend_kind, bytes)
+        model_resource_plan(
+            self.backend_router.context().backend_kind,
+            model_memory_estimate(variant),
+        )
     }
 
     async fn reserve_model_resources(
@@ -380,7 +422,8 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        model_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
+        model_memory_estimate, model_resource_plan, residency_budget_has_capacity,
+        select_lru_eviction_candidate, ModelMemoryEstimate,
     };
     use crate::backends::{BackendKind, BackendPreference};
     use crate::config::EngineConfig;
@@ -514,49 +557,115 @@ mod tests {
 
     #[test]
     fn model_load_resource_plan_authorizes_backend_specific_peaks() {
-        let bytes = 64;
+        let estimate = ModelMemoryEstimate {
+            load_peak_bytes: 96,
+            resident_bytes: 64,
+        };
 
-        let cpu = model_resource_plan(BackendKind::Cpu, bytes);
+        let cpu = model_resource_plan(BackendKind::Cpu, estimate);
         assert_eq!(
             cpu.load_authorization,
             ResourceVector {
-                host_bytes: ResourceAmount::Known(bytes),
+                host_bytes: ResourceAmount::Known(96),
                 ..ResourceVector::zero()
             }
         );
-        assert_eq!(cpu.resident_authorization, cpu.load_authorization);
+        assert_eq!(
+            cpu.resident_authorization,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(64),
+                ..ResourceVector::zero()
+            }
+        );
 
-        let metal = model_resource_plan(BackendKind::Metal, bytes);
+        let metal = model_resource_plan(BackendKind::Metal, estimate);
         assert_eq!(
             metal.load_authorization,
             ResourceVector {
-                unified_bytes: ResourceAmount::Known(bytes),
+                unified_bytes: ResourceAmount::Known(96),
                 ..ResourceVector::zero()
             }
         );
-        assert_eq!(metal.resident_authorization, metal.load_authorization);
+        assert_eq!(
+            metal.resident_authorization,
+            ResourceVector {
+                unified_bytes: ResourceAmount::Known(64),
+                ..ResourceVector::zero()
+            }
+        );
 
-        let cuda = model_resource_plan(BackendKind::Cuda, bytes);
+        let cuda = model_resource_plan(BackendKind::Cuda, estimate);
         assert_eq!(
             cuda.load_authorization,
             ResourceVector {
-                host_bytes: ResourceAmount::Known(bytes),
-                device_bytes: ResourceAmount::Known(bytes),
+                host_bytes: ResourceAmount::Known(96),
+                device_bytes: ResourceAmount::Known(96),
                 ..ResourceVector::zero()
             }
         );
         assert_eq!(
             cuda.resident_authorization,
             ResourceVector {
-                device_bytes: ResourceAmount::Known(bytes),
+                device_bytes: ResourceAmount::Known(64),
                 ..ResourceVector::zero()
             }
         );
     }
 
     #[test]
+    fn lfm25_audio_model_memory_excludes_request_scoped_inference_workspace() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(ModelVariant::Lfm25Audio15BGguf.memory_required_gb(), 5.0);
+        assert_eq!(
+            model_memory_estimate(ModelVariant::Lfm25Audio15BGguf),
+            ModelMemoryEstimate {
+                load_peak_bytes: 3 * GIB,
+                resident_bytes: 3 * GIB,
+            }
+        );
+    }
+
+    #[test]
+    fn lfm25_audio_cold_load_fits_with_separately_reserved_request_workspace() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        let authority = vector_authority(ResourceVector {
+            unified_bytes: ResourceAmount::Known(4 * GIB),
+            ..ResourceVector::zero()
+        });
+        let _request = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "lfm-request"),
+                ResourceVector {
+                    unified_bytes: ResourceAmount::Known(512 * MIB),
+                    ..ResourceVector::zero()
+                },
+            )
+            .expect("request workspace should fit");
+        let plan = model_resource_plan(
+            BackendKind::Metal,
+            model_memory_estimate(ModelVariant::Lfm25Audio15BGguf),
+        );
+
+        let _model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "lfm-model"),
+                plan.load_authorization,
+            )
+            .expect("model-owned memory should not include request workspace twice");
+    }
+
+    #[test]
     fn cuda_load_is_rejected_when_only_device_peak_has_capacity() {
-        let plan = model_resource_plan(BackendKind::Cuda, 64);
+        let plan = model_resource_plan(
+            BackendKind::Cuda,
+            ModelMemoryEstimate {
+                load_peak_bytes: 64,
+                resident_bytes: 64,
+            },
+        );
         let capacity = ResourceVector {
             host_bytes: ResourceAmount::Known(63),
             device_bytes: ResourceAmount::Known(64),
@@ -591,7 +700,13 @@ mod tests {
         let variant = ModelVariant::Kokoro82M;
 
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let plan = model_resource_plan(backend, 64);
+            let plan = model_resource_plan(
+                backend,
+                ModelMemoryEstimate {
+                    load_peak_bytes: 64,
+                    resident_bytes: 64,
+                },
+            );
             let authority = vector_authority(all_memory_capacity(1024));
             let resource_lease = authority
                 .reserve(
