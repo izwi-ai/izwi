@@ -800,6 +800,20 @@ async fn resolve_batch_asr_audio(
         .ok_or_else(|| anyhow::anyhow!("Legacy ASR route audio payload was not found"))
 }
 
+async fn send_transcription_terminal_events(
+    event_tx: mpsc::Sender<String>,
+    terminal_payload: String,
+) {
+    // Deltas and progress are intentionally lossy under backpressure, but the
+    // terminal result and trailing `done` marker define the stream contract.
+    // Await capacity so a slow connected client cannot receive a silent EOF.
+    if event_tx.send(terminal_payload).await.is_ok() {
+        let _ = event_tx
+            .send(serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default())
+            .await;
+    }
+}
+
 fn spawn_transcription_processing_task(
     state: AppState,
     record_id: String,
@@ -835,10 +849,7 @@ fn spawn_transcription_processing_task(
                 })
                 .unwrap_or_default(),
             };
-            let _ = tx.try_send(payload);
-            let _ = tx.try_send(
-                serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
-            );
+            send_transcription_terminal_events(tx, payload).await;
         }
     });
 }
@@ -1970,10 +1981,10 @@ mod tests {
     use super::{
         alignments_to_word_records, asr_queue_class, build_segment_records, initial_summary_state,
         multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
-        sanitize_summary_output, should_retry_transcription_summary_generation,
-        transcription_summary_messages, transcription_summary_params,
-        validate_batch_transcription_model, QueueClass, TranscriptionSummaryStatus,
-        TranscriptionWordRecord,
+        sanitize_summary_output, send_transcription_terminal_events,
+        should_retry_transcription_summary_generation, transcription_summary_messages,
+        transcription_summary_params, validate_batch_transcription_model, QueueClass,
+        TranscriptionSummaryStatus, TranscriptionWordRecord,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -2175,6 +2186,44 @@ mod tests {
         assert_eq!(value["progress"]["current_chunk"], 1);
         assert_eq!(value["progress"]["total_chunks"], 2);
         assert_eq!(value["progress"]["percent"], 50.0);
+    }
+
+    #[tokio::test]
+    async fn terminal_events_wait_for_capacity_and_preserve_order() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .try_send(serde_json::json!({ "event": "delta", "delta": "first" }).to_string())
+            .expect("initial delta should fill the bounded queue");
+
+        let sender = tokio::spawn(send_transcription_terminal_events(
+            event_tx,
+            serde_json::json!({ "event": "final", "record": { "id": "record-1" } }).to_string(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "terminal sender must wait rather than drop a full-queue event"
+        );
+
+        let delta: serde_json::Value = serde_json::from_str(
+            &event_rx
+                .recv()
+                .await
+                .expect("queued delta should arrive first"),
+        )
+        .expect("delta JSON");
+        let terminal: serde_json::Value =
+            serde_json::from_str(&event_rx.recv().await.expect("final event must be retained"))
+                .expect("terminal JSON");
+        let done: serde_json::Value =
+            serde_json::from_str(&event_rx.recv().await.expect("done event must follow final"))
+                .expect("done JSON");
+
+        assert_eq!(delta["event"], "delta");
+        assert_eq!(terminal["event"], "final");
+        assert_eq!(done["event"], "done");
+        sender.await.expect("terminal sender should finish");
+        assert!(event_rx.recv().await.is_none());
     }
 
     #[test]

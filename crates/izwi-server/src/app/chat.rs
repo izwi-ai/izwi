@@ -1,8 +1,9 @@
-#[cfg(test)]
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
 
 use crate::error::ApiError;
@@ -62,6 +63,84 @@ pub enum ChatStreamEvent {
 }
 
 const CHAT_STREAM_CAPACITY: usize = 64;
+const CHAT_STREAM_BACKPRESSURE_ERROR: &str =
+    "Chat stream consumer is too slow; generation was cancelled";
+
+#[derive(Debug, Default)]
+struct ChatStreamBackpressure {
+    full: AtomicBool,
+    notify: Notify,
+}
+
+impl ChatStreamBackpressure {
+    fn trip(&self) {
+        self.full.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    fn is_tripped(&self) -> bool {
+        self.full.load(Ordering::Acquire)
+    }
+
+    async fn notified(&self) {
+        if self.is_tripped() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+fn try_send_chat_delta(
+    event_tx: &mpsc::Sender<ChatStreamEvent>,
+    backpressure: &ChatStreamBackpressure,
+    delta: String,
+) {
+    match event_tx.try_send(ChatStreamEvent::Delta(delta)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => backpressure.trip(),
+        // The receiver has gone away, so there is nobody to notify with a
+        // terminal event. `event_tx.closed()` cancels the generation task.
+        Err(TrySendError::Closed(_)) => {}
+    }
+}
+
+async fn forward_chat_generation<F>(
+    event_tx: mpsc::Sender<ChatStreamEvent>,
+    backpressure: Arc<ChatStreamBackpressure>,
+    generation: F,
+) where
+    F: Future<Output = izwi_core::Result<ChatGeneration>>,
+{
+    tokio::pin!(generation);
+    let result = tokio::select! {
+        result = &mut generation => Some(result),
+        _ = event_tx.closed() => return,
+        _ = backpressure.notified() => None,
+    };
+
+    // A generation can produce the overflowing delta and complete in the same
+    // poll. Check the latch even when the generation branch wins the select so
+    // a dropped delta can never be reported as a successful completion.
+    if result.is_none() || backpressure.is_tripped() {
+        let _ = event_tx
+            .send(ChatStreamEvent::Failed(
+                CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    match result.expect("completed generation result must be present") {
+        Ok(generation) => {
+            let _ = event_tx.send(ChatStreamEvent::Completed(generation)).await;
+        }
+        Err(err) => {
+            let _ = event_tx
+                .send(ChatStreamEvent::Failed(err.to_string()))
+                .await;
+        }
+    }
+}
 
 pub fn max_new_tokens(
     _variant: ModelVariant,
@@ -116,7 +195,7 @@ pub fn spawn_chat_stream(
     let correlation_id = request.correlation_id;
 
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
-    let cancelled = Arc::new(Notify::new());
+    let backpressure = Arc::new(ChatStreamBackpressure::default());
     tokio::spawn(async move {
         let permit = match state
             .acquire_owned_workload_permit(WorkloadClass::Streaming)
@@ -142,31 +221,13 @@ pub fn spawn_chat_stream(
             permit.runtime_context(),
             {
                 let event_tx = event_tx.clone();
-                let cancelled = cancelled.clone();
+                let backpressure = backpressure.clone();
                 move |delta| {
-                    if event_tx.try_send(ChatStreamEvent::Delta(delta)).is_err() {
-                        cancelled.notify_one();
-                    }
+                    try_send_chat_delta(&event_tx, &backpressure, delta);
                 }
             },
         );
-        tokio::pin!(generation);
-        let result: izwi_core::Result<ChatGeneration> = tokio::select! {
-            result = &mut generation => result,
-            _ = event_tx.closed() => return,
-            _ = cancelled.notified() => return,
-        };
-
-        match result {
-            Ok(generation) => {
-                let _ = event_tx.send(ChatStreamEvent::Completed(generation)).await;
-            }
-            Err(err) => {
-                let _ = event_tx
-                    .send(ChatStreamEvent::Failed(err.to_string()))
-                    .await;
-            }
-        }
+        forward_chat_generation(event_tx, backpressure, generation).await;
     });
 
     event_rx
@@ -175,33 +236,31 @@ pub fn spawn_chat_stream(
 #[cfg(test)]
 fn spawn_chat_stream_with_task<G, Fut>(
     semaphore: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
     generation_task: G,
-) -> mpsc::UnboundedReceiver<ChatStreamEvent>
+) -> mpsc::Receiver<ChatStreamEvent>
 where
-    G: FnOnce(mpsc::UnboundedSender<ChatStreamEvent>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<ChatGeneration, String>> + Send + 'static,
+    G: FnOnce(mpsc::Sender<ChatStreamEvent>, Arc<ChatStreamBackpressure>) -> Fut + Send + 'static,
+    Fut: Future<Output = izwi_core::Result<ChatGeneration>> + Send + 'static,
 {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(capacity);
+    let backpressure = Arc::new(ChatStreamBackpressure::default());
 
     tokio::spawn(async move {
         let _permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(ChatStreamEvent::ShuttingDown);
+                let _ = event_tx.send(ChatStreamEvent::ShuttingDown).await;
                 return;
             }
         };
 
-        let _ = event_tx.send(ChatStreamEvent::Started);
-
-        match generation_task(event_tx.clone()).await {
-            Ok(generation) => {
-                let _ = event_tx.send(ChatStreamEvent::Completed(generation));
-            }
-            Err(err) => {
-                let _ = event_tx.send(ChatStreamEvent::Failed(err));
-            }
+        if event_tx.send(ChatStreamEvent::Started).await.is_err() {
+            return;
         }
+
+        let generation = generation_task(event_tx.clone(), backpressure.clone());
+        forward_chat_generation(event_tx, backpressure, generation).await;
     });
 
     event_rx
@@ -258,17 +317,18 @@ mod tests {
     #[tokio::test]
     async fn streaming_chat_allows_long_running_generations_to_complete() {
         let semaphore = Arc::new(Semaphore::new(1));
-        let mut event_rx = spawn_chat_stream_with_task(semaphore, |event_tx| async move {
-            let _ = event_tx.send(ChatStreamEvent::Delta("Hello".to_string()));
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let _ = event_tx.send(ChatStreamEvent::Delta(" world".to_string()));
-            Ok(ChatGeneration {
-                text: "Hello world".to_string(),
-                prompt_tokens: 12,
-                tokens_generated: 2,
-                generation_time_ms: 25.0,
-            })
-        });
+        let mut event_rx =
+            spawn_chat_stream_with_task(semaphore, 4, |event_tx, backpressure| async move {
+                try_send_chat_delta(&event_tx, &backpressure, "Hello".to_string());
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                try_send_chat_delta(&event_tx, &backpressure, " world".to_string());
+                Ok(ChatGeneration {
+                    text: "Hello world".to_string(),
+                    prompt_tokens: 12,
+                    tokens_generated: 2,
+                    generation_time_ms: 25.0,
+                })
+            });
 
         match event_rx.recv().await {
             Some(ChatStreamEvent::Started) => {}
@@ -292,5 +352,37 @@ mod tests {
             }
             other => panic!("expected completed event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_chat_stream_emits_explicit_terminal_failure() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut event_rx =
+            spawn_chat_stream_with_task(semaphore, 2, |event_tx, backpressure| async move {
+                try_send_chat_delta(&event_tx, &backpressure, "first".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, "overflow".to_string());
+                // Completion in the same poll as the overflow must not win the
+                // race and turn a truncated stream into apparent success.
+                Ok(ChatGeneration {
+                    text: "firstoverflow".to_string(),
+                    prompt_tokens: 1,
+                    tokens_generated: 2,
+                    generation_time_ms: 1.0,
+                })
+            });
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ChatStreamEvent::Started)
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ChatStreamEvent::Delta(delta)) if delta == "first"
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ChatStreamEvent::Failed(error)) if error == CHAT_STREAM_BACKPRESSURE_ERROR
+        ));
+        assert!(event_rx.recv().await.is_none());
     }
 }
