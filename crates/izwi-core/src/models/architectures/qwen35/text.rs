@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding};
@@ -154,7 +152,6 @@ struct Qwen35FullAttention {
     dense_decode_max_tokens: usize,
     rope_kernel_enabled: bool,
     rope_inv_freqs: Vec<f32>,
-    rope_cache: Mutex<HashMap<[usize; 3], (Tensor, Tensor)>>,
 }
 
 struct Qwen35LinearAttention {
@@ -610,7 +607,6 @@ impl Qwen35FullAttention {
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
             )?,
-            rope_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -959,8 +955,7 @@ impl Qwen35FullAttention {
         if self.rope_dim == 0 {
             return Ok((query_states.clone(), key_states.clone()));
         }
-        let (cos, sin) =
-            self.cached_mrope(position_ids, query_states.device(), query_states.dtype())?;
+        let (cos, sin) = self.mrope(position_ids, query_states.device(), query_states.dtype())?;
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
@@ -1020,7 +1015,7 @@ impl Qwen35FullAttention {
         let mut sin_tokens = Vec::with_capacity(seq_len);
         for &position_id in position_ids {
             let (cos, sin) =
-                self.cached_mrope(position_id, query_states.device(), query_states.dtype())?;
+                self.mrope(position_id, query_states.device(), query_states.dtype())?;
             cos_tokens.push(cos);
             sin_tokens.push(sin);
         }
@@ -1071,30 +1066,20 @@ impl Qwen35FullAttention {
         ))
     }
 
-    fn cached_mrope(
+    fn mrope(
         &self,
         position_ids: [usize; 3],
         device: &Device,
         dtype: DType,
     ) -> Result<(Tensor, Tensor)> {
-        if let Ok(cache) = self.rope_cache.lock() {
-            if let Some((cos, sin)) = cache.get(&position_ids) {
-                return Ok((cos.clone(), sin.clone()));
-            }
-        }
-
-        let (cos, sin) = build_mrope(
+        build_mrope(
             self.rope_dim,
             position_ids,
             &self.mrope_sections,
             &self.rope_inv_freqs,
             device,
             dtype,
-        )?;
-        if let Ok(mut cache) = self.rope_cache.lock() {
-            cache.insert(position_ids, (cos.clone(), sin.clone()));
-        }
-        Ok((cos, sin))
+        )
     }
 
     fn should_try_rope_kernel(&self, dtype: DType) -> bool {

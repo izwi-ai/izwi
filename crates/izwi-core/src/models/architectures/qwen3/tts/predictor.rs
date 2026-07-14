@@ -10,7 +10,7 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
 use crate::models::architectures::qwen3::tts::rope::{
-    build_rope_inv_freq, build_rope_window_full, qwen_rotate_half, RopeCache,
+    build_rope_inv_freq, build_rope_window_full, qwen_rotate_half,
 };
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -419,7 +419,6 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_inv_freq: Vec<f32>,
-    rope_cache: RopeCache,
 }
 
 impl Attention {
@@ -460,7 +459,6 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
-            rope_cache: RopeCache::default(),
         })
     }
 
@@ -483,23 +481,13 @@ impl Attention {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
 
-        let (cos, sin) = if x.device().is_cuda() {
-            self.rope_cache.get_window(
-                seq_len,
-                start_pos,
-                &self.rope_inv_freq,
-                x.device(),
-                x.dtype(),
-            )?
-        } else {
-            build_rope_window_full(
-                seq_len,
-                start_pos,
-                &self.rope_inv_freq,
-                x.device(),
-                x.dtype(),
-            )?
-        };
+        let (cos, sin) = build_rope_window_full(
+            seq_len,
+            start_pos,
+            &self.rope_inv_freq,
+            x.device(),
+            x.dtype(),
+        )?;
 
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;

@@ -55,7 +55,7 @@ impl StreamDeltaBatch {
 }
 
 impl NativeExecutor {
-    fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
+    pub(super) fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
         ChatGenerationConfig {
             temperature: request.params.temperature.max(0.0),
             top_p: request.params.top_p.clamp(0.0, 1.0),

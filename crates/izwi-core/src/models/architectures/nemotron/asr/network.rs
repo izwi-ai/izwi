@@ -13,6 +13,7 @@ use serde_json::json;
 
 use super::config::NemotronConfigInventory;
 use crate::error::{Error, Result};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -1020,6 +1021,10 @@ impl NemotronStreamingFeatureState {
         }
     }
 
+    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        accounting.add_bytes(retained_vec_bytes::<f32>(self.preemphasized.capacity())?)
+    }
+
     pub(super) fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
@@ -1073,6 +1078,13 @@ impl NemotronStreamingPreEncodeState {
         }
     }
 
+    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        if let Some(features) = &self.features {
+            accounting.add_tensor(features)?;
+        }
+        Some(())
+    }
+
     pub(super) fn push_features(&mut self, chunk: NemotronStreamingFeatureChunk) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
@@ -1120,6 +1132,21 @@ impl NemotronStreamingEncoderState {
                 .map(|_| ConformerLayerStreamState::new())
                 .collect(),
         }
+    }
+
+    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        if let Some(pending) = &self.pending_pre_encoded {
+            accounting.add_tensor(pending)?;
+        }
+        for layer in &self.layer_states {
+            if let Some(cache) = &layer.attn_cache {
+                accounting.add_tensor(cache)?;
+            }
+            if let Some(cache) = &layer.conv_cache {
+                accounting.add_tensor(cache)?;
+            }
+        }
+        Some(())
     }
 
     pub(super) fn push_pre_encoded(&mut self, chunk: NemotronStreamingEncodedChunk) -> Result<()> {
@@ -1211,6 +1238,22 @@ impl NemotronRnntStreamState {
     fn token_ids(&self) -> &[usize] {
         &self.token_ids
     }
+
+    pub(super) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        accounting.add_tensor(&self.predictor_state.h0)?;
+        accounting.add_tensor(&self.predictor_state.c0)?;
+        accounting.add_tensor(&self.predictor_state.h1)?;
+        accounting.add_tensor(&self.predictor_state.c1)?;
+        accounting.add_tensor(&self.predictor_out)?;
+        if let Some(projection) = &self.predictor_projection {
+            accounting.add_tensor(projection)?;
+        }
+        accounting.add_bytes(retained_vec_bytes::<usize>(self.token_ids.capacity())?)
+    }
+}
+
+fn retained_vec_bytes<T>(capacity: usize) -> Option<u64> {
+    u64::try_from(capacity.checked_mul(std::mem::size_of::<T>())?).ok()
 }
 
 impl ConformerLayerStreamState {

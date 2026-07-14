@@ -81,7 +81,9 @@ pub struct WorkerConfig {
     pub model_registry: Option<Arc<ModelRegistry>>,
     /// Shared physical resource authority used for model-owned cache lifetime.
     pub resource_authority: Option<Arc<ResourceAuthority>>,
-    /// Conservative bytes represented by one scheduler logical KV block.
+    /// Bytes represented by one scheduler logical KV block for logical
+    /// scheduling metrics only. Model-owned physical cache authorization must
+    /// come from the loaded model adapter.
     pub logical_kv_block_bytes: u64,
     /// Maximum width of a model-native tensor batch on this backend.
     pub max_tensor_batch_size: usize,
@@ -631,9 +633,6 @@ impl NativeExecutor {
             return Ok(());
         };
 
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
         for item in scheduled {
             let Some(request) = requests
                 .iter()
@@ -650,24 +649,13 @@ impl NativeExecutor {
             {
                 continue;
             }
-            let logical_bytes = (item.block_ids.len() as u64)
-                .checked_mul(self.config.logical_kv_block_bytes)
-                .ok_or_else(|| Error::Overloaded("cache reservation overflow".to_string()))?;
+            let authorized_bytes = self.authorized_session_cache_bytes(request)?;
             let session = item.session_key();
+            let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
+                Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+            })?;
             let reservation = reservations.entry(session.clone()).or_default();
-            let projected_bytes = if reservation.observed_blocks == 0 {
-                0
-            } else {
-                reservation
-                    .reserved_bytes
-                    .checked_mul(item.block_ids.len() as u64)
-                    .and_then(|bytes| bytes.checked_add(reservation.observed_blocks as u64 - 1))
-                    .map(|bytes| bytes / reservation.observed_blocks as u64)
-                    .ok_or_else(|| Error::Overloaded("cache projection overflow".to_string()))?
-            };
-            let desired_bytes = logical_bytes
-                .max(projected_bytes)
-                .max(reservation.reserved_bytes);
+            let desired_bytes = authorized_bytes.max(reservation.reserved_bytes);
             let growth = desired_bytes.saturating_sub(reservation.reserved_bytes);
             if reservation.lease.is_none() {
                 reservation.lease = Some(authority.reserve(
@@ -687,6 +675,53 @@ impl NativeExecutor {
             reservation.reserved_bytes = desired_bytes;
         }
         Ok(())
+    }
+
+    fn authorized_session_cache_bytes(&self, request: &EngineCoreRequest) -> Result<u64> {
+        let variant = request.model_variant.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Request {} is missing model variant for cache authorization",
+                request.id
+            ))
+        })?;
+        match request.task_type {
+            super::types::TaskType::Chat => {
+                let messages = request.chat_messages.as_deref().ok_or_else(|| {
+                    Error::InvalidInput("Chat request is missing messages".to_string())
+                })?;
+                let generation_config = Self::chat_generation_config(request);
+                self.with_registry(|registry| {
+                    let model = registry.try_get_chat(variant).ok_or_else(|| {
+                        Error::ModelNotFound(format!("Chat model {variant} is not loaded"))
+                    })?;
+                    model.session_cache_reservation_bytes(
+                        messages,
+                        request.params.max_tokens.max(1),
+                        &generation_config,
+                    )
+                })
+            }
+            super::types::TaskType::ASR => self.with_registry(|registry| {
+                let model = registry.try_get_asr(variant).ok_or_else(|| {
+                    Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
+                })?;
+                model.session_cache_reservation_bytes(
+                    request.language.as_deref(),
+                    request.asr_prompt.as_deref(),
+                    request.params.max_tokens.max(1),
+                )
+            }),
+            super::types::TaskType::TTS => {
+                let params = Self::to_tts_params(request);
+                self.with_qwen_model(Some(variant), |model| {
+                    model.session_cache_reservation_bytes(params.max_frames)
+                })
+            }
+            super::types::TaskType::SpeechToSpeech => Err(Error::InvalidInput(
+                "Speech-to-speech does not expose model-owned session cache authorization"
+                    .to_string(),
+            )),
+        }
     }
 
     fn observed_session_cache_bytes(
@@ -738,10 +773,10 @@ impl NativeExecutor {
         {
             return Ok(ResourceVector::zero());
         }
-        let Some(observed_bytes) = self.observed_session_cache_bytes(request, scheduled, output)
-        else {
-            return Ok(unknown_cache_observation());
-        };
+        let observed_bytes = require_known_cache_bytes(
+            self.observed_session_cache_bytes(request, scheduled, output),
+            scheduled,
+        )?;
         let observation = cache_observation(observed_bytes);
         if self.config.resource_authority.is_none() {
             return Ok(observation);
@@ -779,6 +814,23 @@ fn cache_observation(bytes: u64) -> ResourceVector {
         kv_bytes: ResourceAmount::Known(bytes),
         ..ResourceVector::zero()
     }
+}
+
+fn cache_observation_after_release(report: CacheReleaseReport) -> ResourceVector {
+    if report.confirmed {
+        cache_observation(0)
+    } else {
+        unknown_cache_observation()
+    }
+}
+
+fn require_known_cache_bytes(observed: Option<u64>, scheduled: &ScheduledRequest) -> Result<u64> {
+    observed.ok_or_else(|| {
+        Error::InferenceError(format!(
+            "loaded model did not report cache bytes for session {}:{}",
+            scheduled.request_id, scheduled.sequence_id
+        ))
+    })
 }
 
 fn unknown_cache_observation() -> ResourceVector {
@@ -1309,6 +1361,40 @@ mod tests {
             assert_eq!(authority.snapshot().reservations, 0);
             assert_eq!(executor.cleanup_session(&session).released_sessions, 0);
         }
+    }
+
+    #[test]
+    fn model_owned_cache_observation_is_required() {
+        let scheduled = ScheduledRequest {
+            plan_id: 9,
+            request_id: "cache-contract".to_string(),
+            sequence_id: 42,
+            num_tokens: 1,
+            is_prefill: false,
+            block_ids: Vec::new(),
+            num_computed_tokens: 1,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Decode,
+                input: crate::engine::InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        };
+
+        assert_eq!(
+            require_known_cache_bytes(Some(4_096), &scheduled).unwrap(),
+            4_096
+        );
+        let error = require_known_cache_bytes(None, &scheduled).unwrap_err();
+        assert!(error.to_string().contains("cache-contract:42"));
+
+        assert_eq!(
+            cache_observation_after_release(CacheReleaseReport::confirmed(1)).kv_bytes,
+            ResourceAmount::Known(0)
+        );
+        assert_eq!(
+            cache_observation_after_release(CacheReleaseReport::unconfirmed()).kv_bytes,
+            ResourceAmount::Unknown
+        );
     }
 
     #[test]

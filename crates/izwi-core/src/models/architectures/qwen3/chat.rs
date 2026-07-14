@@ -484,6 +484,26 @@ impl Qwen3ChatModel {
         self.build_prompt(messages)
     }
 
+    /// Model-derived authorization for all retained incremental decode tensors.
+    pub fn session_cache_reservation_bytes(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+    ) -> Result<u64> {
+        let text_model = match &self.backend {
+            Qwen3ChatBackend::Native { text_model } => text_model,
+            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
+                return Err(Error::InvalidInput(format!(
+                    "Incremental chat cache authorization is unavailable for GGUF model {gguf_file}"
+                )))
+            }
+        };
+        let prompt_tokens = self.build_prompt(messages)?.len();
+        text_model
+            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
+            .ok_or_else(|| Error::Overloaded("Qwen3 session cache bound overflow".to_string()))
+    }
+
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(

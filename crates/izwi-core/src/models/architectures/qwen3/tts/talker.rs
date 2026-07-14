@@ -10,7 +10,7 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
 use crate::models::architectures::qwen3::tts::rope::{
-    build_rope_inv_freq, build_rope_window, duplicate_rope_window, qwen_rotate_half, RopeCache,
+    build_rope_inv_freq, build_rope_window, duplicate_rope_window, qwen_rotate_half,
 };
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -146,7 +146,6 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_inv_freq: Vec<f32>,
-    rope_cache: RopeCache,
     use_mrope: bool,
     mrope_section: Vec<usize>,
 }
@@ -194,7 +193,6 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
-            rope_cache: RopeCache::default(),
             use_mrope,
             mrope_section,
         })
@@ -239,44 +237,24 @@ impl Attention {
                     &self.rope_inv_freq,
                 )?
             } else {
-                if x.device().is_cuda() {
-                    self.rope_cache.get_window(
-                        seq_len,
-                        start_pos,
-                        &self.rope_inv_freq,
-                        x.device(),
-                        x.dtype(),
-                    )?
-                } else {
-                    let position_ids = repeated_mrope_position_ids(seq_len, start_pos, x.device())?;
-                    build_mrope_cache(
-                        seq_len,
-                        x.device(),
-                        x.dtype(),
-                        &position_ids,
-                        &self.mrope_section,
-                        &self.rope_inv_freq,
-                    )?
-                }
+                let position_ids = repeated_mrope_position_ids(seq_len, start_pos, x.device())?;
+                build_mrope_cache(
+                    seq_len,
+                    x.device(),
+                    x.dtype(),
+                    &position_ids,
+                    &self.mrope_section,
+                    &self.rope_inv_freq,
+                )?
             }
         } else {
-            if x.device().is_cuda() {
-                self.rope_cache.get_window(
-                    seq_len,
-                    start_pos,
-                    &self.rope_inv_freq,
-                    x.device(),
-                    x.dtype(),
-                )?
-            } else {
-                build_rope_window(
-                    seq_len,
-                    start_pos,
-                    &self.rope_inv_freq,
-                    x.device(),
-                    x.dtype(),
-                )?
-            }
+            build_rope_window(
+                seq_len,
+                start_pos,
+                &self.rope_inv_freq,
+                x.device(),
+                x.dtype(),
+            )?
         };
 
         // Qwen RoPE uses rotate_half(x) over [first_half, second_half].

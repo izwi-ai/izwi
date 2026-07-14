@@ -646,6 +646,33 @@ impl Qwen3AsrModel {
         None
     }
 
+    /// Model-derived authorization for the largest incremental ASR session
+    /// accepted by this checkpoint's audio preprocessor.
+    pub fn session_cache_reservation_bytes(
+        &self,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<u64> {
+        let hop_length = self.mel.config().hop_length.max(1);
+        let max_audio_tokens = self
+            .preprocessor
+            .nb_max_frames
+            .max(self.preprocessor.n_samples.saturating_add(hop_length - 1) / hop_length);
+        if max_audio_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR checkpoint does not declare a bounded audio context".to_string(),
+            ));
+        }
+        let prompt_tokens = self
+            .build_prompt(max_audio_tokens, language, system_prompt)?
+            .ids
+            .len();
+        self.text_model
+            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR session cache bound overflow".to_string()))
+    }
+
     pub fn transcribe_with_callback(
         &self,
         audio: &[f32],

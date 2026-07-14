@@ -557,9 +557,7 @@ impl NativeAsrDecodeState {
     pub fn session_cache_bytes(&self) -> Option<u64> {
         match self {
             Self::Qwen3(state) => state.session_cache_bytes(),
-            // Nemotron's streaming state has not exposed all persistent
-            // tensors yet, so undercounting is rejected.
-            Self::Nemotron(_) => None,
+            Self::Nemotron(state) => state.session_cache_bytes(),
         }
     }
 }
@@ -1018,6 +1016,22 @@ impl NativeAsrModel {
 
     pub fn supports_incremental_decode(&self) -> bool {
         matches!(self, Self::Qwen3(_))
+    }
+
+    pub fn session_cache_reservation_bytes(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<u64> {
+        match self {
+            Self::Qwen3(model) => {
+                model.session_cache_reservation_bytes(language, prompt, max_new_tokens)
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not expose incremental cache authorization".to_string(),
+            )),
+        }
     }
 
     pub fn supports_realtime_stream_decode(&self) -> bool {
@@ -1640,6 +1654,23 @@ impl NativeChatModel {
             Self::Qwen35(model) => model.supports_incremental_decode(),
             Self::Gemma3(_) => false,
             Self::Lfm2(model) => model.supports_incremental_decode(),
+        }
+    }
+
+    pub fn session_cache_reservation_bytes(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<u64> {
+        match self {
+            Self::Qwen3(model) => model.session_cache_reservation_bytes(messages, max_new_tokens),
+            Self::Qwen35(model) => {
+                model.session_cache_reservation_bytes(messages, max_new_tokens, config)
+            }
+            Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
+                "Loaded chat model does not expose incremental cache authorization".to_string(),
+            )),
         }
     }
 

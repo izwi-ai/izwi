@@ -133,7 +133,8 @@ pub struct TtsDecodeState {
 }
 
 impl TtsDecodeState {
-    /// Observable per-request allocations, excluding model-global RoPE caches.
+    /// Observable per-request allocations. Rotary windows are transient and
+    /// no longer retained in model-global caches.
     pub fn allocated_session_bytes(&self) -> Option<u64> {
         let mut accounting = TensorStorageAccounting::default();
         self.talker_cache.account_storage(&mut accounting)?;
@@ -145,17 +146,9 @@ impl TtsDecodeState {
         Some(accounting.bytes())
     }
 
-    /// Complete scheduler accounting is available on CPU and Metal.
-    ///
-    /// CUDA uses model-global, growing RoPE caches in both the talker and code
-    /// predictor, so it must remain fail-closed until those allocations are
-    /// bounded or charged to the loaded-model lease.
+    /// Complete per-session scheduler accounting on CPU, Metal, and CUDA.
     pub fn session_cache_bytes(&self) -> Option<u64> {
-        if self.last_hidden.device().is_cuda() {
-            None
-        } else {
-            self.allocated_session_bytes()
-        }
+        self.allocated_session_bytes()
     }
 }
 
@@ -321,6 +314,53 @@ fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
     frames_generated >= MIN_QWEN_TTS_TOKENS_BEFORE_EOS
 }
 
+fn qwen3_tts_session_cache_upper_bound_bytes(
+    config: &Qwen3TtsConfig,
+    max_frames: usize,
+    talker_element_bytes: usize,
+    predictor_element_bytes: usize,
+) -> Option<u64> {
+    let talker = &config.talker_config;
+    let predictor = &talker.code_predictor_config;
+    let as_u64 = |value: usize| u64::try_from(value).ok();
+
+    // Voice-clone reference length is only known after codec preprocessing.
+    // Pricing the full model context is therefore the smallest fail-safe bound
+    // that can be issued before any session tensor is allocated.
+    let talker_kv = 2u64
+        .checked_mul(as_u64(talker.num_hidden_layers)?)?
+        .checked_mul(as_u64(talker.max_position_embeddings)?)?
+        .checked_mul(as_u64(talker.num_key_value_heads)?)?
+        .checked_mul(as_u64(talker.head_dim)?)?
+        .checked_mul(as_u64(talker_element_bytes)?)?;
+
+    // The predictor cache is cleared for every semantic frame and retains at
+    // most its two-token prefill plus one token per remaining code group.
+    let predictor_tokens = talker.num_code_groups.checked_add(1)?;
+    let predictor_kv = 2u64
+        .checked_mul(as_u64(predictor.num_hidden_layers)?)?
+        .checked_mul(as_u64(predictor_tokens)?)?
+        .checked_mul(as_u64(predictor.num_key_value_heads)?)?
+        .checked_mul(as_u64(predictor.head_dim)?)?
+        .checked_mul(as_u64(predictor_element_bytes)?)?;
+
+    let retained_frames = max_frames
+        .max(1)
+        .min(talker.max_position_embeddings)
+        .checked_add(1)?;
+    let trailing_text = as_u64(retained_frames)?
+        .checked_mul(as_u64(talker.hidden_size)?)?
+        .checked_mul(as_u64(talker_element_bytes)?)?;
+    let step_tensors = as_u64(talker.hidden_size.checked_mul(2)?)?
+        .checked_add(as_u64(talker.vocab_size)?)?
+        .checked_mul(as_u64(talker_element_bytes)?)?;
+
+    talker_kv
+        .checked_add(predictor_kv)?
+        .checked_add(trailing_text)?
+        .checked_add(step_tensors)
+}
+
 impl Qwen3TtsModel {
     /// Load a Qwen3-TTS model from the specified directory
     pub fn load(
@@ -434,6 +474,17 @@ impl Qwen3TtsModel {
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
         })
+    }
+
+    /// Model-derived authorization for all retained incremental decode tensors.
+    pub fn session_cache_reservation_bytes(&self, max_frames: usize) -> Result<u64> {
+        qwen3_tts_session_cache_upper_bound_bytes(
+            &self.config,
+            max_frames,
+            self.dtype.size_in_bytes(),
+            self.code_predictor_dtype.size_in_bytes(),
+        )
+        .ok_or_else(|| Error::Overloaded("Qwen3-TTS session cache bound overflow".to_string()))
     }
 
     pub fn diagnostics(&self) -> Qwen3TtsDiagnostics {
@@ -2940,6 +2991,15 @@ mod tests {
         let specials = TtsSpecialTokens::from_configs(&main_config, &main_config.talker_config);
         assert_eq!(specials.codec_bos_id, 2149);
         assert_eq!(specials.codec_eos_token_id, 2150);
+
+        let short = qwen3_tts_session_cache_upper_bound_bytes(&main_config, 16, 2, 2).unwrap();
+        let long = qwen3_tts_session_cache_upper_bound_bytes(&main_config, 128, 2, 2).unwrap();
+        assert!(short > 0);
+        assert!(long > short);
+        // Element widths come from the actual loaded backend dtypes rather
+        // than a scheduler-global architecture guess.
+        let f32 = qwen3_tts_session_cache_upper_bound_bytes(&main_config, 16, 4, 4).unwrap();
+        assert_eq!(f32, short * 2);
     }
 
     #[test]

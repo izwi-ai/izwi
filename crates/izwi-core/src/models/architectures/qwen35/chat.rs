@@ -56,7 +56,8 @@ pub struct ChatDecodeState {
 }
 
 impl ChatDecodeState {
-    /// Observable per-request allocations, excluding model-global RoPE caches.
+    /// Observable per-request allocations. Rotary windows are transient and
+    /// no longer retained in model-global caches.
     pub fn allocated_session_bytes(&self) -> Option<u64> {
         let mut accounting = TensorStorageAccounting::default();
         self.text_state.account_storage(&mut accounting)?;
@@ -64,9 +65,9 @@ impl ChatDecodeState {
         Some(accounting.bytes())
     }
 
-    /// Complete scheduler accounting is unavailable while RoPE is model-global.
+    /// Complete per-session scheduler accounting.
     pub fn session_cache_bytes(&self) -> Option<u64> {
-        None
+        self.allocated_session_bytes()
     }
 }
 
@@ -410,6 +411,32 @@ impl Qwen35ChatModel {
         Ok(self.prepare_prompt(messages, config)?.prompt_ids)
     }
 
+    /// Model-derived authorization for all retained incremental decode tensors.
+    pub fn session_cache_reservation_bytes(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<u64> {
+        let prompt_tokens = self.prepare_prompt(messages, config)?.prompt_ids.len();
+        let total_tokens = prompt_tokens
+            .checked_add(max_new_tokens.max(1))
+            .ok_or_else(|| Error::Overloaded("Qwen3.5 session token bound overflow".to_string()))?;
+        if total_tokens > self.text_config.context_length {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 session requires {total_tokens} tokens but the model context is {}",
+                self.text_config.context_length
+            )));
+        }
+        qwen35_session_cache_upper_bound_bytes(
+            &self.text_config,
+            self.tokenizer.vocab_size,
+            prompt_tokens,
+            max_new_tokens,
+        )
+        .ok_or_else(|| Error::Overloaded("Qwen3.5 session cache bound overflow".to_string()))
+    }
+
     pub fn generate(
         &self,
         messages: &[ChatMessage],
@@ -738,6 +765,56 @@ impl Qwen35ChatModel {
             vision_inputs: Some(vision_inputs),
         })
     }
+}
+
+fn qwen35_session_cache_upper_bound_bytes(
+    cfg: &Qwen35TextConfig,
+    vocab_size: usize,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+) -> Option<u64> {
+    let total_tokens = prompt_tokens.max(1).checked_add(max_new_tokens.max(1))?;
+    let cache_capacity = total_tokens.checked_next_power_of_two()?;
+    let full_layers = if cfg.full_attention_interval == 0 {
+        0
+    } else {
+        cfg.block_count / cfg.full_attention_interval
+    };
+    let linear_layers = cfg.block_count.checked_sub(full_layers)?;
+    let as_u64 = |value: usize| u64::try_from(value).ok();
+    let bytes_per_element = 4u64;
+
+    let kv_width = cfg
+        .attention_key_length
+        .checked_add(cfg.attention_value_length)?
+        .checked_mul(cfg.attention_head_count_kv)?;
+    let one_kv_copy = as_u64(full_layers)?
+        .checked_mul(as_u64(cache_capacity)?)?
+        .checked_mul(as_u64(kv_width)?)?
+        .checked_mul(bytes_per_element)?;
+    // Account for both representations even though normal migration takes the
+    // dense tensors before publishing pages. This keeps authorization safe if
+    // a backend retains either backing allocation across the conversion.
+    let kv_bytes = one_kv_copy.checked_mul(2)?;
+
+    let conv_width = cfg
+        .ssm_state_size
+        .checked_mul(cfg.ssm_group_count)?
+        .checked_mul(2)?
+        .checked_add(cfg.ssm_inner_size)?;
+    let conv_slots = cfg.ssm_conv_kernel.saturating_sub(1);
+    let recurrent_width = cfg.ssm_state_size.checked_mul(cfg.ssm_inner_size)?;
+    let linear_state_width = conv_width
+        .checked_mul(conv_slots)?
+        .checked_add(recurrent_width)?;
+    let linear_bytes = as_u64(linear_layers)?
+        .checked_mul(as_u64(linear_state_width)?)?
+        .checked_mul(bytes_per_element)?;
+    let logits_bytes = as_u64(vocab_size)?.checked_mul(bytes_per_element)?;
+
+    kv_bytes
+        .checked_add(linear_bytes)?
+        .checked_add(logits_bytes)
 }
 
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
@@ -1512,6 +1589,39 @@ mod tests {
         PathBuf::from(home)
             .join("Library/Application Support/izwi/models")
             .join(name)
+    }
+
+    #[test]
+    fn session_cache_bound_covers_growth_and_duplicate_kv_backing() {
+        let config = Qwen35TextConfig {
+            architecture: "qwen35".to_string(),
+            block_count: 8,
+            context_length: 4_096,
+            embedding_length: 1_024,
+            feed_forward_length: 3_072,
+            attention_head_count: 16,
+            attention_head_count_kv: 4,
+            attention_key_length: 64,
+            attention_value_length: 64,
+            rope_dimension_sections: vec![8, 12, 12],
+            rope_dimension_count: 64,
+            rope_freq_base: 10_000.0,
+            attention_layer_norm_rms_epsilon: 1e-6,
+            ssm_conv_kernel: 4,
+            ssm_state_size: 64,
+            ssm_group_count: 4,
+            ssm_time_step_rank: 8,
+            ssm_inner_size: 1_024,
+            full_attention_interval: 4,
+        };
+
+        let bound = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 32, 16).unwrap();
+        let larger = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 64, 32).unwrap();
+        let cache_capacity = (32usize + 16).next_power_of_two() as u64;
+        let one_kv_copy = 2u64 * cache_capacity * 4 * (64 + 64) * 4;
+
+        assert!(bound >= one_kv_copy * 2);
+        assert!(larger > bound);
     }
 
     fn local_metal_device() -> Option<DeviceProfile> {

@@ -10,8 +10,7 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::TaskType;
 use super::{
-    unknown_cache_observation, ExecutorOutput, ExecutorStepResult, ModelExecutor,
-    ModelSessionResult, NativeExecutor,
+    ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, NativeExecutor,
 };
 use crate::engine::{BatchDispatch, BatchDispatchKind};
 
@@ -274,7 +273,9 @@ impl NativeExecutor {
                         .with_dispatch(dispatch)
                         .with_observed_resources(observed),
                     Err(err) => {
-                        let _ = ModelExecutor::cleanup_session(self, &scheduled.session_key());
+                        let release =
+                            ModelExecutor::cleanup_session(self, &scheduled.session_key());
+                        let observed = super::cache_observation_after_release(release);
                         ExecutorStepResult::from_session(
                             scheduled,
                             ModelSessionResult::atomic(ExecutorOutput::error(
@@ -283,7 +284,7 @@ impl NativeExecutor {
                             )),
                         )
                         .with_dispatch(dispatch)
-                        .with_observed_resources(unknown_cache_observation())
+                        .with_observed_resources(observed)
                     }
                 }
             })

@@ -18,6 +18,7 @@ use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
@@ -482,6 +483,28 @@ impl NemotronStreamingState {
         self.emitted_tokens
     }
 
+    /// Complete retained backing allocation for this exact stream session.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_bytes(retained_capacity_bytes::<f32>(self.samples.capacity())?)?;
+        accounting.add_bytes(retained_capacity_bytes::<u8>(
+            self.assembled_text.capacity(),
+        )?)?;
+        accounting.add_bytes(retained_capacity_bytes::<u8>(
+            self.prompt.target_lang.capacity(),
+        )?)?;
+        if let Some(prompt) = &self.prompt.context_prompt {
+            accounting.add_bytes(retained_capacity_bytes::<u8>(prompt.capacity())?)?;
+        }
+        self.feature_state.account_storage(&mut accounting)?;
+        self.pre_encode_state.account_storage(&mut accounting)?;
+        self.encoder_state.account_storage(&mut accounting)?;
+        if let Some(rnnt_state) = &self.rnnt_state {
+            rnnt_state.account_storage(&mut accounting)?;
+        }
+        Some(accounting.bytes())
+    }
+
     pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
@@ -560,6 +583,10 @@ impl NemotronStreamingState {
             "supports_realtime_stream_decode": self.rnnt_state.is_some(),
         })
     }
+}
+
+fn retained_capacity_bytes<T>(capacity: usize) -> Option<u64> {
+    u64::try_from(capacity.checked_mul(std::mem::size_of::<T>())?).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1801,6 +1828,7 @@ mod tests {
         let profile = NemotronStreamingProfile::new(56, 0).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
         let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let empty_bytes = state.session_cache_bytes().unwrap();
 
         state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
         state.push_samples(&[0.4]).unwrap();
@@ -1809,6 +1837,7 @@ mod tests {
         assert_eq!(state.samples, vec![0.1, 0.2, 0.3, 0.4]);
         assert_eq!(state.text(), "");
         assert_eq!(state.emitted_tokens(), 0);
+        assert!(state.session_cache_bytes().unwrap() >= empty_bytes + 4 * 4);
         assert_eq!(
             state.diagnostics()["supports_realtime_stream_decode"],
             false
