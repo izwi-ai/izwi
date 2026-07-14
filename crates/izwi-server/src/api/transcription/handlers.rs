@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::{
@@ -65,6 +65,10 @@ const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
+#[cfg(not(test))]
+const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTranscriptionRecordResponse {
@@ -806,11 +810,24 @@ async fn send_transcription_terminal_events(
 ) {
     // Deltas and progress are intentionally lossy under backpressure, but the
     // terminal result and trailing `done` marker define the stream contract.
-    // Await capacity so a slow connected client cannot receive a silent EOF.
-    if event_tx.send(terminal_payload).await.is_ok() {
-        let _ = event_tx
-            .send(serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default())
-            .await;
+    // A connected client can stop polling forever. Preserve ordered terminal
+    // delivery for a slow reader, but bound transport waiting so the producer
+    // task cannot leak indefinitely.
+    if matches!(
+        tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+            event_tx.send(terminal_payload),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        let _ = tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+            event_tx.send(
+                serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
+            ),
+        )
+        .await;
     }
 }
 
@@ -1970,6 +1987,8 @@ fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::{
         body::Body,
         http::{header, StatusCode},
@@ -1984,7 +2003,7 @@ mod tests {
         sanitize_summary_output, send_transcription_terminal_events,
         should_retry_transcription_summary_generation, transcription_summary_messages,
         transcription_summary_params, validate_batch_transcription_model, QueueClass,
-        TranscriptionSummaryStatus, TranscriptionWordRecord,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -2223,6 +2242,27 @@ mod tests {
         assert_eq!(terminal["event"], "final");
         assert_eq!(done["event"], "done");
         sender.await.expect("terminal sender should finish");
+        assert!(event_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_events_stop_waiting_for_a_non_draining_consumer() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx.send("queued-delta".to_string()).await.unwrap();
+
+        let sender = tokio::spawn(send_transcription_terminal_events(
+            event_tx,
+            serde_json::json!({ "event": "final" }).to_string(),
+        ));
+        tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT + Duration::from_millis(50),
+            sender,
+        )
+        .await
+        .expect("terminal sender must not wait forever")
+        .expect("terminal sender should not panic");
+
+        assert_eq!(event_rx.recv().await.as_deref(), Some("queued-delta"));
         assert!(event_rx.recv().await.is_none());
     }
 

@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info};
@@ -33,6 +33,10 @@ use izwi_core::{parse_model_variant, AsrTranscription, WorkloadClass};
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
 const TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR: &str =
     "Transcription stream consumer is too slow; generation was cancelled";
+#[cfg(not(test))]
+const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default)]
 struct TranscriptionStreamBackpressure {
@@ -72,47 +76,41 @@ fn try_send_transcript_delta(
     }
 }
 
-async fn forward_transcription_generation<F>(
-    event_tx: mpsc::Sender<String>,
+async fn resolve_transcription_terminal<F>(
+    event_tx: &mpsc::Sender<String>,
     backpressure: Arc<TranscriptionStreamBackpressure>,
     generation: F,
-) where
+) -> Option<String>
+where
     F: Future<Output = izwi_core::Result<AsrTranscription>>,
 {
     tokio::pin!(generation);
     let result = tokio::select! {
         result = &mut generation => Some(result),
-        _ = event_tx.closed() => return,
+        _ = event_tx.closed() => return None,
         _ = backpressure.notified() => None,
     };
 
     // The overflowing callback and successful generation may become ready in
     // the same poll. The latch makes the explicit failure authoritative.
     if result.is_none() || backpressure.is_tripped() {
-        let _ = event_tx
-            .send(transcript_error_event_payload(
-                TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR,
-            ))
-            .await;
-        return;
+        return Some(transcript_error_event_payload(
+            TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR,
+        ));
     }
 
     match result.expect("completed transcription result must be present") {
-        Ok(output) => {
-            let _ = event_tx
-                .send(transcript_done_event_payload(
-                    output.text,
-                    output.language,
-                    output.duration_secs,
-                ))
-                .await;
-        }
-        Err(err) => {
-            let _ = event_tx
-                .send(transcript_error_event_payload(&err.to_string()))
-                .await;
-        }
+        Ok(output) => Some(transcript_done_event_payload(
+            output.text,
+            output.language,
+            output.duration_secs,
+        )),
+        Err(err) => Some(transcript_error_event_payload(&err.to_string())),
     }
+}
+
+async fn send_transcription_terminal(event_tx: mpsc::Sender<String>, payload: String) {
+    let _ = tokio::time::timeout(TRANSCRIPTION_TERMINAL_SEND_TIMEOUT, event_tx.send(payload)).await;
 }
 
 #[derive(Debug, Default)]
@@ -409,9 +407,11 @@ async fn transcriptions_stream(
         {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx
-                    .send(transcript_error_event_payload("Server is shutting down"))
-                    .await;
+                send_transcription_terminal(
+                    event_tx,
+                    transcript_error_event_payload("Server is shutting down"),
+                )
+                .await;
                 return;
             }
         };
@@ -430,7 +430,11 @@ async fn transcriptions_stream(
                 try_send_transcript_delta(&delta_tx, &delta_backpressure, delta);
             },
         );
-        forward_transcription_generation(event_tx, backpressure, generation).await;
+        let terminal = resolve_transcription_terminal(&event_tx, backpressure, generation).await;
+        drop(permit);
+        if let Some(terminal) = terminal {
+            send_transcription_terminal(event_tx, terminal).await;
+        }
     });
 
     let stream = async_stream::stream! {
@@ -1196,11 +1200,13 @@ mod tests {
                 asr_diagnostics: None,
             })
         };
-        let driver = tokio::spawn(forward_transcription_generation(
-            event_tx,
-            backpressure,
-            generation,
-        ));
+        let driver = tokio::spawn(async move {
+            if let Some(terminal) =
+                resolve_transcription_terminal(&event_tx, backpressure, generation).await
+            {
+                send_transcription_terminal(event_tx, terminal).await;
+            }
+        });
 
         let first: serde_json::Value = serde_json::from_str(
             &event_rx
@@ -1225,6 +1231,48 @@ mod tests {
             TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR
         );
         driver.await.expect("stream driver must finish");
+        assert!(event_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_draining_transcription_consumer_cannot_retain_workload_capacity() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx.send("queued-delta".to_string()).await.unwrap();
+        let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
+
+        let driver = tokio::spawn(async move {
+            let terminal = resolve_transcription_terminal(&event_tx, backpressure, async {
+                Ok(AsrTranscription {
+                    text: "done".to_string(),
+                    language: Some("en".to_string()),
+                    duration_secs: 1.0,
+                    asr_diagnostics: None,
+                })
+            })
+            .await;
+            drop(permit);
+            if let Some(terminal) = terminal {
+                send_transcription_terminal(event_tx, terminal).await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while semaphore.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal transport wait must not retain the workload permit");
+        tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT + Duration::from_millis(50),
+            driver,
+        )
+        .await
+        .expect("terminal transport wait must be bounded")
+        .expect("stream driver should not panic");
+        assert_eq!(event_rx.recv().await.as_deref(), Some("queued-delta"));
         assert!(event_rx.recv().await.is_none());
     }
 

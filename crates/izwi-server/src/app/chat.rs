@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -65,6 +66,10 @@ pub enum ChatStreamEvent {
 const CHAT_STREAM_CAPACITY: usize = 64;
 const CHAT_STREAM_BACKPRESSURE_ERROR: &str =
     "Chat stream consumer is too slow; generation was cancelled";
+#[cfg(not(test))]
+const CHAT_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CHAT_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default)]
 struct ChatStreamBackpressure {
@@ -104,17 +109,18 @@ fn try_send_chat_delta(
     }
 }
 
-async fn forward_chat_generation<F>(
-    event_tx: mpsc::Sender<ChatStreamEvent>,
+async fn resolve_chat_terminal<F>(
+    event_tx: &mpsc::Sender<ChatStreamEvent>,
     backpressure: Arc<ChatStreamBackpressure>,
     generation: F,
-) where
+) -> Option<ChatStreamEvent>
+where
     F: Future<Output = izwi_core::Result<ChatGeneration>>,
 {
     tokio::pin!(generation);
     let result = tokio::select! {
         result = &mut generation => Some(result),
-        _ = event_tx.closed() => return,
+        _ = event_tx.closed() => return None,
         _ = backpressure.notified() => None,
     };
 
@@ -122,24 +128,22 @@ async fn forward_chat_generation<F>(
     // poll. Check the latch even when the generation branch wins the select so
     // a dropped delta can never be reported as a successful completion.
     if result.is_none() || backpressure.is_tripped() {
-        let _ = event_tx
-            .send(ChatStreamEvent::Failed(
-                CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
-            ))
-            .await;
-        return;
+        return Some(ChatStreamEvent::Failed(
+            CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
+        ));
     }
 
     match result.expect("completed generation result must be present") {
-        Ok(generation) => {
-            let _ = event_tx.send(ChatStreamEvent::Completed(generation)).await;
-        }
-        Err(err) => {
-            let _ = event_tx
-                .send(ChatStreamEvent::Failed(err.to_string()))
-                .await;
-        }
+        Ok(generation) => Some(ChatStreamEvent::Completed(generation)),
+        Err(err) => Some(ChatStreamEvent::Failed(err.to_string())),
     }
+}
+
+async fn send_chat_terminal(event_tx: mpsc::Sender<ChatStreamEvent>, event: ChatStreamEvent) {
+    // A connected receiver may stop polling forever. Terminal delivery remains
+    // best-effort for that transport, but it must never retain inference or
+    // workload capacity indefinitely.
+    let _ = tokio::time::timeout(CHAT_TERMINAL_SEND_TIMEOUT, event_tx.send(event)).await;
 }
 
 pub fn max_new_tokens(
@@ -203,7 +207,7 @@ pub fn spawn_chat_stream(
         {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(ChatStreamEvent::ShuttingDown).await;
+                send_chat_terminal(event_tx, ChatStreamEvent::ShuttingDown).await;
                 return;
             }
         };
@@ -227,7 +231,11 @@ pub fn spawn_chat_stream(
                 }
             },
         );
-        forward_chat_generation(event_tx, backpressure, generation).await;
+        let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+        drop(permit);
+        if let Some(terminal) = terminal {
+            send_chat_terminal(event_tx, terminal).await;
+        }
     });
 
     event_rx
@@ -247,10 +255,10 @@ where
     let backpressure = Arc::new(ChatStreamBackpressure::default());
 
     tokio::spawn(async move {
-        let _permit = match semaphore.acquire_owned().await {
+        let permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                let _ = event_tx.send(ChatStreamEvent::ShuttingDown).await;
+                send_chat_terminal(event_tx, ChatStreamEvent::ShuttingDown).await;
                 return;
             }
         };
@@ -260,7 +268,11 @@ where
         }
 
         let generation = generation_task(event_tx.clone(), backpressure.clone());
-        forward_chat_generation(event_tx, backpressure, generation).await;
+        let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+        drop(permit);
+        if let Some(terminal) = terminal {
+            send_chat_terminal(event_tx, terminal).await;
+        }
     });
 
     event_rx
@@ -382,6 +394,52 @@ mod tests {
         assert!(matches!(
             event_rx.recv().await,
             Some(ChatStreamEvent::Failed(error)) if error == CHAT_STREAM_BACKPRESSURE_ERROR
+        ));
+        assert!(event_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_draining_chat_consumer_cannot_retain_workload_capacity() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let generation_started = Arc::new(Notify::new());
+        let release_generation = Arc::new(Notify::new());
+        let started = generation_started.clone();
+        let release = release_generation.clone();
+        let mut event_rx = spawn_chat_stream_with_task(
+            semaphore.clone(),
+            1,
+            move |_event_tx, _backpressure| async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(ChatGeneration {
+                    text: "done".to_string(),
+                    prompt_tokens: 1,
+                    tokens_generated: 1,
+                    generation_time_ms: 1.0,
+                })
+            },
+        );
+
+        generation_started.notified().await;
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(
+            event_rx.len(),
+            1,
+            "the unread Started event fills the queue"
+        );
+        release_generation.notify_one();
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while semaphore.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal transport wait must not retain the workload permit");
+
+        tokio::time::sleep(CHAT_TERMINAL_SEND_TIMEOUT + Duration::from_millis(25)).await;
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ChatStreamEvent::Started)
         ));
         assert!(event_rx.recv().await.is_none());
     }
