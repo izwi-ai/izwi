@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,8 @@ const PREEMPH: f32 = 0.97;
 const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
 const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 10;
+const MAX_SHAPE_CACHE_ENTRIES: usize = 4;
+const MAX_SHAPE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NemotronRealtimeStateShape {
@@ -206,6 +209,48 @@ struct StreamingMaskCacheKey {
     left_context: usize,
     right_context: usize,
     dtype: DType,
+}
+
+fn tensor_storage_bytes(tensor: &Tensor) -> Option<usize> {
+    tensor
+        .elem_count()
+        .checked_mul(tensor.dtype().size_in_bytes())
+}
+
+fn insert_bounded_tensor_cache<K>(
+    cache: &mut HashMap<K, Tensor>,
+    key: K,
+    tensor: Tensor,
+    max_entries: usize,
+    max_bytes: usize,
+) where
+    K: Copy + Eq + Hash,
+{
+    let Some(new_bytes) = tensor_storage_bytes(&tensor) else {
+        return;
+    };
+    if max_entries == 0 || new_bytes > max_bytes {
+        return;
+    }
+
+    cache.remove(&key);
+    loop {
+        let retained_bytes = cache.values().fold(0usize, |total, cached| {
+            total.saturating_add(tensor_storage_bytes(cached).unwrap_or(usize::MAX))
+        });
+        if cache.len() < max_entries
+            && retained_bytes
+                .checked_add(new_bytes)
+                .is_some_and(|total| total <= max_bytes)
+        {
+            break;
+        }
+        let Some(victim) = cache.keys().next().copied() else {
+            return;
+        };
+        cache.remove(&victim);
+    }
+    cache.insert(key, tensor);
 }
 
 impl NemotronNetwork {
@@ -776,10 +821,17 @@ impl NemotronNetwork {
         }
 
         let tensor = build_rel_positional_embedding_for_dtype(len, ENCODER_DIM, device, dtype)?;
-        self.rel_pos_cache
+        let mut cache = self
+            .rel_pos_cache
             .lock()
-            .map_err(|_| Error::InferenceError("Nemotron rel-pos cache lock poisoned".into()))?
-            .insert(key, tensor.clone());
+            .map_err(|_| Error::InferenceError("Nemotron rel-pos cache lock poisoned".into()))?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 
@@ -813,10 +865,17 @@ impl NemotronNetwork {
 
         let tensor =
             build_limited_context_mask_for_dtype(len, left_context, right_context, device, dtype)?;
-        self.att_mask_cache
+        let mut cache = self
+            .att_mask_cache
             .lock()
-            .map_err(|_| Error::InferenceError("Nemotron mask cache lock poisoned".into()))?
-            .insert(key, tensor.clone());
+            .map_err(|_| Error::InferenceError("Nemotron mask cache lock poisoned".into()))?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 
@@ -854,12 +913,16 @@ impl NemotronNetwork {
             device,
             dtype,
         )?;
-        self.stream_rel_pos_cache
-            .lock()
-            .map_err(|_| {
-                Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
-            })?
-            .insert(key, tensor.clone());
+        let mut cache = self.stream_rel_pos_cache.lock().map_err(|_| {
+            Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
+        })?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 
@@ -900,10 +963,16 @@ impl NemotronNetwork {
             device,
             dtype,
         )?;
-        self.stream_att_mask_cache
-            .lock()
-            .map_err(|_| Error::InferenceError("Nemotron stream mask cache lock poisoned".into()))?
-            .insert(key, tensor.clone());
+        let mut cache = self.stream_att_mask_cache.lock().map_err(|_| {
+            Error::InferenceError("Nemotron stream mask cache lock poisoned".into())
+        })?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 }
@@ -2765,6 +2834,40 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shape_tensor_cache_bounds_entries_and_retained_bytes() {
+        let mut cache = HashMap::new();
+        for key in 0usize..3 {
+            insert_bounded_tensor_cache(
+                &mut cache,
+                key,
+                Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+                2,
+                32,
+            );
+        }
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&2));
+        assert!(
+            cache
+                .values()
+                .map(|tensor| tensor_storage_bytes(tensor).unwrap())
+                .sum::<usize>()
+                <= 32
+        );
+
+        insert_bounded_tensor_cache(
+            &mut cache,
+            99,
+            Tensor::zeros(9, DType::F32, &Device::Cpu).unwrap(),
+            2,
+            32,
+        );
+        assert!(!cache.contains_key(&99));
+        assert_eq!(cache.len(), 2);
+    }
 
     fn test_preprocessor(normalize: FeatureNormalize) -> NemotronPreprocessor {
         let device = Device::Cpu;
