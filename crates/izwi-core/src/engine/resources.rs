@@ -163,8 +163,15 @@ pub struct ResourceReservation {
 pub struct ResourceLedger {
     capacity: ResourceVector,
     used: ResourceVector,
-    reservations: HashMap<ReservationId, ResourceVector>,
+    capacity_used: ResourceVector,
+    reservations: HashMap<ReservationId, LedgerReservation>,
     next_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LedgerReservation {
+    resources: ResourceVector,
+    capacity_charged: bool,
 }
 
 impl ResourceLedger {
@@ -172,6 +179,7 @@ impl ResourceLedger {
         Self {
             capacity,
             used: ResourceVector::zero(),
+            capacity_used: ResourceVector::zero(),
             reservations: HashMap::new(),
             next_id: 1,
         }
@@ -186,33 +194,73 @@ impl ResourceLedger {
     }
 
     pub fn reserve(&mut self, resources: ResourceVector) -> Result<ResourceReservation> {
+        self.reserve_internal(resources, true)
+    }
+
+    fn track(&mut self, resources: ResourceVector) -> Result<ResourceReservation> {
+        self.reserve_internal(resources, false)
+    }
+
+    fn reserve_internal(
+        &mut self,
+        resources: ResourceVector,
+        capacity_charged: bool,
+    ) -> Result<ResourceReservation> {
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(
                 "resource reservation contains an unresolved quantity".to_string(),
             ));
         }
-        let candidate = self.used.checked_add(resources)?;
-        if !candidate.fits_within(self.capacity) {
+        let used = self.used.checked_add(resources)?;
+        let capacity_used = if capacity_charged {
+            self.capacity_used.checked_add(resources)?
+        } else {
+            self.capacity_used
+        };
+        if !capacity_used.fits_within(self.capacity) {
             return Err(Error::Overloaded(
                 "requested resources exceed available capacity".to_string(),
             ));
         }
         let id = ReservationId(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
-        self.reservations.insert(id, resources);
-        self.used = candidate;
+        self.reservations.insert(
+            id,
+            LedgerReservation {
+                resources,
+                capacity_charged,
+            },
+        );
+        self.used = used;
+        self.capacity_used = capacity_used;
         Ok(ResourceReservation { id, resources })
     }
 
     pub fn release(&mut self, id: ReservationId) -> Result<bool> {
-        let Some(resources) = self.reservations.remove(&id) else {
+        let Some(reservation) = self.reservations.remove(&id) else {
             return Ok(false);
         };
-        self.used = self.used.checked_sub(resources)?;
+        self.used = self.used.checked_sub(reservation.resources)?;
+        if reservation.capacity_charged {
+            self.capacity_used = self.capacity_used.checked_sub(reservation.resources)?;
+        }
         Ok(true)
     }
 
     pub fn resize(&mut self, id: ReservationId, resources: ResourceVector) -> Result<bool> {
+        self.resize_internal(id, resources, true)
+    }
+
+    fn resize_tracked(&mut self, id: ReservationId, resources: ResourceVector) -> Result<bool> {
+        self.resize_internal(id, resources, false)
+    }
+
+    fn resize_internal(
+        &mut self,
+        id: ReservationId,
+        resources: ResourceVector,
+        capacity_charged: bool,
+    ) -> Result<bool> {
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(
                 "resource reservation contains an unresolved quantity".to_string(),
@@ -221,19 +269,49 @@ impl ResourceLedger {
         let Some(current) = self.reservations.get(&id).copied() else {
             return Ok(false);
         };
-        let candidate = self.used.checked_sub(current)?.checked_add(resources)?;
-        if !candidate.fits_within(self.capacity) {
+        if current.capacity_charged != capacity_charged {
+            return Err(Error::InferenceError(
+                "resource reservation enforcement cannot change during resize".to_string(),
+            ));
+        }
+        let used = self
+            .used
+            .checked_sub(current.resources)?
+            .checked_add(resources)?;
+        let capacity_used = if capacity_charged {
+            self.capacity_used
+                .checked_sub(current.resources)?
+                .checked_add(resources)?
+        } else {
+            self.capacity_used
+        };
+        if !capacity_used.fits_within(self.capacity) {
             return Err(Error::Overloaded(
                 "resized resources exceed available capacity".to_string(),
             ));
         }
-        self.reservations.insert(id, resources);
-        self.used = candidate;
+        self.reservations.insert(
+            id,
+            LedgerReservation {
+                resources,
+                capacity_charged,
+            },
+        );
+        self.used = used;
+        self.capacity_used = capacity_used;
         Ok(true)
     }
 
     fn reservation(&self, id: ReservationId) -> Option<ResourceVector> {
-        self.reservations.get(&id).copied()
+        self.reservations
+            .get(&id)
+            .map(|reservation| reservation.resources)
+    }
+
+    fn capacity_charged(&self, id: ReservationId) -> Option<bool> {
+        self.reservations
+            .get(&id)
+            .map(|reservation| reservation.capacity_charged)
     }
 }
 
@@ -313,16 +391,22 @@ impl AuthorityState {
     fn pending_resources(&self) -> Result<ResourceVector> {
         self.ledger.reservations.iter().try_fold(
             ResourceVector::zero(),
-            |pending, (id, reserved)| {
+            |pending, (id, reservation)| {
                 let materialized = self
                     .materialized
                     .get(id)
                     .copied()
                     .unwrap_or_else(ResourceVector::zero);
-                pending.checked_add(reserved.positive_growth_over(materialized)?)
+                pending.checked_add(reservation.resources.positive_growth_over(materialized)?)
             },
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationEnforcement {
+    Guarded,
+    TrackedModel,
 }
 
 /// One transactional authority for every physical-memory consumer on a backend.
@@ -375,6 +459,38 @@ impl ResourceAuthority {
         resources: ResourceVector,
         materialized: ResourceVector,
     ) -> Result<ResourceLease> {
+        self.reserve_internal(
+            owner,
+            resources,
+            materialized,
+            ReservationEnforcement::Guarded,
+        )
+    }
+
+    /// Track a CPU or unified-memory model authorization without treating a
+    /// volatile host-headroom sample as a hard load gate. The model remains in
+    /// the authority ledger, pending-growth accounting, lifecycle slots, and
+    /// telemetry; only its own physical/ledger admission is advisory.
+    pub(crate) fn track_model(
+        self: &Arc<Self>,
+        key: impl Into<String>,
+        resources: ResourceVector,
+    ) -> Result<ResourceLease> {
+        self.reserve_internal(
+            ReservationOwner::new(ReservationClass::Model, key),
+            resources,
+            ResourceVector::zero(),
+            ReservationEnforcement::TrackedModel,
+        )
+    }
+
+    fn reserve_internal(
+        self: &Arc<Self>,
+        owner: ReservationOwner,
+        resources: ResourceVector,
+        materialized: ResourceVector,
+        enforcement: ReservationEnforcement,
+    ) -> Result<ResourceLease> {
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(format!(
                 "resource reservation for {} contains an unresolved quantity",
@@ -397,20 +513,26 @@ impl ResourceAuthority {
             .state
             .lock()
             .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
-        // Serialize the observation with ledger mutation. `available` already
-        // excludes materialized allocations, but it cannot see reservations
-        // that have not allocated yet. Charge every pending claim against live
-        // headroom so concurrent reservations cannot spend it more than once.
-        let physical = self.provider.snapshot();
-        let pending = resources.positive_growth_over(materialized)?;
-        let live_claim = state.pending_resources()?.checked_add(pending)?;
-        if !live_claim.fits_within(physical.available) {
-            return Err(Error::Overloaded(format!(
-                "insufficient live physical capacity for {}",
-                owner.key
-            )));
-        }
-        let reservation = state.ledger.reserve(resources)?;
+        let reservation = match enforcement {
+            ReservationEnforcement::Guarded => {
+                // Serialize the observation with ledger mutation. `available`
+                // already excludes materialized allocations, but it cannot see
+                // reservations that have not allocated yet. Charge every
+                // pending claim against live headroom so concurrent guarded
+                // reservations cannot spend it more than once.
+                let physical = self.provider.snapshot();
+                let pending = resources.positive_growth_over(materialized)?;
+                let live_claim = state.pending_resources()?.checked_add(pending)?;
+                if !live_claim.fits_within(physical.available) {
+                    return Err(Error::Overloaded(format!(
+                        "insufficient live physical capacity for {}",
+                        owner.key
+                    )));
+                }
+                state.ledger.reserve(resources)?
+            }
+            ReservationEnforcement::TrackedModel => state.ledger.track(resources)?,
+        };
         state.owners.insert(reservation.id, owner);
         state.materialized.insert(reservation.id, materialized);
         Ok(ResourceLease {
@@ -451,17 +573,25 @@ impl ResourceAuthority {
                 "resource resize would shrink authorization below materialized usage".to_string(),
             ));
         }
-        let current_pending = current.positive_growth_over(materialized)?;
-        let next_pending = resources.positive_growth_over(materialized)?;
-        let other_pending = state.pending_resources()?.checked_sub(current_pending)?;
-        let live_claim = other_pending.checked_add(next_pending)?;
-        let physical = self.provider.snapshot();
-        if !live_claim.fits_within(physical.available) {
-            return Err(Error::Overloaded(
-                "insufficient live physical capacity for resource lease growth".to_string(),
-            ));
-        }
-        if !state.ledger.resize(id, resources)? {
+        let capacity_charged = state.ledger.capacity_charged(id).ok_or_else(|| {
+            Error::InferenceError("resource reservation enforcement is missing".to_string())
+        })?;
+        let resized = if capacity_charged {
+            let current_pending = current.positive_growth_over(materialized)?;
+            let next_pending = resources.positive_growth_over(materialized)?;
+            let other_pending = state.pending_resources()?.checked_sub(current_pending)?;
+            let live_claim = other_pending.checked_add(next_pending)?;
+            let physical = self.provider.snapshot();
+            if !live_claim.fits_within(physical.available) {
+                return Err(Error::Overloaded(
+                    "insufficient live physical capacity for resource lease growth".to_string(),
+                ));
+            }
+            state.ledger.resize(id, resources)?
+        } else {
+            state.ledger.resize_tracked(id, resources)?
+        };
+        if !resized {
             return Err(Error::InferenceError(
                 "resource lease disappeared during resize".to_string(),
             ));
@@ -736,6 +866,56 @@ mod tests {
                 slots(1),
             )
             .is_err());
+        assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn tracked_model_bypasses_its_own_capacity_gate_but_remains_accounted() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 2,
+            available: AtomicU64::new(0),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let model = authority.track_model("model", slots(3)).unwrap();
+
+        assert_eq!(authority.snapshot().reserved, slots(3));
+        assert!(matches!(
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Request, "during-load"),
+                slots(1),
+            ),
+            Err(Error::Overloaded(_))
+        ));
+
+        // Once allocation is materialized, it is visible to the physical
+        // provider rather than charged as pending growth. Guarded work remains
+        // independently bounded by live and capacity-enforced headroom.
+        provider.set_available(1);
+        model.reconcile_materialized(slots(3)).unwrap();
+        let request = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "after-load"),
+                slots(1),
+            )
+            .unwrap();
+        assert_eq!(authority.snapshot().reserved, slots(4));
+
+        drop((request, model));
+        assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn tracked_model_resize_and_release_remain_transactional() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 1,
+            available: AtomicU64::new(0),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let mut model = authority.track_model("model", slots(3)).unwrap();
+
+        model.resize(slots(4)).unwrap();
+        assert_eq!(authority.snapshot().reserved, slots(4));
+        drop(model);
         assert_eq!(authority.snapshot().reserved, slots(0));
     }
 
