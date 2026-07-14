@@ -1066,11 +1066,28 @@ impl EngineCore {
                     .scheduler
                     .confirm_preemption(session, self.kv_cache.inner_mut())
                 {
+                    let quarantined = self.scheduler.quarantine_rejected_confirmed_preemption(
+                        session,
+                        self.kv_cache.inner_mut(),
+                    );
                     warn!(
                         request_id = %session.request_id,
                         session_epoch = session.epoch,
+                        quarantined,
                         "Scheduler rejected confirmed preemption"
                     );
+                    if quarantined {
+                        self.requests.remove(&session.request_id);
+                        let message = "scheduler could not commit an executor-confirmed preemption";
+                        self.pending_terminal_outputs
+                            .push_back(CommittedExecutorOutput {
+                                session: session.clone(),
+                                output: ExecutorOutput::error(session.request_id.clone(), message),
+                                disposition: ExecutionDisposition::Failed(
+                                    ExecutionFailure::invalid_output(message),
+                                ),
+                            });
+                    }
                 }
             } else {
                 self.scheduler.quarantine_failed_preemption(session);

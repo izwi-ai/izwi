@@ -240,6 +240,7 @@ pub(crate) enum TerminalReleaseCause {
     Cancelled,
     TimedOut,
     PreemptionCleanupFailed,
+    PreemptionCommitRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2398,6 +2399,57 @@ impl Scheduler {
         true
     }
 
+    /// Fail closed after the executor has already confirmed physical cleanup
+    /// but the scheduler can no longer commit the prepared preemption.
+    ///
+    /// The exact session is terminally quarantined with logical cache released
+    /// and its public ID fenced until the outer terminal event is delivered.
+    /// This path intentionally does not resume the victim: its physical cache
+    /// no longer exists.
+    pub(crate) fn quarantine_rejected_confirmed_preemption(
+        &mut self,
+        session: &SessionKey,
+        kv_cache: &mut KVCacheManager,
+    ) -> bool {
+        if let Some(pending) = self.pending_releases.get(&session.request_id) {
+            return pending.session == *session;
+        }
+        if self
+            .requests
+            .get(&session.request_id)
+            .is_some_and(|metadata| metadata.sequence_id != session.epoch)
+        {
+            return false;
+        }
+        let owns_pending_preemption =
+            self.running
+                .get(&session.request_id)
+                .is_some_and(|running| {
+                    running.sequence_id == session.epoch && running.preemption_pending
+                });
+        if !owns_pending_preemption {
+            return false;
+        }
+
+        self.remove_from_waiting(&session.request_id);
+        self.running.remove(&session.request_id);
+        self.requests.remove(&session.request_id);
+        kv_cache.free(&session.request_id);
+        self.pending_releases.insert(
+            session.request_id.clone(),
+            PendingRelease {
+                session: session.clone(),
+                cause: TerminalReleaseCause::PreemptionCommitRejected,
+                confirmation_required: false,
+                cleanup_confirmed: true,
+                terminal_delivered: false,
+                cleanup_attempts: 0,
+                retry_at: Instant::now(),
+            },
+        );
+        true
+    }
+
     pub(crate) fn quarantine_failed_preemption(&mut self, session: &SessionKey) -> bool {
         matches!(
             self.begin_terminal_release(session, TerminalReleaseCause::PreemptionCleanupFailed),
@@ -2979,6 +3031,41 @@ mod tests {
         let admitted = scheduler.schedule(&mut kv_cache);
         assert_eq!(admitted.prefill_requests.len(), 1);
         assert_eq!(admitted.prefill_requests[0].request_id, high.id);
+    }
+
+    #[test]
+    fn rejected_confirmed_preemption_terminally_quarantines_the_victim() {
+        let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
+        let low = build_request(TaskType::Chat, "rejected-preempt", Priority::Low);
+        assert!(scheduler.add_request(&low));
+        allow_recompute(&mut scheduler, &low.id);
+        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        scheduler.update_after_step(&low.id, 1, 0, Vec::new(), 1.0);
+
+        let high = build_request(TaskType::Chat, "preemptor", Priority::High);
+        assert!(scheduler.add_request(&high));
+        let prepared = scheduler.schedule(&mut kv_cache);
+        let victim = prepared.preempted_requests[0].clone();
+        assert!(scheduler
+            .running
+            .get(&victim.request_id)
+            .is_some_and(|running| running.preemption_pending));
+
+        // Inject the only state split that can reject a prepared exact-session
+        // commit after the executor has already released physical cache.
+        scheduler.requests.remove(&victim.request_id);
+        assert!(!scheduler.confirm_preemption(&victim, &mut kv_cache));
+        assert!(scheduler.quarantine_rejected_confirmed_preemption(&victim, &mut kv_cache));
+
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert!(!scheduler.running.contains_key(&victim.request_id));
+        assert_eq!(
+            scheduler.pending_release_confirmation_required(&victim),
+            Some(false)
+        );
+        assert!(!scheduler.add_request(&low));
+        assert!(scheduler.mark_terminal_delivered(&victim));
+        assert!(scheduler.add_request(&low));
     }
 
     #[test]
