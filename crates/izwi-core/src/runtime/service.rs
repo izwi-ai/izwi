@@ -90,16 +90,22 @@ fn reported_gpu_resident_blocks(_backend_kind: BackendKind, _logical_blocks: u64
 }
 
 fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
+    const BASE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
     let input_bytes = input_bytes as u64;
-    let estimated_bytes = (64 * 1024 * 1024u64).saturating_add(input_bytes.saturating_mul(8));
+    let host_preparation_bytes = BASE_WORKSPACE_BYTES.saturating_add(input_bytes.saturating_mul(8));
     let mut resources = ResourceVector::zero();
     match backend {
-        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(estimated_bytes),
-        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(estimated_bytes),
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(host_preparation_bytes),
+        BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(host_preparation_bytes)
+        }
         BackendKind::Cuda => {
-            resources.host_bytes =
-                ResourceAmount::Known((4 * 1024 * 1024u64).saturating_add(input_bytes));
-            resources.device_bytes = ResourceAmount::Known(estimated_bytes);
+            // Decode, resample, tokenization, media parsing, and request
+            // construction all occur in host memory before CUDA upload. Keep
+            // the input expansion in the host domain and reserve only the
+            // backend-neutral execution workspace in VRAM.
+            resources.host_bytes = ResourceAmount::Known(host_preparation_bytes);
+            resources.device_bytes = ResourceAmount::Known(BASE_WORKSPACE_BYTES);
         }
     }
     resources
@@ -1983,17 +1989,32 @@ mod tests {
 
     #[test]
     fn transient_estimates_are_fully_known_for_every_backend() {
-        let cpu = transient_resources(BackendKind::Cpu, 1024);
-        let metal = transient_resources(BackendKind::Metal, 1024);
-        let cuda = transient_resources(BackendKind::Cuda, 1024);
+        const BASE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+        const INPUT_BYTES: usize = 1024;
+        let host_preparation_bytes = BASE_WORKSPACE_BYTES + (INPUT_BYTES as u64 * 8);
+        let cpu = transient_resources(BackendKind::Cpu, INPUT_BYTES);
+        let metal = transient_resources(BackendKind::Metal, INPUT_BYTES);
+        let cuda = transient_resources(BackendKind::Cuda, INPUT_BYTES);
 
         assert!(cpu.is_fully_known());
         assert!(metal.is_fully_known());
         assert!(cuda.is_fully_known());
-        assert!(matches!(cpu.host_bytes, ResourceAmount::Known(value) if value > 0));
-        assert!(matches!(metal.unified_bytes, ResourceAmount::Known(value) if value > 0));
-        assert!(matches!(cuda.device_bytes, ResourceAmount::Known(value) if value > 0));
-        assert!(matches!(cuda.host_bytes, ResourceAmount::Known(value) if value > 0));
+        assert_eq!(
+            cpu.host_bytes,
+            ResourceAmount::Known(host_preparation_bytes)
+        );
+        assert_eq!(
+            metal.unified_bytes,
+            ResourceAmount::Known(host_preparation_bytes)
+        );
+        assert_eq!(
+            cuda.host_bytes,
+            ResourceAmount::Known(host_preparation_bytes)
+        );
+        assert_eq!(
+            cuda.device_bytes,
+            ResourceAmount::Known(BASE_WORKSPACE_BYTES)
+        );
     }
 
     #[test]
