@@ -24,7 +24,8 @@ use crate::tokenizer::Tokenizer;
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
 use network::{
-    resample_linear, NemotronEncodeProfile, NemotronNetwork, NemotronRnntStreamState,
+    default_realtime_state_shape, resample_linear, resample_linear_output_len,
+    NemotronEncodeProfile, NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntStreamState,
     NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
 
@@ -33,6 +34,11 @@ const DEFAULT_STRIP_LANG_TAGS: bool = true;
 const DEFAULT_MAX_AUDIO_SECONDS_HINT: f32 = 30.0;
 const STREAMING_FRAME_MS: usize = 80;
 const NEMOTRON_ASR_DTYPE_ENV: &str = "IZWI_NEMOTRON_ASR_DTYPE";
+const NEMOTRON_REALTIME_MAX_SECONDS_ENV: &str = "IZWI_NEMOTRON_REALTIME_MAX_SECONDS";
+const DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS: usize = 300;
+const CONSERVATIVE_DECODED_TOKEN_EXPANSION: usize = 4;
+const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
+const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 const SUPPORTED_TARGET_LANGS: &[&str] = &[
     "auto", "en-US", "en-GB", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "pt-PT",
     "nl-NL", "de-DE", "tr-TR", "ru-RU", "ar-AR", "hi-IN", "ja-JP", "ko-KR", "vi-VN", "uk-UA",
@@ -54,6 +60,15 @@ pub struct NemotronAsrDecodeStep {
     pub text: String,
     pub tokens_generated: usize,
     pub finished: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NemotronRealtimeResourceReservation {
+    pub max_samples: usize,
+    pub host_bytes: u64,
+    pub tensor_bytes: u64,
+    max_output_tokens: usize,
+    max_text_bytes: usize,
 }
 
 pub struct NemotronAsrModel {
@@ -135,6 +150,20 @@ impl NemotronDecoder {
             Self::HfTokenizer(_) => "huggingface_tokenizer",
             Self::ConfigLabels(_) => "config_labels",
             Self::Vocab(_) => "vocab_file",
+        }
+    }
+
+    fn max_token_bytes(&self) -> usize {
+        match self {
+            Self::HfTokenizer(tokenizer) => tokenizer
+                .vocab()
+                .keys()
+                .map(|token| token.len())
+                .max()
+                .unwrap_or(1),
+            Self::ConfigLabels(vocab) | Self::Vocab(vocab) => {
+                vocab.iter().map(String::len).max().unwrap_or(1)
+            }
         }
     }
 }
@@ -316,6 +345,7 @@ pub struct NemotronRealtimeStreamConfig {
     pub language: Option<String>,
     pub prompt: Option<String>,
     pub right_context_frames: Option<usize>,
+    pub max_samples: Option<usize>,
     pub emit_partials: bool,
 }
 
@@ -325,6 +355,7 @@ impl Default for NemotronRealtimeStreamConfig {
             language: None,
             prompt: None,
             right_context_frames: None,
+            max_samples: None,
             emit_partials: true,
         }
     }
@@ -365,6 +396,11 @@ impl NemotronRealtimeStreamConfig {
         self
     }
 
+    pub fn with_max_samples(mut self, max_samples: usize) -> Self {
+        self.max_samples = Some(max_samples);
+        self
+    }
+
     pub fn with_emit_partials(mut self, emit_partials: bool) -> Self {
         self.emit_partials = emit_partials;
         self
@@ -382,6 +418,7 @@ impl NemotronRealtimeStreamConfig {
                 .as_ref()
                 .is_some_and(|prompt| prompt.context_prompt.is_some()),
             "right_context_frames": self.right_context_frames,
+            "max_samples": self.max_samples,
             "emit_partials": self.emit_partials,
         })
     }
@@ -404,6 +441,8 @@ pub struct NemotronStreamingState {
     profile: NemotronStreamingProfile,
     prompt: NemotronPromptCondition,
     sample_rate: u32,
+    max_samples: usize,
+    max_text_bytes: usize,
     samples: Vec<f32>,
     buffered_samples: usize,
     consumed_samples: usize,
@@ -425,6 +464,8 @@ impl NemotronStreamingState {
         profile: NemotronStreamingProfile,
         prompt: NemotronPromptCondition,
         sample_rate: u32,
+        max_samples: usize,
+        max_text_bytes: usize,
     ) -> Self {
         let encoder_state = NemotronStreamingEncoderState::new(
             profile.left_context_frames,
@@ -434,6 +475,8 @@ impl NemotronStreamingState {
             profile,
             prompt,
             sample_rate,
+            max_samples,
+            max_text_bytes,
             samples: Vec::new(),
             buffered_samples: 0,
             consumed_samples: 0,
@@ -465,6 +508,10 @@ impl NemotronStreamingState {
 
     pub fn buffered_samples(&self) -> usize {
         self.buffered_samples
+    }
+
+    pub fn max_samples(&self) -> usize {
+        self.max_samples
     }
 
     pub fn consumed_samples(&self) -> usize {
@@ -511,9 +558,28 @@ impl NemotronStreamingState {
                 "Cannot push audio into a finalized Nemotron streaming state".to_string(),
             ));
         }
+        let next_samples = self.ensure_can_accept_samples(samples.len())?;
         self.samples.extend_from_slice(samples);
-        self.buffered_samples = self.buffered_samples.saturating_add(samples.len());
+        self.buffered_samples = next_samples;
         Ok(())
+    }
+
+    fn ensure_can_accept_samples(&self, additional_samples: usize) -> Result<usize> {
+        let next_samples = self
+            .buffered_samples
+            .checked_add(additional_samples)
+            .ok_or_else(|| {
+                Error::InvalidInput("Nemotron realtime stream sample count overflowed".to_string())
+            })?;
+        if next_samples > self.max_samples {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron realtime stream exceeds the configured limit of {} samples ({:.3} seconds at {} Hz)",
+                self.max_samples,
+                self.max_samples as f64 / self.sample_rate as f64,
+                self.sample_rate
+            )));
+        }
+        Ok(next_samples)
     }
 
     pub fn finish_input(&mut self) {
@@ -571,6 +637,8 @@ impl NemotronStreamingState {
             "profile": self.profile.diagnostics(),
             "prompt": self.prompt.diagnostics(),
             "sample_rate": self.sample_rate,
+            "max_samples": self.max_samples,
+            "max_duration_seconds": self.max_samples as f64 / self.sample_rate as f64,
             "buffered_samples": self.buffered_samples,
             "consumed_samples": self.consumed_samples,
             "chunks_processed": self.chunks_processed,
@@ -587,6 +655,177 @@ impl NemotronStreamingState {
 
 fn retained_capacity_bytes<T>(capacity: usize) -> Option<u64> {
     u64::try_from(capacity.checked_mul(std::mem::size_of::<T>())?).ok()
+}
+
+fn realtime_max_samples_for_seconds(sample_rate: u32, seconds: usize) -> Result<usize> {
+    if sample_rate == 0 || seconds == 0 {
+        return Err(Error::ConfigError(
+            "Nemotron realtime stream duration and sample rate must be greater than zero"
+                .to_string(),
+        ));
+    }
+    (sample_rate as usize).checked_mul(seconds).ok_or_else(|| {
+        Error::ConfigError("Nemotron realtime stream sample limit overflowed".to_string())
+    })
+}
+
+fn configured_realtime_max_samples(
+    sample_rate: u32,
+    max_samples_override: Option<usize>,
+) -> Result<usize> {
+    if let Some(max_samples) = max_samples_override {
+        if max_samples == 0 {
+            return Err(Error::ConfigError(
+                "Nemotron realtime stream max_samples must be greater than zero".to_string(),
+            ));
+        }
+        return Ok(max_samples);
+    }
+
+    let seconds = match std::env::var(NEMOTRON_REALTIME_MAX_SECONDS_ENV) {
+        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            Error::ConfigError(format!(
+                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must be a positive whole number of seconds"
+            ))
+        })?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::ConfigError(format!(
+                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must contain valid UTF-8"
+            )));
+        }
+    };
+    realtime_max_samples_for_seconds(sample_rate, seconds)
+}
+
+fn estimate_realtime_resource_reservation(
+    max_samples: usize,
+    max_decoder_token_bytes: usize,
+    profile: &NemotronStreamingProfile,
+    shape: NemotronRealtimeStateShape,
+    prompt: &NemotronPromptCondition,
+) -> Result<NemotronRealtimeResourceReservation> {
+    if max_samples == 0 || shape.hop_length == 0 || shape.subsampling_factor == 0 {
+        return Err(Error::ConfigError(
+            "Nemotron realtime resource shape contains a zero limit".to_string(),
+        ));
+    }
+
+    let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
+    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    let max_output_tokens = encoded_frames
+        .checked_mul(shape.max_symbols_per_frame)
+        .ok_or_else(realtime_reservation_overflow)?;
+    let decoded_token_bytes = max_decoder_token_bytes
+        .max(1)
+        .checked_mul(CONSERVATIVE_DECODED_TOKEN_EXPANSION)
+        .ok_or_else(realtime_reservation_overflow)?
+        .max(16);
+    let max_text_bytes = max_output_tokens
+        .checked_mul(decoded_token_bytes)
+        .ok_or_else(realtime_reservation_overflow)?;
+
+    let audio_capacity = conservative_vec_capacity(max_samples, 4)?;
+    let token_capacity = conservative_vec_capacity(max_output_tokens, 4)?;
+    let text_capacity = conservative_vec_capacity(max_text_bytes, 8)?;
+    let target_lang_capacity = conservative_vec_capacity(prompt.target_lang.len(), 8)?;
+    let context_prompt_capacity = conservative_vec_capacity(
+        prompt
+            .context_prompt
+            .as_deref()
+            .map(str::len)
+            .unwrap_or_default(),
+        8,
+    )?;
+
+    let mut host_bytes = REALTIME_HOST_FIXED_OVERHEAD_BYTES;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        checked_element_bytes(audio_capacity, std::mem::size_of::<f32>())?
+            .checked_mul(2)
+            .ok_or_else(realtime_reservation_overflow)?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        checked_element_bytes(token_capacity, std::mem::size_of::<usize>())?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        u64::try_from(text_capacity).map_err(|_| realtime_reservation_overflow())?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        u64::try_from(target_lang_capacity).map_err(|_| realtime_reservation_overflow())?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        u64::try_from(context_prompt_capacity).map_err(|_| realtime_reservation_overflow())?,
+    )?;
+
+    let feature_elements = checked_product(&[feature_frames, shape.feature_bins])?;
+    let pending_encoder_elements = checked_product(&[encoded_frames, shape.encoder_dim])?;
+    let layer_cache_frames = profile
+        .left_context_frames
+        .checked_add(shape.conv_kernel_size.saturating_sub(1))
+        .ok_or_else(realtime_reservation_overflow)?;
+    let layer_cache_elements =
+        checked_product(&[shape.encoder_layers, layer_cache_frames, shape.encoder_dim])?;
+    let predictor_state_tensors = shape
+        .predictor_layers
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(realtime_reservation_overflow)?;
+    let predictor_elements = checked_product(&[predictor_state_tensors, shape.predictor_hidden])?
+        .checked_add(shape.joint_hidden)
+        .ok_or_else(realtime_reservation_overflow)?;
+    let tensor_elements = feature_elements
+        .checked_add(pending_encoder_elements)
+        .and_then(|value| value.checked_add(layer_cache_elements))
+        .and_then(|value| value.checked_add(predictor_elements))
+        .ok_or_else(realtime_reservation_overflow)?;
+    let tensor_bytes = checked_element_bytes(tensor_elements, std::mem::size_of::<f32>())?;
+
+    Ok(NemotronRealtimeResourceReservation {
+        max_samples,
+        host_bytes,
+        tensor_bytes,
+        max_output_tokens,
+        max_text_bytes,
+    })
+}
+
+fn conservative_vec_capacity(length: usize, minimum_nonzero: usize) -> Result<usize> {
+    if length == 0 {
+        return Ok(0);
+    }
+    length
+        .checked_mul(2)
+        .map(|capacity| capacity.max(minimum_nonzero))
+        .ok_or_else(realtime_reservation_overflow)
+}
+
+fn checked_product(values: &[usize]) -> Result<usize> {
+    values.iter().try_fold(1usize, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or_else(realtime_reservation_overflow)
+    })
+}
+
+fn checked_element_bytes(elements: usize, element_size: usize) -> Result<u64> {
+    let bytes = elements
+        .checked_mul(element_size)
+        .ok_or_else(realtime_reservation_overflow)?;
+    u64::try_from(bytes).map_err(|_| realtime_reservation_overflow())
+}
+
+fn checked_add_bytes(left: u64, right: u64) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(realtime_reservation_overflow)
+}
+
+fn realtime_reservation_overflow() -> Error {
+    Error::ConfigError("Nemotron realtime resource reservation overflowed".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -848,15 +1087,115 @@ impl NemotronAsrModel {
         )
     }
 
+    pub fn realtime_stream_resource_reservation(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NemotronRealtimeResourceReservation> {
+        self.realtime_stream_resource_reservation_with_config(
+            &NemotronRealtimeStreamConfig::new()
+                .with_emit_partials(true)
+                .with_optional_language(language)
+                .with_optional_prompt(prompt)
+                .with_optional_right_context_frames(right_context_frames),
+        )
+    }
+
+    pub fn conservative_realtime_stream_resource_reservation(
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NemotronRealtimeResourceReservation> {
+        let prompt = NemotronPromptCondition::resolve(language, prompt)?;
+        let profile = NemotronStreamingProfile::new(56, right_context_frames.unwrap_or(13))?;
+        let max_samples = configured_realtime_max_samples(SAMPLE_RATE, None)?;
+        estimate_realtime_resource_reservation(
+            max_samples,
+            CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES,
+            &profile,
+            default_realtime_state_shape(),
+            &prompt,
+        )
+    }
+
+    fn realtime_stream_resource_reservation_with_config(
+        &self,
+        config: &NemotronRealtimeStreamConfig,
+    ) -> Result<NemotronRealtimeResourceReservation> {
+        let prompt = config.prompt_condition()?;
+        let profile = self.resolve_streaming_profile(config.right_context_frames)?;
+        let max_samples =
+            configured_realtime_max_samples(self.runtime_plan.sample_rate, config.max_samples)?;
+        estimate_realtime_resource_reservation(
+            max_samples,
+            self.decoder.max_token_bytes(),
+            &profile,
+            self.network.realtime_state_shape(),
+            &prompt,
+        )
+    }
+
     pub fn start_stream_state_with_config(
         &self,
         config: &NemotronRealtimeStreamConfig,
     ) -> Result<NemotronStreamingState> {
+        let reservation = self.realtime_stream_resource_reservation_with_config(config)?;
+        self.start_stream_state_with_config_and_reservation(config, reservation)
+    }
+
+    pub fn start_stream_state_with_reservation(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+        reservation: NemotronRealtimeResourceReservation,
+    ) -> Result<NemotronStreamingState> {
+        self.start_stream_state_with_config_and_reservation(
+            &NemotronRealtimeStreamConfig::new()
+                .with_emit_partials(true)
+                .with_optional_language(language)
+                .with_optional_prompt(prompt)
+                .with_optional_right_context_frames(right_context_frames),
+            reservation,
+        )
+    }
+
+    fn start_stream_state_with_config_and_reservation(
+        &self,
+        config: &NemotronRealtimeStreamConfig,
+        reservation: NemotronRealtimeResourceReservation,
+    ) -> Result<NemotronStreamingState> {
         let prompt = config.prompt_condition()?;
         let profile = self.resolve_streaming_profile(config.right_context_frames)?;
-        let rnnt_state = self.network.start_rnnt_stream()?;
+        let required_reservation = estimate_realtime_resource_reservation(
+            reservation.max_samples,
+            self.decoder.max_token_bytes(),
+            &profile,
+            self.network.realtime_state_shape(),
+            &prompt,
+        )?;
+        if reservation.host_bytes < required_reservation.host_bytes
+            || reservation.tensor_bytes < required_reservation.tensor_bytes
+            || reservation.max_output_tokens < required_reservation.max_output_tokens
+            || reservation.max_text_bytes < required_reservation.max_text_bytes
+        {
+            return Err(Error::InvalidInput(
+                "Nemotron realtime reservation is smaller than the loaded model's retained-state bound"
+                    .to_string(),
+            ));
+        }
+        let rnnt_state = self
+            .network
+            .start_rnnt_stream(reservation.max_output_tokens)?;
 
-        let mut state = NemotronStreamingState::new(profile, prompt, self.runtime_plan.sample_rate);
+        let mut state = NemotronStreamingState::new(
+            profile,
+            prompt,
+            self.runtime_plan.sample_rate,
+            reservation.max_samples,
+            reservation.max_text_bytes,
+        );
         state.attach_rnnt_state(rnnt_state);
         Ok(state)
     }
@@ -895,11 +1234,15 @@ impl NemotronAsrModel {
                 "Audio sample rate must be greater than zero".to_string(),
             ));
         }
+        let output_samples =
+            resample_linear_output_len(samples.len(), sample_rate, state.sample_rate);
+        state.ensure_can_accept_samples(output_samples)?;
         let samples = if sample_rate == state.sample_rate {
             samples.to_vec()
         } else {
             resample_linear(samples, sample_rate, state.sample_rate)
         };
+        debug_assert_eq!(samples.len(), output_samples);
         state.push_samples(&samples)?;
         self.decode_ready_stream_chunks(state)
     }
@@ -1039,8 +1382,15 @@ impl NemotronAsrModel {
                 )?;
                 state.emitted_tokens = decoded.stats.emitted_tokens;
                 let text = self.decoder.decode(&decoded.token_ids);
+                if text.len() > state.max_text_bytes {
+                    return Err(Error::InferenceError(format!(
+                        "Nemotron realtime decoder output exceeded its model-derived limit of {} bytes",
+                        state.max_text_bytes
+                    )));
+                }
                 let delta = text_delta(&state.assembled_text, &text);
-                state.assembled_text = text.clone();
+                state.assembled_text.clear();
+                state.assembled_text.push_str(&text);
                 if !delta.is_empty() || encoder_chunk.is_final {
                     let is_final = encoder_chunk.is_final;
                     state.final_event_emitted |= is_final;
@@ -1795,7 +2145,8 @@ mod tests {
         let config = NemotronRealtimeStreamConfig::new()
             .with_language("German")
             .with_prompt("medical dictation")
-            .with_right_context_frames(3);
+            .with_right_context_frames(3)
+            .with_max_samples(32_000);
 
         let prompt = config.prompt_condition().unwrap();
         let diagnostics = config.diagnostics();
@@ -1803,16 +2154,55 @@ mod tests {
         assert_eq!(prompt.target_lang, "de-DE");
         assert_eq!(prompt.context_prompt.as_deref(), Some("medical dictation"));
         assert_eq!(config.right_context_frames, Some(3));
+        assert_eq!(config.max_samples, Some(32_000));
         assert_eq!(diagnostics["target_lang"], "de-DE");
         assert_eq!(diagnostics["right_context_frames"], 3);
+        assert_eq!(diagnostics["max_samples"], 32_000);
         assert_eq!(diagnostics["emit_partials"], true);
+    }
+
+    #[test]
+    fn realtime_duration_limit_resolves_to_target_samples() {
+        assert_eq!(
+            realtime_max_samples_for_seconds(16_000, 300).unwrap(),
+            4_800_000
+        );
+        assert!(realtime_max_samples_for_seconds(16_000, 0).is_err());
+        assert!(realtime_max_samples_for_seconds(0, 300).is_err());
+    }
+
+    #[test]
+    fn realtime_resource_reservation_prices_model_state_growth() {
+        let profile = NemotronStreamingProfile::new(56, 3).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let shape = NemotronRealtimeStateShape {
+            feature_bins: 128,
+            hop_length: 160,
+            encoder_layers: 24,
+            encoder_dim: 1_024,
+            conv_kernel_size: 9,
+            subsampling_factor: 8,
+            predictor_hidden: 640,
+            predictor_layers: 2,
+            joint_hidden: 640,
+            max_symbols_per_frame: 10,
+        };
+
+        let reservation =
+            estimate_realtime_resource_reservation(16_000, 8, &profile, shape, &prompt).unwrap();
+
+        assert_eq!(reservation.max_samples, 16_000);
+        assert_eq!(reservation.max_output_tokens, 130);
+        assert_eq!(reservation.max_text_bytes, 4_160);
+        assert_eq!(reservation.host_bytes, 331_946);
+        assert_eq!(reservation.tensor_bytes, 6_411_264);
     }
 
     #[test]
     fn streaming_state_contract_does_not_claim_native_cache_before_wiring() {
         let profile = NemotronStreamingProfile::new(56, 3).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("auto"), None).unwrap();
-        let state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096);
         let diagnostics = state.diagnostics();
 
         assert_eq!(diagnostics["supports_realtime_cache_decode"], false);
@@ -1827,7 +2217,7 @@ mod tests {
     fn streaming_state_retains_audio_samples_for_native_pipeline() {
         let profile = NemotronStreamingProfile::new(56, 0).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
-        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096);
         let empty_bytes = state.session_cache_bytes().unwrap();
 
         state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
@@ -1845,10 +2235,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_state_rejects_sample_limit_without_mutation() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4, 4_096);
+        state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
+        let samples_before = state.samples.clone();
+        let buffered_before = state.buffered_samples();
+        let bytes_before = state.session_cache_bytes();
+
+        let err = state.push_samples(&[0.4, 0.5]).unwrap_err();
+
+        assert!(err.to_string().contains("configured limit of 4 samples"));
+        assert_eq!(state.samples, samples_before);
+        assert_eq!(state.buffered_samples(), buffered_before);
+        assert_eq!(state.session_cache_bytes(), bytes_before);
+    }
+
+    #[test]
     fn streaming_state_emits_non_overlapping_ready_chunks() {
         let profile = NemotronStreamingProfile::new(56, 1).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
-        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096);
 
         state.push_samples(&vec![0.0; 2_560]).unwrap();
         let first = state.next_ready_chunk().expect("first chunk");
@@ -1870,7 +2278,7 @@ mod tests {
     fn streaming_state_rejects_out_of_order_chunk_accounting() {
         let profile = NemotronStreamingProfile::new(56, 0).unwrap();
         let prompt = NemotronPromptCondition::resolve(None, None).unwrap();
-        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096);
         state.push_samples(&vec![0.0; 1_280]).unwrap();
 
         let mut chunk = state.next_ready_chunk().unwrap();

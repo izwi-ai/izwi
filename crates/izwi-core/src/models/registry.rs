@@ -25,7 +25,8 @@ use crate::models::architectures::lfm25_audio::{
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::nemotron::asr::{
-    NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput, NemotronStreamingState,
+    NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
+    NemotronRealtimeResourceReservation, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput,
@@ -566,6 +567,31 @@ pub enum NativeAsrRealtimeState {
     Nemotron(NemotronStreamingState),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAsrRealtimeResourceReservation {
+    Nemotron(NemotronRealtimeResourceReservation),
+}
+
+impl NativeAsrRealtimeResourceReservation {
+    pub fn max_samples(self) -> usize {
+        match self {
+            Self::Nemotron(reservation) => reservation.max_samples,
+        }
+    }
+
+    pub fn host_bytes(self) -> u64 {
+        match self {
+            Self::Nemotron(reservation) => reservation.host_bytes,
+        }
+    }
+
+    pub fn tensor_bytes(self) -> u64 {
+        match self {
+            Self::Nemotron(reservation) => reservation.tensor_bytes,
+        }
+    }
+}
+
 pub enum NativeDiarizationModel {
     Sortformer(SortformerDiarizerModel),
 }
@@ -1038,6 +1064,46 @@ impl NativeAsrModel {
         matches!(self, Self::Nemotron(_))
     }
 
+    pub fn conservative_realtime_stream_resource_reservation(
+        variant: ModelVariant,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NativeAsrRealtimeResourceReservation> {
+        if variant.family() != ModelFamily::NemotronAsr {
+            return Err(Error::InvalidInput(
+                "Realtime resource reservation is not available for this ASR model".to_string(),
+            ));
+        }
+        Ok(NativeAsrRealtimeResourceReservation::Nemotron(
+            NemotronAsrModel::conservative_realtime_stream_resource_reservation(
+                language,
+                prompt,
+                right_context_frames,
+            )?,
+        ))
+    }
+
+    pub fn realtime_stream_resource_reservation(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NativeAsrRealtimeResourceReservation> {
+        match self {
+            Self::Nemotron(model) => Ok(NativeAsrRealtimeResourceReservation::Nemotron(
+                model.realtime_stream_resource_reservation(
+                    language,
+                    prompt,
+                    right_context_frames,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "Realtime resource reservation is not available for this ASR model".to_string(),
+            )),
+        }
+    }
+
     pub fn start_realtime_stream_state(
         &self,
         language: Option<&str>,
@@ -1050,6 +1116,31 @@ impl NativeAsrModel {
             )),
             _ => Err(Error::InvalidInput(
                 "Realtime audio stream state is not available for this ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub fn start_realtime_stream_state_with_reservation(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+        reservation: NativeAsrRealtimeResourceReservation,
+    ) -> Result<NativeAsrRealtimeState> {
+        match (self, reservation) {
+            (
+                Self::Nemotron(model),
+                NativeAsrRealtimeResourceReservation::Nemotron(reservation),
+            ) => Ok(NativeAsrRealtimeState::Nemotron(
+                model.start_stream_state_with_reservation(
+                    language,
+                    prompt,
+                    right_context_frames,
+                    reservation,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "Realtime resource reservation does not match the loaded ASR model".to_string(),
             )),
         }
     }

@@ -23,6 +23,7 @@ const ENCODER_HEADS: usize = 8;
 const ENCODER_HEAD_DIM: usize = ENCODER_DIM / ENCODER_HEADS;
 const FF_DIM: usize = ENCODER_DIM * 4;
 const PRED_HIDDEN: usize = 640;
+const PRED_LAYERS: usize = 2;
 const JOINT_HIDDEN: usize = 640;
 const PROMPT_DIM: usize = 128;
 const PROMPT_HIDDEN: usize = 2048;
@@ -37,6 +38,35 @@ const PREEMPH: f32 = 0.97;
 const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
 const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NemotronRealtimeStateShape {
+    pub feature_bins: usize,
+    pub hop_length: usize,
+    pub encoder_layers: usize,
+    pub encoder_dim: usize,
+    pub conv_kernel_size: usize,
+    pub subsampling_factor: usize,
+    pub predictor_hidden: usize,
+    pub predictor_layers: usize,
+    pub joint_hidden: usize,
+    pub max_symbols_per_frame: usize,
+}
+
+pub(super) fn default_realtime_state_shape() -> NemotronRealtimeStateShape {
+    NemotronRealtimeStateShape {
+        feature_bins: N_MELS,
+        hop_length: HOP_LENGTH,
+        encoder_layers: ENCODER_LAYERS,
+        encoder_dim: ENCODER_DIM,
+        conv_kernel_size: CONV_KERNEL_1D,
+        subsampling_factor: SUBSAMPLING_FACTOR,
+        predictor_hidden: PRED_HIDDEN,
+        predictor_layers: PRED_LAYERS,
+        joint_hidden: JOINT_HIDDEN,
+        max_symbols_per_frame: DEFAULT_MAX_SYMBOLS_PER_FRAME,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct NemotronDecodeStats {
@@ -250,6 +280,13 @@ impl NemotronNetwork {
                     "Nemotron prompt dictionary does not contain target_lang '{target_lang}'"
                 ))
             })
+    }
+
+    pub(super) fn realtime_state_shape(&self) -> NemotronRealtimeStateShape {
+        NemotronRealtimeStateShape {
+            max_symbols_per_frame: self.max_symbols_per_frame,
+            ..default_realtime_state_shape()
+        }
     }
 
     pub(super) fn encode_with_prompt(
@@ -503,7 +540,10 @@ impl NemotronNetwork {
         })
     }
 
-    pub(super) fn start_rnnt_stream(&self) -> Result<NemotronRnntStreamState> {
+    pub(super) fn start_rnnt_stream(
+        &self,
+        max_output_tokens: usize,
+    ) -> Result<NemotronRnntStreamState> {
         let device = &self.preprocessor.device;
         let mut predictor_state = self.predictor.initial_state(1, device)?;
         let predictor_out = self
@@ -520,6 +560,7 @@ impl NemotronNetwork {
             predictor_out,
             predictor_projection,
             token_ids: Vec::new(),
+            max_output_tokens,
             stats: NemotronDecodeStats {
                 encoded_frames: 0,
                 emitted_tokens: 0,
@@ -594,6 +635,12 @@ impl NemotronNetwork {
                     )));
                 }
 
+                if state.token_ids.len() >= state.max_output_tokens {
+                    return Err(Error::InvalidInput(format!(
+                        "Nemotron realtime stream exceeded its model-derived output limit of {} tokens",
+                        state.max_output_tokens
+                    )));
+                }
                 state.token_ids.push(label);
                 new_token_ids.push(label);
                 on_token(label);
@@ -892,7 +939,7 @@ fn validate_inventory_for_forward(inventory: &NemotronConfigInventory) -> Result
         CONV_KERNEL_1D,
     )?;
     expect_dim("predictor_hidden", inventory.predictor_hidden, PRED_HIDDEN)?;
-    expect_dim("predictor_layers", inventory.predictor_layers, 2)?;
+    expect_dim("predictor_layers", inventory.predictor_layers, PRED_LAYERS)?;
     expect_dim("joint_hidden", inventory.joint_hidden, JOINT_HIDDEN)?;
     expect_dim("prompt_dim", inventory.prompt_dim, PROMPT_DIM)?;
     if inventory.vocab_size.is_none() {
@@ -997,6 +1044,7 @@ pub(super) struct NemotronRnntStreamState {
     predictor_out: Tensor,
     predictor_projection: Option<Tensor>,
     token_ids: Vec<usize>,
+    max_output_tokens: usize,
     stats: NemotronDecodeStats,
 }
 
@@ -2371,13 +2419,30 @@ impl Joint {
     }
 }
 
+pub(super) fn resample_linear_output_len(
+    input_samples: usize,
+    src_rate: u32,
+    dst_rate: u32,
+) -> usize {
+    if src_rate == dst_rate || input_samples < 2 {
+        return input_samples;
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return 0;
+    }
+
+    let numerator = (input_samples as u128) * u128::from(dst_rate);
+    let rounded = (numerator + u128::from(src_rate / 2)) / u128::from(src_rate);
+    usize::try_from(rounded.max(1)).unwrap_or(usize::MAX)
+}
+
 pub(super) fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if src_rate == dst_rate || audio.len() < 2 {
         return audio.to_vec();
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
+    let out_len = resample_linear_output_len(audio.len(), src_rate, dst_rate);
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = (i as f64) / ratio;
@@ -3247,7 +3312,7 @@ mod tests {
     #[test]
     fn rnnt_stream_state_accumulates_blank_stats_across_chunks() {
         let network = rnnt_test_network(vec![0.0, 0.0, 10.0], DEFAULT_MAX_SYMBOLS_PER_FRAME);
-        let mut state = network.start_rnnt_stream().unwrap();
+        let mut state = network.start_rnnt_stream(128).unwrap();
         let first = Tensor::zeros((1, 2, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
         let second = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
         let mut emitted = Vec::new();
@@ -3272,7 +3337,7 @@ mod tests {
     #[test]
     fn rnnt_stream_state_keeps_token_history_across_chunks() {
         let network = rnnt_test_network(vec![10.0, 0.0, 1.0], 2);
-        let mut state = network.start_rnnt_stream().unwrap();
+        let mut state = network.start_rnnt_stream(128).unwrap();
         let encoded = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
         let mut emitted = Vec::new();
 

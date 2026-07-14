@@ -4,16 +4,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
-use crate::engine::{AsrProgress, AsrProgressPhase, TaskType};
+use crate::engine::{AsrProgress, AsrProgressPhase, ResourceAmount, ResourceVector, TaskType};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
     parse_granite_speech_output, GraniteSpeechTask,
 };
 use crate::models::registry::{
-    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent, NativeAsrRealtimeState,
-    NativeAsrTranscription,
+    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
+    NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
 use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes, wav_duration_seconds_fast};
@@ -150,6 +151,45 @@ fn map_native_realtime_events(events: Vec<NativeAsrRealtimeEvent>) -> Vec<Runtim
         .collect()
 }
 
+fn realtime_stream_resource_vector(
+    backend: BackendKind,
+    host_bytes: u64,
+    tensor_bytes: u64,
+) -> Result<ResourceVector> {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resources.host_bytes =
+                ResourceAmount::Known(host_bytes.checked_add(tensor_bytes).ok_or_else(|| {
+                    Error::Overloaded("realtime ASR resource reservation overflowed".to_string())
+                })?);
+        }
+        BackendKind::Metal => {
+            resources.unified_bytes =
+                ResourceAmount::Known(host_bytes.checked_add(tensor_bytes).ok_or_else(|| {
+                    Error::Overloaded("realtime ASR resource reservation overflowed".to_string())
+                })?);
+        }
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(host_bytes);
+            resources.device_bytes = ResourceAmount::Known(tensor_bytes);
+        }
+    }
+    Ok(resources)
+}
+
+fn add_realtime_stream_reservation(
+    base: ResourceVector,
+    backend: BackendKind,
+    reservation: NativeAsrRealtimeResourceReservation,
+) -> Result<ResourceVector> {
+    base.checked_add(realtime_stream_resource_vector(
+        backend,
+        reservation.host_bytes(),
+        reservation.tensor_bytes(),
+    )?)
+}
+
 impl RuntimeService {
     pub async fn try_start_asr_realtime_stream(
         &self,
@@ -165,15 +205,21 @@ impl RuntimeService {
         let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Realtime);
         let metadata_bytes =
             language.map(str::len).unwrap_or_default() + prompt.map(str::len).unwrap_or_default();
-        let job = self
-            .coordinator
-            .admit(self.coordinator_job_for_input(
-                uuid::Uuid::new_v4().to_string(),
-                CoordinatorLane::Realtime,
-                context,
-                metadata_bytes,
-            ))
-            .await?;
+        let reservation = NativeAsrModel::conservative_realtime_stream_resource_reservation(
+            variant, language, prompt, None,
+        )?;
+        let mut job_spec = self.coordinator_job_for_input(
+            uuid::Uuid::new_v4().to_string(),
+            CoordinatorLane::Realtime,
+            context,
+            metadata_bytes,
+        );
+        job_spec.resources = add_realtime_stream_reservation(
+            job_spec.resources,
+            self.backend_context().backend_kind,
+            reservation,
+        )?;
+        let job = self.coordinator.admit(job_spec).await?;
         let lease = self.load_model_for_inference(variant).await?;
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
@@ -182,7 +228,12 @@ impl RuntimeService {
         if !model.supports_realtime_stream_decode() {
             return Ok(None);
         }
-        let state = model.start_realtime_stream_state(language, prompt, None)?;
+        let state = model.start_realtime_stream_state_with_reservation(
+            language,
+            prompt,
+            None,
+            reservation,
+        )?;
 
         Ok(Some(RuntimeAsrRealtimeStream {
             variant,
@@ -2474,6 +2525,23 @@ mod tests {
             resolve_asr_realtime_stream_variant(Some("not-a-real-model")),
             None
         );
+    }
+
+    #[test]
+    fn realtime_stream_reservation_routes_to_backend_memory_domains() {
+        let cpu = realtime_stream_resource_vector(BackendKind::Cpu, 11, 29).unwrap();
+        let metal = realtime_stream_resource_vector(BackendKind::Metal, 11, 29).unwrap();
+        let cuda = realtime_stream_resource_vector(BackendKind::Cuda, 11, 29).unwrap();
+
+        assert_eq!(cpu.host_bytes, ResourceAmount::Known(40));
+        assert_eq!(cpu.device_bytes, ResourceAmount::Known(0));
+        assert_eq!(cpu.unified_bytes, ResourceAmount::Known(0));
+        assert_eq!(metal.host_bytes, ResourceAmount::Known(0));
+        assert_eq!(metal.device_bytes, ResourceAmount::Known(0));
+        assert_eq!(metal.unified_bytes, ResourceAmount::Known(40));
+        assert_eq!(cuda.host_bytes, ResourceAmount::Known(11));
+        assert_eq!(cuda.device_bytes, ResourceAmount::Known(29));
+        assert_eq!(cuda.unified_bytes, ResourceAmount::Known(0));
     }
 
     #[test]
