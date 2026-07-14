@@ -1750,14 +1750,15 @@ impl NativeChatModel {
 
     pub fn session_cache_reservation_bytes(
         &self,
-        messages: &[ChatMessage],
+        prompt_tokens: usize,
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
     ) -> Result<u64> {
         match self {
-            Self::Qwen3(model) => model.session_cache_reservation_bytes(messages, max_new_tokens),
+            Self::Qwen3(model) => {
+                model.session_cache_reservation_bytes(prompt_tokens, max_new_tokens)
+            }
             Self::Qwen35(model) => {
-                model.session_cache_reservation_bytes(messages, max_new_tokens, config)
+                model.session_cache_reservation_bytes(prompt_tokens, max_new_tokens)
             }
             Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
                 "Loaded chat model does not expose incremental cache authorization".to_string(),

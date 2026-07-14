@@ -414,27 +414,15 @@ impl Qwen35ChatModel {
     /// Model-derived authorization for all retained incremental decode tensors.
     pub fn session_cache_reservation_bytes(
         &self,
-        messages: &[ChatMessage],
+        prompt_tokens: usize,
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
     ) -> Result<u64> {
-        let prompt_tokens = self.prepare_prompt(messages, config)?.prompt_ids.len();
-        let total_tokens = prompt_tokens
-            .checked_add(max_new_tokens.max(1))
-            .ok_or_else(|| Error::Overloaded("Qwen3.5 session token bound overflow".to_string()))?;
-        if total_tokens > self.text_config.context_length {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3.5 session requires {total_tokens} tokens but the model context is {}",
-                self.text_config.context_length
-            )));
-        }
-        qwen35_session_cache_upper_bound_bytes(
+        qwen35_session_cache_reservation_bytes(
             &self.text_config,
             self.tokenizer.vocab_size,
             prompt_tokens,
             max_new_tokens,
         )
-        .ok_or_else(|| Error::Overloaded("Qwen3.5 session cache bound overflow".to_string()))
     }
 
     pub fn generate(
@@ -765,6 +753,30 @@ impl Qwen35ChatModel {
             vision_inputs: Some(vision_inputs),
         })
     }
+}
+
+fn qwen35_session_cache_reservation_bytes(
+    cfg: &Qwen35TextConfig,
+    vocab_size: usize,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+) -> Result<u64> {
+    if prompt_tokens == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 cache authorization requires exact precomputed prompt tokens".to_string(),
+        ));
+    }
+    let total_tokens = prompt_tokens
+        .checked_add(max_new_tokens.max(1))
+        .ok_or_else(|| Error::Overloaded("Qwen3.5 session token bound overflow".to_string()))?;
+    if total_tokens > cfg.context_length {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3.5 session requires {total_tokens} tokens but the model context is {}",
+            cfg.context_length
+        )));
+    }
+    qwen35_session_cache_upper_bound_bytes(cfg, vocab_size, prompt_tokens, max_new_tokens)
+        .ok_or_else(|| Error::Overloaded("Qwen3.5 session cache bound overflow".to_string()))
 }
 
 fn qwen35_session_cache_upper_bound_bytes(
@@ -1617,11 +1629,21 @@ mod tests {
 
         let bound = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 32, 16).unwrap();
         let larger = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 64, 32).unwrap();
+        let authorized = qwen35_session_cache_reservation_bytes(&config, 32_000, 32, 16).unwrap();
         let cache_capacity = (32usize + 16).next_power_of_two() as u64;
         let one_kv_copy = 2u64 * cache_capacity * 4 * (64 + 64) * 4;
 
+        assert_eq!(authorized, bound);
         assert!(bound >= one_kv_copy * 2);
         assert!(larger > bound);
+        assert!(matches!(
+            qwen35_session_cache_reservation_bytes(&config, 32_000, 0, 16),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            qwen35_session_cache_reservation_bytes(&config, 32_000, 4_090, 16),
+            Err(Error::InvalidInput(message)) if message.contains("model context is 4096")
+        ));
     }
 
     fn local_metal_device() -> Option<DeviceProfile> {

@@ -405,12 +405,7 @@ impl ResourceAuthority {
         }
     }
 
-    fn resize(
-        &self,
-        id: ReservationId,
-        resources: ResourceVector,
-        allocation_already_materialized: bool,
-    ) -> Result<()> {
+    fn resize(&self, id: ReservationId, resources: ResourceVector) -> Result<()> {
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(
                 "resource resize contains an unresolved quantity".to_string(),
@@ -423,30 +418,30 @@ impl ResourceAuthority {
         let current = state.ledger.reservation(id).ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
-        if !allocation_already_materialized {
-            let materialized = state
-                .materialized
-                .get(&id)
-                .copied()
-                .unwrap_or_else(ResourceVector::zero);
-            let current_pending = current.positive_growth_over(materialized)?;
-            let next_pending = resources.positive_growth_over(materialized)?;
-            let other_pending = state.pending_resources()?.checked_sub(current_pending)?;
-            let live_claim = other_pending.checked_add(next_pending)?;
-            let physical = self.provider.snapshot();
-            if !live_claim.fits_within(physical.available) {
-                return Err(Error::Overloaded(
-                    "insufficient live physical capacity for resource lease growth".to_string(),
-                ));
-            }
+        let materialized = state
+            .materialized
+            .get(&id)
+            .copied()
+            .unwrap_or_else(ResourceVector::zero);
+        if !materialized.fits_within(resources) {
+            return Err(Error::InvalidInput(
+                "resource resize would shrink authorization below materialized usage".to_string(),
+            ));
+        }
+        let current_pending = current.positive_growth_over(materialized)?;
+        let next_pending = resources.positive_growth_over(materialized)?;
+        let other_pending = state.pending_resources()?.checked_sub(current_pending)?;
+        let live_claim = other_pending.checked_add(next_pending)?;
+        let physical = self.provider.snapshot();
+        if !live_claim.fits_within(physical.available) {
+            return Err(Error::Overloaded(
+                "insufficient live physical capacity for resource lease growth".to_string(),
+            ));
         }
         if !state.ledger.resize(id, resources)? {
             return Err(Error::InferenceError(
                 "resource lease disappeared during resize".to_string(),
             ));
-        }
-        if allocation_already_materialized {
-            state.materialized.insert(id, resources);
         }
         Ok(())
     }
@@ -497,22 +492,20 @@ impl ResourceLease {
         let id = self.id.ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
-        self.authority.resize(id, resources, false)?;
+        self.authority.resize(id, resources)?;
         self.resources = resources;
         Ok(())
     }
 
-    /// Reconcile a lease to a physical allocation that was just observed.
-    /// The allocation already contributes to the provider's used-memory
-    /// reading, so checking it again against live headroom would double-count
-    /// it. The total ledger ceiling remains enforced transactionally.
-    pub fn reconcile_materialized(&mut self, resources: ResourceVector) -> Result<()> {
+    /// Record a physical allocation that was just observed without changing
+    /// the authorization established before allocation. Observed usage must
+    /// fit within that authorization; callers must use `resize` before any
+    /// physical growth.
+    pub fn reconcile_materialized(&self, resources: ResourceVector) -> Result<()> {
         let id = self.id.ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
-        self.authority.resize(id, resources, true)?;
-        self.resources = resources;
-        Ok(())
+        self.authority.record_materialized_usage(id, resources)
     }
 
     /// Record the portion of this reservation that is physically allocated
@@ -665,7 +658,7 @@ mod tests {
             available: AtomicU64::new(10),
         });
         let authority = Arc::new(ResourceAuthority::new(provider.clone()));
-        let mut model = authority
+        let model = authority
             .reserve(
                 ReservationOwner::new(ReservationClass::Model, "model"),
                 slots(6),
@@ -776,7 +769,7 @@ mod tests {
             available: AtomicU64::new(40),
         });
         let authority = Arc::new(ResourceAuthority::new(provider.clone()));
-        let mut materialized = authority
+        let materialized = authority
             .reserve(
                 ReservationOwner::new(ReservationClass::Model, "materialized"),
                 slots(20),
@@ -843,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_growth_and_materialized_reconciliation_use_distinct_headroom_rules() {
+    fn materialized_reconciliation_cannot_expand_authorization_after_allocation() {
         let provider = Arc::new(LiveProvider {
             capacity: 10,
             available: AtomicU64::new(10),
@@ -861,15 +854,23 @@ mod tests {
         assert_eq!(cache.resources(), slots(2));
         assert_eq!(authority.snapshot().reserved, slots(2));
 
-        // The four units now represent an allocation already visible in the
-        // provider's one unit of live headroom, so reconciliation must not ask
-        // for the same physical capacity a second time.
-        cache.reconcile_materialized(slots(4)).unwrap();
-        assert_eq!(cache.resources(), slots(4));
-        assert_eq!(authority.snapshot().reserved, slots(4));
+        // Observation cannot retroactively authorize an allocation that was
+        // not reserved before physical growth, even if the provider now sees
+        // the allocation and reports less live headroom.
+        assert!(matches!(
+            cache.reconcile_materialized(slots(4)),
+            Err(Error::InferenceError(_))
+        ));
+        assert_eq!(cache.resources(), slots(2));
+        assert_eq!(authority.snapshot().reserved, slots(2));
 
-        cache.resize(slots(3)).unwrap();
-        assert_eq!(authority.snapshot().reserved, slots(3));
+        cache.reconcile_materialized(slots(2)).unwrap();
+        assert!(matches!(
+            cache.resize(slots(1)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(cache.resources(), slots(2));
+        assert_eq!(authority.snapshot().reserved, slots(2));
     }
 
     #[test]

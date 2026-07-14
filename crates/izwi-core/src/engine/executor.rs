@@ -656,31 +656,46 @@ impl NativeExecutor {
             {
                 continue;
             }
-            let authorized_bytes = self.authorized_session_cache_bytes(request)?;
             let session = item.session_key();
-            let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-                Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+            self.reserve_exact_session_cache(authority, &session, || {
+                self.authorized_session_cache_bytes(request)
             })?;
-            let reservation = reservations.entry(session.clone()).or_default();
-            let desired_bytes = authorized_bytes.max(reservation.reserved_bytes);
-            let growth = desired_bytes.saturating_sub(reservation.reserved_bytes);
-            if reservation.lease.is_none() {
-                reservation.lease = Some(authority.reserve(
-                    ReservationOwner::new(
-                        ReservationClass::Cache,
-                        format!("{}:{}", session.request_id, session.epoch),
-                    ),
-                    cache_resource_vector(self.config.backend, desired_bytes),
-                )?);
-            } else if growth > 0 {
-                reservation
-                    .lease
-                    .as_mut()
-                    .expect("cache lease checked above")
-                    .resize(cache_resource_vector(self.config.backend, desired_bytes))?;
-            }
-            reservation.reserved_bytes = desired_bytes;
         }
+        Ok(())
+    }
+
+    fn reserve_exact_session_cache(
+        &self,
+        authority: &Arc<ResourceAuthority>,
+        session: &SessionKey,
+        authorize: impl FnOnce() -> Result<u64>,
+    ) -> Result<()> {
+        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
+            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
+        })?;
+        if reservations.contains_key(session) {
+            return Ok(());
+        }
+
+        // Authorization is pure, but it remains under the exact-session map
+        // lock so concurrent executor entry cannot repeat it or double-reserve.
+        // Later decode steps reuse this lease until exact-session cleanup.
+        let authorized_bytes = authorize()?;
+        let lease = authority.reserve(
+            ReservationOwner::new(
+                ReservationClass::Cache,
+                format!("{}:{}", session.request_id, session.epoch),
+            ),
+            cache_resource_vector(self.config.backend, authorized_bytes),
+        )?;
+        reservations.insert(
+            session.clone(),
+            CacheResourceReservation {
+                reserved_bytes: authorized_bytes,
+                observed_blocks: 0,
+                lease: Some(lease),
+            },
+        );
         Ok(())
     }
 
@@ -693,18 +708,20 @@ impl NativeExecutor {
         })?;
         match request.task_type {
             super::types::TaskType::Chat => {
-                let messages = request.chat_messages.as_deref().ok_or_else(|| {
-                    Error::InvalidInput("Chat request is missing messages".to_string())
-                })?;
-                let generation_config = Self::chat_generation_config(request);
+                let prompt_tokens = request.prompt_tokens.len();
+                if prompt_tokens == 0 {
+                    return Err(Error::InvalidInput(format!(
+                        "Chat request {} is missing exact precomputed prompt tokens for cache authorization",
+                        request.id
+                    )));
+                }
                 self.with_registry(|registry| {
                     let model = registry.try_get_chat(variant).ok_or_else(|| {
                         Error::ModelNotFound(format!("Chat model {variant} is not loaded"))
                     })?;
                     model.session_cache_reservation_bytes(
-                        messages,
+                        prompt_tokens,
                         request.params.max_tokens.max(1),
-                        &generation_config,
                     )
                 })
             }
@@ -1245,6 +1262,7 @@ mod tests {
     use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
     use crate::model::ModelVariant;
     use base64::Engine;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
     #[derive(Debug)]
@@ -1374,6 +1392,75 @@ mod tests {
             assert_eq!(authority.snapshot().reservations, 0);
             assert_eq!(executor.cleanup_session(&session).released_sessions, 0);
         }
+    }
+
+    #[test]
+    fn cache_authorization_runs_once_per_exact_session_on_every_backend() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let capacity = cache_resource_vector(backend, 4096);
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity,
+            })));
+            let mut config = WorkerConfig::default();
+            config.backend = backend;
+            let executor = NativeExecutor::new(config);
+            let session = SessionKey::new("session".to_string(), 7);
+            let authorizations = AtomicUsize::new(0);
+
+            executor
+                .reserve_exact_session_cache(&authority, &session, || {
+                    authorizations.fetch_add(1, Ordering::Relaxed);
+                    Ok(1024)
+                })
+                .unwrap();
+            executor
+                .reserve_exact_session_cache(&authority, &session, || {
+                    authorizations.fetch_add(1, Ordering::Relaxed);
+                    Err(Error::InferenceError(
+                        "existing exact session must not be reauthorized".to_string(),
+                    ))
+                })
+                .unwrap();
+
+            assert_eq!(authorizations.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                authority.snapshot().reserved,
+                cache_resource_vector(backend, 1024)
+            );
+            assert_eq!(
+                executor
+                    .cache_resource_leases
+                    .lock()
+                    .unwrap()
+                    .get(&session)
+                    .unwrap()
+                    .reserved_bytes,
+                1024
+            );
+
+            let next_epoch = SessionKey::new("session".to_string(), 8);
+            executor
+                .reserve_exact_session_cache(&authority, &next_epoch, || {
+                    authorizations.fetch_add(1, Ordering::Relaxed);
+                    Ok(1024)
+                })
+                .unwrap();
+            assert_eq!(authorizations.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn chat_cache_authorization_requires_exact_precomputed_tokens() {
+        let executor = NativeExecutor::new(WorkerConfig::default());
+        let request =
+            EngineCoreRequest::chat(Vec::new()).with_model_variant(ModelVariant::Qwen306B);
+
+        let error = executor
+            .authorized_session_cache_bytes(&request)
+            .expect_err("estimated prompt length must not authorize physical cache");
+        assert!(error
+            .to_string()
+            .contains("missing exact precomputed prompt tokens"));
     }
 
     #[test]

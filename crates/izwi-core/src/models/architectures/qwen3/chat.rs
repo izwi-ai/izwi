@@ -487,9 +487,14 @@ impl Qwen3ChatModel {
     /// Model-derived authorization for all retained incremental decode tensors.
     pub fn session_cache_reservation_bytes(
         &self,
-        messages: &[ChatMessage],
+        prompt_tokens: usize,
         max_new_tokens: usize,
     ) -> Result<u64> {
+        if prompt_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 cache authorization requires exact precomputed prompt tokens".to_string(),
+            ));
+        }
         let text_model = match &self.backend {
             Qwen3ChatBackend::Native { text_model } => text_model,
             Qwen3ChatBackend::Gguf { gguf_file, .. } => {
@@ -498,7 +503,6 @@ impl Qwen3ChatModel {
                 )))
             }
         };
-        let prompt_tokens = self.build_prompt(messages)?.len();
         text_model
             .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
             .ok_or_else(|| Error::Overloaded("Qwen3 session cache bound overflow".to_string()))
