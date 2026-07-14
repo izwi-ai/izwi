@@ -43,7 +43,7 @@ use crate::backends::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
+use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
 use crate::models::registry::NativeChatModel;
 use crate::models::ModelRegistry;
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
@@ -737,8 +737,20 @@ impl NativeExecutor {
             }),
             super::types::TaskType::TTS => {
                 let params = Self::to_tts_params(request);
+                let text = request
+                    .text
+                    .as_deref()
+                    .ok_or_else(|| Error::InvalidInput("TTS request missing text".to_string()))?;
+                let reference = Self::reference_from_request(request)?;
                 self.with_qwen_model(Some(variant), |model| {
-                    model.session_cache_reservation_bytes(params.max_frames)
+                    model.session_cache_reservation_bytes(TtsSessionCacheRequest {
+                        text,
+                        reference: reference.as_ref(),
+                        language: request.language.as_deref(),
+                        instruct: request.voice_description.as_deref(),
+                        uses_preset_speaker: !model.available_speakers().is_empty(),
+                        max_frames: params.max_frames,
+                    })
                 })
             }
             super::types::TaskType::SpeechToSpeech => Err(Error::InvalidInput(

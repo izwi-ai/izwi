@@ -187,7 +187,9 @@ impl NativeExecutor {
         }
     }
 
-    fn reference_from_request(request: &EngineCoreRequest) -> Result<Option<SpeakerReference>> {
+    pub(super) fn reference_from_request(
+        request: &EngineCoreRequest,
+    ) -> Result<Option<SpeakerReference>> {
         if request.reference_audio.is_none() && request.reference_text.is_none() {
             return Ok(None);
         }
