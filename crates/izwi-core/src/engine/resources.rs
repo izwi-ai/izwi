@@ -450,6 +450,32 @@ impl ResourceAuthority {
         }
         Ok(())
     }
+
+    fn record_materialized_usage(
+        &self,
+        id: ReservationId,
+        resources: ResourceVector,
+    ) -> Result<()> {
+        if !resources.is_fully_known() {
+            return Err(Error::InvalidInput(
+                "materialized resource usage contains an unresolved quantity".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        let reserved = state.ledger.reservation(id).ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        if !resources.fits_within(reserved) {
+            return Err(Error::InferenceError(
+                "materialized resource usage exceeds its authorized reservation".to_string(),
+            ));
+        }
+        state.materialized.insert(id, resources);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -487,6 +513,15 @@ impl ResourceLease {
         self.authority.resize(id, resources, true)?;
         self.resources = resources;
         Ok(())
+    }
+
+    /// Record the portion of this reservation that is physically allocated
+    /// without relinquishing any of the capacity authorized for future growth.
+    pub fn record_materialized_usage(&self, resources: ResourceVector) -> Result<()> {
+        let id = self.id.ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        self.authority.record_materialized_usage(id, resources)
     }
 }
 
@@ -835,5 +870,40 @@ mod tests {
 
         cache.resize(slots(3)).unwrap();
         assert_eq!(authority.snapshot().reserved, slots(3));
+    }
+
+    #[test]
+    fn materialized_usage_preserves_authorized_future_growth() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 10,
+            available: AtomicU64::new(10),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let cache = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, "bounded-session"),
+                slots(8),
+            )
+            .unwrap();
+
+        provider.set_available(8);
+        cache.record_materialized_usage(slots(2)).unwrap();
+
+        assert_eq!(cache.resources(), slots(8));
+        assert_eq!(authority.snapshot().reserved, slots(8));
+        assert!(matches!(
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Request, "double-spend"),
+                slots(3),
+            ),
+            Err(Error::Overloaded(_))
+        ));
+
+        cache.record_materialized_usage(slots(8)).unwrap();
+        assert!(matches!(
+            cache.record_materialized_usage(slots(9)),
+            Err(Error::InferenceError(_))
+        ));
+        assert_eq!(authority.snapshot().reserved, slots(8));
     }
 }

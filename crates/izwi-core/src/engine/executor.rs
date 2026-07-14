@@ -796,11 +796,13 @@ impl NativeExecutor {
         let reservation = reservations.get_mut(&session).ok_or_else(|| {
             Error::InferenceError("cache allocation has no exact-session reservation".to_string())
         })?;
-        let lease = reservation.lease.as_mut().ok_or_else(|| {
+        let lease = reservation.lease.as_ref().ok_or_else(|| {
             Error::InferenceError("cache allocation has no physical resource lease".to_string())
         })?;
-        lease.reconcile_materialized(cache_resource_vector(self.config.backend, observed_bytes))?;
-        reservation.reserved_bytes = observed_bytes;
+        lease.record_materialized_usage(cache_resource_vector(
+            self.config.backend,
+            observed_bytes,
+        ))?;
         reservation.observed_blocks = scheduled.block_ids.len();
         Ok(observation)
     }
