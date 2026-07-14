@@ -155,6 +155,7 @@ impl ModelLifecycleController {
 
     async fn run_unload(self: Arc<Self>, variant: ModelVariant) -> Result<()> {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.supersede_registered_load_locked(variant, "explicit unload");
         self.unload_model_locked(variant).await
     }
 
@@ -191,6 +192,7 @@ impl ModelLifecycleController {
 
     async fn run_unload_all(self: Arc<Self>) -> Result<usize> {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.supersede_all_registered_loads_locked("explicit unload-all");
         let mut variants = self.authoritative_resident_variants();
         variants.extend(self.model_manager.resident_variants().await);
         variants.sort_by_key(|variant| variant.to_string());

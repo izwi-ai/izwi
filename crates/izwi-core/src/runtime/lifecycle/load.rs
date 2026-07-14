@@ -284,7 +284,7 @@ impl ModelLifecycleController {
         variant: ModelVariant,
         max_loaded_models: Option<usize>,
         leader: crate::runtime::lifecycle::controller::LoadLeader,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let controller = self.clone();
         tokio::spawn(async move {
             // Publication of both the Ready slot and the shared terminal
@@ -292,6 +292,9 @@ impl ModelLifecycleController {
             // neither erase a successful load before waiters are notified nor
             // observe a half-published failure rollback.
             let _mutation_guard = controller.mutation_gate.lock().await;
+            if !controller.is_current_load_generation_locked(variant, leader.generation) {
+                return;
+            }
             let _coordinator_load = match controller
                 .coordinator
                 .begin_model_load(format!("model-load:{variant}"))
@@ -333,7 +336,7 @@ impl ModelLifecycleController {
                 }
             };
             controller.finish_load_locked(variant, leader.generation, &leader.completion, outcome);
-        });
+        })
     }
 }
 
@@ -350,7 +353,7 @@ impl RuntimeService {
 
             let (waiter, leader) = self.model_lifecycle.join_or_start_load(variant);
             if let Some(leader) = leader {
-                self.model_lifecycle.spawn_load_transaction(
+                let _load_task = self.model_lifecycle.spawn_load_transaction(
                     variant,
                     self.max_loaded_models,
                     leader,
@@ -622,6 +625,142 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_unload_supersedes_registered_load_before_spawn() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "izwi-runtime-pre-gate-load-unload-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+
+        // Register the generation but deliberately delay spawning its detached
+        // transaction. This is the exact window where unload used to return
+        // before the stale task acquired the gate and published the model.
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let leader = leader.expect("registered load leader");
+        let stale_generation = leader.generation;
+
+        runtime
+            .unload_model(variant)
+            .await
+            .expect("explicit unload supersedes pending load");
+        {
+            let _mutation_guard = runtime.model_lifecycle.mutation_gate.lock().await;
+            runtime.model_lifecycle.finish_load_locked(
+                variant,
+                leader.generation,
+                &leader.completion,
+                SharedLoadOutcome::Ready,
+            );
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
+            .await
+            .expect("superseded waiter timed out")
+            .expect_err("superseded load must fail");
+        assert!(matches!(
+            error,
+            Error::Cancelled(message)
+                if message.contains("superseded by explicit unload")
+        ));
+
+        let stale_task = runtime.model_lifecycle.spawn_load_transaction(
+            variant,
+            runtime.max_loaded_models,
+            leader,
+        );
+        tokio::time::timeout(Duration::from_secs(1), stale_task)
+            .await
+            .expect("stale detached load timed out")
+            .expect("stale detached load task");
+
+        assert_eq!(runtime.model_lifecycle.resident_phase(variant), None);
+        assert!(!runtime.model_manager.is_ready(variant).await);
+        assert_eq!(runtime.coordinator.snapshot().active_model_loads, 0);
+
+        // Removal of the stale registration must allow a later request to own
+        // a new generation rather than coalescing with cancelled work.
+        let (retry_waiter, retry_leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let retry_leader = retry_leader.expect("new load generation after unload");
+        assert_ne!(retry_leader.generation, stale_generation);
+        {
+            let _mutation_guard = runtime.model_lifecycle.mutation_gate.lock().await;
+            runtime.model_lifecycle.finish_load_locked(
+                variant,
+                retry_leader.generation,
+                &retry_leader.completion,
+                SharedLoadOutcome::Failed(SharedLoadFailure::Cancelled("test cleanup".to_string())),
+            );
+        }
+        assert!(matches!(
+            retry_waiter.wait().await,
+            Err(Error::Cancelled(_))
+        ));
+
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unload_all_supersedes_every_registered_load_before_spawn() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "izwi-runtime-pre-gate-load-unload-all-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variants = [ModelVariant::Kokoro82M, ModelVariant::Qwen38BGguf];
+        let mut registrations = Vec::new();
+        for variant in variants {
+            let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+            registrations.push((variant, waiter, leader.expect("registered load leader")));
+        }
+
+        assert_eq!(
+            runtime
+                .unload_all_models()
+                .await
+                .expect("unload-all supersedes pending loads"),
+            0
+        );
+
+        for (variant, waiter, leader) in registrations {
+            let error = tokio::time::timeout(Duration::from_secs(1), waiter.wait())
+                .await
+                .expect("superseded unload-all waiter timed out")
+                .expect_err("superseded load must fail");
+            assert!(matches!(
+                error,
+                Error::Cancelled(message)
+                    if message.contains("superseded by explicit unload-all")
+            ));
+            let stale_task = runtime.model_lifecycle.spawn_load_transaction(
+                variant,
+                runtime.max_loaded_models,
+                leader,
+            );
+            tokio::time::timeout(Duration::from_secs(1), stale_task)
+                .await
+                .expect("stale unload-all load timed out")
+                .expect("stale unload-all task");
+            assert_eq!(runtime.model_lifecycle.resident_phase(variant), None);
+            assert!(!runtime.model_manager.is_ready(variant).await);
+        }
+        assert_eq!(runtime.coordinator.snapshot().active_model_loads, 0);
+
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_outcome_is_published_before_explicit_unload_enters_the_gate() {
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-load-publication-race-test-{}",
@@ -728,7 +867,7 @@ mod tests {
         runtime.model_lifecycle.set_load_test_panics(1);
 
         let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
-        runtime.model_lifecycle.spawn_load_transaction(
+        let _load_task = runtime.model_lifecycle.spawn_load_transaction(
             variant,
             runtime.max_loaded_models,
             leader.expect("load leader"),

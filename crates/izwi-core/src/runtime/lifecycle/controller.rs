@@ -348,6 +348,57 @@ impl ModelLifecycleController {
         )
     }
 
+    /// Check that a detached load still owns the registered generation after
+    /// acquiring the lifecycle mutation gate. An unload that acquired the
+    /// gate first removes the registration and publishes cancellation, fencing
+    /// the stale task before it can instantiate or publish model state.
+    pub(super) fn is_current_load_generation_locked(
+        &self,
+        variant: ModelVariant,
+        generation: u64,
+    ) -> bool {
+        self.state()
+            .loads
+            .get(&variant)
+            .is_some_and(|load| load.generation == generation)
+    }
+
+    /// Supersede one registered load while holding the lifecycle mutation
+    /// gate. If the load already owns the gate, the caller cannot reach this
+    /// method until that generation has published its terminal outcome.
+    pub(super) fn supersede_registered_load_locked(
+        &self,
+        variant: ModelVariant,
+        operation: &str,
+    ) -> bool {
+        let mut state = self.state();
+        let Some(load) = state.loads.remove(&variant) else {
+            return false;
+        };
+        load.completion.send_replace(Some(SharedLoadOutcome::Failed(
+            SharedLoadFailure::Cancelled(format!(
+                "model load {variant} was superseded by {operation}"
+            )),
+        )));
+        true
+    }
+
+    /// Supersede every registered load while holding the lifecycle mutation
+    /// gate. Later load requests receive a new generation and are not affected.
+    pub(super) fn supersede_all_registered_loads_locked(&self, operation: &str) -> usize {
+        let mut state = self.state();
+        let loads = std::mem::take(&mut state.loads);
+        let count = loads.len();
+        for (variant, load) in loads {
+            load.completion.send_replace(Some(SharedLoadOutcome::Failed(
+                SharedLoadFailure::Cancelled(format!(
+                    "model load {variant} was superseded by {operation}"
+                )),
+            )));
+        }
+        count
+    }
+
     /// Publish a terminal load outcome while the caller still owns the
     /// lifecycle mutation gate. This prevents unload from separating the Ready
     /// slot commit from the outcome observed by coalesced waiters.
@@ -358,13 +409,13 @@ impl ModelLifecycleController {
         completion: &watch::Sender<Option<SharedLoadOutcome>>,
         outcome: SharedLoadOutcome,
     ) {
-        completion.send_replace(Some(outcome));
         let mut state = self.state();
         if state
             .loads
             .get(&variant)
             .is_some_and(|load| load.generation == generation)
         {
+            completion.send_replace(Some(outcome));
             state.loads.remove(&variant);
         }
     }
