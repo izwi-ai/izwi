@@ -95,7 +95,7 @@ use crate::error::Result;
 use crate::model::ModelVariant;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tracing::{debug, info, warn};
 
 /// Main inference engine - the primary interface for audio generation.
@@ -106,6 +106,34 @@ struct RequestControl {
     session_epoch: SequenceId,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
     model_variant: Option<ModelVariant>,
+}
+
+struct CompletionMailbox {
+    registration_id: u64,
+    session_epoch: Option<SequenceId>,
+    sender: oneshot::Sender<EngineOutput>,
+}
+
+struct CompletionRegistration<'a> {
+    engine: &'a Engine,
+    request_id: RequestId,
+    registration_id: u64,
+}
+
+impl Drop for CompletionRegistration<'_> {
+    fn drop(&mut self) {
+        let mut mailboxes = self
+            .engine
+            .completion_mailboxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if mailboxes
+            .get(&self.request_id)
+            .is_some_and(|mailbox| mailbox.registration_id == self.registration_id)
+        {
+            mailboxes.remove(&self.request_id);
+        }
+    }
 }
 
 pub struct Engine {
@@ -125,6 +153,10 @@ pub struct Engine {
     wake_notify: Arc<Notify>,
     /// Session-fenced cooperative cancellation signals available without the core lock.
     request_controls: std::sync::Mutex<HashMap<RequestId, RequestControl>>,
+    /// Exact-session terminal outputs for synchronous public callers.
+    completion_mailboxes: std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>,
+    /// Distinguishes a cancelled registration from a later reuse of the public ID.
+    next_completion_registration: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -184,14 +216,110 @@ impl Engine {
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             wake_notify: Arc::new(Notify::new()),
             request_controls: std::sync::Mutex::new(HashMap::new()),
+            completion_mailboxes: std::sync::Mutex::new(HashMap::new()),
+            next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    /// Add a request to the engine for processing.
-    ///
-    /// The request will be validated, preprocessed, and added to the scheduler's
-    /// waiting queue. Returns a request ID that can be used to track the request.
-    pub async fn add_request(&self, request: EngineCoreRequest) -> Result<RequestId> {
+    fn register_completion_mailbox(
+        &self,
+        request_id: RequestId,
+    ) -> Result<(CompletionRegistration<'_>, oneshot::Receiver<EngineOutput>)> {
+        use std::collections::hash_map::Entry;
+        use std::sync::atomic::Ordering;
+
+        let registration_id = self
+            .next_completion_registration
+            .fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        let mut mailboxes = self
+            .completion_mailboxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match mailboxes.entry(request_id.clone()) {
+            Entry::Occupied(_) => {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "Request {request_id} already has a completion waiter"
+                )));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(CompletionMailbox {
+                    registration_id,
+                    session_epoch: None,
+                    sender,
+                });
+            }
+        }
+        drop(mailboxes);
+
+        Ok((
+            CompletionRegistration {
+                engine: self,
+                request_id,
+                registration_id,
+            },
+            receiver,
+        ))
+    }
+
+    fn bind_completion_mailbox(
+        &self,
+        request_id: &RequestId,
+        registration_id: u64,
+        session_epoch: SequenceId,
+    ) {
+        let mut mailboxes = self
+            .completion_mailboxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mailbox = mailboxes
+            .get_mut(request_id)
+            .filter(|mailbox| mailbox.registration_id == registration_id)
+            .expect("completion registration must remain live while its request is admitted");
+        mailbox.session_epoch = Some(session_epoch);
+    }
+
+    fn take_completion_sender(
+        &self,
+        session: &SessionKey,
+    ) -> Option<oneshot::Sender<EngineOutput>> {
+        let mut mailboxes = self
+            .completion_mailboxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let owns_session = mailboxes
+            .get(&session.request_id)
+            .is_some_and(|mailbox| mailbox.session_epoch == Some(session.epoch));
+        owns_session
+            .then(|| mailboxes.remove(&session.request_id))
+            .flatten()
+            .map(|mailbox| mailbox.sender)
+    }
+
+    fn resolve_generation_output(
+        request_id: &RequestId,
+        output: EngineOutput,
+    ) -> Result<EngineOutput> {
+        if output.request_id != *request_id {
+            return Err(crate::error::Error::InferenceError(format!(
+                "Completion mailbox for {request_id} received output for {}",
+                output.request_id
+            )));
+        }
+        if output.finish_reason == Some(types::FinishReason::Aborted) {
+            return Err(crate::error::Error::Cancelled(request_id.clone()));
+        }
+        if let Some(err) = output.error.clone() {
+            return Err(crate::error::Error::InferenceError(err));
+        }
+        Ok(output)
+    }
+
+    async fn add_request_with_completion(
+        &self,
+        request: EngineCoreRequest,
+        completion_registration: Option<u64>,
+    ) -> Result<RequestId> {
         // Validate and preprocess
         let mut processed = self.request_processor.process(request)?;
         let request_id = processed.id.clone();
@@ -199,7 +327,8 @@ impl Engine {
         let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
         processed.set_cancellation_signal(cancellation.clone());
 
-        // Add to engine core
+        // Add to engine core. The core write lock also makes binding a pending
+        // completion registration atomic with respect to every engine step.
         let mut core = self.core.write().await;
         core.add_request(processed)?;
         let session = core.get_session_key(&request_id).ok_or_else(|| {
@@ -218,48 +347,81 @@ impl Engine {
                     model_variant,
                 },
             );
+        if let Some(registration_id) = completion_registration {
+            self.bind_completion_mailbox(&request_id, registration_id, session.epoch);
+        }
         self.wake_notify.notify_one();
 
         debug!("Added request {} to engine", request_id);
         Ok(request_id)
     }
 
+    /// Add a request to the engine for processing.
+    ///
+    /// The request will be validated, preprocessed, and added to the scheduler's
+    /// waiting queue. Returns a request ID that can be used to track the request.
+    pub async fn add_request(&self, request: EngineCoreRequest) -> Result<RequestId> {
+        self.add_request_with_completion(request, None).await
+    }
+
     /// Generate audio synchronously (blocking until complete).
     ///
     /// This is a convenience method that adds a request and waits for completion.
     pub async fn generate(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
-        let request_id = self.add_request(request).await?;
+        let request_id = request.id.clone();
+        let (registration, mut completion) =
+            self.register_completion_mailbox(request_id.clone())?;
+        self.add_request_with_completion(request, Some(registration.registration_id))
+            .await?;
         let mut idle_backoff_ms = 1u64;
 
         // Run steps until this request completes
         loop {
-            let outputs = self.step().await?;
-            let step_was_idle = outputs.is_empty();
-
-            for output in outputs {
-                if output.request_id == request_id && output.is_finished {
-                    if output.finish_reason == Some(types::FinishReason::Aborted) {
-                        return Err(crate::error::Error::Cancelled(request_id));
-                    }
-                    if let Some(err) = output.error.clone() {
-                        return Err(crate::error::Error::InferenceError(err));
-                    }
-                    return Ok(output);
+            let outputs = tokio::select! {
+                biased;
+                completion = &mut completion => {
+                    let output = completion.map_err(|_| {
+                        crate::error::Error::InferenceError(format!(
+                            "Completion mailbox for {request_id} closed before delivery"
+                        ))
+                    })?;
+                    return Self::resolve_generation_output(&request_id, output);
                 }
-            }
+                outputs = self.step() => outputs?,
+            };
+            let step_was_idle = outputs.is_empty();
 
             // Check if request is still in the system
             let core = self.core.read().await;
             if !core.has_request(&request_id) && !core.has_pending_terminal_output(&request_id) {
-                return Err(crate::error::Error::InferenceError(format!(
-                    "Request {} was removed unexpectedly",
-                    request_id
-                )));
+                drop(core);
+                return match completion.try_recv() {
+                    Ok(output) => Self::resolve_generation_output(&request_id, output),
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        Err(crate::error::Error::InferenceError(format!(
+                            "Completion mailbox for {request_id} closed before delivery"
+                        )))
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        Err(crate::error::Error::InferenceError(format!(
+                            "Request {request_id} was removed unexpectedly"
+                        )))
+                    }
+                };
             }
             drop(core);
 
             if step_was_idle {
                 tokio::select! {
+                    biased;
+                    completion = &mut completion => {
+                        let output = completion.map_err(|_| {
+                            crate::error::Error::InferenceError(format!(
+                                "Completion mailbox for {request_id} closed before delivery"
+                            ))
+                        })?;
+                        return Self::resolve_generation_output(&request_id, output);
+                    }
                     _ = self.wake_notify.notified() => {},
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(idle_backoff_ms)) => {},
                 }
@@ -302,13 +464,43 @@ impl Engine {
     pub async fn step(&self) -> Result<Vec<EngineOutput>> {
         let mut core = self.core.write().await;
         let outputs = core.step().await?;
+
+        // Keep every await before terminal dispatch. Once a completion sender
+        // is notified, routing and exact-session acknowledgement must finish
+        // synchronously so cancelling a competing generate future cannot leave
+        // the delivery half-committed.
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_steps += 1;
+            metrics.requests_processed += outputs.len() as u64;
+        }
+
         if outputs.iter().any(|output| output.is_finished) {
-            let mut controls = self
-                .request_controls
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
             for output in &outputs {
                 if output.is_finished {
+                    let session = SessionKey::new(output.request_id.clone(), output.sequence_id);
+                    if let Some(sender) = self.take_completion_sender(&session) {
+                        // A dropped receiver is a completed routing attempt: no
+                        // live caller remains, so the public ID must not stay
+                        // fenced forever.
+                        let _ = sender.send(output.clone());
+                    }
+
+                    // Acknowledge only after the exact-session mailbox has been
+                    // routed (or the output has been placed in this step's
+                    // return batch for callers without a mailbox).
+                    if !core.acknowledge_terminal_output(&session) {
+                        warn!(
+                            request_id = %session.request_id,
+                            session_epoch = session.epoch,
+                            "Terminal output had no matching delivery fence"
+                        );
+                    }
+
+                    let mut controls = self
+                        .request_controls
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
                     let owns_output = controls
                         .get(&output.request_id)
                         .is_some_and(|control| control.session_epoch == output.sequence_id);
@@ -317,13 +509,6 @@ impl Engine {
                     }
                 }
             }
-        }
-
-        // Update metrics
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.total_steps += 1;
-            metrics.requests_processed += outputs.len() as u64;
         }
 
         Ok(outputs)
@@ -631,6 +816,103 @@ mod tests {
         }
     }
 
+    struct ImmediateTerminalExecutor {
+        max_batch_width: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ImmediateTerminalExecutor {
+        fn new(max_batch_width: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { max_batch_width }
+        }
+
+        fn outputs(&self, scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
+            use std::sync::atomic::Ordering;
+
+            self.max_batch_width
+                .fetch_max(scheduled.len(), Ordering::Relaxed);
+            scheduled
+                .iter()
+                .map(|entry| {
+                    ExecutorStepResult::new(
+                        entry,
+                        ExecutorOutput {
+                            request_id: entry.request_id.clone(),
+                            audio: None,
+                            text: Some(format!("done-{}", entry.request_id)),
+                            input_transcription: None,
+                            tokens_processed: entry.num_tokens.max(1),
+                            tokens_generated: 1,
+                            finished: true,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                        },
+                    )
+                    .with_dispatch(BatchDispatch::new(
+                        BatchDispatchKind::TensorStatic,
+                        scheduled.len(),
+                    ))
+                })
+                .collect()
+        }
+    }
+
+    impl ModelExecutor for ImmediateTerminalExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            profile.prefill_batch = NativeBatchMode::Static;
+            profile.decode_batch = NativeBatchMode::Static;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = 8;
+            profile.resolved_from_loaded_model = true;
+            Some(profile)
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.outputs(scheduled))
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.outputs(scheduled))
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> executor::CacheReleaseReport {
+            executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
+    fn immediate_terminal_request(id: &str) -> EngineCoreRequest {
+        let mut request = EngineCoreRequest::tts(format!("terminal output for {id}"));
+        request.id = id.to_string();
+        request.prompt_tokens = vec![1];
+        request
+    }
+
     fn engine_with_test_executor(executor: Box<dyn ModelExecutor>) -> Engine {
         let config = EngineCoreConfig::default();
         let core = EngineCore::new_with_unified_executor(
@@ -647,6 +929,8 @@ mod tests {
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             wake_notify: Arc::new(Notify::new()),
             request_controls: std::sync::Mutex::new(HashMap::new()),
+            completion_mailboxes: std::sync::Mutex::new(HashMap::new()),
+            next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -655,6 +939,140 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_generate_callers_receive_their_own_batched_terminal_output() {
+        let max_batch_width = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            ImmediateTerminalExecutor::new(max_batch_width.clone()),
+        )));
+
+        // Hold the core until both generate futures have installed their
+        // mailboxes and queued admission. Tokio's fair write lock then admits
+        // both requests before either caller can enter its first engine step.
+        let admission_gate = engine.core.write().await;
+        let first_engine = engine.clone();
+        let first = tokio::spawn(async move {
+            first_engine
+                .generate(immediate_terminal_request("generate-first"))
+                .await
+        });
+        let second_engine = engine.clone();
+        let second = tokio::spawn(async move {
+            second_engine
+                .generate(immediate_terminal_request("generate-second"))
+                .await
+        });
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                let mailbox_count = engine
+                    .completion_mailboxes
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .len();
+                if mailbox_count == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both generate callers must register before admission opens");
+        drop(admission_gate);
+
+        let first = tokio::time::timeout(tokio::time::Duration::from_secs(1), first)
+            .await
+            .expect("first generate timed out")
+            .expect("first generate task panicked")
+            .expect("first generation failed");
+        let second = tokio::time::timeout(tokio::time::Duration::from_secs(1), second)
+            .await
+            .expect("second generate timed out")
+            .expect("second generate task panicked")
+            .expect("second generation failed");
+
+        assert_eq!(first.request_id, "generate-first");
+        assert_eq!(first.text.as_deref(), Some("done-generate-first"));
+        assert_eq!(second.request_id, "generate-second");
+        assert_eq!(second.text.as_deref(), Some("done-generate-second"));
+        assert_eq!(
+            max_batch_width.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the regression requires both terminal outputs in one shared step"
+        );
+        assert!(
+            engine
+                .completion_mailboxes
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "terminal routing must consume both exact-session mailboxes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_dispatches_batched_terminal_outputs_to_registered_mailboxes() {
+        let max_batch_width = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            ImmediateTerminalExecutor::new(max_batch_width.clone()),
+        )));
+        let first_request = immediate_terminal_request("run-first");
+        let second_request = immediate_terminal_request("run-second");
+
+        let (first_registration, first_completion) = engine
+            .register_completion_mailbox(first_request.id.clone())
+            .unwrap();
+        engine
+            .add_request_with_completion(
+                first_request,
+                Some(first_registration.registration_id),
+            )
+            .await
+            .unwrap();
+        let (second_registration, second_completion) = engine
+            .register_completion_mailbox(second_request.id.clone())
+            .unwrap();
+        engine
+            .add_request_with_completion(
+                second_request,
+                Some(second_registration.registration_id),
+            )
+            .await
+            .unwrap();
+
+        let run_engine = engine.clone();
+        let runner = tokio::spawn(async move { run_engine.run().await });
+        let (first, second) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            async { tokio::join!(first_completion, second_completion) },
+        )
+        .await
+        .expect("run loop did not route both completions");
+        engine.stop();
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), runner)
+            .await
+            .expect("run loop did not stop")
+            .expect("run task panicked")
+            .expect("run loop failed");
+
+        let first = first.expect("first mailbox closed");
+        let second = second.expect("second mailbox closed");
+        assert_eq!(first.request_id, "run-first");
+        assert_eq!(second.request_id, "run-second");
+        assert_eq!(
+            max_batch_width.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "run must route every output from the shared terminal batch"
+        );
+
+        // Exact-session acknowledgement happens after the mailboxes are routed,
+        // so the public ID is reusable once delivery completes.
+        engine
+            .add_request(immediate_terminal_request("run-first"))
+            .await
+            .expect("delivered session must release its public ID fence");
+        engine.abort_all_requests().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

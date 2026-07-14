@@ -1372,7 +1372,6 @@ impl EngineCore {
                 self.request_start_times.remove(&request_id);
                 self.request_phase_timings.remove(&request_id);
                 self.clear_exact_execution_state(&session);
-                self.scheduler.mark_terminal_delivered(&session);
                 debug!("Finished request {}", request_id);
             }
 
@@ -1380,6 +1379,15 @@ impl EngineCore {
         }
 
         Ok(outputs)
+    }
+
+    /// Confirm that a terminal output has been routed outside the core.
+    ///
+    /// The exact scheduler session remains fenced after [`Self::step`] returns
+    /// its terminal output. Callers must acknowledge that same session only
+    /// after placing the output in their delivery channel or return batch.
+    pub fn acknowledge_terminal_output(&mut self, session: &super::SessionKey) -> bool {
+        self.scheduler.mark_terminal_delivered(session)
     }
 
     /// Check if there's pending work.
@@ -2353,6 +2361,14 @@ mod tests {
         assert_eq!(
             core.scheduler
                 .pending_release_confirmation_required(&aborted_session),
+            Some(true),
+            "the delivered batch remains fenced until its outer consumer routes it"
+        );
+        assert!(core.add_request(aborted.clone()).is_err());
+        assert!(core.acknowledge_terminal_output(&aborted_session));
+        assert_eq!(
+            core.scheduler
+                .pending_release_confirmation_required(&aborted_session),
             None
         );
 
@@ -2396,6 +2412,11 @@ mod tests {
         );
         assert_eq!(outputs[0].error.as_deref(), Some("request cancelled"));
 
+        assert!(
+            core.add_request(second.clone()).is_err(),
+            "returning a terminal output must not acknowledge delivery inside the core"
+        );
+        assert!(core.acknowledge_terminal_output(&first_session));
         core.add_request(second).unwrap();
         let second_session = core.get_session_key(&"reused".to_string()).unwrap();
         assert_ne!(first_session.epoch, second_session.epoch);
