@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use candle_core::DeviceLocation;
@@ -777,13 +777,17 @@ fn known_memory_bytes(amount: ResourceAmount) -> u64 {
 }
 
 // Admission calls the provider while the shared resource-authority ledger is
-// locked. Keep that path to a cache lookup and a non-blocking refresh signal;
-// slow or wedged OS/device probes are isolated to the single sampler worker.
-// A short stale window coalesces bursts, then capacity becomes unknown so
-// admission fails closed until a successful refresh arrives.
+// locked. Keep fresh and bounded-stale reads to a cache lookup; slow or wedged
+// OS/device probes are isolated to the single sampler worker. After hard-stale
+// expiry, admission waits once for that worker under a strict bound and fails
+// closed if no successful refresh arrives.
 const CAPACITY_SAMPLE_FRESH_FOR: Duration = Duration::from_millis(250);
 const CAPACITY_SAMPLE_MAX_STALE: Duration = Duration::from_secs(1);
 const CAPACITY_SAMPLE_RETRY_AFTER: Duration = Duration::from_millis(250);
+// macOS capacity sampling runs two commands with individual 250 ms deadlines.
+// Keep admission bounded beyond their combined worst case while CUDA/CPU probes
+// remain isolated on the same sampler thread.
+const CAPACITY_REFRESH_WAIT: Duration = Duration::from_millis(550);
 
 #[cfg(target_os = "macos")]
 const CAPACITY_COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
@@ -804,6 +808,7 @@ struct CapacitySampleState {
 #[derive(Debug)]
 struct CapacitySampleCache {
     state: Mutex<CapacitySampleState>,
+    refreshed: Condvar,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -823,6 +828,7 @@ impl CapacitySampleCache {
                 last_attempt: Some(now),
                 refresh_in_flight: false,
             }),
+            refreshed: Condvar::new(),
         }
     }
 
@@ -865,6 +871,42 @@ impl CapacitySampleCache {
             });
         }
         state.refresh_in_flight = false;
+        drop(state);
+        self.refreshed.notify_all();
+    }
+
+    /// Wait for an already-isolated refresh only when hard-stale expiry left no
+    /// usable snapshot. The caller remains fail-closed if the probe fails,
+    /// disconnects, or does not finish within the bounded wait.
+    fn wait_for_refresh(&self, timeout: Duration) -> Option<PhysicalCapacitySnapshot> {
+        let deadline = Instant::now().checked_add(timeout)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            let now = Instant::now();
+            let snapshot = state
+                .sample
+                .filter(|sample| {
+                    now.checked_duration_since(sample.sampled_at)
+                        .is_some_and(|age| age <= CAPACITY_SAMPLE_MAX_STALE)
+                })
+                .map(|sample| sample.snapshot);
+            if snapshot.is_some() || !state.refresh_in_flight {
+                return snapshot;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next_state, _wait) = self
+                .refreshed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = next_state;
+        }
     }
 }
 
@@ -1056,6 +1098,7 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
         }
         decision
             .snapshot
+            .or_else(|| self.cache.wait_for_refresh(CAPACITY_REFRESH_WAIT))
             .unwrap_or_else(|| self.probe.unavailable_snapshot())
     }
 }
@@ -1239,7 +1282,6 @@ impl Drop for ExecutionLease {
 mod tests {
     use super::*;
     use crate::engine::ResourceVector;
-    use std::sync::Condvar;
 
     #[derive(Debug)]
     struct MutableCapacityProvider {
@@ -1681,6 +1723,86 @@ Pages free: 10.\n";
         let concurrent = cache.decision(expired_at + Duration::from_millis(1));
         assert_eq!(concurrent.snapshot, None);
         assert!(!concurrent.request_refresh);
+    }
+
+    #[test]
+    fn capacity_cache_waits_for_successful_refresh_after_hard_stale_expiry() {
+        let now = Instant::now();
+        let started = now
+            .checked_sub(CAPACITY_SAMPLE_MAX_STALE + Duration::from_millis(1))
+            .unwrap();
+        let initial = host_capacity_snapshot(100);
+        let refreshed = host_capacity_snapshot(40);
+        let cache = Arc::new(CapacitySampleCache::new(Some(initial), started));
+        let decision = cache.decision(now);
+        assert_eq!(decision.snapshot, None);
+        assert!(decision.request_refresh);
+
+        let worker_cache = cache.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            worker_cache.finish_refresh(Some(refreshed), Instant::now());
+        });
+        let snapshot = cache.wait_for_refresh(Duration::from_secs(1));
+        worker.join().unwrap();
+
+        assert_eq!(snapshot, Some(refreshed));
+    }
+
+    #[test]
+    fn capacity_cache_failed_refresh_wakes_waiters_and_remains_fail_closed() {
+        let now = Instant::now();
+        let started = now
+            .checked_sub(CAPACITY_SAMPLE_MAX_STALE + Duration::from_millis(1))
+            .unwrap();
+        let initial = host_capacity_snapshot(100);
+        let cache = Arc::new(CapacitySampleCache::new(Some(initial), started));
+        let decision = cache.decision(now);
+        assert_eq!(decision.snapshot, None);
+        assert!(decision.request_refresh);
+
+        let worker_cache = cache.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            worker_cache.finish_refresh(None, Instant::now());
+        });
+        let snapshot = cache.wait_for_refresh(Duration::from_secs(1));
+        worker.join().unwrap();
+
+        assert_eq!(snapshot, None);
+    }
+
+    #[test]
+    fn capacity_provider_waits_for_queued_refresh_instead_of_false_unavailable() {
+        let now = Instant::now();
+        let started = now
+            .checked_sub(CAPACITY_SAMPLE_MAX_STALE + Duration::from_millis(1))
+            .unwrap();
+        let initial = host_capacity_snapshot(100);
+        let refreshed = host_capacity_snapshot(40);
+        let cache = Arc::new(CapacitySampleCache::new(Some(initial), started));
+        let (refresh, requests) = std::sync::mpsc::sync_channel(1);
+        let worker_cache = cache.clone();
+        let worker = std::thread::spawn(move || {
+            requests.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            worker_cache.finish_refresh(Some(refreshed), Instant::now());
+        });
+        let provider = DeviceCapacityProvider {
+            probe: DeviceCapacityProbe {
+                backend: BackendKind::Cpu,
+                device: None,
+                configured_cap: None,
+                test_capacity: None,
+            },
+            cache,
+            refresh: Some(refresh),
+        };
+
+        let snapshot = provider.snapshot();
+        worker.join().unwrap();
+
+        assert_eq!(snapshot, refreshed);
     }
 
     #[test]
