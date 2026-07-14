@@ -59,6 +59,26 @@ run_core_scheduler_regressions() {
     done
 }
 
+run_server_scheduler_regressions() {
+    local features="${1:-}"
+    local cargo_args=(--locked -p izwi-server --lib)
+    local suites=(
+        saturated_chat_stream
+        saturated_stream_emits_explicit_terminal_error
+        terminal_events_wait_for_capacity_and_preserve_order
+        http_shutdown_
+    )
+
+    if [[ -n "${features}" ]]; then
+        cargo_args+=(--features "${features}")
+    fi
+
+    for suite in "${suites[@]}"; do
+        echo "Running izwi-server ${suite} regressions"
+        cargo test "${cargo_args[@]}" "${suite}"
+    done
+}
+
 smoke_cuda_device_if_available() {
     local cuda_features="$1"
 
@@ -241,6 +261,7 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
     run_core_scheduler_regressions
+    run_server_scheduler_regressions
 }
 
 run_cargo_metal() {
@@ -253,7 +274,9 @@ run_cargo_metal() {
 
     cargo check --locked -p izwi-core --features metal
     cargo check --locked -p izwi-cli --features metal
+    cargo check --locked -p izwi-server
     run_core_scheduler_regressions metal
+    run_server_scheduler_regressions
 }
 
 run_cargo_cuda() {
@@ -272,6 +295,7 @@ run_cargo_cuda() {
     cargo check --locked -p izwi-cli --features "${cuda_features}"
     cargo check --locked -p izwi-server --features "${cuda_features}"
     run_core_scheduler_regressions "${cuda_features}"
+    run_server_scheduler_regressions "${cuda_features}"
     smoke_cuda_device_if_available "${cuda_features}"
 }
 

@@ -7,8 +7,6 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use tracing::warn;
-
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, ModelVariant};
 use crate::error::{Error, Result};
@@ -21,7 +19,6 @@ const EXECUTION_ROLLOUT_OVERRIDES_ENV: &str = "IZWI_EXECUTION_ROLLOUT_OVERRIDES"
 pub(crate) enum ExecutionRolloutMode {
     #[default]
     Off,
-    Shadow,
     Static,
     Continuous,
 }
@@ -30,10 +27,13 @@ impl ExecutionRolloutMode {
     fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" => Ok(Self::Off),
-            "shadow" => Ok(Self::Shadow),
             "static" => Ok(Self::Static),
+            "shadow" => Err(Error::InvalidInput(
+                "Shadow execution rollout is not implemented; use `off` or an exact model@backend=static override"
+                    .to_string(),
+            )),
             "continuous" => Err(Error::InvalidInput(
-                "Continuous execution rollout is not implemented; use `off`, `shadow`, or an exact model@backend=static override"
+                "Continuous execution rollout is not implemented; use `off` or an exact model@backend=static override"
                     .to_string(),
             )),
             value => Err(Error::InvalidInput(format!(
@@ -68,18 +68,12 @@ pub(crate) struct ExecutionRolloutPolicy {
 }
 
 impl ExecutionRolloutPolicy {
-    /// Reads rollout configuration without ever enabling execution on invalid
-    /// input. Callers that need diagnostics can use `try_from_raw` directly.
-    pub(crate) fn from_env() -> Self {
+    /// Read rollout configuration fail-closed. Invalid production
+    /// configuration is a startup error rather than a silently ignored typo.
+    pub(crate) fn from_env() -> Result<Self> {
         let default = std::env::var(EXECUTION_ROLLOUT_ENV).ok();
         let overrides = std::env::var(EXECUTION_ROLLOUT_OVERRIDES_ENV).ok();
-        match Self::try_from_raw(default.as_deref(), overrides.as_deref()) {
-            Ok(policy) => policy,
-            Err(err) => {
-                warn!(error = %err, "Ignoring invalid execution rollout configuration");
-                Self::default()
-            }
-        }
+        Self::try_from_raw(default.as_deref(), overrides.as_deref())
     }
 
     pub(crate) fn try_from_raw(default: Option<&str>, overrides: Option<&str>) -> Result<Self> {
@@ -89,7 +83,7 @@ impl ExecutionRolloutPolicy {
             .unwrap_or_default();
         if default.executes() {
             return Err(Error::InvalidInput(
-                "Execution rollout defaults may only be `off` or `shadow`; static and continuous execution require exact model@backend overrides"
+                "Execution rollout defaults may only be `off`; static execution requires exact model@backend overrides"
                     .to_string(),
             ));
         }
@@ -183,10 +177,6 @@ mod tests {
         assert!(!ExecutionRolloutMode::Off.executes());
         assert!(!ExecutionRolloutMode::Off.continuous_batching());
 
-        assert!(ExecutionRolloutMode::Shadow.observes());
-        assert!(!ExecutionRolloutMode::Shadow.executes());
-        assert!(!ExecutionRolloutMode::Shadow.continuous_batching());
-
         assert!(ExecutionRolloutMode::Static.observes());
         assert!(ExecutionRolloutMode::Static.executes());
         assert!(!ExecutionRolloutMode::Static.continuous_batching());
@@ -199,14 +189,14 @@ mod tests {
     #[test]
     fn exact_model_backend_override_wins_over_default() {
         let policy = ExecutionRolloutPolicy::try_from_raw(
-            Some("shadow"),
+            Some("off"),
             Some("Qwen3-0.6B@metal=static"),
         )
         .expect("valid rollout policy");
 
         assert_eq!(
             policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cpu),
-            ExecutionRolloutMode::Shadow
+            ExecutionRolloutMode::Off
         );
         assert_eq!(
             policy.mode_for(ModelVariant::Qwen306B, BackendKind::Metal),
@@ -214,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cuda),
-            ExecutionRolloutMode::Shadow
+            ExecutionRolloutMode::Off
         );
     }
 
@@ -222,6 +212,7 @@ mod tests {
     fn malformed_configuration_cannot_enable_execution() {
         for (default, overrides) in [
             (Some("enabled"), None),
+            (Some("shadow"), None),
             (Some("static"), None),
             (Some("continuous"), None),
             (Some("off"), Some("Qwen3-0.6B@cuda=enabled")),

@@ -286,7 +286,7 @@ impl RuntimeService {
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
-        let execution_rollout = ExecutionRolloutPolicy::from_env();
+        let execution_rollout = ExecutionRolloutPolicy::from_env()?;
         worker_config.static_tensor_batch_variants = Arc::new(
             ModelVariant::all()
                 .iter()

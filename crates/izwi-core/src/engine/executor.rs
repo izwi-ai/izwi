@@ -197,10 +197,17 @@ impl WorkerConfig {
         num_threads: usize,
         override_value: Option<usize>,
     ) -> usize {
+        // Candle's Metal path is intentionally serialized in dispatch. Do not
+        // let an environment override inflate coordinator capacity beyond what
+        // the executor can actually run concurrently.
+        if backend == BackendKind::Metal {
+            return 1;
+        }
         let default_parallelism = match backend {
             // CPU workloads already use `num_threads` for BLAS/Rayon/intra-op work, so
             // keep inter-request fan-out conservative unless explicitly overridden.
-            BackendKind::Cpu | BackendKind::Metal => 1,
+            BackendKind::Cpu => 1,
+            BackendKind::Metal => unreachable!("Metal is clamped above"),
             BackendKind::Cuda => num_threads.max(1),
         };
 
@@ -1290,6 +1297,10 @@ mod tests {
         assert_eq!(
             WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, Some(3)),
             3
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, Some(3)),
+            1
         );
     }
 
