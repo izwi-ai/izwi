@@ -22,12 +22,12 @@ use crate::engine::{
     engine_request_parallel_batches_total, engine_stream_backpressure_total,
     engine_tensor_batch_max_width, engine_tensor_batches_total, Engine as CoreEngine,
     EngineCoreConfig, EngineCoreRequest, EngineOutput, OutputFinishReason, ResourceAmount,
-    ResourceLease, ResourceVector, SessionKey, StreamingOutput, TaskType, WorkerConfig,
-    WorkloadClass, ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
-    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
@@ -45,6 +45,7 @@ use crate::runtime::broker::{
 use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobSpec,
 };
+use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::rollout::ExecutionRolloutPolicy;
 use crate::runtime::routing::RouteSource;
@@ -151,8 +152,8 @@ pub struct RuntimeService {
     pub(crate) adapter_registry: RuntimeAdapterRegistry,
     pub(crate) model_manager: Arc<ModelManager>,
     pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) tokenizer: RwLock<Option<Tokenizer>>,
-    pub(crate) codec: RwLock<AudioCodec>,
+    pub(crate) tokenizer: Arc<RwLock<Option<Tokenizer>>>,
+    pub(crate) codec: Arc<RwLock<AudioCodec>>,
     #[allow(dead_code)]
     pub(crate) streaming_config: StreamingConfig,
     pub(crate) core_engine: Arc<CoreEngine>,
@@ -162,11 +163,9 @@ pub struct RuntimeService {
     step_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     step_driver_wakeup: Arc<Notify>,
     step_driver_started: AtomicBool,
-    pub(crate) loaded_tts_variant: RwLock<Option<ModelVariant>>,
+    pub(crate) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(crate) max_loaded_models: Option<usize>,
-    pub(crate) model_last_used: Arc<Mutex<HashMap<ModelVariant, u64>>>,
-    pub(crate) model_load_lock: Mutex<()>,
-    pub(crate) model_resource_leases: Mutex<HashMap<ModelVariant, ResourceLease>>,
+    pub(crate) model_lifecycle: Arc<ModelLifecycleController>,
     pub(crate) device: DeviceProfile,
 }
 
@@ -307,16 +306,31 @@ impl RuntimeService {
         )?);
         worker_config.resource_authority = Some(coordinator.resource_authority());
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
+        let backend_router = BackendRouter::from_context(backend_context);
+        let tokenizer = Arc::new(RwLock::new(None));
+        let codec = Arc::new(RwLock::new(AudioCodec::new()));
+        let loaded_tts_variant = Arc::new(RwLock::new(None));
+        let model_lifecycle = Arc::new(ModelLifecycleController::new(
+            config.clone(),
+            backend_router.clone(),
+            model_manager.clone(),
+            model_registry.clone(),
+            core_engine.clone(),
+            coordinator.clone(),
+            tokenizer.clone(),
+            codec.clone(),
+            loaded_tts_variant.clone(),
+        ));
 
         Ok(Self {
             config,
-            backend_router: BackendRouter::from_context(backend_context),
+            backend_router,
             inference_broker: InferenceBroker::from_env(),
             adapter_registry: RuntimeAdapterRegistry::built_in(),
             model_manager,
             model_registry,
-            tokenizer: RwLock::new(None),
-            codec: RwLock::new(AudioCodec::new()),
+            tokenizer,
+            codec,
             streaming_config: StreamingConfig::default(),
             core_engine,
             coordinator,
@@ -325,11 +339,9 @@ impl RuntimeService {
             step_driver_task: Mutex::new(None),
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
-            loaded_tts_variant: RwLock::new(None),
+            loaded_tts_variant,
             max_loaded_models: positive_usize_env("IZWI_MAX_LOADED_MODELS"),
-            model_last_used: Arc::new(Mutex::new(HashMap::new())),
-            model_load_lock: Mutex::new(()),
-            model_resource_leases: Mutex::new(HashMap::new()),
+            model_lifecycle,
             device,
         })
     }
@@ -360,21 +372,6 @@ impl RuntimeService {
     /// Snapshot of inference broker rollout state.
     pub(crate) fn inference_broker_snapshot(&self) -> InferenceBrokerSnapshot {
         self.inference_broker.snapshot()
-    }
-
-    /// Acquire a model residency lease for active runtime work.
-    ///
-    /// Phase 4 keeps this as observable scaffolding; unload/eviction enforcement
-    /// is introduced only after direct model paths are fully wrapped.
-    pub(crate) fn acquire_model_residency_lease(
-        &self,
-        variant: ModelVariant,
-    ) -> ModelResidencyLease {
-        self.model_manager.acquire_residency_lease(variant)
-    }
-
-    pub(crate) fn active_model_residency_leases(&self, variant: ModelVariant) -> usize {
-        self.model_manager.active_residency_leases(variant)
     }
 
     pub fn record_stage_observation(&self, observation: RuntimeStageObservation) {
@@ -543,7 +540,10 @@ impl RuntimeService {
     pub async fn available_speakers(&self) -> Result<Vec<String>> {
         let variant = (*self.loaded_tts_variant.read().await)
             .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
-        let _lease = self.acquire_model_residency_lease(variant);
+        let _lease = self
+            .model_lifecycle
+            .try_acquire_ready_lease(variant)
+            .ok_or_else(|| Error::InferenceError("No TTS model loaded".to_string()))?;
 
         match variant.family() {
             crate::catalog::ModelFamily::Qwen3Tts => {
