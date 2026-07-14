@@ -190,8 +190,9 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
-    /// Typed terminal events created outside executor dispatch (for example an
-    /// explicit cancellation) and delivered by the next engine step.
+    /// Durable typed terminal events created outside a committed executor
+    /// result (for example cancellation, deadline expiry, or failed
+    /// preemption) and delivered by the next successful engine step.
     pending_terminal_outputs: VecDeque<CommittedExecutorOutput>,
     /// Consecutive retryable executor failures for each exact session.
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
@@ -1039,8 +1040,6 @@ impl EngineCore {
             self.initialize().await?;
         }
 
-        let mut terminal_outputs: Vec<_> = self.pending_terminal_outputs.drain(..).collect();
-
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
         self.kv_cache.maintenance()?;
@@ -1060,7 +1059,6 @@ impl EngineCore {
             self.attempt_pending_release_cleanup(&session).await;
         }
 
-        let mut preemption_failures = Vec::new();
         for session in &schedule_result.preempted_requests {
             let release = self.executor.cleanup_session(session).await;
             if release.confirmed {
@@ -1079,13 +1077,14 @@ impl EngineCore {
                 self.record_unconfirmed_cleanup(session);
                 self.requests.remove(&session.request_id);
                 let message = "executor could not confirm physical cache release during preemption";
-                preemption_failures.push(CommittedExecutorOutput {
-                    session: session.clone(),
-                    output: ExecutorOutput::error(session.request_id.clone(), message),
-                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
-                        message,
-                    )),
-                });
+                self.pending_terminal_outputs
+                    .push_back(CommittedExecutorOutput {
+                        session: session.clone(),
+                        output: ExecutorOutput::error(session.request_id.clone(), message),
+                        disposition: ExecutionDisposition::Failed(
+                            ExecutionFailure::invalid_output(message),
+                        ),
+                    });
             }
             self.clear_exact_execution_state(session);
             self.request_phase_timings
@@ -1093,16 +1092,16 @@ impl EngineCore {
                 .and_modify(|timing| *timing = RequestPhaseTiming::default());
         }
 
-        terminal_outputs.extend(preemption_failures);
         for request in &schedule_result.expired_requests {
-            terminal_outputs.push(CommittedExecutorOutput {
-                session: request.session_key(),
-                output: ExecutorOutput::terminal(request.request_id.clone()),
-                disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
-            });
+            self.pending_terminal_outputs
+                .push_back(CommittedExecutorOutput {
+                    session: request.session_key(),
+                    output: ExecutorOutput::terminal(request.request_id.clone()),
+                    disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                });
         }
 
-        if !schedule_result.has_execution_work() && terminal_outputs.is_empty() {
+        if !schedule_result.has_execution_work() && self.pending_terminal_outputs.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -1145,7 +1144,7 @@ impl EngineCore {
 
         if prefill_request_refs.is_empty()
             && decode_request_refs.is_empty()
-            && terminal_outputs.is_empty()
+            && self.pending_terminal_outputs.is_empty()
         {
             return Ok(Vec::new());
         }
@@ -1241,7 +1240,7 @@ impl EngineCore {
         decode_outputs.append(&mut prefill_outputs);
         let executor_results = decode_outputs;
         let mut executor_outputs =
-            Vec::with_capacity(executor_results.len() + terminal_outputs.len());
+            Vec::with_capacity(executor_results.len() + self.pending_terminal_outputs.len());
         for result in executor_results {
             let step_time_ms = if decode_ids.contains(&result.session.request_id) {
                 decode_step_ms
@@ -1252,7 +1251,10 @@ impl EngineCore {
                 executor_outputs.push(committed);
             }
         }
-        executor_outputs.append(&mut terminal_outputs);
+        // Terminal events are a durable outbox until all fallible work for the
+        // step has completed. Draining earlier can lose an abort/deadline event
+        // when maintenance or execution-plan preparation returns an error.
+        executor_outputs.extend(self.pending_terminal_outputs.drain(..));
 
         // Phase 3: Process outputs
         let mut outputs = Vec::new();
@@ -2271,6 +2273,100 @@ mod tests {
         assert!(cleanup_attempts >= 2, "cleanup was not retried");
         assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
         assert!(core.add_request(request).is_err());
+    }
+
+    #[tokio::test]
+    async fn aborted_terminal_output_survives_plan_failure_until_successful_delivery() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(events, true)));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                min_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 4,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+
+        let mut aborted = EngineCoreRequest::tts("durable terminal outbox");
+        aborted.id = "durable-abort".to_string();
+        aborted.prompt_tokens = vec![1];
+        core.add_request(aborted.clone()).unwrap();
+        core.step().await.unwrap();
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+
+        let aborted_session = core.get_session_key(&aborted.id).unwrap();
+        assert!(core.abort_request_session(&aborted_session).await);
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
+        assert!(core.has_pending_terminal_output(&aborted.id));
+        assert!(core.add_request(aborted.clone()).is_err());
+
+        let mut plan_fault = EngineCoreRequest::tts("force plan validation failure");
+        plan_fault.id = "plan-fault".to_string();
+        plan_fault.prompt_tokens = vec![2];
+        core.add_request(plan_fault.clone()).unwrap();
+        let plan_fault_session = core.get_session_key(&plan_fault.id).unwrap();
+        core.execution_trackers.insert(
+            plan_fault.id.clone(),
+            ExecutionTracker::new(super::super::SessionKey::new(
+                plan_fault.id.clone(),
+                plan_fault_session.epoch + 1,
+            )),
+        );
+
+        let error = core.step().await.expect_err("plan preparation must fail");
+        assert!(error
+            .to_string()
+            .contains("already has a different active session"));
+        assert!(core.has_pending_terminal_output(&aborted.id));
+        assert_eq!(
+            core.scheduler
+                .pending_release_confirmation_required(&aborted_session),
+            Some(true)
+        );
+        assert!(core.add_request(aborted.clone()).is_err());
+
+        core.execution_trackers.remove(&plan_fault.id);
+        assert!(core
+            .scheduler
+            .release_execution_quantum_for_retry(&plan_fault_session));
+        let retry_outputs = core.step().await.unwrap();
+        let aborted_outputs: Vec<_> = retry_outputs
+            .iter()
+            .filter(|output| output.request_id == aborted.id)
+            .collect();
+        assert_eq!(aborted_outputs.len(), 1);
+        assert_eq!(aborted_outputs[0].sequence_id, aborted_session.epoch);
+        assert_eq!(
+            aborted_outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert!(!core.has_pending_terminal_output(&aborted.id));
+        assert_eq!(
+            core.scheduler
+                .pending_release_confirmation_required(&aborted_session),
+            None
+        );
+
+        let later_outputs = core.step().await.unwrap();
+        assert!(later_outputs
+            .iter()
+            .all(|output| output.request_id != aborted.id));
+        core.add_request(aborted).unwrap();
+        assert_ne!(
+            core.get_session_key(&"durable-abort".to_string())
+                .unwrap()
+                .epoch,
+            aborted_session.epoch
+        );
     }
 
     #[tokio::test]
