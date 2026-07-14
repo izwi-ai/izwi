@@ -229,10 +229,12 @@ impl Engine {
     /// This is a convenience method that adds a request and waits for completion.
     pub async fn generate(&self, request: EngineCoreRequest) -> Result<EngineOutput> {
         let request_id = self.add_request(request).await?;
+        let mut idle_backoff_ms = 1u64;
 
         // Run steps until this request completes
         loop {
             let outputs = self.step().await?;
+            let step_was_idle = outputs.is_empty();
 
             for output in outputs {
                 if output.request_id == request_id && output.is_finished {
@@ -248,11 +250,22 @@ impl Engine {
 
             // Check if request is still in the system
             let core = self.core.read().await;
-            if !core.has_request(&request_id) {
+            if !core.has_request(&request_id) && !core.has_pending_terminal_output(&request_id) {
                 return Err(crate::error::Error::InferenceError(format!(
                     "Request {} was removed unexpectedly",
                     request_id
                 )));
+            }
+            drop(core);
+
+            if step_was_idle {
+                tokio::select! {
+                    _ = self.wake_notify.notified() => {},
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(idle_backoff_ms)) => {},
+                }
+                idle_backoff_ms = idle_backoff_ms.saturating_mul(2).min(50);
+            } else {
+                idle_backoff_ms = 1;
             }
         }
     }
@@ -296,7 +309,12 @@ impl Engine {
                 .unwrap_or_else(|poison| poison.into_inner());
             for output in &outputs {
                 if output.is_finished {
-                    controls.remove(&output.request_id);
+                    let owns_output = controls
+                        .get(&output.request_id)
+                        .is_some_and(|control| control.session_epoch == output.sequence_id);
+                    if owns_output {
+                        controls.remove(&output.request_id);
+                    }
                 }
             }
         }
@@ -319,6 +337,7 @@ impl Engine {
 
         self.running.store(true, Ordering::SeqCst);
         info!("Engine started");
+        let mut idle_backoff_ms = 1u64;
 
         while self.running.load(Ordering::SeqCst) {
             // Check if there are requests to process
@@ -328,8 +347,21 @@ impl Engine {
             };
 
             if has_work {
-                if let Err(e) = self.step().await {
-                    warn!("Engine step error: {}", e);
+                match self.step().await {
+                    Ok(outputs) if outputs.is_empty() => {
+                        tokio::select! {
+                            _ = self.wake_notify.notified() => {},
+                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(idle_backoff_ms)) => {},
+                        }
+                        idle_backoff_ms = idle_backoff_ms.saturating_mul(2).min(50);
+                    }
+                    Ok(_) => idle_backoff_ms = 1,
+                    Err(e) => {
+                        warn!("Engine step error: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(idle_backoff_ms))
+                            .await;
+                        idle_backoff_ms = idle_backoff_ms.saturating_mul(2).min(50);
+                    }
                 }
             } else {
                 // Event-driven wait to avoid hot polling on local/edge devices.
@@ -337,6 +369,7 @@ impl Engine {
                     _ = self.wake_notify.notified() => {},
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {},
                 }
+                idle_backoff_ms = 1;
             }
         }
 
@@ -381,11 +414,13 @@ impl Engine {
         }
         let mut core = self.core.write().await;
         let aborted = core.abort_request(request_id).await;
+        drop(core);
         if aborted {
             self.request_controls
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .remove(request_id);
+            self.wake_notify.notify_one();
         }
         Ok(aborted)
     }
@@ -411,11 +446,20 @@ impl Engine {
         }
         let mut core = self.core.write().await;
         let aborted = core.abort_request_session(session).await;
+        drop(core);
         if aborted {
-            self.request_controls
+            let mut controls = self
+                .request_controls
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .remove(&session.request_id);
+                .unwrap_or_else(|poison| poison.into_inner());
+            if controls
+                .get(&session.request_id)
+                .is_some_and(|control| control.session_epoch == session.epoch)
+            {
+                controls.remove(&session.request_id);
+            }
+            drop(controls);
+            self.wake_notify.notify_one();
         }
         Ok(aborted)
     }
@@ -441,6 +485,9 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .retain(|_, control| control.model_variant != Some(variant));
+        if !aborted.is_empty() {
+            self.wake_notify.notify_one();
+        }
         aborted
     }
 
@@ -463,6 +510,9 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clear();
+        if !aborted.is_empty() {
+            self.wake_notify.notify_one();
+        }
         aborted
     }
 
@@ -505,13 +555,139 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use super::scheduler::ScheduledRequest;
     use super::*;
+    use crate::backends::BackendKind;
+    use crate::error::Error;
+
+    struct EndlessSequenceExecutor;
+
+    impl EndlessSequenceExecutor {
+        fn outputs(scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
+            scheduled
+                .iter()
+                .map(|entry| {
+                    ExecutorStepResult::new(
+                        entry,
+                        ExecutorOutput {
+                            request_id: entry.request_id.clone(),
+                            audio: None,
+                            text: None,
+                            input_transcription: None,
+                            tokens_processed: usize::from(entry.is_prefill) * entry.num_tokens,
+                            tokens_generated: usize::from(!entry.is_prefill),
+                            finished: false,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+
+    impl ModelExecutor for EndlessSequenceExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            Some(profile)
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(Self::outputs(scheduled))
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(Self::outputs(scheduled))
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> executor::CacheReleaseReport {
+            executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
+    fn engine_with_test_executor(executor: Box<dyn ModelExecutor>) -> Engine {
+        let config = EngineCoreConfig::default();
+        let core = EngineCore::new_with_unified_executor(
+            config.clone(),
+            executor::UnifiedExecutor::new_for_test(executor),
+        )
+        .unwrap();
+        Engine {
+            core: Arc::new(RwLock::new(core)),
+            request_processor: RequestProcessor::new(config.clone()),
+            output_processor: OutputProcessor::new(config.sample_rate),
+            config,
+            running: std::sync::atomic::AtomicBool::new(false),
+            metrics: Arc::new(RwLock::new(EngineMetrics::default())),
+            wake_notify: Arc::new(Notify::new()),
+            request_controls: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
 
     #[tokio::test]
     async fn test_engine_creation() {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_generate_returns_cancelled_after_exact_abort() {
+        let engine = Arc::new(engine_with_test_executor(Box::new(EndlessSequenceExecutor)));
+        let mut request = EngineCoreRequest::tts("cancel direct generation");
+        request.id = "direct-generate-abort".to_string();
+        request.prompt_tokens = vec![1];
+        request.params.max_tokens = usize::MAX;
+        let request_id = request.id.clone();
+        let generating_engine = engine.clone();
+        let generating = tokio::spawn(async move { generating_engine.generate(request).await });
+
+        let session = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(session) = engine.request_session_key(&request_id).await {
+                    break session;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request was not admitted");
+        assert!(engine.abort_request_session(&session).await.unwrap());
+
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(1), generating)
+            .await
+            .expect("generate did not observe cancellation")
+            .expect("generate task panicked");
+        assert!(matches!(
+            result,
+            Err(Error::Cancelled(id)) if id == request_id
+        ));
     }
 
     #[test]

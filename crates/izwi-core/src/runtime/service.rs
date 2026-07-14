@@ -645,11 +645,6 @@ impl RuntimeService {
                 match step_result {
                     Ok(Ok(outputs)) => {
                         if outputs.is_empty() {
-                            if engine.has_pending_work().await {
-                                idle_backoff_ms = 1;
-                                tokio::task::yield_now().await;
-                                continue;
-                            }
                             let sleep_for = tokio::time::Duration::from_millis(idle_backoff_ms);
                             tokio::select! {
                                 _ = tokio::time::sleep(sleep_for) => {}

@@ -233,6 +233,33 @@ pub struct ExpiredRequest {
     pub sequence_id: SequenceId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalReleaseCause {
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    PreemptionCleanupFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeginTerminalRelease {
+    Started { confirmation_required: bool },
+    AlreadyPending { confirmation_required: bool },
+    StaleOrMissing,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRelease {
+    session: SessionKey,
+    cause: TerminalReleaseCause,
+    confirmation_required: bool,
+    cleanup_confirmed: bool,
+    terminal_delivered: bool,
+    cleanup_attempts: u32,
+    retry_at: Instant,
+}
+
 impl ExpiredRequest {
     pub fn session_key(&self) -> SessionKey {
         SessionKey::new(self.request_id.clone(), self.sequence_id)
@@ -356,15 +383,17 @@ pub struct Scheduler {
     running: HashMap<RequestId, RunningRequest>,
     /// Request metadata
     requests: HashMap<RequestId, RequestMetadata>,
-    /// Running sessions whose deadlines elapsed before their executor-owned
-    /// cache could be proven released. Their logical blocks remain allocated
-    /// and the public request ID remains fenced until exact-session cleanup is
-    /// confirmed.
-    expired_releases: HashMap<RequestId, SessionKey>,
+    /// Terminal sessions whose executor-owned cache has not yet been proven
+    /// released, or whose terminal event has not yet been delivered. Logical
+    /// blocks and the public request ID remain fenced until both conditions are
+    /// satisfied.
+    pending_releases: HashMap<RequestId, PendingRelease>,
     /// Next sequence ID
     next_sequence_id: SequenceId,
     /// Next execution plan identity.
     next_plan_id: PlanId,
+    /// Monotonic scheduling cycle used for one-cycle preemption resume fences.
+    schedule_generation: u64,
     /// Adaptive scheduling telemetry.
     telemetry: SchedulerTelemetry,
     /// Completed scheduling quanta by workload class for weighted service.
@@ -387,6 +416,7 @@ struct RequestMetadata {
     max_tokens: usize,
     prompt_prefix_tokens: Vec<u32>,
     cache_policy: RequestCachePolicy,
+    retry_not_before: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +477,12 @@ struct RunningRequest {
     first_token_emitted: bool,
     /// Whether this request is temporarily paused due to preemption.
     paused: bool,
+    /// Whether the scheduler has selected this session for two-phase
+    /// preemption and is waiting for executor cache cleanup confirmation.
+    preemption_pending: bool,
+    /// Scheduling generation in which this preempted victim must remain paused
+    /// so the request that caused preemption gets the first chance to allocate.
+    preemption_defer_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -468,9 +504,10 @@ impl Scheduler {
             waiting_members: HashSet::new(),
             running: HashMap::new(),
             requests: HashMap::new(),
-            expired_releases: HashMap::new(),
+            pending_releases: HashMap::new(),
             next_sequence_id: 0,
             next_plan_id: 1,
+            schedule_generation: 0,
             telemetry,
             class_service: HashMap::new(),
         }
@@ -479,7 +516,7 @@ impl Scheduler {
     /// Add a request to the waiting queue.
     pub fn add_request(&mut self, request: &EngineCoreRequest) -> bool {
         if self.requests.contains_key(&request.id)
-            || self.expired_releases.contains_key(&request.id)
+            || self.pending_releases.contains_key(&request.id)
         {
             return false;
         }
@@ -515,6 +552,7 @@ impl Scheduler {
             max_tokens,
             prompt_prefix_tokens: request.prompt_tokens.clone(),
             cache_policy: RequestCachePolicy::default(),
+            retry_not_before: None,
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -555,8 +593,11 @@ impl Scheduler {
 
     /// Schedule requests for the next step.
     pub fn schedule(&mut self, kv_cache: &mut KVCacheManager) -> ScheduleResult {
+        self.schedule_generation = self.schedule_generation.wrapping_add(1);
+        let schedule_generation = self.schedule_generation;
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
+        let scheduling_now = Instant::now();
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
         self.update_dynamic_budget();
@@ -616,7 +657,16 @@ impl Scheduler {
             .iter()
             .filter(|(_, r)| r.prefill_complete)
             .filter_map(|(id, r)| {
+                if r.preemption_pending {
+                    return None;
+                }
                 let metadata = self.requests.get(id)?;
+                if metadata
+                    .retry_not_before
+                    .is_some_and(|not_before| not_before > scheduling_now)
+                {
+                    return None;
+                }
                 let remaining_decode_tokens =
                     metadata.max_tokens.saturating_sub(r.num_tokens_generated);
                 if remaining_decode_tokens == 0 {
@@ -865,14 +915,24 @@ impl Scheduler {
         let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight)
-            .map(|(id, r)| {
-                (
+            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight && !r.preemption_pending)
+            .filter_map(|(id, r)| {
+                if r.preemption_defer_generation == Some(schedule_generation) {
+                    return None;
+                }
+                let metadata = self.requests.get(id)?;
+                if metadata
+                    .retry_not_before
+                    .is_some_and(|not_before| not_before > scheduling_now)
+                {
+                    return None;
+                }
+                Some((
                     id.clone(),
                     r.priority,
                     r.sequence_id,
                     r.num_tokens_processed,
-                )
+                ))
             })
             .collect();
         incomplete_prefill_candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)));
@@ -933,7 +993,7 @@ impl Scheduler {
                     &metadata.prompt_prefix_tokens,
                     total_tokens_after,
                     existing_blocks,
-                    self.expired_releases.is_empty()
+                    self.pending_releases.is_empty()
                         && metadata.cache_policy.allows_external_prefix_reuse(),
                 );
 
@@ -961,7 +1021,7 @@ impl Scheduler {
                 }
 
                 let (block_ids, fresh_blocks) = if existing_blocks == 0 {
-                    let block_ids = if self.expired_releases.is_empty()
+                    let block_ids = if self.pending_releases.is_empty()
                         && self.config.enable_prefix_caching
                         && metadata.cache_policy.allows_external_prefix_reuse()
                     {
@@ -1021,6 +1081,7 @@ impl Scheduler {
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.prefill_in_flight = true;
                 running.paused = false;
+                running.preemption_defer_generation = None;
                 running.block_ids = block_ids.clone();
             }
 
@@ -1113,7 +1174,7 @@ impl Scheduler {
                     &metadata.prompt_prefix_tokens,
                     num_tokens,
                     0,
-                    self.expired_releases.is_empty()
+                    self.pending_releases.is_empty()
                         && metadata.cache_policy.allows_external_prefix_reuse(),
                 );
 
@@ -1139,7 +1200,7 @@ impl Scheduler {
                     break;
                 }
 
-                let block_ids = if self.expired_releases.is_empty()
+                let block_ids = if self.pending_releases.is_empty()
                     && self.config.enable_prefix_caching
                     && metadata.cache_policy.allows_external_prefix_reuse()
                 {
@@ -1191,6 +1252,8 @@ impl Scheduler {
                 workload_class: metadata.workload_class,
                 first_token_emitted: false,
                 paused: false,
+                preemption_pending: false,
+                preemption_defer_generation: None,
             };
 
             let plan_id = self.next_plan_id;
@@ -1264,6 +1327,11 @@ impl Scheduler {
         new_block_ids: Vec<BlockId>,
         step_time_ms: f64,
     ) {
+        if tokens_processed > 0 || tokens_generated > 0 {
+            if let Some(metadata) = self.requests.get_mut(request_id) {
+                metadata.retry_not_before = None;
+            }
+        }
         if let Some(running) = self.running.get_mut(request_id) {
             running.prefill_in_flight = false;
             running.paused = false;
@@ -1318,6 +1386,30 @@ impl Scheduler {
         true
     }
 
+    /// Defer the next execution quantum for an exact session. This clears an
+    /// uncommitted prefill marker without changing committed progress.
+    pub(crate) fn defer_execution_retry(
+        &mut self,
+        session: &SessionKey,
+        not_before: Instant,
+    ) -> bool {
+        let Some(metadata) = self.requests.get_mut(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch {
+            return false;
+        }
+        let Some(running) = self.running.get_mut(&session.request_id) else {
+            return false;
+        };
+        if running.sequence_id != session.epoch || running.preemption_pending {
+            return false;
+        }
+        running.prefill_in_flight = false;
+        metadata.retry_not_before = Some(not_before);
+        true
+    }
+
     /// Restart an exact running request incarnation from prefill after an
     /// executor reports that its session must be recomputed.
     pub fn restart_request_for_recompute(
@@ -1365,26 +1457,199 @@ impl Scheduler {
         self.requests.remove(request_id);
     }
 
-    /// Release the logical cache for an expired running session only after
-    /// the executor has confirmed cleanup for that exact incarnation.
+    /// Move an exact active session into terminal quarantine without releasing
+    /// its logical cache. The request ID remains fenced until cleanup is
+    /// confirmed and its terminal event has been delivered.
+    pub(crate) fn begin_terminal_release(
+        &mut self,
+        session: &SessionKey,
+        cause: TerminalReleaseCause,
+    ) -> BeginTerminalRelease {
+        if let Some(pending) = self.pending_releases.get(&session.request_id) {
+            return if pending.session == *session {
+                BeginTerminalRelease::AlreadyPending {
+                    confirmation_required: pending.confirmation_required,
+                }
+            } else {
+                BeginTerminalRelease::StaleOrMissing
+            };
+        }
+
+        let Some(metadata) = self.requests.get(&session.request_id).cloned() else {
+            return BeginTerminalRelease::StaleOrMissing;
+        };
+        if metadata.sequence_id != session.epoch {
+            return BeginTerminalRelease::StaleOrMissing;
+        }
+
+        self.remove_from_waiting(&session.request_id);
+        let running = self.running.remove(&session.request_id);
+        if running
+            .as_ref()
+            .is_some_and(|running| running.sequence_id != session.epoch)
+        {
+            if let Some(running) = running {
+                self.running.insert(session.request_id.clone(), running);
+            }
+            return BeginTerminalRelease::StaleOrMissing;
+        }
+        self.requests.remove(&session.request_id);
+
+        let confirmation_required =
+            running.is_some() && metadata.cache_policy.mode != Some(CacheMode::None);
+        self.pending_releases.insert(
+            session.request_id.clone(),
+            PendingRelease {
+                session: session.clone(),
+                cause,
+                confirmation_required,
+                cleanup_confirmed: false,
+                terminal_delivered: false,
+                cleanup_attempts: 0,
+                retry_at: Instant::now(),
+            },
+        );
+        BeginTerminalRelease::Started {
+            confirmation_required,
+        }
+    }
+
+    /// Release logical cache for an exact terminal session only after the core
+    /// has established that physical cleanup is complete or not required.
+    pub(crate) fn confirm_session_release(
+        &mut self,
+        session: &SessionKey,
+        kv_cache: &mut KVCacheManager,
+    ) -> bool {
+        let remove = {
+            let Some(pending) = self.pending_releases.get_mut(&session.request_id) else {
+                return false;
+            };
+            if pending.session != *session {
+                return false;
+            }
+            if !pending.cleanup_confirmed {
+                kv_cache.free(&session.request_id);
+                pending.cleanup_confirmed = true;
+                debug!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    cause = ?pending.cause,
+                    "Confirmed exact-session terminal cache release"
+                );
+            }
+            pending.terminal_delivered
+        };
+        if remove {
+            self.pending_releases.remove(&session.request_id);
+        }
+        true
+    }
+
+    pub(crate) fn mark_terminal_delivered(&mut self, session: &SessionKey) -> bool {
+        let remove = {
+            let Some(pending) = self.pending_releases.get_mut(&session.request_id) else {
+                return false;
+            };
+            if pending.session != *session {
+                return false;
+            }
+            pending.terminal_delivered = true;
+            pending.cleanup_confirmed
+        };
+        if remove {
+            self.pending_releases.remove(&session.request_id);
+        }
+        true
+    }
+
+    pub(crate) fn pending_release_confirmation_required(
+        &self,
+        session: &SessionKey,
+    ) -> Option<bool> {
+        self.pending_releases
+            .get(&session.request_id)
+            .filter(|pending| pending.session == *session)
+            .map(|pending| pending.confirmation_required)
+    }
+
+    pub(crate) fn due_cleanup_sessions(&self, now: Instant, limit: usize) -> Vec<SessionKey> {
+        let mut pending: Vec<_> = self
+            .pending_releases
+            .values()
+            .filter(|pending| {
+                pending.confirmation_required
+                    && !pending.cleanup_confirmed
+                    && pending.retry_at <= now
+            })
+            .collect();
+        pending.sort_by_key(|pending| (pending.retry_at, pending.session.epoch));
+        pending
+            .into_iter()
+            .take(limit)
+            .map(|pending| pending.session.clone())
+            .collect()
+    }
+
+    pub(crate) fn record_cleanup_retry(
+        &mut self,
+        session: &SessionKey,
+        retry_at: Instant,
+    ) -> Option<u32> {
+        let pending = self.pending_releases.get_mut(&session.request_id)?;
+        if pending.session != *session || pending.cleanup_confirmed {
+            return None;
+        }
+        pending.cleanup_attempts = pending.cleanup_attempts.saturating_add(1);
+        pending.retry_at = retry_at;
+        Some(pending.cleanup_attempts)
+    }
+
+    pub(crate) fn pending_cleanup_attempts(&self, session: &SessionKey) -> Option<u32> {
+        self.pending_releases
+            .get(&session.request_id)
+            .filter(|pending| pending.session == *session)
+            .map(|pending| pending.cleanup_attempts)
+    }
+
+    pub(crate) fn has_due_cleanup(&self, now: Instant) -> bool {
+        self.pending_releases.values().any(|pending| {
+            pending.confirmation_required && !pending.cleanup_confirmed && pending.retry_at <= now
+        })
+    }
+
+    pub(crate) fn force_release_all_after_executor_shutdown(
+        &mut self,
+        kv_cache: &mut KVCacheManager,
+    ) {
+        for request_id in self.pending_releases.keys() {
+            kv_cache.free(request_id);
+        }
+        self.pending_releases.clear();
+    }
+
+    /// Compatibility helper retained for scheduler-level tests. Core runtime
+    /// paths use the generalized exact-session release protocol above.
     pub fn confirm_expired_session_cleanup(
         &mut self,
         session: &SessionKey,
         kv_cache: &mut KVCacheManager,
     ) -> bool {
-        if self.expired_releases.get(&session.request_id) != Some(session) {
-            return false;
+        let confirmed = self.confirm_session_release(session, kv_cache);
+        if confirmed {
+            self.mark_terminal_delivered(session);
         }
-
-        self.expired_releases.remove(&session.request_id);
-        kv_cache.free(&session.request_id);
-        true
+        confirmed
     }
 
-    /// Exact expired sessions still waiting for physical cache cleanup. A
-    /// later engine step may retry them before admitting more cache work.
+    /// Compatibility helper retained for existing deadline tests.
     pub(crate) fn pending_expired_cleanup_sessions(&self) -> Vec<SessionKey> {
-        let mut sessions: Vec<_> = self.expired_releases.values().cloned().collect();
+        let mut sessions: Vec<_> = self
+            .pending_releases
+            .values()
+            .filter(|pending| !pending.cleanup_confirmed)
+            .map(|pending| pending.session.clone())
+            .collect();
         sessions.sort_by_key(|session| session.epoch);
         sessions
     }
@@ -1688,26 +1953,7 @@ impl Scheduler {
             .collect();
         expired.sort_by_key(|request| request.sequence_id);
         for request in &expired {
-            if self
-                .requests
-                .get(&request.request_id)
-                .map(|metadata| metadata.sequence_id)
-                != Some(request.sequence_id)
-            {
-                continue;
-            }
-
-            self.remove_from_waiting(&request.request_id);
-            if self
-                .running
-                .get(&request.request_id)
-                .is_some_and(|running| running.sequence_id == request.sequence_id)
-            {
-                self.running.remove(&request.request_id);
-                self.expired_releases
-                    .insert(request.request_id.clone(), request.session_key());
-            }
-            self.requests.remove(&request.request_id);
+            self.begin_terminal_release(&request.session_key(), TerminalReleaseCause::TimedOut);
         }
         expired
     }
@@ -2016,6 +2262,15 @@ impl Scheduler {
         protected_requests: &HashSet<RequestId>,
         kv_cache: &mut KVCacheManager,
     ) -> Vec<SessionKey> {
+        // A prepared victim must be reconciled with the executor before the
+        // scheduler prepares another preemption plan or reuses its blocks.
+        if self
+            .running
+            .values()
+            .any(|running| running.preemption_pending)
+        {
+            return Vec::new();
+        }
         // Collect candidates for preemption and score them by expected user impact.
         let mut candidates: Vec<_> =
             self.running
@@ -2023,6 +2278,7 @@ impl Scheduler {
                 .filter(|(_, r)| {
                     r.priority < requesting_priority
                         && !r.paused
+                        && !r.preemption_pending
                         && !r.first_token_emitted
                         && !r.block_ids.is_empty()
                         && !protected_requests.contains(&r.request_id)
@@ -2091,29 +2347,62 @@ impl Scheduler {
         }
 
         let mut preempted = Vec::with_capacity(selected.len());
-        let mut blocks_freed = 0usize;
         for (request_id, _priority, _reclaimable, ..) in selected {
             let running_epoch = self
                 .running
                 .get(&request_id)
                 .map(|running| running.sequence_id)
                 .expect("selected preemption victim must still be running");
-            let freed = kv_cache.free_for_preemption(&request_id);
-            debug_assert!(freed > 0, "validated preemption victim reclaimed no blocks");
-            blocks_freed = blocks_freed.saturating_add(freed);
             if let Some(running) = self.running.get_mut(&request_id) {
-                running.block_ids.clear();
-                running.num_tokens_processed = 0;
-                running.num_tokens_generated = 0;
-                running.prefill_complete = false;
                 running.prefill_in_flight = false;
-                running.first_token_emitted = false;
                 running.paused = true;
+                running.preemption_pending = true;
             }
             preempted.push(SessionKey::new(request_id, running_epoch));
         }
-        debug_assert!(blocks_freed >= blocks_needed);
         preempted
+    }
+
+    /// Commit a prepared preemption only after executor cleanup confirms that
+    /// the exact session no longer owns physical cache state.
+    pub(crate) fn confirm_preemption(
+        &mut self,
+        session: &SessionKey,
+        kv_cache: &mut KVCacheManager,
+    ) -> bool {
+        let Some(metadata) = self.requests.get_mut(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch {
+            return false;
+        }
+        let Some(running) = self.running.get_mut(&session.request_id) else {
+            return false;
+        };
+        if running.sequence_id != session.epoch || !running.preemption_pending {
+            return false;
+        }
+
+        let freed = kv_cache.free_for_preemption(&session.request_id);
+        debug_assert!(freed > 0, "confirmed preemption reclaimed no blocks");
+        running.block_ids.clear();
+        running.num_tokens_processed = 0;
+        running.num_tokens_generated = 0;
+        running.prefill_complete = false;
+        running.prefill_in_flight = false;
+        running.first_token_emitted = false;
+        running.paused = true;
+        running.preemption_pending = false;
+        running.preemption_defer_generation = Some(self.schedule_generation.wrapping_add(1));
+        metadata.retry_not_before = None;
+        true
+    }
+
+    pub(crate) fn quarantine_failed_preemption(&mut self, session: &SessionKey) -> bool {
+        matches!(
+            self.begin_terminal_release(session, TerminalReleaseCause::PreemptionCleanupFailed),
+            BeginTerminalRelease::Started { .. } | BeginTerminalRelease::AlreadyPending { .. }
+        )
     }
 }
 
@@ -2438,6 +2727,29 @@ mod tests {
     }
 
     #[test]
+    fn deferred_retry_is_not_scheduled_before_its_deadline() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut kv_cache = KVCacheManager::new(Default::default());
+        let request = build_request(TaskType::Chat, "deferred-retry", Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let first = scheduler.schedule(&mut kv_cache).prefill_requests.remove(0);
+        let session = first.session_key();
+
+        assert!(scheduler.defer_execution_retry(&session, Instant::now() + Duration::from_secs(1),));
+        assert!(!scheduler.schedule(&mut kv_cache).has_execution_work());
+
+        assert!(scheduler.defer_execution_retry(&session, Instant::now()));
+        let retry = scheduler.schedule(&mut kv_cache);
+        assert_eq!(retry.prefill_requests.len(), 1);
+        assert_eq!(retry.prefill_requests[0].session_key(), session);
+    }
+
+    #[test]
     fn test_adaptive_aging_can_promote_old_request() {
         let config = SchedulerConfig {
             max_batch_size: 1,
@@ -2610,22 +2922,63 @@ mod tests {
             );
             assert_eq!(
                 scheduler.get_status(&high_id),
-                Some(RequestStatus::Running),
-                "high-priority {task_type:?} request should run after preemption"
+                Some(RequestStatus::Waiting),
+                "high-priority {task_type:?} request must wait for physical cleanup"
             );
 
-            scheduler.finish_request(&high_id, &mut kv_cache);
+            let preempted = second
+                .preempted_requests
+                .iter()
+                .find(|session| session.request_id == low_id)
+                .unwrap();
+            assert!(scheduler.confirm_preemption(preempted, &mut kv_cache));
 
             let third = scheduler.schedule(&mut kv_cache);
+            assert_eq!(third.prefill_requests.len(), 1);
+            assert_eq!(third.prefill_requests[0].request_id, high_id);
+            scheduler.finish_request(&high_id, &mut kv_cache);
+
+            let fourth = scheduler.schedule(&mut kv_cache);
             assert_eq!(
-                third.prefill_requests.len(),
+                fourth.prefill_requests.len(),
                 1,
                 "preempted {task_type:?} request should restart from prefill"
             );
-            assert_eq!(third.prefill_requests[0].request_id, low_id);
-            assert!(third.prefill_requests[0].is_prefill);
-            assert_eq!(third.prefill_requests[0].num_computed_tokens, 0);
+            assert_eq!(fourth.prefill_requests[0].request_id, low_id);
+            assert!(fourth.prefill_requests[0].is_prefill);
+            assert_eq!(fourth.prefill_requests[0].num_computed_tokens, 0);
         }
+    }
+
+    #[test]
+    fn preemption_does_not_reuse_blocks_before_exact_cleanup_confirmation() {
+        let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
+        let low = build_request(TaskType::Chat, "preempt-low", Priority::Low);
+        assert!(scheduler.add_request(&low));
+        allow_recompute(&mut scheduler, &low.id);
+        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        scheduler.update_after_step(&low.id, 1, 0, Vec::new(), 1.0);
+        let allocated_before = kv_cache.stats().allocated_blocks;
+
+        let high = build_request(TaskType::Chat, "preempt-high", Priority::High);
+        assert!(scheduler.add_request(&high));
+        let prepared = scheduler.schedule(&mut kv_cache);
+        let victim = prepared.preempted_requests[0].clone();
+        assert_eq!(scheduler.get_status(&high.id), Some(RequestStatus::Waiting));
+        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
+
+        let still_blocked = scheduler.schedule(&mut kv_cache);
+        assert!(!still_blocked.has_execution_work());
+        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
+        let stale = SessionKey::new(victim.request_id.clone(), victim.epoch + 1);
+        assert!(!scheduler.confirm_preemption(&stale, &mut kv_cache));
+        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
+
+        assert!(scheduler.confirm_preemption(&victim, &mut kv_cache));
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        let admitted = scheduler.schedule(&mut kv_cache);
+        assert_eq!(admitted.prefill_requests.len(), 1);
+        assert_eq!(admitted.prefill_requests[0].request_id, high.id);
     }
 
     #[test]
@@ -3249,6 +3602,43 @@ mod tests {
         assert!(scheduler.confirm_expired_session_cleanup(&session, &mut kv_cache));
         assert_eq!(kv_cache.stats().allocated_blocks, 0);
         assert!(scheduler.pending_expired_cleanup_sessions().is_empty());
+        assert!(scheduler.add_request(&request));
+    }
+
+    #[test]
+    fn terminal_release_requires_exact_cleanup_and_delivery_before_id_reuse() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let mut kv_cache = KVCacheManager::new(Default::default());
+        let request = build_request(TaskType::Chat, "terminal-fence", Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request.id).unwrap();
+        let session = SessionKey::new(request.id.clone(), epoch);
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_release_safe = true;
+        assert!(scheduler.update_execution_profile(&session, &profile));
+        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        let allocated = kv_cache.stats().allocated_blocks;
+        assert!(allocated > 0);
+
+        assert_eq!(
+            scheduler.begin_terminal_release(&session, TerminalReleaseCause::Completed),
+            BeginTerminalRelease::Started {
+                confirmation_required: true,
+            }
+        );
+        assert!(!scheduler.add_request(&request));
+        let stale = SessionKey::new(request.id.clone(), session.epoch + 1);
+        assert!(!scheduler.confirm_session_release(&stale, &mut kv_cache));
+        assert!(!scheduler.mark_terminal_delivered(&stale));
+        assert_eq!(kv_cache.stats().allocated_blocks, allocated);
+
+        assert!(scheduler.mark_terminal_delivered(&session));
+        assert_eq!(kv_cache.stats().allocated_blocks, allocated);
+        assert!(!scheduler.add_request(&request));
+        assert!(scheduler.confirm_session_release(&session, &mut kv_cache));
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
         assert!(scheduler.add_request(&request));
     }
 

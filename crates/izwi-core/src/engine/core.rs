@@ -6,8 +6,8 @@
 //! - KV cache management
 //! - Output processing
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
@@ -25,7 +25,7 @@ use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::metrics::record_engine_batch_dispatch;
 use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
-use super::scheduler::{Scheduler, SchedulerConfig};
+use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
 use super::{ResourceAmount, ResourceVector};
 use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
@@ -114,8 +114,51 @@ struct RequestPhaseTiming {
 
 #[derive(Debug)]
 struct CommittedExecutorOutput {
+    session: super::SessionKey,
     output: ExecutorOutput,
     disposition: ExecutionDisposition,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LifecycleRetryPolicy {
+    max_execution_retries: u32,
+    execution_backoff_base: Duration,
+    execution_backoff_max: Duration,
+    cleanup_backoff_base: Duration,
+    cleanup_backoff_max: Duration,
+    cleanup_budget_per_step: usize,
+}
+
+impl Default for LifecycleRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_execution_retries: 3,
+            execution_backoff_base: Duration::from_millis(5),
+            execution_backoff_max: Duration::from_millis(200),
+            cleanup_backoff_base: Duration::from_millis(25),
+            cleanup_backoff_max: Duration::from_secs(1),
+            cleanup_budget_per_step: 16,
+        }
+    }
+}
+
+impl LifecycleRetryPolicy {
+    fn exponential_delay(base: Duration, max: Duration, attempt: u32) -> Duration {
+        let exponent = attempt.saturating_sub(1).min(20);
+        base.saturating_mul(1u32 << exponent).min(max)
+    }
+
+    fn execution_delay(self, attempt: u32) -> Duration {
+        Self::exponential_delay(
+            self.execution_backoff_base,
+            self.execution_backoff_max,
+            attempt,
+        )
+    }
+
+    fn cleanup_delay(self, attempt: u32) -> Duration {
+        Self::exponential_delay(self.cleanup_backoff_base, self.cleanup_backoff_max, attempt)
+    }
 }
 
 fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
@@ -147,6 +190,12 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
+    /// Typed terminal events created outside executor dispatch (for example an
+    /// explicit cancellation) and delivered by the next engine step.
+    pending_terminal_outputs: VecDeque<CommittedExecutorOutput>,
+    /// Consecutive retryable executor failures for each exact session.
+    execution_retry_attempts: HashMap<super::SessionKey, u32>,
+    retry_policy: LifecycleRetryPolicy,
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
@@ -351,6 +400,33 @@ impl EngineCore {
             );
             return None;
         };
+
+        let retry_attempt = match &mut result.disposition {
+            ExecutionDisposition::Failed(failure) if failure.retry != RetryDisposition::Never => {
+                let attempts = self
+                    .execution_retry_attempts
+                    .entry(plan.session.clone())
+                    .or_default();
+                *attempts = attempts.saturating_add(1);
+                if *attempts > self.retry_policy.max_execution_retries {
+                    let message = format!(
+                        "executor retry budget exhausted after {} attempts: {}",
+                        self.retry_policy.max_execution_retries, failure.message
+                    );
+                    failure.retry = RetryDisposition::Never;
+                    failure.message = message.clone();
+                    result.output.finished = true;
+                    result.output.error = Some(message);
+                    None
+                } else {
+                    Some(*attempts)
+                }
+            }
+            _ => {
+                self.execution_retry_attempts.remove(&plan.session);
+                None
+            }
+        };
         let report = Self::report_from_result(&result);
         let commit_result = self
             .execution_trackers
@@ -381,6 +457,7 @@ impl EngineCore {
             }
             let message = format!("invalid executor result: {err}");
             return Some(CommittedExecutorOutput {
+                session: plan.session.clone(),
                 output: ExecutorOutput::error(plan.session.request_id, message.clone()),
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                     message,
@@ -392,15 +469,21 @@ impl EngineCore {
             ExecutionDisposition::Failed(failure)
                 if failure.retry == RetryDisposition::RetrySameSession =>
             {
+                let attempt = retry_attempt.unwrap_or(1);
+                let retry_at = Instant::now() + self.retry_policy.execution_delay(attempt);
                 if self
                     .scheduler
-                    .release_execution_quantum_for_retry(&plan.session)
+                    .defer_execution_retry(&plan.session, retry_at)
                 {
                     return None;
                 }
                 let message = "scheduler rejected a same-session execution retry";
                 return Some(CommittedExecutorOutput {
-                    output: ExecutorOutput::error(plan.session.request_id, message.to_string()),
+                    session: plan.session.clone(),
+                    output: ExecutorOutput::error(
+                        plan.session.request_id.clone(),
+                        message.to_string(),
+                    ),
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
@@ -415,6 +498,21 @@ impl EngineCore {
                         .scheduler
                         .restart_request_for_recompute(&plan.session, self.kv_cache.inner_mut())
                 {
+                    let attempt = retry_attempt.unwrap_or(1);
+                    let retry_at = Instant::now() + self.retry_policy.execution_delay(attempt);
+                    if !self
+                        .scheduler
+                        .defer_execution_retry(&plan.session, retry_at)
+                    {
+                        let message = "scheduler rejected a deferred recompute retry";
+                        return Some(CommittedExecutorOutput {
+                            session: plan.session.clone(),
+                            output: ExecutorOutput::error(plan.session.request_id.clone(), message),
+                            disposition: ExecutionDisposition::Failed(
+                                ExecutionFailure::invalid_output(message),
+                            ),
+                        });
+                    }
                     self.execution_trackers.remove(&plan.session.request_id);
                     self.active_plans
                         .retain(|_, active| active.session != plan.session);
@@ -430,7 +528,11 @@ impl EngineCore {
                     "executor could not confirm physical cache release for recompute retry"
                 };
                 return Some(CommittedExecutorOutput {
-                    output: ExecutorOutput::error(plan.session.request_id, message.to_string()),
+                    session: plan.session.clone(),
+                    output: ExecutorOutput::error(
+                        plan.session.request_id.clone(),
+                        message.to_string(),
+                    ),
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
@@ -449,8 +551,9 @@ impl EngineCore {
             }
             ExecutionDisposition::Failed(_) => {}
         }
-        result.output.request_id = plan.session.request_id;
+        result.output.request_id = plan.session.request_id.clone();
         Some(CommittedExecutorOutput {
+            session: plan.session,
             output: result.output,
             disposition: result.disposition,
         })
@@ -763,6 +866,9 @@ impl EngineCore {
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
+            pending_terminal_outputs: VecDeque::new(),
+            execution_retry_attempts: HashMap::new(),
+            retry_policy: LifecycleRetryPolicy::default(),
             initialized: false,
             maintenance_steps: 0,
         })
@@ -831,18 +937,27 @@ impl EngineCore {
         Ok(())
     }
 
-    async fn reconcile_expired_session_cleanup(&mut self, session: &super::SessionKey) {
-        let release = self.executor.cleanup_session(session).await;
-        if release.confirmed {
-            self.scheduler
-                .confirm_expired_session_cleanup(session, self.kv_cache.inner_mut());
-        } else {
-            warn!(
-                request_id = %session.request_id,
-                session_epoch = session.epoch,
-                "Executor could not confirm physical cache release for expired session; logical cache remains quarantined"
-            );
+    fn terminal_release_cause(disposition: &ExecutionDisposition) -> Option<TerminalReleaseCause> {
+        match disposition {
+            ExecutionDisposition::Finished(ExecutionFinishReason::Completed) => {
+                Some(TerminalReleaseCause::Completed)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled) => {
+                Some(TerminalReleaseCause::Cancelled)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut) => {
+                Some(TerminalReleaseCause::TimedOut)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::Rejected)
+            | ExecutionDisposition::Failed(ExecutionFailure {
+                retry: RetryDisposition::Never,
+                ..
+            }) => Some(TerminalReleaseCause::Failed),
+            _ => None,
         }
+    }
+
+    fn clear_exact_execution_state(&mut self, session: &super::SessionKey) {
         if self
             .execution_trackers
             .get(&session.request_id)
@@ -851,6 +966,65 @@ impl EngineCore {
             self.execution_trackers.remove(&session.request_id);
         }
         self.active_plans.retain(|_, plan| plan.session != *session);
+        self.execution_retry_attempts.remove(session);
+    }
+
+    fn record_unconfirmed_cleanup(&mut self, session: &super::SessionKey) {
+        let attempt = self
+            .scheduler
+            .pending_cleanup_attempts(session)
+            .unwrap_or_default()
+            .saturating_add(1);
+        let retry_at = Instant::now() + self.retry_policy.cleanup_delay(attempt);
+        self.scheduler.record_cleanup_retry(session, retry_at);
+        if attempt == 1 || attempt.is_power_of_two() {
+            warn!(
+                request_id = %session.request_id,
+                session_epoch = session.epoch,
+                cleanup_attempt = attempt,
+                retry_in_ms = self.retry_policy.cleanup_delay(attempt).as_millis(),
+                "Executor could not confirm exact-session cleanup; cache remains quarantined"
+            );
+        }
+    }
+
+    async fn attempt_pending_release_cleanup(&mut self, session: &super::SessionKey) {
+        let Some(confirmation_required) = self
+            .scheduler
+            .pending_release_confirmation_required(session)
+        else {
+            return;
+        };
+        let release = self.executor.cleanup_session(session).await;
+        if release.confirmed || !confirmation_required {
+            self.scheduler
+                .confirm_session_release(session, self.kv_cache.inner_mut());
+        } else {
+            self.record_unconfirmed_cleanup(session);
+        }
+    }
+
+    async fn begin_terminal_release(
+        &mut self,
+        session: &super::SessionKey,
+        cause: TerminalReleaseCause,
+    ) {
+        if matches!(
+            self.scheduler.begin_terminal_release(session, cause),
+            BeginTerminalRelease::Started { .. }
+        ) {
+            self.attempt_pending_release_cleanup(session).await;
+        }
+        self.clear_exact_execution_state(session);
+    }
+
+    async fn reconcile_due_cleanup(&mut self) {
+        let sessions = self
+            .scheduler
+            .due_cleanup_sessions(Instant::now(), self.retry_policy.cleanup_budget_per_step);
+        for session in sessions {
+            self.attempt_pending_release_cleanup(&session).await;
+        }
     }
 
     /// Execute one step of the inference loop.
@@ -865,6 +1039,8 @@ impl EngineCore {
             self.initialize().await?;
         }
 
+        let mut terminal_outputs: Vec<_> = self.pending_terminal_outputs.drain(..).collect();
+
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
         self.kv_cache.maintenance()?;
@@ -872,9 +1048,7 @@ impl EngineCore {
         if self.maintenance_steps % 64 == 0 {
             self.kv_cache.compact_shared_prefixes();
         }
-        for session in self.scheduler.pending_expired_cleanup_sessions() {
-            self.reconcile_expired_session_cleanup(&session).await;
-        }
+        self.reconcile_due_cleanup().await;
         let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
 
         // Deadline expiry removes a request from runnable scheduler state but
@@ -883,58 +1057,52 @@ impl EngineCore {
         // only a confirmed physical cleanup permits logical block reuse.
         for expired in &schedule_result.expired_requests {
             let session = expired.session_key();
-            self.reconcile_expired_session_cleanup(&session).await;
+            self.attempt_pending_release_cleanup(&session).await;
         }
 
         let mut preemption_failures = Vec::new();
         for session in &schedule_result.preempted_requests {
             let release = self.executor.cleanup_session(session).await;
-            if !release.confirmed {
-                // The scheduler already rolled logical progress back. If the
-                // executor cannot prove physical state release, abort this
-                // incarnation rather than risk stale-cache recomputation.
-                self.scheduler
-                    .abort_request(&session.request_id, self.kv_cache.inner_mut());
+            if release.confirmed {
+                if !self
+                    .scheduler
+                    .confirm_preemption(session, self.kv_cache.inner_mut())
+                {
+                    warn!(
+                        request_id = %session.request_id,
+                        session_epoch = session.epoch,
+                        "Scheduler rejected confirmed preemption"
+                    );
+                }
+            } else {
+                self.scheduler.quarantine_failed_preemption(session);
+                self.record_unconfirmed_cleanup(session);
                 self.requests.remove(&session.request_id);
-                self.request_start_times.remove(&session.request_id);
-                self.request_phase_timings.remove(&session.request_id);
                 let message = "executor could not confirm physical cache release during preemption";
                 preemption_failures.push(CommittedExecutorOutput {
+                    session: session.clone(),
                     output: ExecutorOutput::error(session.request_id.clone(), message),
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
                 });
             }
-            if self
-                .execution_trackers
-                .get(&session.request_id)
-                .is_some_and(|tracker| tracker.session() == session)
-            {
-                self.execution_trackers.remove(&session.request_id);
-            }
-            self.active_plans.retain(|_, plan| plan.session != *session);
+            self.clear_exact_execution_state(session);
             self.request_phase_timings
                 .entry(session.request_id.clone())
                 .and_modify(|timing| *timing = RequestPhaseTiming::default());
         }
 
-        let expired_sequence_ids: HashMap<_, _> = schedule_result
-            .expired_requests
-            .iter()
-            .map(|request| (request.request_id.clone(), request.sequence_id))
-            .collect();
-        let mut terminal_outputs =
-            Vec::with_capacity(schedule_result.expired_requests.len() + preemption_failures.len());
         terminal_outputs.extend(preemption_failures);
         for request in &schedule_result.expired_requests {
             terminal_outputs.push(CommittedExecutorOutput {
+                session: request.session_key(),
                 output: ExecutorOutput::terminal(request.request_id.clone()),
                 disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
             });
         }
 
-        if !schedule_result.has_work() {
+        if !schedule_result.has_execution_work() && terminal_outputs.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -1091,6 +1259,7 @@ impl EngineCore {
 
         for committed in executor_outputs {
             let CommittedExecutorOutput {
+                session,
                 output: exec_output,
                 disposition,
             } = committed;
@@ -1104,12 +1273,7 @@ impl EngineCore {
                 .unwrap_or_default();
             let generation_time_ms = generation_time.as_secs_f64() * 1000.0;
 
-            // Get sequence ID from scheduler
-            let sequence_id = expired_sequence_ids
-                .get(&request_id)
-                .copied()
-                .or_else(|| self.scheduler.get_sequence_id(&request_id))
-                .unwrap_or(0);
+            let sequence_id = session.epoch;
 
             if let Some(override_timing) = exec_output.phase_timing_override.as_ref() {
                 let phase = self
@@ -1199,27 +1363,14 @@ impl EngineCore {
                 });
             }
 
-            // Update scheduler state
-            if exec_output.finished {
-                if !expired_sequence_ids.contains_key(&request_id) {
-                    if let Some(session) = self
-                        .execution_trackers
-                        .get(&request_id)
-                        .map(|tracker| tracker.session().clone())
-                    {
-                        self.executor.cleanup_session(&session).await;
-                    } else {
-                        self.executor.cleanup_request(&request_id).await;
-                    }
-                    self.scheduler
-                        .finish_request(&request_id, self.kv_cache.inner_mut());
-                }
+            // Update scheduler state only from the authoritative disposition.
+            if let Some(cause) = Self::terminal_release_cause(&disposition) {
+                self.begin_terminal_release(&session, cause).await;
                 self.requests.remove(&request_id);
                 self.request_start_times.remove(&request_id);
                 self.request_phase_timings.remove(&request_id);
-                self.execution_trackers.remove(&request_id);
-                self.active_plans
-                    .retain(|_, plan| plan.session.request_id != request_id);
+                self.clear_exact_execution_state(&session);
+                self.scheduler.mark_terminal_delivered(&session);
                 debug!("Finished request {}", request_id);
             }
 
@@ -1231,12 +1382,20 @@ impl EngineCore {
 
     /// Check if there's pending work.
     pub fn has_pending_work(&self) -> bool {
-        self.scheduler.has_pending_work()
+        !self.pending_terminal_outputs.is_empty()
+            || self.scheduler.has_pending_work()
+            || self.scheduler.has_due_cleanup(Instant::now())
     }
 
     /// Check if a request exists.
     pub fn has_request(&self, request_id: &RequestId) -> bool {
         self.requests.contains_key(request_id)
+    }
+
+    pub(crate) fn has_pending_terminal_output(&self, request_id: &RequestId) -> bool {
+        self.pending_terminal_outputs
+            .iter()
+            .any(|committed| committed.session.request_id == *request_id)
     }
 
     /// Get the set of model variants currently referenced by active engine requests.
@@ -1264,28 +1423,31 @@ impl EngineCore {
         if self.scheduler.get_sequence_id(&session.request_id) != Some(session.epoch) {
             return false;
         }
-        self.abort_request(&session.request_id).await
+
+        self.begin_terminal_release(session, TerminalReleaseCause::Cancelled)
+            .await;
+        self.requests.remove(&session.request_id);
+        self.clear_exact_execution_state(session);
+        self.pending_terminal_outputs
+            .push_back(CommittedExecutorOutput {
+                session: session.clone(),
+                output: ExecutorOutput::terminal(session.request_id.clone()),
+                disposition: ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+            });
+        debug!(
+            request_id = %session.request_id,
+            session_epoch = session.epoch,
+            "Queued exact-session cancellation"
+        );
+        true
     }
 
     /// Abort a request.
     pub async fn abort_request(&mut self, request_id: &RequestId) -> bool {
-        let existed = self.scheduler.has_request(request_id);
-        let removed_running = self
-            .scheduler
-            .abort_request(request_id, self.kv_cache.inner_mut());
-        if removed_running || (existed && !self.scheduler.has_request(request_id)) {
-            self.executor.cleanup_request(request_id).await;
-            self.requests.remove(request_id);
-            self.request_start_times.remove(request_id);
-            self.request_phase_timings.remove(request_id);
-            self.execution_trackers.remove(request_id);
-            self.active_plans
-                .retain(|_, plan| plan.session.request_id != *request_id);
-            debug!("Aborted request {}", request_id);
-            true
-        } else {
-            false
-        }
+        let Some(session) = self.get_session_key(request_id) else {
+            return false;
+        };
+        self.abort_request_session(&session).await
     }
 
     /// Abort all active requests that target a specific model variant.
@@ -1355,6 +1517,18 @@ impl EngineCore {
 
         // Shutdown executor
         self.executor.shutdown().await?;
+
+        // A successful executor shutdown is the final physical-release fence:
+        // no backend session can still reference the quarantined logical cache.
+        self.scheduler
+            .force_release_all_after_executor_shutdown(self.kv_cache.inner_mut());
+        self.requests.clear();
+        self.request_start_times.clear();
+        self.request_phase_timings.clear();
+        self.execution_trackers.clear();
+        self.active_plans.clear();
+        self.pending_terminal_outputs.clear();
+        self.execution_retry_attempts.clear();
 
         self.initialized = false;
         info!("Engine core shutdown complete");
@@ -1994,6 +2168,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waiting_and_running_aborts_emit_one_cancelled_output_each() {
+        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+
+        let mut waiting = EngineCoreRequest::tts("waiting");
+        waiting.id = "abort-waiting".to_string();
+        waiting.prompt_tokens = vec![1];
+        core.add_request(waiting).unwrap();
+        let waiting_session = core.get_session_key(&"abort-waiting".to_string()).unwrap();
+        assert!(core.abort_request_session(&waiting_session).await);
+        let waiting_outputs = core.step().await.unwrap();
+        assert_eq!(waiting_outputs.len(), 1);
+        assert_eq!(waiting_outputs[0].sequence_id, waiting_session.epoch);
+        assert_eq!(
+            waiting_outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+
+        let mut running = EngineCoreRequest::tts("running");
+        running.id = "abort-running".to_string();
+        running.prompt_tokens = vec![1];
+        core.add_request(running).unwrap();
+        let progress = core.step().await.unwrap();
+        assert_eq!(progress.len(), 1);
+        assert!(!progress[0].is_finished);
+        let running_session = core.get_session_key(&"abort-running".to_string()).unwrap();
+        assert!(core.abort_request_session(&running_session).await);
+        let running_outputs = core.step().await.unwrap();
+        assert_eq!(running_outputs.len(), 1);
+        assert_eq!(running_outputs[0].sequence_id, running_session.epoch);
+        assert_eq!(
+            running_outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert!(core.step().await.unwrap().is_empty());
+
+        let calls = cleanup_calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|id| id.as_str() == "abort-waiting")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|id| id.as_str() == "abort-running")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_cancel_cleanup_is_retried_and_keeps_the_id_fenced() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(
+            events.clone(),
+            false,
+        )));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1,
+                block_size: 1,
+                max_blocks: 1,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        core.retry_policy.cleanup_backoff_base = Duration::ZERO;
+        core.retry_policy.cleanup_backoff_max = Duration::ZERO;
+
+        let mut request = EngineCoreRequest::tts("retry cleanup");
+        request.id = "cleanup-fence".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request.clone()).unwrap();
+        core.step().await.unwrap();
+        let session = core.get_session_key(&request.id).unwrap();
+        assert!(core.abort_request_session(&session).await);
+        assert!(core.add_request(request.clone()).is_err());
+
+        let outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert!(core.step().await.unwrap().is_empty());
+        let cleanup_attempts = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.starts_with("cleanup:cleanup-fence:"))
+            .count();
+        assert!(cleanup_attempts >= 2, "cleanup was not retried");
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+        assert!(core.add_request(request).is_err());
+    }
+
+    #[tokio::test]
     async fn stale_session_cannot_abort_reused_request_id() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls)));
@@ -2007,6 +2287,19 @@ mod tests {
 
         let mut second = EngineCoreRequest::tts("second");
         second.id = "reused".to_string();
+        assert!(
+            core.add_request(second.clone()).is_err(),
+            "public ID must remain fenced until cancellation is delivered"
+        );
+        let outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].sequence_id, first_session.epoch);
+        assert_eq!(
+            outputs[0].finish_reason,
+            Some(super::super::types::FinishReason::Aborted)
+        );
+        assert_eq!(outputs[0].error.as_deref(), Some("request cancelled"));
+
         core.add_request(second).unwrap();
         let second_session = core.get_session_key(&"reused".to_string()).unwrap();
         assert_ne!(first_session.epoch, second_session.epoch);
@@ -2344,6 +2637,8 @@ mod tests {
             executor,
         )
         .unwrap();
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
         let mut request = EngineCoreRequest::tts("retry");
         request.id = "same-session-retry".to_string();
         request.prompt_tokens = vec![1];
@@ -2384,6 +2679,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_budget_exhaustion_terminalizes_the_exact_session() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        core.retry_policy.max_execution_retries = 2;
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let mut request = EngineCoreRequest::tts("retry budget");
+        request.id = "retry-budget".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
+
+        let mut scheduled = core
+            .scheduler
+            .schedule(core.kv_cache.inner_mut())
+            .prefill_requests
+            .remove(0);
+        let session = scheduled.session_key();
+        for attempt in 1..=3 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            let committed = core
+                .commit_executor_result(
+                    retryable_step_result(&scheduled, RetryDisposition::RetrySameSession),
+                    1.0,
+                )
+                .await;
+            if attempt <= 2 {
+                assert!(committed.is_none());
+                scheduled = core
+                    .scheduler
+                    .schedule(core.kv_cache.inner_mut())
+                    .prefill_requests
+                    .remove(0);
+                assert_eq!(scheduled.session_key(), session);
+            } else {
+                let committed = committed.expect("retry budget must terminalize");
+                assert_eq!(committed.session, session);
+                assert!(committed
+                    .output
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("retry budget exhausted")));
+                assert!(matches!(
+                    committed.disposition,
+                    ExecutionDisposition::Failed(ExecutionFailure {
+                        retry: RetryDisposition::Never,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn recompute_retry_releases_physical_and_logical_session_state() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
@@ -2397,6 +2756,8 @@ mod tests {
             executor,
         )
         .unwrap();
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
         let mut request = EngineCoreRequest::tts("recompute");
         request.id = "recompute-retry".to_string();
         request.prompt_tokens = vec![1];
