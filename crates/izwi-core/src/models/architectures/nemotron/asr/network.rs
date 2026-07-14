@@ -587,8 +587,6 @@ impl NemotronNetwork {
         } else {
             None
         };
-        let mut new_token_ids = Vec::new();
-
         for t in 0..encoded_len {
             let enc_t = if let Some(projection) = encoded_projection.as_ref() {
                 projection.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?
@@ -642,7 +640,6 @@ impl NemotronNetwork {
                     )));
                 }
                 state.token_ids.push(label);
-                new_token_ids.push(label);
                 on_token(label);
                 symbols_this_frame = symbols_this_frame.saturating_add(1);
                 if symbols_this_frame >= self.max_symbols_per_frame {
@@ -664,8 +661,6 @@ impl NemotronNetwork {
         state.stats.emitted_tokens = state.token_ids.len();
 
         Ok(NemotronRnntStreamStep {
-            token_ids: state.token_ids.clone(),
-            new_token_ids,
             stats: state.stats.clone(),
         })
     }
@@ -1049,8 +1044,6 @@ pub(super) struct NemotronRnntStreamState {
 }
 
 pub(super) struct NemotronRnntStreamStep {
-    pub token_ids: Vec<usize>,
-    pub new_token_ids: Vec<usize>,
     pub stats: NemotronDecodeStats,
 }
 
@@ -1283,7 +1276,7 @@ impl NemotronStreamingEncoderState {
 }
 
 impl NemotronRnntStreamState {
-    fn token_ids(&self) -> &[usize] {
+    pub(super) fn token_ids(&self) -> &[usize] {
         &self.token_ids
     }
 
@@ -3320,10 +3313,9 @@ mod tests {
         let step = network
             .decode_rnnt_streaming_chunk(&mut state, &first, 2, &mut |token| emitted.push(token))
             .unwrap();
-        assert!(step.new_token_ids.is_empty());
-        assert!(step.token_ids.is_empty());
         assert_eq!(step.stats.encoded_frames, 2);
         assert_eq!(step.stats.blank_frames, 2);
+        assert!(state.token_ids().is_empty());
 
         let step = network
             .decode_rnnt_streaming_chunk(&mut state, &second, 1, &mut |token| emitted.push(token))
@@ -3335,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn rnnt_stream_state_keeps_token_history_across_chunks() {
+    fn rnnt_stream_state_keeps_token_history_without_copying_it_into_steps() {
         let network = rnnt_test_network(vec![10.0, 0.0, 1.0], 2);
         let mut state = network.start_rnnt_stream(128).unwrap();
         let encoded = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
@@ -3344,18 +3336,16 @@ mod tests {
         let first = network
             .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| emitted.push(token))
             .unwrap();
-        assert_eq!(first.new_token_ids, vec![0, 0]);
-        assert_eq!(first.token_ids, vec![0, 0]);
         assert_eq!(first.stats.guard_exits, 1);
+        assert_eq!(state.token_ids(), &[0, 0]);
 
         let second = network
             .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| emitted.push(token))
             .unwrap();
-        assert_eq!(second.new_token_ids, vec![0, 0]);
-        assert_eq!(second.token_ids, vec![0, 0, 0, 0]);
         assert_eq!(second.stats.encoded_frames, 2);
         assert_eq!(second.stats.emitted_tokens, 4);
         assert_eq!(second.stats.guard_exits, 2);
+        assert_eq!(state.token_ids(), &[0, 0, 0, 0]);
         assert_eq!(emitted, vec![0, 0, 0, 0]);
     }
 
