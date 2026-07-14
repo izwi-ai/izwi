@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::signal;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 mod api;
@@ -186,16 +187,34 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
 
     // Clone state for shutdown handler
     let shutdown_state = state.clone();
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
 
     // Spawn server with graceful shutdown
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_state, batch_worker_drain));
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(
+        shutdown_state,
+        batch_worker_drain,
+        shutdown_started_tx,
+    ));
 
     info!("Server ready. Press Ctrl+C to stop.");
-    let server_result = server.await;
+    let http_shutdown_grace = http_shutdown_grace_timeout();
+    let server_result = await_http_server_shutdown(
+        async move { server.await },
+        shutdown_started_rx,
+        http_shutdown_grace,
+    )
+    .await;
+    if server_result.is_none() {
+        warn!(
+            grace_secs = http_shutdown_grace.as_secs(),
+            "HTTP graceful shutdown timed out; dropping remaining connections"
+        );
+    }
     batch_worker_supervisor.shutdown().await?;
     cleanup_runtime_for_shutdown(&state).await;
-    server_result?;
+    if let Some(server_result) = server_result {
+        server_result?;
+    }
 
     Ok(())
 }
@@ -276,6 +295,11 @@ fn batch_stage_execution_timeout() -> Option<Duration> {
 
 fn batch_worker_drain_timeout() -> Duration {
     duration_secs_from_env("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS", 20, 1, 300)
+        .unwrap_or_else(|| Duration::from_secs(20))
+}
+
+fn http_shutdown_grace_timeout() -> Duration {
+    duration_secs_from_env("IZWI_HTTP_SHUTDOWN_GRACE_SECS", 20, 1, 300)
         .unwrap_or_else(|| Duration::from_secs(20))
 }
 
@@ -570,7 +594,11 @@ async fn warmup_preloaded_asr_models(state: &AppState) -> Vec<String> {
 }
 
 /// Wait for shutdown signal and cleanup
-async fn shutdown_signal(state: AppState, batch_worker_drain: BatchWorkerDrain) {
+async fn shutdown_signal(
+    state: AppState,
+    batch_worker_drain: BatchWorkerDrain,
+    shutdown_started: oneshot::Sender<()>,
+) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -600,8 +628,29 @@ async fn shutdown_signal(state: AppState, batch_worker_drain: BatchWorkerDrain) 
     state.lifecycle.mark_draining();
     state.runtime.begin_drain();
     batch_worker_drain.begin();
+    let _ = shutdown_started.send(());
 
     drop(state);
+}
+
+async fn await_http_server_shutdown<F>(
+    server: F,
+    shutdown_started: oneshot::Receiver<()>,
+    grace: Duration,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => Some(result),
+        started = shutdown_started => {
+            if started.is_err() {
+                return Some(server.await);
+            }
+            tokio::time::timeout(grace, &mut server).await.ok()
+        }
+    }
 }
 
 async fn cleanup_runtime_for_shutdown(state: &AppState) {
@@ -674,19 +723,52 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
+        std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
         assert_eq!(batch_stage_execution_timeout(), None);
         assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(20));
+        assert_eq!(http_shutdown_grace_timeout(), Duration::from_secs(20));
 
         std::env::set_var("IZWI_BATCH_STAGE_TIMEOUT_SECS", "1");
         std::env::set_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS", "999");
+        std::env::set_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS", "0");
         assert_eq!(
             batch_stage_execution_timeout(),
             Some(Duration::from_secs(30))
         );
         assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(300));
+        assert_eq!(http_shutdown_grace_timeout(), Duration::from_secs(20));
+
+        std::env::set_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS", "999");
+        assert_eq!(http_shutdown_grace_timeout(), Duration::from_secs(300));
 
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
+        std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
+    }
+
+    #[tokio::test]
+    async fn http_shutdown_finishes_without_waiting_for_a_signal_when_server_exits() {
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let result = await_http_server_shutdown(
+            async { "server-exited" },
+            shutdown_rx,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result, Some("server-exited"));
+    }
+
+    #[tokio::test]
+    async fn http_shutdown_grace_period_bounds_stuck_connections() {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        shutdown_tx.send(()).expect("shutdown receiver is alive");
+        let result = await_http_server_shutdown(
+            std::future::pending::<()>(),
+            shutdown_rx,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(result, None);
     }
 
     fn clear_bind_env() {
@@ -711,6 +793,7 @@ mod tests {
         std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
+        std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
