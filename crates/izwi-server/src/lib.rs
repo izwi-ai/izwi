@@ -210,8 +210,11 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "HTTP graceful shutdown timed out; dropping remaining connections"
         );
     }
-    batch_worker_supervisor.shutdown().await?;
-    cleanup_runtime_for_shutdown(&state).await;
+    shutdown_worker_then_cleanup(
+        batch_worker_supervisor.shutdown(),
+        cleanup_runtime_for_shutdown(&state),
+    )
+    .await?;
     if let Some(server_result) = server_result {
         server_result?;
     }
@@ -685,10 +688,42 @@ async fn cleanup_runtime_for_shutdown(state: &AppState) {
     }
 }
 
+async fn shutdown_worker_then_cleanup<W, C>(worker_shutdown: W, cleanup: C) -> anyhow::Result<()>
+where
+    W: std::future::Future<Output = anyhow::Result<()>>,
+    C: std::future::Future<Output = ()>,
+{
+    let worker_result = worker_shutdown.await;
+    cleanup.await;
+    worker_result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn worker_shutdown_failure_still_runs_runtime_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        let result = shutdown_worker_then_cleanup(
+            async {
+                tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("injected worker shutdown timeout"))
+            },
+            async move {
+                cleanup_flag.store(true, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(cleaned.load(Ordering::Acquire));
+    }
 
     #[test]
     fn local_batch_worker_subscribes_to_explicit_runtime_queues() {
