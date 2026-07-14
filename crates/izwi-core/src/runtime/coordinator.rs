@@ -622,18 +622,29 @@ fn parse_macos_vm_stat_available(contents: &str) -> Option<u64> {
 #[cfg(feature = "metal")]
 fn metal_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
     let metal = device.device.as_metal_device().ok()?.metal_device();
-    let total = u64::try_from(metal.recommended_max_working_set_size()).ok()?;
-    let allocated = u64::try_from(metal.current_allocated_size()).ok()?;
-    Some((
-        total,
-        total.saturating_sub(allocated),
-        CapacitySource::MetalWorkingSet,
-    ))
+    let metal_total = u64::try_from(metal.recommended_max_working_set_size()).ok()?;
+    let metal_allocated = u64::try_from(metal.current_allocated_size()).ok()?;
+    let (host_total, host_available) = host_memory_snapshot()?;
+    let (total, available) =
+        combine_metal_memory_snapshot(metal_total, metal_allocated, host_total, host_available);
+    Some((total, available, CapacitySource::MetalWorkingSet))
 }
 
 #[cfg(not(feature = "metal"))]
 fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
     None
+}
+
+fn combine_metal_memory_snapshot(
+    metal_total: u64,
+    metal_allocated: u64,
+    host_total: u64,
+    host_available: u64,
+) -> (u64, u64) {
+    let total = metal_total.min(host_total);
+    let metal_available = metal_total.saturating_sub(metal_allocated);
+    let available = metal_available.min(host_available).min(total);
+    (total, available)
 }
 
 #[cfg(feature = "cuda")]
@@ -710,6 +721,18 @@ Pages purgeable: 7.\n";
 Pages free: 10.\n";
 
         assert_eq!(parse_macos_vm_stat_available(snapshot), None);
+    }
+
+    #[test]
+    fn metal_capacity_is_bounded_by_host_memory_pressure() {
+        assert_eq!(combine_metal_memory_snapshot(100, 20, 200, 30), (100, 30));
+        assert_eq!(combine_metal_memory_snapshot(200, 10, 80, 70), (80, 70));
+    }
+
+    #[test]
+    fn metal_capacity_is_bounded_by_working_set_pressure() {
+        assert_eq!(combine_metal_memory_snapshot(100, 90, 200, 150), (100, 10));
+        assert_eq!(combine_metal_memory_snapshot(100, 120, 200, 150), (100, 0));
     }
 
     #[tokio::test]

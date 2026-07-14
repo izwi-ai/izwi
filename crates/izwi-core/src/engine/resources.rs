@@ -280,9 +280,10 @@ pub struct PhysicalCapacitySnapshot {
     /// report actual free/reclaimable capacity here; allocations belonging to
     /// existing leases may therefore already be subtracted from this value.
     ///
-    /// `ResourceAuthority` compares only the new reservation against this
-    /// vector. It separately compares the complete reservation ledger against
-    /// `capacity`, avoiding double-counting materialized leases.
+    /// `ResourceAuthority` compares the new reservation plus every
+    /// unmaterialized claim against this vector. It separately compares the
+    /// complete reservation ledger against `capacity`, avoiding
+    /// double-counting materialized leases.
     pub available: ResourceVector,
     pub source: CapacitySource,
 }
@@ -302,6 +303,26 @@ pub struct ResourceAuthoritySnapshot {
 struct AuthorityState {
     ledger: ResourceLedger,
     owners: HashMap<ReservationId, ReservationOwner>,
+    /// Portion of each reservation that is already visible in the physical
+    /// provider's used-memory reading. The remainder is pending allocation and
+    /// must be subtracted from live headroom before admitting more work.
+    materialized: HashMap<ReservationId, ResourceVector>,
+}
+
+impl AuthorityState {
+    fn pending_resources(&self) -> Result<ResourceVector> {
+        self.ledger.reservations.iter().try_fold(
+            ResourceVector::zero(),
+            |pending, (id, reserved)| {
+                let materialized = self
+                    .materialized
+                    .get(id)
+                    .copied()
+                    .unwrap_or_else(ResourceVector::zero);
+                pending.checked_add(reserved.positive_growth_over(materialized)?)
+            },
+        )
+    }
 }
 
 /// One transactional authority for every physical-memory consumer on a backend.
@@ -319,6 +340,7 @@ impl ResourceAuthority {
             state: Mutex::new(AuthorityState {
                 ledger: ResourceLedger::new(capacity),
                 owners: HashMap::new(),
+                materialized: HashMap::new(),
             }),
         }
     }
@@ -351,13 +373,13 @@ impl ResourceAuthority {
             .state
             .lock()
             .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
-        // Serialize the observation with ledger mutation. `available` is live
-        // physical headroom, so existing reservations must not be added to the
-        // new request: providers already subtract any leases that have
-        // materialized. The ledger's own reserve call independently protects
-        // unmaterialized reservations against the total capacity ceiling.
+        // Serialize the observation with ledger mutation. `available` already
+        // excludes materialized allocations, but it cannot see reservations
+        // that have not allocated yet. Charge every pending claim against live
+        // headroom so concurrent reservations cannot spend it more than once.
         let physical = self.provider.snapshot();
-        if !resources.fits_within(physical.available) {
+        let live_claim = state.pending_resources()?.checked_add(resources)?;
+        if !live_claim.fits_within(physical.available) {
             return Err(Error::Overloaded(format!(
                 "insufficient live physical capacity for {}",
                 owner.key
@@ -365,6 +387,9 @@ impl ResourceAuthority {
         }
         let reservation = state.ledger.reserve(resources)?;
         state.owners.insert(reservation.id, owner);
+        state
+            .materialized
+            .insert(reservation.id, ResourceVector::zero());
         Ok(ResourceLease {
             authority: self.clone(),
             id: Some(reservation.id),
@@ -375,6 +400,7 @@ impl ResourceAuthority {
     fn release(&self, id: ReservationId) {
         if let Ok(mut state) = self.state.lock() {
             state.owners.remove(&id);
+            state.materialized.remove(&id);
             let _ = state.ledger.release(id);
         }
     }
@@ -398,9 +424,17 @@ impl ResourceAuthority {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
         if !allocation_already_materialized {
-            let growth = resources.positive_growth_over(current)?;
+            let materialized = state
+                .materialized
+                .get(&id)
+                .copied()
+                .unwrap_or_else(ResourceVector::zero);
+            let current_pending = current.positive_growth_over(materialized)?;
+            let next_pending = resources.positive_growth_over(materialized)?;
+            let other_pending = state.pending_resources()?.checked_sub(current_pending)?;
+            let live_claim = other_pending.checked_add(next_pending)?;
             let physical = self.provider.snapshot();
-            if !growth.fits_within(physical.available) {
+            if !live_claim.fits_within(physical.available) {
                 return Err(Error::Overloaded(
                     "insufficient live physical capacity for resource lease growth".to_string(),
                 ));
@@ -410,6 +444,9 @@ impl ResourceAuthority {
             return Err(Error::InferenceError(
                 "resource lease disappeared during resize".to_string(),
             ));
+        }
+        if allocation_already_materialized {
+            state.materialized.insert(id, resources);
         }
         Ok(())
     }
@@ -593,7 +630,7 @@ mod tests {
             available: AtomicU64::new(10),
         });
         let authority = Arc::new(ResourceAuthority::new(provider.clone()));
-        let model = authority
+        let mut model = authority
             .reserve(
                 ReservationOwner::new(ReservationClass::Model, "model"),
                 slots(6),
@@ -603,6 +640,7 @@ mod tests {
         // Simulate the model allocation becoming visible to the provider. The
         // six-unit model lease is already reflected in the four live units.
         provider.set_available(4);
+        model.reconcile_materialized(slots(6)).unwrap();
         let request = authority
             .reserve(
                 ReservationOwner::new(ReservationClass::Request, "request"),
@@ -637,6 +675,136 @@ mod tests {
             Err(Error::Overloaded(_))
         ));
         assert_eq!(authority.snapshot().reserved, slots(6));
+    }
+
+    #[test]
+    fn pending_reservations_cannot_double_spend_external_headroom() {
+        let vectors: [fn(u64) -> ResourceVector; 3] = [
+            |value| ResourceVector {
+                host_bytes: ResourceAmount::Known(value),
+                ..ResourceVector::zero()
+            },
+            |value| ResourceVector {
+                device_bytes: ResourceAmount::Known(value),
+                ..ResourceVector::zero()
+            },
+            |value| ResourceVector {
+                unified_bytes: ResourceAmount::Known(value),
+                ..ResourceVector::zero()
+            },
+        ];
+
+        for vector in vectors {
+            let provider = Arc::new(TestProvider {
+                snapshot: PhysicalCapacitySnapshot {
+                    capacity: vector(100),
+                    // Sixty units are already owned outside the authority.
+                    available: vector(40),
+                    source: CapacitySource::Test,
+                },
+            });
+            let authority = Arc::new(ResourceAuthority::new(provider));
+            let first = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Model, "first"),
+                    vector(30),
+                )
+                .unwrap();
+
+            // The total ledger would allow fifty units, but only forty units
+            // of physical headroom exist and thirty are already pending.
+            assert!(matches!(
+                authority.reserve(
+                    ReservationOwner::new(ReservationClass::Model, "second"),
+                    vector(20),
+                ),
+                Err(Error::Overloaded(_))
+            ));
+            assert_eq!(authority.snapshot().reserved, vector(30));
+
+            drop(first);
+            let second = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Model, "second"),
+                    vector(20),
+                )
+                .unwrap();
+            drop(second);
+            assert_eq!(authority.snapshot().reserved, vector(0));
+        }
+    }
+
+    #[test]
+    fn mixed_materialized_and_pending_claims_share_live_headroom() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 100,
+            available: AtomicU64::new(40),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let mut materialized = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "materialized"),
+                slots(20),
+            )
+            .unwrap();
+        provider.set_available(30);
+        materialized.reconcile_materialized(slots(20)).unwrap();
+
+        let pending = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, "pending"),
+                slots(15),
+            )
+            .unwrap();
+        assert!(matches!(
+            authority.reserve(
+                ReservationOwner::new(ReservationClass::Request, "too-large"),
+                slots(16),
+            ),
+            Err(Error::Overloaded(_))
+        ));
+        let fitting = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "fitting"),
+                slots(15),
+            )
+            .unwrap();
+
+        assert_eq!(authority.snapshot().reserved, slots(50));
+        drop((fitting, pending, materialized));
+        assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn lease_growth_accounts_for_other_pending_reservations() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 100,
+            available: AtomicU64::new(50),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let mut materialized = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "materialized"),
+                slots(10),
+            )
+            .unwrap();
+        provider.set_available(40);
+        materialized.reconcile_materialized(slots(10)).unwrap();
+        let _pending = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "pending"),
+                slots(15),
+            )
+            .unwrap();
+
+        // Growing the materialized lease to 36 adds 26 pending units. Together
+        // with the other 15-unit claim that would consume 41 live units.
+        assert!(matches!(
+            materialized.resize(slots(36)),
+            Err(Error::Overloaded(_))
+        ));
+        materialized.resize(slots(35)).unwrap();
+        assert_eq!(authority.snapshot().reserved, slots(50));
     }
 
     #[test]
