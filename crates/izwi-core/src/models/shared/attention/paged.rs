@@ -4,7 +4,7 @@ use candle_core::{DType, Tensor, D};
 
 use crate::error::{Error, Result};
 use crate::models::shared::memory::accounting::{
-    compact_tensor_storage, deep_copy_tensor_storage, TensorStorageAccounting,
+    deep_copy_tensor_storage, TensorStorageAccounting,
 };
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 

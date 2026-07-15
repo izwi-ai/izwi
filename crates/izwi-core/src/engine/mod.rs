@@ -50,8 +50,8 @@ pub use execution::{
     WorkUnit, YieldReason,
 };
 pub use executor::{
-    ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, WorkerConfig,
-    REQUEST_DEADLINE_EXCEEDED,
+    CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
+    WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
 };
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
@@ -1105,6 +1105,11 @@ impl Engine {
             self.wake_notify.notify_one();
         }
         aborted
+    }
+
+    /// Purge reusable executor cache state owned by one model variant.
+    pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        self.core.write().await.purge_model_cache(variant).await
     }
 
     /// Abort every request currently tracked by the engine.

@@ -1,9 +1,10 @@
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::debug;
 
-use crate::engine::resources::{ReservationClass, ReservationOwner};
+use crate::engine::resources::{ReservationClass, ReservationOwner, ResourceLease};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen35::chat::{Qwen35PrefixSnapshot, Qwen35PreparedPrompt};
 use crate::models::registry::NativeChatModel;
@@ -19,6 +20,11 @@ use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecu
 
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
+
+struct PendingPrefixAuthorization {
+    max_bytes: u64,
+    lease: ResourceLease,
+}
 
 #[derive(Debug, Default)]
 struct StreamDeltaBatch {
@@ -237,6 +243,19 @@ impl NativeExecutor {
                     )
                 })
                 .flatten();
+            let pending_prefix_authorization = prefix_cache_enabled
+                .then(|| {
+                    self.preauthorize_qwen35_prefix_snapshot(
+                        request,
+                        &prefix_scope,
+                        prepared_qwen35_prompt
+                            .expect("enabled Qwen3.5 prefix cache requires prepared prompt"),
+                    )
+                })
+                .flatten();
+            let capture_prefix_max_bytes = pending_prefix_authorization
+                .as_ref()
+                .map(|authorization| authorization.max_bytes);
             let mut decode_state = Self::run_blocking(|| {
                 model.start_decode_state_with_prefix(
                     messages,
@@ -244,7 +263,7 @@ impl NativeExecutor {
                     &generation_config,
                     prepared_qwen35_prompt,
                     cached_prefix.as_ref().map(|cached| cached.snapshot()),
-                    prefix_cache_enabled.then_some(self.qwen35_prefix_cache.max_retained_bytes()),
+                    capture_prefix_max_bytes,
                 )
             })?;
             let reused_prefix_tokens = decode_state.reused_qwen35_prefix_tokens();
@@ -256,11 +275,15 @@ impl NativeExecutor {
                     "Qwen3.5 exact-prefix cache hit"
                 );
             }
-            let pending_prefix_snapshot = decode_state
-                .take_pending_qwen35_prefix_snapshot()
-                .and_then(|snapshot| {
-                    self.authorize_qwen35_prefix_snapshot(&prefix_scope, snapshot)
-                });
+            let pending_prefix_snapshot = match (
+                decode_state.take_pending_qwen35_prefix_snapshot(),
+                pending_prefix_authorization,
+            ) {
+                (Some(snapshot), Some(authorization)) => {
+                    self.materialize_qwen35_prefix_snapshot(&prefix_scope, snapshot, authorization)
+                }
+                _ => None,
+            };
             ActiveChatDecode {
                 variant,
                 state: decode_state,
@@ -369,30 +392,70 @@ impl NativeExecutor {
             && prepared.is_some_and(Qwen35PreparedPrompt::supports_exact_prefix_reuse)
     }
 
-    fn authorize_qwen35_prefix_snapshot(
+    fn preauthorize_qwen35_prefix_snapshot(
         &self,
+        request: &EngineCoreRequest,
         scope: &ExactPrefixScope,
-        snapshot: Qwen35PrefixSnapshot,
-    ) -> Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>> {
-        let Some(bytes) = snapshot.retained_bytes() else {
-            return None;
-        };
-        if bytes == 0 || bytes > self.qwen35_prefix_cache.max_retained_bytes() {
+        prepared: &Qwen35PreparedPrompt,
+    ) -> Option<PendingPrefixAuthorization> {
+        let state_bytes = self.authorized_session_cache_bytes(request).ok()?;
+        let metadata_per_token = size_of::<u32>().checked_add(size_of::<[usize; 3]>())?;
+        let metadata_bytes = prepared
+            .prompt_ids()
+            .len()
+            .checked_mul(metadata_per_token)?
+            .checked_add(size_of::<Qwen35PrefixSnapshot>())?;
+        let max_bytes = state_bytes.checked_add(u64::try_from(metadata_bytes).ok()?)?;
+        if max_bytes == 0 || max_bytes > self.qwen35_prefix_cache.max_retained_bytes() {
             return None;
         }
         let Some(authority) = self.config.resource_authority.as_ref() else {
             return None;
         };
-        let resources = super::cache_resource_vector(scope.backend, bytes);
+        let resources = super::cache_resource_vector(scope.backend, max_bytes);
         let owner = ReservationOwner::new(
             ReservationClass::Cache,
             format!("qwen35-prefix-pending:{}", scope.variant),
         );
-        let Ok(lease) = authority.reserve_with_initial_materialized(owner, resources, resources)
-        else {
+        let lease = authority.reserve(owner, resources).ok()?;
+        Some(PendingPrefixAuthorization { max_bytes, lease })
+    }
+
+    fn materialize_qwen35_prefix_snapshot(
+        &self,
+        scope: &ExactPrefixScope,
+        snapshot: Qwen35PrefixSnapshot,
+        mut authorization: PendingPrefixAuthorization,
+    ) -> Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>> {
+        let Some(bytes) = snapshot.retained_bytes() else {
+            drop(snapshot);
+            drop(authorization);
             return None;
         };
-        Some(ExactPrefixHandle::new(scope.backend, snapshot, Some(lease)))
+        if bytes == 0 || bytes > authorization.max_bytes {
+            drop(snapshot);
+            drop(authorization);
+            return None;
+        }
+        let resources = super::cache_resource_vector(scope.backend, bytes);
+        if authorization
+            .lease
+            .record_materialized_usage(resources)
+            .is_err()
+        {
+            drop(snapshot);
+            drop(authorization);
+            return None;
+        }
+        // The copy is complete and its exact backing size is known. Relinquish
+        // unused preauthorization while keeping the materialized snapshot fully
+        // covered for its retained lifetime.
+        let _ = authorization.lease.resize(resources);
+        Some(ExactPrefixHandle::new(
+            scope.backend,
+            snapshot,
+            Some(authorization.lease),
+        ))
     }
 }
 

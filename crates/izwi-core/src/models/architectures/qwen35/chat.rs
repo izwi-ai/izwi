@@ -141,8 +141,8 @@ impl ChatDecodeState {
 /// sampler, history, RNG, and stream state are rebuilt on every restore.
 pub struct Qwen35PrefixSnapshot {
     text_state: Qwen35TextRuntimeState,
-    token_ids: Vec<u32>,
-    positions: Vec<[usize; 3]>,
+    token_ids: Box<[u32]>,
+    positions: Box<[[usize; 3]]>,
     next_text_position: usize,
 }
 
@@ -158,16 +158,10 @@ impl Qwen35PrefixSnapshot {
     pub(crate) fn retained_bytes(&self) -> Option<u64> {
         let mut accounting = TensorStorageAccounting::default();
         self.text_state.account_storage(&mut accounting)?;
+        accounting
+            .add_bytes(u64::try_from(self.token_ids.len().checked_mul(size_of::<u32>())?).ok()?)?;
         accounting.add_bytes(
-            u64::try_from(self.token_ids.capacity().checked_mul(size_of::<u32>())?).ok()?,
-        )?;
-        accounting.add_bytes(
-            u64::try_from(
-                self.positions
-                    .capacity()
-                    .checked_mul(size_of::<[usize; 3]>())?,
-            )
-            .ok()?,
+            u64::try_from(self.positions.len().checked_mul(size_of::<[usize; 3]>())?).ok()?,
         )?;
         accounting.add_bytes(u64::try_from(size_of::<Self>()).ok()?)?;
         Some(accounting.bytes())
@@ -849,8 +843,12 @@ impl Qwen35ChatModel {
                 .ok()
                 .map(|text_state| Qwen35PrefixSnapshot {
                     text_state,
-                    token_ids: prepared.prompt_ids[..checkpoint].to_vec(),
-                    positions: prepared.prompt_positions[..checkpoint].to_vec(),
+                    token_ids: prepared.prompt_ids[..checkpoint]
+                        .to_vec()
+                        .into_boxed_slice(),
+                    positions: prepared.prompt_positions[..checkpoint]
+                        .to_vec()
+                        .into_boxed_slice(),
                     next_text_position: checkpoint,
                 })
                 .filter(|snapshot| {
@@ -2076,6 +2074,32 @@ mod tests {
 
         assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
         assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reusable_prefix_boundary_is_an_exact_assistant_header_token_prefix() {
+        let tokenizer = synthetic_qwen35_tokenizer();
+        let rendered = "<|im_start|>user\nFirst question<|im_end|>\n\
+                        <|im_start|>assistant\nFirst answer<|im_end|>\n\
+                        <|im_start|>user\nFollow-up<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let full_ids = tokenizer.encode_text(rendered).unwrap();
+        let boundary_len = reusable_prefix_token_len(&tokenizer, rendered, &full_ids)
+            .unwrap()
+            .expect("assistant header should be an exact token boundary");
+        let boundary_end = rendered.rfind("<think>").unwrap();
+        let boundary_ids = tokenizer.encode_text(&rendered[..boundary_end]).unwrap();
+
+        assert_eq!(boundary_len, boundary_ids.len());
+        assert_eq!(&full_ids[..boundary_len], boundary_ids.as_slice());
+        assert!(boundary_len < full_ids.len());
+
+        let mut mismatched = full_ids;
+        mismatched[0] = u32::MAX;
+        assert_eq!(
+            reusable_prefix_token_len(&tokenizer, rendered, &mismatched).unwrap(),
+            None
+        );
     }
 
     #[test]

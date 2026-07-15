@@ -522,6 +522,11 @@ pub trait ModelExecutor: Send + Sync {
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         self.cleanup_request(&session.request_id)
     }
+
+    /// Purge model-owned reusable cache state before one model is unloaded.
+    fn purge_model_cache(&self, _variant: ModelVariant) -> CacheReleaseReport {
+        CacheReleaseReport::unconfirmed()
+    }
 }
 
 /// Proof returned after an executor cache cleanup request. Preemption may only
@@ -1241,6 +1246,10 @@ impl ModelExecutor for NativeExecutor {
             .saturating_add(usize::from(reservations.remove(session).is_some()));
         CacheReleaseReport::confirmed(released)
     }
+
+    fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        CacheReleaseReport::confirmed(self.qwen35_prefix_cache.purge_variant(variant))
+    }
 }
 
 /// Unified executor that wraps a model executor implementation.
@@ -1325,6 +1334,11 @@ impl UnifiedExecutor {
     pub async fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         let executor = self.inner.read().await;
         executor.cleanup_session(session)
+    }
+
+    pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        let executor = self.inner.read().await;
+        executor.purge_model_cache(variant)
     }
 }
 
