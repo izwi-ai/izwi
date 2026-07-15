@@ -21,7 +21,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::accounting::{compact_tensor_storage, TensorStorageAccounting};
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_prefill_sequence_span, record_prefill_token_mode_step,
     record_rope_kernel, record_rope_manual, DecodeAttentionPath,
@@ -114,7 +114,7 @@ impl ConvRingState {
             return Ok(());
         }
         let slot_refs: Vec<&Tensor> = self.slots.iter().collect();
-        let packed = Tensor::cat(&slot_refs, 1)?;
+        let packed = compact_tensor_storage(&Tensor::cat(&slot_refs, 1)?)?;
         let mut slots = Vec::with_capacity(self.slots.len());
         for idx in 0..self.slots.len() {
             slots.push(packed.narrow(1, idx, 1)?);
@@ -1327,7 +1327,7 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, self.num_v_heads))?;
         let (output, next_state) =
             recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?;
-        *recurrent_state = Some(next_state);
+        *recurrent_state = Some(compact_tensor_storage(&next_state)?);
 
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
@@ -1432,7 +1432,7 @@ impl Qwen35LinearAttention {
         } else {
             recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
         };
-        *recurrent_state = Some(next_state);
+        *recurrent_state = Some(compact_tensor_storage(&next_state)?);
 
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
@@ -1900,15 +1900,14 @@ fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Resul
         return Ok(());
     }
     let append = append.contiguous()?;
-    match cache {
+    let next = match cache {
         Some(existing) => {
             let existing_ref: &Tensor = &*existing;
-            *cache = Some(Tensor::cat(&[existing_ref, &append], 2)?);
+            Tensor::cat(&[existing_ref, &append], 2)?
         }
-        None => {
-            *cache = Some(append);
-        }
-    }
+        None => append.clone(),
+    };
+    *cache = Some(compact_tensor_storage(&next)?);
     Ok(())
 }
 

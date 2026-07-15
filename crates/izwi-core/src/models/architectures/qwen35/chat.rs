@@ -15,7 +15,7 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::accounting::{compact_tensor_storage, TensorStorageAccounting};
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{Tokenizer, TokenizerDecodeStreamState};
@@ -502,7 +502,8 @@ impl Qwen35ChatModel {
         }
 
         let mut text_state = self.text_model.new_state();
-        let logits = self.prefill_prompt(&prepared_prompt, &mut text_state)?;
+        let logits =
+            compact_tensor_storage(&self.prefill_prompt(&prepared_prompt, &mut text_state)?)?;
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
         let history_ids =
@@ -577,11 +578,11 @@ impl Qwen35ChatModel {
         if stopped_on_sequence {
             state.finished = true;
         } else {
-            state.logits = self.text_model.forward_token_id_at(
+            state.logits = compact_tensor_storage(&self.text_model.forward_token_id_at(
                 next,
                 [state.next_text_position; 3],
                 &mut state.text_state,
-            )?;
+            )?)?;
             state.next_text_position += 1;
             if state.tokens_generated >= state.max_new_tokens {
                 state.finished = true;
