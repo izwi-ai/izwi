@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::api::request_context::RequestContext;
@@ -16,10 +17,10 @@ use crate::app::chat::{
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
-use crate::chat_store::{ChatThreadMessage, ChatThreadSummary};
+use crate::chat_store::{ChatStore, ChatThreadMessage, ChatThreadSummary};
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole};
+use izwi_core::{ChatGeneration, ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole};
 
 #[derive(Debug, Serialize)]
 pub struct ChatThreadListResponse {
@@ -242,19 +243,11 @@ pub async fn create_thread_message(
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
 
-    let user_message = state
-        .chat_store
-        .append_message(
-            thread_id.clone(),
-            "user".to_string(),
-            flattened_content.display_text.clone(),
-            prepared_content_parts.clone(),
-            Some(model_id.clone()),
-            None,
-            None,
-        )
-        .await
-        .map_err(map_store_or_not_found)?;
+    let user_message = state.chat_store.prepare_user_message(
+        thread_id.clone(),
+        flattened_content.display_text.clone(),
+        prepared_content_parts.clone(),
+    );
 
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
@@ -283,21 +276,10 @@ pub async fn create_thread_message(
         .await;
     }
 
-    let generation = generate_chat(&state, execution_request).await?;
-
-    let assistant_message = state
-        .chat_store
-        .append_message(
-            thread_id.clone(),
-            "assistant".to_string(),
-            generation.text.clone(),
-            None,
-            Some(model_id.clone()),
-            Some(generation.tokens_generated),
-            Some(generation.generation_time_ms),
-        )
-        .await
-        .map_err(map_store_or_not_found)?;
+    let generation = generate_chat(&state, execution_request).await;
+    let (generation, user_message, assistant_message) =
+        persist_generated_thread_turn(&state.chat_store, user_message, &model_id, generation)
+            .await?;
 
     let response = CreateThreadMessageResponse {
         thread_id,
@@ -313,6 +295,26 @@ pub async fn create_thread_message(
     Ok(Json(response).into_response())
 }
 
+async fn persist_generated_thread_turn(
+    chat_store: &ChatStore,
+    user_message: ChatThreadMessage,
+    model_id: &str,
+    generation: Result<ChatGeneration, ApiError>,
+) -> Result<(ChatGeneration, ChatThreadMessage, ChatThreadMessage), ApiError> {
+    let generation = generation?;
+    let (user_message, assistant_message) = chat_store
+        .append_turn(
+            user_message,
+            generation.text.clone(),
+            Some(model_id.to_string()),
+            generation.tokens_generated,
+            generation.generation_time_ms,
+        )
+        .await
+        .map_err(map_store_or_not_found)?;
+    Ok((generation, user_message, assistant_message))
+}
+
 async fn create_streaming_thread_message(
     state: AppState,
     model_id: String,
@@ -324,17 +326,39 @@ async fn create_streaming_thread_message(
     let thread_id_for_task = thread_id.clone();
     let model_id_for_task = model_id.clone();
     let user_message_for_start = user_message.clone();
-    let mut event_rx = spawn_chat_stream(state, execution_request);
+    let event_rx = spawn_chat_stream(state, execution_request);
+    let stream = thread_message_stream(
+        chat_store,
+        model_id_for_task,
+        thread_id_for_task,
+        user_message_for_start,
+        event_rx,
+    );
 
-    let stream = async_stream::stream! {
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+fn thread_message_stream(
+    chat_store: std::sync::Arc<ChatStore>,
+    model_id: String,
+    thread_id: String,
+    user_message: ChatThreadMessage,
+    mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
+) -> impl Stream<Item = Result<String, Infallible>> {
+    async_stream::stream! {
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => (
                     serde_json::to_string(&ThreadStreamStartEvent {
                         event: "start",
-                        thread_id: thread_id_for_task.clone(),
-                        model_id: model_id_for_task.clone(),
-                        user_message: user_message_for_start.clone(),
+                        thread_id: thread_id.clone(),
+                        model_id: model_id.clone(),
+                        user_message: user_message.clone(),
                     })
                     .unwrap_or_default(),
                     false,
@@ -349,28 +373,30 @@ async fn create_streaming_thread_message(
                 ),
                 ChatStreamEvent::Completed(generation) => {
                     let payload = match chat_store
-                        .append_message(
-                            thread_id_for_task.clone(),
-                            "assistant".to_string(),
+                        .append_turn(
+                            user_message.clone(),
                             generation.text.clone(),
-                            None,
-                            Some(model_id_for_task.clone()),
-                            Some(generation.tokens_generated),
-                            Some(generation.generation_time_ms),
+                            Some(model_id.clone()),
+                            generation.tokens_generated,
+                            generation.generation_time_ms,
                         )
                         .await
                     {
-                        Ok(assistant_message) => serde_json::to_string(&ThreadStreamDoneEvent {
-                            event: "done",
-                            thread_id: thread_id_for_task.clone(),
-                            model_id: model_id_for_task.clone(),
-                            assistant_message,
-                            stats: ChatGenerationStats {
-                                tokens_generated: generation.tokens_generated,
-                                generation_time_ms: generation.generation_time_ms,
-                            },
-                        })
-                        .unwrap_or_default(),
+                        Ok((persisted_user_message, assistant_message)) => {
+                            debug_assert_eq!(persisted_user_message.id, user_message.id);
+                            debug_assert_eq!(persisted_user_message.created_at, user_message.created_at);
+                            serde_json::to_string(&ThreadStreamDoneEvent {
+                                event: "done",
+                                thread_id: thread_id.clone(),
+                                model_id: model_id.clone(),
+                                assistant_message,
+                                stats: ChatGenerationStats {
+                                    tokens_generated: generation.tokens_generated,
+                                    generation_time_ms: generation.generation_time_ms,
+                                },
+                            })
+                            .unwrap_or_default()
+                        }
                         Err(err) => serde_json::to_string(&ThreadStreamErrorEvent {
                             event: "error",
                             error: format!("Failed to persist assistant message: {err}"),
@@ -402,14 +428,7 @@ async fn create_streaming_thread_message(
             }
         }
         yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
-    };
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap())
+    }
 }
 
 fn build_runtime_messages(
@@ -492,7 +511,29 @@ fn map_store_or_not_found(err: anyhow::Error) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::StoreDatabase;
+    use futures::StreamExt;
     use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    fn setup_stream_store() -> (TempDir, Arc<ChatStore>) {
+        let temp_dir = tempfile::tempdir().expect("temp dir should create");
+        let store = ChatStore::initialize_with_database(StoreDatabase::new(
+            temp_dir.path().join("chat.sqlite3"),
+        ));
+        (temp_dir, Arc::new(store))
+    }
+
+    fn test_generation() -> ChatGeneration {
+        ChatGeneration {
+            text: "assistant reply".to_string(),
+            prompt_tokens: 11,
+            tokens_generated: 3,
+            generation_time_ms: 4.5,
+        }
+    }
 
     #[test]
     fn flattens_thread_text_parts() {
@@ -582,5 +623,183 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(media_inputs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_stream_atomically_persists_the_wire_visible_user_and_assistant() {
+        let (_temp, store) = setup_stream_store();
+        let thread = store
+            .create_thread(None, Some("old-model".to_string()))
+            .await
+            .expect("thread should create");
+        let pending = store.prepare_user_message(
+            thread.id.clone(),
+            "hello".to_string(),
+            Some(vec![json!({"type":"text","text":"hello"})]),
+        );
+        let pending_id = pending.id.clone();
+        let pending_created_at = pending.created_at;
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send(ChatStreamEvent::Started)
+            .await
+            .expect("start should queue");
+        event_tx
+            .send(ChatStreamEvent::Completed(test_generation()))
+            .await
+            .expect("completion should queue");
+        drop(event_tx);
+
+        let chunks = thread_message_stream(
+            store.clone(),
+            "Qwen3.5-4B".to_string(),
+            thread.id.clone(),
+            pending,
+            event_rx,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream chunks should succeed");
+        assert_eq!(chunks.len(), 3);
+        let start: serde_json::Value = serde_json::from_str(
+            chunks[0]
+                .strip_prefix("data: ")
+                .expect("start data prefix")
+                .trim(),
+        )
+        .expect("start event should be json");
+        assert_eq!(start["event"], "start");
+        assert_eq!(start["user_message"]["id"], pending_id);
+        assert_eq!(
+            start["user_message"]["created_at"],
+            serde_json::Value::from(pending_created_at)
+        );
+        let done: serde_json::Value = serde_json::from_str(
+            chunks[1]
+                .strip_prefix("data: ")
+                .expect("done data prefix")
+                .trim(),
+        )
+        .expect("done event should be json");
+        assert_eq!(done["event"], "done");
+
+        let messages = store
+            .list_messages(thread.id)
+            .await
+            .expect("messages should list");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, pending_id);
+        assert_eq!(messages[0].created_at, pending_created_at);
+        assert_eq!(done["assistant_message"]["id"], messages[1].id);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_inference_failure_does_not_persist_the_pending_user() {
+        let (_temp, store) = setup_stream_store();
+        let thread = store
+            .create_thread(None, Some("Qwen3.5-4B".to_string()))
+            .await
+            .expect("thread should create");
+        let pending = store.prepare_user_message(thread.id.clone(), "hello".to_string(), None);
+
+        let err = persist_generated_thread_turn(
+            &store,
+            pending,
+            "Qwen3.5-4B",
+            Err(ApiError::internal("inference failed")),
+        )
+        .await
+        .expect_err("inference failure should propagate");
+        assert_eq!(err.message, "inference failed");
+        assert!(store
+            .list_messages(thread.id)
+            .await
+            .expect("messages should list")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_stream_does_not_persist_an_unmatched_user_message() {
+        let (_temp, store) = setup_stream_store();
+        let thread = store
+            .create_thread(None, Some("Qwen3.5-4B".to_string()))
+            .await
+            .expect("thread should create");
+        let pending = store.prepare_user_message(thread.id.clone(), "hello".to_string(), None);
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send(ChatStreamEvent::Started)
+            .await
+            .expect("start should queue");
+        event_tx
+            .send(ChatStreamEvent::Failed("inference failed".to_string()))
+            .await
+            .expect("failure should queue");
+        drop(event_tx);
+
+        let chunks = thread_message_stream(
+            store.clone(),
+            "Qwen3.5-4B".to_string(),
+            thread.id.clone(),
+            pending,
+            event_rx,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream chunks should succeed");
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.contains("inference failed")));
+        assert!(store
+            .list_messages(thread.id)
+            .await
+            .expect("messages should list")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_does_not_persist_the_pending_user_message() {
+        let (_temp, store) = setup_stream_store();
+        let thread = store
+            .create_thread(None, Some("Qwen3.5-4B".to_string()))
+            .await
+            .expect("thread should create");
+        let pending = store.prepare_user_message(thread.id.clone(), "hello".to_string(), None);
+        let (event_tx, event_rx) = mpsc::channel(4);
+        event_tx
+            .send(ChatStreamEvent::Started)
+            .await
+            .expect("start should queue");
+
+        {
+            let stream = thread_message_stream(
+                store.clone(),
+                "Qwen3.5-4B".to_string(),
+                thread.id.clone(),
+                pending,
+                event_rx,
+            );
+            futures::pin_mut!(stream);
+            let start = stream
+                .next()
+                .await
+                .expect("start chunk")
+                .expect("start chunk should succeed");
+            assert!(start.contains("\"event\":\"start\""));
+        }
+
+        assert!(event_tx
+            .send(ChatStreamEvent::Completed(test_generation()))
+            .await
+            .is_err());
+        assert!(store
+            .list_messages(thread.id)
+            .await
+            .expect("messages should list")
+            .is_empty());
     }
 }

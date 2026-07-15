@@ -151,6 +151,29 @@ impl ChatStore {
         fetch_thread_summary(db, &thread_id).await
     }
 
+    /// Build the user half of a chat turn without making it durable yet.
+    ///
+    /// Streaming responses expose this record in their `start` event. The exact
+    /// same id and timestamp are committed with the assistant response only
+    /// after generation succeeds.
+    pub fn prepare_user_message(
+        &self,
+        thread_id: String,
+        content: String,
+        content_parts: Option<Vec<JsonValue>>,
+    ) -> ChatThreadMessage {
+        ChatThreadMessage {
+            id: new_uuid(),
+            thread_id,
+            role: "user".to_string(),
+            content,
+            content_parts,
+            created_at: now_unix_millis_u64(),
+            tokens_generated: None,
+            generation_time_ms: None,
+        }
+    }
+
     pub async fn append_message(
         &self,
         thread_id: String,
@@ -167,62 +190,154 @@ impl ChatStore {
             .await
             .context("Failed to start chat message transaction")?;
 
-        let thread_exists = chat_threads::Entity::find_by_id(thread_id.clone())
-            .one(&tx)
-            .await
-            .context("Failed to load chat thread")?
-            .is_some();
+        ensure_thread_exists(&tx, &thread_id).await?;
 
-        if !thread_exists {
-            return Err(anyhow!("Thread not found"));
-        }
-
-        let now = now_unix_millis_i64();
-        let message_id = new_uuid();
-        let tokens_i64 = opt_usize_to_i64(tokens_generated)?;
-        let serialized_content_parts = content_parts
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("Failed serializing chat message content_parts")?;
-
-        chat_messages::Entity::insert(chat_messages::ActiveModel {
-            id: Set(message_id.clone()),
-            thread_id: Set(thread_id.clone()),
-            role: Set(role.clone()),
-            content: Set(content.clone()),
-            content_parts: Set(serialized_content_parts),
-            created_at: Set(now),
-            tokens_generated: Set(tokens_i64),
-            generation_time_ms: Set(generation_time_ms),
-        })
-        .exec(&tx)
-        .await
-        .context("Failed to append chat message")?;
-
-        chat_threads::Entity::update_many()
-            .col_expr(chat_threads::Column::UpdatedAt, Expr::value(now))
-            .col_expr(chat_threads::Column::ModelId, Expr::value(model_id.clone()))
-            .filter(chat_threads::Column::Id.eq(thread_id.clone()))
-            .exec(&tx)
-            .await
-            .context("Failed to update chat thread metadata")?;
+        let message = ChatThreadMessage {
+            id: new_uuid(),
+            thread_id: thread_id.clone(),
+            role,
+            content,
+            content_parts,
+            created_at: now_unix_millis_u64(),
+            tokens_generated,
+            generation_time_ms,
+        };
+        insert_message(&tx, &message).await?;
+        update_thread_metadata(&tx, &thread_id, model_id, message.created_at).await?;
 
         tx.commit()
             .await
             .context("Failed to commit chat message transaction")?;
 
-        Ok(ChatThreadMessage {
-            id: message_id,
-            thread_id,
-            role,
-            content,
-            content_parts,
-            created_at: now as u64,
-            tokens_generated,
-            generation_time_ms,
-        })
+        Ok(message)
     }
+
+    /// Atomically persist a completed user/assistant turn.
+    ///
+    /// The caller prepares `user_message` before generation so streaming clients
+    /// can receive a stable identity immediately. Neither message becomes
+    /// visible unless both inserts and the single thread metadata update commit.
+    pub async fn append_turn(
+        &self,
+        user_message: ChatThreadMessage,
+        assistant_content: String,
+        model_id: Option<String>,
+        tokens_generated: usize,
+        generation_time_ms: f64,
+    ) -> anyhow::Result<(ChatThreadMessage, ChatThreadMessage)> {
+        validate_pending_user_message(&user_message)?;
+
+        let assistant_message = ChatThreadMessage {
+            id: new_uuid(),
+            thread_id: user_message.thread_id.clone(),
+            role: "assistant".to_string(),
+            content: assistant_content,
+            content_parts: None,
+            created_at: now_unix_millis_u64().max(user_message.created_at.saturating_add(1)),
+            tokens_generated: Some(tokens_generated),
+            generation_time_ms: Some(generation_time_ms),
+        };
+
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin()
+            .await
+            .context("Failed to start chat turn transaction")?;
+        ensure_thread_exists(&tx, &user_message.thread_id).await?;
+        insert_message(&tx, &user_message)
+            .await
+            .context("Failed to append chat turn user message")?;
+        insert_message(&tx, &assistant_message)
+            .await
+            .context("Failed to append chat turn assistant message")?;
+        update_thread_metadata(
+            &tx,
+            &user_message.thread_id,
+            model_id,
+            assistant_message.created_at,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("Failed to commit chat turn transaction")?;
+
+        Ok((user_message, assistant_message))
+    }
+}
+
+async fn ensure_thread_exists<C>(db: &C, thread_id: &str) -> anyhow::Result<()>
+where
+    C: ConnectionTrait,
+{
+    let exists = chat_threads::Entity::find_by_id(thread_id.to_string())
+        .one(db)
+        .await
+        .context("Failed to load chat thread")?
+        .is_some();
+    if !exists {
+        return Err(anyhow!("Thread not found"));
+    }
+    Ok(())
+}
+
+async fn insert_message<C>(db: &C, message: &ChatThreadMessage) -> anyhow::Result<()>
+where
+    C: ConnectionTrait,
+{
+    let serialized_content_parts = message
+        .content_parts
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("Failed serializing chat message content_parts")?;
+    chat_messages::Entity::insert(chat_messages::ActiveModel {
+        id: Set(message.id.clone()),
+        thread_id: Set(message.thread_id.clone()),
+        role: Set(message.role.clone()),
+        content: Set(message.content.clone()),
+        content_parts: Set(serialized_content_parts),
+        created_at: Set(u64_to_i64(message.created_at, "created_at")?),
+        tokens_generated: Set(opt_usize_to_i64(message.tokens_generated)?),
+        generation_time_ms: Set(message.generation_time_ms),
+    })
+    .exec(db)
+    .await
+    .context("Failed to append chat message")?;
+    Ok(())
+}
+
+async fn update_thread_metadata<C>(
+    db: &C,
+    thread_id: &str,
+    model_id: Option<String>,
+    updated_at: u64,
+) -> anyhow::Result<()>
+where
+    C: ConnectionTrait,
+{
+    chat_threads::Entity::update_many()
+        .col_expr(
+            chat_threads::Column::UpdatedAt,
+            Expr::value(u64_to_i64(updated_at, "updated_at")?),
+        )
+        .col_expr(chat_threads::Column::ModelId, Expr::value(model_id))
+        .filter(chat_threads::Column::Id.eq(thread_id.to_string()))
+        .exec(db)
+        .await
+        .context("Failed to update chat thread metadata")?;
+    Ok(())
+}
+
+fn validate_pending_user_message(message: &ChatThreadMessage) -> anyhow::Result<()> {
+    if message.role != "user" {
+        return Err(anyhow!("Pending chat turn message must have role=user"));
+    }
+    if message.tokens_generated.is_some() || message.generation_time_ms.is_some() {
+        return Err(anyhow!(
+            "Pending chat turn user message cannot contain generation statistics"
+        ));
+    }
+    Ok(())
 }
 
 const THREAD_SUMMARY_LIST_SQL: &str = r#"
@@ -333,10 +448,14 @@ fn map_thread_message(row: &QueryResult) -> anyhow::Result<ChatThreadMessage> {
 }
 
 fn now_unix_millis_i64() -> i64 {
+    i64::try_from(now_unix_millis_u64()).unwrap_or(i64::MAX)
+}
+
+fn now_unix_millis_u64() -> u64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    duration.as_millis() as i64
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn sanitize_thread_title(raw: Option<&str>) -> String {
@@ -373,6 +492,10 @@ fn opt_usize_to_i64(value: Option<usize>) -> anyhow::Result<Option<i64>> {
         )),
         None => Ok(None),
     }
+}
+
+fn u64_to_i64(value: u64, field: &str) -> anyhow::Result<i64> {
+    i64::try_from(value).with_context(|| format!("Numeric conversion overflow for {field}"))
 }
 
 fn i64_to_u64(value: i64) -> u64 {
@@ -527,6 +650,115 @@ mod tests {
                 .await
                 .expect_err("missing thread should fail");
             assert!(err.to_string().contains("Thread not found"));
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn append_turn_persists_both_messages_with_stable_user_identity() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store
+                .create_thread(None, Some("old-model".to_string()))
+                .await
+                .expect("thread should create");
+            let pending = store.prepare_user_message(
+                thread.id.clone(),
+                "hello".to_string(),
+                Some(vec![json!({"type":"text","text":"hello"})]),
+            );
+            let pending_id = pending.id.clone();
+            let pending_created_at = pending.created_at;
+
+            let (user, assistant) = store
+                .append_turn(
+                    pending,
+                    "world".to_string(),
+                    Some("new-model".to_string()),
+                    7,
+                    12.5,
+                )
+                .await
+                .expect("turn should append");
+
+            assert_eq!(user.id, pending_id);
+            assert_eq!(user.created_at, pending_created_at);
+            assert!(assistant.created_at > user.created_at);
+            let messages = store
+                .list_messages(thread.id.clone())
+                .await
+                .expect("messages should list");
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].id, user.id);
+            assert_eq!(messages[1].id, assistant.id);
+            assert_eq!(messages[1].tokens_generated, Some(7));
+
+            let summary = store
+                .get_thread(thread.id)
+                .await
+                .expect("thread should load")
+                .expect("thread should exist");
+            assert_eq!(summary.model_id.as_deref(), Some("new-model"));
+            assert_eq!(summary.last_message_preview.as_deref(), Some("world"));
+            assert_eq!(summary.message_count, 2);
+            assert_eq!(summary.updated_at, assistant.created_at);
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn append_turn_rolls_back_user_when_assistant_insert_fails() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store
+                .create_thread(None, Some("old-model".to_string()))
+                .await
+                .expect("thread should create");
+            let original_updated_at = thread.updated_at;
+            let db = store.db.connection().await.expect("database connection");
+            db.execute_unprepared(
+                r#"
+                CREATE TRIGGER fail_chat_assistant_insert
+                BEFORE INSERT ON chat_messages
+                WHEN NEW.role = 'assistant'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced assistant insert failure');
+                END
+                "#,
+            )
+            .await
+            .expect("failure trigger should create");
+
+            let pending =
+                store.prepare_user_message(thread.id.clone(), "must roll back".to_string(), None);
+            let err = store
+                .append_turn(
+                    pending,
+                    "not persisted".to_string(),
+                    Some("new-model".to_string()),
+                    3,
+                    4.0,
+                )
+                .await
+                .expect_err("assistant failure should abort the transaction");
+            assert!(err.to_string().contains("assistant"));
+
+            assert!(store
+                .list_messages(thread.id.clone())
+                .await
+                .expect("messages should list")
+                .is_empty());
+            let summary = store
+                .get_thread(thread.id)
+                .await
+                .expect("thread should load")
+                .expect("thread should exist");
+            assert_eq!(summary.model_id.as_deref(), Some("old-model"));
+            assert_eq!(summary.updated_at, original_updated_at);
+            assert_eq!(summary.message_count, 0);
+            assert!(summary.last_message_preview.is_none());
             clear_env();
         })
         .await;
