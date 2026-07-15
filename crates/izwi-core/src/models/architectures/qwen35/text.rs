@@ -14,7 +14,9 @@ use crate::kernels::{
     try_fused_silu_mul, try_tiled_deltanet_recurrence, use_block_fusion_for_device,
 };
 use crate::models::architectures::qwen3::core::repeat_kv;
-use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::flash::{
+    try_fused_self_attention, try_fused_self_attention_preserve_dtype,
+};
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
@@ -100,6 +102,28 @@ struct ConvRingState {
     next_idx: usize,
 }
 
+impl ConvRingState {
+    /// Copy every logical history slot into one compact backing allocation.
+    ///
+    /// Token slices produced during sequence prefill are views into the entire
+    /// projected `[batch, sequence, conv_dim]` tensor. Retaining those views in
+    /// decode state would retain and account the full prefill allocation rather
+    /// than the fixed `kernel_size - 1` convolution history.
+    fn compact_owned(&mut self) -> Result<()> {
+        if self.slots.is_empty() {
+            return Ok(());
+        }
+        let slot_refs: Vec<&Tensor> = self.slots.iter().collect();
+        let packed = Tensor::cat(&slot_refs, 1)?;
+        let mut slots = Vec::with_capacity(self.slots.len());
+        for idx in 0..self.slots.len() {
+            slots.push(packed.narrow(1, idx, 1)?);
+        }
+        self.slots = slots;
+        Ok(())
+    }
+}
+
 enum Qwen35LayerRuntimeState {
     Linear {
         conv_state: Option<ConvRingState>,
@@ -112,6 +136,25 @@ enum Qwen35LayerRuntimeState {
         dense_v_cache_h: Option<Tensor>,
         dense_kv_tokens: usize,
     },
+}
+
+fn full_attention_state_has_cached_prefix(state: &Qwen35LayerRuntimeState) -> Result<bool> {
+    match state {
+        Qwen35LayerRuntimeState::Full {
+            k_pages,
+            v_pages,
+            dense_k_cache_h,
+            dense_v_cache_h,
+            dense_kv_tokens,
+        } => Ok(!k_pages.is_empty()
+            || !v_pages.is_empty()
+            || dense_k_cache_h.is_some()
+            || dense_v_cache_h.is_some()
+            || *dense_kv_tokens > 0),
+        _ => Err(Error::InferenceError(
+            "Qwen3.5 layer runtime state does not match full-attention layer".to_string(),
+        )),
+    }
 }
 
 struct Qwen35Layer {
@@ -454,16 +497,13 @@ impl Qwen35Layer {
                 },
             ) => {
                 if conv_state.is_none() && mixer.kernel_size > 1 {
-                    // Initialize the ring buffer with zeros
-                    let mut slots = Vec::with_capacity(mixer.kernel_size - 1);
-                    let zero = pooled_zero_tensor(
-                        pool.as_ref(),
-                        &[mixer.conv_dim, 1],
-                        DType::F32,
-                        device,
-                    )?;
-                    for _ in 0..(mixer.kernel_size - 1) {
-                        slots.push(zero.clone());
+                    // Keep the persistent history in one exact-size allocation;
+                    // scratch-pool capacity must not become retained state.
+                    let history_len = mixer.kernel_size - 1;
+                    let zero = Tensor::zeros((mixer.conv_dim, history_len), DType::F32, device)?;
+                    let mut slots = Vec::with_capacity(history_len);
+                    for idx in 0..history_len {
+                        slots.push(zero.narrow(1, idx, 1)?);
                     }
                     *conv_state = Some(ConvRingState { slots, next_idx: 0 });
                 }
@@ -761,18 +801,14 @@ impl Qwen35FullAttention {
             )? {
                 out
             } else {
-                // Unfused fallback path still expects explicit KV expansion.
-                let key_states = key_states_h.transpose(1, 2)?.contiguous()?;
-                let value_states = value_states_h.transpose(1, 2)?.contiguous()?;
-                let key_states = repeat_kv(&key_states, self.num_heads, self.num_kv_heads)?;
-                let value_states = repeat_kv(&value_states, self.num_heads, self.num_kv_heads)?;
-                let key_states = key_states.transpose(1, 2)?.contiguous()?;
-                let value_states = value_states.transpose(1, 2)?.contiguous()?;
-                let key_states_t = key_states.transpose(2, 3)?.contiguous()?;
-                let attn = query_states.matmul(&key_states_t)?;
-                let attn = (attn / (self.head_dim as f64).sqrt())?;
-                let attn = ops::softmax_last_dim(&attn)?;
-                attn.contiguous()?.matmul(&value_states)?
+                unfused_causal_attention(
+                    &query_states,
+                    &key_states_h,
+                    &value_states_h,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )?
             };
             attn_output
                 .transpose(1, 2)?
@@ -805,21 +841,12 @@ impl Qwen35FullAttention {
             )));
         }
 
-        let has_prefix_pages = match state {
-            Qwen35LayerRuntimeState::Full {
-                k_pages, v_pages, ..
-            } => !k_pages.is_empty() || !v_pages.is_empty(),
-            _ => {
-                return Err(Error::InferenceError(
-                    "Qwen3.5 layer runtime state does not match full-attention layer".to_string(),
-                ))
-            }
-        };
+        let has_cached_prefix = full_attention_state_has_cached_prefix(state)?;
 
         // Safe fallback: if the layer already has cached prefix pages (for example after
         // multimodal placeholder spans), keep the token-step semantics to preserve
         // attention offset correctness.
-        if has_prefix_pages {
+        if has_cached_prefix {
             let mut outputs = Vec::with_capacity(seq_len);
             for (idx, &position_id) in position_ids.iter().enumerate() {
                 let token_hidden = hidden_states.narrow(1, idx, 1)?;
@@ -884,7 +911,7 @@ impl Qwen35FullAttention {
         let query_states = query_states.transpose(1, 2)?.contiguous()?;
         let key_states_h = key_states_kv.transpose(1, 2)?.contiguous()?;
         let value_states_h = value_states_kv.transpose(1, 2)?.contiguous()?;
-        let attn_output = if let Some(out) = try_fused_self_attention(
+        let attn_output = if let Some(out) = try_fused_self_attention_preserve_dtype(
             &query_states,
             &key_states_h,
             &value_states_h,
@@ -894,16 +921,14 @@ impl Qwen35FullAttention {
         )? {
             out
         } else {
-            // Unfused fallback path still expects explicit KV expansion.
-            let key_states = repeat_kv(&key_states_kv, self.num_heads, self.num_kv_heads)?;
-            let value_states = repeat_kv(&value_states_kv, self.num_heads, self.num_kv_heads)?;
-            let key_states = key_states.transpose(1, 2)?.contiguous()?;
-            let value_states = value_states.transpose(1, 2)?.contiguous()?;
-            let key_states_t = key_states.transpose(2, 3)?.contiguous()?;
-            let attn = query_states.matmul(&key_states_t)?;
-            let attn = (attn / (self.head_dim as f64).sqrt())?;
-            let attn = ops::softmax_last_dim(&attn)?;
-            attn.contiguous()?.matmul(&value_states)?
+            unfused_causal_attention(
+                &query_states,
+                &key_states_h,
+                &value_states_h,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )?
         };
         let attn_output =
             attn_output
@@ -1091,6 +1116,74 @@ impl Qwen35FullAttention {
         }
         matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
     }
+}
+
+/// Reference attention path used whenever a backend cannot preserve the input
+/// dtype in its fused kernel. Q/K/V use head-major layout
+/// `[batch, heads, tokens, head_dim]`.
+fn unfused_causal_attention(
+    query_states: &Tensor,
+    key_states_h: &Tensor,
+    value_states_h: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let query_len = query_states.dim(2)?;
+    let key_len = key_states_h.dim(2)?;
+    if query_len == 0 || key_len == 0 || query_len > key_len {
+        return Err(Error::InvalidInput(format!(
+            "Invalid Qwen3.5 causal attention lengths: query={query_len}, key={key_len}"
+        )));
+    }
+
+    // `repeat_kv` consumes sequence-major KV and returns sequence-major GQA
+    // expansion. Convert back to head-major for the score/value matmuls.
+    let key_states = key_states_h.transpose(1, 2)?.contiguous()?;
+    let value_states = value_states_h.transpose(1, 2)?.contiguous()?;
+    let key_states = repeat_kv(&key_states, num_heads, num_kv_heads)?;
+    let value_states = repeat_kv(&value_states, num_heads, num_kv_heads)?;
+    let key_states = key_states.transpose(1, 2)?.contiguous()?;
+    let value_states = value_states.transpose(1, 2)?.contiguous()?;
+
+    let key_states_t = key_states.transpose(2, 3)?.contiguous()?;
+    let scores = query_states.matmul(&key_states_t)?;
+    let mut scores = (scores / (head_dim as f64).sqrt())?;
+    if query_len > 1 {
+        let query_start = key_len - query_len;
+        let mask = qwen35_causal_attention_mask(
+            query_len,
+            key_len,
+            query_start,
+            scores.device(),
+            scores.dtype(),
+        )?;
+        scores = scores.broadcast_add(&mask)?;
+    }
+    let probabilities = ops::softmax_last_dim(&scores)?;
+    probabilities
+        .contiguous()?
+        .matmul(&value_states)
+        .map_err(Error::from)
+}
+
+fn qwen35_causal_attention_mask(
+    query_len: usize,
+    key_len: usize,
+    query_start: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut values = vec![0f32; query_len * key_len];
+    for query_idx in 0..query_len {
+        let last_visible_key = query_start + query_idx;
+        for key_idx in (last_visible_key + 1)..key_len {
+            values[query_idx * key_len + key_idx] = f32::NEG_INFINITY;
+        }
+    }
+    Tensor::from_vec(values, (1, 1, query_len, key_len), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
 }
 
 impl Qwen35LinearAttention {
@@ -1409,9 +1502,11 @@ impl Qwen35LinearAttention {
                 convolved = (&convolved + &(prev_token * k_slice)?)?;
             }
 
-            // Update the ring buffer in O(1): overwrite oldest and advance cursor.
+            // Overwrite the oldest logical slot, advance the cursor, then compact
+            // the history so state accounting retains only the live conv window.
             buffer.slots[buffer.next_idx] = current;
             buffer.next_idx = (buffer.next_idx + 1) % history_len;
+            buffer.compact_owned()?;
 
             convolved.squeeze(1)?
         };
@@ -1668,7 +1763,13 @@ fn pooled_zero_tensor(
 }
 
 fn softplus(x: &Tensor) -> Result<Tensor> {
-    (x.exp()? + 1.0)?.log().map_err(Error::from)
+    // Match the reference Gated DeltaNet path: discretization is evaluated in
+    // F32 and uses a stable softplus identity. `log(exp(x) + 1)` overflows for
+    // otherwise valid large positive activations.
+    let x = x.to_dtype(DType::F32)?;
+    let positive = x.relu()?;
+    let correction = (x.abs()?.neg()?.exp()? + 1.0)?.log()?;
+    (&positive + &correction).map_err(Error::from)
 }
 
 fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
@@ -1968,11 +2069,12 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_dense_kv_cache_h, apply_rotary_emb, build_mrope, qwen35_dense_decode_max_pages,
-        qwen35_page_count_for_tokens, repeat_head_states, repeat_head_states_seq, ConvRingState,
-        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        append_dense_kv_cache_h, apply_rotary_emb, build_mrope,
+        full_attention_state_has_cached_prefix, qwen35_dense_decode_max_pages,
+        qwen35_page_count_for_tokens, repeat_head_states, repeat_head_states_seq, softplus,
+        unfused_causal_attention, ConvRingState, Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
     };
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
 
     #[test]
@@ -2023,32 +2125,121 @@ mod tests {
     }
 
     #[test]
-    fn runtime_accounting_deduplicates_shared_conv_slots() {
-        let shared = Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap();
-        let single = Qwen35TextRuntimeState {
+    fn compact_conv_ring_drops_full_prefill_backing() {
+        let backing = Tensor::zeros((1, 40, 32), DType::F32, &Device::Cpu).unwrap();
+        let mut slots = Vec::new();
+        for token_idx in 37..40 {
+            slots.push(backing.i((0, token_idx)).unwrap().reshape((32, 1)).unwrap());
+        }
+        let mut state = Qwen35TextRuntimeState {
             layers: vec![Qwen35LayerRuntimeState::Linear {
-                conv_state: Some(ConvRingState {
-                    slots: vec![shared.clone()],
-                    next_idx: 0,
-                }),
-                recurrent_state: None,
-            }],
-        };
-        let repeated = Qwen35TextRuntimeState {
-            layers: vec![Qwen35LayerRuntimeState::Linear {
-                conv_state: Some(ConvRingState {
-                    slots: vec![shared.clone(), shared.clone(), shared],
-                    next_idx: 0,
-                }),
+                conv_state: Some(ConvRingState { slots, next_idx: 0 }),
                 recurrent_state: None,
             }],
         };
 
-        assert_eq!(
-            single.allocated_session_bytes(),
-            repeated.allocated_session_bytes()
-        );
-        assert!(single.allocated_session_bytes().unwrap() >= 32 * 4);
+        let retained_prefill_bytes = state.allocated_session_bytes().unwrap();
+        assert!(retained_prefill_bytes >= 40 * 32 * 4);
+
+        let Qwen35LayerRuntimeState::Linear { conv_state, .. } = &mut state.layers[0] else {
+            unreachable!("test state is linear")
+        };
+        conv_state
+            .as_mut()
+            .unwrap()
+            .compact_owned()
+            .expect("compaction should succeed");
+
+        assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
+    }
+
+    #[test]
+    fn unfused_causal_prefill_matches_incremental_token_steps() {
+        let device = Device::Cpu;
+        let query = Tensor::from_vec(
+            vec![
+                0.2f32, 0.1, 0.3, -0.2, 0.4, 0.5, -0.1, 0.6, // head 0
+                -0.3, 0.2, 0.7, 0.1, 0.2, -0.4, 0.5, 0.3, // head 1
+            ],
+            (1, 2, 4, 2),
+            &device,
+        )
+        .unwrap();
+        let key = Tensor::from_vec(
+            vec![0.1f32, 0.3, 0.4, -0.2, 0.6, 0.5, -0.1, 0.7],
+            (1, 1, 4, 2),
+            &device,
+        )
+        .unwrap();
+        let value = Tensor::from_vec(
+            vec![1.0f32, 10.0, 2.0, 20.0, 4.0, 40.0, 8.0, 80.0],
+            (1, 1, 4, 2),
+            &device,
+        )
+        .unwrap();
+
+        let prefill =
+            unfused_causal_attention(&query, &key, &value, 2, 1, 2).expect("causal prefill");
+        let mut steps = Vec::new();
+        for token_idx in 0..4 {
+            let q = query.narrow(2, token_idx, 1).unwrap();
+            let k = key.narrow(2, 0, token_idx + 1).unwrap();
+            let v = value.narrow(2, 0, token_idx + 1).unwrap();
+            steps.push(
+                unfused_causal_attention(&q, &k, &v, 2, 1, 2).expect("incremental attention"),
+            );
+        }
+        let step_refs: Vec<&Tensor> = steps.iter().collect();
+        let incremental = Tensor::cat(&step_refs, 2).unwrap();
+
+        let prefill = prefill.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let incremental = incremental.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (prefill, incremental) in prefill.iter().zip(incremental.iter()) {
+            assert!((prefill - incremental).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn dense_full_attention_cache_counts_as_a_prefix() {
+        let dense = Tensor::zeros((1, 1, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        let state = Qwen35LayerRuntimeState::Full {
+            k_pages: Vec::new(),
+            v_pages: Vec::new(),
+            dense_k_cache_h: Some(dense),
+            dense_v_cache_h: None,
+            dense_kv_tokens: 0,
+        };
+        assert!(full_attention_state_has_cached_prefix(&state).unwrap());
+
+        let tracked_only = Qwen35LayerRuntimeState::Full {
+            k_pages: Vec::new(),
+            v_pages: Vec::new(),
+            dense_k_cache_h: None,
+            dense_v_cache_h: None,
+            dense_kv_tokens: 2,
+        };
+        assert!(full_attention_state_has_cached_prefix(&tracked_only).unwrap());
+
+        let empty = Qwen35LayerRuntimeState::Full {
+            k_pages: Vec::new(),
+            v_pages: Vec::new(),
+            dense_k_cache_h: None,
+            dense_v_cache_h: None,
+            dense_kv_tokens: 0,
+        };
+        assert!(!full_attention_state_has_cached_prefix(&empty).unwrap());
+    }
+
+    #[test]
+    fn softplus_is_f32_and_stable_for_large_magnitudes() {
+        let input = Tensor::from_vec(vec![-1000f32, 0.0, 1000.0], 3, &Device::Cpu).unwrap();
+        let output = softplus(&input).expect("softplus");
+        assert_eq!(output.dtype(), DType::F32);
+        let values = output.to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values[0].abs() < 1e-6);
+        assert!((values[1] - std::f32::consts::LN_2).abs() < 1e-6);
+        assert!((values[2] - 1000.0).abs() < 1e-4);
     }
 
     #[test]

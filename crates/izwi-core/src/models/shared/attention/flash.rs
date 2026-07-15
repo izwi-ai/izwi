@@ -157,6 +157,34 @@ pub fn try_fused_self_attention(
     try_fused_self_attention_scaled(q, k, v, mask, head_dim, causal, scale)
 }
 
+/// Try fused self-attention without lowering F32 inputs to F16.
+///
+/// Candle's Metal SDPA implementation cannot safely execute every long F32
+/// prefill shape. In that case this helper returns `None` so the caller can use
+/// a correctness-preserving F32 fallback instead of silently narrowing the
+/// model activations to F16.
+pub fn try_fused_self_attention_preserve_dtype(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    head_dim: usize,
+    causal: bool,
+) -> Result<Option<Tensor>> {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    try_fused_self_attention_with_options_and_scale(
+        q,
+        k,
+        v,
+        mask,
+        head_dim,
+        causal,
+        scale,
+        CudaFlashAttentionOptions::default(),
+        false,
+    )
+}
+
 /// Try a fused self-attention kernel with an explicit attention score scale.
 ///
 /// Input/output layout: `[batch, heads, seq, head_dim]`.
@@ -178,6 +206,7 @@ pub fn try_fused_self_attention_scaled(
         causal,
         scale,
         CudaFlashAttentionOptions::default(),
+        true,
     )
 }
 
@@ -205,6 +234,7 @@ pub fn try_fused_self_attention_with_options(
         causal,
         scale,
         cuda_options,
+        true,
     )
 }
 
@@ -217,6 +247,7 @@ fn try_fused_self_attention_with_options_and_scale(
     causal: bool,
     scale: f32,
     cuda_options: CudaFlashAttentionOptions<'_>,
+    allow_metal_f32_prefill_f16_cast: bool,
 ) -> Result<Option<Tensor>> {
     let masked = mask.is_some();
     record_fused_attention_attempt();
@@ -270,11 +301,12 @@ fn try_fused_self_attention_with_options_and_scale(
     }
 
     if q.device().is_metal() {
-        match should_try_metal_sdpa(q, k, v, mask)? {
+        match should_try_metal_sdpa(q, k, v, mask, allow_metal_f32_prefill_f16_cast)? {
             MetalSdpaDecision::Try => {
                 let q_seq = q.dim(2)?;
-                let use_f16_cast =
-                    mask.is_none() && should_use_metal_sdpa_f16_cast(q.dtype(), q_seq);
+                let use_f16_cast = allow_metal_f32_prefill_f16_cast
+                    && mask.is_none()
+                    && should_use_metal_sdpa_f16_cast(q.dtype(), q_seq);
                 let sdpa_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if use_f16_cast {
                         run_metal_sdpa_with_f16_inputs(q, k, v, mask, causal, scale)
@@ -444,6 +476,7 @@ fn should_try_metal_sdpa(
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
+    allow_f32_prefill_f16_cast: bool,
 ) -> Result<MetalSdpaDecision> {
     if let Some(mask) = mask {
         return should_try_metal_sdpa_masked(q, k, v, mask);
@@ -477,7 +510,10 @@ fn should_try_metal_sdpa(
 
     // F32 + full-SDPA prefill has triggered oversized threadgroup plans on some
     // Apple GPUs. We only enable this shape when the guarded F16-cast route is on.
-    if q_seq > 8 && q.dtype() == DType::F32 && !metal_sdpa_f32_prefill_cast_enabled() {
+    if q_seq > 8
+        && q.dtype() == DType::F32
+        && !(allow_f32_prefill_f16_cast && metal_sdpa_f32_prefill_cast_enabled())
+    {
         return Ok(MetalSdpaDecision::Skip(
             AttentionFallbackReason::UnsupportedBackend,
         ));
@@ -637,8 +673,8 @@ mod tests {
     use super::{
         cuda_flash_attention_capabilities, cuda_flash_attention_head_dim_supported,
         cuda_flash_attention_window, metal_sdpa_mask_shape_supported, metal_sdpa_shape_supported,
-        should_try_cuda_flash_attention, should_use_metal_sdpa_f16_cast,
-        CudaFlashAttentionDecision, CudaFlashAttentionOptions,
+        should_try_cuda_flash_attention, should_try_metal_sdpa, should_use_metal_sdpa_f16_cast,
+        CudaFlashAttentionDecision, CudaFlashAttentionOptions, MetalSdpaDecision,
         CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE, CUDA_FLASH_ATTENTION_MAX_HEAD_DIM,
     };
     use crate::models::shared::telemetry::AttentionFallbackReason;
@@ -672,6 +708,25 @@ mod tests {
         assert!(!should_use_metal_sdpa_f16_cast(DType::F32, 23));
 
         std::env::remove_var("IZWI_METAL_SDPA_F32_PREFILL_F16");
+    }
+
+    #[test]
+    fn preserve_dtype_policy_rejects_long_f32_metal_sdpa_shape() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::remove_var("IZWI_METAL_SDPA_F32_PREFILL_F16");
+
+        let q = Tensor::zeros((1, 4, 9, 256), DType::F32, &Device::Cpu).unwrap();
+        let k = Tensor::zeros((1, 1, 9, 256), DType::F32, &Device::Cpu).unwrap();
+        let v = Tensor::zeros((1, 1, 9, 256), DType::F32, &Device::Cpu).unwrap();
+
+        assert!(matches!(
+            should_try_metal_sdpa(&q, &k, &v, None, false).unwrap(),
+            MetalSdpaDecision::Skip(AttentionFallbackReason::UnsupportedBackend)
+        ));
+        assert!(matches!(
+            should_try_metal_sdpa(&q, &k, &v, None, true).unwrap(),
+            MetalSdpaDecision::Try
+        ));
     }
 
     #[test]
