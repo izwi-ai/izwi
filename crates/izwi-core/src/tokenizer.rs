@@ -1,4 +1,4 @@
-//! Text tokenization for Qwen3-TTS
+//! Shared text tokenization helpers.
 
 use std::collections::HashMap;
 use std::fs;
@@ -6,17 +6,18 @@ use std::path::Path;
 use uuid::Uuid;
 
 use serde::Deserialize;
-use tokenizers::AddedToken;
-use tokenizers::SplitDelimiterBehavior;
-use tokenizers::Tokenizer as HfTokenizer;
-use tokenizers::decoders::DecoderWrapper;
 use tokenizers::decoders::byte_fallback::ByteFallback;
 use tokenizers::decoders::sequence::Sequence as DecoderSequence;
+use tokenizers::decoders::DecoderWrapper;
 use tokenizers::models::bpe::BPE;
-use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::tokenizer::step_decode_stream;
+use tokenizers::AddedToken;
+use tokenizers::SplitDelimiterBehavior;
+use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
@@ -36,6 +37,15 @@ pub struct Tokenizer {
 }
 
 const QWEN2_PRETOKENIZER_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const GGUF_TOKEN_TYPE_CONTROL: usize = 3;
+const GGUF_TOKEN_TYPE_USER_DEFINED: usize = 4;
+
+#[derive(Debug, Clone, Default)]
+pub struct TokenizerDecodeStreamState {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
 
 impl Tokenizer {
     pub fn from_path(model_dir: &Path) -> Result<Self> {
@@ -188,10 +198,45 @@ impl Tokenizer {
         pre_tokenizer: Option<&str>,
         add_prefix_space: bool,
     ) -> Result<Self> {
+        Self::from_gguf_bpe_metadata(tokens, merges, None, pre_tokenizer, add_prefix_space)
+    }
+
+    pub fn from_gguf_bpe_with_token_types(
+        tokens: &[String],
+        merges: &[String],
+        token_types: &[usize],
+        pre_tokenizer: Option<&str>,
+        add_prefix_space: bool,
+    ) -> Result<Self> {
+        Self::from_gguf_bpe_metadata(
+            tokens,
+            merges,
+            Some(token_types),
+            pre_tokenizer,
+            add_prefix_space,
+        )
+    }
+
+    fn from_gguf_bpe_metadata(
+        tokens: &[String],
+        merges: &[String],
+        token_types: Option<&[usize]>,
+        pre_tokenizer: Option<&str>,
+        add_prefix_space: bool,
+    ) -> Result<Self> {
         if tokens.is_empty() {
             return Err(Error::TokenizationError(
                 "Cannot build tokenizer from empty GGUF token list".to_string(),
             ));
+        }
+        if let Some(token_types) = token_types {
+            if token_types.len() != tokens.len() {
+                return Err(Error::TokenizationError(format!(
+                    "GGUF tokenizer token/type length mismatch: {} tokens, {} types",
+                    tokens.len(),
+                    token_types.len()
+                )));
+            }
         }
 
         let mut vocab = HashMap::with_capacity(tokens.len());
@@ -234,8 +279,9 @@ impl Tokenizer {
             .to_str()
             .ok_or_else(|| Error::TokenizationError("Invalid temporary merges path".to_string()))?;
 
+        let is_qwen35 = matches!(pre_tokenizer, Some("qwen35"));
         let bpe = BPE::from_file(vocab_str, merges_str)
-            .byte_fallback(true)
+            .byte_fallback(!is_qwen35)
             .build()
             .map_err(|e| Error::TokenizationError(format!("BPE build failed: {e}")))?;
         let _ = fs::remove_file(&vocab_path);
@@ -243,13 +289,13 @@ impl Tokenizer {
         let _ = fs::remove_dir(&temp_dir);
         let mut inner = HfTokenizer::new(bpe);
 
-        let byte_level = if matches!(pre_tokenizer, Some("qwen2")) {
+        let byte_level = if matches!(pre_tokenizer, Some("qwen2" | "qwen35")) {
             let split = Split::new(
                 SplitPattern::Regex(QWEN2_PRETOKENIZER_REGEX.to_string()),
                 SplitDelimiterBehavior::Isolated,
                 false,
             )
-            .map_err(|e| Error::TokenizationError(format!("Invalid Qwen2 split regex: {e}")))?;
+            .map_err(|e| Error::TokenizationError(format!("Invalid Qwen split regex: {e}")))?;
             let byte_level = ByteLevel::new(add_prefix_space, false, false);
             let sequence = PreTokenizerSequence::new(vec![
                 PreTokenizerWrapper::Split(split),
@@ -263,11 +309,31 @@ impl Tokenizer {
             byte_level
         };
 
-        let decoder = DecoderWrapper::Sequence(DecoderSequence::new(vec![
-            DecoderWrapper::ByteFallback(ByteFallback::new()),
-            DecoderWrapper::ByteLevel(byte_level),
-        ]));
+        let decoder = if is_qwen35 {
+            DecoderWrapper::ByteLevel(byte_level)
+        } else {
+            DecoderWrapper::Sequence(DecoderSequence::new(vec![
+                DecoderWrapper::ByteFallback(ByteFallback::new()),
+                DecoderWrapper::ByteLevel(byte_level),
+            ]))
+        };
         inner.with_decoder(Some(decoder));
+
+        if let Some(token_types) = token_types {
+            for (token, &token_type) in tokens.iter().zip(token_types) {
+                let is_special = token_type == GGUF_TOKEN_TYPE_CONTROL;
+                if !is_special && token_type != GGUF_TOKEN_TYPE_USER_DEFINED {
+                    continue;
+                }
+
+                let token = AddedToken::from(token.clone(), is_special).normalized(false);
+                if is_special {
+                    inner.add_special_tokens(&[token]);
+                } else {
+                    inner.add_tokens(&[token]);
+                }
+            }
+        }
 
         debug!("Loaded BPE tokenizer from GGUF metadata");
         Self::new_with_tokenizer(inner)
@@ -300,6 +366,23 @@ impl Tokenizer {
         self.inner
             .decode(ids, false)
             .map_err(|e| Error::TokenizationError(e.to_string()))
+    }
+
+    pub fn decode_stream_step(
+        &self,
+        state: &mut TokenizerDecodeStreamState,
+        token_id: u32,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        step_decode_stream(
+            &self.inner,
+            vec![token_id],
+            skip_special_tokens,
+            &mut state.ids,
+            &mut state.prefix,
+            &mut state.prefix_index,
+        )
+        .map_err(|e| Error::TokenizationError(e.to_string()))
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -365,4 +448,108 @@ fn load_tokenizer_config(model_dir: &Path) -> Result<Option<TokenizerConfigFile>
     let config_str = fs::read_to_string(config_path)?;
     let config: TokenizerConfigFile = serde_json::from_str(&config_str)?;
     Ok(Some(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Tokenizer, TokenizerDecodeStreamState};
+
+    fn qwen35_fixture() -> Tokenizer {
+        let tokens = [
+            "a",
+            "l",
+            "p",
+            "h",
+            "b",
+            "e",
+            "t",
+            "Ċ",
+            "al",
+            "alp",
+            "alph",
+            "alpha",
+            "be",
+            "bet",
+            "beta",
+            "ĊĊ",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<|im_start|>",
+            "Ã",
+            "©",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let merges = [
+            "a l", "al p", "alp h", "alph a", "b e", "be t", "bet a", "Ċ Ċ",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut token_types = vec![1usize; tokens.len()];
+        token_types[16..22].fill(4);
+        token_types[22] = 3;
+
+        Tokenizer::from_gguf_bpe_with_token_types(
+            &tokens,
+            &merges,
+            &token_types,
+            Some("qwen35"),
+            false,
+        )
+        .expect("Qwen3.5 tokenizer fixture")
+    }
+
+    #[test]
+    fn qwen35_gguf_pretokenizer_matches_newline_golden() {
+        let tokenizer = qwen35_fixture();
+        assert_eq!(tokenizer.encode("alpha\n\nbeta").unwrap(), vec![11, 15, 14]);
+    }
+
+    #[test]
+    fn qwen35_gguf_token_types_keep_chat_tokens_atomic() {
+        let tokenizer = qwen35_fixture();
+        let ids = tokenizer
+            .encode("<|im_start|><think>\n\n</think><tool_call><tool_response>")
+            .unwrap();
+        assert_eq!(ids, vec![22, 16, 15, 17, 18, 20]);
+    }
+
+    #[test]
+    fn decode_stream_waits_for_complete_utf8() {
+        let tokenizer = qwen35_fixture();
+        let ids = tokenizer.encode("é").unwrap();
+        assert_eq!(ids, vec![23, 24]);
+
+        let mut state = TokenizerDecodeStreamState::default();
+        assert_eq!(
+            tokenizer
+                .decode_stream_step(&mut state, ids[0], true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            tokenizer
+                .decode_stream_step(&mut state, ids[1], true)
+                .unwrap(),
+            Some("é".to_string())
+        );
+    }
+
+    #[test]
+    fn gguf_token_types_must_align_with_vocab() {
+        let result = Tokenizer::from_gguf_bpe_with_token_types(
+            &["a".to_string()],
+            &[],
+            &[],
+            Some("qwen35"),
+            false,
+        );
+        assert!(result.is_err());
+    }
 }

@@ -4,7 +4,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
@@ -19,7 +18,7 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Tokenizer, TokenizerDecodeStreamState};
 
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
@@ -68,6 +67,7 @@ pub struct ChatDecodeState {
     history_ids: Vec<u32>,
     tokens_generated: usize,
     track_history: bool,
+    decode_stream: TokenizerDecodeStreamState,
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
@@ -154,17 +154,16 @@ struct Qwen35Tokenizer {
     inner: Tokenizer,
     vocab_size: usize,
     specials: SpecialTokenIds,
-    literal_special_tokens: Vec<(String, u32)>,
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
-    decode_piece_cache: Mutex<HashMap<u32, String>>,
 }
 
 #[derive(Debug)]
 struct GgufTokenizerMetadata {
     tokens: Vec<String>,
     merges: Vec<String>,
+    token_types: Vec<usize>,
     pre_tokenizer: Option<String>,
     chat_template: String,
     eos_token_id: Option<u32>,
@@ -176,9 +175,10 @@ impl Qwen35Tokenizer {
         let config = load_tokenizer_config_file(model_dir)?;
         let inner = match Tokenizer::from_path(model_dir) {
             Ok(inner) => inner,
-            Err(_) => Tokenizer::from_gguf_bpe(
+            Err(_) => Tokenizer::from_gguf_bpe_with_token_types(
                 &gguf_meta.tokens,
                 &gguf_meta.merges,
+                &gguf_meta.token_types,
                 gguf_meta.pre_tokenizer.as_deref(),
                 false,
             )?,
@@ -226,16 +226,6 @@ impl Qwen35Tokenizer {
             .unwrap_or_else(|| gguf_meta.chat_template.clone());
         let default_enable_thinking = resolve_default_enable_thinking(&chat_template, variant);
 
-        let mut literal_special_tokens: Vec<(String, u32)> = token_to_id
-            .iter()
-            .filter_map(|(token, id)| {
-                (token.starts_with("<|") && token.ends_with("|>")).then_some((token.clone(), *id))
-            })
-            .collect();
-        literal_special_tokens.sort_by(|(left, _), (right, _)| {
-            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
-        });
-
         Ok(Self {
             inner,
             vocab_size,
@@ -247,79 +237,28 @@ impl Qwen35Tokenizer {
                 eos,
                 eos_alt,
             },
-            literal_special_tokens,
             chat_template,
             default_enable_thinking,
             bos_token: config.and_then(|cfg| cfg.bos_token),
-            decode_piece_cache: Mutex::new(HashMap::new()),
         })
     }
 
     fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
-        if self.literal_special_tokens.is_empty() {
-            return self.inner.encode(text);
-        }
-
-        let mut ids = Vec::new();
-        let mut offset = 0usize;
-        while offset < text.len() {
-            let tail = &text[offset..];
-            let mut next_match: Option<(usize, &str, u32)> = None;
-            for (token, token_id) in &self.literal_special_tokens {
-                if let Some(rel_idx) = tail.find(token) {
-                    let candidate = (rel_idx, token.as_str(), *token_id);
-                    match next_match {
-                        None => next_match = Some(candidate),
-                        Some((best_idx, best_token, _)) => {
-                            if rel_idx < best_idx
-                                || (rel_idx == best_idx && token.len() > best_token.len())
-                            {
-                                next_match = Some(candidate);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let Some((rel_idx, matched_token, matched_id)) = next_match else {
-                ids.extend(self.inner.encode(tail)?);
-                break;
-            };
-
-            if rel_idx > 0 {
-                ids.extend(self.inner.encode(&tail[..rel_idx])?);
-            }
-            ids.push(matched_id);
-            offset += rel_idx + matched_token.len();
-        }
-
-        Ok(ids)
+        self.inner.encode(text)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
-    }
-
-    fn decode_token_piece(&self, token_id: u32) -> Result<String> {
+    fn decode_token_piece(
+        &self,
+        state: &mut TokenizerDecodeStreamState,
+        token_id: u32,
+    ) -> Result<String> {
         if token_id as usize >= self.vocab_size {
             return Ok(String::new());
         }
-        if let Ok(cache) = self.decode_piece_cache.lock() {
-            if let Some(piece) = cache.get(&token_id) {
-                return Ok(piece.clone());
-            }
-        }
-
-        let piece = self.decode_text(&[token_id])?;
-        if let Ok(mut cache) = self.decode_piece_cache.lock() {
-            cache.insert(token_id, piece.clone());
-        }
-        Ok(piece)
+        Ok(self
+            .inner
+            .decode_stream_step(state, token_id, true)?
+            .unwrap_or_default())
     }
 }
 
@@ -564,17 +503,16 @@ impl Qwen35ChatModel {
         let logits = self.prefill_prompt(&prepared_prompt, &mut text_state)?;
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let history_ids =
+            initial_penalty_history(&prepared_prompt.prompt_ids, max_new_tokens, track_history);
 
         Ok(ChatDecodeState {
             text_state,
             logits,
-            history_ids: if track_history {
-                Vec::with_capacity(max_new_tokens.max(1))
-            } else {
-                Vec::new()
-            },
+            history_ids,
             tokens_generated: 0,
             track_history,
+            decode_stream: TokenizerDecodeStreamState::default(),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
@@ -617,7 +555,9 @@ impl Qwen35ChatModel {
             });
         }
 
-        let delta = self.tokenizer.decode_token_piece(next)?;
+        let delta = self
+            .tokenizer
+            .decode_token_piece(&mut state.decode_stream, next)?;
         if state.track_history {
             state.history_ids.push(next);
         }
@@ -1194,6 +1134,7 @@ fn parse_gguf_tokenizer_metadata(loader: &GgufLoader) -> Result<GgufTokenizerMet
     Ok(GgufTokenizerMetadata {
         tokens: required_string_array(loader, "tokenizer.ggml.tokens")?,
         merges: required_string_array(loader, "tokenizer.ggml.merges")?,
+        token_types: required_usize_array(loader, "tokenizer.ggml.token_type")?,
         pre_tokenizer: loader.get_metadata_string("tokenizer.ggml.pre"),
         chat_template: loader
             .get_metadata_string("tokenizer.chat_template")
@@ -1346,6 +1287,20 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
     }
 }
 
+fn initial_penalty_history(
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    track_history: bool,
+) -> Vec<u32> {
+    if !track_history {
+        return Vec::new();
+    }
+
+    let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(max_new_tokens.max(1)));
+    history.extend_from_slice(prompt_ids);
+    history
+}
+
 fn sample_next_token(
     logits: &Tensor,
     vocab_size: usize,
@@ -1366,6 +1321,12 @@ fn sample_next_token(
         && config.presence_penalty.abs() <= f32::EPSILON
         && config.top_k == 0
         && config.top_p >= 1.0;
+    let sampling_context = if deterministic_greedy {
+        "deterministic greedy sampling"
+    } else {
+        "configured sampling"
+    };
+    validate_finite_vocab_logits(logits, vocab_size, sampling_context)?;
     if deterministic_greedy {
         return argmax_clamped(logits, vocab_size);
     }
@@ -1523,6 +1484,66 @@ fn clamp_logits_to_vocab(values: &mut [f32], vocab_size: usize) {
     if vocab_size < values.len() {
         values[vocab_size..].fill(f32::NEG_INFINITY);
     }
+}
+
+fn validate_finite_vocab_logits(
+    logits: &Tensor,
+    vocab_size: usize,
+    sampling_context: &str,
+) -> Result<()> {
+    let logits = match logits.rank() {
+        1 => logits.clone(),
+        2 => {
+            let (rows, _cols) = logits.dims2()?;
+            if rows != 1 {
+                return Err(Error::InferenceError(format!(
+                    "Unexpected Qwen3.5 logits shape during {sampling_context}: {:?}",
+                    logits.shape().dims()
+                )));
+            }
+            logits.i(0)?
+        }
+        rank => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3.5 logits rank during {sampling_context}: {rank}"
+            )))
+        }
+    };
+
+    let logits_len = logits.dim(0)?;
+    let inspected_len = vocab_size.min(logits_len);
+    if inspected_len == 0 {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.5 {sampling_context} has no in-vocabulary logits to validate \
+             (vocab_size={vocab_size}, logits_len={logits_len})"
+        )));
+    }
+
+    let in_vocab = logits.narrow(0, 0, inspected_len)?.to_dtype(DType::F32)?;
+    let nan_count = in_vocab
+        .ne(&in_vocab)?
+        .to_dtype(DType::F32)?
+        .sum_all()?
+        .to_scalar::<f32>()? as usize;
+    let infinite_count = in_vocab
+        .abs()?
+        .eq(f32::INFINITY)?
+        .to_dtype(DType::F32)?
+        .sum_all()?
+        .to_scalar::<f32>()? as usize;
+    let non_finite_count = nan_count.saturating_add(infinite_count);
+
+    if non_finite_count > 0 {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.5 {sampling_context} received {non_finite_count} non-finite \
+             in-vocabulary raw logits ({nan_count} NaN, {infinite_count} infinite) \
+             across {inspected_len} inspected logits \
+             (vocab_size={vocab_size}, logits_len={logits_len}); refusing to sample \
+             corrupted model state"
+        )));
+    }
+
+    Ok(())
 }
 
 fn argmax_values(values: &[f32]) -> Result<u32> {
@@ -1842,9 +1863,18 @@ mod tests {
     }
 
     #[test]
+    fn penalty_history_starts_with_the_complete_prompt() {
+        let prompt = [11, 12, 13, 14];
+        let history = initial_penalty_history(&prompt, 8, true);
+        assert_eq!(history, prompt);
+        assert!(history.capacity() >= prompt.len() + 8);
+        assert!(initial_penalty_history(&prompt, 8, false).is_empty());
+    }
+
+    #[test]
     fn sample_next_token_masks_logits_above_vocab_limit() {
         let logits = Tensor::from_vec(
-            vec![0.1f32, 0.2, 0.3, 12.0, 9.0],
+            vec![0.1f32, 0.2, 0.3, f32::NAN, f32::INFINITY],
             (5,),
             &candle_core::Device::Cpu,
         )
@@ -1881,6 +1911,45 @@ mod tests {
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn greedy_sampler_rejects_any_non_finite_raw_logits() {
+        let logits = Tensor::from_vec(
+            vec![f32::NAN, 1.25, f32::INFINITY, f32::NEG_INFINITY],
+            (4,),
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits");
+        let mut rng = SimpleRng::new(7);
+        let error = sample_next_token(&logits, 4, &ChatGenerationConfig::default(), &[], &mut rng)
+            .expect_err("one non-finite in-vocabulary logit must fail greedy sampling");
+        let message = error.to_string();
+        assert!(message.contains("deterministic greedy sampling"));
+        assert!(message.contains("3 non-finite"));
+        assert!(message.contains("1 NaN, 2 infinite"));
+        assert!(message.contains("vocab_size=4, logits_len=4"));
+    }
+
+    #[test]
+    fn configured_sampler_rejects_any_non_finite_raw_logits() {
+        let logits = Tensor::from_vec(
+            vec![0.5f32, f32::NAN, 1.25],
+            (3,),
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 0.8,
+            ..ChatGenerationConfig::default()
+        };
+        let mut rng = SimpleRng::new(7);
+        let error = sample_next_token(&logits, 3, &config, &[], &mut rng)
+            .expect_err("one non-finite in-vocabulary logit must fail configured sampling");
+        let message = error.to_string();
+        assert!(message.contains("configured sampling"));
+        assert!(message.contains("1 non-finite"));
+        assert!(message.contains("1 NaN, 0 infinite"));
     }
 
     #[test]
