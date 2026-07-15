@@ -159,6 +159,7 @@ pub struct ChatGeneration {
     pub prompt_tokens: usize,
     pub tokens_generated: usize,
     pub generation_time_ms: f64,
+    pub finish_reason: crate::models::shared::chat::ChatGenerationFinishReason,
 }
 
 #[derive(Debug, Clone)]

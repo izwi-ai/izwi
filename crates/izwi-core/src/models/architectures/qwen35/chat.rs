@@ -15,7 +15,9 @@ use tracing::info;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::chat::{
+    ChatGenerationConfig, ChatGenerationFinishReason, ChatMessage, ChatRole,
+};
 use crate::models::shared::memory::accounting::{compact_tensor_storage, TensorStorageAccounting};
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
@@ -94,6 +96,7 @@ pub struct ChatDecodeState {
     stop_sequences: Vec<String>,
     max_new_tokens: usize,
     finished: bool,
+    finish_reason: Option<ChatGenerationFinishReason>,
     next_text_position: usize,
     pending_prefix_snapshot: Option<Qwen35PrefixSnapshot>,
     reused_prefix_tokens: usize,
@@ -176,6 +179,7 @@ pub struct ChatDecodeStep {
     pub text: String,
     pub tokens_generated: usize,
     pub finished: bool,
+    pub finish_reason: Option<ChatGenerationFinishReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -657,6 +661,7 @@ impl Qwen35ChatModel {
             stop_sequences: normalize_stop_sequences(&config.stop_sequences),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            finish_reason: None,
             next_text_position: prepared_prompt.next_text_position,
             pending_prefix_snapshot,
             reused_prefix_tokens,
@@ -668,12 +673,16 @@ impl Qwen35ChatModel {
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
+            state
+                .finish_reason
+                .get_or_insert(ChatGenerationFinishReason::MaxTokens);
             let delta = flush_stream_text(&state.assembled, &mut state.emitted_text_bytes)?;
             return Ok(ChatDecodeStep {
                 delta,
                 text: state.assembled.trim().to_string(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
+                finish_reason: state.finish_reason,
             });
         }
 
@@ -691,12 +700,14 @@ impl Qwen35ChatModel {
         )?;
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
+            state.finish_reason = Some(ChatGenerationFinishReason::StopToken);
             let delta = flush_stream_text(&state.assembled, &mut state.emitted_text_bytes)?;
             return Ok(ChatDecodeStep {
                 delta,
                 text: state.assembled.trim().to_string(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
+                finish_reason: state.finish_reason,
             });
         }
 
@@ -713,8 +724,13 @@ impl Qwen35ChatModel {
             state.emitted_text_bytes,
             &state.stop_sequences,
         )?;
-        if stopped_on_sequence {
+        if let Some(reason) = generated_token_finish_reason(
+            stopped_on_sequence,
+            state.tokens_generated,
+            state.max_new_tokens,
+        ) {
             state.finished = true;
+            state.finish_reason = Some(reason);
         } else {
             state.logits = compact_tensor_storage(&self.text_model.forward_token_id_at(
                 next,
@@ -722,9 +738,6 @@ impl Qwen35ChatModel {
                 &mut state.text_state,
             )?)?;
             state.next_text_position += 1;
-            if state.tokens_generated >= state.max_new_tokens {
-                state.finished = true;
-            }
         }
         let delta = take_stream_safe_text(
             &state.assembled,
@@ -743,6 +756,7 @@ impl Qwen35ChatModel {
             text: final_text,
             tokens_generated: state.tokens_generated,
             finished: state.finished,
+            finish_reason: state.finish_reason,
         })
     }
 
@@ -993,6 +1007,20 @@ impl Qwen35ChatModel {
             reusable_prefix_len: None,
             vision_inputs: Some(vision_inputs),
         })
+    }
+}
+
+fn generated_token_finish_reason(
+    stopped_on_sequence: bool,
+    tokens_generated: usize,
+    max_new_tokens: usize,
+) -> Option<ChatGenerationFinishReason> {
+    if stopped_on_sequence {
+        Some(ChatGenerationFinishReason::StopSequence)
+    } else if tokens_generated >= max_new_tokens {
+        Some(ChatGenerationFinishReason::MaxTokens)
+    } else {
+        None
     }
 }
 
@@ -2047,6 +2075,19 @@ mod tests {
 
         assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
         assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stop_sequence_precedes_length_on_the_final_allowed_token() {
+        assert_eq!(
+            generated_token_finish_reason(true, 4, 4),
+            Some(ChatGenerationFinishReason::StopSequence)
+        );
+        assert_eq!(
+            generated_token_finish_reason(false, 4, 4),
+            Some(ChatGenerationFinishReason::MaxTokens)
+        );
+        assert_eq!(generated_token_finish_reason(false, 3, 4), None);
     }
 
     #[test]

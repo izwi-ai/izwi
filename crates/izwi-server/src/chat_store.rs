@@ -8,7 +8,10 @@ use sea_orm::{
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::db::{raw, StoreDatabase};
 use crate::entity::{chat_messages, chat_threads};
@@ -21,6 +24,7 @@ pub struct ChatThreadSummary {
     pub id: String,
     pub title: String,
     pub model_id: Option<String>,
+    pub system_prompt: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
     pub last_message_preview: Option<String>,
@@ -43,17 +47,49 @@ pub struct ChatThreadMessage {
 #[derive(Clone)]
 pub struct ChatStore {
     db: StoreDatabase,
+    turn_locks: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatThreadSystemPromptUpdate {
+    Retain,
+    Replace(Option<String>),
 }
 
 impl ChatStore {
     pub fn initialize() -> anyhow::Result<Self> {
         Ok(Self {
             db: StoreDatabase::from_default_path()?,
+            turn_locks: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
     pub fn initialize_with_database(db: StoreDatabase) -> Self {
-        Self { db }
+        Self {
+            db,
+            turn_locks: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Serialize the complete history-read, generation, and persistence span
+    /// for one thread while allowing unrelated threads to proceed independently.
+    pub async fn acquire_turn(&self, thread_id: &str) -> OwnedMutexGuard<()> {
+        let turn_lock = {
+            let mut locks = self
+                .turn_locks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(thread_id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(AsyncMutex::new(()));
+                    locks.insert(thread_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        turn_lock.lock_owned().await
     }
 
     pub async fn list_threads(&self) -> anyhow::Result<Vec<ChatThreadSummary>> {
@@ -75,6 +111,16 @@ impl ChatStore {
         title: Option<String>,
         model_id: Option<String>,
     ) -> anyhow::Result<ChatThreadSummary> {
+        self.create_thread_with_system_prompt(title, model_id, None)
+            .await
+    }
+
+    pub async fn create_thread_with_system_prompt(
+        &self,
+        title: Option<String>,
+        model_id: Option<String>,
+        system_prompt: Option<String>,
+    ) -> anyhow::Result<ChatThreadSummary> {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
         let thread_id = new_uuid();
@@ -84,6 +130,7 @@ impl ChatStore {
             id: Set(thread_id.clone()),
             title: Set(resolved_title.clone()),
             model_id: Set(model_id.clone()),
+            system_prompt: Set(system_prompt.clone()),
             created_at: Set(now),
             updated_at: Set(now),
         })
@@ -95,6 +142,7 @@ impl ChatStore {
             id: thread_id,
             title: resolved_title,
             model_id,
+            system_prompt,
             created_at: now as u64,
             updated_at: now as u64,
             last_message_preview: None,
@@ -132,21 +180,32 @@ impl ChatStore {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
         let resolved_title = sanitize_thread_title(Some(title.as_str()));
+        let tx = db
+            .begin()
+            .await
+            .context("Failed to start chat thread title transaction")?;
+        let Some(existing) = chat_threads::Entity::find_by_id(thread_id.clone())
+            .one(&tx)
+            .await
+            .context("Failed to load chat thread for title update")?
+        else {
+            return Ok(None);
+        };
+        let updated_at = now.max(existing.updated_at);
 
-        let result = chat_threads::Entity::update_many()
+        chat_threads::Entity::update_many()
             .col_expr(
                 chat_threads::Column::Title,
                 Expr::value(resolved_title.clone()),
             )
-            .col_expr(chat_threads::Column::UpdatedAt, Expr::value(now))
+            .col_expr(chat_threads::Column::UpdatedAt, Expr::value(updated_at))
             .filter(chat_threads::Column::Id.eq(thread_id.clone()))
-            .exec(db)
+            .exec(&tx)
             .await
             .context("Failed to update chat thread title")?;
-
-        if result.rows_affected == 0 {
-            return Ok(None);
-        }
+        tx.commit()
+            .await
+            .context("Failed to commit chat thread title transaction")?;
 
         fetch_thread_summary(db, &thread_id).await
     }
@@ -161,6 +220,7 @@ impl ChatStore {
         thread_id: String,
         content: String,
         content_parts: Option<Vec<JsonValue>>,
+        after: u64,
     ) -> ChatThreadMessage {
         ChatThreadMessage {
             id: new_uuid(),
@@ -168,7 +228,7 @@ impl ChatStore {
             role: "user".to_string(),
             content,
             content_parts,
-            created_at: now_unix_millis_u64(),
+            created_at: now_unix_millis_u64().max(after.saturating_add(1)),
             tokens_generated: None,
             generation_time_ms: None,
         }
@@ -190,7 +250,7 @@ impl ChatStore {
             .await
             .context("Failed to start chat message transaction")?;
 
-        ensure_thread_exists(&tx, &thread_id).await?;
+        let previous_updated_at = thread_updated_at(&tx, &thread_id).await?;
 
         let message = ChatThreadMessage {
             id: new_uuid(),
@@ -198,12 +258,19 @@ impl ChatStore {
             role,
             content,
             content_parts,
-            created_at: now_unix_millis_u64(),
+            created_at: now_unix_millis_u64().max(previous_updated_at.saturating_add(1)),
             tokens_generated,
             generation_time_ms,
         };
         insert_message(&tx, &message).await?;
-        update_thread_metadata(&tx, &thread_id, model_id, message.created_at).await?;
+        update_thread_metadata(
+            &tx,
+            &thread_id,
+            model_id,
+            message.created_at,
+            &ChatThreadSystemPromptUpdate::Retain,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -212,18 +279,16 @@ impl ChatStore {
         Ok(message)
     }
 
-    /// Atomically persist a completed user/assistant turn.
-    ///
-    /// The caller prepares `user_message` before generation so streaming clients
-    /// can receive a stable identity immediately. Neither message becomes
-    /// visible unless both inserts and the single thread metadata update commit.
-    pub async fn append_turn(
+    /// Atomically persist a completed turn and its effective thread system
+    /// prompt update. Failed or cancelled generation never mutates the prompt.
+    pub async fn append_turn_with_system_prompt_update(
         &self,
         user_message: ChatThreadMessage,
         assistant_content: String,
         model_id: Option<String>,
         tokens_generated: usize,
         generation_time_ms: f64,
+        system_prompt_update: ChatThreadSystemPromptUpdate,
     ) -> anyhow::Result<(ChatThreadMessage, ChatThreadMessage)> {
         validate_pending_user_message(&user_message)?;
 
@@ -255,6 +320,7 @@ impl ChatStore {
             &user_message.thread_id,
             model_id,
             assistant_message.created_at,
+            &system_prompt_update,
         )
         .await?;
         tx.commit()
@@ -269,15 +335,19 @@ async fn ensure_thread_exists<C>(db: &C, thread_id: &str) -> anyhow::Result<()>
 where
     C: ConnectionTrait,
 {
-    let exists = chat_threads::Entity::find_by_id(thread_id.to_string())
+    thread_updated_at(db, thread_id).await.map(|_| ())
+}
+
+async fn thread_updated_at<C>(db: &C, thread_id: &str) -> anyhow::Result<u64>
+where
+    C: ConnectionTrait,
+{
+    let thread = chat_threads::Entity::find_by_id(thread_id.to_string())
         .one(db)
         .await
         .context("Failed to load chat thread")?
-        .is_some();
-    if !exists {
-        return Err(anyhow!("Thread not found"));
-    }
-    Ok(())
+        .ok_or_else(|| anyhow!("Thread not found"))?;
+    Ok(i64_to_u64(thread.updated_at))
 }
 
 async fn insert_message<C>(db: &C, message: &ChatThreadMessage) -> anyhow::Result<()>
@@ -311,16 +381,24 @@ async fn update_thread_metadata<C>(
     thread_id: &str,
     model_id: Option<String>,
     updated_at: u64,
+    system_prompt_update: &ChatThreadSystemPromptUpdate,
 ) -> anyhow::Result<()>
 where
     C: ConnectionTrait,
 {
-    chat_threads::Entity::update_many()
+    let mut update = chat_threads::Entity::update_many()
         .col_expr(
             chat_threads::Column::UpdatedAt,
             Expr::value(u64_to_i64(updated_at, "updated_at")?),
         )
-        .col_expr(chat_threads::Column::ModelId, Expr::value(model_id))
+        .col_expr(chat_threads::Column::ModelId, Expr::value(model_id));
+    if let ChatThreadSystemPromptUpdate::Replace(system_prompt) = system_prompt_update {
+        update = update.col_expr(
+            chat_threads::Column::SystemPrompt,
+            Expr::value(system_prompt.clone()),
+        );
+    }
+    update
         .filter(chat_threads::Column::Id.eq(thread_id.to_string()))
         .exec(db)
         .await
@@ -345,6 +423,7 @@ const THREAD_SUMMARY_LIST_SQL: &str = r#"
         t.id,
         t.title,
         t.model_id,
+        t.system_prompt,
         t.created_at,
         t.updated_at,
         (
@@ -368,6 +447,7 @@ const THREAD_SUMMARY_BY_ID_SQL: &str = r#"
         t.id,
         t.title,
         t.model_id,
+        t.system_prompt,
         t.created_at,
         t.updated_at,
         (
@@ -417,14 +497,15 @@ async fn fetch_thread_summary(
 }
 
 fn map_thread_summary(row: &QueryResult) -> anyhow::Result<ChatThreadSummary> {
-    let message_count_raw: i64 = row.try_get_by_index(6)?;
+    let message_count_raw: i64 = row.try_get_by_index(7)?;
     Ok(ChatThreadSummary {
         id: row.try_get_by_index(0)?,
         title: row.try_get_by_index(1)?,
         model_id: row.try_get_by_index(2)?,
-        created_at: i64_to_u64(row.try_get_by_index(3)?),
-        updated_at: i64_to_u64(row.try_get_by_index(4)?),
-        last_message_preview: row.try_get_by_index(5)?,
+        system_prompt: row.try_get_by_index(3)?,
+        created_at: i64_to_u64(row.try_get_by_index(4)?),
+        updated_at: i64_to_u64(row.try_get_by_index(5)?),
+        last_message_preview: row.try_get_by_index(6)?,
         message_count: i64_to_usize(message_count_raw),
     })
 }
@@ -667,17 +748,19 @@ mod tests {
                 thread.id.clone(),
                 "hello".to_string(),
                 Some(vec![json!({"type":"text","text":"hello"})]),
+                thread.updated_at,
             );
             let pending_id = pending.id.clone();
             let pending_created_at = pending.created_at;
 
             let (user, assistant) = store
-                .append_turn(
+                .append_turn_with_system_prompt_update(
                     pending,
                     "world".to_string(),
                     Some("new-model".to_string()),
                     7,
                     12.5,
+                    ChatThreadSystemPromptUpdate::Retain,
                 )
                 .await
                 .expect("turn should append");
@@ -709,11 +792,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_prompt_round_trips_and_updates_with_completed_turn() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store
+                .create_thread_with_system_prompt(
+                    None,
+                    Some("Qwen3.5-4B".to_string()),
+                    Some("Be concise.".to_string()),
+                )
+                .await
+                .expect("thread should create");
+            assert_eq!(thread.system_prompt.as_deref(), Some("Be concise."));
+
+            let pending = store.prepare_user_message(
+                thread.id.clone(),
+                "hello".to_string(),
+                None,
+                thread.updated_at,
+            );
+            store
+                .append_turn_with_system_prompt_update(
+                    pending,
+                    "world".to_string(),
+                    Some("Qwen3.5-4B".to_string()),
+                    1,
+                    2.0,
+                    ChatThreadSystemPromptUpdate::Replace(Some("Answer in one word.".to_string())),
+                )
+                .await
+                .expect("turn should append");
+
+            let summary = store
+                .get_thread(thread.id)
+                .await
+                .expect("thread should load")
+                .expect("thread should exist");
+            assert_eq!(
+                summary.system_prompt.as_deref(),
+                Some("Answer in one word.")
+            );
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn title_updates_never_move_the_thread_clock_behind_messages() {
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store
+                .create_thread(None, Some("Qwen3.5-4B".to_string()))
+                .await
+                .expect("thread should create");
+            let pending = store.prepare_user_message(
+                thread.id.clone(),
+                "future turn".to_string(),
+                None,
+                thread.updated_at.saturating_add(10_000),
+            );
+            let (_, assistant) = store
+                .append_turn_with_system_prompt_update(
+                    pending,
+                    "complete".to_string(),
+                    Some("Qwen3.5-4B".to_string()),
+                    1,
+                    1.0,
+                    ChatThreadSystemPromptUpdate::Retain,
+                )
+                .await
+                .expect("turn should append");
+
+            let updated = store
+                .update_thread_title(thread.id, "Renamed".to_string())
+                .await
+                .expect("title should update")
+                .expect("thread should exist");
+            assert_eq!(updated.updated_at, assistant.created_at);
+            clear_env();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn turn_locks_serialize_same_thread_but_not_different_threads() {
+        let store = ChatStore::initialize_with_database(StoreDatabase::new(
+            tempfile::tempdir()
+                .expect("temp dir")
+                .path()
+                .join("chat.sqlite3"),
+        ));
+        let first = store.acquire_turn("thread-a").await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.acquire_turn("thread-b"),
+        )
+        .await
+        .expect("different thread should not block");
+        drop(other);
+
+        let blocked_store = store.clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = blocked_store.acquire_turn("thread-a").await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("same-thread waiter should proceed after release")
+            .expect("waiter should not panic");
+    }
+
+    #[tokio::test]
     async fn append_turn_rolls_back_user_when_assistant_insert_fails() {
         with_env_lock(async {
             let (_temp, store) = setup_store();
             let thread = store
-                .create_thread(None, Some("old-model".to_string()))
+                .create_thread_with_system_prompt(
+                    None,
+                    Some("old-model".to_string()),
+                    Some("old prompt".to_string()),
+                )
                 .await
                 .expect("thread should create");
             let original_updated_at = thread.updated_at;
@@ -731,15 +931,20 @@ mod tests {
             .await
             .expect("failure trigger should create");
 
-            let pending =
-                store.prepare_user_message(thread.id.clone(), "must roll back".to_string(), None);
+            let pending = store.prepare_user_message(
+                thread.id.clone(),
+                "must roll back".to_string(),
+                None,
+                thread.updated_at,
+            );
             let err = store
-                .append_turn(
+                .append_turn_with_system_prompt_update(
                     pending,
                     "not persisted".to_string(),
                     Some("new-model".to_string()),
                     3,
                     4.0,
+                    ChatThreadSystemPromptUpdate::Replace(Some("new prompt".to_string())),
                 )
                 .await
                 .expect_err("assistant failure should abort the transaction");
@@ -756,6 +961,7 @@ mod tests {
                 .expect("thread should load")
                 .expect("thread should exist");
             assert_eq!(summary.model_id.as_deref(), Some("old-model"));
+            assert_eq!(summary.system_prompt.as_deref(), Some("old prompt"));
             assert_eq!(summary.updated_at, original_updated_at);
             assert_eq!(summary.message_count, 0);
             assert!(summary.last_message_preview.is_none());

@@ -311,6 +311,9 @@ pub enum YieldReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
     Completed,
+    MaxTokens,
+    StopToken,
+    StopSequence,
     Cancelled,
     TimedOut,
     Rejected,
@@ -319,7 +322,9 @@ pub enum FinishReason {
 impl FinishReason {
     fn terminal_outcome(self) -> TerminalOutcome {
         match self {
-            Self::Completed => TerminalOutcome::Completed,
+            Self::Completed | Self::MaxTokens | Self::StopToken | Self::StopSequence => {
+                TerminalOutcome::Completed
+            }
             Self::Cancelled => TerminalOutcome::Cancelled,
             Self::TimedOut => TerminalOutcome::TimedOut,
             Self::Rejected => TerminalOutcome::Rejected,

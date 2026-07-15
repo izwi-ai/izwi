@@ -4,12 +4,12 @@ use std::time::Instant;
 
 use tracing::debug;
 
+use crate::engine::execution::FinishReason as ExecutionFinishReason;
 use crate::engine::resources::{ReservationClass, ReservationOwner, ResourceLease};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen35::chat::{Qwen35PrefixSnapshot, Qwen35PreparedPrompt};
 use crate::models::registry::NativeChatModel;
-use crate::models::shared::chat::ChatGenerationConfig;
-use crate::models::shared::chat::ChatMessage;
+use crate::models::shared::chat::{ChatGenerationConfig, ChatGenerationFinishReason, ChatMessage};
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
@@ -302,6 +302,7 @@ impl NativeExecutor {
         let mut decode_steps_ran = 0usize;
         let mut final_text = String::new();
         let mut finished = false;
+        let mut finish_reason = None;
 
         for _ in 0..decode_iterations {
             if request.is_cancelled() {
@@ -345,6 +346,7 @@ impl NativeExecutor {
             }
 
             if step.finished {
+                finish_reason = step.finish_reason;
                 if let Some(snapshot) = active_state.pending_prefix_snapshot.take() {
                     let _ = self
                         .qwen35_prefix_cache
@@ -367,7 +369,7 @@ impl NativeExecutor {
             guard.insert(session, active_state);
         }
 
-        Ok(ModelSessionResult::sequence(ExecutorOutput {
+        let output = ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput::empty(24_000)),
             text: Some(final_text),
@@ -378,7 +380,15 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        }))
+        };
+        if finished {
+            Ok(ModelSessionResult::finished(
+                output,
+                Self::chat_execution_finish_reason(finish_reason),
+            ))
+        } else {
+            Ok(ModelSessionResult::sequence(output))
+        }
     }
 
     fn qwen35_prefix_cache_enabled(
@@ -390,6 +400,17 @@ impl NativeExecutor {
             && self.qwen35_prefix_cache.max_retained_bytes() > 0
             && matches!(model, NativeChatModel::Qwen35(_))
             && prepared.is_some_and(Qwen35PreparedPrompt::supports_exact_prefix_reuse)
+    }
+
+    fn chat_execution_finish_reason(
+        reason: Option<ChatGenerationFinishReason>,
+    ) -> ExecutionFinishReason {
+        match reason {
+            Some(ChatGenerationFinishReason::MaxTokens) => ExecutionFinishReason::MaxTokens,
+            Some(ChatGenerationFinishReason::StopToken) => ExecutionFinishReason::StopToken,
+            Some(ChatGenerationFinishReason::StopSequence) => ExecutionFinishReason::StopSequence,
+            None => ExecutionFinishReason::Completed,
+        }
     }
 
     fn preauthorize_qwen35_prefix_snapshot(

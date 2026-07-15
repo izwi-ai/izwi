@@ -149,6 +149,7 @@ export function ChatPlayground({
     !!activeThreadId &&
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
   const isEmptyChatWorkspace = !hasConversation;
+  const isActiveThreadMetadataPending = !!activeThreadId && !activeThread;
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
   const supportsImageAttachments =
     supportsImageAttachmentsForModel(selectedModel);
@@ -479,6 +480,10 @@ export function ChatPlayground({
     try {
       const thread = await api.createChatThread({
         model_id: selectedModel ?? undefined,
+        system_prompt: systemPromptForModel(
+          selectedModel,
+          thinkingEnabledForModel,
+        ),
       });
       setThreads((previous) => [thread, ...previous]);
       setActiveThreadInUrl(thread.id);
@@ -498,6 +503,7 @@ export function ChatPlayground({
     selectedModel,
     setPendingImages,
     setActiveThreadInUrl,
+    thinkingEnabledForModel,
   ]);
 
   const openDeleteThreadConfirm = useCallback((threadId: string) => {
@@ -610,7 +616,12 @@ export function ChatPlayground({
 
   const sendMessage = async () => {
     const text = input.trim();
-    if ((text.length === 0 && pendingImages.length === 0) || isStreaming || isPreparingThread) {
+    if (
+      (text.length === 0 && pendingImages.length === 0) ||
+      isStreaming ||
+      isPreparingThread ||
+      isActiveThreadMetadataPending
+    ) {
       return;
     }
 
@@ -620,11 +631,16 @@ export function ChatPlayground({
     }
 
     let targetThreadId = activeThreadId;
+    let targetThread = activeThread;
     if (!targetThreadId) {
       setIsPreparingThread(true);
       try {
         const createdThread = await api.createChatThread({
           model_id: selectedModel ?? undefined,
+          system_prompt: systemPromptForModel(
+            selectedModel,
+            thinkingEnabledForModel,
+          ),
         });
         setThreads((previous) => [createdThread, ...previous]);
         setActiveThreadInUrl(createdThread.id);
@@ -632,6 +648,7 @@ export function ChatPlayground({
         setExpandedThoughts({});
         setStats(null);
         targetThreadId = createdThread.id;
+        targetThread = createdThread;
       } catch (threadError) {
         setError(getErrorMessage(threadError, "Failed to create a new chat."));
         setIsPreparingThread(false);
@@ -682,13 +699,13 @@ export function ChatPlayground({
       generation_time_ms: null,
     };
 
-    const systemPrompt = systemPromptForModel(
-      selectedModel,
-      thinkingEnabledForModel,
-    );
     const enableThinking =
       isQwen35ThinkingModel(selectedModel) && supportsThinking
         ? thinkingEnabledForModel
+        : undefined;
+    const systemPromptBackfill =
+      targetThread && targetThread.system_prompt == null
+        ? systemPromptForModel(selectedModel, thinkingEnabledForModel)
         : undefined;
 
     setMessages((previous) => [
@@ -707,7 +724,9 @@ export function ChatPlayground({
         model_id: selectedModel,
         content: requestPayload.content,
         content_parts: requestPayload.contentParts,
-        system_prompt: systemPrompt,
+        ...(systemPromptBackfill
+          ? { system_prompt: systemPromptBackfill }
+          : {}),
         enable_thinking: enableThinking,
       },
       {
@@ -919,7 +938,12 @@ export function ChatPlayground({
                   : "Ask anything..."
         }
         className="chat-composer-input w-full resize-none bg-transparent px-5 pt-5 pb-2 text-[0.9375rem] focus:outline-none placeholder:text-[var(--text-muted)]"
-        disabled={isStreaming || isPreparingThread || isReadingImages}
+        disabled={
+          isStreaming ||
+          isPreparingThread ||
+          isReadingImages ||
+          isActiveThreadMetadataPending
+        }
       />
 
       <input
@@ -1000,6 +1024,7 @@ export function ChatPlayground({
             disabled={
               isPreparingThread ||
               isReadingImages ||
+              (!isStreaming && isActiveThreadMetadataPending) ||
               (!isStreaming &&
                 input.trim().length === 0 &&
                 pendingImages.length === 0)

@@ -947,9 +947,12 @@ impl EngineCore {
 
     fn terminal_release_cause(disposition: &ExecutionDisposition) -> Option<TerminalReleaseCause> {
         match disposition {
-            ExecutionDisposition::Finished(ExecutionFinishReason::Completed) => {
-                Some(TerminalReleaseCause::Completed)
-            }
+            ExecutionDisposition::Finished(
+                ExecutionFinishReason::Completed
+                | ExecutionFinishReason::MaxTokens
+                | ExecutionFinishReason::StopToken
+                | ExecutionFinishReason::StopSequence,
+            ) => Some(TerminalReleaseCause::Completed),
             ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled) => {
                 Some(TerminalReleaseCause::Cancelled)
             }

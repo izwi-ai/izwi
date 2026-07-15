@@ -54,6 +54,7 @@ export interface ChatThread {
   id: string;
   title: string;
   model_id: string | null;
+  system_prompt?: string | null;
   created_at: number;
   updated_at: number;
   last_message_preview: string | null;
@@ -79,6 +80,7 @@ export interface ChatThreadDetail {
 export interface ChatThreadCreateRequest {
   title?: string;
   model_id?: string;
+  system_prompt?: string;
 }
 
 export interface ChatThreadUpdateRequest {
@@ -110,7 +112,19 @@ export interface ChatThreadSendMessageRequest {
   content_parts?: ChatThreadContentPart[];
   max_tokens?: number;
   system_prompt?: string;
+  stop?: string | string[];
   enable_thinking?: boolean;
+}
+
+export type ChatGenerationFinishReason =
+  | "max_tokens"
+  | "stop_token"
+  | "stop_sequence";
+
+export interface ChatGenerationStats {
+  tokens_generated: number;
+  generation_time_ms: number;
+  finish_reason: ChatGenerationFinishReason;
 }
 
 export interface ChatThreadSendMessageResponse {
@@ -118,10 +132,7 @@ export interface ChatThreadSendMessageResponse {
   model_id: string;
   user_message: ChatThreadMessageRecord;
   assistant_message: ChatThreadMessageRecord;
-  stats: {
-    tokens_generated: number;
-    generation_time_ms: number;
-  };
+  stats: ChatGenerationStats;
 }
 
 type ChatThreadStreamEvent =
@@ -137,10 +148,7 @@ type ChatThreadStreamEvent =
       thread_id: string;
       model_id: string;
       assistant_message: ChatThreadMessageRecord;
-      stats: {
-        tokens_generated: number;
-        generation_time_ms: number;
-      };
+      stats: ChatGenerationStats;
     }
   | { event: "error"; error: string };
 
@@ -155,10 +163,7 @@ export interface ChatThreadStreamCallbacks {
     threadId: string;
     modelId: string;
     assistantMessage: ChatThreadMessageRecord;
-    stats: {
-      tokens_generated: number;
-      generation_time_ms: number;
-    };
+    stats: ChatGenerationStats;
   }) => void;
   onError?: (error: string) => void;
   onClose?: () => void;
@@ -333,6 +338,7 @@ export class ChatApiClient {
       body: JSON.stringify({
         title: request?.title,
         model_id: request?.model_id,
+        system_prompt: request?.system_prompt,
       }),
     });
   }
@@ -384,6 +390,7 @@ export class ChatApiClient {
           max_tokens: request.max_tokens,
           stream: false,
           system_prompt: request.system_prompt,
+          stop: request.stop,
           enable_thinking: request.enable_thinking,
         }),
       },
@@ -415,6 +422,7 @@ export class ChatApiClient {
               max_tokens: request.max_tokens,
               stream: true,
               system_prompt: request.system_prompt,
+              stop: request.stop,
               enable_thinking: request.enable_thinking,
             }),
             signal: abortController.signal,

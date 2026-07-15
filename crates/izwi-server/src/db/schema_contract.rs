@@ -12,7 +12,14 @@ struct RequiredSchemaTable {
 const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
     RequiredSchemaTable {
         name: "chat_threads",
-        columns: &["id", "title", "model_id", "created_at", "updated_at"],
+        columns: &[
+            "id",
+            "title",
+            "model_id",
+            "system_prompt",
+            "created_at",
+            "updated_at",
+        ],
     },
     RequiredSchemaTable {
         name: "chat_messages",

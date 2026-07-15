@@ -39,6 +39,7 @@ pub mod chat_threads {
         pub id: String,
         pub title: String,
         pub model_id: Option<String>,
+        pub system_prompt: Option<String>,
         pub created_at: i64,
         pub updated_at: i64,
     }

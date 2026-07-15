@@ -57,7 +57,7 @@ use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
 };
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
+use crate::models::shared::chat::{ChatGenerationConfig, ChatGenerationFinishReason, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
 type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
@@ -1842,6 +1842,7 @@ pub struct NativeChatDecodeStep {
     pub text: String,
     pub tokens_generated: usize,
     pub finished: bool,
+    pub finish_reason: Option<ChatGenerationFinishReason>,
 }
 
 impl NativeChatModel {
@@ -2078,6 +2079,7 @@ impl NativeChatModel {
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     finished: step.finished,
+                    finish_reason: None,
                 })
             }
             (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
@@ -2087,6 +2089,7 @@ impl NativeChatModel {
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     finished: step.finished,
+                    finish_reason: step.finish_reason,
                 })
             }
             _ => Err(Error::InvalidInput(

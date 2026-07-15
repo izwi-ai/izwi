@@ -93,7 +93,11 @@ pub async fn create_session(
 
     let thread = state
         .chat_store
-        .create_thread(req.title, Some(model_id.clone()))
+        .create_thread_with_system_prompt(
+            req.title,
+            Some(model_id.clone()),
+            Some(system_prompt.clone()),
+        )
         .await
         .map_err(map_store_error)?;
 
@@ -140,6 +144,10 @@ pub async fn create_turn(
             .cloned()
             .ok_or_else(|| ApiError::not_found("Agent session not found"))?
     };
+    let _turn_guard = state
+        .chat_store
+        .acquire_turn(&session_record.thread_id)
+        .await;
 
     let requested_model_id = match req.model_id.as_deref() {
         Some(model_id) => Some(resolve_chat_model_id(Some(model_id))?),

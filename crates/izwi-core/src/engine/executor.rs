@@ -368,6 +368,15 @@ impl ModelSessionResult {
         }
     }
 
+    pub fn finished(mut output: ExecutorOutput, reason: FinishReason) -> Self {
+        output.finished = true;
+        Self {
+            output,
+            disposition: ExecutionDisposition::Finished(reason),
+            safe_point: true,
+        }
+    }
+
     pub fn cancelled(mut output: ExecutorOutput) -> Self {
         output.finished = true;
         Self {

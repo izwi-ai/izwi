@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ApiError;
 use crate::state::AppState;
+#[cfg(test)]
+use izwi_core::ChatGenerationFinishReason;
 use izwi_core::{
     parse_chat_model_variant, ChatGeneration, ChatMessage, ChatRequestConfig, GenerationParams,
     ModelVariant, WorkloadClass,
@@ -63,6 +65,16 @@ pub enum ChatStreamEvent {
     Completed(ChatGeneration),
     Failed(String),
     ShuttingDown,
+}
+
+struct ChatStreamCompletion(Option<oneshot::Sender<()>>);
+
+impl Drop for ChatStreamCompletion {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 const CHAT_STREAM_CAPACITY: usize = 64;
@@ -162,6 +174,60 @@ pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
     parse_chat_model_variant(Some(model_id)).map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
+pub fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Result<Vec<String>, ApiError> {
+    const MAX_STOP_SEQUENCES: usize = 4;
+
+    let values: Vec<&str> = match stop {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::String(value)) => vec![value.as_str()],
+        Some(serde_json::Value::Array(values)) => {
+            if values.len() > MAX_STOP_SEQUENCES {
+                return Err(ApiError::bad_request(format!(
+                    "`stop` supports at most {MAX_STOP_SEQUENCES} sequences"
+                )));
+            }
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().ok_or_else(|| {
+                        ApiError::bad_request(
+                            "`stop` must be a string or an array containing only strings",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "`stop` must be a string or an array containing only strings",
+            ))
+        }
+    };
+
+    let mut stop_sequences = Vec::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() {
+            return Err(ApiError::bad_request("`stop` sequences cannot be empty"));
+        }
+        if !stop_sequences.iter().any(|existing| existing == value) {
+            stop_sequences.push(value.to_string());
+        }
+    }
+    Ok(stop_sequences)
+}
+
+pub fn validate_chat_stop_support(
+    variant: ModelVariant,
+    stop_sequences: &[String],
+) -> Result<(), ApiError> {
+    if !stop_sequences.is_empty() && !variant.is_qwen35_chat_gguf() {
+        return Err(ApiError::bad_request(format!(
+            "`stop` is currently supported only by Qwen3.5 chat models, not {variant}"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn generate_chat(
     state: &AppState,
     request: ChatExecutionRequest,
@@ -193,6 +259,13 @@ pub fn spawn_chat_stream(
     state: AppState,
     request: ChatExecutionRequest,
 ) -> mpsc::Receiver<ChatStreamEvent> {
+    spawn_chat_stream_with_completion(state, request).0
+}
+
+pub(crate) fn spawn_chat_stream_with_completion(
+    state: AppState,
+    request: ChatExecutionRequest,
+) -> (mpsc::Receiver<ChatStreamEvent>, oneshot::Receiver<()>) {
     let runtime = state.runtime.clone();
     let params = request.resolved_generation_params();
     let chat_config = request.resolved_chat_config();
@@ -201,8 +274,10 @@ pub fn spawn_chat_stream(
     let correlation_id = request.correlation_id;
 
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
+    let (completion_tx, completion_rx) = oneshot::channel();
     let backpressure = Arc::new(ChatStreamBackpressure::default());
     tokio::spawn(async move {
+        let _completion = ChatStreamCompletion(Some(completion_tx));
         let permit = match state
             .acquire_owned_workload_permit(WorkloadClass::Streaming)
             .await
@@ -240,7 +315,7 @@ pub fn spawn_chat_stream(
         }
     });
 
-    event_rx
+    (event_rx, completion_rx)
 }
 
 #[cfg(test)]
@@ -284,6 +359,7 @@ where
 mod tests {
     use super::*;
     use izwi_core::ChatRole;
+    use serde_json::json;
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
@@ -315,6 +391,23 @@ mod tests {
     }
 
     #[test]
+    fn stop_sequences_validate_and_only_qwen35_accepts_them() {
+        assert_eq!(
+            parse_stop_sequences(Some(&json!(["END", "DONE", "END"]))).unwrap(),
+            ["END", "DONE"]
+        );
+        assert!(parse_stop_sequences(Some(&json!(["END", 7]))).is_err());
+        assert!(parse_stop_sequences(Some(&json!([""]))).is_err());
+        assert!(parse_stop_sequences(Some(&json!(["1", "2", "3", "4", "5"]))).is_err());
+        assert!(
+            validate_chat_stop_support(ModelVariant::Qwen354BGguf, &["END".to_string()]).is_ok()
+        );
+        assert!(
+            validate_chat_stop_support(ModelVariant::Qwen34BGguf, &["END".to_string()]).is_err()
+        );
+    }
+
+    #[test]
     fn chat_models_default_to_4096_max_tokens_when_request_omits_limits() {
         for variant in [
             ModelVariant::Gemma34BIt,
@@ -343,6 +436,7 @@ mod tests {
                     prompt_tokens: 12,
                     tokens_generated: 2,
                     generation_time_ms: 25.0,
+                    finish_reason: ChatGenerationFinishReason::StopToken,
                 })
             });
 
@@ -384,6 +478,7 @@ mod tests {
                     prompt_tokens: 1,
                     tokens_generated: 2,
                     generation_time_ms: 1.0,
+                    finish_reason: ChatGenerationFinishReason::StopToken,
                 })
             });
 
@@ -420,6 +515,7 @@ mod tests {
                     prompt_tokens: 1,
                     tokens_generated: 1,
                     generation_time_ms: 1.0,
+                    finish_reason: ChatGenerationFinishReason::StopToken,
                 })
             },
         );

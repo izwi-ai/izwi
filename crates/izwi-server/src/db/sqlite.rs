@@ -277,6 +277,7 @@ mod tests {
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[
+        ("chat_threads", "system_prompt"),
         ("chat_messages", "content_parts"),
         ("media_assets", "source_asset_id"),
         ("media_assets", "canonical_profile_version"),

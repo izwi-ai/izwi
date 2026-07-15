@@ -1,17 +1,39 @@
 //! Chat runtime methods routed through the unified core engine.
 
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams, TaskType};
+use crate::engine::{GenerationParams, OutputFinishReason as EngineFinishReason, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen35::media_resource_estimate;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
+use crate::models::shared::chat::{
+    ChatGenerationConfig, ChatGenerationFinishReason, ChatMessage, ChatRequestConfig,
+};
 use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::{
     media_preparation_resources, retained_chat_preparation_input_bytes, AdmittedEngineRequest,
     RuntimeService,
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
+
+fn chat_generation_finish_reason(reason: Option<EngineFinishReason>) -> ChatGenerationFinishReason {
+    match reason {
+        Some(EngineFinishReason::MaxTokens) => ChatGenerationFinishReason::MaxTokens,
+        Some(EngineFinishReason::StopSequence) => ChatGenerationFinishReason::StopSequence,
+        Some(EngineFinishReason::StopToken) | None => ChatGenerationFinishReason::StopToken,
+        Some(EngineFinishReason::Aborted | EngineFinishReason::Error) => {
+            ChatGenerationFinishReason::StopToken
+        }
+    }
+}
+
+fn validate_chat_stop_support(variant: ModelVariant, params: &GenerationParams) -> Result<()> {
+    if !params.stop_sequences.is_empty() && !variant.is_qwen35_chat_gguf() {
+        return Err(Error::InvalidInput(format!(
+            "Chat stop sequences are supported only by Qwen3.5 chat models, not {variant}"
+        )));
+    }
+    Ok(())
+}
 
 impl RuntimeService {
     fn prompt_token_config(
@@ -46,6 +68,7 @@ impl RuntimeService {
                 "Chat request missing messages".to_string(),
             ));
         }
+        validate_chat_stop_support(variant, &params)?;
         if !chat_config.media_inputs.is_empty() && variant.family() != ModelFamily::Qwen35Chat {
             return Err(Error::InvalidInput(format!(
                 "Chat model {variant} does not support Qwen3.5 media inputs"
@@ -157,6 +180,7 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            finish_reason: chat_generation_finish_reason(output.finish_reason),
         })
     }
 
@@ -232,6 +256,7 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            finish_reason: chat_generation_finish_reason(output.finish_reason),
         })
     }
 
@@ -320,6 +345,7 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            finish_reason: chat_generation_finish_reason(output.finish_reason),
         })
     }
 
@@ -428,6 +454,24 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            finish_reason: chat_generation_finish_reason(output.finish_reason),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_rejects_stop_sequences_that_a_model_would_ignore() {
+        let mut params = GenerationParams::default();
+        params.stop_sequences = vec!["done".to_string()];
+
+        let error = validate_chat_stop_support(ModelVariant::Qwen34BGguf, &params)
+            .expect_err("Qwen3 would ignore text stop sequences");
+        assert!(error.to_string().contains("only by Qwen3.5"));
+        validate_chat_stop_support(ModelVariant::Qwen354BGguf, &params)
+            .expect("Qwen3.5 should accept text stop sequences");
     }
 }

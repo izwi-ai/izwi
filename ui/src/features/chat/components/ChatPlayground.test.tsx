@@ -92,6 +92,52 @@ describe("ChatPlayground", () => {
     );
   });
 
+  it("waits for existing thread metadata before enabling the composer", async () => {
+    const thread = {
+      id: "thread-pending",
+      title: "Custom prompt thread",
+      model_id: "Qwen3.5-4B",
+      system_prompt: "Keep the stored custom prompt.",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+    let resolveThreads!: (threads: (typeof thread)[]) => void;
+    apiMocks.listChatThreads.mockReturnValue(
+      new Promise((resolve) => {
+        resolveThreads = resolve;
+      }),
+    );
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-pending"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.5-4B"
+          selectedModelReady={true}
+          supportsThinking={true}
+          modelLabel="Qwen3.5 4B GGUF (Q4_K_M)"
+          modelOptions={[
+            {
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B GGUF (Q4_K_M)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    resolveThreads([thread]);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeEnabled());
+  });
+
   it("shows the active thread title below the selector without the old conversation header", async () => {
     const thread = {
       id: "thread-1",
@@ -307,6 +353,7 @@ describe("ChatPlayground", () => {
       id: "thread-1",
       title: "Vision thread",
       model_id: "Qwen3.5-4B",
+      system_prompt: "Describe images precisely.",
       created_at: 1,
       updated_at: 2,
       last_message_preview: null,
@@ -398,6 +445,9 @@ describe("ChatPlayground", () => {
       }),
       expect.any(Object),
     );
+    expect(
+      apiMocks.sendChatThreadMessageStream.mock.calls[0]?.[1],
+    ).not.toHaveProperty("system_prompt");
   });
 
   it("allows attachment-only Qwen3.5 turns and sends a preview summary", async () => {

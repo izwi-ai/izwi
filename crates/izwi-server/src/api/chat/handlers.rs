@@ -9,17 +9,23 @@ use axum::{
 };
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{oneshot, OwnedMutexGuard};
 
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, parse_chat_model, parse_stop_sequences, spawn_chat_stream_with_completion,
+    validate_chat_stop_support, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
-use crate::chat_store::{ChatStore, ChatThreadMessage, ChatThreadSummary};
+use crate::chat_store::{
+    ChatStore, ChatThreadMessage, ChatThreadSummary, ChatThreadSystemPromptUpdate,
+};
 use crate::error::ApiError;
 use crate::state::AppState;
+#[cfg(test)]
+use izwi_core::ChatGenerationFinishReason;
 use izwi_core::{ChatGeneration, ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole};
 
 #[derive(Debug, Serialize)]
@@ -33,6 +39,8 @@ pub struct CreateChatThreadRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,12 +81,15 @@ pub struct CreateThreadMessageRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub stop: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatGenerationStats {
     pub tokens_generated: usize,
     pub generation_time_ms: f64,
+    pub finish_reason: izwi_core::ChatGenerationFinishReason,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,7 +148,13 @@ pub async fn create_thread(
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
     let thread = state
         .chat_store
-        .create_thread(req.title, req.model_id)
+        .create_thread_with_system_prompt(
+            req.title,
+            req.model_id,
+            req.system_prompt
+                .as_deref()
+                .and_then(normalize_system_prompt),
+        )
         .await
         .map_err(map_store_error)?;
 
@@ -176,6 +193,7 @@ pub async fn delete_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
 ) -> Result<Json<DeleteChatThreadResponse>, ApiError> {
+    let _turn_guard = state.chat_store.acquire_turn(&thread_id).await;
     let deleted = state
         .chat_store
         .delete_thread(thread_id.clone())
@@ -201,6 +219,7 @@ pub async fn update_thread(
         return Err(ApiError::bad_request("Thread title cannot be empty"));
     }
 
+    let _turn_guard = state.chat_store.acquire_turn(&thread_id).await;
     let updated = state
         .chat_store
         .update_thread_title(thread_id, req.title)
@@ -228,17 +247,25 @@ pub async fn create_thread_message(
         return Err(ApiError::bad_request("Message content cannot be empty"));
     }
 
-    get_thread_or_not_found(&state, &thread_id).await?;
+    let stop_sequences = parse_stop_sequences(req.stop.as_ref())?;
+    validate_chat_stop_support(model_variant, &stop_sequences)?;
+
+    let turn_guard = state.chat_store.acquire_turn(&thread_id).await;
+    let thread = get_thread_or_not_found(&state, &thread_id).await?;
     let existing_messages = state
         .chat_store
         .list_messages(thread_id.clone())
         .await
         .map_err(map_store_error)?;
 
+    let (system_prompt_update, effective_system_prompt) = resolve_thread_system_prompt(
+        thread.system_prompt.as_deref(),
+        req.system_prompt.as_deref(),
+    );
     let (runtime_messages, media_inputs) = build_runtime_messages(
         &existing_messages,
         &flattened_content,
-        req.system_prompt.as_deref(),
+        effective_system_prompt.as_deref(),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
@@ -247,6 +274,7 @@ pub async fn create_thread_message(
         thread_id.clone(),
         flattened_content.display_text.clone(),
         prepared_content_parts.clone(),
+        thread.updated_at,
     );
 
     let execution_request = ChatExecutionRequest {
@@ -257,7 +285,7 @@ pub async fn create_thread_message(
         temperature: req.temperature,
         top_p: req.top_p,
         presence_penalty: None,
-        stop_sequences: Vec::new(),
+        stop_sequences,
         chat_config: ChatRequestConfig {
             enable_thinking: req.enable_thinking,
             tools: Vec::new(),
@@ -273,14 +301,21 @@ pub async fn create_thread_message(
             thread_id,
             user_message,
             execution_request,
+            system_prompt_update,
+            turn_guard,
         )
         .await;
     }
 
     let generation = generate_chat(&state, execution_request).await;
-    let (generation, user_message, assistant_message) =
-        persist_generated_thread_turn(&state.chat_store, user_message, &model_id, generation)
-            .await?;
+    let (generation, user_message, assistant_message) = persist_generated_thread_turn(
+        &state.chat_store,
+        user_message,
+        &model_id,
+        generation,
+        system_prompt_update,
+    )
+    .await?;
 
     let response = CreateThreadMessageResponse {
         thread_id,
@@ -290,6 +325,7 @@ pub async fn create_thread_message(
         stats: ChatGenerationStats {
             tokens_generated: generation.tokens_generated,
             generation_time_ms: generation.generation_time_ms,
+            finish_reason: generation.finish_reason,
         },
     };
 
@@ -301,15 +337,17 @@ async fn persist_generated_thread_turn(
     user_message: ChatThreadMessage,
     model_id: &str,
     generation: Result<ChatGeneration, ApiError>,
+    system_prompt_update: ChatThreadSystemPromptUpdate,
 ) -> Result<(ChatGeneration, ChatThreadMessage, ChatThreadMessage), ApiError> {
     let generation = generation?;
     let (user_message, assistant_message) = chat_store
-        .append_turn(
+        .append_turn_with_system_prompt_update(
             user_message,
             generation.text.clone(),
             Some(model_id.to_string()),
             generation.tokens_generated,
             generation.generation_time_ms,
+            system_prompt_update,
         )
         .await
         .map_err(map_store_or_not_found)?;
@@ -322,18 +360,23 @@ async fn create_streaming_thread_message(
     thread_id: String,
     user_message: ChatThreadMessage,
     execution_request: ChatExecutionRequest,
+    system_prompt_update: ChatThreadSystemPromptUpdate,
+    turn_guard: OwnedMutexGuard<()>,
 ) -> Result<Response, ApiError> {
     let chat_store = state.chat_store.clone();
     let thread_id_for_task = thread_id.clone();
     let model_id_for_task = model_id.clone();
     let user_message_for_start = user_message.clone();
-    let event_rx = spawn_chat_stream(state, execution_request);
+    let (event_rx, completion_rx) = spawn_chat_stream_with_completion(state, execution_request);
     let stream = thread_message_stream(
         chat_store,
         model_id_for_task,
         thread_id_for_task,
         user_message_for_start,
         event_rx,
+        Some(completion_rx),
+        system_prompt_update,
+        turn_guard,
     );
 
     Ok(Response::builder()
@@ -350,9 +393,24 @@ fn thread_message_stream(
     thread_id: String,
     user_message: ChatThreadMessage,
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
+    completion_rx: Option<oneshot::Receiver<()>>,
+    system_prompt_update: ChatThreadSystemPromptUpdate,
+    turn_guard: OwnedMutexGuard<()>,
 ) -> impl Stream<Item = Result<String, Infallible>> {
-    async_stream::stream! {
-        while let Some(event) = event_rx.recv().await {
+    const THREAD_STREAM_CAPACITY: usize = 64;
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(THREAD_STREAM_CAPACITY);
+
+    tokio::spawn(async move {
+        let _turn_guard = turn_guard;
+        loop {
+            let event = tokio::select! {
+                _ = client_tx.closed() => None,
+                event = event_rx.recv() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
+
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => (
                     serde_json::to_string(&ThreadStreamStartEvent {
@@ -374,18 +432,22 @@ fn thread_message_stream(
                 ),
                 ChatStreamEvent::Completed(generation) => {
                     let payload = match chat_store
-                        .append_turn(
+                        .append_turn_with_system_prompt_update(
                             user_message.clone(),
                             generation.text.clone(),
                             Some(model_id.clone()),
                             generation.tokens_generated,
                             generation.generation_time_ms,
+                            system_prompt_update.clone(),
                         )
                         .await
                     {
                         Ok((persisted_user_message, assistant_message)) => {
                             debug_assert_eq!(persisted_user_message.id, user_message.id);
-                            debug_assert_eq!(persisted_user_message.created_at, user_message.created_at);
+                            debug_assert_eq!(
+                                persisted_user_message.created_at,
+                                user_message.created_at
+                            );
                             serde_json::to_string(&ThreadStreamDoneEvent {
                                 event: "done",
                                 thread_id: thread_id.clone(),
@@ -394,6 +456,7 @@ fn thread_message_stream(
                                 stats: ChatGenerationStats {
                                     tokens_generated: generation.tokens_generated,
                                     generation_time_ms: generation.generation_time_ms,
+                                    finish_reason: generation.finish_reason,
                                 },
                             })
                             .unwrap_or_default()
@@ -423,12 +486,53 @@ fn thread_message_stream(
                     true,
                 ),
             };
-            yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
+
+            if client_tx.try_send(format!("data: {payload}\n\n")).is_err() {
+                break;
+            }
             if terminal {
+                let _ = client_tx.try_send("data: [DONE]\n\n".to_string());
                 break;
             }
         }
-        yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
+
+        // Dropping the engine receiver first requests cancellation. Keep the
+        // per-thread guard until the generation task confirms it has unwound,
+        // so an abort-and-resend cannot overlap model sessions for one thread.
+        drop(event_rx);
+        if let Some(completion_rx) = completion_rx {
+            let _ = completion_rx.await;
+        }
+    });
+
+    async_stream::stream! {
+        while let Some(payload) = client_rx.recv().await {
+            yield Ok::<_, Infallible>(payload);
+        }
+    }
+}
+
+fn normalize_system_prompt(prompt: &str) -> Option<String> {
+    let prompt = prompt.trim();
+    (!prompt.is_empty()).then(|| prompt.to_string())
+}
+
+fn resolve_thread_system_prompt(
+    stored: Option<&str>,
+    requested: Option<&str>,
+) -> (ChatThreadSystemPromptUpdate, Option<String>) {
+    match requested {
+        Some(requested) => {
+            let resolved = normalize_system_prompt(requested);
+            (
+                ChatThreadSystemPromptUpdate::Replace(resolved.clone()),
+                resolved,
+            )
+        }
+        None => (
+            ChatThreadSystemPromptUpdate::Retain,
+            stored.and_then(normalize_system_prompt),
+        ),
     }
 }
 
@@ -533,6 +637,7 @@ mod tests {
             prompt_tokens: 11,
             tokens_generated: 3,
             generation_time_ms: 4.5,
+            finish_reason: ChatGenerationFinishReason::StopToken,
         }
     }
 
@@ -594,6 +699,28 @@ mod tests {
     }
 
     #[test]
+    fn thread_system_prompt_is_inherited_updated_and_cleared_explicitly() {
+        assert_eq!(
+            resolve_thread_system_prompt(Some("stored"), None),
+            (
+                ChatThreadSystemPromptUpdate::Retain,
+                Some("stored".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_thread_system_prompt(Some("stored"), Some("  replacement  ")),
+            (
+                ChatThreadSystemPromptUpdate::Replace(Some("replacement".to_string())),
+                Some("replacement".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_thread_system_prompt(Some("stored"), Some("  ")),
+            (ChatThreadSystemPromptUpdate::Replace(None), None)
+        );
+    }
+
+    #[test]
     fn build_runtime_messages_collects_media_from_history_and_new_message() {
         let (messages, media_inputs) = build_runtime_messages(
             &[ChatThreadMessage {
@@ -637,6 +764,7 @@ mod tests {
             thread.id.clone(),
             "hello".to_string(),
             Some(vec![json!({"type":"text","text":"hello"})]),
+            thread.updated_at,
         );
         let pending_id = pending.id.clone();
         let pending_created_at = pending.created_at;
@@ -657,6 +785,9 @@ mod tests {
             thread.id.clone(),
             pending,
             event_rx,
+            None,
+            ChatThreadSystemPromptUpdate::Retain,
+            store.acquire_turn(&thread.id).await,
         )
         .collect::<Vec<_>>()
         .await
@@ -685,6 +816,7 @@ mod tests {
         )
         .expect("done event should be json");
         assert_eq!(done["event"], "done");
+        assert_eq!(done["stats"]["finish_reason"], "stop_token");
 
         let messages = store
             .list_messages(thread.id)
@@ -703,13 +835,19 @@ mod tests {
             .create_thread(None, Some("Qwen3.5-4B".to_string()))
             .await
             .expect("thread should create");
-        let pending = store.prepare_user_message(thread.id.clone(), "hello".to_string(), None);
+        let pending = store.prepare_user_message(
+            thread.id.clone(),
+            "hello".to_string(),
+            None,
+            thread.updated_at,
+        );
 
         let err = persist_generated_thread_turn(
             &store,
             pending,
             "Qwen3.5-4B",
             Err(ApiError::internal("inference failed")),
+            ChatThreadSystemPromptUpdate::Retain,
         )
         .await
         .expect_err("inference failure should propagate");
@@ -728,7 +866,12 @@ mod tests {
             .create_thread(None, Some("Qwen3.5-4B".to_string()))
             .await
             .expect("thread should create");
-        let pending = store.prepare_user_message(thread.id.clone(), "hello".to_string(), None);
+        let pending = store.prepare_user_message(
+            thread.id.clone(),
+            "hello".to_string(),
+            None,
+            thread.updated_at,
+        );
         let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
             .send(ChatStreamEvent::Started)
@@ -746,6 +889,9 @@ mod tests {
             thread.id.clone(),
             pending,
             event_rx,
+            None,
+            ChatThreadSystemPromptUpdate::Retain,
+            store.acquire_turn(&thread.id).await,
         )
         .collect::<Vec<_>>()
         .await
@@ -769,7 +915,12 @@ mod tests {
             .create_thread(None, Some("Qwen3.5-4B".to_string()))
             .await
             .expect("thread should create");
-        let pending = store.prepare_user_message(thread.id.clone(), "hello".to_string(), None);
+        let pending = store.prepare_user_message(
+            thread.id.clone(),
+            "hello".to_string(),
+            None,
+            thread.updated_at,
+        );
         let (event_tx, event_rx) = mpsc::channel(4);
         event_tx
             .send(ChatStreamEvent::Started)
@@ -783,6 +934,9 @@ mod tests {
                 thread.id.clone(),
                 pending,
                 event_rx,
+                None,
+                ChatThreadSystemPromptUpdate::Retain,
+                store.acquire_turn(&thread.id).await,
             );
             futures::pin_mut!(stream);
             let start = stream
@@ -793,6 +947,9 @@ mod tests {
             assert!(start.contains("\"event\":\"start\""));
         }
 
+        tokio::time::timeout(std::time::Duration::from_millis(100), event_tx.closed())
+            .await
+            .expect("dropped client should cancel the engine receiver");
         assert!(event_tx
             .send(ChatStreamEvent::Completed(test_generation()))
             .await
@@ -802,5 +959,51 @@ mod tests {
             .await
             .expect("messages should list")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborted_stream_holds_the_turn_lock_until_generation_unwinds() {
+        let (_temp, store) = setup_stream_store();
+        let thread = store
+            .create_thread(None, Some("Qwen3.5-4B".to_string()))
+            .await
+            .expect("thread should create");
+        let pending = store.prepare_user_message(
+            thread.id.clone(),
+            "hello".to_string(),
+            None,
+            thread.updated_at,
+        );
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (completion_tx, completion_rx) = oneshot::channel();
+
+        let stream = thread_message_stream(
+            store.clone(),
+            "Qwen3.5-4B".to_string(),
+            thread.id.clone(),
+            pending,
+            event_rx,
+            Some(completion_rx),
+            ChatThreadSystemPromptUpdate::Retain,
+            store.acquire_turn(&thread.id).await,
+        );
+        drop(stream);
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            store.acquire_turn(&thread.id),
+        )
+        .await
+        .is_err());
+
+        completion_tx
+            .send(())
+            .expect("generation completion should still be observed");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            store.acquire_turn(&thread.id),
+        )
+        .await
+        .expect("turn lock should release after generation completion");
     }
 }

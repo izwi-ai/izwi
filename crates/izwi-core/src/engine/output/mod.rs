@@ -201,6 +201,21 @@ impl OutputProcessor {
                 executor_output.error = None;
                 Some(FinishReason::StopToken)
             }
+            ExecutionDisposition::Finished(ExecutionFinishReason::MaxTokens) => {
+                executor_output.finished = true;
+                executor_output.error = None;
+                Some(FinishReason::MaxTokens)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::StopToken) => {
+                executor_output.finished = true;
+                executor_output.error = None;
+                Some(FinishReason::StopToken)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::StopSequence) => {
+                executor_output.finished = true;
+                executor_output.error = None;
+                Some(FinishReason::StopSequence)
+            }
             ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled) => {
                 executor_output.finished = true;
                 executor_output.error = Some("request cancelled".to_string());
@@ -488,6 +503,27 @@ mod tests {
         assert_eq!(output.finish_reason, Some(FinishReason::Aborted));
         assert_eq!(output.error.as_deref(), Some("request cancelled"));
         assert_eq!(output.num_tokens, 0);
+    }
+
+    #[test]
+    fn successful_chat_finish_reasons_remain_exact() {
+        for (execution, expected) in [
+            (ExecutionFinishReason::MaxTokens, FinishReason::MaxTokens),
+            (ExecutionFinishReason::StopToken, FinishReason::StopToken),
+            (
+                ExecutionFinishReason::StopSequence,
+                FinishReason::StopSequence,
+            ),
+        ] {
+            let mut processor = OutputProcessor::new(24_000);
+            let output = processor.process_execution(
+                ExecutorOutput::terminal("chat".to_string()),
+                &ExecutionDisposition::Finished(execution),
+                10,
+                Duration::from_millis(1),
+            );
+            assert_eq!(output.finish_reason, Some(expected));
+        }
     }
 
     #[test]

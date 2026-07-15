@@ -16,7 +16,8 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, parse_chat_model, parse_stop_sequences, spawn_chat_stream,
+    validate_chat_stop_support, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -24,7 +25,10 @@ use crate::app::chat_content::{
 use crate::error::ApiError;
 use crate::ids::new_uuid;
 use crate::state::AppState;
-use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole, ModelVariant};
+use izwi_core::{
+    ChatGenerationFinishReason, ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole,
+    ModelVariant,
+};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -521,6 +525,7 @@ fn parse_tool_call_block(block: &str) -> Option<OpenAiOutputToolCall> {
 
 fn build_assistant_response_parts(
     text: String,
+    generation_finish_reason: ChatGenerationFinishReason,
 ) -> (
     Option<String>,
     Option<Vec<OpenAiOutputToolCall>>,
@@ -528,7 +533,15 @@ fn build_assistant_response_parts(
 ) {
     let parsed = parse_assistant_tool_output(&text);
     if parsed.tool_calls.is_empty() {
-        (Some(text), None, "stop")
+        (
+            Some(text),
+            None,
+            match generation_finish_reason {
+                ChatGenerationFinishReason::MaxTokens => "length",
+                ChatGenerationFinishReason::StopToken
+                | ChatGenerationFinishReason::StopSequence => "stop",
+            },
+        )
     } else {
         let content = if parsed.content.is_empty() {
             None
@@ -575,10 +588,6 @@ fn validate_chat_request_compatibility(
         )));
     }
 
-    if profile.is_strict() && req.stop.is_some() {
-        return Err(ApiError::bad_request(strict_guardrail_message("stop")));
-    }
-
     if profile.is_strict() {
         if let Some(tool_choice) = &req.tool_choice {
             if !tool_choice.is_null()
@@ -595,48 +604,6 @@ fn validate_chat_request_compatibility(
     Ok(())
 }
 
-fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Result<Vec<String>, ApiError> {
-    const MAX_STOP_SEQUENCES: usize = 4;
-
-    let values: Vec<&str> = match stop {
-        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
-        Some(serde_json::Value::String(value)) => vec![value.as_str()],
-        Some(serde_json::Value::Array(values)) => {
-            if values.len() > MAX_STOP_SEQUENCES {
-                return Err(ApiError::bad_request(format!(
-                    "`stop` supports at most {MAX_STOP_SEQUENCES} sequences"
-                )));
-            }
-            values
-                .iter()
-                .map(|value| {
-                    value.as_str().ok_or_else(|| {
-                        ApiError::bad_request(
-                            "`stop` must be a string or an array containing only strings",
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        Some(_) => {
-            return Err(ApiError::bad_request(
-                "`stop` must be a string or an array containing only strings",
-            ))
-        }
-    };
-
-    let mut stop_sequences = Vec::with_capacity(values.len());
-    for value in values {
-        if value.is_empty() {
-            return Err(ApiError::bad_request("`stop` sequences cannot be empty"));
-        }
-        if !stop_sequences.iter().any(|existing| existing == value) {
-            stop_sequences.push(value.to_string());
-        }
-    }
-    Ok(stop_sequences)
-}
-
 pub async fn completions(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
@@ -647,6 +614,7 @@ pub async fn completions(
     let stop_sequences = parse_stop_sequences(req.stop.as_ref())?;
 
     let variant = parse_chat_model(&req.model)?;
+    validate_chat_stop_support(variant, &stop_sequences)?;
     let (messages, media_inputs) = to_core_messages_with_media(
         variant,
         req.messages.clone(),
@@ -690,7 +658,7 @@ pub async fn completions(
     let completion_tokens = generation.tokens_generated;
     let prompt_tokens = generation.prompt_tokens;
     let (assistant_content, assistant_tool_calls, finish_reason) =
-        build_assistant_response_parts(generation.text);
+        build_assistant_response_parts(generation.text, generation.finish_reason);
 
     let response = OpenAiChatCompletionResponse {
         id: completion_id,
@@ -783,7 +751,7 @@ async fn complete_stream(
                 ),
                 ChatStreamEvent::Completed(generation) => {
                     let (_, tool_calls, finish_reason) =
-                        build_assistant_response_parts(generation.text);
+                        build_assistant_response_parts(generation.text, generation.finish_reason);
                     let delta_tool_calls =
                         tool_calls.as_ref().map(|calls| stream_tool_call_deltas(calls));
                     (
@@ -799,11 +767,7 @@ async fn complete_stream(
                                     content: None,
                                     tool_calls: delta_tool_calls,
                                 },
-                                finish_reason: Some(if tool_calls.is_some() {
-                                    "tool_calls"
-                                } else {
-                                    finish_reason
-                                }),
+                                finish_reason: Some(finish_reason),
                             }],
                             usage: include_usage.then_some(OpenAiUsage {
                                 prompt_tokens: generation.prompt_tokens,
@@ -1000,11 +964,25 @@ mod tests {
     fn builds_tool_call_finish_reason_when_tool_output_detected() {
         let (content, tool_calls, finish_reason) = build_assistant_response_parts(
             "<tool_call>\n<function=ping>\n</function>\n</tool_call>".to_string(),
+            ChatGenerationFinishReason::MaxTokens,
         );
 
         assert!(content.is_none());
         assert_eq!(finish_reason, "tool_calls");
         assert_eq!(tool_calls.map(|calls| calls.len()), Some(1));
+    }
+
+    #[test]
+    fn maps_generation_finish_reasons_to_openai_values() {
+        for (reason, expected) in [
+            (ChatGenerationFinishReason::MaxTokens, "length"),
+            (ChatGenerationFinishReason::StopToken, "stop"),
+            (ChatGenerationFinishReason::StopSequence, "stop"),
+        ] {
+            let (_, tools, actual) = build_assistant_response_parts("answer".to_string(), reason);
+            assert!(tools.is_none());
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -1075,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_rejects_stop_sequences() {
+    fn strict_profile_accepts_supported_stop_syntax() {
         let req = ChatCompletionRequest {
             model: "Qwen3-8B-GGUF".to_string(),
             messages: vec![OpenAiInboundMessage {
@@ -1099,9 +1077,8 @@ mod tests {
             enable_thinking: None,
         };
 
-        let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
-            .expect_err("should reject");
-        assert!(err.message.contains("stop"));
+        validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
+            .expect("strict compatibility should accept standard stop sequences");
     }
 
     #[test]
