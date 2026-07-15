@@ -1157,7 +1157,7 @@ impl EngineCoreRequest {
 
         let is_qwen35 = model_variant.family() == ModelFamily::Qwen35Chat;
         match prepared_qwen35_prompt.as_ref() {
-            Some(prepared) if !is_qwen35 => {
+            Some(_) if !is_qwen35 => {
                 return Err(Error::InvalidInput(format!(
                     "Chat request {} routed a Qwen3.5 prompt artifact to {model_variant}",
                     self.id

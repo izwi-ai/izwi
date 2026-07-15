@@ -79,10 +79,22 @@ run_server_scheduler_regressions() {
     done
 }
 
+cuda_device_available() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
+compile_cuda_test_harnesses() {
+    local cuda_features="$1"
+
+    echo "Compiling CUDA-linked test harnesses without executing them"
+    cargo test --locked -p izwi-core --features "${cuda_features}" --lib --no-run
+    cargo test --locked -p izwi-server --features "${cuda_features}" --lib --no-run
+}
+
 smoke_cuda_device_if_available() {
     local cuda_features="$1"
 
-    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    if ! cuda_device_available; then
         echo "No usable NVIDIA device exposed; portable CUDA regressions completed."
         return
     fi
@@ -294,8 +306,18 @@ run_cargo_cuda() {
 
     cargo check --locked -p izwi-cli --features "${cuda_features}"
     cargo check --locked -p izwi-server --features "${cuda_features}"
-    run_core_scheduler_regressions "${cuda_features}"
-    run_server_scheduler_regressions "${cuda_features}"
+    if cuda_device_available; then
+        run_core_scheduler_regressions "${cuda_features}"
+        run_server_scheduler_regressions "${cuda_features}"
+    else
+        # CUDA devel images provide linker stubs but GitHub's ordinary hosted
+        # runners do not mount the NVIDIA driver library (`libcuda.so.1`). Build
+        # the CUDA test harnesses to retain compile/link coverage, then execute
+        # the backend-neutral scheduler regressions without CUDA linkage.
+        compile_cuda_test_harnesses "${cuda_features}"
+        run_core_scheduler_regressions
+        run_server_scheduler_regressions
+    fi
     smoke_cuda_device_if_available "${cuda_features}"
 }
 
