@@ -95,3 +95,6 @@ accelerate = [
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[build-dependencies]
+cudaforge = "0.1.5"

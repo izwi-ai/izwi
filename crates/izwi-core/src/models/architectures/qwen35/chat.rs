@@ -25,6 +25,17 @@ use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
+const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
+const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
+
+fn qwen35_prefill_chunk_size() -> usize {
+    std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
+        .min(MAX_PREFILL_CHUNK_SIZE)
+}
 
 /// Fully prepared Qwen3.5 prefill input. The runtime carries this exact
 /// artifact into the executor so media loading and vision encoding happen once.
@@ -503,7 +514,7 @@ impl Qwen35ChatModel {
 
         let mut text_state = self.text_model.new_state();
         let logits =
-            compact_tensor_storage(&self.prefill_prompt(&prepared_prompt, &mut text_state)?)?;
+            compact_tensor_storage(&self.prefill_prompt(prepared_prompt, &mut text_state)?)?;
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
         let history_ids =
@@ -674,14 +685,20 @@ impl Qwen35ChatModel {
                     run_end += 1;
                 }
 
-                let compute_logits = run_end == prepared_prompt.prompt_ids.len();
-                if let Some(run_logits) = self.text_model.prefill_token_ids(
-                    &prepared_prompt.prompt_ids[idx..run_end],
-                    &prepared_prompt.prompt_positions[idx..run_end],
-                    text_state,
-                    compute_logits,
-                )? {
-                    logits = Some(run_logits);
+                let chunk_size = qwen35_prefill_chunk_size();
+                let mut chunk_start = idx;
+                while chunk_start < run_end {
+                    let chunk_end = (chunk_start + chunk_size).min(run_end);
+                    let compute_logits = chunk_end == prepared_prompt.prompt_ids.len();
+                    if let Some(run_logits) = self.text_model.prefill_token_ids(
+                        &prepared_prompt.prompt_ids[chunk_start..chunk_end],
+                        &prepared_prompt.prompt_positions[chunk_start..chunk_end],
+                        text_state,
+                        compute_logits,
+                    )? {
+                        logits = Some(run_logits);
+                    }
+                    chunk_start = chunk_end;
                 }
                 idx = run_end;
                 continue;
@@ -1798,6 +1815,25 @@ mod tests {
 
         assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
         assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prefill_chunk_size_is_bounded_and_rejects_zero() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+
+        std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
+        assert_eq!(qwen35_prefill_chunk_size(), DEFAULT_PREFILL_CHUNK_SIZE);
+
+        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "0");
+        assert_eq!(qwen35_prefill_chunk_size(), DEFAULT_PREFILL_CHUNK_SIZE);
+
+        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "64");
+        assert_eq!(qwen35_prefill_chunk_size(), 64);
+
+        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "999999");
+        assert_eq!(qwen35_prefill_chunk_size(), MAX_PREFILL_CHUNK_SIZE);
+
+        std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
     }
 
     #[test]
