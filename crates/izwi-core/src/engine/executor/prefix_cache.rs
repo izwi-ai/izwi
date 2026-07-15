@@ -142,31 +142,45 @@ where
         }
 
         let requested_owner = Arc::downgrade(owner);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        remove_stale_entries(&mut state);
+        let (cached, stale) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let stale = detach_stale_entries(&mut state);
 
-        let best = state
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                entry.scope == *scope
-                    && Weak::ptr_eq(&entry.owner, &requested_owner)
-                    && exact_prefix_matches(entry.cached.snapshot(), prompt_ids, prompt_positions)
-            })
-            .max_by_key(|(_, entry)| entry.cached.snapshot().token_ids().len())
-            .map(|(index, _)| index)?;
+            let best = state
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.scope == *scope
+                        && Weak::ptr_eq(&entry.owner, &requested_owner)
+                        && exact_prefix_matches(
+                            entry.cached.snapshot(),
+                            prompt_ids,
+                            prompt_positions,
+                        )
+                })
+                .max_by_key(|(_, entry)| entry.cached.snapshot().token_ids().len())
+                .map(|(index, _)| index);
 
-        let entry = state
-            .entries
-            .remove(best)
-            .expect("selected exact-prefix entry must still exist");
-        let cached = Arc::clone(&entry.cached);
-        state.entries.push_back(entry);
-        Some(cached)
+            let cached = best.map(|best| {
+                let entry = state
+                    .entries
+                    .remove(best)
+                    .expect("selected exact-prefix entry must still exist");
+                let cached = Arc::clone(&entry.cached);
+                state.entries.push_back(entry);
+                cached
+            });
+            (cached, stale)
+        };
+        // Resource leases and Candle/Metal storage must be released outside
+        // the cache mutex to avoid lock inversion and long device frees while
+        // other requests access the LRU.
+        drop(stale);
+        cached
     }
 
     /// Insert one immutable snapshot. Oversized or unaccountable snapshots are
@@ -185,49 +199,81 @@ where
         }
 
         let owner = Arc::downgrade(owner);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        remove_stale_entries(&mut state);
+        let (inserted, detached) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let mut detached = detach_stale_entries(&mut state);
+            let mut remove = vec![false; state.entries.len()];
+            let replacement = cached.snapshot();
 
-        if let Some(index) = state.entries.iter().position(|entry| {
-            entry.scope == scope
-                && Weak::ptr_eq(&entry.owner, &owner)
-                && entry.cached.snapshot().token_ids() == cached.snapshot().token_ids()
-                && entry.cached.snapshot().positions() == cached.snapshot().positions()
-        }) {
-            if Arc::strong_count(&state.entries[index].cached) > 1 {
-                return false;
+            // Plan replacement and ancestor compaction before mutating the
+            // LRU. A failed fit must leave every useful entry intact.
+            for (index, entry) in state.entries.iter().enumerate() {
+                if entry.scope != scope || !Weak::ptr_eq(&entry.owner, &owner) {
+                    continue;
+                }
+                let candidate = entry.cached.snapshot();
+                let exact = candidate.token_ids() == replacement.token_ids()
+                    && candidate.positions() == replacement.positions();
+                if exact && Arc::strong_count(&entry.cached) > 1 {
+                    drop(state);
+                    drop(detached);
+                    return false;
+                }
+                let ancestor = candidate.token_ids().len() < replacement.token_ids().len()
+                    && replacement.token_ids().starts_with(candidate.token_ids())
+                    && replacement.positions().starts_with(candidate.positions());
+                if exact || (ancestor && Arc::strong_count(&entry.cached) == 1) {
+                    remove[index] = true;
+                }
             }
-            if let Some(replaced) = state.entries.remove(index) {
-                state.retained_bytes = state.retained_bytes.saturating_sub(replaced.retained_bytes);
+
+            let mut projected = state.retained_bytes;
+            for (index, entry) in state.entries.iter().enumerate() {
+                if remove[index] {
+                    projected = projected.saturating_sub(entry.retained_bytes);
+                }
             }
-        }
 
-        while state.retained_bytes.saturating_add(retained_bytes) > self.max_retained_bytes {
-            let Some(index) = state
-                .entries
-                .iter()
-                .position(|entry| Arc::strong_count(&entry.cached) == 1)
-            else {
-                return false;
-            };
-            let evicted = state
-                .entries
-                .remove(index)
-                .expect("selected evictable prefix entry must exist");
-            state.retained_bytes = state.retained_bytes.saturating_sub(evicted.retained_bytes);
-        }
+            while projected.saturating_add(retained_bytes) > self.max_retained_bytes {
+                let Some((index, entry)) =
+                    state.entries.iter().enumerate().find(|(index, entry)| {
+                        !remove[*index] && Arc::strong_count(&entry.cached) == 1
+                    })
+                else {
+                    drop(state);
+                    drop(detached);
+                    return false;
+                };
+                remove[index] = true;
+                projected = projected.saturating_sub(entry.retained_bytes);
+            }
 
-        state.retained_bytes = state.retained_bytes.saturating_add(retained_bytes);
-        state.entries.push_back(ExactPrefixEntry {
-            scope,
-            owner,
-            cached,
-            retained_bytes,
-        });
-        true
+            for index in (0..remove.len()).rev() {
+                if !remove[index] {
+                    continue;
+                }
+                let entry = state
+                    .entries
+                    .remove(index)
+                    .expect("planned exact-prefix removal must still exist");
+                state.retained_bytes = state.retained_bytes.saturating_sub(entry.retained_bytes);
+                detached.push(entry);
+            }
+
+            state.retained_bytes = state.retained_bytes.saturating_add(retained_bytes);
+            state.entries.push_back(ExactPrefixEntry {
+                scope,
+                owner,
+                cached,
+                retained_bytes,
+            });
+            (true, detached)
+        };
+        drop(detached);
+        inserted
     }
 
     pub(super) fn retained_bytes(&self) -> u64 {
@@ -237,13 +283,34 @@ where
             .retained_bytes
     }
 
+    /// Purge all checkpoints owned by one model variant.
+    ///
+    /// Model unload calls this after active requests have been aborted and
+    /// before the model residency lease is released. Any external lookup
+    /// handle remains valid and keeps its own resource lease until it drops.
+    pub(super) fn purge_variant(&self, variant: ModelVariant) -> usize {
+        let detached = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            detach_matching_entries(&mut state, |entry| entry.scope.variant == variant)
+        };
+        let removed = detached.len();
+        drop(detached);
+        removed
+    }
+
     pub(super) fn clear(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.entries.clear();
-        state.retained_bytes = 0;
+        let detached = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.retained_bytes = 0;
+            std::mem::take(&mut state.entries)
+        };
+        drop(detached);
     }
 }
 
@@ -260,18 +327,33 @@ fn exact_prefix_matches<S: ExactPrefixSnapshot + ?Sized>(
         && prompt_positions.starts_with(cached_positions)
 }
 
-fn remove_stale_entries<O, S>(state: &mut ExactPrefixCacheState<O, S>) {
-    let mut retained_bytes = state.retained_bytes;
-    state.entries.retain(|entry| {
-        // A lookup handle owns the snapshot and its lease independently of the
-        // LRU entry, so a dead model owner can always be pruned immediately.
-        let retain = entry.owner.strong_count() > 0;
-        if !retain {
-            retained_bytes = retained_bytes.saturating_sub(entry.retained_bytes);
+fn detach_stale_entries<O, S>(
+    state: &mut ExactPrefixCacheState<O, S>,
+) -> Vec<ExactPrefixEntry<O, S>> {
+    // A lookup handle owns the snapshot and its lease independently of the LRU
+    // entry, so a dead model owner can always be detached immediately.
+    detach_matching_entries(state, |entry| entry.owner.strong_count() == 0)
+}
+
+fn detach_matching_entries<O, S>(
+    state: &mut ExactPrefixCacheState<O, S>,
+    mut should_detach: impl FnMut(&ExactPrefixEntry<O, S>) -> bool,
+) -> Vec<ExactPrefixEntry<O, S>> {
+    let mut detached = Vec::new();
+    let mut index = 0usize;
+    while index < state.entries.len() {
+        if should_detach(&state.entries[index]) {
+            let entry = state
+                .entries
+                .remove(index)
+                .expect("selected exact-prefix entry must still exist");
+            state.retained_bytes = state.retained_bytes.saturating_sub(entry.retained_bytes);
+            detached.push(entry);
+        } else {
+            index += 1;
         }
-        retain
-    });
-    state.retained_bytes = retained_bytes;
+    }
+    detached
 }
 
 #[cfg(test)]
@@ -315,13 +397,17 @@ mod tests {
         }
     }
 
-    fn scope() -> ExactPrefixScope {
+    fn scope_for(variant: ModelVariant) -> ExactPrefixScope {
         ExactPrefixScope {
-            variant: ModelVariant::Qwen354BGguf,
+            variant,
             backend: BackendKind::Cpu,
             activation_dtype: "float32".to_string(),
             kv_cache_dtype: "float16".to_string(),
         }
+    }
+
+    fn scope() -> ExactPrefixScope {
+        scope_for(ModelVariant::Qwen354BGguf)
     }
 
     fn snapshot(
@@ -404,6 +490,59 @@ mod tests {
             .lookup(&owner, &scope(), &[3, 9], &positions(2))
             .is_some());
         assert_eq!(cache.retained_bytes(), 10);
+    }
+
+    #[test]
+    fn monotonic_lineage_supersedes_unpinned_ancestors_but_preserves_branches() {
+        let cache = ExactPrefixCache::<(), TestSnapshot>::new(128);
+        let owner = Arc::new(());
+        assert!(cache.insert(&owner, scope(), snapshot(&[1], 4, "root")));
+        assert!(cache.insert(&owner, scope(), snapshot(&[1, 2], 5, "middle")));
+        assert!(cache.insert(&owner, scope(), snapshot(&[9, 8], 6, "branch")));
+        assert!(cache.insert(&owner, scope(), snapshot(&[1, 2, 3], 7, "tip")));
+
+        assert!(cache
+            .lookup(&owner, &scope(), &[1, 2, 9], &positions(3))
+            .is_none());
+        assert_eq!(
+            cache
+                .lookup(&owner, &scope(), &[1, 2, 3, 4], &positions(4))
+                .unwrap()
+                .snapshot()
+                .label,
+            "tip"
+        );
+        assert_eq!(
+            cache
+                .lookup(&owner, &scope(), &[9, 8, 7], &positions(3))
+                .unwrap()
+                .snapshot()
+                .label,
+            "branch"
+        );
+        assert_eq!(cache.retained_bytes(), 13);
+    }
+
+    #[test]
+    fn failed_insert_does_not_destroy_existing_ancestors() {
+        let cache = ExactPrefixCache::<(), TestSnapshot>::new(8);
+        let owner = Arc::new(());
+        assert!(cache.insert(&owner, scope(), snapshot(&[1], 8, "root")));
+        let pinned = cache
+            .lookup(&owner, &scope(), &[1, 2], &positions(2))
+            .unwrap();
+
+        assert!(!cache.insert(&owner, scope(), snapshot(&[1, 2], 8, "tip")));
+        assert_eq!(cache.retained_bytes(), 8);
+        assert_eq!(
+            cache
+                .lookup(&owner, &scope(), &[1, 3], &positions(2))
+                .unwrap()
+                .snapshot()
+                .label,
+            "root"
+        );
+        drop(pinned);
     }
 
     #[test]
@@ -494,5 +633,68 @@ mod tests {
         assert_eq!(authority.snapshot().reservations, 1);
         drop(pending);
         assert_eq!(authority.snapshot().reservations, 0);
+    }
+
+    #[test]
+    fn variant_purge_releases_only_matching_unpinned_leases() {
+        let capacity = super::super::cache_resource_vector(BackendKind::Cpu, 64);
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity,
+                available: capacity,
+                source: crate::engine::resources::CapacitySource::Test,
+            },
+        })));
+        let cache = ExactPrefixCache::<(), TestSnapshot>::new(64);
+        let owner = Arc::new(());
+
+        for (variant, id, label) in [
+            (ModelVariant::Qwen354BGguf, 1, "four"),
+            (ModelVariant::Qwen352BGguf, 2, "two"),
+        ] {
+            let resources = super::super::cache_resource_vector(BackendKind::Cpu, 4);
+            let lease = authority
+                .reserve_with_initial_materialized(
+                    ReservationOwner::new(ReservationClass::Cache, label),
+                    resources,
+                    resources,
+                )
+                .unwrap();
+            assert!(cache.insert(
+                &owner,
+                scope_for(variant),
+                ExactPrefixHandle::new(
+                    BackendKind::Cpu,
+                    TestSnapshot {
+                        ids: vec![id],
+                        positions: vec![[0; 3]],
+                        bytes: 4,
+                        label,
+                    },
+                    Some(lease),
+                ),
+            ));
+        }
+        assert_eq!(authority.snapshot().reservations, 2);
+
+        assert_eq!(cache.purge_variant(ModelVariant::Qwen354BGguf), 1);
+        assert_eq!(cache.retained_bytes(), 4);
+        assert_eq!(authority.snapshot().reservations, 1);
+        assert!(cache
+            .lookup(
+                &owner,
+                &scope_for(ModelVariant::Qwen354BGguf),
+                &[1, 3],
+                &positions(2),
+            )
+            .is_none());
+        assert!(cache
+            .lookup(
+                &owner,
+                &scope_for(ModelVariant::Qwen352BGguf),
+                &[2, 3],
+                &positions(2),
+            )
+            .is_some());
     }
 }

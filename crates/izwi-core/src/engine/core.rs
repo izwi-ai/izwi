@@ -19,7 +19,9 @@ use super::execution::{
 };
 #[cfg(test)]
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
-use super::executor::{ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig};
+use super::executor::{
+    CacheReleaseReport, ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig,
+};
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::metrics::record_engine_batch_dispatch;
@@ -1553,6 +1555,11 @@ impl EngineCore {
             }
         }
         aborted
+    }
+
+    /// Purge reusable executor cache state owned by one model variant.
+    pub async fn purge_model_cache(&mut self, variant: ModelVariant) -> CacheReleaseReport {
+        self.executor.purge_model_cache(variant).await
     }
 
     /// Abort every request tracked by the core and release executor state.

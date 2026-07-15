@@ -85,8 +85,19 @@ impl ModelLifecycleController {
         }
     }
 
+    async fn purge_executor_model_cache(&self, variant: ModelVariant) -> Result<()> {
+        let release = self.core_engine.purge_model_cache(variant).await;
+        if variant.family() == ModelFamily::Qwen35Chat && !release.confirmed {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 cache purge was not confirmed before unloading {variant}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) async fn rollback_model_locked(&self, variant: ModelVariant) -> Result<()> {
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
+        self.purge_executor_model_cache(variant).await?;
         self.model_manager.unload_model(variant).await?;
         self.remove_registry_and_auxiliary_state(variant).await;
         self.remove_resident_slot(variant);
@@ -121,6 +132,10 @@ impl ModelLifecycleController {
     pub(super) async fn unload_model_locked(&self, variant: ModelVariant) -> Result<()> {
         self.begin_unloading_slot(variant)?;
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
+        if let Err(error) = self.purge_executor_model_cache(variant).await {
+            self.restore_ready_slot_after_failed_unload(variant);
+            return Err(error);
+        }
 
         // Clear externally visible Ready state before removing the physical
         // handle. The authoritative slot remains Unloading and retains its
