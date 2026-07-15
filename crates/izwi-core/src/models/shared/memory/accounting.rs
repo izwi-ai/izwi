@@ -4,6 +4,57 @@ use std::collections::HashSet;
 
 use candle_core::{CpuStorage, Storage, Tensor};
 
+/// Copy a tensor into storage whose backing allocation matches its logical size.
+///
+/// Candle's Metal scratch allocator may satisfy a small operation from a larger
+/// pooled buffer. Persistent recurrent/KV state must not retain that transient
+/// backing allocation because physical cache accounting would become inaccurate.
+pub(crate) fn compact_tensor_storage(tensor: &Tensor) -> candle_core::Result<Tensor> {
+    let tensor = tensor.contiguous()?;
+
+    #[cfg(feature = "metal")]
+    if let candle_core::Device::Metal(device) = tensor.device() {
+        use candle_core::{op::BackpropOp, MetalStorage};
+
+        let element_count = tensor.elem_count();
+        if element_count == 0 {
+            return Ok(tensor);
+        }
+        let dtype = tensor.dtype();
+        let byte_count = element_count
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("persistent Metal tensor byte size overflow".to_string())
+            })?;
+        let target = device.new_private_buffer(element_count, dtype, "persistent-state")?;
+        let (storage, layout) = tensor.storage_and_layout();
+        let Storage::Metal(source) = &*storage else {
+            return Err(candle_core::Error::Msg(
+                "Metal tensor exposed non-Metal storage".to_string(),
+            ));
+        };
+        let source_offset = layout
+            .start_offset()
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("persistent Metal tensor offset overflow".to_string())
+            })?;
+        {
+            let mut blit = device.blit_command_encoder()?;
+            blit.copy_from_buffer(source.buffer(), source_offset, &target, 0, byte_count);
+        }
+        let storage = MetalStorage::new(target, device.clone(), element_count, dtype);
+        return Ok(Tensor::from_storage(
+            Storage::Metal(storage),
+            tensor.shape().clone(),
+            BackpropOp::none(),
+            false,
+        ));
+    }
+
+    Ok(tensor)
+}
+
 /// Accumulates the backing allocations retained by a set of Candle tensors.
 ///
 /// Tensor views share a Candle storage allocation. Accounting logical tensor
@@ -110,6 +161,8 @@ fn metal_storage_bytes(_storage: &candle_core::MetalStorage) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "metal")]
+    use super::compact_tensor_storage;
     use super::TensorStorageAccounting;
     use candle_core::{Device, IndexOp, Tensor};
 
@@ -150,5 +203,20 @@ mod tests {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_bytes(u64::MAX).unwrap();
         assert!(accounting.add_bytes(1).is_none());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn persistent_metal_copy_has_exact_backing_size() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let pooled = Tensor::zeros((3,), candle_core::DType::F32, &device).unwrap();
+        let compact = compact_tensor_storage(&pooled).unwrap();
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&compact).unwrap();
+
+        assert_eq!(accounting.bytes(), 3 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(compact.to_vec1::<f32>().unwrap(), vec![0.0; 3]);
     }
 }

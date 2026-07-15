@@ -6,10 +6,10 @@ use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::error::{Error, Result};
-use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
-    try_fused_silu_mul, try_tiled_deltanet_recurrence, use_block_fusion_for_device,
+    try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
+    use_block_fusion_for_device,
 };
 use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::{
@@ -19,7 +19,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::accounting::{compact_tensor_storage, TensorStorageAccounting};
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_prefill_sequence_span, record_rope_kernel,
     record_rope_manual, DecodeAttentionPath,
@@ -113,7 +113,7 @@ impl ConvRingState {
         }
 
         let slot_refs: Vec<&Tensor> = self.slots.iter().collect();
-        let packed = Tensor::cat(&slot_refs, 1)?;
+        let packed = compact_tensor_storage(&Tensor::cat(&slot_refs, 1)?)?;
         let mut slots = Vec::with_capacity(self.slots.len());
         for idx in 0..self.slots.len() {
             slots.push(packed.narrow(1, idx, 1)?);
@@ -236,9 +236,6 @@ impl Qwen35TextModel {
                 cfg.ssm_inner_size, cfg.ssm_time_step_rank
             )));
         }
-
-        // Phase 5: initialize the shared scratch buffer pool once per process.
-        let _ = maybe_init_global_buffer_pool(device);
 
         let embedding_weights = loader
             .load_qtensor("token_embd.weight", device)?
@@ -896,7 +893,6 @@ impl Qwen35FullAttention {
         }
 
         let state_has_cached_prefix = full_attention_state_has_cached_prefix(state)?;
-
         let (k_pages, v_pages, dense_k_cache_h, dense_v_cache_h, dense_kv_tokens) = match state {
             Qwen35LayerRuntimeState::Full {
                 k_pages,
@@ -1485,7 +1481,7 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, self.num_v_heads))?;
         let (output, next_state) =
             recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?;
-        *recurrent_state = Some(next_state);
+        *recurrent_state = Some(compact_tensor_storage(&next_state)?);
 
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
@@ -1545,18 +1541,13 @@ impl Qwen35LinearAttention {
             self.head_v_dim,
         ))?;
 
-        let mut query = l2norm(&query, 1e-6)?;
-        let mut key = l2norm(&key, 1e-6)?;
-        if self.num_v_heads != self.num_k_heads {
-            if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
-                return Err(Error::InferenceError(format!(
-                    "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
-                    self.num_v_heads, self.num_k_heads
-                )));
-            }
-            let repeats = self.num_v_heads / self.num_k_heads;
-            query = repeat_head_states_seq(&query, repeats)?;
-            key = repeat_head_states_seq(&key, repeats)?;
+        let query = l2norm(&query, 1e-6)?;
+        let key = l2norm(&key, 1e-6)?;
+        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
+            return Err(Error::InferenceError(format!(
+                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
+                self.num_v_heads, self.num_k_heads
+            )));
         }
 
         let current_state = if let Some(state) = recurrent_state.take() {
@@ -1573,8 +1564,8 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
         let tile_size =
             qwen35_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
-        let (output, next_state) = if self.tiled_recurrence_enabled {
-            if let Some((tiled_output, tiled_state)) = try_tiled_deltanet_recurrence(
+        let fused_sequence = if self.tiled_recurrence_enabled {
+            try_tiled_deltanet_recurrence(
                 &query,
                 &key,
                 &value,
@@ -1582,15 +1573,44 @@ impl Qwen35LinearAttention {
                 &beta,
                 &current_state,
                 tile_size,
-            ) {
-                (tiled_output, tiled_state)
+            )
+        } else {
+            None
+        };
+        let (output, next_state) = if let Some(fused_sequence) = fused_sequence {
+            fused_sequence
+        } else {
+            // CUDA's equal-head kernel and the portable Candle reference consume
+            // tiled Q/K heads. The Metal sequence op above consumes the compact
+            // converted-GGUF 16K layout directly for both 16V and 32V models.
+            let (query, key) = if self.num_v_heads == self.num_k_heads {
+                (query, key)
+            } else {
+                let repeats = self.num_v_heads / self.num_k_heads;
+                (
+                    repeat_head_states_seq(&query, repeats)?,
+                    repeat_head_states_seq(&key, repeats)?,
+                )
+            };
+            if self.tiled_recurrence_enabled {
+                if let Some(fused_sequence) = try_tiled_deltanet_recurrence(
+                    &query,
+                    &key,
+                    &value,
+                    &g,
+                    &beta,
+                    &current_state,
+                    tile_size,
+                ) {
+                    fused_sequence
+                } else {
+                    recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
+                }
             } else {
                 recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
             }
-        } else {
-            recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
         };
-        *recurrent_state = Some(next_state);
+        *recurrent_state = Some(compact_tensor_storage(&next_state)?);
 
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
@@ -1607,6 +1627,34 @@ impl Qwen35LinearAttention {
         let seq_len = mixed_qkv.dim(1)?;
         if seq_len == 1 {
             return self.depthwise_conv_step(mixed_qkv, conv_state);
+        }
+
+        if self.kernel_size > 1 {
+            let history_len = self.kernel_size - 1;
+            let buffer = conv_state.as_mut().ok_or_else(|| {
+                Error::InferenceError("conv_state not initialized but kernel_size > 1".to_string())
+            })?;
+            if buffer.slots.len() != history_len || buffer.next_idx >= history_len {
+                return Err(Error::InferenceError(format!(
+                    "Invalid Qwen3.5 convolution history: slots={}, next_idx={}, expected_slots={history_len}",
+                    buffer.slots.len(),
+                    buffer.next_idx
+                )));
+            }
+            let logical_slots: Vec<&Tensor> = (0..history_len)
+                .map(|idx| &buffer.slots[(buffer.next_idx + idx) % history_len])
+                .collect();
+            let history = Tensor::cat(&logical_slots, 1)?;
+            if let Some((output, final_history)) =
+                try_qwen35_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
+            {
+                let final_history = compact_tensor_storage(&final_history)?;
+                buffer.slots = (0..history_len)
+                    .map(|idx| final_history.narrow(1, idx, 1))
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                buffer.next_idx = 0;
+                return Ok(output);
+            }
         }
 
         let mut outputs = Vec::with_capacity(seq_len);
@@ -1897,7 +1945,7 @@ fn build_rope_inv_freqs(rope_dim: usize, rope_theta: f64) -> Result<Vec<f32>> {
 /// Candle tensor views can outlive a scratch-pool checkout, so state that
 /// survives a forward call must never escape after its pool lease is released.
 fn owned_zero_tensor(shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
-    Tensor::zeros(shape.to_vec(), dtype, device).map_err(Error::from)
+    compact_tensor_storage(&Tensor::zeros(shape.to_vec(), dtype, device)?).map_err(Error::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2106,15 +2154,14 @@ fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Resul
         return Ok(());
     }
     let append = append.contiguous()?;
-    match cache {
+    let next = match cache {
         Some(existing) => {
             let existing_ref: &Tensor = &*existing;
-            *cache = Some(Tensor::cat(&[existing_ref, &append], 2)?);
+            Tensor::cat(&[existing_ref, &append], 2)?
         }
-        None => {
-            *cache = Some(append);
-        }
-    }
+        None => append.clone(),
+    };
+    *cache = Some(compact_tensor_storage(&next)?);
     Ok(())
 }
 
@@ -2283,6 +2330,71 @@ mod tests {
     };
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    fn tensor_storage_address(tensor: &Tensor) -> usize {
+        let (storage, _) = tensor.storage_and_layout();
+        std::ptr::from_ref(&*storage) as usize
+    }
+
+    #[test]
+    fn owned_recurrent_states_do_not_alias_across_concurrent_sessions() {
+        const SESSION_COUNT: usize = 8;
+        let barrier = Arc::new(Barrier::new(SESSION_COUNT));
+        let handles = (0..SESSION_COUNT)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &Device::Cpu)
+                        .expect("persistent recurrent state should allocate")
+                })
+            })
+            .collect::<Vec<_>>();
+        let states = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("allocation thread should finish"))
+            .collect::<Vec<_>>();
+
+        let storage_addresses = states
+            .iter()
+            .map(tensor_storage_address)
+            .collect::<HashSet<_>>();
+        assert_eq!(storage_addresses.len(), SESSION_COUNT);
+        assert!(states.iter().all(|state| state.dims() == [1, 2, 4, 4]));
+        assert!(states.iter().all(|state| {
+            state
+                .flatten_all()
+                .and_then(|state| state.to_vec1::<f32>())
+                .is_ok_and(|values| values.iter().all(|value| *value == 0.0))
+        }));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn owned_recurrent_states_do_not_alias_on_metal() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let first = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)
+            .expect("first Metal recurrent state should allocate");
+        let second = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)
+            .expect("second Metal recurrent state should allocate");
+
+        assert_ne!(
+            tensor_storage_address(&first),
+            tensor_storage_address(&second)
+        );
+        assert_eq!(
+            first.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.0; 32]
+        );
+        assert_eq!(
+            second.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0.0; 32]
+        );
+    }
 
     #[test]
     fn repeat_head_states_uses_tiled_order() {
@@ -2407,6 +2519,20 @@ mod tests {
 
         let prefill =
             unfused_causal_attention(&query, &key, &value, 2, 1, 2).expect("causal prefill");
+        let rectangular =
+            unfused_causal_attention(&query.narrow(2, 2, 2).unwrap(), &key, &value, 2, 1, 2)
+                .expect("rectangular prefix attention");
+        let expected_rectangular = prefill.narrow(2, 2, 2).unwrap();
+        let rectangular_values = rectangular.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected_values = expected_rectangular
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (actual, expected) in rectangular_values.iter().zip(expected_values.iter()) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+
         let mut steps = Vec::new();
         for token_idx in 0..4 {
             let q = query.narrow(2, token_idx, 1).unwrap();
