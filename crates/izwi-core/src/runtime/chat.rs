@@ -24,6 +24,7 @@ impl RuntimeService {
             top_k: params.top_k,
             repetition_penalty: params.repetition_penalty.max(1.0),
             presence_penalty: params.presence_penalty.clamp(-2.0, 2.0),
+            stop_sequences: params.stop_sequences.clone(),
             stop_token_ids: params.stop_token_ids.clone(),
             seed: 0,
             request: chat_config.clone(),

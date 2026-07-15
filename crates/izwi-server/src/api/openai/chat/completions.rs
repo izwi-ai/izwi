@@ -595,6 +595,48 @@ fn validate_chat_request_compatibility(
     Ok(())
 }
 
+fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Result<Vec<String>, ApiError> {
+    const MAX_STOP_SEQUENCES: usize = 4;
+
+    let values: Vec<&str> = match stop {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::String(value)) => vec![value.as_str()],
+        Some(serde_json::Value::Array(values)) => {
+            if values.len() > MAX_STOP_SEQUENCES {
+                return Err(ApiError::bad_request(format!(
+                    "`stop` supports at most {MAX_STOP_SEQUENCES} sequences"
+                )));
+            }
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().ok_or_else(|| {
+                        ApiError::bad_request(
+                            "`stop` must be a string or an array containing only strings",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "`stop` must be a string or an array containing only strings",
+            ))
+        }
+    };
+
+    let mut stop_sequences = Vec::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() {
+            return Err(ApiError::bad_request("`stop` sequences cannot be empty"));
+        }
+        if !stop_sequences.iter().any(|existing| existing == value) {
+            stop_sequences.push(value.to_string());
+        }
+    }
+    Ok(stop_sequences)
+}
+
 pub async fn completions(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
@@ -602,6 +644,7 @@ pub async fn completions(
 ) -> Result<Response, ApiError> {
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
+    let stop_sequences = parse_stop_sequences(req.stop.as_ref())?;
 
     let variant = parse_chat_model(&req.model)?;
     let (messages, media_inputs) = to_core_messages_with_media(
@@ -625,6 +668,7 @@ pub async fn completions(
         temperature: req.temperature,
         top_p: req.top_p,
         presence_penalty: req.presence_penalty,
+        stop_sequences,
         chat_config: ChatRequestConfig {
             enable_thinking: req.enable_thinking,
             tools: req.tools.clone().unwrap_or_default(),
@@ -634,7 +678,8 @@ pub async fn completions(
     };
 
     if req.stream.unwrap_or(false) {
-        let stream_response = complete_stream(state, req, execution_request, compat_profile).await?;
+        let stream_response =
+            complete_stream(state, req, execution_request, compat_profile).await?;
         return Ok(stream_response.into_response());
     }
 
@@ -1086,6 +1131,25 @@ mod tests {
 
         validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
             .expect("relaxed mode should allow passthrough");
+        assert_eq!(
+            parse_stop_sequences(req.stop.as_ref()).expect("valid stop sequences"),
+            ["END"]
+        );
+    }
+
+    #[test]
+    fn parses_string_and_deduplicated_array_stop_sequences() {
+        assert_eq!(
+            parse_stop_sequences(Some(&json!("DONE"))).expect("string stop"),
+            ["DONE"]
+        );
+        assert_eq!(
+            parse_stop_sequences(Some(&json!(["END", "DONE", "END"]))).expect("array stop"),
+            ["END", "DONE"]
+        );
+        assert!(parse_stop_sequences(Some(&json!(["END", 7]))).is_err());
+        assert!(parse_stop_sequences(Some(&json!(["", "END"]))).is_err());
+        assert!(parse_stop_sequences(Some(&json!(["1", "2", "3", "4", "5"]))).is_err());
     }
 
     #[test]
@@ -1111,12 +1175,10 @@ mod tests {
                 .and_then(|function| function.name.as_deref()),
             Some("get_weather")
         );
-        assert!(
-            deltas[0]
-                .function
-                .as_ref()
-                .and_then(|function| function.arguments.as_deref())
-                .is_some_and(|args| args.contains("Harare"))
-        );
+        assert!(deltas[0]
+            .function
+            .as_ref()
+            .and_then(|function| function.arguments.as_deref())
+            .is_some_and(|args| args.contains("Harare")));
     }
 }

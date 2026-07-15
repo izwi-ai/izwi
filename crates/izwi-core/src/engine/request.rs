@@ -1477,6 +1477,7 @@ impl EngineCoreRequest {
             top_k: self.params.top_k,
             repetition_penalty: self.params.repetition_penalty.max(1.0),
             presence_penalty: self.params.presence_penalty.clamp(-2.0, 2.0),
+            stop_sequences: self.params.stop_sequences.clone(),
             stop_token_ids: self.params.stop_token_ids.clone(),
             seed: Self::chat_request_seed(&self.id),
             request: self.chat_config.clone(),

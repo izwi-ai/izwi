@@ -69,6 +69,8 @@ pub struct ChatDecodeState {
     track_history: bool,
     decode_stream: TokenizerDecodeStreamState,
     assembled: String,
+    emitted_text_bytes: usize,
+    stop_sequences: Vec<String>,
     max_new_tokens: usize,
     finished: bool,
     next_text_position: usize,
@@ -514,6 +516,8 @@ impl Qwen35ChatModel {
             track_history,
             decode_stream: TokenizerDecodeStreamState::default(),
             assembled: String::new(),
+            emitted_text_bytes: 0,
+            stop_sequences: normalize_stop_sequences(&config.stop_sequences),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared_prompt.next_text_position,
@@ -525,8 +529,9 @@ impl Qwen35ChatModel {
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
+            let delta = flush_stream_text(&state.assembled, &mut state.emitted_text_bytes)?;
             return Ok(ChatDecodeStep {
-                delta: String::new(),
+                delta,
                 text: state.assembled.trim().to_string(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
@@ -547,31 +552,47 @@ impl Qwen35ChatModel {
         )?;
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
+            let delta = flush_stream_text(&state.assembled, &mut state.emitted_text_bytes)?;
             return Ok(ChatDecodeStep {
-                delta: String::new(),
+                delta,
                 text: state.assembled.trim().to_string(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
             });
         }
 
-        let delta = self
+        let decoded = self
             .tokenizer
             .decode_token_piece(&mut state.decode_stream, next)?;
         if state.track_history {
             state.history_ids.push(next);
         }
         state.tokens_generated = state.tokens_generated.saturating_add(1);
-        state.assembled.push_str(&delta);
-        state.logits = self.text_model.forward_token_id_at(
-            next,
-            [state.next_text_position; 3],
-            &mut state.text_state,
+        state.assembled.push_str(&decoded);
+        let stopped_on_sequence = truncate_at_stop_sequence(
+            &mut state.assembled,
+            state.emitted_text_bytes,
+            &state.stop_sequences,
         )?;
-        state.next_text_position += 1;
-        if state.tokens_generated >= state.max_new_tokens {
+        if stopped_on_sequence {
             state.finished = true;
+        } else {
+            state.logits = self.text_model.forward_token_id_at(
+                next,
+                [state.next_text_position; 3],
+                &mut state.text_state,
+            )?;
+            state.next_text_position += 1;
+            if state.tokens_generated >= state.max_new_tokens {
+                state.finished = true;
+            }
         }
+        let delta = take_stream_safe_text(
+            &state.assembled,
+            &mut state.emitted_text_bytes,
+            &state.stop_sequences,
+            state.finished,
+        )?;
         let final_text = if state.finished {
             state.assembled.trim().to_string()
         } else {
@@ -1301,6 +1322,87 @@ fn initial_penalty_history(
     history
 }
 
+fn normalize_stop_sequences(stop_sequences: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(stop_sequences.len());
+    for sequence in stop_sequences {
+        if sequence.is_empty() || normalized.iter().any(|existing| existing == sequence) {
+            continue;
+        }
+        normalized.push(sequence.clone());
+    }
+    normalized
+}
+
+fn truncate_at_stop_sequence(
+    text: &mut String,
+    emitted_text_bytes: usize,
+    stop_sequences: &[String],
+) -> Result<bool> {
+    let stop_index = stop_sequences
+        .iter()
+        .filter_map(|sequence| text.find(sequence))
+        .min();
+    let Some(stop_index) = stop_index else {
+        return Ok(false);
+    };
+    if stop_index < emitted_text_bytes {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.5 stop-sequence streaming invariant failed: stop begins at byte {stop_index}, but {emitted_text_bytes} bytes were already emitted"
+        )));
+    }
+    text.truncate(stop_index);
+    Ok(true)
+}
+
+fn take_stream_safe_text(
+    text: &str,
+    emitted_text_bytes: &mut usize,
+    stop_sequences: &[String],
+    terminal: bool,
+) -> Result<String> {
+    let safe_end = if terminal {
+        text.len()
+    } else {
+        text.len()
+            .saturating_sub(longest_stop_prefix_suffix(text, stop_sequences))
+    };
+    if *emitted_text_bytes > safe_end || !text.is_char_boundary(*emitted_text_bytes) {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.5 streamed text cursor is invalid: emitted={}, safe_end={}, text_len={}",
+            *emitted_text_bytes,
+            safe_end,
+            text.len()
+        )));
+    }
+    let delta = text[*emitted_text_bytes..safe_end].to_string();
+    *emitted_text_bytes = safe_end;
+    Ok(delta)
+}
+
+fn flush_stream_text(text: &str, emitted_text_bytes: &mut usize) -> Result<String> {
+    take_stream_safe_text(text, emitted_text_bytes, &[], true)
+}
+
+fn longest_stop_prefix_suffix(text: &str, stop_sequences: &[String]) -> usize {
+    let max_stop_bytes = stop_sequences.iter().map(String::len).max().unwrap_or(0);
+    if max_stop_bytes == 0 || text.is_empty() {
+        return 0;
+    }
+
+    let earliest_candidate = text.len().saturating_sub(max_stop_bytes);
+    text.char_indices()
+        .filter(|(index, _)| *index >= earliest_candidate)
+        .filter_map(|(index, _)| {
+            let suffix = &text[index..];
+            stop_sequences
+                .iter()
+                .any(|sequence| sequence.starts_with(suffix))
+                .then_some(suffix.len())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn sample_next_token(
     logits: &Tensor,
     vocab_size: usize,
@@ -1863,6 +1965,93 @@ mod tests {
     }
 
     #[test]
+    fn render_prompt_matches_qwen35_multiturn_golden() {
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(
+            &[
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "First question".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: "reasoning first</think>\nFinal answer".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Follow-up".to_string(),
+                },
+            ],
+            &config,
+            true,
+        )
+        .expect("prompt should render");
+
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nFirst question<|im_end|>\n\
+             <|im_start|>assistant\nFinal answer<|im_end|>\n\
+             <|im_start|>user\nFollow-up<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn stop_sequence_streaming_holds_back_cross_token_prefixes() {
+        let stops =
+            normalize_stop_sequences(&["END".to_string(), String::new(), "END".to_string()]);
+        assert_eq!(stops, ["END"]);
+
+        let mut text = "hello E".to_string();
+        let mut emitted = 0usize;
+        assert_eq!(
+            take_stream_safe_text(&text, &mut emitted, &stops, false).unwrap(),
+            "hello "
+        );
+        text.push('N');
+        assert!(take_stream_safe_text(&text, &mut emitted, &stops, false)
+            .unwrap()
+            .is_empty());
+        text.push_str("D ignored");
+        assert!(truncate_at_stop_sequence(&mut text, emitted, &stops).unwrap());
+        assert_eq!(text, "hello ");
+        assert!(take_stream_safe_text(&text, &mut emitted, &stops, true)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stop_sequence_streaming_releases_nonmatching_and_unicode_prefixes() {
+        let stops = vec!["終わり".to_string(), "END".to_string()];
+        let mut emitted = 0usize;
+        let mut text = "go E".to_string();
+        assert_eq!(
+            take_stream_safe_text(&text, &mut emitted, &stops, false).unwrap(),
+            "go "
+        );
+        text.push('x');
+        assert_eq!(
+            take_stream_safe_text(&text, &mut emitted, &stops, false).unwrap(),
+            "Ex"
+        );
+        text.push_str(" answer 終");
+        assert_eq!(
+            take_stream_safe_text(&text, &mut emitted, &stops, false).unwrap(),
+            " answer "
+        );
+        text.push_str("わり trailing");
+        assert!(truncate_at_stop_sequence(&mut text, emitted, &stops).unwrap());
+        assert_eq!(text, "go Ex answer ");
+    }
+
+    #[test]
     fn penalty_history_starts_with_the_complete_prompt() {
         let prompt = [11, 12, 13, 14];
         let history = initial_penalty_history(&prompt, 8, true);
@@ -1885,6 +2074,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
@@ -1904,6 +2094,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
@@ -2003,6 +2194,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
@@ -2036,6 +2228,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig {
@@ -2088,6 +2281,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
@@ -2182,6 +2376,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig {
@@ -2231,6 +2426,7 @@ mod tests {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig {

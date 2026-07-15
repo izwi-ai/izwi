@@ -61,6 +61,7 @@ pub struct ChatGenerationConfig {
     pub top_k: usize,
     pub repetition_penalty: f32,
     pub presence_penalty: f32,
+    pub stop_sequences: Vec<String>,
     pub stop_token_ids: Vec<u32>,
     pub seed: u64,
     pub request: ChatRequestConfig,
@@ -74,6 +75,7 @@ impl Default for ChatGenerationConfig {
             top_k: 0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
             seed: 0,
             request: ChatRequestConfig::default(),
@@ -93,6 +95,7 @@ mod tests {
         assert_eq!(config.top_k, 0);
         assert_eq!(config.repetition_penalty, 1.0);
         assert_eq!(config.presence_penalty, 0.0);
+        assert!(config.stop_sequences.is_empty());
         assert!(config.stop_token_ids.is_empty());
         assert_eq!(config.seed, 0);
         assert_eq!(config.request, ChatRequestConfig::default());

@@ -23,6 +23,7 @@ pub struct ChatExecutionRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub presence_penalty: Option<f32>,
+    pub stop_sequences: Vec<String>,
     pub chat_config: ChatRequestConfig,
     pub correlation_id: Option<String>,
 }
@@ -46,6 +47,7 @@ impl ChatExecutionRequest {
         if let Some(presence_penalty) = self.presence_penalty {
             params.presence_penalty = presence_penalty;
         }
+        params.stop_sequences = self.stop_sequences.clone();
         params
     }
 
@@ -298,6 +300,7 @@ mod tests {
             temperature: Some(0.42),
             top_p: Some(0.73),
             presence_penalty: Some(0.25),
+            stop_sequences: vec!["END".to_string()],
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         };
@@ -307,6 +310,7 @@ mod tests {
         assert_eq!(params.top_p, 0.73);
         assert_eq!(params.top_k, 0);
         assert_eq!(params.presence_penalty, 0.25);
+        assert_eq!(params.stop_sequences, ["END"]);
         assert_eq!(params.max_tokens, 32);
     }
 
