@@ -3,7 +3,9 @@
 use candle_core::{DType, Tensor, D};
 
 use crate::error::{Error, Result};
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::memory::accounting::{
+    compact_tensor_storage, deep_copy_tensor_storage, TensorStorageAccounting,
+};
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
 const Q4_0_BLOCK_SIZE: usize = 32;
@@ -84,6 +86,41 @@ pub enum KvPage {
 }
 
 impl KvPage {
+    /// Fork this page with independent Candle backing storage.
+    ///
+    /// Prefix-cache snapshots may be restored into multiple mutable decode
+    /// sessions. `Tensor::clone` shares storage, so it is not a sufficient
+    /// boundary if a backend later introduces in-place KV updates.
+    pub(crate) fn deep_copy(&self) -> Result<Self> {
+        match self {
+            Self::Dense(tensor) => Ok(Self::Dense(deep_copy_tensor_storage(tensor)?)),
+            Self::Int8 {
+                values,
+                scale,
+                target_dtype,
+            } => Ok(Self::Int8 {
+                values: deep_copy_tensor_storage(values)?,
+                scale: *scale,
+                target_dtype: *target_dtype,
+            }),
+            Self::Q4_0 {
+                values,
+                scales,
+                shape,
+                seq_len,
+                num_elements,
+                target_dtype,
+            } => Ok(Self::Q4_0 {
+                values: deep_copy_tensor_storage(values)?,
+                scales: deep_copy_tensor_storage(scales)?,
+                shape: *shape,
+                seq_len: *seq_len,
+                num_elements: *num_elements,
+                target_dtype: *target_dtype,
+            }),
+        }
+    }
+
     fn from_dense(tensor: Tensor, quantization: KvCacheQuantization) -> Result<Self> {
         // A page must own compact storage. Retaining a narrow view can keep an
         // entire previous backing allocation alive and invalidate byte accounting.

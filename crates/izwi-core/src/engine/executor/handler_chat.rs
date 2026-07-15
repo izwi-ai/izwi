@@ -1,12 +1,19 @@
+use std::sync::Arc;
 use std::time::Instant;
 
+use tracing::debug;
+
+use crate::engine::resources::{ReservationClass, ReservationOwner};
 use crate::error::{Error, Result};
+use crate::models::architectures::qwen35::chat::{Qwen35PrefixSnapshot, Qwen35PreparedPrompt};
+use crate::models::registry::NativeChatModel;
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
 
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
+use super::prefix_cache::{ExactPrefixHandle, ExactPrefixScope};
 use super::state::ActiveChatDecode;
 use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
@@ -84,6 +91,14 @@ impl NativeExecutor {
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
         let model = request.prepared_chat_model_for_executor()?;
+        let prefix_scope = ExactPrefixScope {
+            variant,
+            backend: self.config.backend,
+            activation_dtype: self.config.dtype.clone(),
+            kv_cache_dtype: self.config.kv_cache_dtype.clone(),
+        };
+        let prefix_cache_enabled =
+            self.qwen35_prefix_cache_enabled(prepared_qwen35_prompt, model.as_ref());
 
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
@@ -210,19 +225,48 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
-            let decode_state = Self::run_blocking(|| {
-                model.start_decode_state_with_prepared(
+            let cached_prefix = prefix_cache_enabled
+                .then(|| {
+                    let prepared = prepared_qwen35_prompt
+                        .expect("enabled Qwen3.5 prefix cache requires prepared prompt");
+                    self.qwen35_prefix_cache.lookup(
+                        &model,
+                        &prefix_scope,
+                        prepared.prompt_ids(),
+                        prepared.prompt_positions(),
+                    )
+                })
+                .flatten();
+            let mut decode_state = Self::run_blocking(|| {
+                model.start_decode_state_with_prefix(
                     messages,
                     max_new_tokens,
                     &generation_config,
                     prepared_qwen35_prompt,
+                    cached_prefix.as_ref().map(|cached| cached.snapshot()),
+                    prefix_cache_enabled.then_some(self.qwen35_prefix_cache.max_retained_bytes()),
                 )
             })?;
+            let reused_prefix_tokens = decode_state.reused_qwen35_prefix_tokens();
+            if reused_prefix_tokens > 0 {
+                debug!(
+                    model = %variant,
+                    reused_prefix_tokens,
+                    prompt_tokens = request.num_prompt_tokens(),
+                    "Qwen3.5 exact-prefix cache hit"
+                );
+            }
+            let pending_prefix_snapshot = decode_state
+                .take_pending_qwen35_prefix_snapshot()
+                .and_then(|snapshot| {
+                    self.authorize_qwen35_prefix_snapshot(&prefix_scope, snapshot)
+                });
             ActiveChatDecode {
                 variant,
                 state: decode_state,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
+                pending_prefix_snapshot,
             }
         };
 
@@ -278,6 +322,11 @@ impl NativeExecutor {
             }
 
             if step.finished {
+                if let Some(snapshot) = active_state.pending_prefix_snapshot.take() {
+                    let _ = self
+                        .qwen35_prefix_cache
+                        .insert(&model, prefix_scope.clone(), snapshot);
+                }
                 finished = true;
                 break;
             }
@@ -307,6 +356,43 @@ impl NativeExecutor {
             asr_diagnostics: None,
             error: None,
         }))
+    }
+
+    fn qwen35_prefix_cache_enabled(
+        &self,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        model: &NativeChatModel,
+    ) -> bool {
+        self.config.resource_authority.is_some()
+            && self.qwen35_prefix_cache.max_retained_bytes() > 0
+            && matches!(model, NativeChatModel::Qwen35(_))
+            && prepared.is_some_and(Qwen35PreparedPrompt::supports_exact_prefix_reuse)
+    }
+
+    fn authorize_qwen35_prefix_snapshot(
+        &self,
+        scope: &ExactPrefixScope,
+        snapshot: Qwen35PrefixSnapshot,
+    ) -> Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>> {
+        let Some(bytes) = snapshot.retained_bytes() else {
+            return None;
+        };
+        if bytes == 0 || bytes > self.qwen35_prefix_cache.max_retained_bytes() {
+            return None;
+        }
+        let Some(authority) = self.config.resource_authority.as_ref() else {
+            return None;
+        };
+        let resources = super::cache_resource_vector(scope.backend, bytes);
+        let owner = ReservationOwner::new(
+            ReservationClass::Cache,
+            format!("qwen35-prefix-pending:{}", scope.variant),
+        );
+        let Ok(lease) = authority.reserve_with_initial_materialized(owner, resources, resources)
+        else {
+            return None;
+        };
+        Some(ExactPrefixHandle::new(scope.backend, snapshot, Some(lease)))
     }
 }
 

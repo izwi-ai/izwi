@@ -55,6 +55,16 @@ pub(crate) fn compact_tensor_storage(tensor: &Tensor) -> candle_core::Result<Ten
     Ok(tensor)
 }
 
+/// Deep-copy persistent state without routing Metal through Candle's pooled
+/// allocator, which may return an oversized backing allocation.
+pub(crate) fn deep_copy_tensor_storage(tensor: &Tensor) -> candle_core::Result<Tensor> {
+    if tensor.device().is_metal() {
+        compact_tensor_storage(tensor)
+    } else {
+        tensor.copy()
+    }
+}
+
 /// Accumulates the backing allocations retained by a set of Candle tensors.
 ///
 /// Tensor views share a Candle storage allocation. Accounting logical tensor
