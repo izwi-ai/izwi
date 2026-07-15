@@ -1,6 +1,6 @@
 //! Runtime metrics, snapshots, and Prometheus formatting.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
@@ -23,6 +23,7 @@ use crate::runtime::voice_metrics::{
     VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
     VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
 };
+use crate::runtime::CoordinatorSnapshot;
 use crate::runtime_models::LoadedModelDiagnostics;
 use crate::KernelPathTelemetrySnapshot;
 
@@ -58,6 +59,9 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub kv_cache_allocated_blocks: u64,
     pub kv_cache_prefix_reuse_blocks_total: u64,
     pub stream_backpressure_total: u64,
+    pub tensor_batches_total: u64,
+    pub request_parallel_batches_total: u64,
+    pub tensor_batch_max_width: u64,
     pub kv_cache: EngineKvCacheRuntimeSnapshot,
 }
 
@@ -284,6 +288,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub requests_queued: u64,
     pub requests_completed: u64,
     pub requests_failed: u64,
+    pub requests_cancelled: u64,
     pub requests_active: u64,
     pub worker_restarts: u64,
     pub worker_panics: u64,
@@ -304,6 +309,7 @@ pub struct RuntimeTelemetrySnapshot {
     pub end_to_end_ms_p95: f64,
     pub kernel_path: KernelPathTelemetrySnapshot,
     pub engine: EngineRuntimeTelemetrySnapshot,
+    pub coordinator: CoordinatorSnapshot,
     pub models: Vec<LoadedModelDiagnostics>,
     pub voice: VoiceRuntimeTelemetrySnapshot,
     pub realtime: RealtimeRuntimeTelemetrySnapshot,
@@ -333,7 +339,9 @@ pub(crate) struct RuntimeTelemetryCollector {
     requests_queued: AtomicU64,
     requests_completed: AtomicU64,
     requests_failed: AtomicU64,
+    requests_cancelled: AtomicU64,
     requests_active: AtomicU64,
+    active_request_ids: Mutex<HashSet<String>>,
     worker_restarts: AtomicU64,
     worker_panics: AtomicU64,
     voice_sessions_started: AtomicU64,
@@ -371,7 +379,9 @@ impl RuntimeTelemetryCollector {
             requests_queued: AtomicU64::new(0),
             requests_completed: AtomicU64::new(0),
             requests_failed: AtomicU64::new(0),
+            requests_cancelled: AtomicU64::new(0),
             requests_active: AtomicU64::new(0),
+            active_request_ids: Mutex::new(HashSet::new()),
             worker_restarts: AtomicU64::new(0),
             worker_panics: AtomicU64::new(0),
             voice_sessions_started: AtomicU64::new(0),
@@ -402,12 +412,19 @@ impl RuntimeTelemetryCollector {
         }
     }
 
-    pub(crate) async fn record_request_queued(&self) {
+    pub(crate) async fn record_request_queued(&self, request_id: &str) {
+        let mut active = self.active_request_ids.lock().await;
+        if !active.insert(request_id.to_string()) {
+            return;
+        }
         self.requests_queued.fetch_add(1, Ordering::Relaxed);
         self.requests_active.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) async fn record_request_finished(&self, output: &EngineOutput) {
+        if !self.finish_active_request(&output.request_id).await {
+            return;
+        }
         self.requests_completed.fetch_add(1, Ordering::Relaxed);
         if output.error.is_some() {
             self.requests_failed.fetch_add(1, Ordering::Relaxed);
@@ -447,19 +464,39 @@ impl RuntimeTelemetryCollector {
         }
     }
 
-    pub(crate) fn record_forced_failures(&self, count: usize) {
-        if count == 0 {
+    pub(crate) async fn record_request_cancelled(&self, request_id: &str) {
+        if !self.finish_active_request(request_id).await {
             return;
         }
-        let count_u64 = count as u64;
-        self.requests_completed
-            .fetch_add(count_u64, Ordering::Relaxed);
-        self.requests_failed.fetch_add(count_u64, Ordering::Relaxed);
+        self.requests_completed.fetch_add(1, Ordering::Relaxed);
+        self.requests_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn record_forced_failures<'a>(
+        &self,
+        request_ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut count = 0u64;
+        for request_id in request_ids {
+            if self.finish_active_request(request_id).await {
+                count += 1;
+            }
+        }
+        self.requests_completed.fetch_add(count, Ordering::Relaxed);
+        self.requests_failed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    async fn finish_active_request(&self, request_id: &str) -> bool {
+        let mut active = self.active_request_ids.lock().await;
+        if !active.remove(request_id) {
+            return false;
+        }
         let _ = self
             .requests_active
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(count_u64))
+                Some(v.saturating_sub(1))
             });
+        true
     }
 
     pub(crate) fn record_worker_restart(&self) {
@@ -588,6 +625,7 @@ impl RuntimeTelemetryCollector {
             requests_queued: self.requests_queued.load(Ordering::Relaxed),
             requests_completed: self.requests_completed.load(Ordering::Relaxed),
             requests_failed: self.requests_failed.load(Ordering::Relaxed),
+            requests_cancelled: self.requests_cancelled.load(Ordering::Relaxed),
             requests_active: self.requests_active.load(Ordering::Relaxed),
             worker_restarts: self.worker_restarts.load(Ordering::Relaxed),
             worker_panics: self.worker_panics.load(Ordering::Relaxed),
@@ -608,6 +646,7 @@ impl RuntimeTelemetryCollector {
             end_to_end_ms_p95: percentile(&end_to_end, 0.95),
             kernel_path: kernel_path_telemetry_snapshot(),
             engine: EngineRuntimeTelemetrySnapshot::default(),
+            coordinator: CoordinatorSnapshot::default(),
             models: Vec::new(),
             voice: VoiceRuntimeTelemetrySnapshot {
                 sessions_started: self.voice_sessions_started.load(Ordering::Relaxed),
@@ -667,12 +706,14 @@ impl RuntimeTelemetryCollector {
             "# TYPE izwi_requests_queued_total counter\nizwi_requests_queued_total {}\n\
 # TYPE izwi_requests_completed_total counter\nizwi_requests_completed_total {}\n\
 # TYPE izwi_requests_failed_total counter\nizwi_requests_failed_total {}\n\
+# TYPE izwi_requests_cancelled_total counter\nizwi_requests_cancelled_total {}\n\
 # TYPE izwi_requests_active gauge\nizwi_requests_active {}\n\
 # TYPE izwi_worker_restarts_total counter\nizwi_worker_restarts_total {}\n\
 # TYPE izwi_worker_panics_total counter\nizwi_worker_panics_total {}\n",
             snapshot.requests_queued,
             snapshot.requests_completed,
             snapshot.requests_failed,
+            snapshot.requests_cancelled,
             snapshot.requests_active,
             snapshot.worker_restarts,
             snapshot.worker_panics,
@@ -1095,6 +1136,23 @@ fn prometheus_label_value(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::engine::ENGINE_SCHEDULER_QUEUE_DEPTH;
+
+    #[tokio::test]
+    async fn request_terminal_accounting_is_exactly_once() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_request_queued("request-1").await;
+        telemetry.record_request_queued("request-1").await;
+        telemetry.record_request_cancelled("request-1").await;
+        telemetry.record_request_cancelled("request-1").await;
+        telemetry.record_forced_failures(["request-1"]).await;
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.requests_queued, 1);
+        assert_eq!(snapshot.requests_completed, 1);
+        assert_eq!(snapshot.requests_cancelled, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.requests_active, 0);
+    }
 
     #[tokio::test]
     async fn voice_telemetry_snapshot_and_prometheus_include_recorded_counters() {

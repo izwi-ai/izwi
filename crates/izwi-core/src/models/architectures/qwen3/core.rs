@@ -22,6 +22,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
@@ -114,6 +115,55 @@ struct Qwen3RopeCacheEntry {
 }
 
 impl Qwen3Cache {
+    pub fn paged_storage_bytes(&self) -> usize {
+        self.k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+            .map(KvPage::storage_bytes)
+            .sum()
+    }
+
+    /// Backing allocations currently retained by this session cache.
+    ///
+    /// Includes paged KV, dense Candle KV capacity, and session-local RoPE
+    /// windows. Returns `None` if a backend allocation cannot be observed or
+    /// the total cannot be represented as `u64`.
+    pub fn allocated_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.account_storage(&mut accounting)?;
+        Some(accounting.bytes())
+    }
+
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        for page in self
+            .k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+        {
+            page.account_storage(accounting)?;
+        }
+
+        for cache in self
+            .dense_k_cache_h
+            .iter()
+            .chain(self.dense_v_cache_h.iter())
+            .flatten()
+        {
+            if let Some(tensor) = cache.all_data().as_ref() {
+                accounting.add_tensor(tensor)?;
+            }
+        }
+
+        for entry in &self.rope_cache {
+            accounting.add_tensor(&entry.cos_half)?;
+            accounting.add_tensor(&entry.sin_half)?;
+        }
+
+        Some(())
+    }
+
     pub fn new(num_layers: usize) -> Self {
         Self::with_page_size_and_quantization(
             num_layers,
@@ -2062,6 +2112,20 @@ impl Qwen3Model {
         self.cfg.head_dim()
     }
 
+    /// Conservative retained-session allocation bound for a complete decode.
+    ///
+    /// Candle cache pages may use any supported compute dtype or KV
+    /// quantization, so the bound deliberately prices every element as F32.
+    /// Dense cache growth is rounded to the next power of two to cover backing
+    /// capacity rather than only the logical token count.
+    pub fn session_cache_upper_bound_bytes(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Option<u64> {
+        qwen3_session_cache_upper_bound_bytes(&self.cfg, prompt_tokens, max_new_tokens)
+    }
+
     pub fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
         self.layers
             .iter()
@@ -2135,6 +2199,40 @@ impl Qwen3Model {
     pub fn uses_mrope(&self) -> bool {
         self.use_mrope
     }
+}
+
+fn qwen3_session_cache_upper_bound_bytes(
+    cfg: &Qwen3Config,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+) -> Option<u64> {
+    let prompt_tokens = prompt_tokens.max(1);
+    let total_tokens = prompt_tokens.checked_add(max_new_tokens.max(1))?;
+    let cache_capacity = total_tokens.checked_next_power_of_two()?;
+    let bytes_per_element = 4u64;
+    let as_u64 = |value: usize| u64::try_from(value).ok();
+
+    let kv_bytes = 2u64
+        .checked_mul(as_u64(cfg.num_hidden_layers)?)?
+        .checked_mul(as_u64(cache_capacity)?)?
+        .checked_mul(as_u64(cfg.num_key_value_heads)?)?
+        .checked_mul(as_u64(cfg.head_dim())?)?
+        .checked_mul(bytes_per_element)?;
+    // The session-local RoPE cache retains one pair for prefill and one small
+    // pair for each decode position. Pricing two full-width tensors for every
+    // token is intentionally conservative.
+    let rope_bytes = 2u64
+        .checked_mul(as_u64(total_tokens)?)?
+        .checked_mul(as_u64(cfg.head_dim())?)?
+        .checked_mul(bytes_per_element)?;
+    // Incremental state retains the model output tensor. Its widest point is
+    // prompt prefill, not the one-token decode path.
+    let output_width = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
+    let output_bytes = as_u64(prompt_tokens)?
+        .checked_mul(as_u64(output_width)?)?
+        .checked_mul(bytes_per_element)?;
+
+    kv_bytes.checked_add(rope_bytes)?.checked_add(output_bytes)
 }
 
 fn dense_logits_for_tokens(
@@ -2475,6 +2573,34 @@ mod tests {
                 "tensor mismatch at {idx}: {lhs} != {rhs}"
             );
         }
+    }
+
+    #[test]
+    fn session_cache_bound_is_architecture_derived_and_monotonic() {
+        let cfg = Qwen3Config {
+            hidden_size: 1_024,
+            intermediate_size: 3_072,
+            num_attention_heads: 16,
+            num_hidden_layers: 12,
+            num_key_value_heads: 4,
+            head_dim: Some(64),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            vocab_size: 32_000,
+            lm_head_size: None,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            ada_rms_norm_t_cond: false,
+            ada_rms_norm_t_cond_dim: 0,
+        };
+
+        let small = qwen3_session_cache_upper_bound_bytes(&cfg, 32, 16).unwrap();
+        let large = qwen3_session_cache_upper_bound_bytes(&cfg, 64, 32).unwrap();
+        assert!(small > 0);
+        assert!(large > small);
+        assert!(qwen3_session_cache_upper_bound_bytes(&cfg, usize::MAX, 1).is_none());
     }
 
     #[test]
@@ -2944,6 +3070,31 @@ mod tests {
             .cached_rope_pair(2, 5, head_dim, &device, DType::F32, false, &[], &inv_freqs)
             .expect("new rope window");
         assert_eq!(cache.rope_cache.len(), 2);
+    }
+
+    #[test]
+    fn qwen3_cache_accounting_includes_dense_capacity_and_rope() {
+        let device = Device::Cpu;
+        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
+            1,
+            4,
+            KvCacheQuantization::None,
+            8,
+        );
+        assert_eq!(cache.allocated_bytes(), Some(0));
+
+        let k = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("k");
+        let v = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("v");
+        cache.append(0, k, v).expect("append");
+        let dense_bytes = cache.allocated_bytes().expect("dense bytes");
+        assert!(dense_bytes >= 2 * 4 * 4 * 2);
+        assert_eq!(cache.paged_storage_bytes(), 0);
+
+        let inv_freqs = build_rope_inv_freqs(8, 10_000.0);
+        cache
+            .cached_rope_pair(3, 0, 8, &device, DType::F32, false, &[], &inv_freqs)
+            .expect("rope");
+        assert!(cache.allocated_bytes().expect("total bytes") > dense_bytes);
     }
 
     #[test]

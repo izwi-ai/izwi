@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use super::{BatchDispatch, BatchDispatchKind};
+
 /// Stable metric names for scheduler and KV-cache observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct EngineMetricDescriptor {
@@ -43,6 +45,10 @@ pub const ENGINE_KV_CACHE_CHURN_RATIO: &str = "engine.kv_cache.churn_ratio";
 pub const ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS: &str = "engine.kv_cache.gpu_resident_blocks";
 pub const ENGINE_KV_CACHE_PINNED_BLOCKS: &str = "engine.kv_cache.pinned_blocks";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL: &str = "engine.executor.tensor_batches_total";
+pub const ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL: &str =
+    "engine.executor.request_parallel_batches_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH: &str = "engine.executor.tensor_batch_max_width";
 
 pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
@@ -125,9 +131,24 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         name: ENGINE_STREAM_BACKPRESSURE_TOTAL,
         description: "Engine stream backpressure events.",
     },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
+        description: "Observed model-native tensor batch dispatches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
+        description: "Observed thread-parallel request groups; these are not tensor batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
+        description: "Largest observed model-native tensor batch width.",
+    },
 ];
 
 static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_REQUEST_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_BATCH_MAX_WIDTH: AtomicU64 = AtomicU64::new(0);
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
     ENGINE_METRIC_CATALOG
@@ -139,6 +160,31 @@ pub(crate) fn record_engine_stream_backpressure() {
 
 pub fn engine_stream_backpressure_total() -> u64 {
     ENGINE_STREAM_BACKPRESSURE_EVENTS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
+    match dispatch.kind {
+        BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous => {
+            ENGINE_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
+        }
+        BatchDispatchKind::RequestParallel => {
+            ENGINE_REQUEST_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
+        }
+        BatchDispatchKind::Serial => {}
+    }
+}
+
+pub fn engine_tensor_batches_total() -> u64 {
+    ENGINE_TENSOR_BATCHES.load(Ordering::Relaxed)
+}
+
+pub fn engine_request_parallel_batches_total() -> u64 {
+    ENGINE_REQUEST_PARALLEL_BATCHES.load(Ordering::Relaxed)
+}
+
+pub fn engine_tensor_batch_max_width() -> u64 {
+    ENGINE_TENSOR_BATCH_MAX_WIDTH.load(Ordering::Relaxed)
 }
 
 pub fn prometheus_engine_metric_name(name: &str) -> String {
@@ -512,6 +558,9 @@ mod tests {
         assert!(names.contains(ENGINE_KV_CACHE_HITS_TOTAL));
         assert!(names.contains(ENGINE_KV_CACHE_EVICTIONS_TOTAL));
         assert!(names.contains(ENGINE_STREAM_BACKPRESSURE_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH));
         assert_eq!(names.len(), ENGINE_METRIC_CATALOG.len());
     }
 
@@ -536,5 +585,16 @@ mod tests {
         let before = engine_stream_backpressure_total();
         record_engine_stream_backpressure();
         assert_eq!(engine_stream_backpressure_total(), before + 1);
+    }
+
+    #[test]
+    fn batch_dispatch_metrics_distinguish_tensor_and_request_parallel_work() {
+        let tensor_before = engine_tensor_batches_total();
+        let parallel_before = engine_request_parallel_batches_total();
+        record_engine_batch_dispatch(BatchDispatch::new(BatchDispatchKind::TensorStatic, 3));
+        record_engine_batch_dispatch(BatchDispatch::new(BatchDispatchKind::RequestParallel, 4));
+        assert!(engine_tensor_batches_total() >= tensor_before + 1);
+        assert!(engine_request_parallel_batches_total() >= parallel_before + 1);
+        assert!(engine_tensor_batch_max_width() >= 3);
     }
 }

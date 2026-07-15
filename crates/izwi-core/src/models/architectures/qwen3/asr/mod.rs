@@ -31,6 +31,7 @@ use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
@@ -84,6 +85,16 @@ pub struct AsrDecodeState {
     stop_tokens: Vec<u32>,
     max_new_tokens: usize,
     finished: bool,
+}
+
+impl AsrDecodeState {
+    /// All Candle backing allocations retained by this incremental session.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.cache.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.embeds)?;
+        Some(accounting.bytes())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -633,6 +644,33 @@ impl Qwen3AsrModel {
             return Some(self.preprocessor.n_samples as f32 / sample_rate);
         }
         None
+    }
+
+    /// Model-derived authorization for the largest incremental ASR session
+    /// accepted by this checkpoint's audio preprocessor.
+    pub fn session_cache_reservation_bytes(
+        &self,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+    ) -> Result<u64> {
+        let hop_length = self.mel.config().hop_length.max(1);
+        let max_audio_tokens = self
+            .preprocessor
+            .nb_max_frames
+            .max(self.preprocessor.n_samples.saturating_add(hop_length - 1) / hop_length);
+        if max_audio_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR checkpoint does not declare a bounded audio context".to_string(),
+            ));
+        }
+        let prompt_tokens = self
+            .build_prompt(max_audio_tokens, language, system_prompt)?
+            .ids
+            .len();
+        self.text_model
+            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
+            .ok_or_else(|| Error::Overloaded("Qwen3 ASR session cache bound overflow".to_string()))
     }
 
     pub fn transcribe_with_callback(

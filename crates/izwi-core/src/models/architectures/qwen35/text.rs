@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding};
@@ -21,6 +19,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_prefill_sequence_span, record_prefill_token_mode_step,
     record_rope_kernel, record_rope_manual, DecodeAttentionPath,
@@ -43,6 +42,57 @@ pub struct Qwen35TextModel {
 
 pub struct Qwen35TextRuntimeState {
     layers: Vec<Qwen35LayerRuntimeState>,
+}
+
+impl Qwen35TextRuntimeState {
+    /// Backing allocations retained by the per-request text runtime state.
+    ///
+    /// This intentionally excludes model-global caches (notably full-attention
+    /// RoPE windows), so callers requiring a complete scheduler claim must keep
+    /// Qwen3.5 fail-closed until those caches are independently bounded.
+    pub fn allocated_session_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.account_storage(&mut accounting)?;
+        Some(accounting.bytes())
+    }
+
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        for layer in &self.layers {
+            match layer {
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => {
+                    if let Some(conv_state) = conv_state {
+                        for slot in &conv_state.slots {
+                            accounting.add_tensor(slot)?;
+                        }
+                    }
+                    if let Some(recurrent_state) = recurrent_state {
+                        accounting.add_tensor(recurrent_state)?;
+                    }
+                }
+                Qwen35LayerRuntimeState::Full {
+                    k_pages,
+                    v_pages,
+                    dense_k_cache_h,
+                    dense_v_cache_h,
+                    ..
+                } => {
+                    for page in k_pages.iter().chain(v_pages.iter()) {
+                        page.account_storage(accounting)?;
+                    }
+                    if let Some(cache) = dense_k_cache_h {
+                        accounting.add_tensor(cache)?;
+                    }
+                    if let Some(cache) = dense_v_cache_h {
+                        accounting.add_tensor(cache)?;
+                    }
+                }
+            }
+        }
+        Some(())
+    }
 }
 
 struct ConvRingState {
@@ -102,7 +152,6 @@ struct Qwen35FullAttention {
     dense_decode_max_tokens: usize,
     rope_kernel_enabled: bool,
     rope_inv_freqs: Vec<f32>,
-    rope_cache: Mutex<HashMap<[usize; 3], (Tensor, Tensor)>>,
 }
 
 struct Qwen35LinearAttention {
@@ -558,7 +607,6 @@ impl Qwen35FullAttention {
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
             )?,
-            rope_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -907,8 +955,7 @@ impl Qwen35FullAttention {
         if self.rope_dim == 0 {
             return Ok((query_states.clone(), key_states.clone()));
         }
-        let (cos, sin) =
-            self.cached_mrope(position_ids, query_states.device(), query_states.dtype())?;
+        let (cos, sin) = self.mrope(position_ids, query_states.device(), query_states.dtype())?;
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
@@ -968,7 +1015,7 @@ impl Qwen35FullAttention {
         let mut sin_tokens = Vec::with_capacity(seq_len);
         for &position_id in position_ids {
             let (cos, sin) =
-                self.cached_mrope(position_id, query_states.device(), query_states.dtype())?;
+                self.mrope(position_id, query_states.device(), query_states.dtype())?;
             cos_tokens.push(cos);
             sin_tokens.push(sin);
         }
@@ -1019,30 +1066,20 @@ impl Qwen35FullAttention {
         ))
     }
 
-    fn cached_mrope(
+    fn mrope(
         &self,
         position_ids: [usize; 3],
         device: &Device,
         dtype: DType,
     ) -> Result<(Tensor, Tensor)> {
-        if let Ok(cache) = self.rope_cache.lock() {
-            if let Some((cos, sin)) = cache.get(&position_ids) {
-                return Ok((cos.clone(), sin.clone()));
-            }
-        }
-
-        let (cos, sin) = build_mrope(
+        build_mrope(
             self.rope_dim,
             position_ids,
             &self.mrope_sections,
             &self.rope_inv_freqs,
             device,
             dtype,
-        )?;
-        if let Ok(mut cache) = self.rope_cache.lock() {
-            cache.insert(position_ids, (cos.clone(), sin.clone()));
-        }
-        Ok((cos, sin))
+        )
     }
 
     fn should_try_rope_kernel(&self, dtype: DType) -> bool {
@@ -1932,7 +1969,8 @@ fn recurrent_gated_delta(
 mod tests {
     use super::{
         append_dense_kv_cache_h, apply_rotary_emb, build_mrope, qwen35_dense_decode_max_pages,
-        qwen35_page_count_for_tokens, repeat_head_states, repeat_head_states_seq,
+        qwen35_page_count_for_tokens, repeat_head_states, repeat_head_states_seq, ConvRingState,
+        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
     };
     use candle_core::{DType, Device, Tensor};
     use candle_nn::rotary_emb;
@@ -1982,6 +2020,35 @@ mod tests {
                 vec![5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]
             ]]
         );
+    }
+
+    #[test]
+    fn runtime_accounting_deduplicates_shared_conv_slots() {
+        let shared = Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap();
+        let single = Qwen35TextRuntimeState {
+            layers: vec![Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState {
+                    slots: vec![shared.clone()],
+                    next_idx: 0,
+                }),
+                recurrent_state: None,
+            }],
+        };
+        let repeated = Qwen35TextRuntimeState {
+            layers: vec![Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState {
+                    slots: vec![shared.clone(), shared.clone(), shared],
+                    next_idx: 0,
+                }),
+                recurrent_state: None,
+            }],
+        };
+
+        assert_eq!(
+            single.allocated_session_bytes(),
+            repeated.allocated_session_bytes()
+        );
+        assert!(single.allocated_session_bytes().unwrap() >= 32 * 4);
     }
 
     #[test]

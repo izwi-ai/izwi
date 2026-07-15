@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::{
@@ -65,6 +65,10 @@ const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
+#[cfg(not(test))]
+const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTranscriptionRecordResponse {
@@ -325,8 +329,9 @@ async fn create_record_stream(
     placeholder: TranscriptionRecord,
     correlation_id: String,
 ) -> Result<Response, ApiError> {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
-    let _ = event_tx.send(
+    const TRANSCRIPTION_EVENT_CAPACITY: usize = 64;
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_EVENT_CAPACITY);
+    let _ = event_tx.try_send(
         serde_json::to_string(&StreamCreatedEvent {
             event: "created",
             record: placeholder.clone(),
@@ -799,13 +804,40 @@ async fn resolve_batch_asr_audio(
         .ok_or_else(|| anyhow::anyhow!("Legacy ASR route audio payload was not found"))
 }
 
+async fn send_transcription_terminal_events(
+    event_tx: mpsc::Sender<String>,
+    terminal_payload: String,
+) {
+    // Deltas and progress are intentionally lossy under backpressure, but the
+    // terminal result and trailing `done` marker define the stream contract.
+    // A connected client can stop polling forever. Preserve ordered terminal
+    // delivery for a slow reader, but bound transport waiting so the producer
+    // task cannot leak indefinitely.
+    if matches!(
+        tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+            event_tx.send(terminal_payload),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        let _ = tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+            event_tx.send(
+                serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
+            ),
+        )
+        .await;
+    }
+}
+
 fn spawn_transcription_processing_task(
     state: AppState,
     record_id: String,
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
-    event_tx: Option<mpsc::UnboundedSender<String>>,
+    event_tx: Option<mpsc::Sender<String>>,
 ) {
     tokio::spawn(async move {
         let result = process_transcription_record(
@@ -834,10 +866,7 @@ fn spawn_transcription_processing_task(
                 })
                 .unwrap_or_default(),
             };
-            let _ = tx.send(payload);
-            let _ = tx.send(
-                serde_json::to_string(&StreamDoneEvent { event: "done" }).unwrap_or_default(),
-            );
+            send_transcription_terminal_events(tx, payload).await;
         }
     });
 }
@@ -848,7 +877,7 @@ async fn process_transcription_record(
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
-    event_tx: Option<mpsc::UnboundedSender<String>>,
+    event_tx: Option<mpsc::Sender<String>>,
     audio_override: Option<Vec<u8>>,
     attempt: Option<&StageExecutionContext>,
     projection_attempt: Option<&RuntimeProjectionAttempt>,
@@ -901,7 +930,7 @@ async fn process_transcription_record_inner(
     parsed: ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
     workload_class: WorkloadClass,
-    event_tx: Option<mpsc::UnboundedSender<String>>,
+    event_tx: Option<mpsc::Sender<String>>,
     audio_override: Option<Vec<u8>>,
     attempt: Option<&StageExecutionContext>,
     projection_attempt: Option<&RuntimeProjectionAttempt>,
@@ -923,7 +952,7 @@ async fn process_transcription_record_inner(
     let transcription_store = state.transcription_store.clone();
     let send_event = |payload: String| {
         if let Some(tx) = &event_tx {
-            let _ = tx.send(payload);
+            let _ = tx.try_send(payload);
         }
     };
     let permit = state
@@ -1008,7 +1037,7 @@ async fn process_transcription_record_inner(
                 runtime_context,
                 move |delta| {
                     if let Some(tx) = &delta_tx {
-                        let _ = tx.send(
+                        let _ = tx.try_send(
                             serde_json::to_string(&StreamDeltaEvent {
                                 event: "delta",
                                 delta,
@@ -1019,7 +1048,7 @@ async fn process_transcription_record_inner(
                 },
                 move |progress| {
                     if let Some(tx) = &progress_tx {
-                        let _ = tx.send(progress_event_payload(progress.clone()));
+                        let _ = tx.try_send(progress_event_payload(progress.clone()));
                     }
                     let store = progress_store.clone();
                     let id = progress_record_id.clone();
@@ -1052,7 +1081,7 @@ async fn process_transcription_record_inner(
                 parsed.max_speakers,
                 move |progress| {
                     if let Some(tx) = &progress_tx {
-                        let _ = tx.send(progress_event_payload(progress.clone()));
+                        let _ = tx.try_send(progress_event_payload(progress.clone()));
                     }
                     let store = progress_store.clone();
                     let id = progress_record_id.clone();
@@ -1958,6 +1987,8 @@ fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::{
         body::Body,
         http::{header, StatusCode},
@@ -1969,10 +2000,10 @@ mod tests {
     use super::{
         alignments_to_word_records, asr_queue_class, build_segment_records, initial_summary_state,
         multipart_field_api_error, parse_bool, parse_create_request, progress_event_payload,
-        sanitize_summary_output, should_retry_transcription_summary_generation,
-        transcription_summary_messages, transcription_summary_params,
-        validate_batch_transcription_model, QueueClass, TranscriptionSummaryStatus,
-        TranscriptionWordRecord,
+        sanitize_summary_output, send_transcription_terminal_events,
+        should_retry_transcription_summary_generation, transcription_summary_messages,
+        transcription_summary_params, validate_batch_transcription_model, QueueClass,
+        TranscriptionSummaryStatus, TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
 
     fn wav_bytes() -> Vec<u8> {
@@ -2174,6 +2205,65 @@ mod tests {
         assert_eq!(value["progress"]["current_chunk"], 1);
         assert_eq!(value["progress"]["total_chunks"], 2);
         assert_eq!(value["progress"]["percent"], 50.0);
+    }
+
+    #[tokio::test]
+    async fn terminal_events_wait_for_capacity_and_preserve_order() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .try_send(serde_json::json!({ "event": "delta", "delta": "first" }).to_string())
+            .expect("initial delta should fill the bounded queue");
+
+        let sender = tokio::spawn(send_transcription_terminal_events(
+            event_tx,
+            serde_json::json!({ "event": "final", "record": { "id": "record-1" } }).to_string(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "terminal sender must wait rather than drop a full-queue event"
+        );
+
+        let delta: serde_json::Value = serde_json::from_str(
+            &event_rx
+                .recv()
+                .await
+                .expect("queued delta should arrive first"),
+        )
+        .expect("delta JSON");
+        let terminal: serde_json::Value =
+            serde_json::from_str(&event_rx.recv().await.expect("final event must be retained"))
+                .expect("terminal JSON");
+        let done: serde_json::Value =
+            serde_json::from_str(&event_rx.recv().await.expect("done event must follow final"))
+                .expect("done JSON");
+
+        assert_eq!(delta["event"], "delta");
+        assert_eq!(terminal["event"], "final");
+        assert_eq!(done["event"], "done");
+        sender.await.expect("terminal sender should finish");
+        assert!(event_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_events_stop_waiting_for_a_non_draining_consumer() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx.send("queued-delta".to_string()).await.unwrap();
+
+        let sender = tokio::spawn(send_transcription_terminal_events(
+            event_tx,
+            serde_json::json!({ "event": "final" }).to_string(),
+        ));
+        tokio::time::timeout(
+            TRANSCRIPTION_TERMINAL_SEND_TIMEOUT + Duration::from_millis(50),
+            sender,
+        )
+        .await
+        .expect("terminal sender must not wait forever")
+        .expect("terminal sender should not panic");
+
+        assert_eq!(event_rx.recv().await.as_deref(), Some("queued-delta"));
+        assert!(event_rx.recv().await.is_none());
     }
 
     #[test]

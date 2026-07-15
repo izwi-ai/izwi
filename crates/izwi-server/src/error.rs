@@ -80,6 +80,17 @@ impl From<izwi_core::Error> for ApiError {
             izwi_core::Error::MissingDependency(_) => {
                 ApiError::service_unavailable(err.to_string())
             }
+            izwi_core::Error::Timeout(_) => ApiError {
+                status: StatusCode::REQUEST_TIMEOUT,
+                message: err.to_string(),
+            },
+            izwi_core::Error::Overloaded(_) | izwi_core::Error::Backpressure(_) => {
+                ApiError::service_unavailable(err.to_string())
+            }
+            izwi_core::Error::Cancelled(_) => ApiError {
+                status: StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                message: err.to_string(),
+            },
             _ => ApiError::internal(err.to_string()),
         }
     }

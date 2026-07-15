@@ -9,7 +9,7 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::decode_request_audio_with_rate;
-use super::{ExecutorOutput, NativeExecutor};
+use super::{ExecutorOutput, ModelSessionResult, NativeExecutor};
 
 impl NativeExecutor {
     fn audio_chat_generation_config(request: &EngineCoreRequest) -> Lfm25AudioGenerationConfig {
@@ -33,14 +33,14 @@ impl NativeExecutor {
     }
 
     fn audio_chat_messages(request: &EngineCoreRequest) -> &[ChatMessage] {
-        request.chat_messages.as_deref().unwrap_or(&[])
+        request.speech_messages_for_execution()
     }
 
     pub(super) fn audio_chat_request(
         &self,
         request: &EngineCoreRequest,
         _scheduled: &ScheduledRequest,
-    ) -> Result<ExecutorOutput> {
+    ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
@@ -54,11 +54,12 @@ impl NativeExecutor {
             .as_deref()
             .or(request.params.voice.as_deref());
         let system_prompt = lfm25_audio_interleaved_system_prompt(
-            request.system_prompt.as_deref(),
+            request.speech_system_prompt_for_execution(),
             requested_speaker,
         );
 
-        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
+        let (samples, sample_rate) =
+            Self::run_blocking(|| decode_request_audio_with_rate(request))?;
         let model = self.with_registry(|registry| {
             registry.try_get_audio_chat(variant).ok_or_else(|| {
                 Error::ModelNotFound(format!("Audio-chat model {variant} is not loaded"))
@@ -149,7 +150,7 @@ impl NativeExecutor {
             }
         })?;
 
-        Ok(ExecutorOutput {
+        Ok(ModelSessionResult::atomic(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput::new(output.samples, output.sample_rate)),
             text: Some(output.text),
@@ -160,6 +161,6 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        })
+        }))
     }
 }

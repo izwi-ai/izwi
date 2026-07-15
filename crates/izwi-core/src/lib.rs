@@ -43,11 +43,16 @@ pub mod tokenizer;
 
 // Re-export main types from the new engine module
 pub use engine::{
-    AsrEngineInput, AudioChatEngineInput, CacheResidency, ChatEngineInput, Engine, EngineAudioInput,
-    AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics,
-    EngineOutput, EngineTask, GenerationParams, KVCacheManager, ModelExecutor, OutputProcessor,
-    PinnedBlockHandle, RequestProcessor, RequestStatus, Scheduler, SchedulerConfig,
-    SchedulingPolicy, StreamingOutput, TtsEngineInput, WorkloadClass,
+    AsrEngineInput, AudioChatEngineInput, BatchKey, CacheResidency, ChatEngineInput, Engine,
+    EngineAudioInput, AsrProgress, AsrProgressPhase, EngineCore, EngineCoreConfig,
+    EngineCoreRequest, EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities,
+    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind, FailureScope, FinishReason,
+    GenerationParams, HealthImpact, KVCacheManager, ModelSessionResult,
+    ModelExecutor, OutputProcessor, PinnedBlockHandle, Priority, RequestProcessor, RequestStatus,
+    ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector,
+    RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey,
+    StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkUnit, WorkloadClass, YieldReason,
 };
 
 // Legacy re-exports for backward compatibility
@@ -72,7 +77,8 @@ pub use runtime::{
     GenerationRequest, GenerationResult,
 };
 pub use runtime::{
-    AudioChunk, EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
+    AudioChunk, CoordinatorSnapshot, EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot,
+    GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
     ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeLatencyStats,
     RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,
@@ -106,8 +112,8 @@ pub use runtime_models::shared::chat::{
 pub use backends::{DeviceProfile, DeviceSelector};
 pub use runtime_models::{
     model_family_registrations, registration_for_variant, registrations_for_capability,
-    FamilyRegistration, LoadedModelDiagnostics, LoadedModelRegistry, ModelRegistry,
-    MODEL_FAMILY_REGISTRATIONS,
+    AsrModelLease, ChatModelLease, FamilyRegistration, LoadedModelDiagnostics, LoadedModelRegistry,
+    ModelRegistry, QwenTtsModelLease, MODEL_FAMILY_REGISTRATIONS,
 };
 
 #[cfg(test)]

@@ -94,6 +94,14 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
                 .then(|| "server is draining for shutdown".to_string()),
         },
         ProbeCheck {
+            name: "runtime_accepting_work",
+            ok: !telemetry.coordinator.draining,
+            message: telemetry
+                .coordinator
+                .draining
+                .then(|| "runtime inference coordinator is draining".to_string()),
+        },
+        ProbeCheck {
             name: "preload_complete",
             ok: preload_complete,
             message: (!preload_complete).then(|| startup_warnings.join("; ")),
@@ -282,6 +290,21 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "not_draining" && !check.ok));
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_unready_when_runtime_is_draining() {
+        let (_guard, state) = test_state("readiness_runtime_draining");
+        state.lifecycle.mark_ready();
+        state.runtime.begin_drain();
+
+        let response = readiness_response(&state).await;
+
+        assert!(!response.ready);
+        assert!(response
+            .checks
+            .iter()
+            .any(|check| check.name == "runtime_accepting_work" && !check.ok));
     }
 
     #[tokio::test]

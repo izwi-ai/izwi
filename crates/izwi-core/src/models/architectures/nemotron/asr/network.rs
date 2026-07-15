@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use serde_json::json;
 
 use super::config::NemotronConfigInventory;
 use crate::error::{Error, Result};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -22,6 +24,7 @@ const ENCODER_HEADS: usize = 8;
 const ENCODER_HEAD_DIM: usize = ENCODER_DIM / ENCODER_HEADS;
 const FF_DIM: usize = ENCODER_DIM * 4;
 const PRED_HIDDEN: usize = 640;
+const PRED_LAYERS: usize = 2;
 const JOINT_HIDDEN: usize = 640;
 const PROMPT_DIM: usize = 128;
 const PROMPT_HIDDEN: usize = 2048;
@@ -36,6 +39,37 @@ const PREEMPH: f32 = 0.97;
 const LOG_GUARD: f32 = 5.960_464_5e-8;
 const NORMALIZE_EPS: f32 = 1e-5;
 const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 10;
+const MAX_SHAPE_CACHE_ENTRIES: usize = 4;
+const MAX_SHAPE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NemotronRealtimeStateShape {
+    pub feature_bins: usize,
+    pub hop_length: usize,
+    pub encoder_layers: usize,
+    pub encoder_dim: usize,
+    pub conv_kernel_size: usize,
+    pub subsampling_factor: usize,
+    pub predictor_hidden: usize,
+    pub predictor_layers: usize,
+    pub joint_hidden: usize,
+    pub max_symbols_per_frame: usize,
+}
+
+pub(super) fn default_realtime_state_shape() -> NemotronRealtimeStateShape {
+    NemotronRealtimeStateShape {
+        feature_bins: N_MELS,
+        hop_length: HOP_LENGTH,
+        encoder_layers: ENCODER_LAYERS,
+        encoder_dim: ENCODER_DIM,
+        conv_kernel_size: CONV_KERNEL_1D,
+        subsampling_factor: SUBSAMPLING_FACTOR,
+        predictor_hidden: PRED_HIDDEN,
+        predictor_layers: PRED_LAYERS,
+        joint_hidden: JOINT_HIDDEN,
+        max_symbols_per_frame: DEFAULT_MAX_SYMBOLS_PER_FRAME,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct NemotronDecodeStats {
@@ -177,6 +211,48 @@ struct StreamingMaskCacheKey {
     dtype: DType,
 }
 
+fn tensor_storage_bytes(tensor: &Tensor) -> Option<usize> {
+    tensor
+        .elem_count()
+        .checked_mul(tensor.dtype().size_in_bytes())
+}
+
+fn insert_bounded_tensor_cache<K>(
+    cache: &mut HashMap<K, Tensor>,
+    key: K,
+    tensor: Tensor,
+    max_entries: usize,
+    max_bytes: usize,
+) where
+    K: Copy + Eq + Hash,
+{
+    let Some(new_bytes) = tensor_storage_bytes(&tensor) else {
+        return;
+    };
+    if max_entries == 0 || new_bytes > max_bytes {
+        return;
+    }
+
+    cache.remove(&key);
+    loop {
+        let retained_bytes = cache.values().fold(0usize, |total, cached| {
+            total.saturating_add(tensor_storage_bytes(cached).unwrap_or(usize::MAX))
+        });
+        if cache.len() < max_entries
+            && retained_bytes
+                .checked_add(new_bytes)
+                .is_some_and(|total| total <= max_bytes)
+        {
+            break;
+        }
+        let Some(victim) = cache.keys().next().copied() else {
+            return;
+        };
+        cache.remove(&victim);
+    }
+    cache.insert(key, tensor);
+}
+
 impl NemotronNetwork {
     pub(super) fn load(vb: &VarBuilder, inventory: &NemotronConfigInventory) -> Result<Self> {
         validate_inventory_for_forward(inventory)?;
@@ -249,6 +325,13 @@ impl NemotronNetwork {
                     "Nemotron prompt dictionary does not contain target_lang '{target_lang}'"
                 ))
             })
+    }
+
+    pub(super) fn realtime_state_shape(&self) -> NemotronRealtimeStateShape {
+        NemotronRealtimeStateShape {
+            max_symbols_per_frame: self.max_symbols_per_frame,
+            ..default_realtime_state_shape()
+        }
     }
 
     pub(super) fn encode_with_prompt(
@@ -502,7 +585,10 @@ impl NemotronNetwork {
         })
     }
 
-    pub(super) fn start_rnnt_stream(&self) -> Result<NemotronRnntStreamState> {
+    pub(super) fn start_rnnt_stream(
+        &self,
+        max_output_tokens: usize,
+    ) -> Result<NemotronRnntStreamState> {
         let device = &self.preprocessor.device;
         let mut predictor_state = self.predictor.initial_state(1, device)?;
         let predictor_out = self
@@ -519,6 +605,7 @@ impl NemotronNetwork {
             predictor_out,
             predictor_projection,
             token_ids: Vec::new(),
+            max_output_tokens,
             stats: NemotronDecodeStats {
                 encoded_frames: 0,
                 emitted_tokens: 0,
@@ -545,8 +632,6 @@ impl NemotronNetwork {
         } else {
             None
         };
-        let mut new_token_ids = Vec::new();
-
         for t in 0..encoded_len {
             let enc_t = if let Some(projection) = encoded_projection.as_ref() {
                 projection.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?
@@ -593,8 +678,13 @@ impl NemotronNetwork {
                     )));
                 }
 
+                if state.token_ids.len() >= state.max_output_tokens {
+                    return Err(Error::InvalidInput(format!(
+                        "Nemotron realtime stream exceeded its model-derived output limit of {} tokens",
+                        state.max_output_tokens
+                    )));
+                }
                 state.token_ids.push(label);
-                new_token_ids.push(label);
                 on_token(label);
                 symbols_this_frame = symbols_this_frame.saturating_add(1);
                 if symbols_this_frame >= self.max_symbols_per_frame {
@@ -616,8 +706,6 @@ impl NemotronNetwork {
         state.stats.emitted_tokens = state.token_ids.len();
 
         Ok(NemotronRnntStreamStep {
-            token_ids: state.token_ids.clone(),
-            new_token_ids,
             stats: state.stats.clone(),
         })
     }
@@ -733,10 +821,17 @@ impl NemotronNetwork {
         }
 
         let tensor = build_rel_positional_embedding_for_dtype(len, ENCODER_DIM, device, dtype)?;
-        self.rel_pos_cache
+        let mut cache = self
+            .rel_pos_cache
             .lock()
-            .map_err(|_| Error::InferenceError("Nemotron rel-pos cache lock poisoned".into()))?
-            .insert(key, tensor.clone());
+            .map_err(|_| Error::InferenceError("Nemotron rel-pos cache lock poisoned".into()))?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 
@@ -770,10 +865,17 @@ impl NemotronNetwork {
 
         let tensor =
             build_limited_context_mask_for_dtype(len, left_context, right_context, device, dtype)?;
-        self.att_mask_cache
+        let mut cache = self
+            .att_mask_cache
             .lock()
-            .map_err(|_| Error::InferenceError("Nemotron mask cache lock poisoned".into()))?
-            .insert(key, tensor.clone());
+            .map_err(|_| Error::InferenceError("Nemotron mask cache lock poisoned".into()))?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 
@@ -811,12 +913,16 @@ impl NemotronNetwork {
             device,
             dtype,
         )?;
-        self.stream_rel_pos_cache
-            .lock()
-            .map_err(|_| {
-                Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
-            })?
-            .insert(key, tensor.clone());
+        let mut cache = self.stream_rel_pos_cache.lock().map_err(|_| {
+            Error::InferenceError("Nemotron stream rel-pos cache lock poisoned".into())
+        })?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 
@@ -857,10 +963,16 @@ impl NemotronNetwork {
             device,
             dtype,
         )?;
-        self.stream_att_mask_cache
-            .lock()
-            .map_err(|_| Error::InferenceError("Nemotron stream mask cache lock poisoned".into()))?
-            .insert(key, tensor.clone());
+        let mut cache = self.stream_att_mask_cache.lock().map_err(|_| {
+            Error::InferenceError("Nemotron stream mask cache lock poisoned".into())
+        })?;
+        insert_bounded_tensor_cache(
+            &mut cache,
+            key,
+            tensor.clone(),
+            MAX_SHAPE_CACHE_ENTRIES,
+            MAX_SHAPE_CACHE_BYTES,
+        );
         Ok(tensor)
     }
 }
@@ -891,7 +1003,7 @@ fn validate_inventory_for_forward(inventory: &NemotronConfigInventory) -> Result
         CONV_KERNEL_1D,
     )?;
     expect_dim("predictor_hidden", inventory.predictor_hidden, PRED_HIDDEN)?;
-    expect_dim("predictor_layers", inventory.predictor_layers, 2)?;
+    expect_dim("predictor_layers", inventory.predictor_layers, PRED_LAYERS)?;
     expect_dim("joint_hidden", inventory.joint_hidden, JOINT_HIDDEN)?;
     expect_dim("prompt_dim", inventory.prompt_dim, PROMPT_DIM)?;
     if inventory.vocab_size.is_none() {
@@ -996,12 +1108,11 @@ pub(super) struct NemotronRnntStreamState {
     predictor_out: Tensor,
     predictor_projection: Option<Tensor>,
     token_ids: Vec<usize>,
+    max_output_tokens: usize,
     stats: NemotronDecodeStats,
 }
 
 pub(super) struct NemotronRnntStreamStep {
-    pub token_ids: Vec<usize>,
-    pub new_token_ids: Vec<usize>,
     pub stats: NemotronDecodeStats,
 }
 
@@ -1018,6 +1129,13 @@ impl NemotronStreamingFeatureState {
             next_frame: 0,
             input_finished: false,
         }
+    }
+
+    pub(super) fn account_host_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
+        accounting.add_bytes(retained_vec_bytes::<f32>(self.preemphasized.capacity())?)
     }
 
     pub(super) fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
@@ -1073,6 +1191,16 @@ impl NemotronStreamingPreEncodeState {
         }
     }
 
+    pub(super) fn account_tensor_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
+        if let Some(features) = &self.features {
+            accounting.add_tensor(features)?;
+        }
+        Some(())
+    }
+
     pub(super) fn push_features(&mut self, chunk: NemotronStreamingFeatureChunk) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
@@ -1120,6 +1248,24 @@ impl NemotronStreamingEncoderState {
                 .map(|_| ConformerLayerStreamState::new())
                 .collect(),
         }
+    }
+
+    pub(super) fn account_tensor_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
+        if let Some(pending) = &self.pending_pre_encoded {
+            accounting.add_tensor(pending)?;
+        }
+        for layer in &self.layer_states {
+            if let Some(cache) = &layer.attn_cache {
+                accounting.add_tensor(cache)?;
+            }
+            if let Some(cache) = &layer.conv_cache {
+                accounting.add_tensor(cache)?;
+            }
+        }
+        Some(())
     }
 
     pub(super) fn push_pre_encoded(&mut self, chunk: NemotronStreamingEncodedChunk) -> Result<()> {
@@ -1208,9 +1354,35 @@ impl NemotronStreamingEncoderState {
 }
 
 impl NemotronRnntStreamState {
-    fn token_ids(&self) -> &[usize] {
+    pub(super) fn token_ids(&self) -> &[usize] {
         &self.token_ids
     }
+
+    pub(super) fn account_host_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
+        accounting.add_bytes(retained_vec_bytes::<usize>(self.token_ids.capacity())?)
+    }
+
+    pub(super) fn account_tensor_storage(
+        &self,
+        accounting: &mut TensorStorageAccounting,
+    ) -> Option<()> {
+        accounting.add_tensor(&self.predictor_state.h0)?;
+        accounting.add_tensor(&self.predictor_state.c0)?;
+        accounting.add_tensor(&self.predictor_state.h1)?;
+        accounting.add_tensor(&self.predictor_state.c1)?;
+        accounting.add_tensor(&self.predictor_out)?;
+        if let Some(projection) = &self.predictor_projection {
+            accounting.add_tensor(projection)?;
+        }
+        Some(())
+    }
+}
+
+fn retained_vec_bytes<T>(capacity: usize) -> Option<u64> {
+    u64::try_from(capacity.checked_mul(std::mem::size_of::<T>())?).ok()
 }
 
 impl ConformerLayerStreamState {
@@ -2328,13 +2500,30 @@ impl Joint {
     }
 }
 
+pub(super) fn resample_linear_output_len(
+    input_samples: usize,
+    src_rate: u32,
+    dst_rate: u32,
+) -> usize {
+    if src_rate == dst_rate || input_samples < 2 {
+        return input_samples;
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return 0;
+    }
+
+    let numerator = (input_samples as u128) * u128::from(dst_rate);
+    let rounded = (numerator + u128::from(src_rate / 2)) / u128::from(src_rate);
+    usize::try_from(rounded.max(1)).unwrap_or(usize::MAX)
+}
+
 pub(super) fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if src_rate == dst_rate || audio.len() < 2 {
         return audio.to_vec();
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
+    let out_len = resample_linear_output_len(audio.len(), src_rate, dst_rate);
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = (i as f64) / ratio;
@@ -2664,6 +2853,40 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shape_tensor_cache_bounds_entries_and_retained_bytes() {
+        let mut cache = HashMap::new();
+        for key in 0usize..3 {
+            insert_bounded_tensor_cache(
+                &mut cache,
+                key,
+                Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+                2,
+                32,
+            );
+        }
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&2));
+        assert!(
+            cache
+                .values()
+                .map(|tensor| tensor_storage_bytes(tensor).unwrap())
+                .sum::<usize>()
+                <= 32
+        );
+
+        insert_bounded_tensor_cache(
+            &mut cache,
+            99,
+            Tensor::zeros(9, DType::F32, &Device::Cpu).unwrap(),
+            2,
+            32,
+        );
+        assert!(!cache.contains_key(&99));
+        assert_eq!(cache.len(), 2);
+    }
 
     fn test_preprocessor(normalize: FeatureNormalize) -> NemotronPreprocessor {
         let device = Device::Cpu;
@@ -3204,7 +3427,7 @@ mod tests {
     #[test]
     fn rnnt_stream_state_accumulates_blank_stats_across_chunks() {
         let network = rnnt_test_network(vec![0.0, 0.0, 10.0], DEFAULT_MAX_SYMBOLS_PER_FRAME);
-        let mut state = network.start_rnnt_stream().unwrap();
+        let mut state = network.start_rnnt_stream(128).unwrap();
         let first = Tensor::zeros((1, 2, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
         let second = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
         let mut emitted = Vec::new();
@@ -3212,10 +3435,9 @@ mod tests {
         let step = network
             .decode_rnnt_streaming_chunk(&mut state, &first, 2, &mut |token| emitted.push(token))
             .unwrap();
-        assert!(step.new_token_ids.is_empty());
-        assert!(step.token_ids.is_empty());
         assert_eq!(step.stats.encoded_frames, 2);
         assert_eq!(step.stats.blank_frames, 2);
+        assert!(state.token_ids().is_empty());
 
         let step = network
             .decode_rnnt_streaming_chunk(&mut state, &second, 1, &mut |token| emitted.push(token))
@@ -3227,27 +3449,25 @@ mod tests {
     }
 
     #[test]
-    fn rnnt_stream_state_keeps_token_history_across_chunks() {
+    fn rnnt_stream_state_keeps_token_history_without_copying_it_into_steps() {
         let network = rnnt_test_network(vec![10.0, 0.0, 1.0], 2);
-        let mut state = network.start_rnnt_stream().unwrap();
+        let mut state = network.start_rnnt_stream(128).unwrap();
         let encoded = Tensor::zeros((1, 1, ENCODER_DIM), DType::F32, &Device::Cpu).unwrap();
         let mut emitted = Vec::new();
 
         let first = network
             .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| emitted.push(token))
             .unwrap();
-        assert_eq!(first.new_token_ids, vec![0, 0]);
-        assert_eq!(first.token_ids, vec![0, 0]);
         assert_eq!(first.stats.guard_exits, 1);
+        assert_eq!(state.token_ids(), &[0, 0]);
 
         let second = network
             .decode_rnnt_streaming_chunk(&mut state, &encoded, 1, &mut |token| emitted.push(token))
             .unwrap();
-        assert_eq!(second.new_token_ids, vec![0, 0]);
-        assert_eq!(second.token_ids, vec![0, 0, 0, 0]);
         assert_eq!(second.stats.encoded_frames, 2);
         assert_eq!(second.stats.emitted_tokens, 4);
         assert_eq!(second.stats.guard_exits, 2);
+        assert_eq!(state.token_ids(), &[0, 0, 0, 0]);
         assert_eq!(emitted, vec![0, 0, 0, 0]);
     }
 

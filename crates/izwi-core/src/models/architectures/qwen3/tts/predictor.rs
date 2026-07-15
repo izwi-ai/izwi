@@ -10,7 +10,7 @@ use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::config::CodePredictorConfig;
 use crate::models::architectures::qwen3::tts::rope::{
-    build_rope_inv_freq, build_rope_window_full, qwen_rotate_half, RopeCache,
+    build_rope_inv_freq, build_rope_window_full, qwen_rotate_half,
 };
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -22,6 +22,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, repeat_kv, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 
 /// KV Cache for the code predictor
@@ -33,6 +34,33 @@ pub struct CodePredictorCache {
 }
 
 impl CodePredictorCache {
+    pub fn storage_bytes(&self) -> usize {
+        self.k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+            .map(KvPage::storage_bytes)
+            .sum()
+    }
+
+    pub fn allocated_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.account_storage(&mut accounting)?;
+        Some(accounting.bytes())
+    }
+
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        for page in self
+            .k_pages
+            .iter()
+            .chain(self.v_pages.iter())
+            .flat_map(|pages| pages.iter())
+        {
+            page.account_storage(accounting)?;
+        }
+        Some(())
+    }
+
     /// Create a new cache
     pub fn new(num_layers: usize) -> Self {
         Self::with_page_size_and_quantization(
@@ -391,7 +419,6 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_inv_freq: Vec<f32>,
-    rope_cache: RopeCache,
 }
 
 impl Attention {
@@ -432,7 +459,6 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             rope_inv_freq: build_rope_inv_freq(head_dim, cfg.rope_theta),
-            rope_cache: RopeCache::default(),
         })
     }
 
@@ -455,23 +481,13 @@ impl Attention {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
 
-        let (cos, sin) = if x.device().is_cuda() {
-            self.rope_cache.get_window(
-                seq_len,
-                start_pos,
-                &self.rope_inv_freq,
-                x.device(),
-                x.dtype(),
-            )?
-        } else {
-            build_rope_window_full(
-                seq_len,
-                start_pos,
-                &self.rope_inv_freq,
-                x.device(),
-                x.dtype(),
-            )?
-        };
+        let (cos, sin) = build_rope_window_full(
+            seq_len,
+            start_pos,
+            &self.rope_inv_freq,
+            x.device(),
+            x.dtype(),
+        )?;
 
         let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(2)?;

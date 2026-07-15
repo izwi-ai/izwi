@@ -41,6 +41,10 @@ pub struct EngineCoreConfig {
     #[serde(default)]
     pub scheduling_policy: SchedulingPolicy,
 
+    /// Enable prefix reuse only for executor-backed physical cache snapshots.
+    #[serde(default)]
+    pub enable_prefix_caching: bool,
+
     /// Enable chunked prefill for long prompts
     #[serde(default = "default_chunked_prefill")]
     pub enable_chunked_prefill: bool,
@@ -153,7 +157,7 @@ fn default_max_blocks() -> usize {
     1024
 }
 fn default_chunked_prefill() -> bool {
-    true
+    false
 }
 fn default_chunked_prefill_threshold() -> usize {
     192
@@ -161,6 +165,7 @@ fn default_chunked_prefill_threshold() -> usize {
 fn default_sample_rate() -> u32 {
     24000
 }
+
 fn default_num_codebooks() -> usize {
     8
 }
@@ -182,10 +187,10 @@ fn default_num_threads() -> usize {
         .min(8)
 }
 fn default_enable_preemption() -> bool {
-    true
+    false
 }
 fn default_enable_adaptive_batching() -> bool {
-    true
+    false
 }
 fn default_min_tokens_per_step() -> usize {
     96
@@ -215,7 +220,7 @@ fn default_low_sla_ms() -> u64 {
     2_500
 }
 fn default_enable_power_adaptive() -> bool {
-    true
+    false
 }
 fn default_thermal_pressure_hint() -> f64 {
     std::env::var("IZWI_THERMAL_PRESSURE")
@@ -234,13 +239,13 @@ fn default_power_save_mode() -> bool {
         .unwrap_or(false)
 }
 fn default_enable_decode_quanta() -> bool {
-    true
+    false
 }
 fn default_max_decode_tokens_per_request() -> usize {
     2
 }
 fn default_enable_kv_tiering() -> bool {
-    true
+    false
 }
 
 impl Default for EngineCoreConfig {
@@ -254,6 +259,7 @@ impl Default for EngineCoreConfig {
             kv_cache_dtype: default_kv_cache_dtype(),
             max_blocks: default_max_blocks(),
             scheduling_policy: SchedulingPolicy::default(),
+            enable_prefix_caching: false,
             enable_chunked_prefill: default_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),

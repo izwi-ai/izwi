@@ -5,7 +5,8 @@
 //! capability that needs them while preserving the existing engine contract.
 
 use crate::engine::{
-    EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams, WorkloadClass,
+    EngineCoreRequest, EngineStreamPolicy, GenerationParams as CoreGenerationParams, Priority,
+    WorkloadClass,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -21,6 +22,7 @@ pub(crate) enum RequestPriority {
     Background,
     Normal,
     Interactive,
+    Critical,
 }
 
 impl Default for RequestPriority {
@@ -117,7 +119,30 @@ impl RequestEnvelope {
     pub(crate) fn with_runtime_context(mut self, context: RuntimeRequestContext) -> Self {
         self.workload_class = context.workload_class;
         self.admission_ms = context.admission_ms;
+        self.priority = match context.priority {
+            Priority::Low => RequestPriority::Background,
+            Priority::Normal => RequestPriority::Normal,
+            Priority::High => RequestPriority::Interactive,
+            Priority::Critical => RequestPriority::Critical,
+        };
+        self.deadline = context.deadline;
         self
+    }
+
+    fn apply_to(self, request: &mut EngineCoreRequest) {
+        request.id = self.request_id;
+        request.model_variant = Some(self.model_variant);
+        request.correlation_id = self.correlation_id;
+        request.priority = match self.priority {
+            RequestPriority::Background => Priority::Low,
+            RequestPriority::Normal => Priority::Normal,
+            RequestPriority::Interactive => Priority::High,
+            RequestPriority::Critical => Priority::Critical,
+        };
+        request.deadline = self.deadline;
+        request.stream_policy = self.stream_policy.into();
+        request.workload_class = self.workload_class;
+        request.admission_ms = self.admission_ms;
     }
 }
 
@@ -176,12 +201,7 @@ impl TtsRuntimeRequest {
 
     pub(crate) fn into_engine_request(self, params: CoreGenerationParams) -> EngineCoreRequest {
         let mut request = EngineCoreRequest::tts(self.text);
-        request.id = self.envelope.request_id;
-        request.model_variant = Some(self.envelope.model_variant);
-        request.correlation_id = self.envelope.correlation_id;
-        request.stream_policy = self.envelope.stream_policy.into();
-        request.workload_class = self.envelope.workload_class;
-        request.admission_ms = self.envelope.admission_ms;
+        self.envelope.apply_to(&mut request);
         request.language = self.language;
         request.reference_audio = self.reference_audio;
         request.reference_text = self.reference_text;
@@ -256,12 +276,7 @@ impl AsrRuntimeRequest {
             RuntimeAudioInput::Base64(audio_base64) => EngineCoreRequest::asr(audio_base64),
             RuntimeAudioInput::Bytes(audio_bytes) => EngineCoreRequest::asr_bytes(audio_bytes),
         };
-        request.id = self.envelope.request_id;
-        request.model_variant = Some(self.envelope.model_variant);
-        request.correlation_id = self.envelope.correlation_id;
-        request.stream_policy = self.envelope.stream_policy.into();
-        request.workload_class = self.envelope.workload_class;
-        request.admission_ms = self.envelope.admission_ms;
+        self.envelope.apply_to(&mut request);
         if let Some(language) = self.language {
             request = request.with_language(language);
         }
@@ -311,12 +326,7 @@ impl ChatRuntimeRequest {
 
     pub(crate) fn into_engine_request(self) -> EngineCoreRequest {
         let mut request = EngineCoreRequest::chat(self.messages);
-        request.id = self.envelope.request_id;
-        request.model_variant = Some(self.envelope.model_variant);
-        request.correlation_id = self.envelope.correlation_id;
-        request.stream_policy = self.envelope.stream_policy.into();
-        request.workload_class = self.envelope.workload_class;
-        request.admission_ms = self.envelope.admission_ms;
+        self.envelope.apply_to(&mut request);
         request.params = self.params;
         request.chat_config = self.chat_config;
         request.prompt_tokens = self.prompt_tokens;
@@ -388,12 +398,7 @@ impl AudioChatRuntimeRequest {
                 EngineCoreRequest::speech_to_speech_bytes(audio_bytes)
             }
         };
-        request.id = self.envelope.request_id;
-        request.model_variant = Some(self.envelope.model_variant);
-        request.correlation_id = self.envelope.correlation_id;
-        request.stream_policy = self.envelope.stream_policy.into();
-        request.workload_class = self.envelope.workload_class;
-        request.admission_ms = self.envelope.admission_ms;
+        self.envelope.apply_to(&mut request);
         request.chat_messages = (!self.messages.is_empty()).then_some(self.messages);
         request.system_prompt = self
             .system_prompt
@@ -598,12 +603,16 @@ mod tests {
 
     #[test]
     fn asr_runtime_request_builds_core_request_with_audio_bytes() {
+        let deadline = Instant::now();
         let runtime_request = AsrRuntimeRequest::from_bytes(
             vec![1, 2, 3],
             ModelVariant::WhisperLargeV3Turbo,
             Some("en".to_string()),
             Some("corr-asr".to_string()),
-            RuntimeRequestContext::new(WorkloadClass::Batch).with_admission_ms(3.5),
+            RuntimeRequestContext::new(WorkloadClass::Batch)
+                .with_admission_ms(3.5)
+                .with_priority(Priority::Critical)
+                .with_deadline(deadline),
         )
         .expect("valid ASR request");
 
@@ -618,6 +627,8 @@ mod tests {
         assert_eq!(core_request.correlation_id.as_deref(), Some("corr-asr"));
         assert_eq!(core_request.workload_class, WorkloadClass::Batch);
         assert_eq!(core_request.admission_ms, Some(3.5));
+        assert_eq!(core_request.priority, Priority::Critical);
+        assert_eq!(core_request.deadline, Some(deadline));
     }
 
     #[test]
@@ -638,12 +649,9 @@ mod tests {
             core_request.asr_prompt.as_deref(),
             Some("spell Izwi correctly")
         );
-        match core_request.task {
-            EngineTask::Asr(input) => {
-                assert_eq!(input.prompt.as_deref(), Some("spell Izwi correctly"));
-            }
-            other => panic!("unexpected task payload: {other:?}"),
-        }
+        // Large direct fields remain in their compatibility owner until the
+        // Engine/RequestProcessor preflight establishes the typed task view.
+        assert!(matches!(core_request.task, EngineTask::Asr(_)));
     }
 
     #[test]

@@ -9,10 +9,13 @@ use crate::model::ModelVariant;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::TaskType;
-use super::{ExecutorOutput, NativeExecutor};
+use super::{
+    ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, NativeExecutor,
+};
+use crate::engine::{BatchDispatch, BatchDispatchKind};
 
 type RouteHandler =
-    fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ExecutorOutput>;
+    fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ModelSessionResult>;
 type VariantMatcher = fn(ModelVariant) -> bool;
 
 struct DispatchRoute {
@@ -95,22 +98,26 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled_req: &ScheduledRequest,
-    ) -> ExecutorOutput {
+    ) -> ModelSessionResult {
         let Some(request) = Self::find_request(requests, scheduled_req) else {
-            return ExecutorOutput::error(
+            return ModelSessionResult::atomic(ExecutorOutput::error(
                 scheduled_req.request_id.clone(),
                 "Scheduled request not found in batch",
-            );
+            ));
         };
 
+        if request.is_cancelled() {
+            return ModelSessionResult::cancelled(ExecutorOutput::cancelled(request.id.clone()));
+        }
+
         let Some(route) = Self::resolve_route(request.task_type, request.model_variant) else {
-            return ExecutorOutput::error(
+            return ModelSessionResult::atomic(ExecutorOutput::error(
                 request.id.clone(),
                 format!(
                     "No executor route for task {:?} (variant {:?})",
                     request.task_type, request.model_variant
                 ),
-            );
+            ));
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -135,7 +142,10 @@ impl NativeExecutor {
 
         match result {
             Ok(output) => output,
-            Err(err) => ExecutorOutput::error(request.id.clone(), err.to_string()),
+            Err(err) => ModelSessionResult::atomic(ExecutorOutput::error(
+                request.id.clone(),
+                err.to_string(),
+            )),
         }
     }
 
@@ -151,14 +161,14 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
+    ) -> Result<Vec<ModelSessionResult>> {
         let worker_count = self.config.request_parallelism.min(scheduled.len()).max(1);
         let mut partitions: Vec<Vec<(usize, ScheduledRequest)>> = vec![Vec::new(); worker_count];
         for (idx, item) in scheduled.iter().enumerate() {
             partitions[idx % worker_count].push((idx, item.clone()));
         }
 
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, ExecutorOutput)>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, ModelSessionResult)>>();
         thread::scope(|scope| {
             for chunk in partitions {
                 if chunk.is_empty() {
@@ -177,7 +187,7 @@ impl NativeExecutor {
         });
         drop(tx);
 
-        let mut ordered: Vec<Option<ExecutorOutput>> = vec![None; scheduled.len()];
+        let mut ordered: Vec<Option<ModelSessionResult>> = vec![None; scheduled.len()];
         while let Ok(batch_outputs) = rx.recv() {
             for (idx, output) in batch_outputs {
                 if idx < ordered.len() {
@@ -191,10 +201,10 @@ impl NativeExecutor {
             .enumerate()
             .map(|(idx, output)| {
                 output.unwrap_or_else(|| {
-                    ExecutorOutput::error(
+                    ModelSessionResult::atomic(ExecutorOutput::error(
                         scheduled[idx].request_id.clone(),
                         "Parallel executor worker failed to produce output",
-                    )
+                    ))
                 })
             })
             .collect();
@@ -205,15 +215,173 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorOutput>> {
-        if self.can_parallelize_requests(scheduled.len()) {
-            return self.execute_requests_parallel(requests, scheduled);
-        }
-
-        let outputs = scheduled
+    ) -> Result<Vec<ExecutorStepResult>> {
+        // Reserve model-owned cache growth before any tensor state can be
+        // allocated. The lease remains attached to the exact session until
+        // finish, abort, failure cleanup, or recompute preemption.
+        self.reserve_scheduled_cache(requests, scheduled)?;
+        self.prepare_scheduled_cache(scheduled)?;
+        let (outputs, dispatch) = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled)
+        {
+            let result = result?;
+            let dispatch = if result.tensor_width > 1 {
+                BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width)
+            } else {
+                BatchDispatch::serial()
+            };
+            (
+                result
+                    .outputs
+                    .into_iter()
+                    .map(ModelSessionResult::atomic)
+                    .collect(),
+                dispatch,
+            )
+        } else if self.can_parallelize_requests(scheduled.len()) {
+            (
+                self.execute_requests_parallel(requests, scheduled)?,
+                BatchDispatch::new(BatchDispatchKind::RequestParallel, scheduled.len()),
+            )
+        } else {
+            (
+                scheduled
+                    .iter()
+                    .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
+                    .collect(),
+                BatchDispatch::serial(),
+            )
+        };
+        Ok(scheduled
             .iter()
-            .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
-            .collect();
-        Ok(outputs)
+            .zip(outputs)
+            .map(|(scheduled, output)| {
+                let Some(request) = requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                else {
+                    return ExecutorStepResult::from_session(
+                        scheduled,
+                        ModelSessionResult::atomic(ExecutorOutput::error(
+                            scheduled.request_id.clone(),
+                            "Scheduled request not found during cache reconciliation",
+                        )),
+                    )
+                    .with_dispatch(dispatch);
+                };
+                match self.reconcile_scheduled_cache(request, scheduled, &output.output) {
+                    Ok(observed) => ExecutorStepResult::from_session(scheduled, output)
+                        .with_dispatch(dispatch)
+                        .with_observed_resources(observed),
+                    Err(err) => {
+                        let release =
+                            ModelExecutor::cleanup_session(self, &scheduled.session_key());
+                        let observed = super::cache_observation_after_release(release);
+                        ExecutorStepResult::from_session(
+                            scheduled,
+                            ModelSessionResult::atomic(ExecutorOutput::error(
+                                scheduled.request_id.clone(),
+                                format!("physical cache reconciliation failed: {err}"),
+                            )),
+                        )
+                        .with_dispatch(dispatch)
+                        .with_observed_resources(observed)
+                    }
+                }
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::BackendKind;
+    use crate::engine::{BatchDispatchKind, InputRange, SequencePhase, WorkUnit};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn scheduled(request_id: &str, plan_id: u64) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id,
+            request_id: request_id.to_string(),
+            sequence_id: plan_id,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn cancelled_request_is_rejected_before_model_dispatch() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let mut request = EngineCoreRequest::tts("cancelled");
+        request.id = "cancelled".to_string();
+        let signal = Arc::new(AtomicBool::new(true));
+        request.set_cancellation_signal(signal);
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Prefill,
+                input: crate::engine::InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        };
+
+        let result = executor.execute_single_request(&[&request], &scheduled);
+        assert!(result.output.finished);
+        assert!(result.output.error.is_none());
+        assert_eq!(
+            result.disposition,
+            crate::engine::ExecutionDisposition::Finished(crate::engine::FinishReason::Cancelled)
+        );
+    }
+
+    #[test]
+    fn backend_policy_controls_real_request_parallel_dispatch() {
+        for (backend, expected) in [
+            (BackendKind::Cpu, BatchDispatchKind::RequestParallel),
+            (BackendKind::Metal, BatchDispatchKind::Serial),
+            (BackendKind::Cuda, BatchDispatchKind::RequestParallel),
+        ] {
+            let mut config = super::super::WorkerConfig::default();
+            config.backend = backend;
+            config.request_parallelism = 2;
+            let executor = NativeExecutor::new(config);
+            let mut first = EngineCoreRequest::tts("first");
+            first.id = "parallel-first".to_string();
+            let mut second = EngineCoreRequest::tts("second");
+            second.id = "parallel-second".to_string();
+            let scheduled = vec![scheduled(&first.id, 1), scheduled(&second.id, 2)];
+
+            let outputs = executor
+                .execute_requests(&[&first, &second], &scheduled)
+                .expect("dispatch should return per-request results");
+
+            assert_eq!(outputs.len(), 2);
+            assert!(outputs
+                .iter()
+                .all(|output| output.dispatch.kind == expected));
+            let expected_width = if expected == BatchDispatchKind::RequestParallel {
+                2
+            } else {
+                1
+            };
+            assert!(outputs
+                .iter()
+                .all(|output| output.dispatch.width == expected_width));
+        }
     }
 }

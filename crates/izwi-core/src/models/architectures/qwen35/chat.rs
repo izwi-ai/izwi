@@ -16,6 +16,7 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::Tokenizer;
@@ -26,12 +27,33 @@ use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 
-#[derive(Debug)]
-struct PreparedPrompt {
+/// Fully prepared Qwen3.5 prefill input. The runtime carries this exact
+/// artifact into the executor so media loading and vision encoding happen once.
+#[derive(Debug, Clone)]
+pub struct Qwen35PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
     vision_inputs: Option<PreparedVisionInputs>,
+}
+
+impl Qwen35PreparedPrompt {
+    pub fn prompt_ids(&self) -> &[u32] {
+        &self.prompt_ids
+    }
+}
+
+fn resolve_prepared_prompt<F>(
+    prepared: Option<&Qwen35PreparedPrompt>,
+    prepare: F,
+) -> Result<Qwen35PreparedPrompt>
+where
+    F: FnOnce() -> Result<Qwen35PreparedPrompt>,
+{
+    match prepared {
+        Some(prepared) => Ok(prepared.clone()),
+        None => prepare(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +74,22 @@ pub struct ChatDecodeState {
     next_text_position: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+}
+
+impl ChatDecodeState {
+    /// Observable per-request allocations. Rotary windows are transient and
+    /// no longer retained in model-global caches.
+    pub fn allocated_session_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.text_state.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.logits)?;
+        Some(accounting.bytes())
+    }
+
+    /// Complete per-session scheduler accounting.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        self.allocated_session_bytes()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -391,7 +429,31 @@ impl Qwen35ChatModel {
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
     ) -> Result<Vec<u32>> {
-        Ok(self.prepare_prompt(messages, config)?.prompt_ids)
+        Ok(self
+            .prepare_prompt_for_execution(messages, config)?
+            .prompt_ids)
+    }
+
+    pub fn prepare_prompt_for_execution(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+    ) -> Result<Qwen35PreparedPrompt> {
+        self.prepare_prompt(messages, config)
+    }
+
+    /// Model-derived authorization for all retained incremental decode tensors.
+    pub fn session_cache_reservation_bytes(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Result<u64> {
+        qwen35_session_cache_reservation_bytes(
+            &self.text_config,
+            self.tokenizer.vocab_size,
+            prompt_tokens,
+            max_new_tokens,
+        )
     }
 
     pub fn generate(
@@ -471,7 +533,27 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
     ) -> Result<ChatDecodeState> {
-        let prepared_prompt = self.prepare_prompt(messages, config)?;
+        self.start_decode_state_with_optional_prepared(messages, max_new_tokens, config, None)
+    }
+
+    pub fn start_decode_state_with_optional_prepared(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+    ) -> Result<ChatDecodeState> {
+        let prepared_prompt =
+            resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        self.start_decode_state_with_prepared(&prepared_prompt, max_new_tokens, config)
+    }
+
+    pub fn start_decode_state_with_prepared(
+        &self,
+        prepared_prompt: &Qwen35PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+    ) -> Result<ChatDecodeState> {
         if prepared_prompt.prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one tokenizable message".to_string(),
@@ -573,7 +655,7 @@ impl Qwen35ChatModel {
 
     fn prefill_prompt(
         &self,
-        prepared_prompt: &PreparedPrompt,
+        prepared_prompt: &Qwen35PreparedPrompt,
         text_state: &mut Qwen35TextRuntimeState,
     ) -> Result<Tensor> {
         let mut logits: Option<Tensor> = None;
@@ -664,7 +746,7 @@ impl Qwen35ChatModel {
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-    ) -> Result<PreparedPrompt> {
+    ) -> Result<Qwen35PreparedPrompt> {
         let prompt = render_prompt(messages, config, self.default_enable_thinking())?;
         let image_placeholders = prompt.matches(IMAGE_PAD_PLACEHOLDER).count();
         let video_placeholders = prompt.matches(VIDEO_PAD_PLACEHOLDER).count();
@@ -685,7 +767,7 @@ impl Qwen35ChatModel {
             }
             let prompt_ids = self.tokenizer.encode_text(&prompt)?;
             let prompt_positions = build_text_positions(prompt_ids.len());
-            return Ok(PreparedPrompt {
+            return Ok(Qwen35PreparedPrompt {
                 next_text_position: prompt_positions.len(),
                 prompt_ids,
                 prompt_positions,
@@ -715,13 +797,87 @@ impl Qwen35ChatModel {
             self.tokenizer.specials.video_pad,
             self.vision_model.spatial_merge_size(),
         )?;
-        Ok(PreparedPrompt {
+        Ok(Qwen35PreparedPrompt {
             prompt_ids,
             prompt_positions,
             next_text_position,
             vision_inputs: Some(vision_inputs),
         })
     }
+}
+
+fn qwen35_session_cache_reservation_bytes(
+    cfg: &Qwen35TextConfig,
+    vocab_size: usize,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+) -> Result<u64> {
+    if prompt_tokens == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 cache authorization requires exact precomputed prompt tokens".to_string(),
+        ));
+    }
+    let total_tokens = prompt_tokens
+        .checked_add(max_new_tokens.max(1))
+        .ok_or_else(|| Error::Overloaded("Qwen3.5 session token bound overflow".to_string()))?;
+    if total_tokens > cfg.context_length {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3.5 session requires {total_tokens} tokens but the model context is {}",
+            cfg.context_length
+        )));
+    }
+    qwen35_session_cache_upper_bound_bytes(cfg, vocab_size, prompt_tokens, max_new_tokens)
+        .ok_or_else(|| Error::Overloaded("Qwen3.5 session cache bound overflow".to_string()))
+}
+
+fn qwen35_session_cache_upper_bound_bytes(
+    cfg: &Qwen35TextConfig,
+    vocab_size: usize,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+) -> Option<u64> {
+    let total_tokens = prompt_tokens.max(1).checked_add(max_new_tokens.max(1))?;
+    let cache_capacity = total_tokens.checked_next_power_of_two()?;
+    let full_layers = if cfg.full_attention_interval == 0 {
+        0
+    } else {
+        cfg.block_count / cfg.full_attention_interval
+    };
+    let linear_layers = cfg.block_count.checked_sub(full_layers)?;
+    let as_u64 = |value: usize| u64::try_from(value).ok();
+    let bytes_per_element = 4u64;
+
+    let kv_width = cfg
+        .attention_key_length
+        .checked_add(cfg.attention_value_length)?
+        .checked_mul(cfg.attention_head_count_kv)?;
+    let one_kv_copy = as_u64(full_layers)?
+        .checked_mul(as_u64(cache_capacity)?)?
+        .checked_mul(as_u64(kv_width)?)?
+        .checked_mul(bytes_per_element)?;
+    // Account for both representations even though normal migration takes the
+    // dense tensors before publishing pages. This keeps authorization safe if
+    // a backend retains either backing allocation across the conversion.
+    let kv_bytes = one_kv_copy.checked_mul(2)?;
+
+    let conv_width = cfg
+        .ssm_state_size
+        .checked_mul(cfg.ssm_group_count)?
+        .checked_mul(2)?
+        .checked_add(cfg.ssm_inner_size)?;
+    let conv_slots = cfg.ssm_conv_kernel.saturating_sub(1);
+    let recurrent_width = cfg.ssm_state_size.checked_mul(cfg.ssm_inner_size)?;
+    let linear_state_width = conv_width
+        .checked_mul(conv_slots)?
+        .checked_add(recurrent_width)?;
+    let linear_bytes = as_u64(linear_layers)?
+        .checked_mul(as_u64(linear_state_width)?)?
+        .checked_mul(bytes_per_element)?;
+    let logits_bytes = as_u64(vocab_size)?.checked_mul(bytes_per_element)?;
+
+    kv_bytes
+        .checked_add(linear_bytes)?
+        .checked_add(logits_bytes)
 }
 
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
@@ -1490,12 +1646,77 @@ mod tests {
     use crate::backends::{DeviceKind, DeviceProfile, DeviceSelector};
     use crate::models::shared::chat::{ChatMediaInput, ChatMediaKind, ChatRequestConfig};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn local_model_dir(name: &str) -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home)
             .join("Library/Application Support/izwi/models")
             .join(name)
+    }
+
+    #[test]
+    fn prepared_prompt_reuse_skips_fetch_and_vision_encode_builder() {
+        let prepared = Qwen35PreparedPrompt {
+            prompt_ids: vec![1, 2, 3],
+            prompt_positions: build_text_positions(3),
+            next_text_position: 3,
+            vision_inputs: None,
+        };
+        let preparation_calls = AtomicUsize::new(0);
+        let resolved = resolve_prepared_prompt(Some(&prepared), || {
+            preparation_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(Error::InferenceError(
+                "fetch/vision encode should not run".to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
+        assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn session_cache_bound_covers_growth_and_duplicate_kv_backing() {
+        let config = Qwen35TextConfig {
+            architecture: "qwen35".to_string(),
+            block_count: 8,
+            context_length: 4_096,
+            embedding_length: 1_024,
+            feed_forward_length: 3_072,
+            attention_head_count: 16,
+            attention_head_count_kv: 4,
+            attention_key_length: 64,
+            attention_value_length: 64,
+            rope_dimension_sections: vec![8, 12, 12],
+            rope_dimension_count: 64,
+            rope_freq_base: 10_000.0,
+            attention_layer_norm_rms_epsilon: 1e-6,
+            ssm_conv_kernel: 4,
+            ssm_state_size: 64,
+            ssm_group_count: 4,
+            ssm_time_step_rank: 8,
+            ssm_inner_size: 1_024,
+            full_attention_interval: 4,
+        };
+
+        let bound = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 32, 16).unwrap();
+        let larger = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 64, 32).unwrap();
+        let authorized = qwen35_session_cache_reservation_bytes(&config, 32_000, 32, 16).unwrap();
+        let cache_capacity = (32usize + 16).next_power_of_two() as u64;
+        let one_kv_copy = 2u64 * cache_capacity * 4 * (64 + 64) * 4;
+
+        assert_eq!(authorized, bound);
+        assert!(bound >= one_kv_copy * 2);
+        assert!(larger > bound);
+        assert!(matches!(
+            qwen35_session_cache_reservation_bytes(&config, 32_000, 0, 16),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            qwen35_session_cache_reservation_bytes(&config, 32_000, 4_090, 16),
+            Err(Error::InvalidInput(message)) if message.contains("model context is 4096")
+        ));
     }
 
     fn local_metal_device() -> Option<DeviceProfile> {

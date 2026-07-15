@@ -5,7 +5,7 @@ use tracing::{info, warn};
 use crate::backends::BackendPlan;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::runtime::service::RuntimeService;
+use crate::runtime::lifecycle::controller::ModelLifecycleController;
 
 pub(super) struct ResolvedModelLoad {
     pub variant: ModelVariant,
@@ -17,7 +17,7 @@ pub(super) struct AcquiredModelLoad {
     pub model_path: PathBuf,
 }
 
-impl RuntimeService {
+impl ModelLifecycleController {
     pub(super) async fn resolve_model_load(
         &self,
         variant: ModelVariant,

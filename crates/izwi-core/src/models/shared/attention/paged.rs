@@ -3,6 +3,7 @@
 use candle_core::{DType, Tensor, D};
 
 use crate::error::{Error, Result};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
 const Q4_0_BLOCK_SIZE: usize = 32;
@@ -84,6 +85,9 @@ pub enum KvPage {
 
 impl KvPage {
     fn from_dense(tensor: Tensor, quantization: KvCacheQuantization) -> Result<Self> {
+        // A page must own compact storage. Retaining a narrow view can keep an
+        // entire previous backing allocation alive and invalidate byte accounting.
+        let tensor = tensor.contiguous()?;
         match quantization {
             KvCacheQuantization::None => Ok(Self::Dense(tensor)),
             KvCacheQuantization::Int8 => {
@@ -122,6 +126,37 @@ impl KvPage {
                     num_elements,
                     target_dtype,
                 })
+            }
+        }
+    }
+
+    pub fn storage_bytes(&self) -> usize {
+        match self {
+            Self::Dense(tensor) => tensor.elem_count() * tensor.dtype().size_in_bytes(),
+            Self::Int8 { values, .. } => {
+                values.elem_count() * values.dtype().size_in_bytes() + std::mem::size_of::<f32>()
+            }
+            Self::Q4_0 { values, scales, .. } => {
+                values.elem_count() * values.dtype().size_in_bytes()
+                    + scales.elem_count() * scales.dtype().size_in_bytes()
+            }
+        }
+    }
+
+    /// Add the backing tensor allocations retained by this page.
+    ///
+    /// This differs from [`Self::storage_bytes`] when a dense page is a view:
+    /// the full shared backing allocation remains live and must be reserved.
+    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        match self {
+            Self::Dense(tensor) => accounting.add_tensor(tensor),
+            Self::Int8 { values, .. } => {
+                accounting.add_tensor(values)?;
+                accounting.add_bytes(std::mem::size_of::<f32>() as u64)
+            }
+            Self::Q4_0 { values, scales, .. } => {
+                accounting.add_tensor(values)?;
+                accounting.add_tensor(scales)
             }
         }
     }
@@ -664,6 +699,19 @@ mod tests {
         assert_eq!(pages.len(), 4);
         assert_eq!(pages[2].seq_len().unwrap(), 4);
         assert_eq!(pages[3].seq_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn kv_page_storage_bytes_tracks_dense_and_quantized_storage() {
+        let device = Device::Cpu;
+        let tensor = Tensor::ones((1, 5, 2, 4), DType::F32, &device).unwrap();
+        let dense = KvPage::from_dense(tensor.clone(), KvCacheQuantization::None).unwrap();
+        let int8 = KvPage::from_dense(tensor.clone(), KvCacheQuantization::Int8).unwrap();
+        let q4 = KvPage::from_dense(tensor, KvCacheQuantization::Q4_0).unwrap();
+
+        assert_eq!(dense.storage_bytes(), 1 * 5 * 2 * 4 * 4);
+        assert!(int8.storage_bytes() < dense.storage_bytes());
+        assert!(q4.storage_bytes() < int8.storage_bytes());
     }
 
     #[test]

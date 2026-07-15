@@ -96,6 +96,8 @@ pub struct KVBlock {
     pub residency: CacheResidency,
     /// Number of outstanding pins for backend execution.
     pub pin_count: usize,
+    /// Last reference was released while an execution pin was outstanding.
+    pending_free: bool,
 }
 
 impl KVBlock {
@@ -107,6 +109,7 @@ impl KVBlock {
             content_hash: None,
             residency: CacheResidency::Cpu,
             pin_count: 0,
+            pending_free: false,
         }
     }
 
@@ -116,6 +119,7 @@ impl KVBlock {
         self.content_hash = None;
         self.residency = CacheResidency::Cpu;
         self.pin_count = 0;
+        self.pending_free = false;
     }
 }
 
@@ -184,8 +188,12 @@ impl BlockAllocator {
             block.ref_count -= 1;
 
             if block.ref_count == 0 {
-                self.free_list.push_back(block_id);
-                self.num_allocated = self.num_allocated.saturating_sub(1);
+                if block.pin_count == 0 {
+                    self.free_list.push_back(block_id);
+                    self.num_allocated = self.num_allocated.saturating_sub(1);
+                } else {
+                    block.pending_free = true;
+                }
             }
         }
     }
@@ -207,6 +215,23 @@ impl BlockAllocator {
         for &id in block_ids {
             self.free(id);
         }
+    }
+
+    fn unpin(&mut self, block_id: BlockId) -> bool {
+        let Some(block) = self.blocks.get_mut(block_id) else {
+            return false;
+        };
+        block.pin_count = block.pin_count.saturating_sub(1);
+        if block.pin_count == 0 && block.residency == CacheResidency::PinnedCpu {
+            block.residency = CacheResidency::Cpu;
+        }
+        if block.pin_count == 0 && block.ref_count == 0 && block.pending_free {
+            block.pending_free = false;
+            self.free_list.push_back(block_id);
+            self.num_allocated = self.num_allocated.saturating_sub(1);
+            return true;
+        }
+        false
     }
 
     /// Get block by ID.
@@ -651,8 +676,34 @@ impl KVCacheManager {
 
     /// Free all blocks for a request.
     pub fn free(&mut self, request_id: &RequestId) {
+        self.free_internal(request_id, true);
+    }
+
+    /// Free blocks for recompute preemption without retaining a prefix snapshot.
+    pub fn free_for_preemption(&mut self, request_id: &RequestId) -> usize {
+        self.free_internal(request_id, false)
+    }
+
+    /// Blocks that would become genuinely free if this request were released.
+    pub fn reclaimable_blocks(&self, request_id: &RequestId) -> usize {
+        self.request_blocks
+            .get(request_id)
+            .into_iter()
+            .flatten()
+            .filter(|block_id| {
+                self.allocator
+                    .get_block(**block_id)
+                    .is_some_and(|block| block.ref_count == 1 && block.pin_count == 0)
+            })
+            .count()
+    }
+
+    fn free_internal(&mut self, request_id: &RequestId, persist_prefix: bool) -> usize {
         let released_blocks = self.request_blocks.remove(request_id).unwrap_or_default();
-        self.persist_request_prefix_snapshot(request_id, &released_blocks);
+        if persist_prefix {
+            self.persist_request_prefix_snapshot(request_id, &released_blocks);
+        }
+        let mut freed = 0;
         if !released_blocks.is_empty() {
             let allocated_before = self.allocator.num_allocated();
             debug!(
@@ -662,7 +713,7 @@ impl KVCacheManager {
                 released_blocks
             );
             self.allocator.free_blocks(&released_blocks);
-            let freed = allocated_before.saturating_sub(self.allocator.num_allocated());
+            freed = allocated_before.saturating_sub(self.allocator.num_allocated());
             self.telemetry.total_frees += freed as u64;
         }
         self.cleanup_prefix_levels_for_request(request_id);
@@ -677,6 +728,7 @@ impl KVCacheManager {
         }
         self.block_table.remove(request_id);
         self.maybe_tune_soft_limit();
+        freed
     }
 
     fn hash_prefix_tokens(tokens: &[u32]) -> u64 {
@@ -823,10 +875,8 @@ impl KVCacheManager {
         let Some(entry) = self.persistent_prefix_entries.remove(&key) else {
             return;
         };
-        self.telemetry.persistent_prefix_evictions = self
-            .telemetry
-            .persistent_prefix_evictions
-            .saturating_add(1);
+        self.telemetry.persistent_prefix_evictions =
+            self.telemetry.persistent_prefix_evictions.saturating_add(1);
         self.persistent_prefix_lru
             .retain(|existing| existing != &key);
         let allocated_before = self.allocator.num_allocated();
@@ -968,11 +1018,8 @@ impl KVCacheManager {
     /// Release pinned block handles.
     pub fn unpin_blocks(&mut self, handles: &[PinnedBlockHandle]) {
         for handle in handles {
-            if let Some(block) = self.allocator.get_block_mut(handle.block_id) {
-                block.pin_count = block.pin_count.saturating_sub(1);
-                if block.pin_count == 0 && block.residency == CacheResidency::PinnedCpu {
-                    block.residency = CacheResidency::Cpu;
-                }
+            if self.allocator.unpin(handle.block_id) {
+                self.telemetry.total_frees = self.telemetry.total_frees.saturating_add(1);
             }
         }
     }
@@ -1047,14 +1094,14 @@ impl KVCacheManager {
         let mut gpu_resident_blocks = 0;
         let mut pinned_blocks = 0;
         for block in &self.allocator.blocks {
+            if block.pin_count > 0 || block.residency == CacheResidency::PinnedCpu {
+                pinned_blocks += 1;
+            }
             if block.ref_count == 0 {
                 continue;
             }
             if block.residency == CacheResidency::Gpu {
                 gpu_resident_blocks += 1;
-            }
-            if block.pin_count > 0 || block.residency == CacheResidency::PinnedCpu {
-                pinned_blocks += 1;
             }
         }
 
@@ -1728,5 +1775,56 @@ mod tests {
         assert_eq!(blocks2.len(), 2);
         assert_eq!(blocks2, blocks1);
         assert!(manager.stats().telemetry.shared_prefix_hits >= 1);
+    }
+
+    #[test]
+    fn preemption_free_does_not_retain_prefix_snapshot() {
+        let mut manager = KVCacheManager::new(KVCacheConfig {
+            max_blocks: 4,
+            block_size: 2,
+            ..Default::default()
+        });
+        let source = "preempt-source".to_string();
+        let tokens = vec![10, 11, 12, 13];
+        assert_eq!(
+            manager
+                .allocate_with_prefix_tokens(&source, 2, &tokens)
+                .len(),
+            2
+        );
+        assert_eq!(manager.free_for_preemption(&source), 2);
+
+        let reuser = "preempt-reuser".to_string();
+        assert_eq!(
+            manager
+                .allocate_with_prefix_tokens(&reuser, 2, &tokens)
+                .len(),
+            2
+        );
+        assert_eq!(manager.stats().telemetry.shared_prefix_blocks_reused, 0);
+    }
+
+    #[test]
+    fn pinned_block_is_not_recycled_until_execution_unpins_it() {
+        let mut manager = KVCacheManager::new(KVCacheConfig {
+            max_blocks: 1,
+            block_size: 2,
+            ..Default::default()
+        });
+        let request = "pinned-owner".to_string();
+        let blocks = manager.allocate(&request, 1);
+        let handles = manager.pin_request_blocks(&request, CacheResidency::Gpu);
+        assert_eq!(handles.len(), 1);
+
+        manager.free(&request);
+        assert_eq!(manager.stats().allocated_blocks, 1);
+        assert_eq!(manager.stats().free_blocks, 0);
+        assert!(manager.allocate(&"too-early".to_string(), 1).is_empty());
+
+        manager.unpin_blocks(&handles);
+        assert_eq!(manager.stats().allocated_blocks, 0);
+        assert_eq!(manager.stats().free_blocks, 1);
+        let reused = manager.allocate(&"after-unpin".to_string(), 1);
+        assert_eq!(reused, blocks);
     }
 }

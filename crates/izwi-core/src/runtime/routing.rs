@@ -194,13 +194,16 @@ impl<'a> RuntimeRouter<'a> {
         let mut fallback_chain = Vec::new();
 
         for model_variant in candidates {
-            let execution_request =
-                CapabilityExecutionRequest::new(request.capability, model_variant)
-                    .with_streaming_required(request.streaming_required);
+            let backend_plan = self.backend_router.select(model_variant);
+            let execution_request = CapabilityExecutionRequest::new(
+                request.capability,
+                model_variant,
+                backend_plan.backend.kind(),
+            )
+            .with_streaming_required(request.streaming_required);
 
             match execution_registry.plan(execution_request) {
                 Ok(execution_plan) => {
-                    let backend_plan = self.backend_router.select(model_variant);
                     fallback_chain.push(RoutingCandidateTrace {
                         model_variant,
                         accepted: true,

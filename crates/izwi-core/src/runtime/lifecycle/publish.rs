@@ -1,9 +1,9 @@
 use crate::catalog::ModelFamily;
 use crate::error::Result;
+use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::lifecycle::instantiate::{InstantiatedModelLoad, InstantiatedPayload};
-use crate::runtime::service::RuntimeService;
 
-impl RuntimeService {
+impl ModelLifecycleController {
     pub(super) async fn publish_loaded_model(
         &self,
         instantiated: InstantiatedModelLoad,
@@ -46,7 +46,6 @@ impl RuntimeService {
                 ) {
                     self.set_active_tts_variant(variant).await;
                 }
-                self.model_manager.mark_loaded(variant).await;
             }
             ModelFamily::Tokenizer => {
                 if let InstantiatedPayload::Tokenizer(Some(tokenizer)) = payload {
@@ -56,8 +55,6 @@ impl RuntimeService {
 
                 let mut codec_guard = self.codec.write().await;
                 codec_guard.load_weights(&model_path)?;
-
-                self.model_manager.mark_loaded(variant).await;
             }
         }
 

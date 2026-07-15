@@ -18,13 +18,15 @@ use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
 use network::{
-    resample_linear, NemotronEncodeProfile, NemotronNetwork, NemotronRnntStreamState,
-    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+    default_realtime_state_shape, resample_linear, NemotronEncodeProfile, NemotronNetwork,
+    NemotronRealtimeStateShape, NemotronRnntStreamState, NemotronStreamingEncoderState,
+    NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -32,6 +34,12 @@ const DEFAULT_STRIP_LANG_TAGS: bool = true;
 const DEFAULT_MAX_AUDIO_SECONDS_HINT: f32 = 30.0;
 const STREAMING_FRAME_MS: usize = 80;
 const NEMOTRON_ASR_DTYPE_ENV: &str = "IZWI_NEMOTRON_ASR_DTYPE";
+const NEMOTRON_REALTIME_MAX_SECONDS_ENV: &str = "IZWI_NEMOTRON_REALTIME_MAX_SECONDS";
+const DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS: usize = 300;
+const CONSERVATIVE_DECODED_TOKEN_EXPANSION: usize = 4;
+const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
+const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
+const REALTIME_PEAK_TEXT_COPIES: u64 = 4;
 const SUPPORTED_TARGET_LANGS: &[&str] = &[
     "auto", "en-US", "en-GB", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "pt-PT",
     "nl-NL", "de-DE", "tr-TR", "ru-RU", "ar-AR", "hi-IN", "ja-JP", "ko-KR", "vi-VN", "uk-UA",
@@ -53,6 +61,21 @@ pub struct NemotronAsrDecodeStep {
     pub text: String,
     pub tokens_generated: usize,
     pub finished: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NemotronRealtimeResourceReservation {
+    pub max_samples: usize,
+    pub host_bytes: u64,
+    pub tensor_bytes: u64,
+    max_output_tokens: usize,
+    max_text_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NemotronRealtimeResourceUsage {
+    pub host_bytes: u64,
+    pub tensor_bytes: u64,
 }
 
 pub struct NemotronAsrModel {
@@ -134,6 +157,20 @@ impl NemotronDecoder {
             Self::HfTokenizer(_) => "huggingface_tokenizer",
             Self::ConfigLabels(_) => "config_labels",
             Self::Vocab(_) => "vocab_file",
+        }
+    }
+
+    fn max_token_bytes(&self) -> usize {
+        match self {
+            Self::HfTokenizer(tokenizer) => tokenizer
+                .vocab()
+                .keys()
+                .map(|token| token.len())
+                .max()
+                .unwrap_or(1),
+            Self::ConfigLabels(vocab) | Self::Vocab(vocab) => {
+                vocab.iter().map(String::len).max().unwrap_or(1)
+            }
         }
     }
 }
@@ -403,6 +440,10 @@ pub struct NemotronStreamingState {
     profile: NemotronStreamingProfile,
     prompt: NemotronPromptCondition,
     sample_rate: u32,
+    max_samples: usize,
+    max_text_bytes: usize,
+    emit_partials: bool,
+    resampler: NemotronStreamingResampler,
     samples: Vec<f32>,
     buffered_samples: usize,
     consumed_samples: usize,
@@ -419,11 +460,267 @@ pub struct NemotronStreamingState {
     emitted_tokens: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct NemotronStreamingResampler {
+    source_rate: Option<u32>,
+    source_samples: usize,
+    projected_output_samples: usize,
+    emitted_output_samples: usize,
+    retained_source_samples: [Option<(usize, f32)>; 2],
+    last_source_sample: Option<f32>,
+}
+
+impl NemotronStreamingResampler {
+    fn resample_chunk(
+        &self,
+        samples: &[f32],
+        source_rate: u32,
+        target_rate: u32,
+        max_output_samples: usize,
+    ) -> Result<(Self, Vec<f32>)> {
+        if source_rate == 0 || target_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Audio sample rate must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(expected_rate) = self.source_rate {
+            if expected_rate != source_rate {
+                return Err(Error::InvalidInput(format!(
+                    "Nemotron realtime stream sample rate changed from {expected_rate} Hz to {source_rate} Hz"
+                )));
+            }
+        }
+
+        let source_samples = self
+            .source_samples
+            .checked_add(samples.len())
+            .ok_or_else(|| {
+                Error::InvalidInput("Nemotron realtime source sample count overflowed".to_string())
+            })?;
+        let projected_output_samples =
+            cumulative_resampled_output_len(source_samples, source_rate, target_rate)?;
+        if projected_output_samples > max_output_samples {
+            return Err(realtime_sample_limit_error(max_output_samples, target_rate));
+        }
+
+        let mut next = self.clone();
+        next.source_rate = Some(source_rate);
+        next.source_samples = source_samples;
+        next.projected_output_samples = projected_output_samples;
+        let output_capacity = projected_output_samples
+            .checked_sub(next.emitted_output_samples)
+            .ok_or_else(realtime_resampler_invariant)?;
+        let mut output = Vec::with_capacity(output_capacity);
+        let chunk_start = self.source_samples;
+
+        while next.emitted_output_samples < projected_output_samples {
+            let output_index = next.emitted_output_samples;
+            let source_position = (output_index as u128)
+                .checked_mul(u128::from(source_rate))
+                .ok_or_else(realtime_resampler_invariant)?;
+            let left_index = usize::try_from(source_position / u128::from(target_rate))
+                .map_err(|_| realtime_resampler_invariant())?;
+            let remainder = source_position % u128::from(target_rate);
+            let needs_right_sample = remainder != 0;
+            if left_index >= source_samples
+                || (needs_right_sample && left_index.saturating_add(1) >= source_samples)
+            {
+                break;
+            }
+
+            let left = stream_source_sample(self, samples, chunk_start, left_index)?;
+            let value = if needs_right_sample {
+                let right = stream_source_sample(self, samples, chunk_start, left_index + 1)?;
+                let fraction = (remainder as f64 / target_rate as f64) as f32;
+                left * (1.0 - fraction) + right * fraction
+            } else {
+                left
+            };
+            output.push(value);
+            next.emitted_output_samples = next.emitted_output_samples.saturating_add(1);
+        }
+
+        if let Some(last) = samples.last() {
+            next.last_source_sample = Some(*last);
+        }
+        let next_source_position = (next.emitted_output_samples as u128)
+            .checked_mul(u128::from(source_rate))
+            .ok_or_else(realtime_resampler_invariant)?;
+        let next_left_index = usize::try_from(next_source_position / u128::from(target_rate))
+            .map_err(|_| realtime_resampler_invariant())?;
+        next.retained_source_samples = [None, None];
+        for (slot, sample_index) in [next_left_index, next_left_index.saturating_add(1)]
+            .into_iter()
+            .enumerate()
+        {
+            if sample_index < source_samples {
+                next.retained_source_samples[slot] = Some((
+                    sample_index,
+                    stream_source_sample(self, samples, chunk_start, sample_index)?,
+                ));
+            }
+        }
+        Ok((next, output))
+    }
+
+    fn finish(&self) -> Result<(Self, Vec<f32>)> {
+        let remaining = self
+            .projected_output_samples
+            .checked_sub(self.emitted_output_samples)
+            .ok_or_else(realtime_resampler_invariant)?;
+        if remaining == 0 {
+            return Ok((self.clone(), Vec::new()));
+        }
+        let last_sample = self
+            .last_source_sample
+            .ok_or_else(realtime_resampler_invariant)?;
+        let mut next = self.clone();
+        next.emitted_output_samples = next.projected_output_samples;
+        Ok((next, vec![last_sample; remaining]))
+    }
+}
+
+fn cumulative_resampled_output_len(
+    input_samples: usize,
+    source_rate: u32,
+    target_rate: u32,
+) -> Result<usize> {
+    if source_rate == 0 || target_rate == 0 {
+        return Err(Error::InvalidInput(
+            "Audio sample rate must be greater than zero".to_string(),
+        ));
+    }
+    if input_samples == 0 {
+        return Ok(0);
+    }
+    let numerator = (input_samples as u128)
+        .checked_mul(u128::from(target_rate))
+        .and_then(|value| value.checked_add(u128::from(source_rate / 2)))
+        .ok_or_else(realtime_resampler_invariant)?;
+    usize::try_from((numerator / u128::from(source_rate)).max(1))
+        .map_err(|_| realtime_resampler_invariant())
+}
+
+fn stream_source_sample(
+    state: &NemotronStreamingResampler,
+    samples: &[f32],
+    chunk_start: usize,
+    sample_index: usize,
+) -> Result<f32> {
+    if sample_index < chunk_start {
+        for (retained_index, retained_sample) in state.retained_source_samples.into_iter().flatten()
+        {
+            if retained_index == sample_index {
+                return Ok(retained_sample);
+            }
+        }
+        return Err(Error::InferenceError(format!(
+            "Nemotron realtime resampler requested unretained source sample {sample_index} before chunk {chunk_start}"
+        )));
+    }
+    samples
+        .get(sample_index - chunk_start)
+        .copied()
+        .ok_or_else(|| {
+            Error::InferenceError(format!(
+                "Nemotron realtime resampler requested source sample {sample_index} outside chunk {chunk_start}..{}",
+                chunk_start.saturating_add(samples.len())
+            ))
+        })
+}
+
+fn realtime_resampler_invariant() -> Error {
+    Error::InferenceError("Nemotron realtime resampler state is inconsistent".to_string())
+}
+
+fn realtime_sample_limit_error(max_samples: usize, sample_rate: u32) -> Error {
+    Error::InvalidInput(format!(
+        "Nemotron realtime stream exceeds the configured limit of {} samples ({:.3} seconds at {} Hz)",
+        max_samples,
+        max_samples as f64 / sample_rate as f64,
+        sample_rate
+    ))
+}
+
+struct NemotronRealtimeEventBatch {
+    previous_text: String,
+    changed: bool,
+    is_final: bool,
+}
+
+impl NemotronRealtimeEventBatch {
+    fn new(state: &NemotronStreamingState) -> Self {
+        Self {
+            previous_text: state.assembled_text.clone(),
+            changed: false,
+            is_final: false,
+        }
+    }
+
+    fn record_decoded_text(
+        &mut self,
+        state: &mut NemotronStreamingState,
+        text: String,
+        is_final: bool,
+    ) -> Result<()> {
+        if text.len() > state.max_text_bytes {
+            return Err(Error::InferenceError(format!(
+                "Nemotron realtime decoder output exceeded its model-derived limit of {} bytes",
+                state.max_text_bytes
+            )));
+        }
+        self.changed |= state.assembled_text != text;
+        state.assembled_text = text;
+        self.is_final |= is_final;
+        Ok(())
+    }
+
+    fn mark_final(&mut self) {
+        self.is_final = true;
+    }
+
+    #[cfg(test)]
+    fn pending_event_count(&self) -> usize {
+        usize::from(self.changed || self.is_final)
+    }
+
+    #[cfg(test)]
+    fn retained_text_bytes(&self) -> usize {
+        self.previous_text.capacity()
+    }
+
+    fn into_events(self, state: &mut NemotronStreamingState) -> Vec<NemotronRealtimeStreamEvent> {
+        if (self.is_final && state.final_event_emitted)
+            || (!self.is_final && (!state.emit_partials || !self.changed))
+        {
+            return Vec::new();
+        }
+
+        let delta = if self.is_final && !state.emit_partials && state.events_emitted == 0 {
+            state.assembled_text.clone()
+        } else {
+            text_delta(&self.previous_text, &state.assembled_text)
+        };
+        let event = NemotronRealtimeStreamEvent {
+            text: state.assembled_text.clone(),
+            delta,
+            is_final: self.is_final,
+            chunk_index: state.events_emitted,
+        };
+        state.final_event_emitted |= self.is_final;
+        state.events_emitted = state.events_emitted.saturating_add(1);
+        vec![event]
+    }
+}
+
 impl NemotronStreamingState {
     fn new(
         profile: NemotronStreamingProfile,
         prompt: NemotronPromptCondition,
         sample_rate: u32,
+        max_samples: usize,
+        max_text_bytes: usize,
+        emit_partials: bool,
     ) -> Self {
         let encoder_state = NemotronStreamingEncoderState::new(
             profile.left_context_frames,
@@ -433,6 +730,10 @@ impl NemotronStreamingState {
             profile,
             prompt,
             sample_rate,
+            max_samples,
+            max_text_bytes,
+            emit_partials,
+            resampler: NemotronStreamingResampler::default(),
             samples: Vec::new(),
             buffered_samples: 0,
             consumed_samples: 0,
@@ -466,6 +767,10 @@ impl NemotronStreamingState {
         self.buffered_samples
     }
 
+    pub fn max_samples(&self) -> usize {
+        self.max_samples
+    }
+
     pub fn consumed_samples(&self) -> usize {
         self.consumed_samples
     }
@@ -482,15 +787,64 @@ impl NemotronStreamingState {
         self.emitted_tokens
     }
 
+    /// Complete retained backing allocation for this exact stream session.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        let usage = self.session_resource_usage()?;
+        usage.host_bytes.checked_add(usage.tensor_bytes)
+    }
+
+    pub fn session_resource_usage(&self) -> Option<NemotronRealtimeResourceUsage> {
+        let mut host = TensorStorageAccounting::default();
+        host.add_bytes(retained_capacity_bytes::<f32>(self.samples.capacity())?)?;
+        host.add_bytes(retained_capacity_bytes::<u8>(
+            self.assembled_text.capacity(),
+        )?)?;
+        host.add_bytes(retained_capacity_bytes::<u8>(
+            self.prompt.target_lang.capacity(),
+        )?)?;
+        if let Some(prompt) = &self.prompt.context_prompt {
+            host.add_bytes(retained_capacity_bytes::<u8>(prompt.capacity())?)?;
+        }
+        self.feature_state.account_host_storage(&mut host)?;
+        let mut tensors = TensorStorageAccounting::default();
+        self.pre_encode_state.account_tensor_storage(&mut tensors)?;
+        self.encoder_state.account_tensor_storage(&mut tensors)?;
+        if let Some(rnnt_state) = &self.rnnt_state {
+            rnnt_state.account_host_storage(&mut host)?;
+            rnnt_state.account_tensor_storage(&mut tensors)?;
+        }
+        Some(NemotronRealtimeResourceUsage {
+            host_bytes: host.bytes(),
+            tensor_bytes: tensors.bytes(),
+        })
+    }
+
     pub fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
         if self.input_finished {
             return Err(Error::InvalidInput(
                 "Cannot push audio into a finalized Nemotron streaming state".to_string(),
             ));
         }
+        let next_samples = self.ensure_can_accept_samples(samples.len())?;
         self.samples.extend_from_slice(samples);
-        self.buffered_samples = self.buffered_samples.saturating_add(samples.len());
+        self.buffered_samples = next_samples;
         Ok(())
+    }
+
+    fn ensure_can_accept_samples(&self, additional_samples: usize) -> Result<usize> {
+        let next_samples = self
+            .buffered_samples
+            .checked_add(additional_samples)
+            .ok_or_else(|| {
+                Error::InvalidInput("Nemotron realtime stream sample count overflowed".to_string())
+            })?;
+        if next_samples > self.max_samples {
+            return Err(realtime_sample_limit_error(
+                self.max_samples,
+                self.sample_rate,
+            ));
+        }
+        Ok(next_samples)
     }
 
     pub fn finish_input(&mut self) {
@@ -548,6 +902,13 @@ impl NemotronStreamingState {
             "profile": self.profile.diagnostics(),
             "prompt": self.prompt.diagnostics(),
             "sample_rate": self.sample_rate,
+            "max_samples": self.max_samples,
+            "max_duration_seconds": self.max_samples as f64 / self.sample_rate as f64,
+            "emit_partials": self.emit_partials,
+            "source_sample_rate": self.resampler.source_rate,
+            "source_samples": self.resampler.source_samples,
+            "projected_output_samples": self.resampler.projected_output_samples,
+            "emitted_output_samples": self.resampler.emitted_output_samples,
             "buffered_samples": self.buffered_samples,
             "consumed_samples": self.consumed_samples,
             "chunks_processed": self.chunks_processed,
@@ -560,6 +921,181 @@ impl NemotronStreamingState {
             "supports_realtime_stream_decode": self.rnnt_state.is_some(),
         })
     }
+}
+
+fn retained_capacity_bytes<T>(capacity: usize) -> Option<u64> {
+    u64::try_from(capacity.checked_mul(std::mem::size_of::<T>())?).ok()
+}
+
+fn realtime_max_samples_for_seconds(sample_rate: u32, seconds: usize) -> Result<usize> {
+    if sample_rate == 0 || seconds == 0 {
+        return Err(Error::ConfigError(
+            "Nemotron realtime stream duration and sample rate must be greater than zero"
+                .to_string(),
+        ));
+    }
+    (sample_rate as usize).checked_mul(seconds).ok_or_else(|| {
+        Error::ConfigError("Nemotron realtime stream sample limit overflowed".to_string())
+    })
+}
+
+fn configured_realtime_max_samples(sample_rate: u32) -> Result<usize> {
+    let seconds = match std::env::var(NEMOTRON_REALTIME_MAX_SECONDS_ENV) {
+        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            Error::ConfigError(format!(
+                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must be a positive whole number of seconds"
+            ))
+        })?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::ConfigError(format!(
+                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must contain valid UTF-8"
+            )));
+        }
+    };
+    realtime_max_samples_for_seconds(sample_rate, seconds)
+}
+
+fn estimate_realtime_resource_reservation(
+    max_samples: usize,
+    max_decoder_token_bytes: usize,
+    profile: &NemotronStreamingProfile,
+    shape: NemotronRealtimeStateShape,
+    prompt: &NemotronPromptCondition,
+) -> Result<NemotronRealtimeResourceReservation> {
+    if max_samples == 0 || shape.hop_length == 0 || shape.subsampling_factor == 0 {
+        return Err(Error::ConfigError(
+            "Nemotron realtime resource shape contains a zero limit".to_string(),
+        ));
+    }
+
+    let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
+    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    let max_output_tokens = encoded_frames
+        .checked_mul(shape.max_symbols_per_frame)
+        .ok_or_else(realtime_reservation_overflow)?;
+    let decoded_token_bytes = max_decoder_token_bytes
+        .max(1)
+        .checked_mul(CONSERVATIVE_DECODED_TOKEN_EXPANSION)
+        .ok_or_else(realtime_reservation_overflow)?
+        .max(16);
+    let max_text_bytes = max_output_tokens
+        .checked_mul(decoded_token_bytes)
+        .ok_or_else(realtime_reservation_overflow)?;
+
+    let audio_capacity = conservative_vec_capacity(max_samples, 4)?;
+    let token_capacity = conservative_vec_capacity(max_output_tokens, 4)?;
+    let text_capacity = conservative_vec_capacity(max_text_bytes, 8)?;
+    let target_lang_capacity = conservative_vec_capacity(prompt.target_lang.len(), 8)?;
+    let context_prompt_capacity = conservative_vec_capacity(
+        prompt
+            .context_prompt
+            .as_deref()
+            .map(str::len)
+            .unwrap_or_default(),
+        8,
+    )?;
+
+    let audio_capacity_bytes = checked_element_bytes(audio_capacity, std::mem::size_of::<f32>())?;
+    let mut host_bytes = REALTIME_HOST_FIXED_OVERHEAD_BYTES;
+    // One conservative capacity covers retained target-rate stream audio. The
+    // second covers the ordered owned input packet plus transient resampling
+    // output, so moving packet work onto a blocking worker cannot exceed the
+    // immutable job authorization.
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        audio_capacity_bytes
+            .checked_mul(2)
+            .ok_or_else(realtime_reservation_overflow)?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        checked_element_bytes(token_capacity, std::mem::size_of::<usize>())?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        checked_element_bytes(token_capacity, std::mem::size_of::<u32>())?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        u64::try_from(text_capacity)
+            .map_err(|_| realtime_reservation_overflow())?
+            .checked_mul(REALTIME_PEAK_TEXT_COPIES)
+            .ok_or_else(realtime_reservation_overflow)?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        u64::try_from(target_lang_capacity).map_err(|_| realtime_reservation_overflow())?,
+    )?;
+    host_bytes = checked_add_bytes(
+        host_bytes,
+        u64::try_from(context_prompt_capacity).map_err(|_| realtime_reservation_overflow())?,
+    )?;
+
+    let feature_elements = checked_product(&[feature_frames, shape.feature_bins])?;
+    let pending_encoder_elements = checked_product(&[encoded_frames, shape.encoder_dim])?;
+    let layer_cache_frames = profile
+        .left_context_frames
+        .checked_add(shape.conv_kernel_size.saturating_sub(1))
+        .ok_or_else(realtime_reservation_overflow)?;
+    let layer_cache_elements =
+        checked_product(&[shape.encoder_layers, layer_cache_frames, shape.encoder_dim])?;
+    let predictor_state_tensors = shape
+        .predictor_layers
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(realtime_reservation_overflow)?;
+    let predictor_elements = checked_product(&[predictor_state_tensors, shape.predictor_hidden])?
+        .checked_add(shape.joint_hidden)
+        .ok_or_else(realtime_reservation_overflow)?;
+    let tensor_elements = feature_elements
+        .checked_add(pending_encoder_elements)
+        .and_then(|value| value.checked_add(layer_cache_elements))
+        .and_then(|value| value.checked_add(predictor_elements))
+        .ok_or_else(realtime_reservation_overflow)?;
+    let tensor_bytes = checked_element_bytes(tensor_elements, std::mem::size_of::<f32>())?;
+
+    Ok(NemotronRealtimeResourceReservation {
+        max_samples,
+        host_bytes,
+        tensor_bytes,
+        max_output_tokens,
+        max_text_bytes,
+    })
+}
+
+fn conservative_vec_capacity(length: usize, minimum_nonzero: usize) -> Result<usize> {
+    if length == 0 {
+        return Ok(0);
+    }
+    length
+        .checked_mul(2)
+        .map(|capacity| capacity.max(minimum_nonzero))
+        .ok_or_else(realtime_reservation_overflow)
+}
+
+fn checked_product(values: &[usize]) -> Result<usize> {
+    values.iter().try_fold(1usize, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or_else(realtime_reservation_overflow)
+    })
+}
+
+fn checked_element_bytes(elements: usize, element_size: usize) -> Result<u64> {
+    let bytes = elements
+        .checked_mul(element_size)
+        .ok_or_else(realtime_reservation_overflow)?;
+    u64::try_from(bytes).map_err(|_| realtime_reservation_overflow())
+}
+
+fn checked_add_bytes(left: u64, right: u64) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(realtime_reservation_overflow)
+}
+
+fn realtime_reservation_overflow() -> Error {
+    Error::ConfigError("Nemotron realtime resource reservation overflowed".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -821,15 +1357,115 @@ impl NemotronAsrModel {
         )
     }
 
+    pub fn realtime_stream_resource_reservation(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NemotronRealtimeResourceReservation> {
+        self.realtime_stream_resource_reservation_with_config(
+            &NemotronRealtimeStreamConfig::new()
+                .with_emit_partials(true)
+                .with_optional_language(language)
+                .with_optional_prompt(prompt)
+                .with_optional_right_context_frames(right_context_frames),
+        )
+    }
+
+    pub fn conservative_realtime_stream_resource_reservation(
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+    ) -> Result<NemotronRealtimeResourceReservation> {
+        let prompt = NemotronPromptCondition::resolve(language, prompt)?;
+        let profile = NemotronStreamingProfile::new(56, right_context_frames.unwrap_or(13))?;
+        let max_samples = configured_realtime_max_samples(SAMPLE_RATE)?;
+        estimate_realtime_resource_reservation(
+            max_samples,
+            CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES,
+            &profile,
+            default_realtime_state_shape(),
+            &prompt,
+        )
+    }
+
+    fn realtime_stream_resource_reservation_with_config(
+        &self,
+        config: &NemotronRealtimeStreamConfig,
+    ) -> Result<NemotronRealtimeResourceReservation> {
+        let prompt = config.prompt_condition()?;
+        let profile = self.resolve_streaming_profile(config.right_context_frames)?;
+        let max_samples = configured_realtime_max_samples(self.runtime_plan.sample_rate)?;
+        estimate_realtime_resource_reservation(
+            max_samples,
+            self.decoder.max_token_bytes(),
+            &profile,
+            self.network.realtime_state_shape(),
+            &prompt,
+        )
+    }
+
     pub fn start_stream_state_with_config(
         &self,
         config: &NemotronRealtimeStreamConfig,
     ) -> Result<NemotronStreamingState> {
+        let reservation = self.realtime_stream_resource_reservation_with_config(config)?;
+        self.start_stream_state_with_config_and_reservation(config, reservation)
+    }
+
+    pub fn start_stream_state_with_reservation(
+        &self,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        right_context_frames: Option<usize>,
+        reservation: NemotronRealtimeResourceReservation,
+    ) -> Result<NemotronStreamingState> {
+        self.start_stream_state_with_config_and_reservation(
+            &NemotronRealtimeStreamConfig::new()
+                .with_emit_partials(true)
+                .with_optional_language(language)
+                .with_optional_prompt(prompt)
+                .with_optional_right_context_frames(right_context_frames),
+            reservation,
+        )
+    }
+
+    fn start_stream_state_with_config_and_reservation(
+        &self,
+        config: &NemotronRealtimeStreamConfig,
+        reservation: NemotronRealtimeResourceReservation,
+    ) -> Result<NemotronStreamingState> {
         let prompt = config.prompt_condition()?;
         let profile = self.resolve_streaming_profile(config.right_context_frames)?;
-        let rnnt_state = self.network.start_rnnt_stream()?;
+        let required_reservation = estimate_realtime_resource_reservation(
+            reservation.max_samples,
+            self.decoder.max_token_bytes(),
+            &profile,
+            self.network.realtime_state_shape(),
+            &prompt,
+        )?;
+        if reservation.host_bytes < required_reservation.host_bytes
+            || reservation.tensor_bytes < required_reservation.tensor_bytes
+            || reservation.max_output_tokens < required_reservation.max_output_tokens
+            || reservation.max_text_bytes < required_reservation.max_text_bytes
+        {
+            return Err(Error::InvalidInput(
+                "Nemotron realtime reservation is smaller than the loaded model's retained-state bound"
+                    .to_string(),
+            ));
+        }
+        let rnnt_state = self
+            .network
+            .start_rnnt_stream(reservation.max_output_tokens)?;
 
-        let mut state = NemotronStreamingState::new(profile, prompt, self.runtime_plan.sample_rate);
+        let mut state = NemotronStreamingState::new(
+            profile,
+            prompt,
+            self.runtime_plan.sample_rate,
+            reservation.max_samples,
+            reservation.max_text_bytes,
+            config.emit_partials,
+        );
         state.attach_rnnt_state(rnnt_state);
         Ok(state)
     }
@@ -863,17 +1499,19 @@ impl NemotronAsrModel {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        if sample_rate == 0 {
+        if state.input_finished {
             return Err(Error::InvalidInput(
-                "Audio sample rate must be greater than zero".to_string(),
+                "Cannot push audio into a finalized Nemotron streaming state".to_string(),
             ));
         }
-        let samples = if sample_rate == state.sample_rate {
-            samples.to_vec()
-        } else {
-            resample_linear(samples, sample_rate, state.sample_rate)
-        };
+        let (next_resampler, samples) = state.resampler.resample_chunk(
+            samples,
+            sample_rate,
+            state.sample_rate,
+            state.max_samples,
+        )?;
         state.push_samples(&samples)?;
+        state.resampler = next_resampler;
         self.decode_ready_stream_chunks(state)
     }
 
@@ -881,20 +1519,18 @@ impl NemotronAsrModel {
         &self,
         state: &mut NemotronStreamingState,
     ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
-        state.finish_input();
-        let mut events = self.decode_ready_stream_chunks(state)?;
-        if !state.final_event_emitted {
-            state.final_event_emitted = true;
-            let event = NemotronRealtimeStreamEvent {
-                text: state.assembled_text.clone(),
-                delta: String::new(),
-                is_final: true,
-                chunk_index: state.events_emitted,
-            };
-            state.events_emitted = state.events_emitted.saturating_add(1);
-            events.push(event);
+        let (next_resampler, tail) = state.resampler.finish()?;
+        if !tail.is_empty() {
+            state.push_samples(&tail)?;
         }
-        Ok(events)
+        state.resampler = next_resampler;
+        state.finish_input();
+        let mut batch = NemotronRealtimeEventBatch::new(state);
+        self.decode_ready_stream_chunks_into(state, &mut batch)?;
+        if !state.final_event_emitted {
+            batch.mark_final();
+        }
+        Ok(batch.into_events(state))
     }
 
     pub fn start_decode_with_prompt(
@@ -943,19 +1579,38 @@ impl NemotronAsrModel {
         &self,
         state: &mut NemotronStreamingState,
     ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
-        let mut events = Vec::new();
+        let mut batch = NemotronRealtimeEventBatch::new(state);
+        self.decode_ready_stream_chunks_into(state, &mut batch)?;
+        Ok(batch.into_events(state))
+    }
+
+    fn decode_ready_stream_chunks_into(
+        &self,
+        state: &mut NemotronStreamingState,
+        batch: &mut NemotronRealtimeEventBatch,
+    ) -> Result<()> {
         while state.next_ready_chunk().is_some() {
-            events.extend(self.decode_next_stream_chunk(state)?);
+            self.decode_next_stream_chunk_into(state, batch)?;
         }
-        Ok(events)
+        Ok(())
     }
 
     fn decode_next_stream_chunk(
         &self,
         state: &mut NemotronStreamingState,
     ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
+        let mut batch = NemotronRealtimeEventBatch::new(state);
+        self.decode_next_stream_chunk_into(state, &mut batch)?;
+        Ok(batch.into_events(state))
+    }
+
+    fn decode_next_stream_chunk_into(
+        &self,
+        state: &mut NemotronStreamingState,
+        batch: &mut NemotronRealtimeEventBatch,
+    ) -> Result<()> {
         let Some(chunk) = state.next_ready_chunk() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let chunk_samples = state.samples[chunk.start_sample..chunk.end_sample].to_vec();
         state.feature_state.push_samples(&chunk_samples)?;
@@ -964,15 +1619,15 @@ impl NemotronAsrModel {
         }
         state.mark_chunk_consumed(&chunk)?;
         let prompt_id = self.network.prompt_id(&state.prompt.target_lang)?;
-        self.drain_streaming_network(state, prompt_id)
+        self.drain_streaming_network(state, prompt_id, batch)
     }
 
     fn drain_streaming_network(
         &self,
         state: &mut NemotronStreamingState,
         prompt_id: usize,
-    ) -> Result<Vec<NemotronRealtimeStreamEvent>> {
-        let mut events = Vec::new();
+        batch: &mut NemotronRealtimeEventBatch,
+    ) -> Result<()> {
         loop {
             let mut progressed = false;
 
@@ -1000,31 +1655,22 @@ impl NemotronAsrModel {
                 .network
                 .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
             {
-                let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
-                    Error::InferenceError("Nemotron stream is missing RNNT state".to_string())
-                })?;
-                let mut ignored = |_token_id: usize| {};
-                let decoded = self.network.decode_rnnt_streaming_chunk(
-                    rnnt_state,
-                    &encoder_chunk.encoded,
-                    encoder_chunk.frames,
-                    &mut ignored,
-                )?;
+                let (decoded, text) = {
+                    let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
+                        Error::InferenceError("Nemotron stream is missing RNNT state".to_string())
+                    })?;
+                    let mut ignored = |_token_id: usize| {};
+                    let decoded = self.network.decode_rnnt_streaming_chunk(
+                        rnnt_state,
+                        &encoder_chunk.encoded,
+                        encoder_chunk.frames,
+                        &mut ignored,
+                    )?;
+                    let text = self.decoder.decode(rnnt_state.token_ids());
+                    (decoded, text)
+                };
                 state.emitted_tokens = decoded.stats.emitted_tokens;
-                let text = self.decoder.decode(&decoded.token_ids);
-                let delta = text_delta(&state.assembled_text, &text);
-                state.assembled_text = text.clone();
-                if !delta.is_empty() || encoder_chunk.is_final {
-                    let is_final = encoder_chunk.is_final;
-                    state.final_event_emitted |= is_final;
-                    events.push(NemotronRealtimeStreamEvent {
-                        text,
-                        delta,
-                        is_final,
-                        chunk_index: state.events_emitted,
-                    });
-                    state.events_emitted = state.events_emitted.saturating_add(1);
-                }
+                batch.record_decoded_text(state, text, encoder_chunk.is_final)?;
                 progressed = true;
             }
 
@@ -1032,7 +1678,7 @@ impl NemotronAsrModel {
                 break;
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     pub fn diagnostics_for_prompt(
@@ -1765,11 +2411,18 @@ mod tests {
 
     #[test]
     fn realtime_stream_config_resolves_prompt_and_profile_contract() {
+        let literal = NemotronRealtimeStreamConfig {
+            language: Some("German".to_string()),
+            prompt: Some("medical dictation".to_string()),
+            right_context_frames: Some(3),
+            emit_partials: true,
+        };
         let config = NemotronRealtimeStreamConfig::new()
             .with_language("German")
             .with_prompt("medical dictation")
             .with_right_context_frames(3);
 
+        assert_eq!(literal, config);
         let prompt = config.prompt_condition().unwrap();
         let diagnostics = config.diagnostics();
 
@@ -1782,10 +2435,220 @@ mod tests {
     }
 
     #[test]
+    fn realtime_duration_limit_resolves_to_target_samples() {
+        assert_eq!(
+            realtime_max_samples_for_seconds(16_000, 300).unwrap(),
+            4_800_000
+        );
+        assert!(realtime_max_samples_for_seconds(16_000, 0).is_err());
+        assert!(realtime_max_samples_for_seconds(0, 300).is_err());
+    }
+
+    #[test]
+    fn realtime_resource_reservation_prices_model_state_growth() {
+        let profile = NemotronStreamingProfile::new(56, 3).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let shape = NemotronRealtimeStateShape {
+            feature_bins: 128,
+            hop_length: 160,
+            encoder_layers: 24,
+            encoder_dim: 1_024,
+            conv_kernel_size: 9,
+            subsampling_factor: 8,
+            predictor_hidden: 640,
+            predictor_layers: 2,
+            joint_hidden: 640,
+            max_symbols_per_frame: 10,
+        };
+
+        let reservation =
+            estimate_realtime_resource_reservation(16_000, 8, &profile, shape, &prompt).unwrap();
+
+        assert_eq!(reservation.max_samples, 16_000);
+        assert_eq!(reservation.max_output_tokens, 130);
+        assert_eq!(reservation.max_text_bytes, 4_160);
+        assert_eq!(reservation.host_bytes, 357_946);
+        assert_eq!(reservation.tensor_bytes, 6_411_264);
+        let retained_and_worker_audio_bytes =
+            16_000_u64 * 2 * std::mem::size_of::<f32>() as u64 * 2;
+        assert!(
+            reservation.host_bytes
+                >= REALTIME_HOST_FIXED_OVERHEAD_BYTES + retained_and_worker_audio_bytes
+        );
+    }
+
+    #[test]
+    fn realtime_event_batch_coalesces_large_chunk_bursts_to_one_bounded_event() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let max_text_bytes = 8_192;
+        let mut state =
+            NemotronStreamingState::new(profile, prompt, 16_000, 16_000, max_text_bytes, true);
+        let mut batch = NemotronRealtimeEventBatch::new(&state);
+        let mut cumulative = String::new();
+
+        for _ in 0..4_096 {
+            cumulative.push('a');
+            batch
+                .record_decoded_text(&mut state, cumulative.clone(), false)
+                .unwrap();
+            assert_eq!(batch.pending_event_count(), 1);
+            assert!(batch.retained_text_bytes() <= max_text_bytes);
+        }
+
+        let events = batch.into_events(&mut state);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].chunk_index, 0);
+        assert_eq!(events[0].text.len(), 4_096);
+        assert_eq!(events[0].delta.len(), 4_096);
+        assert!(events[0].text.len() + events[0].delta.len() <= max_text_bytes * 2);
+        assert_eq!(state.events_emitted, 1);
+    }
+
+    #[test]
+    fn realtime_event_batch_honors_partial_policy_and_contiguous_indices() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let mut suppressed =
+            NemotronStreamingState::new(profile.clone(), prompt.clone(), 16_000, 128, 128, false);
+
+        let mut partial = NemotronRealtimeEventBatch::new(&suppressed);
+        partial
+            .record_decoded_text(&mut suppressed, "hello".to_string(), false)
+            .unwrap();
+        assert!(partial.into_events(&mut suppressed).is_empty());
+        assert_eq!(suppressed.text(), "hello");
+        assert_eq!(suppressed.events_emitted, 0);
+
+        let mut final_batch = NemotronRealtimeEventBatch::new(&suppressed);
+        final_batch.mark_final();
+        let final_events = final_batch.into_events(&mut suppressed);
+        assert_eq!(final_events.len(), 1);
+        assert!(final_events[0].is_final);
+        assert_eq!(final_events[0].text, "hello");
+        assert_eq!(final_events[0].delta, "hello");
+        assert_eq!(final_events[0].chunk_index, 0);
+
+        let mut partials = NemotronStreamingState::new(profile, prompt, 16_000, 128, 128, true);
+        let mut first_batch = NemotronRealtimeEventBatch::new(&partials);
+        first_batch
+            .record_decoded_text(&mut partials, "hello".to_string(), false)
+            .unwrap();
+        let first_events = first_batch.into_events(&mut partials);
+        assert_eq!(first_events.len(), 1);
+        assert_eq!(first_events[0].chunk_index, 0);
+        assert!(!first_events[0].is_final);
+
+        let mut second_batch = NemotronRealtimeEventBatch::new(&partials);
+        second_batch
+            .record_decoded_text(&mut partials, "hello world".to_string(), true)
+            .unwrap();
+        let second_events = second_batch.into_events(&mut partials);
+        assert_eq!(second_events.len(), 1);
+        assert_eq!(second_events[0].chunk_index, 1);
+        assert_eq!(second_events[0].delta, " world");
+        assert!(second_events[0].is_final);
+    }
+
+    fn streaming_resample(
+        samples: &[f32],
+        source_rate: u32,
+        target_rate: u32,
+        chunk_sizes: &[usize],
+        max_output_samples: usize,
+    ) -> Result<Vec<f32>> {
+        let mut state = NemotronStreamingResampler::default();
+        let mut output = Vec::new();
+        let mut offset = 0usize;
+        let mut chunk_index = 0usize;
+        while offset < samples.len() {
+            let chunk_len = chunk_sizes[chunk_index % chunk_sizes.len()]
+                .max(1)
+                .min(samples.len() - offset);
+            let (next, chunk) = state.resample_chunk(
+                &samples[offset..offset + chunk_len],
+                source_rate,
+                target_rate,
+                max_output_samples,
+            )?;
+            state = next;
+            output.extend(chunk);
+            offset += chunk_len;
+            chunk_index += 1;
+        }
+        let (next, tail) = state.finish()?;
+        state = next;
+        output.extend(tail);
+        assert_eq!(output.len(), state.projected_output_samples);
+        Ok(output)
+    }
+
+    #[test]
+    fn realtime_resampler_is_phase_continuous_across_randomized_chunks() {
+        let samples = (0..4_411)
+            .map(|index| ((index * 37 % 1_003) as f32 - 501.0) / 501.0)
+            .collect::<Vec<_>>();
+        let one_shot =
+            streaming_resample(&samples, 44_100, 16_000, &[samples.len()], 16_000).unwrap();
+
+        let mut seed = 0x9e37_79b9u32;
+        let chunk_sizes = (0..256)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed as usize % 97) + 1
+            })
+            .collect::<Vec<_>>();
+        let chunked = streaming_resample(&samples, 44_100, 16_000, &chunk_sizes, 16_000).unwrap();
+
+        assert_eq!(chunked, one_shot);
+        assert_eq!(chunked.len(), 1_600);
+    }
+
+    #[test]
+    fn realtime_resampler_counts_repeated_single_samples_against_the_cap() {
+        let samples = (0..8).map(|value| value as f32).collect::<Vec<_>>();
+        let expected = streaming_resample(&samples, 8_000, 16_000, &[8], 16).unwrap();
+        let mut state = NemotronStreamingResampler::default();
+        let mut output = Vec::new();
+
+        for sample in &samples {
+            let (next, chunk) = state.resample_chunk(&[*sample], 8_000, 16_000, 16).unwrap();
+            state = next;
+            output.extend(chunk);
+        }
+        let (finished, tail) = state.finish().unwrap();
+        state = finished;
+        output.extend(tail);
+
+        assert_eq!(output, expected);
+        assert_eq!(output.len(), 16);
+        assert_eq!(state.projected_output_samples, 16);
+        let before = (
+            state.source_samples,
+            state.projected_output_samples,
+            state.emitted_output_samples,
+            state.retained_source_samples,
+            state.last_source_sample,
+        );
+        let err = state.resample_chunk(&[8.0], 8_000, 16_000, 16).unwrap_err();
+        assert!(err.to_string().contains("configured limit of 16 samples"));
+        assert_eq!(
+            before,
+            (
+                state.source_samples,
+                state.projected_output_samples,
+                state.emitted_output_samples,
+                state.retained_source_samples,
+                state.last_source_sample,
+            )
+        );
+    }
+
+    #[test]
     fn streaming_state_contract_does_not_claim_native_cache_before_wiring() {
         let profile = NemotronStreamingProfile::new(56, 3).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("auto"), None).unwrap();
-        let state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096, true);
         let diagnostics = state.diagnostics();
 
         assert_eq!(diagnostics["supports_realtime_cache_decode"], false);
@@ -1800,15 +2663,25 @@ mod tests {
     fn streaming_state_retains_audio_samples_for_native_pipeline() {
         let profile = NemotronStreamingProfile::new(56, 0).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
-        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096, true);
+        let empty_bytes = state.session_cache_bytes().unwrap();
+        let empty_usage = state.session_resource_usage().unwrap();
 
         state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
         state.push_samples(&[0.4]).unwrap();
+        let usage = state.session_resource_usage().unwrap();
 
         assert_eq!(state.buffered_samples(), 4);
         assert_eq!(state.samples, vec![0.1, 0.2, 0.3, 0.4]);
         assert_eq!(state.text(), "");
         assert_eq!(state.emitted_tokens(), 0);
+        assert!(state.session_cache_bytes().unwrap() >= empty_bytes + 4 * 4);
+        assert!(usage.host_bytes >= empty_usage.host_bytes + 4 * 4);
+        assert_eq!(usage.tensor_bytes, 0);
+        assert_eq!(
+            state.session_cache_bytes(),
+            usage.host_bytes.checked_add(usage.tensor_bytes)
+        );
         assert_eq!(
             state.diagnostics()["supports_realtime_stream_decode"],
             false
@@ -1816,10 +2689,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_state_rejects_sample_limit_without_mutation() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4, 4_096, true);
+        state.push_samples(&[0.1, 0.2, 0.3]).unwrap();
+        let samples_before = state.samples.clone();
+        let buffered_before = state.buffered_samples();
+        let bytes_before = state.session_cache_bytes();
+
+        let err = state.push_samples(&[0.4, 0.5]).unwrap_err();
+
+        assert!(err.to_string().contains("configured limit of 4 samples"));
+        assert_eq!(state.samples, samples_before);
+        assert_eq!(state.buffered_samples(), buffered_before);
+        assert_eq!(state.session_cache_bytes(), bytes_before);
+    }
+
+    #[test]
     fn streaming_state_emits_non_overlapping_ready_chunks() {
         let profile = NemotronStreamingProfile::new(56, 1).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
-        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096, true);
 
         state.push_samples(&vec![0.0; 2_560]).unwrap();
         let first = state.next_ready_chunk().expect("first chunk");
@@ -1841,7 +2732,7 @@ mod tests {
     fn streaming_state_rejects_out_of_order_chunk_accounting() {
         let profile = NemotronStreamingProfile::new(56, 0).unwrap();
         let prompt = NemotronPromptCondition::resolve(None, None).unwrap();
-        let mut state = NemotronStreamingState::new(profile, prompt, 16_000);
+        let mut state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096, true);
         state.push_samples(&vec![0.0; 1_280]).unwrap();
 
         let mut chunk = state.next_ready_chunk().unwrap();

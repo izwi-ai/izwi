@@ -7,8 +7,9 @@ usage() {
 Usage: scripts/ci/check-backend-truth.sh <command>
 
 Commands:
-  cargo-cpu     Run CPU-focused cargo checks for the CLI and server
-  cargo-cuda    Run CUDA-focused cargo checks for the CLI and server
+  cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
+  cargo-metal   Run Metal-focused cargo checks and core scheduler regressions on macOS
+  cargo-cuda    Run CUDA-focused checks, portable regressions, and a device smoke when available
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
   docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
 EOF
@@ -31,6 +32,129 @@ resolve_cuda_compute_cap() {
 
 resolve_cuda_features() {
     echo "${IZWI_CUDA_FEATURES:-cuda,cudnn}"
+}
+
+run_core_scheduler_regressions() {
+    local features="${1:-}"
+    local cargo_args=(--locked -p izwi-core)
+    local suites=(
+        engine::scheduler
+        engine::resources
+        engine::core
+        runtime::coordinator
+        runtime::service
+        runtime::rollout
+        engine::executor
+        engine::execution
+        engine::output
+    )
+
+    if [[ -n "${features}" ]]; then
+        cargo_args+=(--features "${features}")
+    fi
+
+    for suite in "${suites[@]}"; do
+        echo "Running ${suite} regressions"
+        cargo test "${cargo_args[@]}" "${suite}" --lib
+    done
+}
+
+run_server_scheduler_regressions() {
+    local features="${1:-}"
+    local cargo_args=(--locked -p izwi-server --lib)
+    local suites=(
+        saturated_chat_stream
+        saturated_stream_emits_explicit_terminal_error
+        terminal_events_wait_for_capacity_and_preserve_order
+        http_shutdown_
+    )
+
+    if [[ -n "${features}" ]]; then
+        cargo_args+=(--features "${features}")
+    fi
+
+    for suite in "${suites[@]}"; do
+        echo "Running izwi-server ${suite} regressions"
+        cargo test "${cargo_args[@]}" "${suite}"
+    done
+}
+
+cuda_device_available() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
+compile_cuda_test_harnesses() {
+    local cuda_features="$1"
+
+    echo "Compiling CUDA-linked test harnesses without executing them"
+    cargo test --locked -p izwi-core --features "${cuda_features}" --lib --no-run
+    cargo test --locked -p izwi-server --features "${cuda_features}" --lib --no-run
+}
+
+smoke_cuda_device_if_available() {
+    local cuda_features="$1"
+
+    if ! cuda_device_available; then
+        echo "No usable NVIDIA device exposed; portable CUDA regressions completed."
+        return
+    fi
+
+    require_command curl
+
+    local port="${IZWI_CUDA_SMOKE_PORT:-18081}"
+    local health_url="http://127.0.0.1:${port}/internal/health"
+    local log_path="${RUNNER_TEMP:-/tmp}/izwi-cuda-device-smoke.log"
+    local server_binary="${CARGO_TARGET_DIR:-target}/debug/izwi-server"
+    local server_pid
+    local health_payload=""
+
+    echo "Smoke-checking the CUDA device through izwi-server"
+    cargo build --locked -p izwi-server --features "${cuda_features}"
+    IZWI_MODELS_DIR="${RUNNER_TEMP:-/tmp}/izwi-cuda-smoke-models" \
+    IZWI_PRELOAD_MODELS= \
+    IZWI_WARMUP_PRELOADED_MODELS=0 \
+    "${server_binary}" \
+        --host 127.0.0.1 \
+        --port "${port}" \
+        --backend cuda >"${log_path}" 2>&1 &
+    server_pid=$!
+    trap 'kill '"${server_pid}"' >/dev/null 2>&1 || true; wait '"${server_pid}"' >/dev/null 2>&1 || true' EXIT
+
+    for _ in {1..60}; do
+        if ! kill -0 "${server_pid}" >/dev/null 2>&1; then
+            echo "CUDA smoke server exited before becoming healthy:" >&2
+            sed -n '1,240p' "${log_path}" >&2
+            return 1
+        fi
+        if health_payload="$(curl -fsS "${health_url}" 2>/dev/null)"; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ -z "${health_payload}" ]]; then
+        echo "CUDA smoke server did not become healthy:" >&2
+        sed -n '1,240p' "${log_path}" >&2
+        return 1
+    fi
+
+    for expected in \
+        '"requested_backend":"cuda"' \
+        '"requested_backend_available":true' \
+        '"selected_backend":"cuda"' \
+        '"cuda":true' \
+        '"driver_available":true' \
+        '"device_usable":true'; do
+        if ! grep -Fq "${expected}" <<<"${health_payload}"; then
+            echo "CUDA health response is missing ${expected}:" >&2
+            printf '%s\n' "${health_payload}" >&2
+            return 1
+        fi
+    done
+
+    kill "${server_pid}" >/dev/null 2>&1 || true
+    wait "${server_pid}" >/dev/null 2>&1 || true
+    trap - EXIT
 }
 
 smoke_docker_server() {
@@ -148,6 +272,23 @@ run_cargo_cpu() {
 
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
+    run_core_scheduler_regressions
+    run_server_scheduler_regressions
+}
+
+run_cargo_metal() {
+    require_command cargo
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "Metal checks require macOS." >&2
+        exit 1
+    fi
+
+    cargo check --locked -p izwi-core --features metal
+    cargo check --locked -p izwi-cli --features metal
+    cargo check --locked -p izwi-server
+    run_core_scheduler_regressions metal
+    run_server_scheduler_regressions
 }
 
 run_cargo_cuda() {
@@ -165,6 +306,19 @@ run_cargo_cuda() {
 
     cargo check --locked -p izwi-cli --features "${cuda_features}"
     cargo check --locked -p izwi-server --features "${cuda_features}"
+    if cuda_device_available; then
+        run_core_scheduler_regressions "${cuda_features}"
+        run_server_scheduler_regressions "${cuda_features}"
+    else
+        # CUDA devel images provide linker stubs but GitHub's ordinary hosted
+        # runners do not mount the NVIDIA driver library (`libcuda.so.1`). Build
+        # the CUDA test harnesses to retain compile/link coverage, then execute
+        # the backend-neutral scheduler regressions without CUDA linkage.
+        compile_cuda_test_harnesses "${cuda_features}"
+        run_core_scheduler_regressions
+        run_server_scheduler_regressions
+    fi
+    smoke_cuda_device_if_available "${cuda_features}"
 }
 
 run_docker_cpu() {
@@ -205,6 +359,9 @@ main() {
     case "$1" in
         cargo-cpu)
             run_cargo_cpu
+            ;;
+        cargo-metal)
+            run_cargo_metal
             ;;
         cargo-cuda)
             run_cargo_cuda

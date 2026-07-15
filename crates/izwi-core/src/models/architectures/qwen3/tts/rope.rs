@@ -1,59 +1,6 @@
-use std::sync::Mutex;
-
 use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
-
-#[derive(Default)]
-pub(super) struct RopeCache {
-    inner: Mutex<RopeCacheInner>,
-}
-
-#[derive(Default)]
-struct RopeCacheInner {
-    dtype: Option<DType>,
-    len: usize,
-    cos: Option<Tensor>,
-    sin: Option<Tensor>,
-}
-
-impl RopeCache {
-    pub(super) fn get_window(
-        &self,
-        seq_len: usize,
-        start_pos: usize,
-        inv_freq: &[f32],
-        device: &Device,
-        dtype: DType,
-    ) -> Result<(Tensor, Tensor)> {
-        let required_len = start_pos.saturating_add(seq_len);
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| Error::InferenceError("Qwen3-TTS RoPE cache lock poisoned".to_string()))?;
-
-        if inner.dtype != Some(dtype) || inner.len < required_len {
-            let cache_len = required_len.max(1).next_power_of_two();
-            let (cos, sin) = build_rope_prefix_full(cache_len, inv_freq, device, dtype)?;
-            inner.dtype = Some(dtype);
-            inner.len = cache_len;
-            inner.cos = Some(cos);
-            inner.sin = Some(sin);
-        }
-
-        let cos = inner
-            .cos
-            .as_ref()
-            .ok_or_else(|| Error::InferenceError("Qwen3-TTS RoPE cos cache missing".to_string()))?
-            .narrow(0, start_pos, seq_len)?;
-        let sin = inner
-            .sin
-            .as_ref()
-            .ok_or_else(|| Error::InferenceError("Qwen3-TTS RoPE sin cache missing".to_string()))?
-            .narrow(0, start_pos, seq_len)?;
-        Ok((cos, sin))
-    }
-}
 
 pub(super) fn build_rope_inv_freq(head_dim: usize, rope_theta: f64) -> Vec<f32> {
     let half_dim = head_dim / 2;
@@ -97,15 +44,6 @@ pub(super) fn build_rope_window_full(
     duplicate_rope_window(cos, sin)
 }
 
-fn build_rope_prefix_full(
-    len: usize,
-    inv_freq: &[f32],
-    device: &Device,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
-    build_rope_window_full(len, 0, inv_freq, device, dtype)
-}
-
 pub(super) fn duplicate_rope_window(cos: Tensor, sin: Tensor) -> Result<(Tensor, Tensor)> {
     let cos = Tensor::cat(&[cos.clone(), cos], 1)?;
     let sin = Tensor::cat(&[sin.clone(), sin], 1)?;
@@ -129,16 +67,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rope_cache_window_matches_uncached_rope() {
+    fn offset_rope_window_matches_full_prefix_slice() {
         let device = Device::Cpu;
         let inv_freq = build_rope_inv_freq(4, 10_000.0);
-        let cache = RopeCache::default();
-
-        let (cached_cos, cached_sin) = cache
-            .get_window(2, 3, &inv_freq, &device, DType::F32)
-            .unwrap();
         let (direct_cos, direct_sin) =
             build_rope_window_full(2, 3, &inv_freq, &device, DType::F32).unwrap();
+        let (prefix_cos, prefix_sin) =
+            build_rope_window_full(5, 0, &inv_freq, &device, DType::F32).unwrap();
+        let cached_cos = prefix_cos.narrow(0, 3, 2).unwrap();
+        let cached_sin = prefix_sin.narrow(0, 3, 2).unwrap();
 
         assert_eq!(cached_cos.dim(1).unwrap(), 4);
         assert_eq!(

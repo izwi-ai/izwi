@@ -34,6 +34,7 @@ pub(crate) enum CapabilityKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StreamingMode {
     None,
+    FinalOnly,
     Chunked,
     Realtime,
 }
@@ -127,7 +128,9 @@ fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
         || model_variant.is_lfm25_audio_gguf()
         || matches!(
             model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts | crate::catalog::ModelFamily::VibeVoiceTts
+            crate::catalog::ModelFamily::VoxtralTts
+                | crate::catalog::ModelFamily::VibeVoiceTts
+                | crate::catalog::ModelFamily::FishS2Tts
         )
     {
         ExecutionTargetKind::DirectModel
@@ -140,14 +143,16 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
     let Some(capabilities) = model_variant.speech_capabilities() else {
         return StreamingMode::None;
     };
-    if capabilities.supports_streaming
-        || model_variant.is_lfm25_audio_gguf()
-        || matches!(
-            model_variant.family(),
-            crate::catalog::ModelFamily::VoxtralTts | crate::catalog::ModelFamily::VibeVoiceTts
-        )
-    {
+    if capabilities.supports_streaming {
         StreamingMode::Chunked
+    } else if matches!(
+        model_variant.family(),
+        crate::catalog::ModelFamily::Lfm25Audio
+            | crate::catalog::ModelFamily::VoxtralTts
+            | crate::catalog::ModelFamily::VibeVoiceTts
+            | crate::catalog::ModelFamily::FishS2Tts
+    ) {
+        StreamingMode::FinalOnly
     } else {
         StreamingMode::None
     }
@@ -157,7 +162,7 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
     if model_variant.is_audio_chat() || model_variant.is_voxtral() {
         ExecutionTargetKind::DirectModel
     } else {
-        ExecutionTargetKind::BatchRunner
+        ExecutionTargetKind::TokenEngine
     }
 }
 
@@ -203,7 +208,9 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 id: "builtin.asr",
                 capability: CapabilityKind::Asr,
                 model_variant,
-                streaming_mode: if model_variant.is_audio_chat() {
+                streaming_mode: if model_variant.is_audio_chat()
+                    || model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+                {
                     StreamingMode::Chunked
                 } else {
                     StreamingMode::None
@@ -218,9 +225,13 @@ struct RealtimeAsrCapabilityAdapter;
 
 impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        // Native Voxtral realtime stays hidden until the Candle realtime runner exists.
-        let _ = model_variant;
-        None
+        (model_variant == ModelVariant::Nemotron35AsrStreaming06B).then_some(AdapterMetadata {
+            id: "builtin.realtime_asr",
+            capability: CapabilityKind::RealtimeAsr,
+            model_variant,
+            streaming_mode: StreamingMode::Realtime,
+            execution_target: ExecutionTargetKind::RealtimeRunner,
+        })
     }
 }
 
@@ -338,6 +349,9 @@ mod tests {
         if model_variant.is_asr() || model_variant.is_voxtral() || model_variant.is_audio_chat() {
             expected.insert(CapabilityKind::Asr);
         }
+        if model_variant == ModelVariant::Nemotron35AsrStreaming06B {
+            expected.insert(CapabilityKind::RealtimeAsr);
+        }
         if model_variant.is_chat() {
             expected.insert(CapabilityKind::Chat);
         }
@@ -383,7 +397,7 @@ mod tests {
         let lfm = registry
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
-        assert_eq!(lfm.streaming_mode, StreamingMode::Chunked);
+        assert_eq!(lfm.streaming_mode, StreamingMode::FinalOnly);
         assert_eq!(lfm.execution_target, ExecutionTargetKind::DirectModel);
     }
 
@@ -409,7 +423,7 @@ mod tests {
                 .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
                 .expect("whisper asr adapter")
                 .execution_target,
-            ExecutionTargetKind::BatchRunner
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
@@ -508,14 +522,14 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_granite_speech_as_batch_asr_without_diarization() {
+    fn built_in_registry_marks_granite_speech_as_token_engine_asr_without_diarization() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::GraniteSpeech412BPlus;
 
         let adapter = registry
             .require(CapabilityKind::Asr, variant)
             .expect("granite speech asr adapter");
-        assert_eq!(adapter.execution_target, ExecutionTargetKind::BatchRunner);
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
         assert!(registry
             .require(CapabilityKind::Diarization, variant)
@@ -537,7 +551,7 @@ mod tests {
             .require(CapabilityKind::Tts, variant)
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
-        assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
+        assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());
@@ -552,10 +566,22 @@ mod tests {
             .require(CapabilityKind::Tts, variant)
             .expect("vibevoice tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
-        assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
+        assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());
+    }
+
+    #[test]
+    fn built_in_registry_marks_fish_s2_as_direct_final_only_tts() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::FishAudioS2Pro;
+
+        let adapter = registry
+            .require(CapabilityKind::Tts, variant)
+            .expect("Fish S2 TTS adapter");
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
     }
 
     #[test]

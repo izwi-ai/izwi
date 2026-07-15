@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::executor::ExecutorOutput;
+use super::execution::{
+    ExecutionDisposition, ExecutionFailure, FinishReason as ExecutionFinishReason,
+    RetryDisposition, YieldReason,
+};
+use super::executor::{ExecutorOutput, REQUEST_DEADLINE_EXCEEDED};
 use super::types::{AudioOutput, EngineOutput, FinishReason, RequestId, SequenceId, TokenStats};
 
 use serde::{Deserialize, Serialize};
@@ -166,21 +170,76 @@ impl OutputProcessor {
         sequence_id: SequenceId,
         generation_time: Duration,
     ) -> EngineOutput {
-        let finish_reason = if executor_output.error.is_some() {
-            Some(FinishReason::Error)
+        let disposition = if let Some(message) = executor_output.error.as_ref() {
+            ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message))
         } else if executor_output.finished {
-            Some(FinishReason::StopToken)
+            ExecutionDisposition::Finished(ExecutionFinishReason::Completed)
         } else {
-            None
+            ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
         };
+        self.process_execution(executor_output, &disposition, sequence_id, generation_time)
+    }
+
+    /// Process a payload whose lifecycle outcome has already been validated
+    /// against an execution plan. The disposition is authoritative; raw
+    /// `finished`/`error` flags are canonicalized at this public boundary.
+    pub(crate) fn process_execution(
+        &mut self,
+        mut executor_output: ExecutorOutput,
+        disposition: &ExecutionDisposition,
+        sequence_id: SequenceId,
+        generation_time: Duration,
+    ) -> EngineOutput {
+        let finish_reason = match disposition {
+            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
+                executor_output.finished = false;
+                executor_output.error = None;
+                None
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::Completed) => {
+                executor_output.finished = true;
+                executor_output.error = None;
+                Some(FinishReason::StopToken)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled) => {
+                executor_output.finished = true;
+                executor_output.error = Some("request cancelled".to_string());
+                Some(FinishReason::Aborted)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut) => {
+                executor_output.finished = true;
+                executor_output.error = Some(REQUEST_DEADLINE_EXCEEDED.to_string());
+                Some(FinishReason::Error)
+            }
+            ExecutionDisposition::Finished(ExecutionFinishReason::Rejected) => {
+                executor_output.finished = true;
+                executor_output.error = Some("request rejected".to_string());
+                Some(FinishReason::Error)
+            }
+            ExecutionDisposition::Failed(failure) if failure.retry == RetryDisposition::Never => {
+                executor_output.finished = true;
+                executor_output.error = Some(failure.message.clone());
+                Some(FinishReason::Error)
+            }
+            ExecutionDisposition::Failed(_) => {
+                executor_output.finished = false;
+                executor_output.error = None;
+                None
+            }
+        };
+        let had_error = executor_output.error.is_some();
 
         let audio = executor_output
             .audio
             .unwrap_or_else(|| AudioOutput::empty(self.sample_rate));
-        let num_tokens = executor_output.tokens_generated.max(
-            // Estimate tokens from audio length if not provided
-            (audio.samples.len() / 256).max(1),
-        );
+        let num_tokens = if had_error {
+            executor_output.tokens_generated
+        } else {
+            executor_output.tokens_generated.max(
+                // Estimate tokens from audio length if not provided
+                (audio.samples.len() / 256).max(1),
+            )
+        };
 
         let token_stats = TokenStats {
             prompt_tokens: executor_output.tokens_processed,
@@ -397,6 +456,38 @@ mod tests {
     fn test_output_processor() {
         let processor = OutputProcessor::new(24000);
         assert_eq!(processor.sample_rate, 24000);
+    }
+
+    #[test]
+    fn executor_error_does_not_invent_generated_tokens() {
+        let mut processor = OutputProcessor::new(24_000);
+
+        let output = processor.process(
+            ExecutorOutput::error("failed".to_string(), "boom"),
+            7,
+            Duration::from_millis(1),
+        );
+
+        assert!(output.is_finished);
+        assert_eq!(output.finish_reason, Some(FinishReason::Error));
+        assert_eq!(output.num_tokens, 0);
+        assert_eq!(output.token_stats.generated_tokens, 0);
+    }
+
+    #[test]
+    fn cancelled_disposition_surfaces_as_aborted_error() {
+        let mut processor = OutputProcessor::new(24_000);
+        let output = processor.process_execution(
+            ExecutorOutput::cancelled("cancelled".to_string()),
+            &ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+            9,
+            Duration::from_millis(1),
+        );
+
+        assert!(output.is_finished);
+        assert_eq!(output.finish_reason, Some(FinishReason::Aborted));
+        assert_eq!(output.error.as_deref(), Some("request cancelled"));
+        assert_eq!(output.num_tokens, 0);
     }
 
     #[test]

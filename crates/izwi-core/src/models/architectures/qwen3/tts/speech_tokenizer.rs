@@ -1714,6 +1714,20 @@ impl SpeechTokenizerDecoder {
         })
     }
 
+    /// Maximum codec frames produced from this exact input shape.
+    pub fn reference_frame_upper_bound(
+        &self,
+        input_samples: usize,
+        sample_rate: u32,
+    ) -> Result<usize> {
+        if input_samples == 0 {
+            return Ok(0);
+        }
+        let resampled_samples =
+            resampled_audio_len(input_samples, sample_rate, self.input_sample_rate as u32)?;
+        Ok(ceil_div(resampled_samples, self.encode_downsample_rate).max(1))
+    }
+
     /// Encode reference waveform into speech-tokenizer codec groups.
     pub fn encode_reference_audio(
         &self,
@@ -1898,6 +1912,27 @@ fn normalized_codec_indices(
     values
 }
 
+fn resampled_audio_len(input_samples: usize, src_rate: u32, dst_rate: u32) -> Result<usize> {
+    if src_rate == 0 || dst_rate == 0 {
+        return Err(Error::InvalidInput(
+            "Audio sample rates must be greater than zero".to_string(),
+        ));
+    }
+    if input_samples == 0 || src_rate == dst_rate {
+        return Ok(input_samples);
+    }
+
+    let numerator = (input_samples as u128)
+        .checked_mul(dst_rate as u128)
+        .ok_or_else(|| Error::Overloaded("Resampled audio length overflow".to_string()))?;
+    let rounded = numerator
+        .checked_add(src_rate as u128 - 1)
+        .ok_or_else(|| Error::Overloaded("Resampled audio length overflow".to_string()))?
+        / src_rate as u128;
+    usize::try_from(rounded)
+        .map_err(|_| Error::Overloaded("Resampled audio length overflow".to_string()))
+}
+
 fn resample_audio_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
     if src_rate == dst_rate {
         return Ok(audio.to_vec());
@@ -1906,7 +1941,7 @@ fn resample_audio_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<
         return Ok(Vec::new());
     }
     let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).ceil() as usize;
+    let out_len = resampled_audio_len(audio.len(), src_rate, dst_rate)?;
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = i as f64 / ratio;
@@ -1934,5 +1969,19 @@ mod tests {
             vec![0, 1, 0, 0]
         );
         assert_eq!(normalized_codec_indices(None, 3, 8), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn resampled_audio_len_is_exact_and_fails_closed() {
+        assert_eq!(resampled_audio_len(16_000, 16_000, 24_000).unwrap(), 24_000);
+        assert_eq!(resampled_audio_len(1, 44_100, 24_000).unwrap(), 1);
+        assert!(matches!(
+            resampled_audio_len(1, 0, 24_000),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            resampled_audio_len(usize::MAX, 1, u32::MAX),
+            Err(Error::Overloaded(_))
+        ));
     }
 }

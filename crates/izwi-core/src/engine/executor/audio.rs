@@ -900,13 +900,12 @@ pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>
 pub(super) fn decode_request_audio_with_rate(
     request: &EngineCoreRequest,
 ) -> Result<(Vec<f32>, u32)> {
-    if let Some(audio_bytes) = request.audio_bytes.as_deref() {
+    if let Some(audio_bytes) = request.audio_bytes_for_execution() {
         return decode_audio_bytes(audio_bytes);
     }
 
     let audio_b64 = request
-        .audio_input
-        .as_deref()
+        .audio_base64_for_execution()
         .ok_or_else(|| Error::InvalidInput("Request missing audio input".to_string()))?;
     decode_audio_base64_with_rate(audio_b64)
 }

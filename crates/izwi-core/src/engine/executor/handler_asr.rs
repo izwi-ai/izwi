@@ -10,7 +10,7 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, NativeExecutor};
+use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
@@ -21,45 +21,52 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-    ) -> Result<ExecutorOutput> {
+    ) -> Result<ModelSessionResult> {
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
-        let language = request.language.as_deref();
-        let asr_prompt = request.asr_prompt.as_deref();
+        let language = request.asr_language_for_execution();
+        let asr_prompt = request.asr_prompt_for_execution();
         let generation_options = Self::asr_generation_options(request);
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
+        let session = scheduled.session_key();
 
         if let Some(tx) = stream_tx.as_ref() {
             if !matches!(family, ModelFamily::Voxtral) {
-                let model = self.with_registry(|registry| {
-                    registry.try_get_asr(variant).ok_or_else(|| {
-                        Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
-                    })
-                })?;
+                let mut active_state = {
+                    let mut guard = self.asr_decode_states.lock().map_err(|_| {
+                        Error::InferenceError("ASR decode state mutex poisoned".to_string())
+                    })?;
+                    guard.remove(&session)
+                };
+
+                if active_state
+                    .as_ref()
+                    .map(|state| state.variant != variant)
+                    .unwrap_or(false)
+                {
+                    active_state = None;
+                }
+                let (model, new_model_lease) = if let Some(state) = active_state.as_ref() {
+                    (state.model.clone(), None)
+                } else {
+                    let (model, lease) = self.asr_model_for_request(request, variant)?;
+                    (model, Some(lease))
+                };
 
                 if model.supports_incremental_decode() {
-                    let mut active_state = {
-                        let mut guard = self.asr_decode_states.lock().map_err(|_| {
-                            Error::InferenceError("ASR decode state mutex poisoned".to_string())
-                        })?;
-                        guard.remove(&request.id)
-                    };
-
-                    if active_state
-                        .as_ref()
-                        .map(|state| state.variant != variant)
-                        .unwrap_or(false)
-                    {
-                        active_state = None;
-                    }
-
                     let mut initial_media_decode_ms = None;
                     let mut active_state = if let Some(state) = active_state {
                         state
                     } else {
+                        if request.is_cancelled() {
+                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                                request.id.clone(),
+                            )));
+                        }
                         let audio_decode_started = Instant::now();
-                        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
+                        let (samples, sample_rate) =
+                            Self::run_blocking(|| decode_request_audio_with_rate(request))?;
                         let audio_decode_ms = audio_decode_started.elapsed().as_secs_f64() * 1000.0;
                         initial_media_decode_ms = Some(audio_decode_ms);
                         let samples_len = samples.len();
@@ -112,7 +119,7 @@ impl NativeExecutor {
                                 audio_decode_ms,
                             );
 
-                            return Ok(ExecutorOutput {
+                            return Ok(ModelSessionResult::atomic(ExecutorOutput {
                                 request_id: request.id.clone(),
                                 audio: Some(AudioOutput {
                                     samples: Vec::new(),
@@ -133,7 +140,7 @@ impl NativeExecutor {
                                 ),
                                 asr_diagnostics: diagnostics,
                                 error: None,
-                            });
+                            }));
                         }
 
                         // Keep ASR decode bounded. If EOS is missed, very high caps
@@ -150,8 +157,10 @@ impl NativeExecutor {
                         })?;
                         ActiveAsrDecode {
                             variant,
+                            model: model.clone(),
+                            _model_lease: new_model_lease
+                                .expect("a new ASR decode state must retain its model lease"),
                             state: decode_state,
-                            prompt_accounted: false,
                             last_tokens_generated: 0,
                             stream_sequence: 0,
                             input_sample_rate: sample_rate,
@@ -170,8 +179,19 @@ impl NativeExecutor {
                     let mut finished = false;
 
                     for _ in 0..decode_iterations {
-                        let step =
-                            Self::run_blocking(|| model.decode_step(&mut active_state.state))?;
+                        if request.is_cancelled() {
+                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                                request.id.clone(),
+                            )));
+                        }
+                        let step = Self::run_blocking(|| {
+                            active_state.model.decode_step(&mut active_state.state)
+                        })?;
+                        if request.is_cancelled() {
+                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                                request.id.clone(),
+                            )));
+                        }
                         decode_steps_ran = decode_steps_ran.saturating_add(1);
                         let step_tokens_generated = step
                             .tokens_generated
@@ -202,17 +222,11 @@ impl NativeExecutor {
                         }
                     }
 
-                    let mut tokens_processed = if scheduled.is_prefill {
-                        scheduled.num_tokens.max(1)
+                    let tokens_processed = if scheduled.is_prefill {
+                        request.num_prompt_tokens()
                     } else {
                         decode_steps_ran.max(1)
                     };
-                    if !active_state.prompt_accounted {
-                        active_state.prompt_accounted = true;
-                        tokens_processed =
-                            tokens_processed.saturating_add(request.num_prompt_tokens());
-                    }
-
                     let input_sample_rate = active_state.input_sample_rate;
                     let input_sample_count = active_state.input_sample_count;
 
@@ -220,10 +234,10 @@ impl NativeExecutor {
                         let mut guard = self.asr_decode_states.lock().map_err(|_| {
                             Error::InferenceError("ASR decode state mutex poisoned".to_string())
                         })?;
-                        guard.insert(request.id.clone(), active_state);
+                        guard.insert(session, active_state);
                     }
 
-                    return Ok(ExecutorOutput {
+                    return Ok(ModelSessionResult::sequence(ExecutorOutput {
                         request_id: request.id.clone(),
                         audio: Some(AudioOutput {
                             samples: Vec::new(),
@@ -243,13 +257,14 @@ impl NativeExecutor {
                             .map(ExecutorPhaseTiming::with_media_decode_ms),
                         asr_diagnostics: None,
                         error: None,
-                    });
+                    }));
                 }
             }
         }
 
         let audio_decode_started = Instant::now();
-        let (samples, sample_rate) = decode_request_audio_with_rate(request)?;
+        let (samples, sample_rate) =
+            Self::run_blocking(|| decode_request_audio_with_rate(request))?;
         let audio_decode_ms = audio_decode_started.elapsed().as_secs_f64() * 1000.0;
         let samples_len = samples.len();
 
@@ -331,11 +346,7 @@ impl NativeExecutor {
                 return Ok((details.text, details.diagnostics));
             }
 
-            let model = self.with_registry(|registry| {
-                registry.try_get_asr(variant).ok_or_else(|| {
-                    Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
-                })
-            })?;
+            let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
 
             let chunk_plan = Self::asr_chunk_plan(
                 &samples,
@@ -401,6 +412,18 @@ impl NativeExecutor {
                 ));
             }
 
+            // Granite's public auto budget is admitted at its conservative
+            // ceiling. Once the audio has been decoded under that admission,
+            // narrow a single-segment decode to the actual duration just as
+            // the chunked path does for each chunk.
+            let segment_generation_options = Self::asr_chunk_generation_options(
+                request,
+                family,
+                samples.len(),
+                sample_rate,
+                &generation_options,
+            );
+
             if request.streaming {
                 if let Some(tx) = stream_tx.as_ref() {
                     let mut stream_err: Option<Error> = None;
@@ -422,7 +445,7 @@ impl NativeExecutor {
                         sample_rate,
                         language,
                         asr_prompt,
-                        generation_options.clone(),
+                        segment_generation_options.clone(),
                         &mut emit,
                     )?;
                     if let Some(err) = stream_err {
@@ -442,13 +465,13 @@ impl NativeExecutor {
                 sample_rate,
                 language,
                 asr_prompt,
-                generation_options.clone(),
+                segment_generation_options,
             )?;
             Ok((details.text, details.diagnostics))
         })?;
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);
 
-        Ok(ExecutorOutput {
+        Ok(ModelSessionResult::atomic(ExecutorOutput {
             request_id: request.id.clone(),
             audio: Some(AudioOutput {
                 samples: Vec::new(),
@@ -463,7 +486,7 @@ impl NativeExecutor {
             phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
             asr_diagnostics,
             error: None,
-        })
+        }))
     }
 
     fn with_audio_decode_timing(
@@ -928,6 +951,29 @@ mod tests {
         );
 
         assert_eq!(options.max_new_tokens, 84);
+    }
+
+    #[test]
+    fn granite_auto_single_segment_options_use_decoded_audio_duration() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 2048;
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+
+        let options = NativeExecutor::asr_chunk_generation_options(
+            &request,
+            ModelFamily::GraniteSpeechAsr,
+            16_000 * 30,
+            16_000,
+            &base,
+        );
+
+        assert_eq!(options.max_new_tokens, 84);
+        assert!(options.max_new_tokens < request.params.max_tokens);
     }
 
     #[test]

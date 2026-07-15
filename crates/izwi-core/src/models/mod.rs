@@ -14,4 +14,7 @@ pub use families::{
     model_family_registrations, registration_for_variant, registrations_for_capability,
     FamilyRegistration, MODEL_FAMILY_REGISTRATIONS,
 };
-pub use registry::{LoadedModelDiagnostics, LoadedModelRegistry, ModelRegistry};
+pub use registry::{
+    AsrModelLease, ChatModelLease, LoadedModelDiagnostics, LoadedModelRegistry, ModelRegistry,
+    QwenTtsModelLease,
+};

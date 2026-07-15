@@ -1,8 +1,9 @@
 //! Runtime request/response types.
 
 use crate::catalog::ModelVariant;
-use crate::engine::{GenerationParams, WorkloadClass};
+use crate::engine::{GenerationParams, Priority, WorkloadClass};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Server-side scheduling and admission metadata carried with an inference request.
@@ -13,6 +14,8 @@ use uuid::Uuid;
 pub struct RuntimeRequestContext {
     pub workload_class: WorkloadClass,
     pub admission_ms: Option<f64>,
+    pub priority: Priority,
+    pub deadline: Option<Instant>,
 }
 
 impl RuntimeRequestContext {
@@ -20,11 +23,23 @@ impl RuntimeRequestContext {
         Self {
             workload_class,
             admission_ms: None,
+            priority: Priority::Normal,
+            deadline: None,
         }
     }
 
     pub fn with_admission_ms(mut self, admission_ms: f64) -> Self {
         self.admission_ms = Some(admission_ms.max(0.0));
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 }

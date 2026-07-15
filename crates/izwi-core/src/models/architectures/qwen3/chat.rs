@@ -21,6 +21,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,16 @@ pub struct ChatDecodeState {
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
+}
+
+impl ChatDecodeState {
+    /// All Candle backing allocations retained by this incremental session.
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.cache.account_storage(&mut accounting)?;
+        accounting.add_tensor(&self.embeds)?;
+        Some(accounting.bytes())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -471,6 +482,30 @@ impl Qwen3ChatModel {
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         self.build_prompt(messages)
+    }
+
+    /// Model-derived authorization for all retained incremental decode tensors.
+    pub fn session_cache_reservation_bytes(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+    ) -> Result<u64> {
+        if prompt_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 cache authorization requires exact precomputed prompt tokens".to_string(),
+            ));
+        }
+        let text_model = match &self.backend {
+            Qwen3ChatBackend::Native { text_model } => text_model,
+            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
+                return Err(Error::InvalidInput(format!(
+                    "Incremental chat cache authorization is unavailable for GGUF model {gguf_file}"
+                )))
+            }
+        };
+        text_model
+            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
+            .ok_or_else(|| Error::Overloaded("Qwen3 session cache bound overflow".to_string()))
     }
 
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {

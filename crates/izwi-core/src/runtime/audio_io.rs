@@ -7,6 +7,95 @@ use tracing::debug;
 use crate::audio::AudioSourceMetadata;
 use crate::error::{Error, Result};
 
+const MIB: usize = 1024 * 1024;
+pub(crate) const MAX_AUDIO_SOURCE_BYTES: usize = 128 * MIB;
+const MAX_DECODED_AUDIO_BYTES: usize = 256 * MIB;
+const MAX_AUDIO_DURATION_SECONDS: u64 = 60 * 60;
+const MAX_AUDIO_SAMPLE_RATE: u32 = 384_000;
+const MAX_AUDIO_CHANNELS: u16 = 32;
+pub(crate) const MAX_REFERENCE_SOURCE_BYTES: usize = 32 * MIB;
+const MAX_REFERENCE_DECODED_BYTES: usize = 32 * MIB;
+const MAX_REFERENCE_DURATION_SECONDS: u64 = 30;
+const MAX_BASE64_AUDIO_METADATA_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct AudioDecodeLimits {
+    max_source_bytes: usize,
+    max_decoded_bytes: usize,
+    max_duration_seconds: u64,
+    max_sample_rate: u32,
+    max_channels: u16,
+}
+
+impl AudioDecodeLimits {
+    const fn inference() -> Self {
+        Self {
+            max_source_bytes: MAX_AUDIO_SOURCE_BYTES,
+            max_decoded_bytes: MAX_DECODED_AUDIO_BYTES,
+            max_duration_seconds: MAX_AUDIO_DURATION_SECONDS,
+            max_sample_rate: MAX_AUDIO_SAMPLE_RATE,
+            max_channels: MAX_AUDIO_CHANNELS,
+        }
+    }
+
+    const fn reference() -> Self {
+        Self {
+            max_source_bytes: MAX_REFERENCE_SOURCE_BYTES,
+            max_decoded_bytes: MAX_REFERENCE_DECODED_BYTES,
+            max_duration_seconds: MAX_REFERENCE_DURATION_SECONDS,
+            max_sample_rate: MAX_AUDIO_SAMPLE_RATE,
+            max_channels: MAX_AUDIO_CHANNELS,
+        }
+    }
+
+    fn validate_source_len(self, source_len: usize) -> Result<()> {
+        if source_len > self.max_source_bytes {
+            return Err(Error::InvalidInput(format!(
+                "Encoded audio is {source_len} bytes, exceeding the {}-byte limit",
+                self.max_source_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_format(self, sample_rate: u32, channels: u16) -> Result<()> {
+        if sample_rate == 0 || sample_rate > self.max_sample_rate {
+            return Err(Error::InvalidInput(format!(
+                "Audio sample rate {sample_rate} Hz is outside the supported 1..={} Hz range",
+                self.max_sample_rate
+            )));
+        }
+        if channels == 0 || channels > self.max_channels {
+            return Err(Error::InvalidInput(format!(
+                "Audio channel count {channels} is outside the supported 1..={} range",
+                self.max_channels
+            )));
+        }
+        Ok(())
+    }
+
+    fn max_mono_samples(self, sample_rate: u32) -> Result<usize> {
+        self.validate_format(sample_rate, 1)?;
+        let duration_samples = u64::from(sample_rate)
+            .checked_mul(self.max_duration_seconds)
+            .ok_or_else(|| Error::InvalidInput("Audio duration limit overflowed".to_string()))?;
+        let byte_samples = self.max_decoded_bytes / std::mem::size_of::<f32>();
+        Ok(usize::try_from(duration_samples)
+            .unwrap_or(usize::MAX)
+            .min(byte_samples))
+    }
+
+    fn validate_mono_samples(self, samples: usize, sample_rate: u32) -> Result<()> {
+        let limit = self.max_mono_samples(sample_rate)?;
+        if samples > limit {
+            return Err(Error::InvalidInput(format!(
+                "Decoded audio would contain {samples} mono samples at {sample_rate} Hz, exceeding the {limit}-sample production limit"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeErrorMode {
     Permissive,
@@ -20,48 +109,163 @@ impl DecodeErrorMode {
 }
 
 pub(crate) fn base64_decode(data: &str) -> Result<Vec<u8>> {
+    base64_decode_with_limit(data, MAX_AUDIO_SOURCE_BYTES)
+}
+
+fn base64_decode_with_limit(data: &str, max_decoded_bytes: usize) -> Result<Vec<u8>> {
     use base64::Engine;
 
+    let (payload, encoded_len) = validated_base64_audio_payload(data, max_decoded_bytes)?;
+
+    let decoded = if !payload.as_bytes().iter().any(u8::is_ascii_whitespace) {
+        base64::engine::general_purpose::STANDARD.decode(payload.as_bytes())
+    } else {
+        // Reserve for the actual base64 alphabet, not the attacker-controlled
+        // raw string length. In particular, a payload containing a small amount
+        // of base64 surrounded by arbitrary whitespace must not cause a second
+        // allocation proportional to the whitespace.
+        let mut normalized = Vec::new();
+        normalized.try_reserve_exact(encoded_len).map_err(|_| {
+            Error::Overloaded("Unable to reserve bounded base64 audio input".to_string())
+        })?;
+        normalized.extend(
+            payload
+                .as_bytes()
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace()),
+        );
+        base64::engine::general_purpose::STANDARD.decode(&normalized)
+    }
+    .map_err(|e| Error::InvalidInput(format!("Base64 audio decode error: {e}")))?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(Error::InvalidInput(format!(
+            "Decoded base64 audio is {} bytes, exceeding the {max_decoded_bytes}-byte limit",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+/// Validate the decoded upper bound of a base64 audio payload without
+/// allocating or decoding it. Direct engine admission uses the same source
+/// contract as the eventual decoder before it moves or clones request data.
+pub(crate) fn validate_base64_audio_source_size(
+    data: &str,
+    max_decoded_bytes: usize,
+) -> Result<()> {
+    validated_base64_audio_payload(data, max_decoded_bytes).map(|_| ())
+}
+
+/// Bound both the retained string and its decoded upper size before a direct
+/// request copies or moves base64 audio. The fixed allowance covers ordinary
+/// data-URI metadata and modest formatting whitespace without permitting those
+/// non-payload bytes to amplify retained memory without limit.
+pub(crate) fn validate_base64_audio_source_input(
+    data: &str,
+    max_decoded_bytes: usize,
+) -> Result<()> {
+    validate_base64_audio_retained_size(data.len(), max_decoded_bytes)?;
+    validate_base64_audio_source_size(data, max_decoded_bytes)
+}
+
+/// O(1) retained-input guard suitable for async admission paths. Callers can
+/// apply it before admission, then run the decoded-upper-bound scan only after
+/// copying work is covered by a lease and moved to a blocking boundary.
+pub(crate) fn validate_base64_audio_retained_size(
+    retained_bytes: usize,
+    max_decoded_bytes: usize,
+) -> Result<()> {
+    if retained_bytes == 0 {
+        return Err(Error::InvalidInput(
+            "Base64 audio input cannot be empty".to_string(),
+        ));
+    }
+    let max_encoded_bytes = max_decoded_bytes
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| Error::InvalidInput("Base64 audio input limit overflow".to_string()))?;
+    let retained_limit = max_encoded_bytes
+        .checked_add(MAX_BASE64_AUDIO_METADATA_BYTES)
+        .ok_or_else(|| Error::InvalidInput("Base64 audio input limit overflow".to_string()))?;
+    if retained_bytes > retained_limit {
+        return Err(Error::InvalidInput(format!(
+            "Base64 audio input retains {} bytes, exceeding the {retained_limit}-byte encoded input limit",
+            retained_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn validated_base64_audio_payload(data: &str, max_decoded_bytes: usize) -> Result<(&str, usize)> {
     let payload = if data.starts_with("data:") {
         data.split_once(',').map(|(_, b64)| b64).unwrap_or(data)
     } else {
         data
     };
 
-    if !payload.as_bytes().iter().any(u8::is_ascii_whitespace) {
-        return base64::engine::general_purpose::STANDARD
-            .decode(payload.as_bytes())
-            .map_err(|e| Error::InferenceError(format!("Base64 decode error: {}", e)));
+    let encoded_len = payload
+        .as_bytes()
+        .iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count();
+    let decoded_upper_bound = encoded_len
+        .checked_add(3)
+        .and_then(|value| value.checked_div(4))
+        .and_then(|groups| groups.checked_mul(3))
+        .ok_or_else(|| Error::InvalidInput("Base64 audio size overflowed".to_string()))?;
+    if decoded_upper_bound > max_decoded_bytes.saturating_add(2) {
+        return Err(Error::InvalidInput(format!(
+            "Base64 audio may decode to {decoded_upper_bound} bytes, exceeding the {max_decoded_bytes}-byte limit"
+        )));
     }
+    Ok((payload, encoded_len))
+}
 
-    let normalized: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(normalized.as_bytes())
-        .map_err(|e| Error::InferenceError(format!("Base64 decode error: {}", e)))
+pub(crate) fn decode_reference_audio_base64(data: &str) -> Result<(Vec<f32>, u32)> {
+    let bytes = base64_decode_with_limit(data, MAX_REFERENCE_SOURCE_BYTES)?;
+    decode_reference_audio_bytes(&bytes)
 }
 
 pub(crate) fn decode_audio_bytes_with_metadata(
     audio_bytes: &[u8],
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
+    decode_audio_bytes_with_metadata_and_limits(
+        audio_bytes,
+        DecodeErrorMode::Strict,
+        AudioDecodeLimits::inference(),
+    )
+}
+
+fn decode_audio_bytes_with_metadata_and_limits(
+    audio_bytes: &[u8],
+    error_mode: DecodeErrorMode,
+    limits: AudioDecodeLimits,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     if audio_bytes.is_empty() {
         return Err(Error::InvalidInput("Empty audio input".to_string()));
     }
+    limits.validate_source_len(audio_bytes.len())?;
 
     if is_riff_wave(audio_bytes) {
-        validate_riff_wave_structure(audio_bytes).map_err(|err| {
-            Error::InferenceError(format!("Failed to decode WAV strictly: {err}"))
-        })?;
-        match decode_wav_bytes_with_metadata(audio_bytes, DecodeErrorMode::Strict) {
+        if error_mode.is_strict() {
+            validate_riff_wave_structure(audio_bytes).map_err(|err| {
+                Error::InferenceError(format!("Failed to decode WAV strictly: {err}"))
+            })?;
+        }
+        match decode_wav_bytes_with_metadata(audio_bytes, error_mode, limits) {
             Ok((samples, source)) => {
-                return finalize_decoded_audio_with_metadata(samples, source);
+                return finalize_decoded_audio_with_metadata(samples, source, limits);
             }
             Err(wav_err) => {
                 return match decode_audio_bytes_symphonia_with_metadata(
                     audio_bytes,
-                    DecodeErrorMode::Strict,
+                    error_mode,
+                    limits,
                 ) {
                     Ok((samples, source)) => {
-                        finalize_decoded_audio_with_metadata(samples, source)
+                        finalize_decoded_audio_with_metadata(samples, source, limits)
                     }
                     Err(symphonia_err) => Err(Error::InferenceError(format!(
                         "Failed to decode WAV strictly. WAV path: {wav_err}; Symphonia: {symphonia_err}"
@@ -71,53 +275,40 @@ pub(crate) fn decode_audio_bytes_with_metadata(
         }
     }
 
-    match decode_audio_bytes_symphonia_with_metadata(audio_bytes, DecodeErrorMode::Strict) {
-        Ok((samples, source)) => finalize_decoded_audio_with_metadata(samples, source),
+    match decode_audio_bytes_symphonia_with_metadata(audio_bytes, error_mode, limits) {
+        Ok((samples, source)) => finalize_decoded_audio_with_metadata(samples, source, limits),
         Err(symphonia_err) => {
-            let (samples, source) =
-                decode_wav_bytes_hound_with_metadata(audio_bytes, DecodeErrorMode::Strict).map_err(
-                    |wav_err| {
-                        Error::InferenceError(format!(
+            let (samples, source) = decode_wav_bytes_hound_with_metadata(
+                audio_bytes,
+                error_mode,
+                limits,
+            )
+            .map_err(|wav_err| {
+                Error::InferenceError(format!(
                             "Failed to decode audio strictly. Symphonia: {symphonia_err}; WAV fallback: {wav_err}"
                         ))
-                    },
-                )?;
-            finalize_decoded_audio_with_metadata(samples, source)
+            })?;
+            finalize_decoded_audio_with_metadata(samples, source, limits)
         }
     }
 }
 
 pub(crate) fn decode_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    if audio_bytes.is_empty() {
-        return Err(Error::InvalidInput("Empty audio input".to_string()));
-    }
+    decode_audio_bytes_with_metadata_and_limits(
+        audio_bytes,
+        DecodeErrorMode::Permissive,
+        AudioDecodeLimits::inference(),
+    )
+    .map(|(samples, source)| (samples, source.sample_rate))
+}
 
-    if is_riff_wave(audio_bytes) {
-        match decode_wav_bytes_fast(audio_bytes) {
-            Ok((samples, sample_rate)) => return finalize_decoded_audio(samples, sample_rate),
-            Err(wav_err) => {
-                return match decode_audio_bytes_symphonia(audio_bytes) {
-                    Ok((samples, sample_rate)) => finalize_decoded_audio(samples, sample_rate),
-                    Err(symphonia_err) => Err(Error::InferenceError(format!(
-                        "Failed to decode WAV. WAV fast path: {wav_err}; Symphonia: {symphonia_err}"
-                    ))),
-                };
-            }
-        }
-    }
-
-    match decode_audio_bytes_symphonia(audio_bytes) {
-        Ok((samples, sample_rate)) => finalize_decoded_audio(samples, sample_rate),
-        Err(symphonia_err) => {
-            let (samples, sample_rate) =
-                decode_wav_bytes_hound(audio_bytes).map_err(|wav_err| {
-                    Error::InferenceError(format!(
-                    "Failed to decode audio. Symphonia: {symphonia_err}; WAV fallback: {wav_err}"
-                ))
-                })?;
-            finalize_decoded_audio(samples, sample_rate)
-        }
-    }
+pub(crate) fn decode_reference_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    decode_audio_bytes_with_metadata_and_limits(
+        audio_bytes,
+        DecodeErrorMode::Permissive,
+        AudioDecodeLimits::reference(),
+    )
+    .map(|(samples, source)| (samples, source.sample_rate))
 }
 
 pub(crate) fn decode_wav_bytes(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
@@ -228,21 +419,27 @@ pub(crate) fn wav_duration_seconds_fast(wav_bytes: &[u8]) -> Option<f32> {
 }
 
 fn decode_wav_bytes_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    decode_wav_bytes_with_metadata(wav_bytes, DecodeErrorMode::Permissive)
-        .map(|(samples, source)| (samples, source.sample_rate))
+    decode_wav_bytes_with_metadata(
+        wav_bytes,
+        DecodeErrorMode::Permissive,
+        AudioDecodeLimits::inference(),
+    )
+    .map(|(samples, source)| (samples, source.sample_rate))
 }
 
 fn decode_wav_bytes_with_metadata(
     wav_bytes: &[u8],
     error_mode: DecodeErrorMode,
+    limits: AudioDecodeLimits,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
-    decode_wav_pcm16_mono_with_metadata(wav_bytes, error_mode)
-        .or_else(|_| decode_wav_bytes_hound_with_metadata(wav_bytes, error_mode))
+    decode_wav_pcm16_mono_with_metadata(wav_bytes, error_mode, limits)
+        .or_else(|_| decode_wav_bytes_hound_with_metadata(wav_bytes, error_mode, limits))
 }
 
 fn decode_wav_pcm16_mono_with_metadata(
     wav_bytes: &[u8],
     error_mode: DecodeErrorMode,
+    limits: AudioDecodeLimits,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     let mut offset = 12usize;
     let mut audio_format = None;
@@ -322,6 +519,7 @@ fn decode_wav_pcm16_mono_with_metadata(
             "WAV fast path only supports PCM16 audio".to_string(),
         ));
     }
+    limits.validate_format(sample_rate, channels)?;
     let source_channel_count = channels;
     let channels = channels as usize;
     let block_align = block_align as usize;
@@ -344,6 +542,7 @@ fn decode_wav_pcm16_mono_with_metadata(
             "Decoded audio produced zero samples".to_string(),
         ));
     }
+    limits.validate_mono_samples(frame_count, sample_rate)?;
 
     let mut samples = Vec::with_capacity(frame_count);
     if channels == 1 {
@@ -374,13 +573,18 @@ fn decode_wav_pcm16_mono_with_metadata(
 }
 
 fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    decode_audio_bytes_symphonia_with_metadata(audio_bytes, DecodeErrorMode::Permissive)
-        .map(|(samples, source)| (samples, source.sample_rate))
+    decode_audio_bytes_symphonia_with_metadata(
+        audio_bytes,
+        DecodeErrorMode::Permissive,
+        AudioDecodeLimits::inference(),
+    )
+    .map(|(samples, source)| (samples, source.sample_rate))
 }
 
 fn decode_audio_bytes_symphonia_with_metadata(
     audio_bytes: &[u8],
     error_mode: DecodeErrorMode,
+    limits: AudioDecodeLimits,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
@@ -425,6 +629,9 @@ fn decode_audio_bytes_symphonia_with_metadata(
         .channels
         .map(|channels| u16::try_from(channels.count()).unwrap_or(u16::MAX))
         .unwrap_or(0);
+    if sample_rate > 0 && channel_count > 0 {
+        limits.validate_format(sample_rate, channel_count)?;
+    }
     let mut decoder = get_codecs()
         .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| Error::InferenceError(format!("Failed to create audio decoder: {e}")))?;
@@ -507,7 +714,14 @@ fn decode_audio_bytes_symphonia_with_metadata(
                 "Audio channel count changed while decoding {container}/{codec} ({channel_count} -> {decoded_channel_count})"
             )));
         }
-        append_decoded_packet(decoded, channels, &mut samples);
+        limits.validate_format(sample_rate, decoded_channel_count)?;
+        append_decoded_packet(
+            decoded,
+            channels,
+            &mut samples,
+            limits.max_mono_samples(sample_rate)?,
+            limits.max_decoded_bytes,
+        )?;
     }
 
     if sample_rate == 0 {
@@ -541,35 +755,128 @@ fn append_decoded_packet(
     decoded: symphonia::core::audio::AudioBufferRef<'_>,
     channels: usize,
     out: &mut Vec<f32>,
-) {
-    use symphonia::core::audio::SampleBuffer;
-
-    let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-    sample_buffer.copy_interleaved_ref(decoded);
-    let data = sample_buffer.samples();
-
-    if channels <= 1 {
-        out.extend_from_slice(data);
-        return;
+    max_mono_samples: usize,
+    max_decoded_bytes: usize,
+) -> Result<()> {
+    let next_len = out
+        .len()
+        .checked_add(decoded.frames())
+        .ok_or_else(|| Error::InvalidInput("Decoded audio sample count overflowed".to_string()))?;
+    if next_len > max_mono_samples {
+        return Err(Error::InvalidInput(format!(
+            "Decoded audio would exceed the {max_mono_samples}-sample production limit"
+        )));
     }
-
-    for frame in data.chunks(channels) {
-        if frame.is_empty() {
-            continue;
+    use symphonia::core::audio::AudioBufferRef;
+    match decoded {
+        AudioBufferRef::U8(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
         }
-        let sum: f32 = frame.iter().copied().sum();
-        out.push(sum / frame.len() as f32);
+        AudioBufferRef::U16(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::U24(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::U32(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::S8(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::S16(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::S24(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::S32(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::F32(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
+        AudioBufferRef::F64(buffer) => {
+            append_planar_packet(buffer.as_ref(), channels, out, max_decoded_bytes)
+        }
     }
 }
 
+fn append_planar_packet<S>(
+    decoded: &symphonia::core::audio::AudioBuffer<S>,
+    channels: usize,
+    out: &mut Vec<f32>,
+    max_decoded_bytes: usize,
+) -> Result<()>
+where
+    S: symphonia::core::sample::Sample + symphonia::core::conv::IntoSample<f32>,
+{
+    use symphonia::core::audio::Signal;
+    use symphonia::core::conv::IntoSample;
+
+    if channels == 0 || channels > decoded.spec().channels.count() {
+        return Err(Error::InvalidInput(
+            "Decoded audio packet has an invalid channel count".to_string(),
+        ));
+    }
+
+    let packet_bytes = decoded
+        .capacity()
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<S>()))
+        .ok_or_else(|| Error::InvalidInput("Decoded audio packet size overflowed".to_string()))?;
+    let output_bytes = out
+        .len()
+        .checked_add(decoded.frames())
+        .ok_or_else(|| Error::InvalidInput("Decoded audio output size overflowed".to_string()))?
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::InvalidInput("Decoded audio output size overflowed".to_string()))?;
+    if packet_bytes
+        .checked_add(output_bytes)
+        .is_none_or(|peak_bytes| peak_bytes > max_decoded_bytes)
+    {
+        return Err(Error::InvalidInput(format!(
+            "Decoded audio packet and output would exceed the {max_decoded_bytes}-byte production limit"
+        )));
+    }
+    out.try_reserve(decoded.frames()).map_err(|_| {
+        Error::Overloaded("Unable to reserve bounded decoded audio output".to_string())
+    })?;
+
+    if channels == 1 {
+        out.extend(
+            decoded
+                .chan(0)
+                .iter()
+                .copied()
+                .map(IntoSample::<f32>::into_sample),
+        );
+        return Ok(());
+    }
+
+    for frame in 0..decoded.frames() {
+        let mut sum = 0.0f32;
+        for channel in 0..channels {
+            sum += decoded.chan(channel)[frame].into_sample();
+        }
+        out.push(sum / channels as f32);
+    }
+    Ok(())
+}
+
 fn decode_wav_bytes_hound(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    decode_wav_bytes_hound_with_metadata(wav_bytes, DecodeErrorMode::Permissive)
-        .map(|(samples, source)| (samples, source.sample_rate))
+    decode_wav_bytes_hound_with_metadata(
+        wav_bytes,
+        DecodeErrorMode::Permissive,
+        AudioDecodeLimits::inference(),
+    )
+    .map(|(samples, source)| (samples, source.sample_rate))
 }
 
 fn decode_wav_bytes_hound_with_metadata(
     wav_bytes: &[u8],
     error_mode: DecodeErrorMode,
+    limits: AudioDecodeLimits,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     let cursor = Cursor::new(wav_bytes);
     let mut reader = hound::WavReader::new(cursor)
@@ -584,8 +891,16 @@ fn decode_wav_bytes_hound_with_metadata(
     }
     let source_channel_count = spec.channels.max(1);
     let channels = source_channel_count as usize;
+    limits.validate_format(sample_rate, source_channel_count)?;
+    let max_mono_samples = limits.max_mono_samples(sample_rate)?;
+    let declared_frames = usize::try_from(reader.duration()).unwrap_or(usize::MAX);
+    if declared_frames > max_mono_samples {
+        return Err(Error::InvalidInput(format!(
+            "Decoded WAV would exceed the {max_mono_samples}-sample production limit"
+        )));
+    }
 
-    let mut samples: Vec<f32> = match spec.sample_format {
+    let samples = match spec.sample_format {
         hound::SampleFormat::Int => {
             let bits = spec.bits_per_sample.max(1) as u32;
             let max_val = if bits > 1 {
@@ -593,59 +908,22 @@ fn decode_wav_bytes_hound_with_metadata(
             } else {
                 1.0
             };
-            if error_mode.is_strict() {
-                reader
-                    .samples::<i32>()
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|err| {
-                        Error::InferenceError(format!("Failed decoding WAV sample: {err}"))
-                    })?
-                    .into_iter()
-                    .map(|sample| (sample as f32 / max_val).clamp(-1.0, 1.0))
-                    .collect()
-            } else {
-                reader
-                    .samples::<i32>()
-                    .filter_map(|sample| sample.ok())
-                    .map(|sample| (sample as f32 / max_val).clamp(-1.0, 1.0))
-                    .collect()
-            }
+            decode_hound_frames::<_, i32, _>(
+                &mut reader,
+                channels,
+                declared_frames,
+                error_mode,
+                |sample| (sample as f32 / max_val).clamp(-1.0, 1.0),
+            )?
         }
-        hound::SampleFormat::Float => {
-            if error_mode.is_strict() {
-                reader
-                    .samples::<f32>()
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|err| {
-                        Error::InferenceError(format!("Failed decoding WAV sample: {err}"))
-                    })?
-            } else {
-                reader
-                    .samples::<f32>()
-                    .filter_map(|sample| sample.ok())
-                    .collect()
-            }
-        }
+        hound::SampleFormat::Float => decode_hound_frames::<_, f32, _>(
+            &mut reader,
+            channels,
+            declared_frames,
+            error_mode,
+            |sample| sample,
+        )?,
     };
-
-    if error_mode.is_strict() && samples.len() % channels != 0 {
-        return Err(Error::InferenceError(format!(
-            "WAV sample count {} is not aligned to {channels} channels",
-            samples.len()
-        )));
-    }
-
-    if channels > 1 {
-        let mut mono = Vec::with_capacity(samples.len() / channels + 1);
-        for frame in samples.chunks(channels) {
-            if frame.is_empty() {
-                continue;
-            }
-            let sum: f32 = frame.iter().copied().sum();
-            mono.push(sum / frame.len() as f32);
-        }
-        samples = mono;
-    }
 
     Ok((
         samples,
@@ -656,6 +934,53 @@ fn decode_wav_bytes_hound_with_metadata(
             channel_count: source_channel_count,
         },
     ))
+}
+
+fn decode_hound_frames<R, S, F>(
+    reader: &mut hound::WavReader<R>,
+    channels: usize,
+    declared_frames: usize,
+    error_mode: DecodeErrorMode,
+    mut convert: F,
+) -> Result<Vec<f32>>
+where
+    R: std::io::Read,
+    S: hound::Sample,
+    F: FnMut(S) -> f32,
+{
+    // A WAV header may declare a large data chunk even when the underlying
+    // source is truncated. Start with a small bounded allocation and let the
+    // vector grow only as samples are successfully read.
+    const INITIAL_OUTPUT_FRAMES: usize = 16 * 1024;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(declared_frames.min(INITIAL_OUTPUT_FRAMES))
+        .map_err(|_| {
+            Error::Overloaded("Unable to reserve bounded decoded WAV output".to_string())
+        })?;
+    let mut input = reader.samples::<S>();
+    'frames: for _ in 0..declared_frames {
+        let mut sum = 0.0f32;
+        for _ in 0..channels {
+            match input.next() {
+                Some(Ok(sample)) => sum += convert(sample),
+                Some(Err(err)) if error_mode.is_strict() => {
+                    return Err(Error::InferenceError(format!(
+                        "Failed decoding WAV sample: {err}"
+                    )));
+                }
+                Some(Err(_)) => break 'frames,
+                None if error_mode.is_strict() => {
+                    return Err(Error::InferenceError(
+                        "WAV ended before its declared sample count".to_string(),
+                    ));
+                }
+                None => break 'frames,
+            }
+        }
+        output.push((sum / channels as f32).clamp(-1.0, 1.0));
+    }
+    Ok(output)
 }
 
 fn hound_codec_name(sample_format: hound::SampleFormat, bits_per_sample: u16) -> String {
@@ -703,7 +1028,11 @@ fn looks_like_adts_frame(audio_bytes: &[u8]) -> bool {
     audio_bytes.len() >= 2 && audio_bytes[0] == 0xff && audio_bytes[1] & 0xf6 == 0xf0
 }
 
-fn finalize_decoded_audio(mut samples: Vec<f32>, sample_rate: u32) -> Result<(Vec<f32>, u32)> {
+fn finalize_decoded_audio(
+    mut samples: Vec<f32>,
+    sample_rate: u32,
+    limits: AudioDecodeLimits,
+) -> Result<(Vec<f32>, u32)> {
     if sample_rate == 0 {
         return Err(Error::InferenceError(
             "Decoded audio has invalid sample rate 0".to_string(),
@@ -714,6 +1043,7 @@ fn finalize_decoded_audio(mut samples: Vec<f32>, sample_rate: u32) -> Result<(Ve
             "Decoded audio contains no samples".to_string(),
         ));
     }
+    limits.validate_mono_samples(samples.len(), sample_rate)?;
 
     for sample in &mut samples {
         if !sample.is_finite() {
@@ -729,13 +1059,15 @@ fn finalize_decoded_audio(mut samples: Vec<f32>, sample_rate: u32) -> Result<(Ve
 fn finalize_decoded_audio_with_metadata(
     samples: Vec<f32>,
     source: AudioSourceMetadata,
+    limits: AudioDecodeLimits,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     if source.channel_count == 0 {
         return Err(Error::InferenceError(
             "Decoded audio has invalid source channel count 0".to_string(),
         ));
     }
-    let (samples, sample_rate) = finalize_decoded_audio(samples, source.sample_rate)?;
+    limits.validate_format(source.sample_rate, source.channel_count)?;
+    let (samples, sample_rate) = finalize_decoded_audio(samples, source.sample_rate, limits)?;
     debug_assert_eq!(sample_rate, source.sample_rate);
     Ok((samples, source))
 }
@@ -866,6 +1198,129 @@ mod tests {
         let uri = format!("data:audio/mpeg;base64,{b64}");
         let decoded = base64_decode(&uri).expect("data URI decode should succeed");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn base64_decode_rejects_payload_before_oversized_allocation() {
+        let error = base64_decode_with_limit("AAAAAAAA", 3)
+            .expect_err("six decoded bytes must exceed a three-byte limit");
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert!(error.to_string().contains("exceeding the 3-byte limit"));
+    }
+
+    #[test]
+    fn base64_retained_input_guard_rejects_unbounded_non_payload_bytes_in_constant_time() {
+        let error = validate_base64_audio_retained_size(4 + 1024 + 1, 3)
+            .expect_err("retained whitespace/data-URI metadata must stay bounded");
+        assert!(error.to_string().contains("encoded input limit"));
+    }
+
+    #[test]
+    fn base64_decode_ignores_whitespace_without_changing_the_bounded_payload() {
+        let decoded = base64_decode_with_limit(" \n\t A Q I D \r\n", 3)
+            .expect("bounded whitespace normalization should decode");
+        assert_eq!(decoded, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn decoder_rejects_declared_audio_duration_before_sample_allocation() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            for _ in 0..8_001 {
+                writer.write_sample(0_i16).expect("sample");
+            }
+            writer.finalize().expect("finalize");
+        }
+        let limits = AudioDecodeLimits {
+            max_source_bytes: MIB,
+            max_decoded_bytes: MIB,
+            max_duration_seconds: 1,
+            max_sample_rate: MAX_AUDIO_SAMPLE_RATE,
+            max_channels: MAX_AUDIO_CHANNELS,
+        };
+
+        let error = decode_audio_bytes_with_metadata_and_limits(
+            &wav_bytes,
+            DecodeErrorMode::Permissive,
+            limits,
+        )
+        .expect_err("duration above the configured bound must fail");
+        assert!(matches!(
+            error,
+            Error::InferenceError(_) | Error::InvalidInput(_)
+        ));
+        assert!(error.to_string().contains("production limit"));
+    }
+
+    #[test]
+    fn hound_downmixes_many_channels_without_materializing_interleaved_output() {
+        let channels = 32;
+        let frames = 64;
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            for _ in 0..frames {
+                for _ in 0..channels {
+                    writer.write_sample(0.25f32).expect("sample");
+                }
+            }
+            writer.finalize().expect("finalize");
+        }
+        let limits = AudioDecodeLimits {
+            max_source_bytes: MIB,
+            max_decoded_bytes: frames * std::mem::size_of::<f32>(),
+            max_duration_seconds: 1,
+            max_sample_rate: MAX_AUDIO_SAMPLE_RATE,
+            max_channels: MAX_AUDIO_CHANNELS,
+        };
+
+        let (samples, source) =
+            decode_wav_bytes_hound_with_metadata(&wav_bytes, DecodeErrorMode::Strict, limits)
+                .expect("bounded planar downmix");
+        assert_eq!(source.channel_count, channels);
+        assert_eq!(samples.len(), frames);
+        assert!(samples.iter().all(|sample| (*sample - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn permissive_hound_decode_stops_at_a_truncated_declared_payload() {
+        let mut wav_bytes = Vec::new();
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&4_000_036u32.to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&16u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16_000u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&32_000u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&2u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16u16.to_le_bytes());
+        wav_bytes.extend_from_slice(b"data");
+        wav_bytes.extend_from_slice(&4_000_000u32.to_le_bytes());
+
+        let (samples, _) = decode_wav_bytes_hound_with_metadata(
+            &wav_bytes,
+            DecodeErrorMode::Permissive,
+            AudioDecodeLimits::inference(),
+        )
+        .expect("permissive decode should stop at the first truncated sample");
+        assert!(samples.is_empty());
+        assert!(samples.capacity() <= 16 * 1024);
     }
 
     #[test]

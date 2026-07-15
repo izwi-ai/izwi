@@ -18,7 +18,7 @@ env:
 
 jobs:
   cargo-cuda-flash-attn:
-    name: Cargo Check (CUDA FlashAttention)
+    name: Cargo Validation (CUDA FlashAttention)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
@@ -46,7 +46,7 @@ jobs:
             --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Run CUDA FlashAttention cargo checks
+      - name: Run CUDA FlashAttention backend validation
         run: scripts/ci/check-backend-truth.sh cargo-cuda
 
   docker-cuda-flash-attn:

@@ -11,11 +11,13 @@ mod broker;
 mod capabilities;
 mod chat;
 mod conformance;
+mod coordinator;
 mod diarization;
 mod kokoro;
 mod lifecycle;
 mod pipeline;
 mod request;
+mod rollout;
 mod routing;
 mod service;
 mod speech_to_speech;
@@ -31,6 +33,7 @@ pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceCapability, ConformanceExecutionClass,
 };
+pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub use service::RuntimeService;
 pub use telemetry::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
