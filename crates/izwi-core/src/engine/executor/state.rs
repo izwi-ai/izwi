@@ -1,9 +1,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::prefix_cache::ExactPrefixHandle;
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen3::tts::TtsDecodeState as QwenTtsDecodeState;
+use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{
     AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
 };
@@ -13,6 +15,7 @@ pub(super) struct ActiveChatDecode {
     pub(super) state: NativeChatDecodeState,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
+    pub(super) pending_prefix_snapshot: Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>>,
 }
 
 pub(super) struct ActiveAsrDecode {

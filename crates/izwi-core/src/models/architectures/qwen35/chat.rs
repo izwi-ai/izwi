@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
+use std::mem::size_of;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,12 +45,21 @@ pub struct Qwen35PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
+    reusable_prefix_len: Option<usize>,
     vision_inputs: Option<PreparedVisionInputs>,
 }
 
 impl Qwen35PreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         &self.prompt_ids
+    }
+
+    pub(crate) fn prompt_positions(&self) -> &[[usize; 3]] {
+        &self.prompt_positions
+    }
+
+    pub(crate) fn supports_exact_prefix_reuse(&self) -> bool {
+        self.vision_inputs.is_none() && self.reusable_prefix_len.is_some()
     }
 }
 
@@ -85,6 +95,8 @@ pub struct ChatDecodeState {
     max_new_tokens: usize,
     finished: bool,
     next_text_position: usize,
+    pending_prefix_snapshot: Option<Qwen35PrefixSnapshot>,
+    reused_prefix_tokens: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
 }
@@ -102,6 +114,65 @@ impl ChatDecodeState {
     /// Complete per-session scheduler accounting.
     pub fn session_cache_bytes(&self) -> Option<u64> {
         self.allocated_session_bytes()
+    }
+
+    pub(crate) fn take_pending_prefix_snapshot(&mut self) -> Option<Qwen35PrefixSnapshot> {
+        self.pending_prefix_snapshot.take()
+    }
+
+    pub(crate) fn reused_prefix_tokens(&self) -> usize {
+        self.reused_prefix_tokens
+    }
+}
+
+/// Immutable checkpoint at an exact rendered-token boundary. Request-specific
+/// sampler, history, RNG, and stream state are rebuilt on every restore.
+pub struct Qwen35PrefixSnapshot {
+    text_state: Qwen35TextRuntimeState,
+    token_ids: Vec<u32>,
+    positions: Vec<[usize; 3]>,
+    next_text_position: usize,
+}
+
+impl Qwen35PrefixSnapshot {
+    pub(crate) fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+
+    pub(crate) fn positions(&self) -> &[[usize; 3]] {
+        &self.positions
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.text_state.account_storage(&mut accounting)?;
+        accounting.add_bytes(
+            u64::try_from(self.token_ids.capacity().checked_mul(size_of::<u32>())?).ok()?,
+        )?;
+        accounting.add_bytes(
+            u64::try_from(
+                self.positions
+                    .capacity()
+                    .checked_mul(size_of::<[usize; 3]>())?,
+            )
+            .ok()?,
+        )?;
+        accounting.add_bytes(u64::try_from(size_of::<Self>()).ok()?)?;
+        Some(accounting.bytes())
+    }
+
+    fn matches(&self, prepared: &Qwen35PreparedPrompt) -> bool {
+        let prefix_len = self.token_ids.len();
+        prepared.vision_inputs.is_none()
+            && prefix_len > 0
+            && prefix_len == self.positions.len()
+            && self.next_text_position == prefix_len
+            && prepared.prompt_ids.starts_with(&self.token_ids)
+            && prepared.prompt_positions.starts_with(&self.positions)
+            && prepared
+                .prompt_positions
+                .get(prefix_len)
+                .is_some_and(|position| *position == [self.next_text_position; 3])
     }
 }
 
@@ -495,9 +566,34 @@ impl Qwen35ChatModel {
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen35PreparedPrompt>,
     ) -> Result<ChatDecodeState> {
+        self.start_decode_state_with_optional_prepared_and_prefix(
+            messages,
+            max_new_tokens,
+            config,
+            prepared,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn start_decode_state_with_optional_prepared_and_prefix(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        prefix: Option<&Qwen35PrefixSnapshot>,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<ChatDecodeState> {
         let prepared_prompt =
             resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
-        self.start_decode_state_with_prepared(&prepared_prompt, max_new_tokens, config)
+        self.start_decode_state_with_prepared_and_prefix(
+            &prepared_prompt,
+            max_new_tokens,
+            config,
+            prefix,
+            capture_prefix_max_bytes,
+        )
     }
 
     pub fn start_decode_state_with_prepared(
@@ -506,15 +602,50 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
     ) -> Result<ChatDecodeState> {
+        self.start_decode_state_with_prepared_and_prefix(
+            prepared_prompt,
+            max_new_tokens,
+            config,
+            None,
+            None,
+        )
+    }
+
+    fn start_decode_state_with_prepared_and_prefix(
+        &self,
+        prepared_prompt: &Qwen35PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prefix: Option<&Qwen35PrefixSnapshot>,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<ChatDecodeState> {
         if prepared_prompt.prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one tokenizable message".to_string(),
             ));
         }
 
-        let mut text_state = self.text_model.new_state();
-        let logits =
-            compact_tensor_storage(&self.prefill_prompt(prepared_prompt, &mut text_state)?)?;
+        let reusable_prefix = prefix.filter(|prefix| prefix.matches(prepared_prompt));
+        let (mut text_state, reused_prefix_tokens) = match reusable_prefix {
+            Some(prefix) => match prefix.text_state.fork_for_prefix() {
+                Ok(state) => (state, prefix.token_ids.len()),
+                Err(_) => (self.text_model.new_state(), 0),
+            },
+            None => (self.text_model.new_state(), 0),
+        };
+        let (logits, pending_prefix_snapshot) = if prepared_prompt.vision_inputs.is_none() {
+            self.prefill_text_prompt_with_prefix_checkpoint(
+                prepared_prompt,
+                &mut text_state,
+                reused_prefix_tokens,
+                capture_prefix_max_bytes,
+            )?
+        } else {
+            (
+                compact_tensor_storage(&self.prefill_prompt(prepared_prompt, &mut text_state)?)?,
+                None,
+            )
+        };
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
         let history_ids =
@@ -533,6 +664,8 @@ impl Qwen35ChatModel {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared_prompt.next_text_position,
+            pending_prefix_snapshot,
+            reused_prefix_tokens,
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
         })
@@ -624,6 +757,82 @@ impl Qwen35ChatModel {
             || token_id == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(token_id)
             || config.stop_token_ids.contains(&token_id)
+    }
+
+    fn prefill_text_prompt_with_prefix_checkpoint(
+        &self,
+        prepared: &Qwen35PreparedPrompt,
+        text_state: &mut Qwen35TextRuntimeState,
+        reused_prefix_tokens: usize,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<(Tensor, Option<Qwen35PrefixSnapshot>)> {
+        let token_count = prepared.prompt_ids.len();
+        if reused_prefix_tokens >= token_count {
+            return Err(Error::InferenceError(
+                "Qwen3.5 cached prefix leaves no prompt suffix for logits".to_string(),
+            ));
+        }
+
+        let checkpoint = prepared
+            .reusable_prefix_len
+            .filter(|checkpoint| *checkpoint > reused_prefix_tokens && *checkpoint < token_count);
+        let mut cursor = reused_prefix_tokens;
+        if let Some(checkpoint) = checkpoint {
+            self.prefill_text_range(prepared, text_state, cursor, checkpoint, false)?;
+            cursor = checkpoint;
+        }
+
+        let pending = match (checkpoint, capture_prefix_max_bytes) {
+            (Some(checkpoint), Some(max_bytes)) if max_bytes > 0 => text_state
+                .fork_for_prefix()
+                .ok()
+                .map(|text_state| Qwen35PrefixSnapshot {
+                    text_state,
+                    token_ids: prepared.prompt_ids[..checkpoint].to_vec(),
+                    positions: prepared.prompt_positions[..checkpoint].to_vec(),
+                    next_text_position: checkpoint,
+                })
+                .filter(|snapshot| {
+                    snapshot
+                        .retained_bytes()
+                        .is_some_and(|bytes| bytes <= max_bytes)
+                }),
+            _ => None,
+        };
+
+        let logits = self
+            .prefill_text_range(prepared, text_state, cursor, token_count, true)?
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 text suffix prefill produced no logits".to_string())
+            })?;
+        Ok((compact_tensor_storage(&logits)?, pending))
+    }
+
+    fn prefill_text_range(
+        &self,
+        prepared: &Qwen35PreparedPrompt,
+        text_state: &mut Qwen35TextRuntimeState,
+        start: usize,
+        end: usize,
+        compute_final_logits: bool,
+    ) -> Result<Option<Tensor>> {
+        let mut logits = None;
+        let mut chunk_start = start;
+        let chunk_size = qwen35_prefill_chunk_size();
+        while chunk_start < end {
+            let chunk_end = (chunk_start + chunk_size).min(end);
+            let compute_logits = compute_final_logits && chunk_end == end;
+            if let Some(chunk_logits) = self.text_model.prefill_token_ids(
+                &prepared.prompt_ids[chunk_start..chunk_end],
+                &prepared.prompt_positions[chunk_start..chunk_end],
+                text_state,
+                compute_logits,
+            )? {
+                logits = Some(chunk_logits);
+            }
+            chunk_start = chunk_end;
+        }
+        Ok(logits)
     }
 
     fn prefill_prompt(
@@ -745,11 +954,14 @@ impl Qwen35ChatModel {
                 ));
             }
             let prompt_ids = self.tokenizer.encode_text(&prompt)?;
+            let reusable_prefix_len =
+                reusable_prefix_token_len(&self.tokenizer, &prompt, &prompt_ids)?;
             let prompt_positions = build_text_positions(prompt_ids.len());
             return Ok(Qwen35PreparedPrompt {
                 next_text_position: prompt_positions.len(),
                 prompt_ids,
                 prompt_positions,
+                reusable_prefix_len,
                 vision_inputs: None,
             });
         };
@@ -780,6 +992,7 @@ impl Qwen35ChatModel {
             prompt_ids,
             prompt_positions,
             next_text_position,
+            reusable_prefix_len: None,
             vision_inputs: Some(vision_inputs),
         })
     }
@@ -861,6 +1074,26 @@ fn qwen35_session_cache_upper_bound_bytes(
 
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
     (0..token_count).map(|idx| [idx; 3]).collect()
+}
+
+fn reusable_prefix_token_len(
+    tokenizer: &Qwen35Tokenizer,
+    rendered_prompt: &str,
+    full_ids: &[u32],
+) -> Result<Option<usize>> {
+    const ASSISTANT_HEADER: &str = "<|im_start|>assistant\n";
+    let Some(header_start) = rendered_prompt.rfind(ASSISTANT_HEADER) else {
+        return Ok(None);
+    };
+    let boundary_end = header_start + ASSISTANT_HEADER.len();
+    let boundary_ids = tokenizer.encode_text(&rendered_prompt[..boundary_end])?;
+    // Tokenizers may merge across an arbitrary string boundary. Reuse is only
+    // valid when the independently encoded boundary is literally the full
+    // prompt's token prefix.
+    Ok(
+        (!boundary_ids.is_empty() && full_ids.starts_with(&boundary_ids))
+            .then_some(boundary_ids.len()),
+    )
 }
 
 fn expand_image_placeholders(prompt: &str, token_counts: &[usize]) -> Result<String> {
@@ -1802,6 +2035,7 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prompt_positions: build_text_positions(3),
             next_text_position: 3,
+            reusable_prefix_len: Some(2),
             vision_inputs: None,
         };
         let preparation_calls = AtomicUsize::new(0);
