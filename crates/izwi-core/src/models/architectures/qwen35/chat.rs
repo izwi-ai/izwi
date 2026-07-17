@@ -4,7 +4,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
@@ -19,7 +18,7 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
@@ -56,6 +55,20 @@ where
     }
 }
 
+fn initial_penalty_history(
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    track_history: bool,
+) -> Vec<u32> {
+    if !track_history {
+        return Vec::new();
+    }
+
+    let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(max_new_tokens.max(1)));
+    history.extend_from_slice(prompt_ids);
+    history
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
     pub text: String,
@@ -66,6 +79,7 @@ pub struct ChatDecodeState {
     text_state: Qwen35TextRuntimeState,
     logits: Tensor,
     history_ids: Vec<u32>,
+    decoder: IncrementalDecoder,
     tokens_generated: usize,
     track_history: bool,
     assembled: String,
@@ -158,12 +172,12 @@ struct Qwen35Tokenizer {
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
-    decode_piece_cache: Mutex<HashMap<u32, String>>,
 }
 
 #[derive(Debug)]
 struct GgufTokenizerMetadata {
     tokens: Vec<String>,
+    token_types: Vec<u32>,
     merges: Vec<String>,
     pre_tokenizer: Option<String>,
     chat_template: String,
@@ -174,7 +188,7 @@ impl Qwen35Tokenizer {
     fn load(model_dir: &Path, variant: ModelVariant, loader: &GgufLoader) -> Result<Self> {
         let gguf_meta = parse_gguf_tokenizer_metadata(loader)?;
         let config = load_tokenizer_config_file(model_dir)?;
-        let inner = match Tokenizer::from_path(model_dir) {
+        let mut inner = match Tokenizer::from_path(model_dir) {
             Ok(inner) => inner,
             Err(_) => Tokenizer::from_gguf_bpe(
                 &gguf_meta.tokens,
@@ -183,6 +197,7 @@ impl Qwen35Tokenizer {
                 false,
             )?,
         };
+        inner.register_gguf_token_types(&gguf_meta.tokens, &gguf_meta.token_types)?;
         let vocab_size = inner.vocab_size();
 
         let mut token_to_id: HashMap<String, u32> = HashMap::new();
@@ -226,15 +241,24 @@ impl Qwen35Tokenizer {
             .unwrap_or_else(|| gguf_meta.chat_template.clone());
         let default_enable_thinking = resolve_default_enable_thinking(&chat_template, variant);
 
-        let mut literal_special_tokens: Vec<(String, u32)> = token_to_id
+        let mut literal_special_tokens: Vec<(String, u32)> = gguf_meta
+            .tokens
             .iter()
-            .filter_map(|(token, id)| {
-                (token.starts_with("<|") && token.ends_with("|>")).then_some((token.clone(), *id))
+            .zip(&gguf_meta.token_types)
+            .enumerate()
+            .filter_map(|(id, (token, token_type))| {
+                matches!(token_type, 3 | 4).then_some((token.clone(), id as u32))
             })
             .collect();
+        if let Some(cfg) = &config {
+            literal_special_tokens.extend(cfg.added_tokens_decoder.iter().filter_map(
+                |(id, entry)| id.parse::<u32>().ok().map(|id| (entry.content.clone(), id)),
+            ));
+        }
         literal_special_tokens.sort_by(|(left, _), (right, _)| {
             right.len().cmp(&left.len()).then_with(|| left.cmp(right))
         });
+        literal_special_tokens.dedup_by(|(left, _), (right, _)| left == right);
 
         Ok(Self {
             inner,
@@ -251,7 +275,6 @@ impl Qwen35Tokenizer {
             chat_template,
             default_enable_thinking,
             bos_token: config.and_then(|cfg| cfg.bos_token),
-            decode_piece_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -296,30 +319,19 @@ impl Qwen35Tokenizer {
         Ok(ids)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
-    }
-
-    fn decode_token_piece(&self, token_id: u32) -> Result<String> {
+    fn decode_token_delta(
+        &self,
+        decoder: &mut IncrementalDecoder,
+        token_id: u32,
+    ) -> Result<String> {
         if token_id as usize >= self.vocab_size {
             return Ok(String::new());
         }
-        if let Ok(cache) = self.decode_piece_cache.lock() {
-            if let Some(piece) = cache.get(&token_id) {
-                return Ok(piece.clone());
-            }
-        }
+        self.inner.decode_incrementally(decoder, token_id)
+    }
 
-        let piece = self.decode_text(&[token_id])?;
-        if let Ok(mut cache) = self.decode_piece_cache.lock() {
-            cache.insert(token_id, piece.clone());
-        }
-        Ok(piece)
+    fn finish_decode(&self, decoder: &mut IncrementalDecoder) -> Result<String> {
+        self.inner.finish_incremental_decode(decoder)
     }
 }
 
@@ -568,11 +580,12 @@ impl Qwen35ChatModel {
         Ok(ChatDecodeState {
             text_state,
             logits,
-            history_ids: if track_history {
-                Vec::with_capacity(max_new_tokens.max(1))
-            } else {
-                Vec::new()
-            },
+            history_ids: initial_penalty_history(
+                &prepared_prompt.prompt_ids,
+                max_new_tokens,
+                track_history,
+            ),
+            decoder: IncrementalDecoder::new(true),
             tokens_generated: 0,
             track_history,
             assembled: String::new(),
@@ -587,9 +600,11 @@ impl Qwen35ChatModel {
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
             return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
+                delta,
+                text: state.assembled.clone(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
             });
@@ -609,15 +624,19 @@ impl Qwen35ChatModel {
         )?;
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
             return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
+                delta,
+                text: state.assembled.clone(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
             });
         }
 
-        let delta = self.tokenizer.decode_token_piece(next)?;
+        let mut delta = self
+            .tokenizer
+            .decode_token_delta(&mut state.decoder, next)?;
         if state.track_history {
             state.history_ids.push(next);
         }
@@ -631,9 +650,12 @@ impl Qwen35ChatModel {
         state.next_text_position += 1;
         if state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
+            let suffix = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&suffix);
+            delta.push_str(&suffix);
         }
         let final_text = if state.finished {
-            state.assembled.trim().to_string()
+            state.assembled.clone()
         } else {
             String::new()
         };
@@ -1177,22 +1199,17 @@ fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str> {
     }
 }
 
-fn resolve_default_enable_thinking(chat_template: &str, variant: ModelVariant) -> bool {
-    if chat_template.contains("enable_thinking is defined and enable_thinking is false") {
-        true
-    } else if chat_template.contains("enable_thinking is defined and enable_thinking is true") {
-        false
-    } else {
-        matches!(
-            variant,
-            ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
-        )
-    }
+fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) -> bool {
+    matches!(
+        variant,
+        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
+    )
 }
 
 fn parse_gguf_tokenizer_metadata(loader: &GgufLoader) -> Result<GgufTokenizerMetadata> {
     Ok(GgufTokenizerMetadata {
         tokens: required_string_array(loader, "tokenizer.ggml.tokens")?,
+        token_types: required_u32_array(loader, "tokenizer.ggml.token_type")?,
         merges: required_string_array(loader, "tokenizer.ggml.merges")?,
         pre_tokenizer: loader.get_metadata_string("tokenizer.ggml.pre"),
         chat_template: loader
@@ -1280,6 +1297,31 @@ fn required_usize_array(loader: &GgufLoader, key: &str) -> Result<Vec<usize>> {
             )));
         };
         let value = usize::try_from(raw).map_err(|_| {
+            Error::ModelLoadError(format!("Array value out of range for {key}: {raw}"))
+        })?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn required_u32_array(loader: &GgufLoader, key: &str) -> Result<Vec<u32>> {
+    let value = loader
+        .metadata_value(key)
+        .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))?;
+    let GgufValue::Array(items) = value else {
+        return Err(Error::ModelLoadError(format!(
+            "Expected GGUF array metadata for {key}"
+        )));
+    };
+
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(raw) = gguf_to_u64(item) else {
+            return Err(Error::ModelLoadError(format!(
+                "Expected integer array values for {key}"
+            )));
+        };
+        let value = u32::try_from(raw).map_err(|_| {
             Error::ModelLoadError(format!("Array value out of range for {key}: {raw}"))
         })?;
         values.push(value);
@@ -1648,6 +1690,80 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    fn byte_level_char_for_test(byte: u8) -> char {
+        let mut bytes: Vec<u8> = (b'!'..=b'~')
+            .chain(b'\xA1'..=b'\xAC')
+            .chain(b'\xAE'..=b'\xFF')
+            .collect();
+        let mut codepoints: Vec<u32> = bytes.iter().map(|byte| u32::from(*byte)).collect();
+        let mut next = 0u32;
+        for candidate in 0..=u8::MAX {
+            if !bytes.contains(&candidate) {
+                bytes.push(candidate);
+                codepoints.push(256 + next);
+                next += 1;
+            }
+        }
+        let index = bytes
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .expect("byte-level alphabet contains every byte");
+        char::from_u32(codepoints[index]).expect("byte-level codepoint is valid")
+    }
+
+    fn synthetic_qwen35_tokenizer() -> Qwen35Tokenizer {
+        let mut tokens: Vec<String> = (0..=u8::MAX)
+            .map(|byte| byte_level_char_for_test(byte).to_string())
+            .collect();
+        let im_start = tokens.len() as u32;
+        tokens.push("<|im_start|>".to_string());
+        let im_end = tokens.len() as u32;
+        tokens.push("<|im_end|>".to_string());
+        let image_pad = tokens.len() as u32;
+        tokens.push("<|image_pad|>".to_string());
+        let video_pad = tokens.len() as u32;
+        tokens.push("<|video_pad|>".to_string());
+        let eos_alt = tokens.len() as u32;
+        tokens.push("<|endoftext|>".to_string());
+        let think_open = tokens.len() as u32;
+        tokens.push("<think>".to_string());
+        let think_close = tokens.len() as u32;
+        tokens.push("</think>".to_string());
+
+        let mut token_types = vec![1; 256];
+        token_types.extend([3, 3, 3, 3, 3, 4, 4]);
+        let mut inner =
+            Tokenizer::from_gguf_bpe(&tokens, &[], Some("qwen35"), false).expect("tokenizer");
+        inner
+            .register_gguf_token_types(&tokens, &token_types)
+            .expect("atomic tokens");
+
+        Qwen35Tokenizer {
+            vocab_size: inner.vocab_size(),
+            inner,
+            specials: SpecialTokenIds {
+                im_start,
+                im_end,
+                image_pad,
+                video_pad,
+                eos: im_end,
+                eos_alt: Some(eos_alt),
+            },
+            literal_special_tokens: vec![
+                ("<|im_start|>".to_string(), im_start),
+                ("<|endoftext|>".to_string(), eos_alt),
+                ("<|image_pad|>".to_string(), image_pad),
+                ("<|video_pad|>".to_string(), video_pad),
+                ("<|im_end|>".to_string(), im_end),
+                ("</think>".to_string(), think_close),
+                ("<think>".to_string(), think_open),
+            ],
+            chat_template: String::new(),
+            default_enable_thinking: false,
+            bos_token: None,
+        }
+    }
+
     fn local_model_dir(name: &str) -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home)
@@ -1674,6 +1790,16 @@ mod tests {
 
         assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
         assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn penalty_history_starts_with_exact_prompt_ids() {
+        let prompt_ids = vec![248_000, 17, 23, 248_001];
+        let mut history = initial_penalty_history(&prompt_ids, 8, true);
+        assert_eq!(history, prompt_ids);
+        history.push(99);
+        assert_eq!(&history[..prompt_ids.len()], prompt_ids.as_slice());
+        assert!(initial_penalty_history(&prompt_ids, 8, false).is_empty());
     }
 
     #[test]
@@ -1730,18 +1856,57 @@ mod tests {
     }
 
     #[test]
-    fn resolve_default_thinking_matches_variant_templates() {
+    fn resolve_default_thinking_depends_on_variant_not_template_signature() {
         let small = "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is true %}<think>\n{%- endif %}{%- endif %}";
         let large = "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is false %}{%- else %}<think>\n{%- endif %}{%- endif %}";
 
         assert!(!resolve_default_enable_thinking(
-            small,
+            large,
             ModelVariant::Qwen3508BGguf
         ));
-        assert!(resolve_default_enable_thinking(
+        assert!(!resolve_default_enable_thinking(
             large,
+            ModelVariant::Qwen352BGguf
+        ));
+        assert!(resolve_default_enable_thinking(
+            small,
             ModelVariant::Qwen354BGguf
         ));
+        assert!(resolve_default_enable_thinking(
+            small,
+            ModelVariant::Qwen359BGguf
+        ));
+    }
+
+    #[test]
+    fn explicit_thinking_override_wins_over_variant_default() {
+        let messages = [ChatMessage {
+            role: ChatRole::User,
+            content: "Answer briefly.".to_string(),
+        }];
+        let enable = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(true),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+        let disable = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+
+        assert!(render_prompt(&messages, &enable, false)
+            .expect("enable thinking")
+            .ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(render_prompt(&messages, &disable, true)
+            .expect("disable thinking")
+            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -1839,6 +2004,59 @@ mod tests {
 
         assert!(prompt.contains("<|im_start|>assistant\nFinal answer<|im_end|>\n"));
         assert!(!prompt.contains("reasoning first"));
+    }
+
+    #[test]
+    fn multi_turn_rendering_preserves_unicode_assistant_content() {
+        let previous_answer = "café 中文 🌍 👨‍👩‍👧‍👦";
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(
+            &[
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "First turn".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: previous_answer.to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Second turn".to_string(),
+                },
+            ],
+            &config,
+            false,
+        )
+        .expect("render multi-turn prompt");
+
+        assert!(prompt.contains(&format!(
+            "<|im_start|>assistant\n{previous_answer}<|im_end|>\n"
+        )));
+        assert!(!prompt.contains('\u{fffd}'));
+
+        let tokenizer = synthetic_qwen35_tokenizer();
+        let ids = tokenizer
+            .encode_text(&prompt)
+            .expect("encode rendered prompt");
+        assert!(ids.contains(&tokenizer.specials.im_start));
+        assert!(ids.contains(&tokenizer.specials.im_end));
+        assert!(ids.contains(&tokenizer.inner.token_to_id("<think>").unwrap()));
+        assert!(ids.contains(&tokenizer.inner.token_to_id("</think>").unwrap()));
+        assert_eq!(
+            tokenizer
+                .inner
+                .decode_with_special_tokens(&ids)
+                .expect("decode rendered ids"),
+            prompt
+        );
     }
 
     #[test]
