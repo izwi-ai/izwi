@@ -1413,7 +1413,7 @@ fn sample_next_token(
     }
 
     let mut values = logits_to_vec(logits)?;
-    clamp_logits_to_vocab(&mut values, vocab_size);
+    truncate_logits_to_vocab(&mut values, vocab_size);
 
     if config.repetition_penalty > 1.0 && !history.is_empty() {
         let mut seen = vec![false; values.len()];
@@ -1561,10 +1561,30 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
         .map_err(Error::from)
 }
 
-fn clamp_logits_to_vocab(values: &mut [f32], vocab_size: usize) {
+fn truncate_logits_to_vocab(values: &mut Vec<f32>, vocab_size: usize) {
     if vocab_size < values.len() {
-        values[vocab_size..].fill(f32::NEG_INFINITY);
+        values.truncate(vocab_size);
     }
+}
+
+fn no_valid_logits_error(values: &[f32]) -> Error {
+    let mut nan = 0usize;
+    let mut positive_infinity = 0usize;
+    let mut negative_infinity = 0usize;
+    for value in values {
+        if value.is_nan() {
+            nan = nan.saturating_add(1);
+        } else if *value == f32::INFINITY {
+            positive_infinity = positive_infinity.saturating_add(1);
+        } else if *value == f32::NEG_INFINITY {
+            negative_infinity = negative_infinity.saturating_add(1);
+        }
+    }
+    Error::InferenceError(format!(
+        "No valid Qwen3.5 logits to sample: 0 finite, {nan} NaN, \
+         {positive_infinity} +Inf, {negative_infinity} -Inf across {} in-vocabulary logits",
+        values.len()
+    ))
 }
 
 fn argmax_values(values: &[f32]) -> Result<u32> {
@@ -1580,7 +1600,7 @@ fn argmax_values(values: &[f32]) -> Result<u32> {
 
     max_idx
         .map(|idx| idx as u32)
-        .ok_or_else(|| Error::InferenceError("No valid Qwen3.5 logits to sample".to_string()))
+        .ok_or_else(|| no_valid_logits_error(values))
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -1646,7 +1666,21 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     } else {
         logits
     };
-    argmax(&clamped)
+    let selected = argmax(&clamped)?;
+    let selected_logit = clamped
+        .i(selected as usize)?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()?;
+    if selected_logit.is_finite() {
+        return Ok(selected);
+    }
+
+    // Some device argmax kernels do not define useful ordering for NaNs. This
+    // slow path runs only after the selected value is non-finite: it recovers a
+    // finite candidate when one exists and otherwise returns useful counts for
+    // the exact in-vocabulary row in every sampling mode.
+    let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    argmax_values(&values)
 }
 
 struct SimpleRng {
@@ -2099,6 +2133,38 @@ mod tests {
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sampler_reports_non_finite_counts_for_greedy_and_probabilistic_modes() {
+        let logits = Tensor::from_vec(
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 42.0],
+            (4,),
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits");
+
+        for temperature in [0.0, 0.7] {
+            let config = ChatGenerationConfig {
+                temperature,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                presence_penalty: 0.0,
+                stop_token_ids: Vec::new(),
+                seed: 7,
+                request: ChatRequestConfig::default(),
+            };
+            let mut rng = SimpleRng::new(7);
+            let error = sample_next_token(&logits, 3, &config, &[], &mut rng)
+                .expect_err("all in-vocabulary logits are non-finite");
+            let message = error.to_string();
+            assert!(message.contains("0 finite"));
+            assert!(message.contains("1 NaN"));
+            assert!(message.contains("1 +Inf"));
+            assert!(message.contains("1 -Inf"));
+            assert!(message.contains("3 in-vocabulary logits"));
+        }
     }
 
     #[test]
