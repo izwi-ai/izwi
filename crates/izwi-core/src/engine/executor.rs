@@ -877,6 +877,12 @@ impl NativeExecutor {
             Error::InferenceError("cache allocation has no physical resource lease".to_string())
         })?;
         if observed_bytes > 0 {
+            if observed_bytes > reservation.reserved_bytes {
+                return Err(Error::InferenceError(format!(
+                    "materialized session cache uses {observed_bytes} bytes, exceeding its {}-byte authorization for request {} epoch {}",
+                    reservation.reserved_bytes, session.request_id, session.epoch
+                )));
+            }
             lease.record_materialized_usage(cache_resource_vector(
                 self.config.backend,
                 observed_bytes,

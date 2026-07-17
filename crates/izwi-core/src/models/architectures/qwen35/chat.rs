@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle_core::quantized::gguf_file::Value as GgufValue;
 use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
@@ -456,6 +456,7 @@ impl Qwen35ChatModel {
         }
 
         let text_config = parse_text_config(&text_loader)?;
+        debug!(variant = %variant, ?text_config, "Resolved Qwen3.5 text configuration");
         let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
         let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
 

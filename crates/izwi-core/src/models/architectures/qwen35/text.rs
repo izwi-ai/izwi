@@ -126,7 +126,7 @@ impl ConvRingState {
         })
     }
 
-    /// Move logical history slots into one exact-size backing allocation.
+    /// Move every logical history slot into independent exact-size storage.
     ///
     /// Sequence-prefill slots are views into the entire projected token span.
     /// Keeping those views in runtime state would retain the full projection
@@ -136,13 +136,24 @@ impl ConvRingState {
             return Ok(());
         }
 
-        let slot_refs: Vec<&Tensor> = self.slots.iter().collect();
-        let packed = compact_tensor_storage(&Tensor::cat(&slot_refs, 1)?)?;
-        let mut slots = Vec::with_capacity(self.slots.len());
-        for idx in 0..self.slots.len() {
-            slots.push(packed.narrow(1, idx, 1)?);
+        self.slots = self
+            .slots
+            .iter()
+            .map(deep_copy_tensor_storage)
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(())
+    }
+
+    fn push_owned(&mut self, current: &Tensor) -> Result<()> {
+        if self.slots.is_empty() || self.next_idx >= self.slots.len() {
+            return Err(Error::InferenceError(format!(
+                "Invalid Qwen3.5 convolution ring: slots={}, next_idx={}",
+                self.slots.len(),
+                self.next_idx
+            )));
         }
-        self.slots = slots;
+        self.slots[self.next_idx] = deep_copy_tensor_storage(current)?;
+        self.next_idx = (self.next_idx + 1) % self.slots.len();
         Ok(())
     }
 }
@@ -614,13 +625,12 @@ impl Qwen35Layer {
             ) => {
                 if conv_state.is_none() && mixer.kernel_size > 1 {
                     // Persistent runtime state cannot outlive a released scratch-pool
-                    // lease. Keep the fixed history in one exact-size allocation.
+                    // lease. Independent exact-size slots allow O(1) replacement
+                    // without retaining dead regions of a shared backing buffer.
                     let history_len = mixer.kernel_size - 1;
-                    let zero =
-                        owned_zero_tensor(&[mixer.conv_dim, history_len], DType::F32, device)?;
                     let mut slots = Vec::with_capacity(history_len);
-                    for idx in 0..history_len {
-                        slots.push(zero.narrow(1, idx, 1)?);
+                    for _ in 0..history_len {
+                        slots.push(owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device)?);
                     }
                     *conv_state = Some(ConvRingState { slots, next_idx: 0 });
                 }
@@ -1717,9 +1727,11 @@ impl Qwen35LinearAttention {
             if let Some((output, final_history)) =
                 try_qwen35_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
             {
-                let final_history = compact_tensor_storage(&final_history)?;
                 buffer.slots = (0..history_len)
-                    .map(|idx| final_history.narrow(1, idx, 1))
+                    .map(|idx| {
+                        let slot = final_history.narrow(1, idx, 1)?;
+                        deep_copy_tensor_storage(&slot)
+                    })
                     .collect::<candle_core::Result<Vec<_>>>()?;
                 buffer.next_idx = 0;
                 return Ok(output);
@@ -1781,8 +1793,7 @@ impl Qwen35LinearAttention {
             }
 
             // Update the ring buffer in O(1): overwrite oldest and advance cursor.
-            buffer.slots[buffer.next_idx] = current;
-            buffer.next_idx = (buffer.next_idx + 1) % history_len;
+            buffer.push_owned(&current)?;
 
             convolved.squeeze(1)?
         };
@@ -2648,6 +2659,28 @@ mod tests {
             .compact_owned()
             .expect("compaction should succeed");
 
+        assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
+    }
+
+    #[test]
+    fn conv_ring_push_does_not_retain_projection_backing() {
+        let slots = (0..3)
+            .map(|_| Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap())
+            .collect();
+        let mut ring = ConvRingState { slots, next_idx: 0 };
+        let projection = Tensor::zeros((1, 40, 32), DType::F32, &Device::Cpu).unwrap();
+        let current = projection.i((0, 39)).unwrap().reshape((32, 1)).unwrap();
+
+        ring.push_owned(&current).expect("ring push should copy");
+        drop(current);
+        drop(projection);
+
+        let state = Qwen35TextRuntimeState {
+            layers: vec![Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ring),
+                recurrent_state: None,
+            }],
+        };
         assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
     }
 
