@@ -1340,6 +1340,10 @@ impl RuntimeService {
                         }
                     }
                     Ok(Err(err)) => {
+                        let error_message = match err {
+                            Error::InferenceError(message) => message,
+                            other => other.to_string(),
+                        };
                         let mut w = waiters.lock().await;
                         let pending: Vec<_> = w.drain().collect();
                         drop(w);
@@ -1350,7 +1354,7 @@ impl RuntimeService {
                         for (_, waiter) in pending {
                             let _ = waiter
                                 .sender
-                                .send(Err(Error::InferenceError(err.to_string())));
+                                .send(Err(Error::InferenceError(error_message.clone())));
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
                     }

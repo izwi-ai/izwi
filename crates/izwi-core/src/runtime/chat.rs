@@ -12,6 +12,73 @@ use crate::runtime::service::{
     RuntimeService,
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
+use tracing::warn;
+
+/// Return prefix endpoints for complete historical user/assistant turns while
+/// preserving a leading system message and the newest user query. Candidate
+/// prompts are still prepared by the loaded model; these boundaries only avoid
+/// O(turns) repeated one-pair tokenization.
+fn complete_chat_turn_prefix_ends(messages: &[ChatMessage]) -> Vec<usize> {
+    let protected_prefix = usize::from(
+        messages
+            .first()
+            .is_some_and(|message| message.role == crate::models::shared::chat::ChatRole::System),
+    );
+    let Some(last_user_index) = messages
+        .iter()
+        .rposition(|message| message.role == crate::models::shared::chat::ChatRole::User)
+    else {
+        return Vec::new();
+    };
+    let mut ends = Vec::new();
+    let mut cursor = protected_prefix;
+    while cursor < last_user_index {
+        let Some(user_offset) = messages[cursor..last_user_index]
+            .iter()
+            .position(|message| message.role == crate::models::shared::chat::ChatRole::User)
+        else {
+            break;
+        };
+        let user_index = cursor + user_offset;
+        let Some(assistant_offset) = messages[(user_index + 1)..last_user_index]
+            .iter()
+            .position(|message| message.role == crate::models::shared::chat::ChatRole::Assistant)
+        else {
+            cursor = user_index + 1;
+            continue;
+        };
+        let assistant_index = user_index + 1 + assistant_offset;
+        ends.push(assistant_index);
+        cursor = assistant_index + 1;
+    }
+    ends
+}
+
+fn chat_messages_after_prefix(messages: &[ChatMessage], prefix_end: usize) -> Vec<ChatMessage> {
+    let protected_prefix = usize::from(
+        messages
+            .first()
+            .is_some_and(|message| message.role == crate::models::shared::chat::ChatRole::System),
+    );
+    let mut compacted = Vec::with_capacity(
+        protected_prefix.saturating_add(messages.len().saturating_sub(prefix_end + 1)),
+    );
+    compacted.extend_from_slice(&messages[..protected_prefix]);
+    compacted.extend_from_slice(&messages[(prefix_end + 1)..]);
+    compacted
+}
+
+fn bounded_chat_completion_tokens(
+    prompt_tokens: usize,
+    requested_max_tokens: usize,
+    context_limit: usize,
+) -> Option<usize> {
+    (prompt_tokens < context_limit).then(|| {
+        requested_max_tokens
+            .max(1)
+            .min(context_limit - prompt_tokens)
+    })
+}
 
 impl RuntimeService {
     fn prompt_token_config(
@@ -51,6 +118,7 @@ impl RuntimeService {
             )));
         }
         let correlation_id = correlation_id.map(ToOwned::to_owned);
+        let context_limit = self.config.max_sequence_length.max(1);
         let input_bytes = retained_chat_preparation_input_bytes(
             &messages,
             messages.capacity(),
@@ -75,10 +143,97 @@ impl RuntimeService {
                 let model = registry
                     .blocking_get_chat(variant)
                     .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-                let (prompt_tokens, prepared_qwen35_prompt) =
-                    model.prepare_prompt_for_execution(&messages, &prompt_config)?;
+                let original_messages = messages;
+                let initial =
+                    model.prepare_prompt_for_execution(&original_messages, &prompt_config)?;
+                let (messages, prompt_tokens, prepared_qwen35_prompt, trimmed_messages) =
+                    if initial.0.len() < context_limit {
+                        (original_messages, initial.0, initial.1, 0usize)
+                    } else {
+                    if !chat_config.media_inputs.is_empty() {
+                        return Err(Error::InvalidInput(format!(
+                            "Chat prompt has {} tokens in a {context_limit}-token context; automatic history compaction is disabled for media turns so inputs cannot become misaligned",
+                            initial.0.len()
+                        )));
+                    }
+                    let prefix_ends = complete_chat_turn_prefix_ends(&original_messages);
+                    if prefix_ends.is_empty() {
+                        return Err(Error::InvalidInput(format!(
+                            "Chat prompt has {} tokens in a {context_limit}-token context and no older complete turn can be compacted",
+                            initial.0.len()
+                        )));
+                    }
+                    let protected_prefix = usize::from(
+                        original_messages.first().is_some_and(|message| {
+                            message.role == crate::models::shared::chat::ChatRole::System
+                        }),
+                    );
+                    let mut low = 0usize;
+                    let mut high = prefix_ends.len() - 1;
+                    let mut selected = None;
+                    while low <= high {
+                        let middle = low + (high - low) / 2;
+                        let prefix_end = prefix_ends[middle];
+                        let candidate =
+                            chat_messages_after_prefix(&original_messages, prefix_end);
+                        let prepared =
+                            model.prepare_prompt_for_execution(&candidate, &prompt_config)?;
+                        if prepared.0.len() < context_limit {
+                            selected = Some((candidate, prepared, prefix_end));
+                            if middle == 0 {
+                                break;
+                            }
+                            high = middle - 1;
+                        } else {
+                            low = middle + 1;
+                        }
+                    }
+                    let Some((messages, prepared, prefix_end)) = selected else {
+                        return Err(Error::InvalidInput(format!(
+                            "Chat prompt has {} tokens in a {context_limit}-token context and remains too long after compacting all older complete turns",
+                            initial.0.len()
+                        )));
+                    };
+                    (
+                        messages,
+                        prepared.0,
+                        prepared.1,
+                        prefix_end + 1 - protected_prefix,
+                    )
+                };
+                if trimmed_messages > 0 {
+                    warn!(
+                        model = %variant,
+                        trimmed_messages,
+                        remaining_messages = messages.len(),
+                        prompt_tokens = prompt_tokens.len(),
+                        context_limit,
+                        "compacted oldest complete chat turns to fit the configured context"
+                    );
+                }
 
-                params.max_tokens = params.max_tokens.max(1);
+                let requested_max_tokens = params.max_tokens.max(1);
+                params.max_tokens = bounded_chat_completion_tokens(
+                    prompt_tokens.len(),
+                    requested_max_tokens,
+                    context_limit,
+                )
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Chat prompt has {} tokens in a {context_limit}-token context",
+                        prompt_tokens.len()
+                    ))
+                })?;
+                if params.max_tokens < requested_max_tokens {
+                    warn!(
+                        model = %variant,
+                        requested_max_tokens,
+                        max_tokens = params.max_tokens,
+                        prompt_tokens = prompt_tokens.len(),
+                        context_limit,
+                        "clamped chat completion budget to the remaining context"
+                    );
+                }
                 let mut request = ChatRuntimeRequest::from_messages(
                     variant,
                     messages,
@@ -428,5 +583,57 @@ impl RuntimeService {
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bounded_chat_completion_tokens, chat_messages_after_prefix, complete_chat_turn_prefix_ends,
+    };
+    use crate::models::shared::chat::{ChatMessage, ChatRole};
+
+    fn message(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn compaction_preserves_system_and_latest_query() {
+        let messages = vec![
+            message(ChatRole::System, "system"),
+            message(ChatRole::User, "u1"),
+            message(ChatRole::Assistant, "a1"),
+            message(ChatRole::User, "u2"),
+            message(ChatRole::Assistant, "a2"),
+            message(ChatRole::User, "u3"),
+        ];
+
+        let ends = complete_chat_turn_prefix_ends(&messages);
+        assert_eq!(ends, vec![2, 4]);
+        let compacted = chat_messages_after_prefix(&messages, ends[0]);
+        assert_eq!(compacted.len(), 4);
+        assert_eq!(compacted[0].role, ChatRole::System);
+        assert_eq!(compacted[1].content, "u2");
+        assert_eq!(compacted[3].content, "u3");
+    }
+
+    #[test]
+    fn compaction_never_drops_the_only_user_query() {
+        let messages = vec![
+            message(ChatRole::System, "system"),
+            message(ChatRole::User, "latest"),
+        ];
+        assert!(complete_chat_turn_prefix_ends(&messages).is_empty());
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn completion_budget_never_exceeds_remaining_context() {
+        assert_eq!(bounded_chat_completion_tokens(90, 32, 100), Some(10));
+        assert_eq!(bounded_chat_completion_tokens(90, 0, 100), Some(1));
+        assert_eq!(bounded_chat_completion_tokens(100, 1, 100), None);
     }
 }

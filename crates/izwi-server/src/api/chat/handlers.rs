@@ -8,15 +8,17 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent,
+    generate_chat, parse_chat_model, spawn_chat_stream_with_keepalive, ChatExecutionRequest,
+    ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
-use crate::chat_store::{ChatThreadMessage, ChatThreadSummary};
+use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole};
@@ -32,6 +34,8 @@ pub struct CreateChatThreadRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,7 +52,10 @@ pub struct DeleteChatThreadResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateChatThreadRequest {
-    pub title: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -136,7 +143,7 @@ pub async fn create_thread(
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
     let thread = state
         .chat_store
-        .create_thread(req.title, req.model_id)
+        .create_thread_with_system_prompt(req.title, req.model_id, req.system_prompt)
         .await
         .map_err(map_store_error)?;
 
@@ -196,13 +203,20 @@ pub async fn update_thread(
     Path(thread_id): Path<String>,
     Json(req): Json<UpdateChatThreadRequest>,
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
-    if req.title.trim().is_empty() {
+    if req.title.is_none() && req.system_prompt.is_none() {
+        return Err(ApiError::bad_request("No thread settings were provided"));
+    }
+    if req
+        .title
+        .as_deref()
+        .is_some_and(|title| title.trim().is_empty())
+    {
         return Err(ApiError::bad_request("Thread title cannot be empty"));
     }
 
     let updated = state
         .chat_store
-        .update_thread_title(thread_id, req.title)
+        .update_thread_settings(thread_id, req.title, req.system_prompt)
         .await
         .map_err(map_store_error)?;
 
@@ -227,7 +241,16 @@ pub async fn create_thread_message(
         return Err(ApiError::bad_request("Message content cannot be empty"));
     }
 
-    get_thread_or_not_found(&state, &thread_id).await?;
+    // Hold one turn lock across history read, generation, and terminal
+    // persistence. Concurrent sends to the same thread therefore observe the
+    // preceding assistant response instead of branching from stale history.
+    let turn_guard = state.chat_store.lock_turn(&thread_id).await;
+    let thread = get_thread_or_not_found(&state, &thread_id).await?;
+    let requested_system_prompt = req.system_prompt.clone();
+    let effective_system_prompt = match requested_system_prompt.as_deref() {
+        Some(prompt) => sanitize_system_prompt(Some(prompt)),
+        None => thread.system_prompt.clone(),
+    };
     let existing_messages = state
         .chat_store
         .list_messages(thread_id.clone())
@@ -237,21 +260,17 @@ pub async fn create_thread_message(
     let (runtime_messages, media_inputs) = build_runtime_messages(
         &existing_messages,
         &flattened_content,
-        req.system_prompt.as_deref(),
+        effective_system_prompt.as_deref(),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
 
     let user_message = state
         .chat_store
-        .append_message(
+        .prepare_user_message(
             thread_id.clone(),
-            "user".to_string(),
             flattened_content.display_text.clone(),
             prepared_content_parts.clone(),
-            Some(model_id.clone()),
-            None,
-            None,
         )
         .await
         .map_err(map_store_or_not_found)?;
@@ -279,22 +298,23 @@ pub async fn create_thread_message(
             thread_id,
             user_message,
             execution_request,
+            turn_guard,
+            requested_system_prompt,
         )
         .await;
     }
 
     let generation = generate_chat(&state, execution_request).await?;
 
-    let assistant_message = state
+    let (user_message, assistant_message) = state
         .chat_store
-        .append_message(
-            thread_id.clone(),
-            "assistant".to_string(),
+        .append_turn_with_system_prompt(
+            user_message,
             generation.text.clone(),
-            None,
-            Some(model_id.clone()),
-            Some(generation.tokens_generated),
-            Some(generation.generation_time_ms),
+            model_id.clone(),
+            generation.tokens_generated,
+            generation.generation_time_ms,
+            requested_system_prompt,
         )
         .await
         .map_err(map_store_or_not_found)?;
@@ -319,14 +339,18 @@ async fn create_streaming_thread_message(
     thread_id: String,
     user_message: ChatThreadMessage,
     execution_request: ChatExecutionRequest,
+    turn_guard: OwnedMutexGuard<()>,
+    system_prompt_update: Option<String>,
 ) -> Result<Response, ApiError> {
     let chat_store = state.chat_store.clone();
     let thread_id_for_task = thread_id.clone();
     let model_id_for_task = model_id.clone();
     let user_message_for_start = user_message.clone();
-    let mut event_rx = spawn_chat_stream(state, execution_request);
+    let (mut event_rx, stream_completion) =
+        spawn_chat_stream_with_keepalive(state, execution_request, turn_guard);
 
     let stream = async_stream::stream! {
+        let mut stream_completion = Some(stream_completion);
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => (
@@ -349,18 +373,17 @@ async fn create_streaming_thread_message(
                 ),
                 ChatStreamEvent::Completed(generation) => {
                     let payload = match chat_store
-                        .append_message(
-                            thread_id_for_task.clone(),
-                            "assistant".to_string(),
+                        .append_turn_with_system_prompt(
+                            user_message_for_start.clone(),
                             generation.text.clone(),
-                            None,
-                            Some(model_id_for_task.clone()),
-                            Some(generation.tokens_generated),
-                            Some(generation.generation_time_ms),
+                            model_id_for_task.clone(),
+                            generation.tokens_generated,
+                            generation.generation_time_ms,
+                            system_prompt_update.clone(),
                         )
                         .await
                     {
-                        Ok(assistant_message) => serde_json::to_string(&ThreadStreamDoneEvent {
+                        Ok((_user_message, assistant_message)) => serde_json::to_string(&ThreadStreamDoneEvent {
                             event: "done",
                             thread_id: thread_id_for_task.clone(),
                             model_id: model_id_for_task.clone(),
@@ -396,6 +419,11 @@ async fn create_streaming_thread_message(
                     true,
                 ),
             };
+            if terminal {
+                if let Some(completion) = stream_completion.take() {
+                    completion.acknowledge();
+                }
+            }
             yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
             if terminal {
                 break;

@@ -12,7 +12,14 @@ struct RequiredSchemaTable {
 const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
     RequiredSchemaTable {
         name: "chat_threads",
-        columns: &["id", "title", "model_id", "created_at", "updated_at"],
+        columns: &[
+            "id",
+            "title",
+            "model_id",
+            "system_prompt",
+            "created_at",
+            "updated_at",
+        ],
     },
     RequiredSchemaTable {
         name: "chat_messages",
@@ -572,4 +579,31 @@ async fn validate_required_seed_data(db: &DatabaseConnection) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_provider_managed_schema;
+    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+    #[tokio::test]
+    async fn provider_contract_rejects_chat_threads_without_system_prompt() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("sqlite connection");
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TABLE chat_threads (id TEXT PRIMARY KEY, title TEXT NOT NULL, model_id TEXT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+        ))
+        .await
+        .expect("legacy chat_threads table");
+
+        let error = validate_provider_managed_schema(&db)
+            .await
+            .expect_err("legacy provider schema should fail");
+        assert!(
+            error.to_string().contains("chat_threads.system_prompt"),
+            "{error}"
+        );
+    }
 }

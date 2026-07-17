@@ -54,6 +54,7 @@ export interface ChatThread {
   id: string;
   title: string;
   model_id: string | null;
+  system_prompt: string | null;
   created_at: number;
   updated_at: number;
   last_message_preview: string | null;
@@ -79,10 +80,12 @@ export interface ChatThreadDetail {
 export interface ChatThreadCreateRequest {
   title?: string;
   model_id?: string;
+  system_prompt?: string;
 }
 
 export interface ChatThreadUpdateRequest {
-  title: string;
+  title?: string;
+  system_prompt?: string;
 }
 
 export interface ChatThreadContentPart {
@@ -333,6 +336,7 @@ export class ChatApiClient {
       body: JSON.stringify({
         title: request?.title,
         model_id: request?.model_id,
+        system_prompt: request?.system_prompt,
       }),
     });
   }
@@ -345,6 +349,7 @@ export class ChatApiClient {
       method: "PATCH",
       body: JSON.stringify({
         title: request.title,
+        system_prompt: request.system_prompt,
       }),
     });
   }
