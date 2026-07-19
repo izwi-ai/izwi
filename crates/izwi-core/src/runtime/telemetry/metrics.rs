@@ -429,7 +429,6 @@ impl RuntimeTelemetryCollector {
         if output.error.is_some() {
             self.requests_failed.fetch_add(1, Ordering::Relaxed);
         }
-        self.requests_active.fetch_sub(1, Ordering::Relaxed);
 
         if let Some(latency) = output.latency_breakdown.as_ref() {
             Self::push_sample(
@@ -1135,7 +1134,16 @@ fn prometheus_label_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ENGINE_SCHEDULER_QUEUE_DEPTH;
+    use crate::engine::{ExecutorOutput, OutputProcessor, ENGINE_SCHEDULER_QUEUE_DEPTH};
+    use std::time::Duration;
+
+    fn terminal_output(request_id: &str, error: Option<&str>) -> EngineOutput {
+        let output = match error {
+            Some(message) => ExecutorOutput::error(request_id.to_string(), message),
+            None => ExecutorOutput::terminal(request_id.to_string()),
+        };
+        OutputProcessor::new(24_000).process(output, 1, Duration::ZERO)
+    }
 
     #[tokio::test]
     async fn request_terminal_accounting_is_exactly_once() {
@@ -1151,6 +1159,41 @@ mod tests {
         assert_eq!(snapshot.requests_completed, 1);
         assert_eq!(snapshot.requests_cancelled, 1);
         assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.requests_active, 0);
+    }
+
+    #[tokio::test]
+    async fn completed_request_releases_active_gauge_once() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_request_queued("request-1").await;
+        let output = terminal_output("request-1", None);
+
+        telemetry.record_request_finished(&output).await;
+        telemetry.record_request_finished(&output).await;
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.requests_queued, 1);
+        assert_eq!(snapshot.requests_completed, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.requests_active, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_and_forced_terminal_paths_release_exact_requests() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_request_queued("failed").await;
+        telemetry.record_request_queued("forced").await;
+
+        telemetry
+            .record_request_finished(&terminal_output("failed", Some("boom")))
+            .await;
+        telemetry
+            .record_forced_failures(["forced", "unknown"])
+            .await;
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.requests_completed, 2);
+        assert_eq!(snapshot.requests_failed, 2);
         assert_eq!(snapshot.requests_active, 0);
     }
 
