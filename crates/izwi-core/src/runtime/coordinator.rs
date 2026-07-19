@@ -396,30 +396,6 @@ impl InferenceCoordinator {
         })
     }
 
-    pub async fn run_direct<T, F>(self: &Arc<Self>, spec: JobSpec, future: F) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        let job = self.admit(spec).await?;
-        self.run_stage(&job, future).await
-    }
-
-    /// Run a direct job whose retained input allocation already exists when
-    /// admission completes. The observation only reconciles physical usage;
-    /// it cannot expand the authorization established by `spec`.
-    pub async fn run_direct_observed<T, F>(
-        self: &Arc<Self>,
-        spec: JobSpec,
-        observation: JobResourceObservation,
-        future: F,
-    ) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        let job = self.admit_observed(spec, observation).await?;
-        self.run_stage(&job, future).await
-    }
-
     /// Admit a request before invoking its potentially expensive preparation
     /// closure. The caller deadline covers model loading and preprocessing as
     /// well as later execution, and a rejected request performs no preparation.
@@ -482,7 +458,8 @@ impl InferenceCoordinator {
         Ok((job, prepared))
     }
 
-    pub async fn run_stage<T, F>(self: &Arc<Self>, job: &JobLease, future: F) -> Result<T>
+    #[cfg(test)]
+    pub(crate) async fn run_stage<T, F>(self: &Arc<Self>, job: &JobLease, future: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {
