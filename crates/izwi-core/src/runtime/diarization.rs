@@ -375,7 +375,7 @@ impl RuntimeService {
         let observation_job = job.clone();
         let (runtime_request, audio, steady_usage) = self
             .coordinator
-            .run_blocking_stage(&job, move || {
+            .run_host_blocking_stage(&job, move || {
                 let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
                 let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
                 let runtime_request =
@@ -530,7 +530,7 @@ impl RuntimeService {
         let observation_job = pipeline_job.clone();
         let (runtime_request, audio, steady_usage) = self
             .coordinator
-            .run_blocking_stage(&pipeline_job, move || {
+            .run_host_blocking_stage(&pipeline_job, move || {
                 let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
                 let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
                 let runtime_request = DiarizationRuntimeRequest::from_bytes(

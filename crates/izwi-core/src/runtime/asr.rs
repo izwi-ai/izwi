@@ -2407,7 +2407,7 @@ impl RuntimeService {
         let observation_job = job.clone();
         let (residency_lease, samples, sample_rate) = self
             .coordinator
-            .run_blocking_stage(&job, move || {
+            .run_host_blocking_stage(&job, move || {
                 let retained_audio_bytes = owned_audio.retained_bytes();
                 let (samples, sample_rate) = owned_audio.decode()?;
                 let samples = Arc::<[f32]>::from(samples);
@@ -3072,7 +3072,7 @@ where
     let planning_samples = samples.clone();
     let planning_job = job.clone();
     let (mut residency_lease, chunks) = coordinator
-        .run_blocking_stage(job, move || {
+        .run_host_blocking_stage(job, move || {
             planning_job.record_materialized_usage(decoded_audio_observation(
                 retained_input_bytes,
                 planning_samples.len(),

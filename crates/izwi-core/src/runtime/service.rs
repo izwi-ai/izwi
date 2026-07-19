@@ -1764,7 +1764,7 @@ impl RuntimeService {
         let registry = self.model_registry.clone();
         let (residency_lease, mut request) = self
             .coordinator
-            .run_blocking_stage(&job, move || {
+            .run_host_blocking_stage(&job, move || {
                 let request = build(registry, prepared_input)?;
                 Ok((residency_lease, request))
             })

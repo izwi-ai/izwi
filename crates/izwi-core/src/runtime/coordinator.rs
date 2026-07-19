@@ -87,6 +87,7 @@ pub struct InferenceCoordinator {
     capacity: usize,
     backend: BackendKind,
     jobs: Arc<Semaphore>,
+    host_work: Arc<Semaphore>,
     execution: Arc<Semaphore>,
     resources: Arc<ResourceAuthority>,
     admission_gate: Mutex<()>,
@@ -146,6 +147,7 @@ impl InferenceCoordinator {
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
+            host_work: Arc::new(Semaphore::new(capacity)),
             execution: Arc::new(Semaphore::new(capacity)),
             resources,
             admission_gate: Mutex::new(()),
@@ -529,6 +531,35 @@ impl InferenceCoordinator {
         self.run_blocking_stage_inner(job, operation).await
     }
 
+    /// Execute admitted CPU-side preparation without spending backend device
+    /// capacity. Host work has its own bounded lane and retains the job lease
+    /// until a detached blocking task physically exits.
+    pub(crate) async fn run_host_blocking_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let acquire = self.host_work.clone().acquire_owned();
+        let permit = match job.spec.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
+                .await
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout(job.spec.request_id.clone())
+                })?
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+            None => acquire
+                .await
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+        };
+        self.run_blocking_task(job, permit, "host preparation", operation)
+            .await
+    }
+
     /// Execute one non-batched model stage through an exact loaded adapter.
     /// Direct, realtime, and pipeline runners use this compatibility boundary
     /// until their model stage gains a proven native tensor adapter.
@@ -589,12 +620,29 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         let deadline = job.spec.deadline;
-        let request_id = job.spec.request_id.clone();
         let execution = self.acquire_execution(deadline).await?;
+        self.run_blocking_task(job, execution, "inference", operation)
+            .await
+    }
+
+    async fn run_blocking_task<T, F, G>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        guard: G,
+        task_kind: &'static str,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+        G: Send + 'static,
+    {
+        let deadline = job.spec.deadline;
+        let request_id = job.spec.request_id.clone();
         let retained_job = job.clone();
         let blocking_request_id = request_id.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let _execution = execution;
+            let _guard = guard;
             let _job = retained_job;
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 return Err(Error::Timeout(blocking_request_id));
@@ -611,7 +659,7 @@ impl InferenceCoordinator {
             None => handle.await,
         };
         let result = joined.map_err(|err| {
-            Error::InferenceError(format!("blocking inference task failed: {err}"))
+            Error::InferenceError(format!("blocking {task_kind} task failed: {err}"))
         })?;
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
@@ -2507,6 +2555,51 @@ Pages free: 10.\n";
         assert_eq!(while_blocked.active_executions, 1);
         assert_eq!(while_blocked.active_jobs, 1);
         assert_eq!(coordinator.snapshot().expired_total, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_blocking_work_does_not_consume_device_execution_capacity() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let host_job = coordinator.admit(job("host-work")).await.unwrap();
+        let device_job = coordinator.admit(job("device-work")).await.unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let task_job = host_job.clone();
+        let host = tokio::spawn(async move {
+            task_coordinator
+                .run_host_blocking_stage(&task_job, move || {
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*task_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    Ok(())
+                })
+                .await
+        });
+
+        started_rx.await.unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            coordinator.run_blocking_stage(&device_job, || Ok(())),
+        )
+        .await
+        .expect("device work should not wait for host preparation")
+        .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        host.await.unwrap().unwrap();
+        drop((host_job, device_job));
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
     }
 
     #[test]
