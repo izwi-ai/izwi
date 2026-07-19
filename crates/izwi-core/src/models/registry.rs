@@ -1976,6 +1976,13 @@ impl NativeChatModel {
         }
     }
 
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        match self {
+            Self::Qwen3(model) => model.supports_continuous_decode_batch(),
+            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => false,
+        }
+    }
+
     pub fn session_cache_reservation_bytes(
         &self,
         prompt_tokens: usize,
@@ -2093,6 +2100,39 @@ impl NativeChatModel {
                 "Chat decode state does not match loaded chat model".to_string(),
             )),
         }
+    }
+
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut NativeChatDecodeState],
+    ) -> Result<Vec<NativeChatDecodeStep>> {
+        let Self::Qwen3(model) = self else {
+            return Err(Error::InvalidInput(
+                "Loaded chat model has no continuous tensor decode adapter".to_string(),
+            ));
+        };
+        let mut qwen_states = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            match &mut **state {
+                NativeChatDecodeState::Qwen3(state) => qwen_states.push(state),
+                NativeChatDecodeState::Qwen35(_) => {
+                    return Err(Error::InvalidInput(
+                        "Qwen3 continuous batch received a Qwen3.5 decode state".to_string(),
+                    ))
+                }
+            }
+        }
+        model.decode_step_batch(&mut qwen_states).map(|steps| {
+            steps
+                .into_iter()
+                .map(|step| NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+                .collect()
+        })
     }
 }
 

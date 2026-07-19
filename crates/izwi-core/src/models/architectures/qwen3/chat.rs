@@ -410,7 +410,92 @@ impl Qwen3ChatModel {
         })
     }
 
+    /// Decode one token for a changing set of independent chat sessions in a
+    /// single model forward. Session-owned caches remain separate so rows may
+    /// enter or leave at every scheduler quantum boundary.
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<Vec<ChatDecodeStep>> {
+        let text_model = match &self.backend {
+            Qwen3ChatBackend::Native { text_model } => text_model,
+            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
+                return Err(Error::InvalidInput(format!(
+                    "Continuous chat decode is unavailable for GGUF model {}",
+                    gguf_file
+                )))
+            }
+        };
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut next_tokens = Vec::with_capacity(states.len());
+        let mut steps = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+                return Err(Error::InvalidInput(
+                    "Continuous chat batch contains a terminal decode state".to_string(),
+                ));
+            }
+
+            let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
+            let next = argmax(&logits)?;
+            next_tokens.push(next);
+            if next == self.tokenizer.specials.im_end
+                || next == self.tokenizer.specials.eos
+                || self.tokenizer.specials.eos_alt == Some(next)
+            {
+                state.finished = true;
+                steps.push(ChatDecodeStep {
+                    delta: String::new(),
+                    text: state.assembled.trim().to_string(),
+                    tokens_generated: state.generated_ids.len(),
+                    finished: true,
+                });
+                continue;
+            }
+
+            state.generated_ids.push(next);
+            let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
+            let delta = text_delta(&state.assembled, &decoded);
+            state.assembled = decoded;
+            if state.generated_ids.len() >= state.max_new_tokens {
+                state.finished = true;
+            }
+            steps.push(ChatDecodeStep {
+                delta,
+                text: state.assembled.trim().to_string(),
+                tokens_generated: state.generated_ids.len(),
+                finished: state.finished,
+            });
+        }
+
+        let positions = states.iter().map(|state| state.pos).collect::<Vec<_>>();
+        let input_ids = Tensor::from_vec(next_tokens, (states.len(), 1), &self.device.device)?;
+        let mut caches = states
+            .iter_mut()
+            .map(|state| &mut state.cache)
+            .collect::<Vec<_>>();
+        let next_logits = text_model.forward_decode_batch(&input_ids, &positions, &mut caches)?;
+        drop(caches);
+
+        for (row_idx, state) in states.iter_mut().enumerate() {
+            // Stop rows participate in the tensor operation to preserve the
+            // physical batch width, but their terminal state is never reused.
+            if !steps[row_idx].finished || state.generated_ids.len() >= state.max_new_tokens {
+                state.embeds = next_logits.i(row_idx)?.unsqueeze(0)?;
+                state.pos = state.pos.saturating_add(1);
+            }
+        }
+        Ok(steps)
+    }
+
     pub fn supports_incremental_decode(&self) -> bool {
+        matches!(&self.backend, Qwen3ChatBackend::Native { .. })
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
         matches!(&self.backend, Qwen3ChatBackend::Native { .. })
     }
 
