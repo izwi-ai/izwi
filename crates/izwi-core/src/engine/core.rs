@@ -13,10 +13,12 @@ use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, BatchKey, CacheMode, ConcurrencyClass, ExecutionDisposition, ExecutionFailure,
-    ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState,
-    ExecutionTracker, FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode,
-    RetryDisposition, WorkUnit,
+    AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
+    BatchLaneKey, CacheMode, ConcurrencyClass, ExecutionDisposition, ExecutionFailure,
+    ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport,
+    ExecutionState, ExecutionTracker, FinishReason as ExecutionFinishReason, ModelInstanceId,
+    NativeBatchMode, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
+    StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     reconcile_executor_outputs, ExecutedEngineStep, ExecutionGroupRunner, PreparedEngineStep,
@@ -126,6 +128,62 @@ struct CommittedExecutorOutput {
     disposition: ExecutionDisposition,
 }
 
+struct PhysicalBatchAssembly {
+    physical_batch: PhysicalBatch,
+    requests: Vec<Arc<EngineCoreRequest>>,
+    scheduled: Vec<super::scheduler::ScheduledRequest>,
+    shape_policy: StageShapePolicy,
+}
+
+impl PhysicalBatchAssembly {
+    fn materialized_tensor_elements(
+        shape_policy: StageShapePolicy,
+        rows: &[ReadyQuantum],
+    ) -> Option<u64> {
+        if shape_policy == StageShapePolicy::Padded {
+            let maximum = rows.iter().map(|row| row.cost.tensor_elements).max()?;
+            maximum.checked_mul(u64::try_from(rows.len()).ok()?)
+        } else {
+            rows.iter().try_fold(0u64, |total, row| {
+                total.checked_add(row.cost.tensor_elements)
+            })
+        }
+    }
+
+    fn workspace_bytes(rows: &[ReadyQuantum]) -> Option<u64> {
+        rows.iter().try_fold(0u64, |total, row| {
+            total.checked_add(row.cost.workspace_bytes)
+        })
+    }
+
+    fn try_push(
+        &mut self,
+        request: Arc<EngineCoreRequest>,
+        scheduled: super::scheduler::ScheduledRequest,
+        row: ReadyQuantum,
+    ) -> bool {
+        let mut candidate = self.physical_batch.clone();
+        candidate.rows.push(row);
+        let Some(materialized) =
+            Self::materialized_tensor_elements(self.shape_policy, &candidate.rows)
+        else {
+            return false;
+        };
+        let Some(workspace_bytes) = Self::workspace_bytes(&candidate.rows) else {
+            return false;
+        };
+        candidate.materialized_tensor_elements = materialized;
+        candidate.workspace_bytes = workspace_bytes;
+        if candidate.validate().is_err() {
+            return false;
+        }
+        self.physical_batch = candidate;
+        self.requests.push(request);
+        self.scheduled.push(scheduled);
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LifecycleRetryPolicy {
     max_execution_retries: u32,
@@ -208,6 +266,8 @@ pub struct EngineCore {
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
     maintenance_steps: u64,
+    /// Monotonic identity for physical dispatch envelopes.
+    next_batch_id: u64,
 }
 
 impl EngineCore {
@@ -760,22 +820,208 @@ impl EngineCore {
         outputs
     }
 
-    fn prepare_compatible_subbatches(
-        &self,
+    fn work_cost(work: &WorkUnit) -> Result<WorkCost> {
+        let logical_units = match work {
+            WorkUnit::SequenceStep {
+                input,
+                max_output_steps,
+                ..
+            } => {
+                let input = u64::try_from(input.len()).map_err(|_| {
+                    Error::Overloaded("execution input length exceeds work accounting".to_string())
+                })?;
+                let output = u64::try_from(*max_output_steps).map_err(|_| {
+                    Error::Overloaded("execution output bound exceeds work accounting".to_string())
+                })?;
+                input.max(output).max(1)
+            }
+            WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
+        };
+        Ok(WorkCost::new(logical_units, logical_units, 0))
+    }
+
+    fn batch_lane(plan: &ExecutionPlan, cost: WorkCost) -> BatchLaneKey {
+        let adapter = plan.batch_key.adapter.as_ref();
+        let stage = plan.stage.as_ref();
+        let shape_policy = stage
+            .map(|stage| stage.shape_policy)
+            .unwrap_or(StageShapePolicy::Exact);
+        let shape_bucket = match shape_policy {
+            StageShapePolicy::Exact => format!("exact.{}", cost.tensor_elements),
+            StageShapePolicy::Bucketed => format!(
+                "bucket.{}",
+                cost.tensor_elements
+                    .checked_next_power_of_two()
+                    .unwrap_or(u64::MAX)
+            ),
+            StageShapePolicy::Padded => "padded".to_string(),
+            StageShapePolicy::Ragged => "ragged".to_string(),
+        };
+        BatchLaneKey {
+            execution_group: adapter
+                .map(|adapter| adapter.execution_group_id)
+                .unwrap_or(ExecutionGroupId::new(0)),
+            model_instance: adapter
+                .map(|adapter| adapter.model_instance_id)
+                .unwrap_or(ModelInstanceId::new(0)),
+            adapter_instance: adapter
+                .map(|adapter| adapter.adapter_instance_id)
+                .unwrap_or(AdapterInstanceId::new(0)),
+            adapter_abi: adapter
+                .map(|adapter| adapter.adapter_abi_revision)
+                .unwrap_or(AdapterAbiRevision::new(0)),
+            capability_id: adapter
+                .map(|adapter| adapter.capability_id.clone())
+                .unwrap_or_else(|| "compatibility".to_string()),
+            stage_id: adapter
+                .map(|adapter| adapter.stage_id)
+                .unwrap_or(StageId::new(0)),
+            backend: plan.batch_key.backend,
+            device_ordinal: None,
+            compute_dtype: plan.batch_key.compute_dtype.clone(),
+            state_dtype: plan.batch_key.kv_dtype.clone(),
+            tensor_layout: format!("{shape_policy:?}").to_ascii_lowercase(),
+            quantization: "adapter-owned".to_string(),
+            state_schema: plan.batch_key.cache_namespace.clone(),
+            kernel_mode: stage
+                .map(|stage| stage.name.clone())
+                .unwrap_or_else(|| "compatibility".to_string()),
+            semantic_mode: format!(
+                "{:?}.{}",
+                plan.batch_key.task_type, plan.batch_key.work_kind
+            )
+            .to_ascii_lowercase(),
+            shape_bucket,
+        }
+    }
+
+    fn batch_budget(plan: &ExecutionPlan) -> Result<(BatchBudget, StageShapePolicy)> {
+        if plan.batch_mode == NativeBatchMode::None {
+            return Ok((BatchBudget::width_one(), StageShapePolicy::Exact));
+        }
+        let stage = plan.stage.as_ref().ok_or_else(|| {
+            Error::InferenceError(
+                "native tensor batch plan is missing its loaded stage contract".to_string(),
+            )
+        })?;
+        let budget = BatchBudget {
+            max_rows: plan.max_batch_size.min(stage.max_batch_size).max(1),
+            max_logical_units: stage.max_work_units,
+            max_tensor_elements: u64::MAX,
+            max_workspace_bytes: stage.max_workspace_bytes,
+            max_padding_basis_points: stage.max_padding_basis_points,
+            max_formation_delay: stage.max_formation_delay,
+        };
+        budget.validate()?;
+        Ok((budget, stage.shape_policy))
+    }
+
+    fn allocate_batch_id(&mut self) -> Result<BatchId> {
+        let batch_id = BatchId::new(self.next_batch_id);
+        self.next_batch_id = self.next_batch_id.checked_add(1).ok_or_else(|| {
+            Error::InferenceError("physical batch identity space was exhausted".to_string())
+        })?;
+        Ok(batch_id)
+    }
+
+    fn form_physical_batches(
+        &mut self,
         requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
-    ) -> Vec<PreparedExecutionBatch> {
-        let request_refs: Vec<_> = requests.iter().map(Arc::as_ref).collect();
-        self.build_compatible_subbatches(&request_refs, scheduled)
+    ) -> Result<Vec<PreparedExecutionBatch>> {
+        let available = requests
+            .iter()
+            .map(|request| request.id.clone())
+            .collect::<HashSet<_>>();
+        let mut assemblies: Vec<PhysicalBatchAssembly> = Vec::new();
+
+        for scheduled in scheduled {
+            if !available.contains(&scheduled.request_id) {
+                continue;
+            }
+            let request = self
+                .requests
+                .get(&scheduled.request_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "scheduled request {} disappeared during batch formation",
+                        scheduled.request_id
+                    ))
+                })?;
+            let plan = self
+                .active_plans
+                .get(&scheduled.plan_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "scheduled plan {} disappeared during batch formation",
+                        scheduled.plan_id
+                    ))
+                })?;
+            let cost = Self::work_cost(&plan.work)?;
+            let lane = Self::batch_lane(&plan, cost);
+            let (budget, shape_policy) = Self::batch_budget(&plan)?;
+            let row = ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: plan.session.clone(),
+                lane: lane.clone(),
+                work: plan.work,
+                cost,
+            };
+
+            let mut pending = Some((request, scheduled.clone(), row));
+            if plan.batch_mode != NativeBatchMode::None {
+                for assembly in &mut assemblies {
+                    if assembly.physical_batch.lane != lane
+                        || assembly.physical_batch.mode != plan.batch_mode
+                        || assembly.physical_batch.budget != budget
+                        || assembly.shape_policy != shape_policy
+                    {
+                        continue;
+                    }
+                    let Some((request, scheduled, row)) = pending.take() else {
+                        break;
+                    };
+                    if assembly.try_push(request.clone(), scheduled.clone(), row.clone()) {
+                        break;
+                    }
+                    pending = Some((request, scheduled, row));
+                }
+            }
+
+            if let Some((request, scheduled, row)) = pending {
+                let materialized_tensor_elements = row.cost.tensor_elements;
+                let workspace_bytes = row.cost.workspace_bytes;
+                let physical_batch = PhysicalBatch {
+                    batch_id: self.allocate_batch_id()?,
+                    lane,
+                    mode: plan.batch_mode,
+                    budget,
+                    rows: vec![row],
+                    materialized_tensor_elements,
+                    workspace_bytes,
+                };
+                physical_batch.validate()?;
+                assemblies.push(PhysicalBatchAssembly {
+                    physical_batch,
+                    requests: vec![request],
+                    scheduled: vec![scheduled],
+                    shape_policy,
+                });
+            }
+        }
+
+        Ok(assemblies
             .into_iter()
-            .map(|(batch_refs, batch)| {
-                let requests = batch_refs
-                    .into_iter()
-                    .filter_map(|request| self.requests.get(&request.id).cloned())
-                    .collect();
-                PreparedExecutionBatch::new(requests, batch)
+            .map(|assembly| {
+                PreparedExecutionBatch::new(
+                    assembly.physical_batch,
+                    assembly.requests,
+                    assembly.scheduled,
+                )
             })
-            .collect()
+            .collect())
     }
 
     fn merge_audio_output(
@@ -942,6 +1188,7 @@ impl EngineCore {
             retry_policy: LifecycleRetryPolicy::default(),
             initialized: false,
             maintenance_steps: 0,
+            next_batch_id: 1,
         })
     }
 
@@ -1250,10 +1497,8 @@ impl EngineCore {
             return Ok(None);
         }
 
-        let decode_batches =
-            self.prepare_compatible_subbatches(&decode_requests, &decode_scheduled);
-        let prefill_batches =
-            self.prepare_compatible_subbatches(&prefill_requests, &prefill_scheduled);
+        let decode_batches = self.form_physical_batches(&decode_requests, &decode_scheduled)?;
+        let prefill_batches = self.form_physical_batches(&prefill_requests, &prefill_scheduled)?;
 
         Ok(Some(PreparedEngineStep::new(
             self.executor.clone(),
@@ -1268,7 +1513,7 @@ impl EngineCore {
         executed: ExecutedEngineStep,
     ) -> Result<Vec<EngineOutput>> {
         let ExecutedEngineStep {
-            executor_results,
+            batches,
             decode_ids,
             prefill_ids,
             decode_elapsed,
@@ -1294,16 +1539,46 @@ impl EngineCore {
             timing.prefill_steps = timing.prefill_steps.saturating_add(1);
         }
 
+        let result_capacity = batches
+            .iter()
+            .map(|batch| batch.results.len())
+            .sum::<usize>();
         let mut executor_outputs =
-            Vec::with_capacity(executor_results.len() + self.pending_terminal_outputs.len());
-        for result in executor_results {
-            let step_time_ms = if decode_ids.contains(&result.session.request_id) {
-                decode_step_ms
+            Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
+        for mut batch in batches {
+            if let Err(error) = batch
+                .report
+                .validate_against(&batch.physical_batch, &self.active_plans)
+            {
+                warn!(
+                    batch_id = batch.physical_batch.batch_id.get(),
+                    error = %error,
+                    "Rejecting an invalid physical batch report before state commit"
+                );
+                let message = format!("invalid physical batch report: {error}");
+                for result in &mut batch.results {
+                    result.output =
+                        ExecutorOutput::error(result.session.request_id.clone(), message.clone());
+                    result.disposition = ExecutionDisposition::Failed(
+                        ExecutionFailure::invalid_output(message.clone()),
+                    );
+                    result.safe_point = true;
+                    result.dispatch = BatchDispatch::serial();
+                    result.observed_resources = ResourceVector::zero();
+                }
             } else {
-                prefill_step_ms
-            };
-            if let Some(committed) = self.commit_executor_result(result, step_time_ms).await {
-                executor_outputs.push(committed);
+                record_engine_batch_dispatch(batch.report.dispatch);
+            }
+
+            for result in batch.results {
+                let step_time_ms = if decode_ids.contains(&result.session.request_id) {
+                    decode_step_ms
+                } else {
+                    prefill_step_ms
+                };
+                if let Some(committed) = self.commit_executor_result(result, step_time_ms).await {
+                    executor_outputs.push(committed);
+                }
             }
         }
         // Terminal events are a durable outbox until all fallible work for the
@@ -2715,6 +2990,94 @@ mod tests {
         assert_eq!(effective.decode_batch, NativeBatchMode::None);
         assert_eq!(effective.max_batch_size, 1);
         assert_eq!(effective.concurrency, ConcurrencyClass::Exclusive);
+    }
+
+    #[test]
+    fn physical_batch_formation_uses_exact_loaded_lane_identity() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        for id in ["physical-a", "physical-b"] {
+            let mut request = EngineCoreRequest::tts("physical batch");
+            request.id = id.to_string();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ["physical-a", "physical-b"]
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_prefill(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(4),
+            "tts.generate",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        let adapter_key = super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "tts".to_string(),
+            stage_id: stage.id,
+        };
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: item.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::TTS,
+                        work_kind: "prefill".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::Static,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let joined = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].physical_batch().rows.len(), 2);
+        assert_eq!(
+            joined[0].physical_batch().lane.model_instance,
+            super::super::ModelInstanceId::new(2)
+        );
+
+        core.active_plans
+            .get_mut(&scheduled[1].plan_id)
+            .unwrap()
+            .batch_key
+            .adapter
+            .as_mut()
+            .unwrap()
+            .model_instance_id = super::super::ModelInstanceId::new(9);
+        let split = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(split.len(), 2);
+        assert!(split
+            .iter()
+            .all(|batch| batch.physical_batch().rows.len() == 1));
     }
 
     #[test]

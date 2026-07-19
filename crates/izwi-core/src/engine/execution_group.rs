@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
+use super::execution::{
+    ExecutionDisposition, ExecutionFailure, ExecutionReport, PhysicalBatch, PhysicalBatchReport,
+    PhysicalBatchRowReport, RetryDisposition, StateDisposition,
+};
 use super::executor::{ExecutorOutput, ExecutorStepResult, UnifiedExecutor};
-use super::metrics::record_engine_batch_dispatch;
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
 use super::types::RequestId;
@@ -21,19 +24,27 @@ use crate::error::Result;
 
 /// One compatibility-checked physical executor call.
 pub(super) struct PreparedExecutionBatch {
+    physical_batch: PhysicalBatch,
     requests: Vec<Arc<EngineCoreRequest>>,
     scheduled: Vec<ScheduledRequest>,
 }
 
 impl PreparedExecutionBatch {
     pub(super) fn new(
+        physical_batch: PhysicalBatch,
         requests: Vec<Arc<EngineCoreRequest>>,
         scheduled: Vec<ScheduledRequest>,
     ) -> Self {
         Self {
+            physical_batch,
             requests,
             scheduled,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn physical_batch(&self) -> &PhysicalBatch {
+        &self.physical_batch
     }
 }
 
@@ -60,11 +71,17 @@ impl PreparedEngineStep {
 
 /// Results that can only be applied by the engine's commit phase.
 pub(super) struct ExecutedEngineStep {
-    pub(super) executor_results: Vec<ExecutorStepResult>,
+    pub(super) batches: Vec<ExecutedPhysicalBatch>,
     pub(super) decode_ids: HashSet<RequestId>,
     pub(super) prefill_ids: HashSet<RequestId>,
     pub(super) decode_elapsed: Duration,
     pub(super) prefill_elapsed: Duration,
+}
+
+pub(super) struct ExecutedPhysicalBatch {
+    pub(super) physical_batch: PhysicalBatch,
+    pub(super) report: PhysicalBatchReport,
+    pub(super) results: Vec<ExecutorStepResult>,
 }
 
 /// The sole owner of model-forward dispatch within one engine step.
@@ -77,19 +94,19 @@ impl ExecutionGroupRunner {
 
         // Physical device work is deliberately serialized for every backend.
         // Tensor adapters may still fan out inside one physical batch.
-        let (mut executor_results, decode_elapsed) =
+        let (mut batches, decode_elapsed) =
             execute_batches(&prepared.executor, "decode", prepared.decode_batches, false).await;
-        let (mut prefill_results, prefill_elapsed) = execute_batches(
+        let (mut prefill_batches, prefill_elapsed) = execute_batches(
             &prepared.executor,
             "prefill",
             prepared.prefill_batches,
             true,
         )
         .await;
-        executor_results.append(&mut prefill_results);
+        batches.append(&mut prefill_batches);
 
         ExecutedEngineStep {
-            executor_results,
+            batches,
             decode_ids,
             prefill_ids,
             decode_elapsed,
@@ -111,14 +128,15 @@ async fn execute_batches(
     phase: &'static str,
     batches: Vec<PreparedExecutionBatch>,
     is_prefill: bool,
-) -> (Vec<ExecutorStepResult>, Duration) {
+) -> (Vec<ExecutedPhysicalBatch>, Duration) {
     if batches.is_empty() {
         return (Vec::new(), Duration::ZERO);
     }
 
     let started = Instant::now();
-    let mut outputs = Vec::new();
+    let mut executed = Vec::new();
     for batch in batches {
+        let batch_started = Instant::now();
         let request_refs: Vec<_> = batch.requests.iter().map(Arc::as_ref).collect();
         let result = if is_prefill {
             executor
@@ -129,14 +147,68 @@ async fn execute_batches(
                 .execute_decode(&request_refs, &batch.scheduled)
                 .await
         };
-        if let Ok(executor_outputs) = &result {
-            if let Some(first) = executor_outputs.first() {
-                record_engine_batch_dispatch(first.dispatch);
-            }
-        }
-        outputs.extend(reconcile_executor_outputs(phase, &batch.scheduled, result));
+        let results = reconcile_executor_outputs(phase, &batch.scheduled, result);
+        let elapsed = batch_started.elapsed();
+        let dispatch = results
+            .first()
+            .map(|result| result.dispatch)
+            .unwrap_or_default();
+        let rows = results
+            .iter()
+            .map(|result| PhysicalBatchRowReport {
+                execution: execution_report_from_result(result, elapsed),
+                state: state_disposition(&result.disposition),
+            })
+            .collect();
+        let report = PhysicalBatchReport {
+            batch_id: batch.physical_batch.batch_id,
+            lane: batch.physical_batch.lane.clone(),
+            dispatch,
+            observed_resources: super::ResourceVector::zero(),
+            elapsed,
+            rows,
+        };
+        executed.push(ExecutedPhysicalBatch {
+            physical_batch: batch.physical_batch,
+            report,
+            results,
+        });
     }
-    (outputs, started.elapsed())
+    (executed, started.elapsed())
+}
+
+fn execution_report_from_result(result: &ExecutorStepResult, elapsed: Duration) -> ExecutionReport {
+    ExecutionReport {
+        plan_id: result.plan_id,
+        session: result.session.clone(),
+        input_consumed: result.output.tokens_processed,
+        output_produced: result.output.tokens_generated,
+        observed_resources: result.observed_resources,
+        dispatch: result.dispatch,
+        elapsed,
+        safe_point: result.safe_point,
+        disposition: result.disposition.clone(),
+        output_finished: result.output.finished,
+        output_has_error: result.output.error.is_some(),
+    }
+}
+
+fn state_disposition(disposition: &ExecutionDisposition) -> StateDisposition {
+    match disposition {
+        ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_) => {
+            StateDisposition::ValidNext
+        }
+        ExecutionDisposition::Failed(ExecutionFailure {
+            retry: RetryDisposition::RetrySameSession,
+            ..
+        }) => StateDisposition::Unchanged,
+        ExecutionDisposition::Failed(ExecutionFailure {
+            retry: RetryDisposition::Recompute,
+            ..
+        }) => StateDisposition::RolledBack,
+        ExecutionDisposition::Failed(_) => StateDisposition::Poisoned,
+        ExecutionDisposition::Finished(_) => StateDisposition::Unchanged,
+    }
 }
 
 fn failed_step_result(
