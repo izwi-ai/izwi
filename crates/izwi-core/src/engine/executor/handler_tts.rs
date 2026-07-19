@@ -73,6 +73,7 @@ impl NativeExecutor {
             // a one-step sequence plan.
             return None;
         }
+        let model_instance_id = ordered[0].model_instance_id()?;
         let (model, model_lease) = match self.qwen_model_for_request(ordered[0]) {
             Ok(model) => model,
             Err(err) => return Some(Err(err)),
@@ -80,15 +81,15 @@ impl NativeExecutor {
         let mut model_leases = Vec::with_capacity(ordered.len());
         model_leases.extend(model_lease);
         for request in ordered.iter().skip(1) {
-            let (request_model, request_lease) = match self.qwen_model_for_request(request) {
-                Ok(model) => model,
-                Err(err) => return Some(Err(err)),
-            };
-            if !std::sync::Arc::ptr_eq(&model, &request_model) {
+            if request.model_instance_id() != Some(model_instance_id) {
                 // Requests admitted on opposite sides of an unload/reload
                 // boundary must never share one native tensor batch.
                 return None;
             }
+            let (_request_model, request_lease) = match self.qwen_model_for_request(request) {
+                Ok(model) => model,
+                Err(err) => return Some(Err(err)),
+            };
             model_leases.extend(request_lease);
         }
         let speakers = model

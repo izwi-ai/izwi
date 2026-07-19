@@ -275,6 +275,7 @@ impl ModelLifecycleController {
         &self,
         variant: ModelVariant,
         max_loaded_models: Option<usize>,
+        generation: u64,
     ) -> Result<()> {
         if self.resident_phase(variant)
             == Some(crate::runtime::lifecycle::controller::ResidentPhase::Ready)
@@ -293,7 +294,21 @@ impl ModelLifecycleController {
         let resource_lease = self
             .reserve_model_resources(variant, resource_plan.load_authorization)
             .await?;
-        self.install_loading_slot(variant, resource_lease)?;
+        let model_instance_id = self.install_loading_slot(variant, resource_lease)?;
+        if model_instance_id != crate::engine::ModelInstanceId::new(generation) {
+            let error = Error::ModelLoadError(format!(
+                "model {variant} loading slot does not match generation {generation}"
+            ));
+            if let Err(rollback_error) = self.rollback_model_locked(variant).await {
+                self.mark_slot_cleanup_required(variant);
+                tracing::error!(
+                    model = %variant,
+                    error = %rollback_error,
+                    "Mismatched model generation rollback failed"
+                );
+            }
+            return Err(error);
+        }
 
         let publication = async {
             // This is the first operation allowed to allocate model tensors;
@@ -311,7 +326,7 @@ impl ModelLifecycleController {
             // commit. Inference pins consult the slot, so no caller can observe
             // Ready while this await is still in progress.
             self.model_manager.mark_loaded(variant).await;
-            self.mark_slot_ready(variant)?;
+            self.mark_slot_ready_for_instance(variant, model_instance_id)?;
             self.touch_model_usage(variant).await;
             Ok(())
         }
@@ -364,7 +379,11 @@ impl ModelLifecycleController {
                 }
             };
             let outcome = match AssertUnwindSafe(
-                controller.run_load_transaction_locked(variant, max_loaded_models),
+                controller.run_load_transaction_locked(
+                    variant,
+                    max_loaded_models,
+                    leader.generation,
+                ),
             )
             .catch_unwind()
             .await
@@ -909,7 +928,7 @@ mod tests {
         let variant = ModelVariant::Kokoro82M;
         let resources = one_byte_host_reservation();
         let (authority, resource_lease) = isolated_resource_lease("publication-race");
-        runtime
+        let installed_instance = runtime
             .model_lifecycle
             .install_loading_slot(variant, resource_lease)
             .expect("loading slot");
@@ -946,6 +965,12 @@ mod tests {
         });
 
         publication_reached.wait().await;
+        let lease = runtime
+            .model_lifecycle
+            .try_acquire_ready_lease(variant)
+            .expect("ready instance lease");
+        assert_eq!(lease.model_instance_id(), Some(installed_instance));
+        drop(lease);
         let unload_controller = runtime.model_lifecycle.clone();
         let unload_events = events.clone();
         let mut unload = tokio::spawn(async move {

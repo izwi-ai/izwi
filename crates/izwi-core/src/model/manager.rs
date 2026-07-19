@@ -208,6 +208,16 @@ impl ModelManager {
         self.residency.acquire_lease(variant)
     }
 
+    /// Acquire a lease tied to one authoritative runtime load generation.
+    pub(crate) fn acquire_instance_residency_lease(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: crate::engine::ModelInstanceId,
+    ) -> ModelResidencyLease {
+        self.residency
+            .acquire_instance_lease(variant, model_instance_id)
+    }
+
     /// Number of active leases for a resident model.
     pub fn active_residency_leases(&self, variant: ModelVariant) -> usize {
         self.residency.active_leases(variant)

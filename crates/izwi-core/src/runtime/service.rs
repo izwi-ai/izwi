@@ -688,6 +688,24 @@ pub(crate) struct AdmittedEngineRequest {
     residency_lease: ModelResidencyLease,
 }
 
+fn bind_request_to_residency(
+    request: &mut EngineCoreRequest,
+    residency_lease: Option<&ModelResidencyLease>,
+) -> Result<()> {
+    let Some(lease) = residency_lease else {
+        return Ok(());
+    };
+    if request.model_variant != Some(lease.variant()) {
+        return Err(Error::InvalidInput(
+            "engine request model does not match its residency lease".to_string(),
+        ));
+    }
+    if let Some(model_instance_id) = lease.model_instance_id() {
+        request.bind_model_instance(model_instance_id)?;
+    }
+    Ok(())
+}
+
 struct WaiterRegistrationGuard {
     request_id: String,
     registration_id: u64,
@@ -1816,10 +1834,11 @@ impl RuntimeService {
 
     async fn run_request_after_admission(
         &self,
-        request: EngineCoreRequest,
+        mut request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
+        bind_request_to_residency(&mut request, residency_lease.as_ref())?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
                 "engine request does not match its coordinator admission".to_string(),
@@ -2074,7 +2093,7 @@ impl RuntimeService {
 
     async fn run_streaming_request_after_admission<F, Fut>(
         &self,
-        request: EngineCoreRequest,
+        mut request: EngineCoreRequest,
         mut on_chunk: F,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
@@ -2083,6 +2102,7 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        bind_request_to_residency(&mut request, residency_lease.as_ref())?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
                 "streaming engine request does not match its coordinator admission".to_string(),
@@ -2665,6 +2685,23 @@ mod tests {
             7,
             std::time::Duration::ZERO,
         )
+    }
+
+    #[test]
+    fn residency_binding_carries_exact_instance_and_rejects_wrong_variant() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(17);
+        let lease = residency.acquire_instance_lease(ModelVariant::Kokoro82M, instance);
+        let mut request =
+            EngineCoreRequest::tts("bind me").with_model_variant(ModelVariant::Kokoro82M);
+
+        bind_request_to_residency(&mut request, Some(&lease)).expect("matching residency");
+        assert_eq!(request.model_instance_id(), Some(instance));
+
+        let mut wrong =
+            EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
+        assert!(bind_request_to_residency(&mut wrong, Some(&lease)).is_err());
+        assert_eq!(wrong.model_instance_id(), None);
     }
 
     async fn pending_streaming_guard_fixture(

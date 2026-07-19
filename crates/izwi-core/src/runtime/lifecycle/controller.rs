@@ -11,7 +11,7 @@ use crate::artifacts::ModelManager;
 use crate::audio::AudioCodec;
 use crate::backends::BackendRouter;
 use crate::config::EngineConfig;
-use crate::engine::{Engine as CoreEngine, ResourceLease, ResourceVector};
+use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::runtime::coordinator::InferenceCoordinator;
@@ -29,6 +29,7 @@ pub(super) enum ResidentPhase {
 #[derive(Debug)]
 struct ResidentSlot {
     phase: ResidentPhase,
+    model_instance_id: ModelInstanceId,
     resource_lease: ResourceLease,
 }
 
@@ -183,11 +184,21 @@ impl ModelLifecycleController {
         variant: ModelVariant,
     ) -> Option<ModelResidencyLease> {
         let state = self.state();
-        matches!(
-            state.residents.get(&variant).map(|slot| slot.phase),
-            Some(ResidentPhase::Ready)
-        )
-        .then(|| self.model_manager.acquire_residency_lease(variant))
+        let slot = state.residents.get(&variant)?;
+        (slot.phase == ResidentPhase::Ready).then(|| {
+            self.model_manager
+                .acquire_instance_residency_lease(variant, slot.model_instance_id)
+        })
+    }
+
+    pub(super) fn resident_instance_id(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<ModelInstanceId> {
+        self.state()
+            .residents
+            .get(&variant)
+            .map(|slot| slot.model_instance_id)
     }
 
     pub(super) fn resident_phase(&self, variant: ModelVariant) -> Option<ResidentPhase> {
@@ -204,24 +215,48 @@ impl ModelLifecycleController {
         &self,
         variant: ModelVariant,
         resource_lease: ResourceLease,
-    ) -> Result<()> {
+    ) -> Result<ModelInstanceId> {
         let mut state = self.state();
         if state.residents.contains_key(&variant) {
             return Err(Error::ModelLoadError(format!(
                 "model {variant} already has authoritative residency state"
             )));
         }
+        let generation = if let Some(load) = state.loads.get(&variant) {
+            load.generation
+        } else {
+            // Tests and legacy manager projections can install an authoritative
+            // slot without first joining the detached-load protocol. They
+            // still receive a unique lifecycle instance identity.
+            state.next_generation = state.next_generation.wrapping_add(1).max(1);
+            state.next_generation
+        };
+        let model_instance_id = ModelInstanceId::new(generation);
         state.residents.insert(
             variant,
             ResidentSlot {
                 phase: ResidentPhase::Loading,
+                model_instance_id,
                 resource_lease,
             },
         );
-        Ok(())
+        Ok(model_instance_id)
     }
 
     pub(super) fn mark_slot_ready(&self, variant: ModelVariant) -> Result<()> {
+        let model_instance_id = self.resident_instance_id(variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "model {variant} lost its resource lease before publication"
+            ))
+        })?;
+        self.mark_slot_ready_for_instance(variant, model_instance_id)
+    }
+
+    pub(super) fn mark_slot_ready_for_instance(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<()> {
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
@@ -232,6 +267,11 @@ impl ModelLifecycleController {
             return Err(Error::ModelLoadError(format!(
                 "model {variant} cannot transition from {:?} to ready",
                 slot.phase
+            )));
+        }
+        if slot.model_instance_id != model_instance_id {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} load generation changed before ready publication"
             )));
         }
         slot.phase = ResidentPhase::Ready;

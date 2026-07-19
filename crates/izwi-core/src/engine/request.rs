@@ -352,6 +352,9 @@ pub struct EngineCoreRequest {
     pub task_type: TaskType,
     /// Specific model variant to route to.
     pub model_variant: Option<ModelVariant>,
+    /// Exact authoritative load generation. Requests without this lifecycle
+    /// fence remain eligible only for scalar compatibility execution.
+    pub(super) model_instance_id: Option<super::ModelInstanceId>,
     /// Input text (for TTS)
     pub text: Option<String>,
     /// Chat input messages.
@@ -1510,6 +1513,7 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::TTS,
             model_variant: None,
+            model_instance_id: None,
             text: Some(text),
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1553,6 +1557,7 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::ASR,
             model_variant: None,
+            model_instance_id: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1596,6 +1601,7 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::ASR,
             model_variant: None,
+            model_instance_id: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1636,6 +1642,7 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::Chat,
             model_variant: None,
+            model_instance_id: None,
             text: None,
             chat_messages: Some(messages),
             chat_config: ChatRequestConfig::default(),
@@ -1677,6 +1684,7 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
+            model_instance_id: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1718,6 +1726,7 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
+            model_instance_id: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1749,6 +1758,26 @@ impl EngineCoreRequest {
 
     pub(crate) fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
         self.cancellation = Some(signal);
+    }
+
+    pub(crate) fn bind_model_instance(
+        &mut self,
+        model_instance_id: super::ModelInstanceId,
+    ) -> Result<()> {
+        if self
+            .model_instance_id
+            .is_some_and(|current| current != model_instance_id)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different model instance".to_string(),
+            ));
+        }
+        self.model_instance_id = Some(model_instance_id);
+        Ok(())
+    }
+
+    pub(crate) fn model_instance_id(&self) -> Option<super::ModelInstanceId> {
+        self.model_instance_id
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -2218,6 +2247,20 @@ mod tests {
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::ChatRole;
+
+    #[test]
+    fn model_instance_binding_is_idempotent_and_fenced() {
+        let mut request = EngineCoreRequest::tts("hello");
+        let first = super::super::ModelInstanceId::new(7);
+        let second = super::super::ModelInstanceId::new(8);
+
+        assert_eq!(request.model_instance_id(), None);
+        request.bind_model_instance(first).expect("initial binding");
+        request.bind_model_instance(first).expect("idempotent binding");
+        assert_eq!(request.model_instance_id(), Some(first));
+        assert!(request.bind_model_instance(second).is_err());
+        assert_eq!(request.model_instance_id(), Some(first));
+    }
 
     #[test]
     fn test_tts_request() {
