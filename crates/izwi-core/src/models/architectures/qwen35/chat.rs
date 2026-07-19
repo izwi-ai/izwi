@@ -16,7 +16,7 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
-use crate::models::shared::memory::accounting::{compact_tensor_storage, TensorStorageAccounting};
+use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -707,10 +707,7 @@ impl Qwen35ChatModel {
                 capture_prefix_max_bytes,
             )?
         } else {
-            (
-                compact_tensor_storage(&self.prefill_prompt(prepared_prompt, &mut text_state)?)?,
-                None,
-            )
+            (self.prefill_prompt(prepared_prompt, &mut text_state)?, None)
         };
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
@@ -782,11 +779,11 @@ impl Qwen35ChatModel {
         }
         state.tokens_generated = state.tokens_generated.saturating_add(1);
         state.assembled.push_str(&delta);
-        state.logits = compact_tensor_storage(&self.text_model.forward_token_id_at(
+        state.logits = self.text_model.forward_token_id_at(
             next,
             [state.next_text_position; 3],
             &mut state.text_state,
-        )?)?;
+        )?;
         state.next_text_position += 1;
         if state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
@@ -865,7 +862,7 @@ impl Qwen35ChatModel {
             .ok_or_else(|| {
                 Error::InferenceError("Qwen3.5 text suffix prefill produced no logits".to_string())
             })?;
-        Ok((compact_tensor_storage(&logits)?, pending))
+        Ok((logits, pending))
     }
 
     fn prefill_text_range(
@@ -1096,17 +1093,28 @@ fn qwen35_session_cache_upper_bound_bytes(
         cfg.block_count / cfg.full_attention_interval
     };
     let linear_layers = cfg.block_count.checked_sub(full_layers)?;
-    let as_u64 = |value: usize| u64::try_from(value).ok();
     let bytes_per_element = 4u64;
 
-    let kv_width = cfg
-        .attention_key_length
-        .checked_add(cfg.attention_value_length)?
-        .checked_mul(cfg.attention_head_count_kv)?;
-    let one_kv_copy = as_u64(full_layers)?
-        .checked_mul(as_u64(cache_capacity)?)?
-        .checked_mul(as_u64(kv_width)?)?
-        .checked_mul(bytes_per_element)?;
+    // Candle's Metal allocator rounds pooled buffers to byte-sized powers of
+    // two. Reserve each persistent tensor at that physical bucket rather than
+    // forcing a second exact-size allocation after every operation. This is
+    // conservative on backends whose allocator returns the logical size.
+    let allocation_bucket = |elements: usize| {
+        let bytes = u64::try_from(elements)
+            .ok()?
+            .checked_mul(bytes_per_element)?;
+        bytes.checked_next_power_of_two()
+    };
+
+    let key_elements = cache_capacity
+        .checked_mul(cfg.attention_head_count_kv)?
+        .checked_mul(cfg.attention_key_length)?;
+    let value_elements = cache_capacity
+        .checked_mul(cfg.attention_head_count_kv)?
+        .checked_mul(cfg.attention_value_length)?;
+    let one_kv_copy = allocation_bucket(key_elements)?
+        .checked_add(allocation_bucket(value_elements)?)?
+        .checked_mul(u64::try_from(full_layers).ok()?)?;
     // Account for both representations even though normal migration takes the
     // dense tensors before publishing pages. This keeps authorization safe if
     // a backend retains either backing allocation across the conversion.
@@ -1119,13 +1127,13 @@ fn qwen35_session_cache_upper_bound_bytes(
         .checked_add(cfg.ssm_inner_size)?;
     let conv_slots = cfg.ssm_conv_kernel.saturating_sub(1);
     let recurrent_width = cfg.ssm_state_size.checked_mul(cfg.ssm_inner_size)?;
-    let linear_state_width = conv_width
-        .checked_mul(conv_slots)?
-        .checked_add(recurrent_width)?;
-    let linear_bytes = as_u64(linear_layers)?
-        .checked_mul(as_u64(linear_state_width)?)?
-        .checked_mul(bytes_per_element)?;
-    let logits_bytes = as_u64(vocab_size)?.checked_mul(bytes_per_element)?;
+    let one_linear_layer = allocation_bucket(conv_width)?
+        .checked_mul(u64::try_from(conv_slots).ok()?)?
+        .checked_add(allocation_bucket(recurrent_width)?)?;
+    let linear_bytes = u64::try_from(linear_layers)
+        .ok()?
+        .checked_mul(one_linear_layer)?;
+    let logits_bytes = allocation_bucket(vocab_size)?;
 
     kv_bytes
         .checked_add(linear_bytes)?

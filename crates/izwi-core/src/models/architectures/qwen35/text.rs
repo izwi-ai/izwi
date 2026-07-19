@@ -20,7 +20,7 @@ use crate::models::shared::attention::paged::{
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::memory::accounting::{
-    compact_tensor_storage, deep_copy_tensor_storage, TensorStorageAccounting,
+    deep_copy_tensor_storage, TensorStorageAccounting,
 };
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_prefill_sequence_span, record_rope_kernel,
@@ -126,7 +126,7 @@ impl ConvRingState {
         })
     }
 
-    /// Move every logical history slot into independent exact-size storage.
+    /// Move every logical history slot into independent fixed-history storage.
     ///
     /// Sequence-prefill slots are views into the entire projected token span.
     /// Keeping those views in runtime state would retain the full projection
@@ -144,7 +144,12 @@ impl ConvRingState {
         Ok(())
     }
 
-    fn push_owned(&mut self, current: &Tensor) -> Result<()> {
+    /// Retain the current one-token projection as the newest decode slot.
+    ///
+    /// Decode projects exactly one token, so this view cannot retain a
+    /// sequence-sized backing tensor. Sequence prefill detaches its final fixed
+    /// history once at the sequence boundary instead.
+    fn push_decode(&mut self, current: &Tensor) -> Result<()> {
         if self.slots.is_empty() || self.next_idx >= self.slots.len() {
             return Err(Error::InferenceError(format!(
                 "Invalid Qwen3.5 convolution ring: slots={}, next_idx={}",
@@ -152,7 +157,7 @@ impl ConvRingState {
                 self.next_idx
             )));
         }
-        self.slots[self.next_idx] = deep_copy_tensor_storage(current)?;
+        self.slots[self.next_idx] = current.clone();
         self.next_idx = (self.next_idx + 1) % self.slots.len();
         Ok(())
     }
@@ -1560,7 +1565,9 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, self.num_v_heads))?;
         let (output, next_state) =
             recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?;
-        *recurrent_state = Some(compact_tensor_storage(&next_state)?);
+        // The recurrent decode output owns a fresh Candle-managed allocation;
+        // retaining it avoids a full state-sized copy on every layer/token.
+        *recurrent_state = Some(next_state);
 
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
@@ -1689,7 +1696,10 @@ impl Qwen35LinearAttention {
                 recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
             }
         };
-        *recurrent_state = Some(compact_tensor_storage(&next_state)?);
+        // Sequence kernels may return the final state as a view into their
+        // packed output. Detach only this fixed-size escape value, using
+        // Candle-managed storage rather than an application private buffer.
+        *recurrent_state = Some(deep_copy_tensor_storage(&next_state)?);
 
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
@@ -1727,11 +1737,9 @@ impl Qwen35LinearAttention {
             if let Some((output, final_history)) =
                 try_qwen35_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
             {
+                let final_history = deep_copy_tensor_storage(&final_history)?;
                 buffer.slots = (0..history_len)
-                    .map(|idx| {
-                        let slot = final_history.narrow(1, idx, 1)?;
-                        deep_copy_tensor_storage(&slot)
-                    })
+                    .map(|idx| final_history.narrow(1, idx, 1))
                     .collect::<candle_core::Result<Vec<_>>>()?;
                 buffer.next_idx = 0;
                 return Ok(output);
@@ -1793,7 +1801,7 @@ impl Qwen35LinearAttention {
             }
 
             // Update the ring buffer in O(1): overwrite oldest and advance cursor.
-            buffer.push_owned(&current)?;
+            buffer.push_decode(&current)?;
 
             convolved.squeeze(1)?
         };
@@ -2025,7 +2033,7 @@ fn build_rope_inv_freqs(rope_dim: usize, rope_theta: f64) -> Result<Vec<f32>> {
 /// Candle tensor views can outlive a scratch-pool checkout, so state that
 /// survives a forward call must never escape after its pool lease is released.
 fn owned_zero_tensor(shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
-    compact_tensor_storage(&Tensor::zeros(shape.to_vec(), dtype, device)?).map_err(Error::from)
+    Tensor::zeros(shape.to_vec(), dtype, device).map_err(Error::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2241,7 +2249,9 @@ fn append_dense_kv_cache_h(cache: &mut Option<Tensor>, append: &Tensor) -> Resul
         }
         None => append.clone(),
     };
-    *cache = Some(compact_tensor_storage(&next)?);
+    // `Tensor::cat` already owns its Candle-managed output. A second full-cache
+    // copy here made decode allocation and memory traffic grow with context.
+    *cache = Some(next);
     Ok(())
 }
 
@@ -2663,15 +2673,18 @@ mod tests {
     }
 
     #[test]
-    fn conv_ring_push_does_not_retain_projection_backing() {
+    fn conv_ring_decode_push_reuses_one_token_projection_backing() {
         let slots = (0..3)
             .map(|_| Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap())
             .collect();
         let mut ring = ConvRingState { slots, next_idx: 0 };
-        let projection = Tensor::zeros((1, 40, 32), DType::F32, &Device::Cpu).unwrap();
-        let current = projection.i((0, 39)).unwrap().reshape((32, 1)).unwrap();
+        let projection = Tensor::zeros((1, 1, 32), DType::F32, &Device::Cpu).unwrap();
+        let current = projection.i((0, 0)).unwrap().reshape((32, 1)).unwrap();
+        let projection_storage = tensor_storage_address(&current);
 
-        ring.push_owned(&current).expect("ring push should copy");
+        ring.push_decode(&current)
+            .expect("ring push should succeed");
+        assert_eq!(tensor_storage_address(&ring.slots[0]), projection_storage);
         drop(current);
         drop(projection);
 

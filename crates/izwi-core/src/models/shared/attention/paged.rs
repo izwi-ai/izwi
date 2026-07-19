@@ -4,7 +4,7 @@ use candle_core::{DType, Tensor, D};
 
 use crate::error::{Error, Result};
 use crate::models::shared::memory::accounting::{
-    compact_tensor_storage, deep_copy_tensor_storage, TensorStorageAccounting,
+    deep_copy_tensor_storage, TensorStorageAccounting,
 };
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
@@ -124,7 +124,7 @@ impl KvPage {
     fn from_dense(tensor: Tensor, quantization: KvCacheQuantization) -> Result<Self> {
         // A page must own compact storage. Retaining a narrow view can keep an
         // entire previous backing allocation alive and invalidate byte accounting.
-        let tensor = compact_tensor_storage(&tensor)?;
+        let tensor = deep_copy_tensor_storage(&tensor)?;
         match quantization {
             KvCacheQuantization::None => Ok(Self::Dense(tensor)),
             KvCacheQuantization::Int8 => {
