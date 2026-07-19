@@ -175,15 +175,6 @@ fn diarization_request_audio_observation(
     )
 }
 
-fn runtime_encoded_audio(audio: &RuntimeAudioInput) -> Result<&[u8]> {
-    match audio {
-        RuntimeAudioInput::Bytes(audio) => Ok(audio),
-        RuntimeAudioInput::Base64(_) => Err(Error::InferenceError(
-            "diarization runtime retained unexpected base64 audio".to_string(),
-        )),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct TranscribedChunk {
     range: AudioChunk,
@@ -498,6 +489,11 @@ impl RuntimeService {
         }
         audio_input.validate_retained_size()?;
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
+        self.observe_broker_capability_request(
+            CapabilityKind::Diarization,
+            Some(diarization_variant),
+            false,
+        )?;
         self.record_diarization_transcript_pipeline(enable_llm_refinement);
         let mut spec = self.coordinator_job_for_input(
             uuid::Uuid::new_v4().to_string(),
@@ -577,21 +573,46 @@ impl RuntimeService {
             .await?;
 
         let asr_variant = resolve_asr_model_variant(runtime_request.asr_model_id.as_deref());
+        self.observe_broker_capability_request(CapabilityKind::Asr, Some(asr_variant), false)?;
+        let asr_target = self
+            .adapter_registry
+            .require(CapabilityKind::Asr, asr_variant)?
+            .execution_target;
+        let (asr_lease, asr_contract) = self
+            .load_capability_for_job(
+                &pipeline_job,
+                asr_variant,
+                CapabilityKind::Asr,
+                false,
+                asr_target,
+            )
+            .await?;
+        let asr_model = self
+            .model_registry
+            .get_asr(asr_variant)
+            .await
+            .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
 
         let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
             runtime_request.aligner_model_id.as_deref(),
         )?;
-        let aligner_lease = match self
-            .load_model_for_job(&pipeline_job, aligner_variant)
+        let aligner_binding = match self
+            .load_capability_for_job(
+                &pipeline_job,
+                aligner_variant,
+                CapabilityKind::ForcedAlignment,
+                false,
+                ExecutionTargetKind::BatchRunner,
+            )
             .await
         {
-            Ok(lease) => Some(lease),
+            Ok(binding) => Some(binding),
             Err(err) => {
                 warn!("Forced aligner load failed, using heuristic timings: {err}");
                 None
             }
         };
-        let aligner_model = if aligner_lease.is_some() {
+        let aligner_model = if aligner_binding.is_some() {
             match self.model_registry.get_asr(aligner_variant).await {
                 Some(model) => Some(model),
                 None => {
@@ -616,39 +637,41 @@ impl RuntimeService {
         );
 
         let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
-            let asr_lease = self.load_model_for_job(&pipeline_job, asr_variant).await?;
-            let asr_model = self
-                .model_registry
-                .get_asr(asr_variant)
-                .await
-                .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
             let audio_for_task = audio.clone();
             let transcription = self
                 .coordinator
-                .run_blocking_stage(&pipeline_job, move || {
-                    let _asr_lease = asr_lease;
-                    asr_model.transcribe_with_details(
-                        &audio_for_task.samples,
-                        PIPELINE_SAMPLE_RATE,
-                        None,
-                    )
-                })
+                .run_loaded_blocking_stage(
+                    &pipeline_job,
+                    asr_contract,
+                    WorkUnit::AtomicJob {
+                        kind: "diarization.transcribe".to_string(),
+                    },
+                    move || {
+                        let _asr_lease = asr_lease;
+                        asr_model.transcribe_with_details(
+                            &audio_for_task.samples,
+                            PIPELINE_SAMPLE_RATE,
+                            None,
+                        )
+                    },
+                )
                 .await?;
             (transcription.text, Vec::new(), transcription.language)
         } else {
-            let asr_lease = self.load_model_for_job(&pipeline_job, asr_variant).await?;
-            let asr_model = self
-                .model_registry
-                .get_asr(asr_variant)
-                .await
-                .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
             let audio_for_task = audio.clone();
             let (text, chunks) = self
                 .coordinator
-                .run_blocking_stage(&pipeline_job, move || {
-                    let _asr_lease = asr_lease;
-                    transcribe_audio_chunks(asr_model, &audio_for_task, None, aligner_limit)
-                })
+                .run_loaded_blocking_stage(
+                    &pipeline_job,
+                    asr_contract,
+                    WorkUnit::AtomicJob {
+                        kind: "diarization.transcribe_chunks".to_string(),
+                    },
+                    move || {
+                        let _asr_lease = asr_lease;
+                        transcribe_audio_chunks(asr_model, &audio_for_task, None, aligner_limit)
+                    },
+                )
                 .await?;
             (text, chunks, None)
         };
@@ -657,41 +680,66 @@ impl RuntimeService {
         let mut model_aligned_words = 0usize;
         let mut alignments = if asr_text.is_empty() {
             Vec::new()
-        } else if use_single_pass_asr && aligner_model.is_some() {
-            match self
-                .force_align_bytes_with_model_and_language(
-                    runtime_encoded_audio(&runtime_request.audio)?,
-                    &asr_text,
-                    detected_language.as_deref(),
-                    runtime_request.aligner_model_id.as_deref(),
-                )
-                .await
-            {
-                Ok(aligned) => {
-                    model_aligned_words = aligned.len();
-                    aligned
-                }
-                Err(err) => {
-                    warn!("Forced alignment failed, using heuristic timings: {err}");
-                    fallback_word_timings_from_words(&asr_words, audio.duration_secs)
-                }
-            }
         } else if use_single_pass_asr {
-            fallback_word_timings_from_words(&asr_words, audio.duration_secs)
-        } else if let Some(model) = aligner_model.as_ref() {
-            let model_for_task = model.clone();
+            match (aligner_model, aligner_binding) {
+                (Some(model), Some((aligner_lease, aligner_contract))) => {
+                    let audio_for_task = audio.clone();
+                    let text_for_task = asr_text.clone();
+                    let language_for_task = detected_language.clone();
+                    match self
+                        .coordinator
+                        .run_loaded_blocking_stage(
+                            &pipeline_job,
+                            aligner_contract,
+                            WorkUnit::AtomicJob {
+                                kind: "diarization.force_align".to_string(),
+                            },
+                            move || {
+                                let _aligner_lease = aligner_lease;
+                                model.force_align(
+                                    &audio_for_task.samples,
+                                    audio_for_task.sample_rate,
+                                    &text_for_task,
+                                    language_for_task.as_deref(),
+                                )
+                            },
+                        )
+                        .await
+                    {
+                        Ok(aligned) => {
+                            model_aligned_words = aligned.len();
+                            aligned
+                        }
+                        Err(err) => {
+                            warn!("Forced alignment failed, using heuristic timings: {err}");
+                            fallback_word_timings_from_words(&asr_words, audio.duration_secs)
+                        }
+                    }
+                }
+                _ => fallback_word_timings_from_words(&asr_words, audio.duration_secs),
+            }
+        } else if let (Some(model), Some((aligner_lease, aligner_contract))) =
+            (aligner_model, aligner_binding)
+        {
             let audio_for_task = audio.clone();
             let chunks_for_task = chunk_texts.clone();
             let (aligned, aligned_word_count) = self
                 .coordinator
-                .run_blocking_stage(&pipeline_job, move || {
-                    let _aligner_lease = aligner_lease;
-                    Ok(force_align_audio_chunks(
-                        model_for_task,
-                        &audio_for_task,
-                        &chunks_for_task,
-                    ))
-                })
+                .run_loaded_blocking_stage(
+                    &pipeline_job,
+                    aligner_contract,
+                    WorkUnit::AtomicJob {
+                        kind: "diarization.force_align_chunks".to_string(),
+                    },
+                    move || {
+                        let _aligner_lease = aligner_lease;
+                        Ok(force_align_audio_chunks(
+                            model,
+                            &audio_for_task,
+                            &chunks_for_task,
+                        ))
+                    },
+                )
                 .await?;
             model_aligned_words = aligned_word_count;
             aligned
