@@ -14,11 +14,13 @@ use serde::Serialize;
 
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::engine::{
-    BatchId, BatchWorkspaceLease, CapacitySource, ExecutionGroupId, PhysicalCapacityProvider,
-    PhysicalCapacitySnapshot, Priority, ReservationClass, ReservationOwner, ResourceAmount,
-    ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector, WorkloadClass,
+    BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain, ExecutionGroupId,
+    NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot, Priority,
+    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate,
+    ResourceLease, ResourceVector, WorkUnit, WorkloadClass,
 };
 use crate::error::{Error, Result};
+use crate::runtime::adapters::LoadedExecutionContract;
 
 static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -516,6 +518,68 @@ impl InferenceCoordinator {
     /// execution permit and job reservation until physical work really ends.
     /// Deadline expiry detaches the blocking task instead of cancelling it.
     pub async fn run_blocking_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        self.run_blocking_stage_inner(job, operation).await
+    }
+
+    /// Execute one non-batched model stage through an exact loaded adapter.
+    /// Direct, realtime, and pipeline runners use this compatibility boundary
+    /// until their model stage gains a proven native tensor adapter.
+    pub(crate) async fn run_loaded_blocking_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if !contract.execution_profile.resolved_from_loaded_model {
+            return Err(Error::InferenceError(
+                "runtime execution contract was not resolved from a loaded model".to_string(),
+            ));
+        }
+        if contract.execution_group_id != self.execution_group_id {
+            return Err(Error::InferenceError(
+                "runtime execution contract belongs to a different execution group".to_string(),
+            ));
+        }
+        if contract.execution_profile.backend != self.backend {
+            return Err(Error::InferenceError(
+                "runtime execution contract belongs to a different backend".to_string(),
+            ));
+        }
+        let binding = contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup {
+            return Err(Error::InvalidInput(
+                "host-only adapter stage cannot enter device execution".to_string(),
+            ));
+        }
+        if stage.batch_mode != NativeBatchMode::None || stage.max_batch_size != 1 {
+            return Err(Error::InvalidInput(
+                "runtime width-one runner cannot execute a native tensor stage".to_string(),
+            ));
+        }
+
+        self.run_blocking_stage_inner(job, move || {
+            let _contract = contract;
+            let _work = work;
+            operation()
+        })
+        .await
+    }
+
+    async fn run_blocking_stage_inner<T, F>(
         self: &Arc<Self>,
         job: &JobLease,
         operation: F,
@@ -1323,6 +1387,8 @@ impl Drop for ExecutionLease {
 mod tests {
     use super::*;
     use crate::engine::ResourceVector;
+    use crate::model::ModelVariant;
+    use crate::runtime::adapters::{CapabilityKind, LoadedModelBundle, RuntimeAdapterRegistry};
 
     #[derive(Debug)]
     struct MutableCapacityProvider {
@@ -2135,6 +2201,70 @@ Pages free: 10.\n";
         release_tx.send(()).unwrap();
         runner.await.unwrap().unwrap();
         coordinator.acquire_execution(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loaded_width_one_stage_rejects_cross_group_execution_before_model_work() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let job = coordinator.admit(job("loaded-width-one")).await.unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            coordinator.execution_group_id(),
+            crate::engine::ModelInstanceId::new(1),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+
+        let output = coordinator
+            .run_loaded_blocking_stage(
+                &job,
+                contract,
+                WorkUnit::AtomicJob {
+                    kind: "tts".to_string(),
+                },
+                move || {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(7usize)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, 7);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let wrong_group = LoadedModelBundle::bind(
+            &adapters,
+            ExecutionGroupId::new(coordinator.execution_group_id().get() + 1),
+            crate::engine::ModelInstanceId::new(1),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = wrong_group.contract(CapabilityKind::Tts, false).unwrap();
+        let task_calls = calls.clone();
+        let error = coordinator
+            .run_loaded_blocking_stage(
+                &job,
+                contract,
+                WorkUnit::AtomicJob {
+                    kind: "tts".to_string(),
+                },
+                move || {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("cross-group contract must fail closed");
+
+        assert!(error.to_string().contains("different execution group"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use crate::runtime::rollout::{ExecutionRolloutMode, ExecutionRolloutPolicy};
 
 mod loaded;
 
-pub(crate) use loaded::LoadedModelBundle;
+pub(crate) use loaded::{LoadedExecutionContract, LoadedModelBundle};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

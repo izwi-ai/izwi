@@ -43,7 +43,10 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
-use crate::runtime::adapters::{CapabilityKind, LoadedModelBundle, RuntimeAdapterRegistry};
+use crate::runtime::adapters::{
+    CapabilityKind, ExecutionTargetKind, LoadedExecutionContract, LoadedModelBundle,
+    RuntimeAdapterRegistry,
+};
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
@@ -724,6 +727,57 @@ fn bind_request_to_residency(
     )?;
     request.bind_execution_adapter(binding)?;
     Ok(())
+}
+
+fn loaded_contract_for_residency(
+    lease: &ModelResidencyLease,
+    bundle: Option<&LoadedModelBundle>,
+    capability: CapabilityKind,
+    streaming_required: bool,
+    execution_group_id: crate::engine::ExecutionGroupId,
+    backend_kind: BackendKind,
+    expected_target: Option<ExecutionTargetKind>,
+) -> Result<LoadedExecutionContract> {
+    let model_instance_id = lease.model_instance_id().ok_or_else(|| {
+        Error::InferenceError(
+            "model residency lease has no authoritative load generation".to_string(),
+        )
+    })?;
+    let bundle = bundle.ok_or_else(|| {
+        Error::InferenceError(
+            "authoritative model residency is missing its loaded execution bundle".to_string(),
+        )
+    })?;
+    if bundle.model_variant() != lease.variant()
+        || bundle.model_instance_id() != model_instance_id
+        || bundle.execution_group_id() != execution_group_id
+        || bundle.backend_kind() != backend_kind
+    {
+        return Err(Error::InferenceError(
+            "loaded execution bundle does not match authoritative runtime residency".to_string(),
+        ));
+    }
+    let contract = bundle.contract(capability, streaming_required)?;
+    if contract.execution_group_id != execution_group_id
+        || contract.model_instance_id != model_instance_id
+        || contract.metadata.model_variant != lease.variant()
+        || contract.execution_profile.backend != backend_kind
+        || !contract.execution_profile.resolved_from_loaded_model
+    {
+        return Err(Error::InferenceError(
+            "loaded capability contract does not match its runtime execution identity".to_string(),
+        ));
+    }
+    if expected_target.is_some_and(|target| contract.metadata.execution_target != target) {
+        return Err(Error::InvalidInput(format!(
+            "loaded capability {:?} for {} targets {:?}, not {:?}",
+            capability,
+            lease.variant(),
+            contract.metadata.execution_target,
+            expected_target.expect("checked as some")
+        )));
+    }
+    Ok(contract)
 }
 
 struct WaiterRegistrationGuard {
@@ -1794,6 +1848,32 @@ impl RuntimeService {
         }
     }
 
+    /// Load and pin the exact model generation selected for a non-engine
+    /// capability stage, then resolve its immutable loaded-adapter contract.
+    /// Returning both values makes it impossible for direct runners to execute
+    /// against catalog metadata or a different load generation.
+    pub(crate) async fn load_capability_for_job(
+        &self,
+        job: &JobLease,
+        variant: ModelVariant,
+        capability: CapabilityKind,
+        streaming_required: bool,
+        expected_target: ExecutionTargetKind,
+    ) -> Result<(ModelResidencyLease, LoadedExecutionContract)> {
+        let lease = self.load_model_for_job(job, variant).await?;
+        let bundle = self.model_lifecycle.try_get_ready_bundle(variant);
+        let contract = loaded_contract_for_residency(
+            &lease,
+            bundle.as_deref(),
+            capability,
+            streaming_required,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(expected_target),
+        )?;
+        Ok((lease, contract))
+    }
+
     /// Bound the pre-session Engine admission transaction by the request's
     /// absolute deadline. Cancelling this future before the core write lock is
     /// acquired cannot create a scheduler session; once that lock is acquired,
@@ -2804,6 +2884,57 @@ mod tests {
             EngineCoreRequest::tts("missing").with_model_variant(ModelVariant::Kokoro82M);
         assert!(bind_request_to_residency(&mut missing_bundle, Some(&lease), None).is_err());
         assert_eq!(missing_bundle.model_instance_id(), None);
+    }
+
+    #[test]
+    fn direct_loaded_contract_requires_exact_generation_group_backend_and_target() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(21);
+        let group = crate::engine::ExecutionGroupId::new(8);
+        let lease = residency.acquire_instance_lease(ModelVariant::Kokoro82M, instance);
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            group,
+            instance,
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        let contract = loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            group,
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::DirectModel),
+        )
+        .unwrap();
+        assert_eq!(contract.model_instance_id, instance);
+        assert_eq!(contract.execution_group_id, group);
+
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            group,
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::TokenEngine),
+        )
+        .is_err());
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            crate::engine::ExecutionGroupId::new(group.get() + 1),
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::DirectModel),
+        )
+        .is_err());
     }
 
     async fn pending_streaming_guard_fixture(

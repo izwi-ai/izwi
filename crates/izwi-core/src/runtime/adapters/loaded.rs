@@ -36,7 +36,7 @@ pub(crate) struct LoadedExecutionContract {
 }
 
 impl LoadedExecutionContract {
-    fn adapter_binding(&self) -> Result<ExecutionAdapterBinding> {
+    pub(crate) fn adapter_binding(&self) -> Result<ExecutionAdapterBinding> {
         let binding = ExecutionAdapterBinding {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,
