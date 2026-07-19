@@ -23,6 +23,7 @@ pub(crate) use loaded::{LoadedExecutionContract, LoadedModelBundle};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilityKind {
     Asr,
+    SpeakerAttributedAsr,
     RealtimeAsr,
     Tts,
     StreamingTts,
@@ -49,6 +50,7 @@ impl CapabilityKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Asr => "asr",
+            Self::SpeakerAttributedAsr => "speaker_attributed_asr",
             Self::RealtimeAsr => "realtime_asr",
             Self::Tts => "tts",
             Self::StreamingTts => "streaming_tts",
@@ -135,6 +137,7 @@ impl RuntimeAdapterRegistry {
         registry.register_adapter(TtsCapabilityAdapter);
         registry.register_adapter(StreamingTtsCapabilityAdapter);
         registry.register_adapter(AsrCapabilityAdapter);
+        registry.register_adapter(SpeakerAttributedAsrCapabilityAdapter);
         registry.register_adapter(RealtimeAsrCapabilityAdapter);
         registry.register_adapter(ChatCapabilityAdapter);
         registry.register_adapter(AudioChatCapabilityAdapter);
@@ -425,6 +428,23 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct SpeakerAttributedAsrCapabilityAdapter;
+
+impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant
+            .supports_speaker_attributed_asr()
+            .then_some(AdapterMetadata {
+                id: "builtin.speaker_attributed_asr",
+                capability: CapabilityKind::SpeakerAttributedAsr,
+                model_variant,
+                streaming_mode: StreamingMode::None,
+                execution_target: ExecutionTargetKind::PipelineRunner,
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct RealtimeAsrCapabilityAdapter;
 
 impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
@@ -552,6 +572,9 @@ mod tests {
         }
         if model_variant.is_asr() || model_variant.is_voxtral() || model_variant.is_audio_chat() {
             expected.insert(CapabilityKind::Asr);
+        }
+        if model_variant.supports_speaker_attributed_asr() {
+            expected.insert(CapabilityKind::SpeakerAttributedAsr);
         }
         if model_variant == ModelVariant::Nemotron35AsrStreaming06B {
             expected.insert(CapabilityKind::RealtimeAsr);
@@ -785,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_granite_speech_as_token_engine_asr_without_diarization() {
+    fn built_in_registry_separates_granite_asr_and_speaker_attribution_execution() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::GraniteSpeech412BPlus;
 
@@ -794,6 +817,13 @@ mod tests {
             .expect("granite speech asr adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        assert_eq!(
+            registry
+                .require(CapabilityKind::SpeakerAttributedAsr, variant)
+                .expect("granite speaker-attributed ASR adapter")
+                .execution_target,
+            ExecutionTargetKind::PipelineRunner
+        );
         assert!(registry
             .require(CapabilityKind::Diarization, variant)
             .is_err());

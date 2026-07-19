@@ -2363,7 +2363,11 @@ impl RuntimeService {
             .ok_or_else(|| {
                 Error::Overloaded("speaker-attributed ASR input overflowed".to_string())
             })?;
-        self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
+        self.observe_broker_capability_request(
+            CapabilityKind::SpeakerAttributedAsr,
+            Some(variant),
+            false,
+        )?;
         let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Background);
         let spec = self.coordinator_job_for_audio_input(
             uuid::Uuid::new_v4().to_string(),
@@ -2385,7 +2389,15 @@ impl RuntimeService {
             owned_audio.retained_bytes(),
             language_bytes,
         ])?)?;
-        let residency_lease = self.load_asr_model_for_job(&job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                &job,
+                variant,
+                CapabilityKind::SpeakerAttributedAsr,
+                false,
+                ExecutionTargetKind::PipelineRunner,
+            )
+            .await?;
         let model = self
             .model_registry
             .get_asr(variant)
@@ -2430,24 +2442,31 @@ impl RuntimeService {
             let task_model = model.clone();
             let max_new_tokens = granite_saa_max_new_tokens(&samples, sample_rate);
             let observation_job = job.clone();
-            let transcription = self
-                .coordinator
-                .run_blocking_stage(&job, move || {
-                    let _residency_lease = residency_lease;
-                    observation_job.record_materialized_usage(decoded_audio_observation(
-                        retained_input_bytes,
-                        samples.len(),
-                    )?)?;
-                    granite_saa_transcribe_chunk(
-                        &task_model,
-                        &samples,
-                        sample_rate,
-                        task_language.as_deref(),
-                        None,
-                        max_new_tokens,
+            let transcription =
+                self.coordinator
+                    .run_loaded_blocking_stage(
+                        &job,
+                        execution_contract,
+                        WorkUnit::PipelineStage {
+                            name: "asr.speaker_attributed.decode".to_string(),
+                            ordinal: 0,
+                        },
+                        move || {
+                            let _residency_lease = residency_lease;
+                            observation_job.record_materialized_usage(
+                                decoded_audio_observation(retained_input_bytes, samples.len())?,
+                            )?;
+                            granite_saa_transcribe_chunk(
+                                &task_model,
+                                &samples,
+                                sample_rate,
+                                task_language.as_deref(),
+                                None,
+                                max_new_tokens,
+                            )
+                        },
                     )
-                })
-                .await?;
+                    .await?;
 
             return Ok(speaker_attributed_asr_result_from_text_with_warnings(
                 transcription.text.as_str(),
@@ -2463,6 +2482,7 @@ impl RuntimeService {
             &self.coordinator,
             &job,
             model,
+            execution_contract,
             samples,
             sample_rate,
             language_owned.as_deref(),
@@ -3037,6 +3057,7 @@ async fn granite_saa_long_form_transcribe<P>(
     coordinator: &Arc<InferenceCoordinator>,
     job: &JobLease,
     model: Arc<NativeAsrModel>,
+    execution_contract: LoadedExecutionContract,
     samples: Arc<[f32]>,
     sample_rate: u32,
     language: Option<&str>,
@@ -3125,29 +3146,37 @@ where
         );
         let chunk_started = Instant::now();
         let (returned_lease, transcription) = coordinator
-            .run_blocking_stage(job, move || {
-                let chunk_audio = task_samples[chunk_start..chunk_end].to_vec();
-                observation_job.record_materialized_usage(
-                    decoded_audio_with_scratch_observation(
-                        retained_input_bytes,
-                        task_samples.len(),
-                        chunk_audio.capacity(),
-                    )?,
-                )?;
-                let transcription = granite_saa_transcribe_chunk(
-                    &task_model,
-                    &chunk_audio,
-                    sample_rate,
-                    language_owned.as_deref(),
-                    prefix_text.as_deref(),
-                    max_new_tokens,
-                );
-                let steady_usage =
-                    decoded_audio_observation(retained_input_bytes, task_samples.len())?;
-                observation_job.prepare_materialized_release(steady_usage)?;
-                drop(chunk_audio);
-                Ok((residency_lease, transcription?))
-            })
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract.clone(),
+                WorkUnit::PipelineStage {
+                    name: "asr.speaker_attributed.chunk".to_string(),
+                    ordinal: idx,
+                },
+                move || {
+                    let chunk_audio = task_samples[chunk_start..chunk_end].to_vec();
+                    observation_job.record_materialized_usage(
+                        decoded_audio_with_scratch_observation(
+                            retained_input_bytes,
+                            task_samples.len(),
+                            chunk_audio.capacity(),
+                        )?,
+                    )?;
+                    let transcription = granite_saa_transcribe_chunk(
+                        &task_model,
+                        &chunk_audio,
+                        sample_rate,
+                        language_owned.as_deref(),
+                        prefix_text.as_deref(),
+                        max_new_tokens,
+                    );
+                    let steady_usage =
+                        decoded_audio_observation(retained_input_bytes, task_samples.len())?;
+                    observation_job.prepare_materialized_release(steady_usage)?;
+                    drop(chunk_audio);
+                    Ok((residency_lease, transcription?))
+                },
+            )
             .await?;
         residency_lease = returned_lease;
         let decode_diagnostics = granite_saa_decode_diagnostics(transcription.diagnostics.as_ref());
