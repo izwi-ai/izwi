@@ -6,12 +6,13 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::engine::WorkUnit;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::kokoro::{
     kokoro_output_budget, KokoroSynthesisResult, KokoroTtsModel,
 };
-use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::tts::direct_tts_retained_input_bytes;
@@ -53,7 +54,15 @@ impl RuntimeService {
             kokoro_output_budget(&request.text, request.config.options.speed)?.max_samples;
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), false)?;
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Tts,
+                false,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
         let model = self
             .model_registry
             .get_kokoro(variant)
@@ -62,36 +71,43 @@ impl RuntimeService {
         let observation_job = job.clone();
 
         self.coordinator
-            .run_blocking_stage(job, move || {
-                let _residency_lease = residency_lease;
-                let opts = &request.config.options;
-                let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
-                let started = Instant::now();
-                let result = synthesize_kokoro_with_fallback(
-                    model,
-                    &request.text,
-                    speaker,
-                    request.language.as_deref(),
-                    opts.speed,
-                    output_budget,
-                )?;
-                record_kokoro_materialized_output(
-                    &observation_job,
-                    retained_input_bytes,
-                    result.samples.capacity(),
-                    output_budget,
-                )?;
-                let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: CapabilityKind::Tts.as_str().to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let opts = &request.config.options;
+                    let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
+                    let started = Instant::now();
+                    let result = synthesize_kokoro_with_fallback(
+                        model,
+                        &request.text,
+                        speaker,
+                        request.language.as_deref(),
+                        opts.speed,
+                        output_budget,
+                    )?;
+                    record_kokoro_materialized_output(
+                        &observation_job,
+                        retained_input_bytes,
+                        result.samples.capacity(),
+                        output_budget,
+                    )?;
+                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
-                Ok(GenerationResult {
-                    request_id: request.id,
-                    samples: result.samples,
-                    sample_rate: result.sample_rate,
-                    total_tokens: result.tokens_generated,
-                    total_time_ms,
-                    diagnostics: None,
-                })
-            })
+                    Ok(GenerationResult {
+                        request_id: request.id,
+                        samples: result.samples,
+                        sample_rate: result.sample_rate,
+                        total_tokens: result.tokens_generated,
+                        total_time_ms,
+                        diagnostics: None,
+                    })
+                },
+            )
             .await
     }
 
@@ -107,7 +123,15 @@ impl RuntimeService {
         let request_id = request.id.clone();
         let variant = self.resolve_kokoro_variant_for_request(&request).await;
         self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), true)?;
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Tts,
+                true,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
         let model = self
             .model_registry
             .get_kokoro(variant)
@@ -127,16 +151,23 @@ impl RuntimeService {
 
         let (mut residency_lease, stream_chunks) = self
             .coordinator
-            .run_blocking_stage(job, move || {
-                let stream_chunks = plan_kokoro_streaming_chunks(
-                    model_for_plan.as_ref(),
-                    &text,
-                    speaker_for_plan.as_deref(),
-                    language_for_plan.as_deref(),
-                    speed,
-                )?;
-                Ok((residency_lease, stream_chunks))
-            })
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract.clone(),
+                WorkUnit::AtomicJob {
+                    kind: CapabilityKind::Tts.as_str().to_string(),
+                },
+                move || {
+                    let stream_chunks = plan_kokoro_streaming_chunks(
+                        model_for_plan.as_ref(),
+                        &text,
+                        speaker_for_plan.as_deref(),
+                        language_for_plan.as_deref(),
+                        speed,
+                    )?;
+                    Ok((residency_lease, stream_chunks))
+                },
+            )
             .await?;
         let total_chunks = stream_chunks.len();
         if total_chunks > output_budget.max_chunks {
@@ -155,17 +186,24 @@ impl RuntimeService {
             let language_for_task = language.clone();
             let (returned_lease, synthesis) = self
                 .coordinator
-                .run_blocking_stage(job, move || {
-                    let synthesis = synthesize_kokoro_with_fallback(
-                        model_for_task,
-                        &chunk_text,
-                        speaker_for_task.as_deref(),
-                        language_for_task.as_deref(),
-                        speed,
-                        output_budget.max_samples,
-                    )?;
-                    Ok((residency_lease, synthesis))
-                })
+                .run_loaded_blocking_stage(
+                    job,
+                    execution_contract.clone(),
+                    WorkUnit::AtomicJob {
+                        kind: CapabilityKind::Tts.as_str().to_string(),
+                    },
+                    move || {
+                        let synthesis = synthesize_kokoro_with_fallback(
+                            model_for_task,
+                            &chunk_text,
+                            speaker_for_task.as_deref(),
+                            language_for_task.as_deref(),
+                            speed,
+                            output_budget.max_samples,
+                        )?;
+                        Ok((residency_lease, synthesis))
+                    },
+                )
                 .await?;
             residency_lease = returned_lease;
             let current_sample_rate = synthesis.sample_rate;

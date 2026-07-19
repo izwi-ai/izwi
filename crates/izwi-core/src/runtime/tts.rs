@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams as CoreGenParams, ResourceAmount, ResourceVector};
+use crate::engine::{GenerationParams as CoreGenParams, ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
@@ -21,7 +21,7 @@ use crate::models::architectures::voxtral::tts::{
     voxtral_tts_auto_max_frames_for_text, VoxtralTtsGenerationParams,
 };
 use crate::models::shared::chat::{ChatMessage, ChatRole};
-use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::TtsRuntimeRequest;
@@ -501,7 +501,15 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Tts,
+                streaming_required,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -530,24 +538,31 @@ impl RuntimeService {
             .or_else(|| request.config.options.voice.clone());
         let request_id = request.id;
         self.coordinator
-            .run_blocking_stage(job, move || {
-                let _residency_lease = residency_lease;
-                let started = Instant::now();
-                let output = model.generate_sequential(
-                    &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
-                    max_new_tokens,
-                )?;
-                let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: CapabilityKind::Tts.as_str().to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let started = Instant::now();
+                    let output = model.generate_sequential(
+                        &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
+                        max_new_tokens,
+                    )?;
+                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
-                Ok(GenerationResult {
-                    request_id,
-                    samples: output.samples,
-                    sample_rate: output.sample_rate,
-                    total_tokens: output.tokens_generated,
-                    total_time_ms,
-                    diagnostics: output.diagnostics,
-                })
-            })
+                    Ok(GenerationResult {
+                        request_id,
+                        samples: output.samples,
+                        sample_rate: output.sample_rate,
+                        total_tokens: output.tokens_generated,
+                        total_time_ms,
+                        diagnostics: output.diagnostics,
+                    })
+                },
+            )
             .await
     }
 
@@ -579,7 +594,15 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Tts,
+                streaming_required,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -594,40 +617,47 @@ impl RuntimeService {
         let request_id = request.id;
         let config = request.config;
         self.coordinator
-            .run_blocking_stage(job, move || {
-                let _residency_lease = residency_lease;
-                let voice = config
-                    .options
-                    .speaker
-                    .clone()
-                    .or_else(|| config.options.voice.clone())
-                    .or_else(|| model.available_speakers().into_iter().next())
-                    .ok_or_else(|| {
-                        Error::InferenceError(
-                            "Voxtral TTS model exposes no preset voices".to_string(),
-                        )
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: CapabilityKind::Tts.as_str().to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let voice = config
+                        .options
+                        .speaker
+                        .clone()
+                        .or_else(|| config.options.voice.clone())
+                        .or_else(|| model.available_speakers().into_iter().next())
+                        .ok_or_else(|| {
+                            Error::InferenceError(
+                                "Voxtral TTS model exposes no preset voices".to_string(),
+                            )
+                        })?;
+                    let params =
+                        VoxtralTtsGenerationParams::from_generation_config_for_text(&config, &text);
+                    let started = Instant::now();
+                    let output = model.generate_with_voice(&text, &voice, params)?;
+                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+                    let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
+                        Error::InferenceError(format!(
+                            "Voxtral TTS sample rate {} exceeds u32",
+                            output.sample_rate
+                        ))
                     })?;
-                let params =
-                    VoxtralTtsGenerationParams::from_generation_config_for_text(&config, &text);
-                let started = Instant::now();
-                let output = model.generate_with_voice(&text, &voice, params)?;
-                let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-                let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
-                    Error::InferenceError(format!(
-                        "Voxtral TTS sample rate {} exceeds u32",
-                        output.sample_rate
-                    ))
-                })?;
 
-                Ok(GenerationResult {
-                    request_id,
-                    samples: output.samples,
-                    sample_rate,
-                    total_tokens: output.frames_generated,
-                    total_time_ms,
-                    diagnostics: None,
-                })
-            })
+                    Ok(GenerationResult {
+                        request_id,
+                        samples: output.samples,
+                        sample_rate,
+                        total_tokens: output.frames_generated,
+                        total_time_ms,
+                        diagnostics: None,
+                    })
+                },
+            )
             .await
     }
 
@@ -666,7 +696,15 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Tts,
+                streaming_required,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -679,33 +717,44 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
         self.coordinator
-            .run_blocking_stage(job, move || {
-                let _residency_lease = residency_lease;
-                let reference = vibevoice_reference_from_request(&request)?;
-                let requested_speaker = request.config.options.speaker.as_deref().or(request
-                    .config
-                    .options
-                    .voice
-                    .as_deref());
-                let params = VibeVoiceTtsGenerationParams::from_generation_config_for_text(
-                    &request.config,
-                    &text,
-                    model.default_diffusion_steps(),
-                );
-                let started = Instant::now();
-                let output =
-                    model.generate_with_reference(&text, &reference, requested_speaker, params)?;
-                let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: CapabilityKind::Tts.as_str().to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let reference = vibevoice_reference_from_request(&request)?;
+                    let requested_speaker = request.config.options.speaker.as_deref().or(request
+                        .config
+                        .options
+                        .voice
+                        .as_deref());
+                    let params = VibeVoiceTtsGenerationParams::from_generation_config_for_text(
+                        &request.config,
+                        &text,
+                        model.default_diffusion_steps(),
+                    );
+                    let started = Instant::now();
+                    let output = model.generate_with_reference(
+                        &text,
+                        &reference,
+                        requested_speaker,
+                        params,
+                    )?;
+                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
-                Ok(GenerationResult {
-                    request_id: request.id,
-                    samples: output.samples,
-                    sample_rate: output.sample_rate,
-                    total_tokens: output.frames_generated,
-                    total_time_ms,
-                    diagnostics: None,
-                })
-            })
+                    Ok(GenerationResult {
+                        request_id: request.id,
+                        samples: output.samples,
+                        sample_rate: output.sample_rate,
+                        total_tokens: output.frames_generated,
+                        total_time_ms,
+                        diagnostics: None,
+                    })
+                },
+            )
             .await
     }
 
@@ -744,7 +793,15 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Tts,
+                streaming_required,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
 
         let text = request.text.trim().to_string();
         if text.is_empty() {
@@ -757,33 +814,40 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No Fish S2 TTS model loaded".to_string()))?;
         self.coordinator
-            .run_blocking_stage(job, move || {
-                let _residency_lease = residency_lease;
-                let reference = fish_s2_reference_from_request(&request)?;
-                let mut params = FishS2GenerationParams::default();
-                if request.config.options.max_tokens > 0 {
-                    params.max_frames = request
-                        .config
-                        .options
-                        .max_tokens
-                        .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
-                }
-                params.temperature = request.config.options.temperature;
-                params.top_p = request.config.options.top_p;
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: CapabilityKind::Tts.as_str().to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let reference = fish_s2_reference_from_request(&request)?;
+                    let mut params = FishS2GenerationParams::default();
+                    if request.config.options.max_tokens > 0 {
+                        params.max_frames = request
+                            .config
+                            .options
+                            .max_tokens
+                            .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
+                    }
+                    params.temperature = request.config.options.temperature;
+                    params.top_p = request.config.options.top_p;
 
-                let started = Instant::now();
-                let output = model.generate_with_reference(&text, reference, params)?;
-                let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
+                    let started = Instant::now();
+                    let output = model.generate_with_reference(&text, reference, params)?;
+                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
-                Ok(GenerationResult {
-                    request_id: request.id,
-                    samples: output.samples,
-                    sample_rate: output.sample_rate,
-                    total_tokens: output.frames_generated,
-                    total_time_ms,
-                    diagnostics: serde_json::to_value(output.diagnostics).ok(),
-                })
-            })
+                    Ok(GenerationResult {
+                        request_id: request.id,
+                        samples: output.samples,
+                        sample_rate: output.sample_rate,
+                        total_tokens: output.frames_generated,
+                        total_time_ms,
+                        diagnostics: serde_json::to_value(output.diagnostics).ok(),
+                    })
+                },
+            )
             .await
     }
 
