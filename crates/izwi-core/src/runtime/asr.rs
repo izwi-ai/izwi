@@ -2592,7 +2592,15 @@ impl RuntimeService {
             audio_input.retained_bytes(),
             owned_metadata_bytes,
         ])?)?;
-        let residency_lease = self.load_asr_model_for_job(&job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                &job,
+                variant,
+                CapabilityKind::ForcedAlignment,
+                false,
+                ExecutionTargetKind::BatchRunner,
+            )
+            .await?;
         let model = self
             .model_registry
             .get_asr(variant)
@@ -2600,27 +2608,35 @@ impl RuntimeService {
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
         let observation_job = job.clone();
         self.coordinator
-            .run_blocking_stage(&job, move || {
-                let _residency_lease = residency_lease;
-                let retained_audio_bytes = audio_input.retained_bytes();
-                let (samples, sample_rate) = audio_input.decode()?;
-                let retained_bytes =
-                    input_bytes
-                        .checked_add(owned_metadata_bytes)
-                        .ok_or_else(|| {
-                            Error::Overloaded(
-                                "forced alignment retained storage overflowed".to_string(),
-                            )
-                        })?;
-                let steady_usage = decoded_audio_observation(retained_bytes, samples.capacity())?;
-                observation_job.record_materialized_usage(add_retained_host_bytes(
-                    steady_usage,
-                    retained_audio_bytes,
-                )?)?;
-                observation_job.prepare_materialized_release(steady_usage)?;
-                drop(audio_input);
-                model.force_align(&samples, sample_rate, &reference_text, language.as_deref())
-            })
+            .run_loaded_blocking_stage(
+                &job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: "asr.forced_alignment".to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let retained_audio_bytes = audio_input.retained_bytes();
+                    let (samples, sample_rate) = audio_input.decode()?;
+                    let retained_bytes =
+                        input_bytes
+                            .checked_add(owned_metadata_bytes)
+                            .ok_or_else(|| {
+                                Error::Overloaded(
+                                    "forced alignment retained storage overflowed".to_string(),
+                                )
+                            })?;
+                    let steady_usage =
+                        decoded_audio_observation(retained_bytes, samples.capacity())?;
+                    observation_job.record_materialized_usage(add_retained_host_bytes(
+                        steady_usage,
+                        retained_audio_bytes,
+                    )?)?;
+                    observation_job.prepare_materialized_release(steady_usage)?;
+                    drop(audio_input);
+                    model.force_align(&samples, sample_rate, &reference_text, language.as_deref())
+                },
+            )
             .await
     }
 }
