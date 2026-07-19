@@ -14,6 +14,33 @@ use super::{RequestId, SequenceId, TaskType};
 pub type PlanId = u64;
 pub type SessionEpoch = SequenceId;
 
+macro_rules! execution_id {
+    ($name:ident, $value:ty) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name($value);
+
+        impl $name {
+            pub const fn new(value: $value) -> Self {
+                Self(value)
+            }
+
+            pub const fn get(self) -> $value {
+                self.0
+            }
+        }
+    };
+}
+
+execution_id!(ExecutionGroupId, u64);
+execution_id!(ModelInstanceId, u64);
+execution_id!(AdapterInstanceId, u64);
+execution_id!(AdapterAbiRevision, u32);
+execution_id!(StageId, u32);
+execution_id!(BatchId, u64);
+
 /// Identity of one request incarnation. Public request IDs may be reused after
 /// completion, so executor transactions must also carry the scheduler epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -113,6 +140,229 @@ pub enum NativeBatchMode {
     None,
     Static,
     Continuous,
+}
+
+/// Where one model stage is executed. Host stages remain part of the same
+/// logical workflow but do not consume a device execution-group permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDomain {
+    Host,
+    ExecutionGroup,
+}
+
+/// How a stage makes observable progress. Continuous batch membership is only
+/// valid for stages that expose repeatable or input-driven safe points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageProgressKind {
+    Atomic,
+    Iterative,
+    InputDriven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageShapePolicy {
+    Exact,
+    Bucketed,
+    Padded,
+    Ragged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipSafePoint {
+    OperationBoundary,
+    QuantumBoundary,
+    InputBoundary,
+    PipelineBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVisibility {
+    AfterQuantumCommit,
+    IncrementalCommitted,
+}
+
+/// Model-owned description of one execution stage. The engine treats `id` as
+/// opaque and never branches on cache, transducer, diffusion, or codec types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageDescriptor {
+    pub id: StageId,
+    pub name: String,
+    pub domain: ExecutionDomain,
+    pub progress: StageProgressKind,
+    pub batch_mode: NativeBatchMode,
+    pub max_batch_size: usize,
+    pub max_work_units: u64,
+    pub max_workspace_bytes: u64,
+    pub shape_policy: StageShapePolicy,
+    pub membership_safe_point: MembershipSafePoint,
+    pub output_visibility: OutputVisibility,
+}
+
+impl StageDescriptor {
+    /// Conservative bridge for existing executors. Callers choose the phase's
+    /// declared batch mode explicitly because one legacy profile can describe
+    /// different prefill and decode behavior.
+    pub fn from_execution_profile(
+        id: StageId,
+        name: impl Into<String>,
+        profile: &ExecutionProfile,
+        batch_mode: NativeBatchMode,
+    ) -> Self {
+        let progress = match profile.mode {
+            ExecutionMode::Sequence => StageProgressKind::Iterative,
+            ExecutionMode::Realtime => StageProgressKind::InputDriven,
+            ExecutionMode::Atomic | ExecutionMode::Pipeline | ExecutionMode::Artifact => {
+                StageProgressKind::Atomic
+            }
+        };
+        let membership_safe_point = match profile.cancellation {
+            CancellationGranularity::OperationBoundary => MembershipSafePoint::OperationBoundary,
+            CancellationGranularity::SequenceStep => MembershipSafePoint::QuantumBoundary,
+            CancellationGranularity::RealtimeChunk => MembershipSafePoint::InputBoundary,
+            CancellationGranularity::PipelineStage => MembershipSafePoint::PipelineBoundary,
+        };
+        let shape_policy = match batch_mode {
+            NativeBatchMode::None => StageShapePolicy::Exact,
+            NativeBatchMode::Static => StageShapePolicy::Padded,
+            NativeBatchMode::Continuous => StageShapePolicy::Ragged,
+        };
+        Self {
+            id,
+            name: name.into(),
+            domain: if profile.mode == ExecutionMode::Artifact {
+                ExecutionDomain::Host
+            } else {
+                ExecutionDomain::ExecutionGroup
+            },
+            progress,
+            batch_mode,
+            max_batch_size: if batch_mode == NativeBatchMode::None {
+                1
+            } else {
+                profile.max_batch_size.max(1)
+            },
+            max_work_units: 1,
+            max_workspace_bytes: 0,
+            shape_policy,
+            membership_safe_point,
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "execution stage name cannot be empty".to_string(),
+            ));
+        }
+        if self.max_batch_size == 0 || self.max_work_units == 0 {
+            return Err(Error::InvalidInput(
+                "execution stage budgets must be greater than zero".to_string(),
+            ));
+        }
+        if self.batch_mode == NativeBatchMode::None && self.max_batch_size != 1 {
+            return Err(Error::InvalidInput(
+                "non-batchable execution stages must have width one".to_string(),
+            ));
+        }
+        if self.batch_mode == NativeBatchMode::Continuous
+            && (self.progress == StageProgressKind::Atomic
+                || self.membership_safe_point == MembershipSafePoint::OperationBoundary)
+        {
+            return Err(Error::InvalidInput(
+                "continuous batching requires a repeatable membership safe point".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Backend-neutral cost of one safe execution quantum. Logical units may be
+/// tokens, audio frames, samples, codec frames, or another adapter-defined unit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkCost {
+    pub logical_units: u64,
+    pub tensor_elements: u64,
+    pub workspace_bytes: u64,
+}
+
+impl WorkCost {
+    pub const fn new(logical_units: u64, tensor_elements: u64, workspace_bytes: u64) -> Self {
+        Self {
+            logical_units,
+            tensor_elements,
+            workspace_bytes,
+        }
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            logical_units: self.logical_units.checked_add(other.logical_units)?,
+            tensor_elements: self.tensor_elements.checked_add(other.tensor_elements)?,
+            workspace_bytes: self.workspace_bytes.checked_add(other.workspace_bytes)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchBudget {
+    pub max_rows: usize,
+    pub max_logical_units: u64,
+    pub max_tensor_elements: u64,
+    pub max_workspace_bytes: u64,
+    /// Maximum padded work as basis points of useful work. `10_000` permits
+    /// padding equal to the useful tensor work.
+    pub max_padding_basis_points: u16,
+    pub max_formation_delay: Duration,
+}
+
+impl BatchBudget {
+    pub const fn width_one() -> Self {
+        Self {
+            max_rows: 1,
+            max_logical_units: u64::MAX,
+            max_tensor_elements: u64::MAX,
+            max_workspace_bytes: u64::MAX,
+            max_padding_basis_points: 0,
+            max_formation_delay: Duration::ZERO,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if self.max_rows == 0
+            || self.max_logical_units == 0
+            || self.max_tensor_elements == 0
+            || self.max_workspace_bytes == 0
+        {
+            return Err(Error::InvalidInput(
+                "physical batch budgets must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_padding_basis_points > 10_000 {
+            return Err(Error::InvalidInput(
+                "physical batch padding budget cannot exceed 100 percent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn admits(self, current_rows: usize, current: WorkCost, next: WorkCost) -> bool {
+        let Some(rows) = current_rows.checked_add(1) else {
+            return false;
+        };
+        let Some(total) = current.checked_add(next) else {
+            return false;
+        };
+        rows <= self.max_rows
+            && total.logical_units <= self.max_logical_units
+            && total.tensor_elements <= self.max_tensor_elements
+            && total.workspace_bytes <= self.max_workspace_bytes
+    }
 }
 
 /// Observed dispatch mechanism for one executor report. Request-parallel work
@@ -692,6 +942,81 @@ impl ExecutionTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_id_newtypes_do_not_alias_domains() {
+        let group = ExecutionGroupId::new(7);
+        let model = ModelInstanceId::new(7);
+        let adapter = AdapterInstanceId::new(7);
+        let stage = StageId::new(7);
+        let batch = BatchId::new(7);
+
+        assert_eq!(group.get(), 7);
+        assert_eq!(model.get(), 7);
+        assert_eq!(adapter.get(), 7);
+        assert_eq!(stage.get(), 7);
+        assert_eq!(batch.get(), 7);
+        assert_eq!(AdapterAbiRevision::new(1).get(), 1);
+    }
+
+    #[test]
+    fn legacy_stage_descriptor_stays_fail_closed_at_width_one() {
+        let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "legacy",
+            &profile,
+            NativeBatchMode::None,
+        );
+
+        assert_eq!(stage.max_batch_size, 1);
+        assert_eq!(stage.batch_mode, NativeBatchMode::None);
+        assert_eq!(stage.progress, StageProgressKind::Atomic);
+        assert!(stage.validate().is_ok());
+    }
+
+    #[test]
+    fn continuous_stage_requires_repeatable_safe_points() {
+        let invalid = StageDescriptor {
+            id: StageId::new(2),
+            name: "atomic".to_string(),
+            domain: ExecutionDomain::ExecutionGroup,
+            progress: StageProgressKind::Atomic,
+            batch_mode: NativeBatchMode::Continuous,
+            max_batch_size: 2,
+            max_work_units: 2,
+            max_workspace_bytes: 1,
+            shape_policy: StageShapePolicy::Ragged,
+            membership_safe_point: MembershipSafePoint::OperationBoundary,
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+        };
+        assert!(invalid.validate().is_err());
+
+        let valid = StageDescriptor {
+            progress: StageProgressKind::Iterative,
+            membership_safe_point: MembershipSafePoint::QuantumBoundary,
+            ..invalid
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn generalized_batch_budget_rejects_overflow_and_excess_work() {
+        let budget = BatchBudget {
+            max_rows: 2,
+            max_logical_units: 8,
+            max_tensor_elements: 32,
+            max_workspace_bytes: 64,
+            max_padding_basis_points: 2_500,
+            max_formation_delay: Duration::from_micros(500),
+        };
+        assert!(budget.validate().is_ok());
+        let current = WorkCost::new(3, 12, 24);
+        assert!(budget.admits(1, current, WorkCost::new(5, 20, 40)));
+        assert!(!budget.admits(1, current, WorkCost::new(6, 20, 40)));
+        assert!(!budget.admits(2, current, WorkCost::new(1, 1, 1)));
+        assert!(!budget.admits(1, WorkCost::new(u64::MAX, 0, 0), WorkCost::new(1, 0, 0),));
+    }
 
     #[test]
     fn lifecycle_rejects_regressions_and_second_terminal() {
