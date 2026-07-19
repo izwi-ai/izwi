@@ -422,6 +422,60 @@ mod tests {
         }
     }
 
+    fn scheduled(request_id: &str, plan_id: u64, epoch: u64) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id,
+            request_id: request_id.to_string(),
+            sequence_id: epoch,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn keyed_reconciliation_rejects_duplicate_unknown_and_missing_transactions() {
+        let scheduled = vec![scheduled("req-a", 1, 0), scheduled("req-b", 2, 1)];
+        let first = ExecutorStepResult::new(
+            &scheduled[0],
+            ExecutorOutput::terminal(scheduled[0].request_id.clone()),
+        );
+        let duplicate = first.clone();
+        let mut unknown = first.clone();
+        unknown.plan_id = 999;
+        unknown.session = SessionKey::new("unknown".to_string(), 999);
+        unknown.output.request_id = "unknown".to_string();
+
+        let reconciled =
+            reconcile_executor_outputs("prefill", &scheduled, Ok(vec![first, duplicate, unknown]));
+
+        assert_eq!(
+            reconciled
+                .iter()
+                .map(|result| result.output.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["req-a", "req-b"]
+        );
+        assert!(reconciled[0]
+            .output
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("duplicate"));
+        assert!(reconciled[1]
+            .output
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("did not return"));
+    }
+
     #[tokio::test]
     async fn workspace_rejection_never_enters_the_model_executor() {
         let calls = Arc::new(AtomicUsize::new(0));
