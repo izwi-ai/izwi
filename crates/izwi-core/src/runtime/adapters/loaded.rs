@@ -5,18 +5,21 @@ use std::sync::Arc;
 
 use crate::backends::BackendKind;
 use crate::engine::{
-    AdapterAbiRevision, AdapterInstanceId, ConcurrencyClass, ExecutionAdapterBinding,
-    ExecutionGroupId, ExecutionProfile, ModelInstanceId, NativeBatchMode, StageDescriptor, StageId,
+    AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity, ConcurrencyClass,
+    ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile, ModelInstanceId,
+    NativeBatchMode, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::runtime::rollout::ExecutionRolloutMode;
 
 use super::{
-    compatibility_execution_profile, AdapterMetadata, CapabilityKind, RuntimeAdapterRegistry,
-    StreamingMode,
+    compatibility_execution_profile, supports_static_tensor_execution, AdapterMetadata,
+    CapabilityKind, RuntimeAdapterRegistry, StreamingMode,
 };
 
 const WIDTH_ONE_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(2);
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -95,28 +98,144 @@ impl LoadedExecutionAdapter for WidthOneExecutionAdapter {
     }
 
     fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
-        let metadata = self.metadata();
-        if streaming_required && metadata.streaming_mode == StreamingMode::None {
-            return Err(Error::InvalidInput(format!(
-                "Model {} supports {:?}, but not streaming execution for that capability",
-                metadata.model_variant, metadata.capability
-            )));
+        width_one_contract(
+            self.execution_group_id,
+            self.model_instance_id,
+            self.adapter_instance_id(),
+            self.adapter_abi_revision(),
+            self.metadata(),
+            self.backend_kind,
+            streaming_required,
+        )
+    }
+}
+
+fn width_one_contract(
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    adapter_abi_revision: AdapterAbiRevision,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    streaming_required: bool,
+) -> Result<LoadedExecutionContract> {
+    if streaming_required && metadata.streaming_mode == StreamingMode::None {
+        return Err(Error::InvalidInput(format!(
+            "Model {} supports {:?}, but not streaming execution for that capability",
+            metadata.model_variant, metadata.capability
+        )));
+    }
+
+    let mut execution_profile =
+        compatibility_execution_profile(metadata, backend_kind, streaming_required);
+    execution_profile.resolved_from_loaded_model = true;
+    execution_profile.prefill_batch = NativeBatchMode::None;
+    execution_profile.decode_batch = NativeBatchMode::None;
+    execution_profile.max_batch_size = 1;
+    execution_profile.concurrency = ConcurrencyClass::Exclusive;
+
+    let stage = StageDescriptor::from_execution_profile(
+        StageId::new(0),
+        format!("{}.compatibility", metadata.capability.as_str()),
+        &execution_profile,
+        NativeBatchMode::None,
+    );
+    stage.validate()?;
+
+    Ok(LoadedExecutionContract {
+        execution_group_id,
+        model_instance_id,
+        adapter_instance_id,
+        adapter_abi_revision,
+        metadata,
+        execution_profile,
+        stages: Arc::from([stage]),
+    })
+}
+
+#[derive(Debug)]
+struct StaticQwenTtsExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+}
+
+impl StaticQwenTtsExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        STATIC_TENSOR_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
+        if streaming_required {
+            return width_one_contract(
+                self.execution_group_id,
+                self.model_instance_id,
+                self.adapter_instance_id(),
+                self.adapter_abi_revision(),
+                self.metadata(),
+                self.backend_kind,
+                true,
+            );
         }
 
+        let metadata = self.metadata();
         let mut execution_profile =
-            compatibility_execution_profile(metadata, self.backend_kind, streaming_required);
-        execution_profile.resolved_from_loaded_model = true;
-        execution_profile.prefill_batch = NativeBatchMode::None;
+            compatibility_execution_profile(metadata, self.backend_kind, false);
+        execution_profile.mode = ExecutionMode::Atomic;
+        execution_profile.prefill = PrefillMode::None;
+        execution_profile.incremental_decode = false;
+        execution_profile.prefill_batch = NativeBatchMode::Static;
         execution_profile.decode_batch = NativeBatchMode::None;
-        execution_profile.max_batch_size = 1;
-        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.cache_mode = CacheMode::None;
+        execution_profile.cancellation = CancellationGranularity::OperationBoundary;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
+        execution_profile.recompute_safe = false;
+        execution_profile.cache_release_safe = false;
+        execution_profile.prefix_reuse_safe = false;
+        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.resolved_from_loaded_model = true;
+        execution_profile.kv_dtype = "none".to_string();
+        execution_profile.cache_namespace = None;
 
-        let stage = StageDescriptor::from_execution_profile(
-            StageId::new(0),
-            format!("{}.compatibility", metadata.capability.as_str()),
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tts.generate.tensor_static",
             &execution_profile,
-            NativeBatchMode::None,
+            NativeBatchMode::Static,
         );
+        stage.selector = StageWorkSelector::Atomic;
         stage.validate()?;
 
         Ok(LoadedExecutionContract {
@@ -169,12 +288,27 @@ impl LoadedModelBundle {
 
         let mut adapters = HashMap::with_capacity(metadata.len());
         for metadata in metadata {
-            let adapter: Arc<dyn LoadedExecutionAdapter> = Arc::new(WidthOneExecutionAdapter::new(
-                execution_group_id,
-                model_instance_id,
-                metadata,
-                backend_kind,
-            ));
+            let adapter: Arc<dyn LoadedExecutionAdapter> = if metadata.capability
+                == CapabilityKind::Tts
+                && registry.execution_mode_for(model_variant, backend_kind)
+                    == ExecutionRolloutMode::Static
+                && supports_static_tensor_execution(model_variant)
+            {
+                Arc::new(StaticQwenTtsExecutionAdapter::new(
+                    execution_group_id,
+                    model_instance_id,
+                    metadata,
+                    backend_kind,
+                    registry.max_tensor_batch_size(),
+                ))
+            } else {
+                Arc::new(WidthOneExecutionAdapter::new(
+                    execution_group_id,
+                    model_instance_id,
+                    metadata,
+                    backend_kind,
+                ))
+            };
             adapter.contract(false)?;
             if adapters.insert(metadata.capability, adapter).is_some() {
                 return Err(Error::ModelLoadError(format!(
@@ -247,6 +381,7 @@ impl LoadedModelBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::rollout::ExecutionRolloutPolicy;
 
     #[test]
     fn every_supported_model_capability_binds_to_an_exact_width_one_contract() {
@@ -324,5 +459,74 @@ mod tests {
 
         assert_ne!(first_asr, first_tts);
         assert_ne!(first_asr, second_asr);
+    }
+
+    #[test]
+    fn exact_qwen_tts_rollout_binds_static_generation_but_not_streaming() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let override_value = format!("{}@metal=static", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            BackendKind::Metal,
+        )
+        .unwrap();
+
+        let batch = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        assert_eq!(batch.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
+        assert_eq!(batch.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(
+            batch.execution_profile.prefill_batch,
+            NativeBatchMode::Static
+        );
+        assert_eq!(batch.execution_profile.max_batch_size, 4);
+        assert_eq!(batch.stages.len(), 1);
+        assert_eq!(batch.stages[0].selector, StageWorkSelector::Atomic);
+        assert_eq!(batch.stages[0].batch_mode, NativeBatchMode::Static);
+        assert_eq!(batch.stages[0].max_batch_size, 4);
+
+        let streaming = bundle.contract(CapabilityKind::Tts, true).unwrap();
+        assert_eq!(streaming.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
+        assert_eq!(
+            streaming.execution_profile.prefill_batch,
+            NativeBatchMode::None
+        );
+        assert_eq!(streaming.execution_profile.max_batch_size, 1);
+        assert_eq!(streaming.stages[0].batch_mode, NativeBatchMode::None);
+
+        let streaming_capability = bundle
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
+        assert_eq!(
+            streaming_capability.adapter_abi_revision,
+            WIDTH_ONE_ADAPTER_ABI
+        );
+    }
+
+    #[test]
+    fn static_rollout_does_not_cross_backend_boundaries() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let override_value = format!("{}@metal=static", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        assert_eq!(contract.adapter_abi_revision, WIDTH_ONE_ADAPTER_ABI);
+        assert_eq!(contract.execution_profile.max_batch_size, 1);
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
     }
 }

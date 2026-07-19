@@ -970,17 +970,12 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         let execution_rollout = ExecutionRolloutPolicy::from_env()?;
-        worker_config.static_tensor_batch_variants = Arc::new(
-            ModelVariant::all()
-                .iter()
-                .copied()
-                .filter(|variant| {
-                    execution_rollout
-                        .mode_for(*variant, selected_backend_kind)
-                        .executes()
-                })
-                .collect(),
-        );
+        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_rollout(
+            execution_rollout,
+            worker_config.max_tensor_batch_size,
+        )?);
+        worker_config.static_tensor_batch_variants =
+            Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
         let execution_parallelism = worker_config.request_parallelism;
         let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
@@ -995,7 +990,6 @@ impl RuntimeService {
         let tokenizer = Arc::new(RwLock::new(None));
         let codec = Arc::new(RwLock::new(AudioCodec::new()));
         let loaded_tts_variant = Arc::new(RwLock::new(None));
-        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in());
         let model_lifecycle = Arc::new(ModelLifecycleController::new(
             config.clone(),
             backend_router.clone(),

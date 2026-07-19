@@ -1,6 +1,6 @@
 //! Runtime capability adapters and loaded-model execution bindings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -12,6 +12,7 @@ use crate::engine::{
     PrefillMode, TaskType,
 };
 use crate::error::{Error, Result};
+use crate::runtime::rollout::{ExecutionRolloutMode, ExecutionRolloutPolicy};
 
 mod loaded;
 
@@ -99,14 +100,38 @@ pub(crate) trait ModelCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RuntimeAdapterRegistry {
     adapters: HashMap<(CapabilityKind, ModelVariant), AdapterMetadata>,
+    execution_rollout: ExecutionRolloutPolicy,
+    max_tensor_batch_size: usize,
+}
+
+impl Default for RuntimeAdapterRegistry {
+    fn default() -> Self {
+        Self {
+            adapters: HashMap::new(),
+            execution_rollout: ExecutionRolloutPolicy::default(),
+            max_tensor_batch_size: 1,
+        }
+    }
 }
 
 impl RuntimeAdapterRegistry {
     pub(crate) fn built_in() -> Self {
-        let mut registry = Self::default();
+        Self::built_in_with_rollout(ExecutionRolloutPolicy::default(), 1)
+            .expect("the fail-closed built-in adapter registry must be valid")
+    }
+
+    pub(crate) fn built_in_with_rollout(
+        execution_rollout: ExecutionRolloutPolicy,
+        max_tensor_batch_size: usize,
+    ) -> Result<Self> {
+        let mut registry = Self {
+            adapters: HashMap::new(),
+            execution_rollout,
+            max_tensor_batch_size: max_tensor_batch_size.max(1),
+        };
         registry.register_adapter(TtsCapabilityAdapter);
         registry.register_adapter(StreamingTtsCapabilityAdapter);
         registry.register_adapter(AsrCapabilityAdapter);
@@ -117,7 +142,8 @@ impl RuntimeAdapterRegistry {
         registry.register_adapter(DiarizationCapabilityAdapter);
         registry.register_adapter(ForcedAlignmentCapabilityAdapter);
         registry.register_adapter(TokenizerCapabilityAdapter);
-        registry
+        registry.validate_execution_rollout()?;
+        Ok(registry)
     }
 
     pub(crate) fn capabilities_for(&self, model_variant: ModelVariant) -> Vec<AdapterMetadata> {
@@ -144,6 +170,60 @@ impl RuntimeAdapterRegistry {
             })
     }
 
+    pub(crate) fn execution_mode_for(
+        &self,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+    ) -> ExecutionRolloutMode {
+        self.execution_rollout.mode_for(model_variant, backend_kind)
+    }
+
+    pub(crate) fn max_tensor_batch_size(&self) -> usize {
+        self.max_tensor_batch_size
+    }
+
+    pub(crate) fn static_tensor_batch_variants(
+        &self,
+        backend_kind: BackendKind,
+    ) -> HashSet<ModelVariant> {
+        ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| {
+                self.execution_mode_for(*variant, backend_kind) == ExecutionRolloutMode::Static
+                    && supports_static_tensor_execution(*variant)
+            })
+            .collect()
+    }
+
+    fn validate_execution_rollout(&self) -> Result<()> {
+        const BACKENDS: [BackendKind; 3] =
+            [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+
+        for model_variant in ModelVariant::all().iter().copied() {
+            for backend_kind in BACKENDS {
+                match self.execution_mode_for(model_variant, backend_kind) {
+                    ExecutionRolloutMode::Off => {}
+                    ExecutionRolloutMode::Static
+                        if supports_static_tensor_execution(model_variant) => {}
+                    ExecutionRolloutMode::Static => {
+                        return Err(Error::InvalidInput(format!(
+                            "Model {model_variant} has no static tensor adapter on {}",
+                            backend_kind.as_str()
+                        )))
+                    }
+                    ExecutionRolloutMode::Continuous => {
+                        return Err(Error::InvalidInput(format!(
+                            "Model {model_variant} has no continuous tensor adapter on {}",
+                            backend_kind.as_str()
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn register_adapter<A>(&mut self, adapter: A)
     where
         A: ModelCapabilityAdapter,
@@ -155,6 +235,13 @@ impl RuntimeAdapterRegistry {
             }
         }
     }
+}
+
+pub(crate) fn supports_static_tensor_execution(model_variant: ModelVariant) -> bool {
+    model_variant.family() == ModelFamily::Qwen3Tts
+        && model_variant
+            .speech_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_builtin_voices)
 }
 
 pub(crate) fn compatibility_execution_profile(
@@ -503,6 +590,36 @@ mod tests {
                 "capability registry mismatch for {variant:?}"
             );
         }
+    }
+
+    #[test]
+    fn exact_static_rollout_only_publishes_proven_native_variants() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let override_value = format!("{}@metal=static", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+
+        assert_eq!(registry.max_tensor_batch_size(), 4);
+        assert_eq!(
+            registry.static_tensor_batch_variants(BackendKind::Metal),
+            HashSet::from([variant])
+        );
+        assert!(registry
+            .static_tensor_batch_variants(BackendKind::Cpu)
+            .is_empty());
+    }
+
+    #[test]
+    fn rollout_cannot_advertise_a_missing_static_adapter() {
+        let variant = ModelVariant::Qwen306B;
+        let override_value = format!("{}@metal=static", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
+            .expect_err("chat has no static tensor adapter");
+
+        assert!(error.to_string().contains("no static tensor adapter"));
     }
 
     #[test]
