@@ -149,8 +149,6 @@ pub fn try_qwen35_causal_conv_sequence(
         .narrow(0, output_elements, state_elements)
         .ok()?
         .reshape((conv_dim, history_len))
-        .ok()?
-        .force_contiguous()
         .ok()?;
     Some((output, final_history))
 }
@@ -190,7 +188,7 @@ pub fn try_tiled_deltanet_recurrence(
     g: &Tensor,
     beta: &Tensor,
     initial_state: &Tensor,
-    _tile_size: usize,
+    tile_size: usize,
 ) -> Option<(Tensor, Tensor)> {
     if !cuda_tensor_pair_supported(queries, keys)
         || !cuda_tensor_pair_supported(queries, values)
@@ -198,6 +196,7 @@ pub fn try_tiled_deltanet_recurrence(
         || !cuda_tensor_pair_supported(queries, beta)
         || !cuda_tensor_pair_supported(queries, initial_state)
         || queries.dtype() != DType::F32
+        || tile_size == 0
     {
         return None;
     }
@@ -232,7 +231,33 @@ pub fn try_tiled_deltanet_recurrence(
         return None;
     }
 
-    cuda_gated_delta_sequence(queries, keys, values, g, beta, initial_state)
+    let tile_size = tile_size.min(seq_len.max(1));
+    if tile_size >= seq_len {
+        return cuda_gated_delta_sequence(queries, keys, values, g, beta, initial_state);
+    }
+
+    let mut outputs = Vec::with_capacity(seq_len.div_ceil(tile_size));
+    let mut state = initial_state.clone();
+    for token_start in (0..seq_len).step_by(tile_size) {
+        let token_count = tile_size.min(seq_len - token_start);
+        let query_tile = queries.narrow(1, token_start, token_count).ok()?;
+        let key_tile = keys.narrow(1, token_start, token_count).ok()?;
+        let value_tile = values.narrow(1, token_start, token_count).ok()?;
+        let g_tile = g.narrow(1, token_start, token_count).ok()?;
+        let beta_tile = beta.narrow(1, token_start, token_count).ok()?;
+        let (output, next_state) = cuda_gated_delta_sequence(
+            &query_tile,
+            &key_tile,
+            &value_tile,
+            &g_tile,
+            &beta_tile,
+            &state,
+        )?;
+        outputs.push(output);
+        state = next_state;
+    }
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    Some((Tensor::cat(&output_refs, 1).ok()?, state))
 }
 
 fn cuda_tensor_supported(tensor: &Tensor) -> bool {
@@ -310,10 +335,6 @@ fn cuda_gated_delta_sequence(
         .narrow(0, output_elements, state_elements)
         .ok()?
         .reshape((batch, heads, key_dim, value_dim))
-        .ok()?
-        // The packed custom-op result also contains sequence outputs. Detach
-        // the persistent state so it retains only its exact live allocation.
-        .force_contiguous()
         .ok()?;
     Some((outputs, next_state))
 }

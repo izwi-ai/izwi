@@ -516,6 +516,9 @@ kernel void izwi_qwen35_gated_delta_sequence_f32(
     constant uint& qkv_width [[buffer(9)]],
     constant uint& output_elem_count [[buffer(10)]],
     constant float& query_scale [[buffer(11)]],
+    constant uint& token_start [[buffer(12)]],
+    constant uint& token_count [[buffer(13)]],
+    constant uint& initialize_state [[buffer(14)]],
     uint tid [[thread_index_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]
@@ -529,10 +532,12 @@ kernel void izwi_qwen35_gated_delta_sequence_f32(
     const uint state_head_size = head_k_dim * head_v_dim;
     const uint state_base = output_elem_count + head * state_head_size;
     const uint initial_state_base = head * state_head_size;
-    for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
-        output[state_base + idx] = initial_state[initial_state_base + idx];
+    if (initialize_state != 0) {
+        for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
+            output[state_base + idx] = initial_state[initial_state_base + idx];
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     // GGUF conversion stores V heads in tiled order, so the matching K head is
     // `v_head % num_k_heads` for both 16K/16V and 16K/32V layouts.
@@ -540,7 +545,8 @@ kernel void izwi_qwen35_gated_delta_sequence_f32(
     const uint key_width = num_k_heads * head_k_dim;
     const uint value_offset = key_width * 2;
 
-    for (uint token = 0; token < seq_len; token++) {
+    const uint token_end = min(token_start + token_count, seq_len);
+    for (uint token = token_start; token < token_end; token++) {
         const uint qkv_base = token * qkv_width;
         const uint query_base = qkv_base + key_head * head_k_dim;
         const uint key_base = qkv_base + key_width + key_head * head_k_dim;
@@ -552,7 +558,7 @@ kernel void izwi_qwen35_gated_delta_sequence_f32(
         for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
             output[state_base + idx] *= decay;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
         for (uint value_dim = tid; value_dim < head_v_dim; value_dim += threads_per_threadgroup) {
             float memory = 0.0f;
@@ -562,14 +568,14 @@ kernel void izwi_qwen35_gated_delta_sequence_f32(
             }
             delta[value_dim] = (qkv[value_base + value_dim] - memory) * beta;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
         for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
             const uint key_dim = idx / head_v_dim;
             const uint value_dim = idx - key_dim * head_v_dim;
             output[state_base + idx] += qkv[key_base + key_dim] * delta[value_dim];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
         for (uint value_dim = tid; value_dim < head_v_dim; value_dim += threads_per_threadgroup) {
             float recurrent_value = 0.0f;
@@ -581,7 +587,7 @@ kernel void izwi_qwen35_gated_delta_sequence_f32(
         }
         // No thread may begin decaying the next state until every output read
         // for the current token has completed.
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
 }
 
@@ -2032,6 +2038,7 @@ fn qwen35_causal_conv_sequence_pipeline(device: &MetalDevice) -> CandleResult<Co
 #[derive(Debug, Clone, Copy)]
 struct Qwen35GatedDeltaSequenceOp {
     seq_len: usize,
+    tile_size: usize,
     num_k_heads: usize,
     num_v_heads: usize,
     head_k_dim: usize,
@@ -2080,6 +2087,7 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
             bail!("izwi-qwen35-gated-delta-sequence-metal requires contiguous tensors")
         }
         if self.seq_len == 0
+            || self.tile_size == 0
             || self.num_k_heads != 16
             || !matches!(self.num_v_heads, 16 | 32)
             || self.num_v_heads % self.num_k_heads != 0
@@ -2193,18 +2201,29 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
             .min(pipeline.max_total_threads_per_threadgroup())
             .min(256)
             .max(1);
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: self.num_v_heads,
-                height: 1,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: threads_per_threadgroup,
-                height: 1,
-                depth: 1,
-            },
-        );
+        let threadgroups = objc2_metal::MTLSize {
+            width: self.num_v_heads,
+            height: 1,
+            depth: 1,
+        };
+        let threads = objc2_metal::MTLSize {
+            width: threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
+        let tile_size = self.tile_size.min(self.seq_len);
+        for token_start in (0..self.seq_len).step_by(tile_size) {
+            if token_start != 0 {
+                // Each tile consumes the recurrent state written into the
+                // packed output buffer by the preceding dispatch.
+                encoder.insert_memory_barrier();
+            }
+            let token_count = tile_size.min(self.seq_len - token_start);
+            encoder.set_bytes(12, &(token_start as u32));
+            encoder.set_bytes(13, &(token_count as u32));
+            encoder.set_bytes(14, &u32::from(token_start == 0));
+            encoder.dispatch_thread_groups(threadgroups, threads);
+        }
         drop(encoder);
 
         Ok((
@@ -2943,7 +2962,7 @@ pub fn try_fused_gated_rms_norm(
     rms_out.broadcast_mul(&silu_gate).ok()
 }
 
-/// Try the reference Qwen3.5 Gated DeltaNet recurrence in one Metal dispatch.
+/// Try the reference Qwen3.5 Gated DeltaNet recurrence in bounded Metal dispatches.
 ///
 /// The shader keeps token causality inside each value-head threadgroup and
 /// evaluates state decay, delta correction, state update, and output reduction
@@ -2957,8 +2976,7 @@ pub fn try_fused_gated_rms_norm(
 /// * `g` - Pre-computed gate values [batch, seq, num_v_heads]
 /// * `beta` - Beta values [batch, seq, num_v_heads]
 /// * `initial_state` - Initial recurrent state [batch, num_v_heads, head_k_dim, head_v_dim]
-/// * `tile_size` - Retained for the backend-neutral API; the Metal dispatch
-///   processes the full supplied sequence.
+/// * `tile_size` - Maximum number of tokens processed by one Metal dispatch.
 ///
 /// # Returns
 /// (outputs, final_state) where outputs is [batch, seq, num_v_heads, head_v_dim]
@@ -2980,7 +2998,6 @@ pub fn try_tiled_deltanet_recurrence(
 
     #[cfg(feature = "metal")]
     {
-        let _ = tile_size;
         let (batch, seq_len, num_k_heads, head_k_dim) = queries.dims4().ok()?;
         let (k_batch, k_seq_len, k_num_heads, k_head_k_dim) = keys.dims4().ok()?;
         let (v_batch, v_seq_len, num_v_heads, head_v_dim) = values.dims4().ok()?;
@@ -2990,6 +3007,7 @@ pub fn try_tiled_deltanet_recurrence(
 
         if batch != 1
             || seq_len == 0
+            || tile_size == 0
             || k_batch != batch
             || v_batch != batch
             || g_batch != batch
@@ -3057,6 +3075,7 @@ pub fn try_tiled_deltanet_recurrence(
                 initial_state,
                 &Qwen35GatedDeltaSequenceOp {
                     seq_len,
+                    tile_size: tile_size.min(seq_len),
                     num_k_heads,
                     num_v_heads,
                     head_k_dim,
@@ -3619,7 +3638,10 @@ mod tests {
         let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
             return;
         };
-        let seq_len = 3;
+        // Cross several tile boundaries so the test also verifies that each
+        // dispatch observes the recurrent state written by the preceding one.
+        let seq_len = 17;
+        let tile_size = 4;
         let num_k_heads = 16;
         let head_k_dim = 3;
         let head_v_dim = 5;
@@ -3679,7 +3701,7 @@ mod tests {
                 &g_tensor,
                 &beta_tensor,
                 &state_tensor,
-                64,
+                tile_size,
             )
             .expect("Qwen3.5 Gated DeltaNet custom Metal op should run");
             assert_eq!(output.dtype(), DType::F32);
@@ -3719,6 +3741,9 @@ mod tests {
             64,
         )
         .is_none());
+        assert!(
+            try_tiled_deltanet_recurrence(&query, &key, &value, &g, &beta, &state, 0,).is_none()
+        );
 
         let invalid_value = Tensor::zeros((1, 2, 24, 3), DType::F32, &device).unwrap();
         let invalid_g = Tensor::zeros((1, 2, 24), DType::F32, &device).unwrap();
