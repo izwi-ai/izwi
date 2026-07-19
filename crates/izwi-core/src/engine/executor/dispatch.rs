@@ -251,6 +251,39 @@ impl NativeExecutor {
                 BatchDispatch::serial(),
             )
         };
+        self.finish_scheduled_execution(requests, scheduled, outputs, dispatch)
+    }
+
+    pub(super) fn execute_continuous_chat_requests(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ExecutorStepResult>> {
+        self.reserve_scheduled_cache(requests, scheduled)?;
+        self.prepare_scheduled_cache(scheduled)?;
+        let outputs = self.chat_decode_batch(requests, scheduled)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
+        )
+    }
+
+    fn finish_scheduled_execution(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        outputs: Vec<ModelSessionResult>,
+        dispatch: BatchDispatch,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        if outputs.len() != scheduled.len() {
+            return Err(Error::InferenceError(format!(
+                "native executor produced {} session results for {} scheduled rows",
+                outputs.len(),
+                scheduled.len()
+            )));
+        }
         Ok(scheduled
             .iter()
             .zip(outputs)

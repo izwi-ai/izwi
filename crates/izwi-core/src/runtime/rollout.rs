@@ -32,10 +32,7 @@ impl ExecutionRolloutMode {
                 "Shadow execution rollout is not implemented; use `off` or an exact model@backend=static override"
                     .to_string(),
             )),
-            "continuous" => Err(Error::InvalidInput(
-                "Continuous execution rollout is not implemented; use `off` or an exact model@backend=static override"
-                    .to_string(),
-            )),
+            "continuous" => Ok(Self::Continuous),
             value => Err(Error::InvalidInput(format!(
                 "Unsupported execution rollout mode `{value}`"
             ))),
@@ -47,7 +44,7 @@ impl ExecutionRolloutMode {
     }
 
     pub(crate) fn executes(self) -> bool {
-        matches!(self, Self::Static)
+        matches!(self, Self::Static | Self::Continuous)
     }
 
     pub(crate) fn continuous_batching(self) -> bool {
@@ -83,7 +80,7 @@ impl ExecutionRolloutPolicy {
             .unwrap_or_default();
         if default.executes() {
             return Err(Error::InvalidInput(
-                "Execution rollout defaults may only be `off`; static execution requires exact model@backend overrides"
+                "Execution rollout defaults may only be `off`; tensor execution requires exact model@backend overrides"
                     .to_string(),
             ));
         }
@@ -182,7 +179,7 @@ mod tests {
         assert!(!ExecutionRolloutMode::Static.continuous_batching());
 
         assert!(ExecutionRolloutMode::Continuous.observes());
-        assert!(!ExecutionRolloutMode::Continuous.executes());
+        assert!(ExecutionRolloutMode::Continuous.executes());
         assert!(ExecutionRolloutMode::Continuous.continuous_batching());
     }
 
@@ -239,14 +236,21 @@ mod tests {
     }
 
     #[test]
-    fn continuous_override_is_rejected_until_an_adapter_exists() {
-        let err = ExecutionRolloutPolicy::try_from_raw(
+    fn continuous_override_is_scoped_to_an_exact_model_and_backend() {
+        let policy = ExecutionRolloutPolicy::try_from_raw(
             Some("off"),
             Some("Qwen3-0.6B@cuda=continuous"),
         )
-        .expect_err("continuous batching must remain fail closed");
+        .expect("valid continuous rollout");
 
-        assert!(err.to_string().contains("not implemented"));
+        assert_eq!(
+            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Cuda),
+            ExecutionRolloutMode::Continuous
+        );
+        assert_eq!(
+            policy.mode_for(ModelVariant::Qwen306B, BackendKind::Metal),
+            ExecutionRolloutMode::Off
+        );
     }
 
     #[test]

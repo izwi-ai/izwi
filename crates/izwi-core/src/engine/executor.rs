@@ -1149,6 +1149,17 @@ impl ModelExecutor for NativeExecutor {
             loaded_has_speakers,
             self.config.static_tensor_batch_variants.contains(&variant),
         );
+        let continuous_chat_batch = matches!(request.task_type, super::types::TaskType::Chat)
+            && request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .is_some_and(|model| model.supports_continuous_decode_batch())
+            && request.execution_adapter_binding().is_some_and(|binding| {
+                binding
+                    .stages
+                    .iter()
+                    .any(|stage| stage.batch_mode == NativeBatchMode::Continuous)
+            });
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
         let implementation_incremental =
             loaded_incremental.unwrap_or_else(|| match request.task_type {
@@ -1203,6 +1214,11 @@ impl ModelExecutor for NativeExecutor {
             profile.decode_batch = NativeBatchMode::None;
             profile.concurrency = ConcurrencyClass::Batchable;
             profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
+        } else if continuous_chat_batch {
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
         } else {
             let request_parallel_width = if can_parallelize_requests(self.config.backend) {
                 self.config.request_parallelism.max(1)
@@ -1219,6 +1235,41 @@ impl ModelExecutor for NativeExecutor {
             profile.max_batch_size = request_parallel_width;
         }
         Some(profile)
+    }
+
+    fn execute_physical_batch(
+        &self,
+        execution: PhysicalBatchExecution<'_>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        execution.validate()?;
+        if !self.initialized {
+            return Err(Error::InferenceError("Executor not initialized".into()));
+        }
+        if execution.batch.mode == NativeBatchMode::Continuous {
+            if execution.is_prefill()
+                || execution.batch.lane.capability_id != "chat"
+                || execution
+                    .requests
+                    .iter()
+                    .any(|request| request.task_type != super::types::TaskType::Chat)
+            {
+                return Err(Error::InferenceError(
+                    "continuous tensor batch was routed to an incompatible native stage"
+                        .to_string(),
+                ));
+            }
+            if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
+                return Err(Error::Overloaded(
+                    "continuous tensor batch exceeds the backend width cap".to_string(),
+                ));
+            }
+            return self.execute_continuous_chat_requests(execution.requests, execution.scheduled);
+        }
+        if execution.is_prefill() {
+            self.execute_prefill(execution.requests, execution.scheduled)
+        } else {
+            self.execute_decode(execution.requests, execution.scheduled)
+        }
     }
 
     fn execute_prefill(

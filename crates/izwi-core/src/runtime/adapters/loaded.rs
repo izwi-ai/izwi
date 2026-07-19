@@ -14,12 +14,14 @@ use crate::model::ModelVariant;
 use crate::runtime::rollout::ExecutionRolloutMode;
 
 use super::{
-    compatibility_execution_profile, supports_static_tensor_execution, AdapterMetadata,
-    CapabilityKind, RuntimeAdapterRegistry, StreamingMode,
+    compatibility_execution_profile, supports_continuous_tensor_execution,
+    supports_static_tensor_execution, AdapterMetadata, CapabilityKind, RuntimeAdapterRegistry,
+    StreamingMode,
 };
 
 const WIDTH_ONE_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(2);
+const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(3);
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -250,6 +252,96 @@ impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
     }
 }
 
+#[derive(Debug)]
+struct ContinuousQwenChatExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    max_batch_size: usize,
+}
+
+impl ContinuousQwenChatExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        max_batch_size: usize,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+            max_batch_size: max_batch_size.max(1),
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for ContinuousQwenChatExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        CONTINUOUS_TENSOR_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming_required && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no streaming chat contract",
+                metadata.model_variant
+            )));
+        }
+        let mut execution_profile =
+            compatibility_execution_profile(metadata, self.backend_kind, streaming_required);
+        execution_profile.prefill_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::Continuous;
+        execution_profile.concurrency = ConcurrencyClass::Batchable;
+        execution_profile.max_batch_size = self.max_batch_size;
+        execution_profile.resolved_from_loaded_model = true;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "chat.prefill.compatibility",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "chat.decode.tensor_continuous",
+            &execution_profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.max_work_units = 1;
+        prefill.validate()?;
+        decode.validate()?;
+
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([prefill, decode]),
+        })
+    }
+}
+
 pub(crate) struct LoadedModelBundle {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
@@ -295,6 +387,18 @@ impl LoadedModelBundle {
                 && supports_static_tensor_execution(model_variant)
             {
                 Arc::new(StaticQwenTtsExecutionAdapter::new(
+                    execution_group_id,
+                    model_instance_id,
+                    metadata,
+                    backend_kind,
+                    registry.max_tensor_batch_size(),
+                ))
+            } else if metadata.capability == CapabilityKind::Chat
+                && registry.execution_mode_for(model_variant, backend_kind)
+                    == ExecutionRolloutMode::Continuous
+                && supports_continuous_tensor_execution(model_variant)
+            {
+                Arc::new(ContinuousQwenChatExecutionAdapter::new(
                     execution_group_id,
                     model_instance_id,
                     metadata,
@@ -528,5 +632,49 @@ mod tests {
         assert_eq!(contract.adapter_abi_revision, WIDTH_ONE_ADAPTER_ABI);
         assert_eq!(contract.execution_profile.max_batch_size, 1);
         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+    }
+
+    #[test]
+    fn qwen_chat_continuous_rollout_publishes_scalar_prefill_and_ragged_decode() {
+        let variant = ModelVariant::Qwen306B;
+        let override_value = format!("{}@cuda=continuous", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 8).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+
+        let contract = bundle.contract(CapabilityKind::Chat, true).unwrap();
+        assert_eq!(contract.adapter_abi_revision, CONTINUOUS_TENSOR_ADAPTER_ABI);
+        assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(
+            contract.execution_profile.prefill_batch,
+            NativeBatchMode::None
+        );
+        assert_eq!(
+            contract.execution_profile.decode_batch,
+            NativeBatchMode::Continuous
+        );
+        assert_eq!(contract.execution_profile.max_batch_size, 8);
+        assert_eq!(contract.stages.len(), 2);
+        assert_eq!(
+            contract.stages[0].selector,
+            StageWorkSelector::SequencePrefill
+        );
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.stages[0].max_batch_size, 1);
+        assert_eq!(
+            contract.stages[1].selector,
+            StageWorkSelector::SequenceDecode
+        );
+        assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
+        assert_eq!(contract.stages[1].max_batch_size, 8);
+        assert_eq!(contract.stages[1].max_work_units, 1);
     }
 }

@@ -196,6 +196,20 @@ impl RuntimeAdapterRegistry {
             .collect()
     }
 
+    pub(crate) fn continuous_tensor_batch_variants(
+        &self,
+        backend_kind: BackendKind,
+    ) -> HashSet<ModelVariant> {
+        ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| {
+                self.execution_mode_for(*variant, backend_kind) == ExecutionRolloutMode::Continuous
+                    && supports_continuous_tensor_execution(*variant)
+            })
+            .collect()
+    }
+
     fn validate_execution_rollout(&self) -> Result<()> {
         const BACKENDS: [BackendKind; 3] =
             [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
@@ -212,6 +226,8 @@ impl RuntimeAdapterRegistry {
                             backend_kind.as_str()
                         )))
                     }
+                    ExecutionRolloutMode::Continuous
+                        if supports_continuous_tensor_execution(model_variant) => {}
                     ExecutionRolloutMode::Continuous => {
                         return Err(Error::InvalidInput(format!(
                             "Model {model_variant} has no continuous tensor adapter on {}",
@@ -242,6 +258,16 @@ pub(crate) fn supports_static_tensor_execution(model_variant: ModelVariant) -> b
         && model_variant
             .speech_capabilities()
             .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+}
+
+pub(crate) fn supports_continuous_tensor_execution(model_variant: ModelVariant) -> bool {
+    matches!(
+        model_variant,
+        ModelVariant::Qwen306B
+            | ModelVariant::Qwen306B4Bit
+            | ModelVariant::Qwen317B
+            | ModelVariant::Qwen317B4Bit
+    )
 }
 
 pub(crate) fn compatibility_execution_profile(
@@ -620,6 +646,35 @@ mod tests {
             .expect_err("chat has no static tensor adapter");
 
         assert!(error.to_string().contains("no static tensor adapter"));
+    }
+
+    #[test]
+    fn exact_continuous_rollout_only_publishes_proven_native_variants() {
+        let variant = ModelVariant::Qwen306B;
+        let override_value = format!("{}@cuda=continuous", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 8).unwrap();
+
+        assert_eq!(
+            registry.continuous_tensor_batch_variants(BackendKind::Cuda),
+            HashSet::from([variant])
+        );
+        assert!(registry
+            .continuous_tensor_batch_variants(BackendKind::Metal)
+            .is_empty());
+    }
+
+    #[test]
+    fn rollout_cannot_advertise_a_missing_continuous_adapter() {
+        let variant = ModelVariant::Qwen3508BGguf;
+        let override_value = format!("{}@metal=continuous", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
+            .expect_err("Qwen3.5 has no continuous tensor adapter");
+
+        assert!(error.to_string().contains("no continuous tensor adapter"));
     }
 
     #[test]

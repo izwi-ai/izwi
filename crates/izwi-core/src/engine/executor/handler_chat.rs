@@ -381,6 +381,162 @@ impl NativeExecutor {
         }))
     }
 
+    pub(super) fn chat_decode_batch(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ModelSessionResult>> {
+        if scheduled.is_empty()
+            || scheduled
+                .iter()
+                .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+        {
+            return Err(Error::InvalidInput(
+                "continuous chat execution requires one decode token per row".to_string(),
+            ));
+        }
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "continuous chat request {} is missing its snapshot",
+                            scheduled.request_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let model = ordered_requests[0].prepared_chat_model_for_executor()?;
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded chat model has no continuous tensor decode adapter".to_string(),
+            ));
+        }
+        for request in ordered_requests.iter().skip(1) {
+            let row_model = request.prepared_chat_model_for_executor()?;
+            if !Arc::ptr_eq(&model, &row_model) {
+                return Err(Error::InferenceError(
+                    "continuous chat batch spans different loaded model instances".to_string(),
+                ));
+            }
+        }
+
+        let mut active_states = {
+            let mut guard = self.chat_decode_states.lock().map_err(|_| {
+                Error::InferenceError("Chat decode state mutex poisoned".to_string())
+            })?;
+            for (request, scheduled) in ordered_requests.iter().zip(scheduled) {
+                let session = scheduled.session_key();
+                let expected_variant = Self::resolve_variant(request)?;
+                let state = guard.get(&session).ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "continuous chat session {}:{} has no active decode state",
+                        session.request_id, session.epoch
+                    ))
+                })?;
+                if state.variant != expected_variant {
+                    return Err(Error::InferenceError(
+                        "continuous chat state variant does not match its request".to_string(),
+                    ));
+                }
+            }
+            scheduled
+                .iter()
+                .map(|scheduled| {
+                    guard
+                        .remove(&scheduled.session_key())
+                        .expect("continuous chat state was validated under the same lock")
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut state_refs = active_states
+            .iter_mut()
+            .map(|state| &mut state.state)
+            .collect::<Vec<_>>();
+        let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
+        drop(state_refs);
+        if steps.len() != active_states.len() {
+            return Err(Error::InferenceError(
+                "continuous chat model returned the wrong number of rows".to_string(),
+            ));
+        }
+
+        let mut outputs = Vec::with_capacity(steps.len());
+        let mut continuing = Vec::new();
+        for (((request, scheduled), mut active_state), step) in ordered_requests
+            .into_iter()
+            .zip(scheduled)
+            .zip(active_states)
+            .zip(steps)
+        {
+            if request.is_cancelled() {
+                outputs.push(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+                continue;
+            }
+
+            let step_tokens_generated = step
+                .tokens_generated
+                .saturating_sub(active_state.last_tokens_generated);
+            active_state.last_tokens_generated = step.tokens_generated;
+            if let Some(tx) = Self::stream_sender(request).as_ref() {
+                if !step.delta.is_empty() {
+                    Self::stream_text_with_policy(
+                        tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active_state.stream_sequence,
+                        step.delta.clone(),
+                    )?;
+                }
+                if step.finished {
+                    Self::stream_final_marker_with_policy(
+                        tx,
+                        request.stream_policy,
+                        &request.id,
+                        &mut active_state.stream_sequence,
+                    )?;
+                }
+            }
+
+            outputs.push(ModelSessionResult::sequence(ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: Some(AudioOutput::empty(24_000)),
+                text: Some(step.text),
+                input_transcription: None,
+                tokens_processed: 1,
+                tokens_generated: step_tokens_generated,
+                finished: step.finished,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            }));
+            if !step.finished {
+                continuing.push((scheduled.session_key(), active_state));
+            }
+        }
+
+        if !continuing.is_empty() {
+            let mut guard = self.chat_decode_states.lock().map_err(|_| {
+                Error::InferenceError("Chat decode state mutex poisoned".to_string())
+            })?;
+            for (session, state) in continuing {
+                if guard.insert(session, state).is_some() {
+                    return Err(Error::InferenceError(
+                        "continuous chat state collided during commit".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
     fn qwen35_prefix_cache_enabled(
         &self,
         prepared: Option<&Qwen35PreparedPrompt>,
