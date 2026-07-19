@@ -406,7 +406,7 @@ impl AuthorityState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReservationEnforcement {
     Guarded,
-    TrackedModel,
+    Tracked,
 }
 
 /// One transactional authority for every physical-memory consumer on a backend.
@@ -476,11 +476,24 @@ impl ResourceAuthority {
         key: impl Into<String>,
         resources: ResourceVector,
     ) -> Result<ResourceLease> {
-        self.reserve_internal(
+        self.track_advisory(
             ReservationOwner::new(ReservationClass::Model, key),
             resources,
+        )
+    }
+
+    /// Track an advisory CPU/unified-memory claim in the resource ledger while
+    /// allowing its authorization to follow exact observed pooled storage.
+    pub(crate) fn track_advisory(
+        self: &Arc<Self>,
+        owner: ReservationOwner,
+        resources: ResourceVector,
+    ) -> Result<ResourceLease> {
+        self.reserve_internal(
+            owner,
+            resources,
             ResourceVector::zero(),
-            ReservationEnforcement::TrackedModel,
+            ReservationEnforcement::Tracked,
         )
     }
 
@@ -531,7 +544,7 @@ impl ResourceAuthority {
                 }
                 state.ledger.reserve(resources)?
             }
-            ReservationEnforcement::TrackedModel => state.ledger.track(resources)?,
+            ReservationEnforcement::Tracked => state.ledger.track(resources)?,
         };
         state.owners.insert(reservation.id, owner);
         state.materialized.insert(reservation.id, materialized);

@@ -734,13 +734,15 @@ impl NativeExecutor {
         // lock so concurrent executor entry cannot repeat it or double-reserve.
         // Later decode steps reuse this lease until exact-session cleanup.
         let authorized_bytes = authorize()?;
-        let lease = authority.reserve(
-            ReservationOwner::new(
-                ReservationClass::Cache,
-                format!("{}:{}", session.request_id, session.epoch),
-            ),
-            cache_resource_vector(self.config.backend, authorized_bytes),
-        )?;
+        let owner = ReservationOwner::new(
+            ReservationClass::Cache,
+            format!("{}:{}", session.request_id, session.epoch),
+        );
+        let resources = cache_resource_vector(self.config.backend, authorized_bytes);
+        let lease = match self.config.backend {
+            BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources)?,
+            BackendKind::Cuda => authority.reserve(owner, resources)?,
+        };
         reservations.insert(
             session.clone(),
             CacheResourceReservation {
@@ -873,20 +875,43 @@ impl NativeExecutor {
         let reservation = reservations.get_mut(&session).ok_or_else(|| {
             Error::InferenceError("cache allocation has no exact-session reservation".to_string())
         })?;
-        let lease = reservation.lease.as_ref().ok_or_else(|| {
-            Error::InferenceError("cache allocation has no physical resource lease".to_string())
-        })?;
         if observed_bytes > 0 {
             if observed_bytes > reservation.reserved_bytes {
-                return Err(Error::InferenceError(format!(
-                    "materialized session cache uses {observed_bytes} bytes, exceeding its {}-byte authorization for request {} epoch {}",
-                    reservation.reserved_bytes, session.request_id, session.epoch
-                )));
+                if matches!(self.config.backend, BackendKind::Cpu | BackendKind::Metal) {
+                    // CPU and unified-memory Metal use advisory capacity. Candle
+                    // can reuse a larger pooled allocation than the requested
+                    // power-of-two bucket, so grow the tracked lease to the
+                    // exact observed backing rather than failing inference
+                    // after the allocation already exists.
+                    reservation
+                        .lease
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::InferenceError(
+                                "cache allocation has no physical resource lease".to_string(),
+                            )
+                        })?
+                        .resize(cache_resource_vector(self.config.backend, observed_bytes))?;
+                    reservation.reserved_bytes = observed_bytes;
+                } else {
+                    return Err(Error::InferenceError(format!(
+                        "materialized session cache uses {observed_bytes} bytes, exceeding its {}-byte authorization for request {} epoch {}",
+                        reservation.reserved_bytes, session.request_id, session.epoch
+                    )));
+                }
             }
-            lease.record_materialized_usage(cache_resource_vector(
-                self.config.backend,
-                observed_bytes,
-            ))?;
+            reservation
+                .lease
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "cache allocation has no physical resource lease".to_string(),
+                    )
+                })?
+                .record_materialized_usage(cache_resource_vector(
+                    self.config.backend,
+                    observed_bytes,
+                ))?;
         }
         reservation.observed_blocks = scheduled.block_ids.len();
         Ok(observation)
@@ -1724,6 +1749,42 @@ mod tests {
                 .unwrap();
             assert_eq!(authorizations.load(Ordering::Relaxed), 2);
         }
+    }
+
+    #[test]
+    fn cpu_and_metal_cache_authorization_is_advisory_while_cuda_is_guarded() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let capacity = cache_resource_vector(backend, 8);
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity,
+            })));
+            let mut config = WorkerConfig::default();
+            config.backend = backend;
+            let executor = NativeExecutor::new(config);
+            let session = SessionKey::new(format!("{backend:?}"), 1);
+
+            executor
+                .reserve_exact_session_cache(&authority, &session, || Ok(16))
+                .expect("advisory unified-memory cache claim");
+            assert_eq!(
+                authority.snapshot().reserved,
+                cache_resource_vector(backend, 16)
+            );
+        }
+
+        let backend = BackendKind::Cuda;
+        let capacity = cache_resource_vector(backend, 8);
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+            capacity,
+        })));
+        let mut config = WorkerConfig::default();
+        config.backend = backend;
+        let executor = NativeExecutor::new(config);
+        let session = SessionKey::new("cuda".to_string(), 1);
+        assert!(matches!(
+            executor.reserve_exact_session_cache(&authority, &session, || Ok(16)),
+            Err(Error::Overloaded(_))
+        ));
     }
 
     #[test]
