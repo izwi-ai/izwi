@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::backends::BackendKind;
 use crate::engine::{
-    AdapterAbiRevision, AdapterInstanceId, ConcurrencyClass, ExecutionGroupId, ExecutionProfile,
-    ModelInstanceId, NativeBatchMode, StageDescriptor, StageId,
+    AdapterAbiRevision, AdapterInstanceId, ConcurrencyClass, ExecutionAdapterBinding,
+    ExecutionGroupId, ExecutionProfile, ModelInstanceId, NativeBatchMode, StageDescriptor, StageId,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -28,6 +28,22 @@ pub(crate) struct LoadedExecutionContract {
     pub(crate) metadata: AdapterMetadata,
     pub(crate) execution_profile: ExecutionProfile,
     pub(crate) stages: Arc<[StageDescriptor]>,
+}
+
+impl LoadedExecutionContract {
+    fn adapter_binding(&self) -> Result<ExecutionAdapterBinding> {
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision,
+            model_variant: self.metadata.model_variant,
+            capability_id: self.metadata.capability.as_str().to_string(),
+            stages: self.stages.clone(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
 }
 
 pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
@@ -217,6 +233,15 @@ impl LoadedModelBundle {
         self.require_adapter(capability)?
             .contract(streaming_required)
     }
+
+    pub(crate) fn adapter_binding(
+        &self,
+        capability: CapabilityKind,
+        streaming_required: bool,
+    ) -> Result<ExecutionAdapterBinding> {
+        self.contract(capability, streaming_required)?
+            .adapter_binding()
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +279,12 @@ mod tests {
                 assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
                 assert_eq!(contract.execution_profile.max_batch_size, 1);
                 assert!(contract.execution_profile.resolved_from_loaded_model);
+                let binding = bundle
+                    .adapter_binding(metadata.capability, false)
+                    .expect("adapter binding");
+                assert_eq!(binding.model_variant, variant);
+                assert_eq!(binding.model_instance_id, instance);
+                assert_eq!(binding.capability_id, metadata.capability.as_str());
             }
         }
     }

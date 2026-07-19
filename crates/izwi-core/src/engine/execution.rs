@@ -1,6 +1,7 @@
 //! Authoritative execution plans, reports, capabilities, and lifecycle states.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -283,6 +284,83 @@ impl StageDescriptor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AdapterBindingKey {
+    pub execution_group_id: ExecutionGroupId,
+    pub model_instance_id: ModelInstanceId,
+    pub adapter_instance_id: AdapterInstanceId,
+    pub adapter_abi_revision: AdapterAbiRevision,
+    pub capability_id: String,
+    pub stage_id: StageId,
+}
+
+/// Exact loaded adapter selected before scheduler admission. The binding is
+/// immutable for one request incarnation and survives until terminal cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionAdapterBinding {
+    pub execution_group_id: ExecutionGroupId,
+    pub model_instance_id: ModelInstanceId,
+    pub adapter_instance_id: AdapterInstanceId,
+    pub adapter_abi_revision: AdapterAbiRevision,
+    pub model_variant: ModelVariant,
+    pub capability_id: String,
+    pub stages: Arc<[StageDescriptor]>,
+}
+
+impl ExecutionAdapterBinding {
+    pub fn validate(&self) -> Result<()> {
+        if self.execution_group_id.get() == 0
+            || self.model_instance_id.get() == 0
+            || self.adapter_instance_id.get() == 0
+            || self.adapter_abi_revision.get() == 0
+        {
+            return Err(Error::InvalidInput(
+                "execution adapter binding contains a zero lifecycle identity".to_string(),
+            ));
+        }
+        if self.capability_id.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "execution adapter binding has an empty capability identity".to_string(),
+            ));
+        }
+        if self.stages.is_empty() {
+            return Err(Error::InvalidInput(
+                "execution adapter binding has no stages".to_string(),
+            ));
+        }
+        let mut stage_ids = HashSet::with_capacity(self.stages.len());
+        for stage in self.stages.iter() {
+            stage.validate()?;
+            if !stage_ids.insert(stage.id) {
+                return Err(Error::InvalidInput(
+                    "execution adapter binding contains a duplicate stage identity".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn primary_stage(&self) -> &StageDescriptor {
+        &self.stages[0]
+    }
+
+    pub fn key_for_stage(&self, stage_id: StageId) -> Result<AdapterBindingKey> {
+        if !self.stages.iter().any(|stage| stage.id == stage_id) {
+            return Err(Error::InvalidInput(
+                "execution adapter binding does not contain the requested stage".to_string(),
+            ));
+        }
+        Ok(AdapterBindingKey {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision,
+            capability_id: self.capability_id.clone(),
+            stage_id,
+        })
+    }
+}
+
 /// Backend-neutral cost of one safe execution quantum. Logical units may be
 /// tokens, audio frames, samples, codec frames, or another adapter-defined unit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -539,7 +617,7 @@ pub struct BatchKey {
     pub compute_dtype: String,
     pub kv_dtype: String,
     pub cache_namespace: String,
-    pub adapter_id: Option<String>,
+    pub adapter: Option<AdapterBindingKey>,
 }
 
 /// Canonical compatibility identity for one physical tensor-batch lane. Every
@@ -959,6 +1037,7 @@ pub struct ExecutionPlan {
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub estimate: ResourceEstimate,
+    pub stage: Option<StageDescriptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1511,11 +1590,12 @@ mod tests {
                 compute_dtype: "f32".to_string(),
                 kv_dtype: "f32".to_string(),
                 cache_namespace: "none".to_string(),
-                adapter_id: None,
+                adapter: None,
             },
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             estimate: ResourceVector::default(),
+            stage: None,
         };
         let report = ExecutionReport {
             plan_id: 7,
@@ -1596,11 +1676,12 @@ mod tests {
                 compute_dtype: "f32".to_string(),
                 kv_dtype: "f32".to_string(),
                 cache_namespace: "none".to_string(),
-                adapter_id: None,
+                adapter: None,
             },
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             estimate: ResourceVector::zero(),
+            stage: None,
         }
     }
 

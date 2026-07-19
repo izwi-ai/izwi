@@ -39,8 +39,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
-use crate::runtime::adapters::CapabilityKind;
-use crate::runtime::adapters::RuntimeAdapterRegistry;
+use crate::runtime::adapters::{CapabilityKind, LoadedModelBundle, RuntimeAdapterRegistry};
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
@@ -691,6 +690,7 @@ pub(crate) struct AdmittedEngineRequest {
 fn bind_request_to_residency(
     request: &mut EngineCoreRequest,
     residency_lease: Option<&ModelResidencyLease>,
+    loaded_bundle: Option<&LoadedModelBundle>,
 ) -> Result<()> {
     let Some(lease) = residency_lease else {
         return Ok(());
@@ -700,9 +700,25 @@ fn bind_request_to_residency(
             "engine request model does not match its residency lease".to_string(),
         ));
     }
-    if let Some(model_instance_id) = lease.model_instance_id() {
-        request.bind_model_instance(model_instance_id)?;
+    let Some(model_instance_id) = lease.model_instance_id() else {
+        return Ok(());
+    };
+    let bundle = loaded_bundle.ok_or_else(|| {
+        Error::InferenceError(
+            "authoritative model residency is missing its loaded execution bundle".to_string(),
+        )
+    })?;
+    if bundle.model_variant() != lease.variant() || bundle.model_instance_id() != model_instance_id
+    {
+        return Err(Error::InferenceError(
+            "loaded execution bundle does not match authoritative model residency".to_string(),
+        ));
     }
+    let binding = bundle.adapter_binding(
+        CapabilityKind::for_engine_task(request.task_type),
+        request.streaming,
+    )?;
+    request.bind_execution_adapter(binding)?;
     Ok(())
 }
 
@@ -1840,7 +1856,14 @@ impl RuntimeService {
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
-        bind_request_to_residency(&mut request, residency_lease.as_ref())?;
+        let loaded_bundle = residency_lease
+            .as_ref()
+            .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
+        bind_request_to_residency(
+            &mut request,
+            residency_lease.as_ref(),
+            loaded_bundle.as_deref(),
+        )?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
                 "engine request does not match its coordinator admission".to_string(),
@@ -2104,7 +2127,14 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        bind_request_to_residency(&mut request, residency_lease.as_ref())?;
+        let loaded_bundle = residency_lease
+            .as_ref()
+            .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
+        bind_request_to_residency(
+            &mut request,
+            residency_lease.as_ref(),
+            loaded_bundle.as_deref(),
+        )?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
                 "streaming engine request does not match its coordinator admission".to_string(),
@@ -2694,16 +2724,32 @@ mod tests {
         let residency = crate::model::ModelResidency::default();
         let instance = crate::engine::ModelInstanceId::new(17);
         let lease = residency.acquire_instance_lease(ModelVariant::Kokoro82M, instance);
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .expect("loaded bundle");
         let mut request =
             EngineCoreRequest::tts("bind me").with_model_variant(ModelVariant::Kokoro82M);
 
-        bind_request_to_residency(&mut request, Some(&lease)).expect("matching residency");
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle))
+            .expect("matching residency");
         assert_eq!(request.model_instance_id(), Some(instance));
+        assert!(request.execution_adapter_binding().is_some());
 
         let mut wrong =
             EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
-        assert!(bind_request_to_residency(&mut wrong, Some(&lease)).is_err());
+        assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle)).is_err());
         assert_eq!(wrong.model_instance_id(), None);
+
+        let mut missing_bundle =
+            EngineCoreRequest::tts("missing").with_model_variant(ModelVariant::Kokoro82M);
+        assert!(bind_request_to_residency(&mut missing_bundle, Some(&lease), None).is_err());
+        assert_eq!(missing_bundle.model_instance_id(), None);
     }
 
     async fn pending_streaming_guard_fixture(

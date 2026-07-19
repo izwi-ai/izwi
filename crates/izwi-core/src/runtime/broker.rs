@@ -216,12 +216,7 @@ impl InferenceBroker {
 }
 
 fn capability_for_task(task_type: TaskType) -> CapabilityKind {
-    match task_type {
-        TaskType::TTS => CapabilityKind::Tts,
-        TaskType::ASR => CapabilityKind::Asr,
-        TaskType::Chat => CapabilityKind::Chat,
-        TaskType::SpeechToSpeech => CapabilityKind::SpeechToSpeech,
-    }
+    CapabilityKind::for_engine_task(task_type)
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::engine::{
     CacheMode, CancellationGranularity, ExecutionMode, ExecutionProfile, NativeBatchMode,
-    PrefillMode,
+    PrefillMode, TaskType,
 };
 use crate::error::{Error, Result};
 
@@ -36,6 +36,15 @@ pub(crate) enum CapabilityKind {
 }
 
 impl CapabilityKind {
+    pub(crate) const fn for_engine_task(task_type: TaskType) -> Self {
+        match task_type {
+            TaskType::TTS => Self::Tts,
+            TaskType::ASR => Self::Asr,
+            TaskType::Chat => Self::Chat,
+            TaskType::SpeechToSpeech => Self::SpeechToSpeech,
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Asr => "asr",

@@ -308,6 +308,13 @@ impl EngineCore {
                 ..ResourceVector::zero()
             }
         };
+        let bound_stage = request
+            .execution_adapter_binding()
+            .map(|binding| binding.primary_stage().clone());
+        let bound_adapter = request
+            .execution_adapter_binding()
+            .map(|binding| binding.key_for_stage(binding.primary_stage().id))
+            .transpose()?;
         let plan = ExecutionPlan {
             plan_id: scheduled.plan_id,
             session: scheduled.session_key(),
@@ -322,7 +329,7 @@ impl EngineCore {
                 cache_namespace: profile
                     .cache_namespace
                     .unwrap_or_else(|| "none".to_string()),
-                adapter_id: None,
+                adapter: bound_adapter,
             },
             batch_mode: if scheduled.is_prefill {
                 profile.prefill_batch
@@ -331,6 +338,7 @@ impl EngineCore {
             },
             max_batch_size: profile.max_batch_size.max(1),
             estimate,
+            stage: bound_stage,
         };
 
         let tracker = self
@@ -2561,11 +2569,12 @@ mod tests {
                         compute_dtype: "f32".to_string(),
                         kv_dtype: "none".to_string(),
                         cache_namespace: "none".to_string(),
-                        adapter_id: None,
+                        adapter: None,
                     },
                     batch_mode: mode,
                     max_batch_size,
                     estimate: ResourceVector::zero(),
+                    stage: None,
                 },
             );
         }
@@ -2617,6 +2626,34 @@ mod tests {
                 .map(|(_, batch)| batch.len())
                 .collect::<Vec<_>>(),
             vec![2, 1]
+        );
+
+        let adapter_key = |model_instance_id| super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(model_instance_id),
+            adapter_instance_id: super::super::AdapterInstanceId::new(1),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "tts".to_string(),
+            stage_id: super::super::StageId::new(0),
+        };
+        core.active_plans
+            .get_mut(&scheduled[0].plan_id)
+            .expect("first plan")
+            .batch_key
+            .adapter = Some(adapter_key(1));
+        core.active_plans
+            .get_mut(&scheduled[1].plan_id)
+            .expect("second plan")
+            .batch_key
+            .adapter = Some(adapter_key(2));
+        let exact_batches = core.build_compatible_subbatches(&refs, &scheduled);
+        assert_eq!(
+            exact_batches
+                .iter()
+                .map(|(_, batch)| batch.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1],
+            "opposite model generations must never share a native batch"
         );
     }
 

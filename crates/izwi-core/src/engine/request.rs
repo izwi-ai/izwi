@@ -355,6 +355,9 @@ pub struct EngineCoreRequest {
     /// Exact authoritative load generation. Requests without this lifecycle
     /// fence remain eligible only for scalar compatibility execution.
     pub(super) model_instance_id: Option<super::ModelInstanceId>,
+    /// Exact loaded capability adapter selected by the runtime. Direct engine
+    /// callers without a lifecycle bundle remain on compatibility dispatch.
+    pub(super) execution_adapter_binding: Option<super::ExecutionAdapterBinding>,
     /// Input text (for TTS)
     pub text: Option<String>,
     /// Chat input messages.
@@ -1514,6 +1517,7 @@ impl EngineCoreRequest {
             task_type: TaskType::TTS,
             model_variant: None,
             model_instance_id: None,
+            execution_adapter_binding: None,
             text: Some(text),
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1558,6 +1562,7 @@ impl EngineCoreRequest {
             task_type: TaskType::ASR,
             model_variant: None,
             model_instance_id: None,
+            execution_adapter_binding: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1602,6 +1607,7 @@ impl EngineCoreRequest {
             task_type: TaskType::ASR,
             model_variant: None,
             model_instance_id: None,
+            execution_adapter_binding: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1643,6 +1649,7 @@ impl EngineCoreRequest {
             task_type: TaskType::Chat,
             model_variant: None,
             model_instance_id: None,
+            execution_adapter_binding: None,
             text: None,
             chat_messages: Some(messages),
             chat_config: ChatRequestConfig::default(),
@@ -1685,6 +1692,7 @@ impl EngineCoreRequest {
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
             model_instance_id: None,
+            execution_adapter_binding: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1727,6 +1735,7 @@ impl EngineCoreRequest {
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
             model_instance_id: None,
+            execution_adapter_binding: None,
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1778,6 +1787,34 @@ impl EngineCoreRequest {
 
     pub(crate) fn model_instance_id(&self) -> Option<super::ModelInstanceId> {
         self.model_instance_id
+    }
+
+    pub(crate) fn bind_execution_adapter(
+        &mut self,
+        binding: super::ExecutionAdapterBinding,
+    ) -> Result<()> {
+        binding.validate()?;
+        if self.model_variant != Some(binding.model_variant) {
+            return Err(Error::InvalidInput(
+                "engine request model does not match its execution adapter".to_string(),
+            ));
+        }
+        self.bind_model_instance(binding.model_instance_id)?;
+        if self
+            .execution_adapter_binding
+            .as_ref()
+            .is_some_and(|current| current != &binding)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different execution adapter".to_string(),
+            ));
+        }
+        self.execution_adapter_binding = Some(binding);
+        Ok(())
+    }
+
+    pub(crate) fn execution_adapter_binding(&self) -> Option<&super::ExecutionAdapterBinding> {
+        self.execution_adapter_binding.as_ref()
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -2260,6 +2297,46 @@ mod tests {
         assert_eq!(request.model_instance_id(), Some(first));
         assert!(request.bind_model_instance(second).is_err());
         assert_eq!(request.model_instance_id(), Some(first));
+    }
+
+    #[test]
+    fn execution_adapter_binding_is_exact_and_idempotent() {
+        let variant = ModelVariant::Kokoro82M;
+        let instance = super::super::ModelInstanceId::new(7);
+        let profile = super::super::ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cpu,
+            Some(variant),
+            super::super::ExecutionMode::Atomic,
+        );
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(0),
+            "tts.compatibility",
+            &profile,
+            super::super::NativeBatchMode::None,
+        );
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(2),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: std::sync::Arc::from([stage]),
+        };
+        let mut request = EngineCoreRequest::tts("hello").with_model_variant(variant);
+
+        request
+            .bind_execution_adapter(binding.clone())
+            .expect("initial binding");
+        request
+            .bind_execution_adapter(binding.clone())
+            .expect("idempotent binding");
+
+        assert_eq!(request.model_instance_id(), Some(instance));
+        assert_eq!(request.execution_adapter_binding(), Some(&binding));
+        let mut mismatched = binding;
+        mismatched.adapter_instance_id = super::super::AdapterInstanceId::new(3);
+        assert!(request.bind_execution_adapter(mismatched).is_err());
     }
 
     #[test]
