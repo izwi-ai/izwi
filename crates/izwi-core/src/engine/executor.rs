@@ -1284,6 +1284,7 @@ impl ModelExecutor for NativeExecutor {
 }
 
 /// Unified executor that wraps a model executor implementation.
+#[derive(Clone)]
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
 }

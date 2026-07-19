@@ -7,6 +7,7 @@
 //! - Output processing
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -16,6 +17,10 @@ use super::execution::{
     ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
     FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode, RetryDisposition,
     WorkUnit,
+};
+use super::execution_group::{
+    reconcile_executor_outputs, ExecutedEngineStep, ExecutionGroupRunner, PreparedEngineStep,
+    PreparedExecutionBatch,
 };
 #[cfg(test)]
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
@@ -183,7 +188,7 @@ pub struct EngineCore {
     /// Output processor
     output_processor: OutputProcessor,
     /// Active requests (by ID)
-    requests: HashMap<RequestId, EngineCoreRequest>,
+    requests: HashMap<RequestId, Arc<EngineCoreRequest>>,
     /// Request start times (for timing)
     request_start_times: HashMap<RequestId, Instant>,
     /// Per-request phase timing accumulated by scheduler steps.
@@ -649,6 +654,24 @@ impl EngineCore {
         outputs
     }
 
+    fn prepare_compatible_subbatches(
+        &self,
+        requests: &[Arc<EngineCoreRequest>],
+        scheduled: &[super::scheduler::ScheduledRequest],
+    ) -> Vec<PreparedExecutionBatch> {
+        let request_refs: Vec<_> = requests.iter().map(Arc::as_ref).collect();
+        self.build_compatible_subbatches(&request_refs, scheduled)
+            .into_iter()
+            .map(|(batch_refs, batch)| {
+                let requests = batch_refs
+                    .into_iter()
+                    .filter_map(|request| self.requests.get(&request.id).cloned())
+                    .collect();
+                PreparedExecutionBatch::new(requests, batch)
+            })
+            .collect()
+    }
+
     fn merge_audio_output(
         existing: Option<AudioOutput>,
         current: Option<AudioOutput>,
@@ -744,80 +767,12 @@ impl EngineCore {
                 .is_some_and(|audio| !audio.samples.is_empty())
     }
 
-    fn failed_step_result(
-        scheduled: &super::scheduler::ScheduledRequest,
-        message: impl Into<String>,
-    ) -> ExecutorStepResult {
-        ExecutorStepResult::new(
-            scheduled,
-            ExecutorOutput::error(scheduled.request_id.clone(), message),
-        )
-    }
-
     fn reconcile_executor_outputs(
         phase: &str,
         scheduled: &[super::scheduler::ScheduledRequest],
         result: Result<Vec<ExecutorStepResult>>,
     ) -> Vec<ExecutorStepResult> {
-        let expected: HashSet<_> = scheduled
-            .iter()
-            .map(|entry| (entry.plan_id, entry.session_key()))
-            .collect();
-        let outputs = match result {
-            Ok(outputs) => outputs,
-            Err(err) => {
-                return scheduled
-                    .iter()
-                    .map(|entry| {
-                        Self::failed_step_result(entry, format!("{phase} executor failed: {err}"))
-                    })
-                    .collect();
-            }
-        };
-
-        let mut by_transaction = HashMap::new();
-        let mut duplicates = HashSet::new();
-        for mut result in outputs {
-            let key = (result.plan_id, result.session.clone());
-            if !expected.contains(&key) {
-                warn!(
-                    phase,
-                    plan_id = result.plan_id,
-                    request_id = %result.session.request_id,
-                    session_epoch = result.session.epoch,
-                    "Ignoring executor output for an unknown or stale transaction"
-                );
-                continue;
-            }
-            if result.output.request_id != result.session.request_id {
-                result.output = ExecutorOutput::error(
-                    result.session.request_id.clone(),
-                    format!("{phase} executor output request ID did not match its session"),
-                );
-            }
-            if by_transaction.insert(key.clone(), result).is_some() {
-                duplicates.insert(key);
-            }
-        }
-
-        scheduled
-            .iter()
-            .map(|entry| {
-                let key = (entry.plan_id, entry.session_key());
-                if duplicates.contains(&key) {
-                    return Self::failed_step_result(
-                        entry,
-                        format!("{phase} executor returned duplicate outputs"),
-                    );
-                }
-                by_transaction.remove(&key).unwrap_or_else(|| {
-                    Self::failed_step_result(
-                        entry,
-                        format!("{phase} executor did not return a scheduled output"),
-                    )
-                })
-            })
-            .collect()
+        reconcile_executor_outputs(phase, scheduled, result)
     }
 
     async fn execute_decode_subbatch(
@@ -937,7 +892,7 @@ impl EngineCore {
         }
 
         // Track request
-        self.requests.insert(request_id.clone(), request);
+        self.requests.insert(request_id.clone(), Arc::new(request));
         self.request_start_times
             .insert(request_id.clone(), Instant::now());
         self.request_phase_timings
@@ -1049,6 +1004,15 @@ impl EngineCore {
     /// 2. Execute - run forward pass
     /// 3. Process - handle outputs, check stop conditions
     pub async fn step(&mut self) -> Result<Vec<EngineOutput>> {
+        let Some(prepared) = self.prepare_step().await? else {
+            return Ok(Vec::new());
+        };
+        let executed = ExecutionGroupRunner::execute(prepared).await;
+        self.commit_step(executed).await
+    }
+
+    /// Prepare an immutable execution transaction under the engine state lock.
+    pub(super) async fn prepare_step(&mut self) -> Result<Option<PreparedEngineStep>> {
         // Ensure initialized
         if !self.initialized {
             self.initialize().await?;
@@ -1133,7 +1097,7 @@ impl EngineCore {
         }
 
         if !schedule_result.has_execution_work() && self.pending_terminal_outputs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         debug!(
@@ -1164,92 +1128,48 @@ impl EngineCore {
             }
         }
 
-        let prefill_request_refs: Vec<&EngineCoreRequest> = prefill_scheduled
+        let prefill_requests: Vec<Arc<EngineCoreRequest>> = prefill_scheduled
             .iter()
-            .filter_map(|s| self.requests.get(&s.request_id))
+            .filter_map(|s| self.requests.get(&s.request_id).cloned())
             .collect();
-        let decode_request_refs: Vec<&EngineCoreRequest> = decode_scheduled
+        let decode_requests: Vec<Arc<EngineCoreRequest>> = decode_scheduled
             .iter()
-            .filter_map(|s| self.requests.get(&s.request_id))
+            .filter_map(|s| self.requests.get(&s.request_id).cloned())
             .collect();
 
-        if prefill_request_refs.is_empty()
-            && decode_request_refs.is_empty()
+        if prefill_requests.is_empty()
+            && decode_requests.is_empty()
             && self.pending_terminal_outputs.is_empty()
         {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
-        // Phase 2: Execute decode/prefill. On Metal we prefer sequential execution
-        // to reduce device contention and thermal spikes on local machines.
-        let run_decode = async {
-            if decode_request_refs.is_empty() || decode_scheduled.is_empty() {
-                return Ok((Vec::new(), std::time::Duration::ZERO));
-            }
-            let started = Instant::now();
-            let sub_batches =
-                self.build_compatible_subbatches(&decode_request_refs, &decode_scheduled);
-            let mut outputs = Vec::new();
-            for (refs, batch) in sub_batches {
-                outputs.extend(self.execute_decode_subbatch(&refs, &batch).await?);
-            }
-            Ok::<_, Error>((outputs, started.elapsed()))
-        };
-        let run_prefill = async {
-            if prefill_request_refs.is_empty() || prefill_scheduled.is_empty() {
-                return Ok((Vec::new(), std::time::Duration::ZERO));
-            }
-            let started = Instant::now();
-            let sub_batches =
-                self.build_compatible_subbatches(&prefill_request_refs, &prefill_scheduled);
-            let mut outputs = Vec::new();
-            for (refs, batch) in sub_batches {
-                let result = self.executor.execute_prefill(&refs, &batch).await;
-                if let Ok(executor_outputs) = &result {
-                    if let Some(first) = executor_outputs.first() {
-                        record_engine_batch_dispatch(first.dispatch);
-                    }
-                }
-                outputs.extend(Self::reconcile_executor_outputs("prefill", &batch, result));
-            }
-            Ok::<_, Error>((outputs, started.elapsed()))
-        };
+        let decode_batches =
+            self.prepare_compatible_subbatches(&decode_requests, &decode_scheduled);
+        let prefill_batches =
+            self.prepare_compatible_subbatches(&prefill_requests, &prefill_scheduled);
 
-        let (mut decode_outputs, decode_elapsed, mut prefill_outputs, prefill_elapsed) =
-            if self.config.backend == BackendKind::Metal
-                && !decode_request_refs.is_empty()
-                && !prefill_request_refs.is_empty()
-            {
-                let (decode_outputs, decode_elapsed) = run_decode.await?;
-                let (prefill_outputs, prefill_elapsed) = run_prefill.await?;
-                (
-                    decode_outputs,
-                    decode_elapsed,
-                    prefill_outputs,
-                    prefill_elapsed,
-                )
-            } else {
-                let (decode_result, prefill_result) = tokio::join!(run_decode, run_prefill);
-                let (decode_outputs, decode_elapsed) = decode_result?;
-                let (prefill_outputs, prefill_elapsed) = prefill_result?;
-                (
-                    decode_outputs,
-                    decode_elapsed,
-                    prefill_outputs,
-                    prefill_elapsed,
-                )
-            };
+        Ok(Some(PreparedEngineStep::new(
+            self.executor.clone(),
+            decode_batches,
+            prefill_batches,
+        )))
+    }
 
+    /// Commit one completed execution transaction under the engine state lock.
+    pub(super) async fn commit_step(
+        &mut self,
+        executed: ExecutedEngineStep,
+    ) -> Result<Vec<EngineOutput>> {
+        let ExecutedEngineStep {
+            executor_results,
+            decode_ids,
+            prefill_ids,
+            decode_elapsed,
+            prefill_elapsed,
+        } = executed;
         let decode_step_ms = decode_elapsed.as_secs_f64() * 1000.0;
         let prefill_step_ms = prefill_elapsed.as_secs_f64() * 1000.0;
-        let decode_ids: HashSet<RequestId> = decode_scheduled
-            .iter()
-            .map(|s| s.request_id.clone())
-            .collect();
-        let prefill_ids: HashSet<RequestId> = prefill_scheduled
-            .iter()
-            .map(|s| s.request_id.clone())
-            .collect();
 
         for request_id in &decode_ids {
             let timing = self
@@ -1268,8 +1188,6 @@ impl EngineCore {
             timing.prefill_steps = timing.prefill_steps.saturating_add(1);
         }
 
-        decode_outputs.append(&mut prefill_outputs);
-        let executor_results = decode_outputs;
         let mut executor_outputs =
             Vec::with_capacity(executor_results.len() + self.pending_terminal_outputs.len());
         for result in executor_results {

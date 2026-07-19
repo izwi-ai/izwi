@@ -28,6 +28,7 @@ mod cache;
 mod config;
 mod core;
 pub mod execution;
+mod execution_group;
 mod executor;
 mod kv_cache;
 mod metal_kv_cache;
@@ -103,7 +104,7 @@ use crate::models::registry::{ChatModelLease, ModelRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot, Notify, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Main inference engine - the primary interface for audio generation.
@@ -171,10 +172,12 @@ impl Drop for CompletionRegistration<'_> {
             return;
         };
         let core = Arc::downgrade(&self.engine.core);
+        let step_gate = self.engine.step_gate.clone();
         let controls = self.engine.request_controls.clone();
         let wake_notify = self.engine.wake_notify.clone();
         handle.spawn(async move {
             let initial_delay = {
+                let _step = step_gate.lock().await;
                 let Some(core) = core.upgrade() else {
                     return;
                 };
@@ -199,6 +202,7 @@ impl Drop for CompletionRegistration<'_> {
             let mut retry_delay = initial_delay;
             while let Some(delay) = retry_delay {
                 tokio::time::sleep(delay).await;
+                let _step = step_gate.lock().await;
                 retry_delay = {
                     let Some(core) = core.upgrade() else {
                         return;
@@ -214,6 +218,9 @@ impl Drop for CompletionRegistration<'_> {
 pub struct Engine {
     /// Engine core handles the actual inference loop
     core: Arc<RwLock<EngineCore>>,
+    /// Serializes one complete prepare/execute/commit transaction without
+    /// keeping the mutable engine state locked during device execution.
+    step_gate: Arc<Mutex<()>>,
     /// Request processor validates and preprocesses inputs
     request_processor: RequestProcessor,
     /// Output processor formats results for clients
@@ -290,6 +297,7 @@ impl Engine {
 
         Ok(Self {
             core: Arc::new(RwLock::new(core)),
+            step_gate: Arc::new(Mutex::new(())),
             request_processor,
             output_processor,
             config,
@@ -856,8 +864,20 @@ impl Engine {
         &self,
         defer_unregistered_terminal_ack: bool,
     ) -> Result<Vec<EngineOutput>> {
+        let _step = self.step_gate.lock().await;
+        let prepared = {
+            let mut core = self.core.write().await;
+            core.prepare_step().await?
+        };
+        let executed = match prepared {
+            Some(prepared) => Some(execution_group::ExecutionGroupRunner::execute(prepared).await),
+            None => None,
+        };
         let mut core = self.core.write().await;
-        let outputs = core.step().await?;
+        let outputs = match executed {
+            Some(executed) => core.commit_step(executed).await?,
+            None => Vec::new(),
+        };
 
         // Keep every await before terminal dispatch. Once a completion sender
         // is notified, routing and exact-session acknowledgement must finish
@@ -1010,6 +1030,7 @@ impl Engine {
                 .cancellation
                 .store(true, std::sync::atomic::Ordering::Release);
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_request(request_id).await;
         drop(core);
@@ -1065,6 +1086,7 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_request_session(session).await;
         drop(core);
@@ -1100,6 +1122,7 @@ impl Engine {
                 }
             }
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_requests_for_variant(variant).await;
         self.request_controls
@@ -1114,6 +1137,7 @@ impl Engine {
 
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        let _step = self.step_gate.lock().await;
         self.core.write().await.purge_model_cache(variant).await
     }
 
@@ -1130,6 +1154,7 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_all_requests().await;
         self.request_controls
@@ -1350,6 +1375,86 @@ mod tests {
         }
     }
 
+    struct BlockingForwardExecutor {
+        entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl BlockingForwardExecutor {
+        fn execute(&self, scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = entered.send(());
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            }
+
+            scheduled
+                .iter()
+                .map(|entry| {
+                    ExecutorStepResult::new(
+                        entry,
+                        ExecutorOutput {
+                            request_id: entry.request_id.clone(),
+                            audio: None,
+                            text: Some("done".to_string()),
+                            input_transcription: None,
+                            tokens_processed: entry.num_tokens.max(1),
+                            tokens_generated: 1,
+                            finished: true,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+
+    impl ModelExecutor for BlockingForwardExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.execute(scheduled))
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.execute(scheduled))
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> executor::CacheReleaseReport {
+            executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
     fn immediate_terminal_request(id: &str) -> EngineCoreRequest {
         let mut request = EngineCoreRequest::tts(format!("terminal output for {id}"));
         request.id = id.to_string();
@@ -1366,6 +1471,7 @@ mod tests {
         .unwrap();
         Engine {
             core: Arc::new(RwLock::new(core)),
+            step_gate: Arc::new(Mutex::new(())),
             request_processor: RequestProcessor::new(config.clone()),
             output_processor: OutputProcessor::new(config.sample_rate),
             direct_request_preparation_permits: Arc::new(Semaphore::new(
@@ -1387,6 +1493,49 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_forward_does_not_hold_the_engine_state_lock() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            BlockingForwardExecutor {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+            },
+        )));
+        let request_id = "forward-lock-release".to_string();
+        engine
+            .core
+            .write()
+            .await
+            .add_request(immediate_terminal_request(&request_id))
+            .unwrap();
+
+        let stepping_engine = engine.clone();
+        let step = tokio::spawn(async move { stepping_engine.step().await });
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("executor did not enter the model forward")
+            .expect("executor entry signal was dropped");
+
+        let visible =
+            tokio::time::timeout(Duration::from_millis(100), engine.has_request(&request_id))
+                .await
+                .expect("model forward retained the engine state lock");
+        assert!(visible);
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let outputs = tokio::time::timeout(Duration::from_secs(1), step)
+            .await
+            .expect("engine step did not complete")
+            .expect("engine step task panicked")
+            .expect("engine step failed");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].request_id, request_id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
