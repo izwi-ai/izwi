@@ -51,9 +51,9 @@ pub struct Qwen35TextRuntimeState {
 impl Qwen35TextRuntimeState {
     /// Fork immutable persistent state by sharing Candle tensor storage.
     ///
-    /// Every Qwen3.5 state transition replaces tensor handles or page entries;
-    /// it never mutates a backing allocation in place. A future in-place kernel
-    /// must add copy-on-write at its mutation boundary before using this path.
+    /// Recurrent, convolution, and paged transitions replace tensor handles or
+    /// page entries. Dense KV appends mutate capacity storage only after their
+    /// `Arc<Tensor>` proves unique, detaching first when a snapshot shares it.
     pub(crate) fn fork_shared_for_prefix(&self) -> Self {
         self.clone()
     }
@@ -3040,6 +3040,140 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(flat, vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    fn synthetic_decode_state(
+        device: &Device,
+        layer_count: usize,
+        num_v_heads: usize,
+    ) -> Qwen35TextRuntimeState {
+        let mut layers = Vec::with_capacity(layer_count);
+        for layer_idx in 0..layer_count {
+            if (layer_idx + 1).is_multiple_of(4) {
+                let initial = Tensor::zeros((1, num_v_heads, 1, 2), DType::F32, device).unwrap();
+                let mut k_cache = Qwen35DenseKvCache::default();
+                let mut v_cache = Qwen35DenseKvCache::default();
+                k_cache.append(&initial, 128, 128).unwrap();
+                v_cache.append(&initial, 128, 128).unwrap();
+                layers.push(Qwen35LayerRuntimeState::Full {
+                    k_pages: Vec::new(),
+                    v_pages: Vec::new(),
+                    dense_k_cache_h: k_cache,
+                    dense_v_cache_h: v_cache,
+                });
+            } else {
+                let conv_width = num_v_heads * 2;
+                layers.push(Qwen35LayerRuntimeState::Linear {
+                    conv_state: Some(ConvRingState {
+                        slots: (0..3)
+                            .map(|_| Tensor::zeros((conv_width, 1), DType::F32, device).unwrap())
+                            .collect(),
+                        next_idx: 0,
+                    }),
+                    recurrent_state: Some(
+                        Tensor::zeros((1, num_v_heads, 2, 2), DType::F32, device).unwrap(),
+                    ),
+                });
+            }
+        }
+        Qwen35TextRuntimeState { layers }
+    }
+
+    fn advance_synthetic_decode_state(
+        state: &mut Qwen35TextRuntimeState,
+        device: &Device,
+        num_v_heads: usize,
+    ) {
+        for layer in &mut state.layers {
+            match layer {
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state: Some(conv_state),
+                    recurrent_state,
+                } => {
+                    let conv_width = num_v_heads * 2;
+                    let projection = Tensor::zeros((1, 1, conv_width), DType::F32, device).unwrap();
+                    let current = projection
+                        .i((0, 0))
+                        .unwrap()
+                        .reshape((conv_width, 1))
+                        .unwrap();
+                    conv_state.push_decode(&current).unwrap();
+                    *recurrent_state =
+                        Some(Tensor::zeros((1, num_v_heads, 2, 2), DType::F32, device).unwrap());
+                }
+                Qwen35LayerRuntimeState::Full {
+                    dense_k_cache_h,
+                    dense_v_cache_h,
+                    ..
+                } => {
+                    let token = Tensor::zeros((1, num_v_heads, 1, 2), DType::F32, device).unwrap();
+                    dense_k_cache_h.append(&token, 128, 128).unwrap();
+                    dense_v_cache_h.append(&token, 128, 128).unwrap();
+                }
+                _ => panic!("synthetic state must initialize every linear cache"),
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_decode_storage_plateaus_for_small_and_large_topologies() {
+        for (layer_count, num_v_heads) in [(24, 16), (32, 32)] {
+            let mut state = synthetic_decode_state(&Device::Cpu, layer_count, num_v_heads);
+            let baseline = state.allocated_session_bytes().unwrap();
+
+            for _ in 0..96 {
+                advance_synthetic_decode_state(&mut state, &Device::Cpu, num_v_heads);
+                assert_eq!(
+                    state.allocated_session_bytes(),
+                    Some(baseline),
+                    "{layer_count}-layer/{num_v_heads}V state retained growing backing storage"
+                );
+            }
+
+            for layer in &state.layers {
+                if let Qwen35LayerRuntimeState::Full {
+                    dense_k_cache_h,
+                    dense_v_cache_h,
+                    ..
+                } = layer
+                {
+                    assert_eq!(dense_k_cache_h.len(), 97);
+                    assert_eq!(dense_v_cache_h.len(), 97);
+                    assert_eq!(dense_k_cache_h.capacity().unwrap(), 128);
+                    assert_eq!(dense_v_cache_h.capacity().unwrap(), 128);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn dense_kv_reuses_one_metal_backing_within_capacity() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+
+        for num_v_heads in [16, 32] {
+            let mut cache = Qwen35DenseKvCache::default();
+            let token = Tensor::zeros((1, num_v_heads, 1, 2), DType::F32, &device).unwrap();
+            cache.append(&token, 16, 16).unwrap();
+            let backing = tensor_storage_address(cache.data.as_deref().unwrap());
+            let mut accounting = super::TensorStorageAccounting::default();
+            cache.account_storage(&mut accounting).unwrap();
+            let allocated_bytes = accounting.bytes();
+
+            for _ in 1..16 {
+                cache.append(&token, 16, 16).unwrap();
+                assert_eq!(
+                    tensor_storage_address(cache.data.as_deref().unwrap()),
+                    backing
+                );
+                let mut accounting = super::TensorStorageAccounting::default();
+                cache.account_storage(&mut accounting).unwrap();
+                assert_eq!(accounting.bytes(), allocated_bytes);
+            }
+            assert_eq!(cache.len(), 16);
+        }
     }
 
     #[test]
