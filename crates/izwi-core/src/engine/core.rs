@@ -331,7 +331,6 @@ impl EngineCore {
             },
             max_batch_size: profile.max_batch_size.max(1),
             estimate,
-            reservation: None,
         };
 
         let tracker = self
@@ -2567,7 +2566,6 @@ mod tests {
                     batch_mode: mode,
                     max_batch_size,
                     estimate: ResourceVector::zero(),
-                    reservation: None,
                 },
             );
         }

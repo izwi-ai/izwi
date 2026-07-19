@@ -9,7 +9,7 @@ use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
-use super::resources::{ResourceEstimate, ResourceReservation, ResourceVector};
+use super::resources::{ResourceEstimate, ResourceVector};
 use super::{RequestId, SequenceId, TaskType};
 
 pub type PlanId = u64;
@@ -959,7 +959,6 @@ pub struct ExecutionPlan {
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub estimate: ResourceEstimate,
-    pub reservation: Option<ResourceReservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1517,7 +1516,6 @@ mod tests {
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             estimate: ResourceVector::default(),
-            reservation: None,
         };
         let report = ExecutionReport {
             plan_id: 7,
@@ -1603,7 +1601,6 @@ mod tests {
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             estimate: ResourceVector::zero(),
-            reservation: None,
         }
     }
 

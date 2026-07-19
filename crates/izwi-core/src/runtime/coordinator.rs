@@ -14,9 +14,9 @@ use serde::Serialize;
 
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::engine::{
-    CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, Priority, ReservationClass,
-    ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate, ResourceLease,
-    ResourceVector, WorkloadClass,
+    BatchId, BatchWorkspaceLease, CapacitySource, ExecutionGroupId, PhysicalCapacityProvider,
+    PhysicalCapacitySnapshot, Priority, ReservationClass, ReservationOwner, ResourceAmount,
+    ResourceAuthority, ResourceEstimate, ResourceLease, ResourceVector, WorkloadClass,
 };
 use crate::error::{Error, Result};
 
@@ -310,6 +310,25 @@ impl InferenceCoordinator {
     /// configured device concurrency. CPU and Metal have capacity one.
     pub async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
         self.acquire_execution_units(self.capacity, None).await
+    }
+
+    /// Reserve scratch memory for one physical tensor dispatch. This does not
+    /// acquire execution capacity; the execution-group runner owns exactly one
+    /// execution permit independently for the duration of device work.
+    pub(crate) fn reserve_batch_workspace(
+        &self,
+        execution_group: ExecutionGroupId,
+        batch_id: BatchId,
+        resources: ResourceVector,
+    ) -> Result<BatchWorkspaceLease> {
+        if !matches!(resources.kv_bytes, ResourceAmount::Known(0)) {
+            return Err(Error::InvalidInput(
+                "batch workspace estimate contains persistent KV resources".to_string(),
+            ));
+        }
+        let resources = effective_resources(resources, self.backend)?;
+        self.resources
+            .reserve_batch_workspace(execution_group, batch_id, resources)
     }
 
     pub async fn acquire_execution_units(
@@ -1845,6 +1864,41 @@ Pages free: 10.\n";
     fn metal_capacity_is_bounded_by_working_set_pressure() {
         assert_eq!(combine_metal_memory_snapshot(100, 90, 200, 150), (100, 10));
         assert_eq!(combine_metal_memory_snapshot(100, 120, 200, 150), (100, 0));
+    }
+
+    #[test]
+    fn batch_workspace_is_transient_and_does_not_own_execution_capacity() {
+        let coordinator = InferenceCoordinator::new(BackendKind::Cpu, 8, 8);
+        let mut resources = ResourceVector::zero();
+        resources.temporary_bytes = ResourceAmount::Known(8);
+
+        let workspace = coordinator
+            .reserve_batch_workspace(ExecutionGroupId::new(4), BatchId::new(12), resources)
+            .expect("batch workspace");
+
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.reserved_host_memory_bytes, 8);
+        assert_eq!(snapshot.active_jobs, 0);
+        assert_eq!(snapshot.active_executions, 0);
+        drop(workspace);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn batch_workspace_rejects_persistent_cache_accounting() {
+        let coordinator = InferenceCoordinator::new(BackendKind::Cpu, 1, 1);
+        let mut resources = ResourceVector::zero();
+        resources.kv_bytes = ResourceAmount::Known(1);
+
+        assert!(matches!(
+            coordinator.reserve_batch_workspace(
+                ExecutionGroupId::new(1),
+                BatchId::new(1),
+                resources,
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
     }
 
     #[tokio::test]
