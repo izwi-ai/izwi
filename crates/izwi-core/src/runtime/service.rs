@@ -19,16 +19,20 @@ use crate::backends::{
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    engine_request_parallel_batches_total, engine_stream_backpressure_total,
-    engine_tensor_batch_max_width, engine_tensor_batches_total, Engine as CoreEngine,
+    engine_batch_metrics_snapshot, engine_stream_backpressure_total, Engine as CoreEngine,
     EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineTask,
     GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
     StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-    ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
-    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
+    ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
@@ -2390,6 +2394,7 @@ impl RuntimeService {
             last_churn_ratio: kv_cache.telemetry.last_churn_ratio,
         };
 
+        let batch = engine_batch_metrics_snapshot();
         EngineRuntimeTelemetrySnapshot {
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
@@ -2399,9 +2404,20 @@ impl RuntimeService {
             kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
             kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
             stream_backpressure_total,
-            tensor_batches_total: engine_tensor_batches_total(),
-            request_parallel_batches_total: engine_request_parallel_batches_total(),
-            tensor_batch_max_width: engine_tensor_batch_max_width(),
+            tensor_batches_total: batch.tensor_batches_total,
+            tensor_static_batches_total: batch.tensor_static_batches_total,
+            tensor_continuous_batches_total: batch.tensor_continuous_batches_total,
+            request_parallel_batches_total: batch.request_parallel_batches_total,
+            physical_batch_rejections_total: batch.physical_batch_rejections_total,
+            tensor_batch_max_width: batch.tensor_batch_max_width,
+            tensor_batch_rows_total: batch.tensor_batch_rows_total,
+            tensor_batch_capacity_rows_total: batch.tensor_batch_capacity_rows_total,
+            tensor_batch_useful_elements_total: batch.tensor_batch_useful_elements_total,
+            tensor_batch_materialized_elements_total: batch
+                .tensor_batch_materialized_elements_total,
+            batch_workspace_bytes_total: batch.batch_workspace_bytes_total,
+            tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
+            tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
             kv_cache: kv_cache_snapshot,
         }
     }
@@ -2512,6 +2528,56 @@ impl RuntimeService {
             payload,
             ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
             snapshot.tensor_batch_max_width,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
+            snapshot.tensor_static_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+            snapshot.tensor_continuous_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+            snapshot.physical_batch_rejections_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL,
+            snapshot.tensor_batch_rows_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL,
+            snapshot.tensor_batch_capacity_rows_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
+            snapshot.tensor_batch_useful_elements_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+            snapshot.tensor_batch_materialized_elements_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+            snapshot.batch_workspace_bytes_total,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
+            snapshot.tensor_batch_fill_ratio,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
+            snapshot.tensor_batch_padding_ratio,
         );
     }
 
@@ -3877,6 +3943,11 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_tensor_batches_total"));
         assert!(payload.contains("izwi_engine_executor_request_parallel_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_max_width"));
+        assert!(payload.contains("izwi_engine_executor_tensor_static_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_continuous_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_batch_fill_ratio"));
+        assert!(payload.contains("izwi_engine_executor_tensor_batch_padding_ratio"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));

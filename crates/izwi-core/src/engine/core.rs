@@ -31,7 +31,7 @@ use super::executor::{
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
-use super::metrics::record_engine_batch_dispatch;
+use super::metrics::{record_engine_batch_dispatch, record_engine_physical_batch};
 use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
@@ -1587,7 +1587,7 @@ impl EngineCore {
                     result.observed_resources = ResourceVector::zero();
                 }
             } else {
-                record_engine_batch_dispatch(batch.report.dispatch);
+                record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
             }
 
             for result in batch.results {

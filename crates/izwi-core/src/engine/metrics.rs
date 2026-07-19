@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use super::{BatchDispatch, BatchDispatchKind};
+use super::{BatchDispatch, BatchDispatchKind, PhysicalBatch};
 
 /// Stable metric names for scheduler and KV-cache observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -49,6 +49,24 @@ pub const ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL: &str = "engine.executor.tensor_b
 pub const ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL: &str =
     "engine.executor.request_parallel_batches_total";
 pub const ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH: &str = "engine.executor.tensor_batch_max_width";
+pub const ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL: &str =
+    "engine.executor.tensor_static_batches_total";
+pub const ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL: &str =
+    "engine.executor.tensor_continuous_batches_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL: &str =
+    "engine.executor.physical_batch_rejections_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL: &str = "engine.executor.tensor_batch_rows_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL: &str =
+    "engine.executor.tensor_batch_capacity_rows_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL: &str =
+    "engine.executor.tensor_batch_useful_elements_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL: &str =
+    "engine.executor.tensor_batch_materialized_elements_total";
+pub const ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL: &str =
+    "engine.executor.batch_workspace_bytes_total";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO: &str = "engine.executor.tensor_batch_fill_ratio";
+pub const ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO: &str =
+    "engine.executor.tensor_batch_padding_ratio";
 
 pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
@@ -143,12 +161,77 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         name: ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
         description: "Largest observed model-native tensor batch width.",
     },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
+        description: "Observed static model-native tensor batch dispatches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+        description: "Observed continuous model-native tensor batch dispatches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+        description: "Physical batches rejected before entering model code.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL,
+        description: "Rows dispatched through model-native tensor batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL,
+        description: "Configured row capacity of dispatched model-native tensor batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
+        description: "Useful tensor elements dispatched through model-native batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+        description: "Materialized tensor elements, including padding, in model-native batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+        description: "Transient workspace bytes admitted for dispatched physical batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
+        description: "Cumulative tensor-batch row utilization against configured capacity.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
+        description: "Cumulative padded tensor elements as a fraction of materialized elements.",
+    },
 ];
 
 static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_REQUEST_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_MAX_WIDTH: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_STATIC_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_CONTINUOUS_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCH_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_BATCH_CAPACITY_ROWS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_BATCH_WORKSPACE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EngineBatchMetricsSnapshot {
+    pub tensor_batches_total: u64,
+    pub tensor_static_batches_total: u64,
+    pub tensor_continuous_batches_total: u64,
+    pub request_parallel_batches_total: u64,
+    pub physical_batch_rejections_total: u64,
+    pub tensor_batch_max_width: u64,
+    pub tensor_batch_rows_total: u64,
+    pub tensor_batch_capacity_rows_total: u64,
+    pub tensor_batch_useful_elements_total: u64,
+    pub tensor_batch_materialized_elements_total: u64,
+    pub batch_workspace_bytes_total: u64,
+    pub tensor_batch_fill_ratio: f64,
+    pub tensor_batch_padding_ratio: f64,
+}
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
     ENGINE_METRIC_CATALOG
@@ -164,8 +247,14 @@ pub fn engine_stream_backpressure_total() -> u64 {
 
 pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
     match dispatch.kind {
-        BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous => {
+        BatchDispatchKind::TensorStatic => {
             ENGINE_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_TENSOR_STATIC_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
+        }
+        BatchDispatchKind::TensorContinuous => {
+            ENGINE_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_TENSOR_CONTINUOUS_BATCHES.fetch_add(1, Ordering::Relaxed);
             ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
         }
         BatchDispatchKind::RequestParallel => {
@@ -173,6 +262,32 @@ pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
         }
         BatchDispatchKind::Serial | BatchDispatchKind::NotDispatched => {}
     }
+}
+
+pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: BatchDispatch) {
+    if dispatch.kind == BatchDispatchKind::NotDispatched {
+        ENGINE_PHYSICAL_BATCH_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    ENGINE_BATCH_WORKSPACE_BYTES.fetch_add(batch.workspace_bytes, Ordering::Relaxed);
+    if !matches!(
+        dispatch.kind,
+        BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous
+    ) {
+        record_engine_batch_dispatch(dispatch);
+        return;
+    }
+
+    record_engine_batch_dispatch(dispatch);
+    ENGINE_TENSOR_BATCH_ROWS.fetch_add(batch.rows.len() as u64, Ordering::Relaxed);
+    ENGINE_TENSOR_BATCH_CAPACITY_ROWS.fetch_add(batch.budget.max_rows as u64, Ordering::Relaxed);
+    let useful_elements = batch.rows.iter().fold(0u64, |total, row| {
+        total.saturating_add(row.cost.tensor_elements)
+    });
+    ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS.fetch_add(useful_elements, Ordering::Relaxed);
+    ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS
+        .fetch_add(batch.materialized_tensor_elements, Ordering::Relaxed);
 }
 
 pub fn engine_tensor_batches_total() -> u64 {
@@ -185,6 +300,39 @@ pub fn engine_request_parallel_batches_total() -> u64 {
 
 pub fn engine_tensor_batch_max_width() -> u64 {
     ENGINE_TENSOR_BATCH_MAX_WIDTH.load(Ordering::Relaxed)
+}
+
+pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
+    let rows = ENGINE_TENSOR_BATCH_ROWS.load(Ordering::Relaxed);
+    let capacity_rows = ENGINE_TENSOR_BATCH_CAPACITY_ROWS.load(Ordering::Relaxed);
+    let useful_elements = ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS.load(Ordering::Relaxed);
+    let materialized_elements = ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS.load(Ordering::Relaxed);
+    EngineBatchMetricsSnapshot {
+        tensor_batches_total: engine_tensor_batches_total(),
+        tensor_static_batches_total: ENGINE_TENSOR_STATIC_BATCHES.load(Ordering::Relaxed),
+        tensor_continuous_batches_total: ENGINE_TENSOR_CONTINUOUS_BATCHES.load(Ordering::Relaxed),
+        request_parallel_batches_total: engine_request_parallel_batches_total(),
+        physical_batch_rejections_total: ENGINE_PHYSICAL_BATCH_REJECTIONS.load(Ordering::Relaxed),
+        tensor_batch_max_width: engine_tensor_batch_max_width(),
+        tensor_batch_rows_total: rows,
+        tensor_batch_capacity_rows_total: capacity_rows,
+        tensor_batch_useful_elements_total: useful_elements,
+        tensor_batch_materialized_elements_total: materialized_elements,
+        batch_workspace_bytes_total: ENGINE_BATCH_WORKSPACE_BYTES.load(Ordering::Relaxed),
+        tensor_batch_fill_ratio: ratio(rows, capacity_rows),
+        tensor_batch_padding_ratio: ratio(
+            materialized_elements.saturating_sub(useful_elements),
+            materialized_elements,
+        ),
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
 }
 
 pub fn prometheus_engine_metric_name(name: &str) -> String {
@@ -516,6 +664,12 @@ impl BenchmarkResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::BackendKind;
+    use crate::engine::{
+        AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchId, BatchLaneKey,
+        ExecutionGroupId, InputRange, ModelInstanceId, NativeBatchMode, PlanId, ReadyQuantum,
+        SequencePhase, SessionKey, StageId, WorkCost, WorkUnit,
+    };
 
     #[tokio::test]
     async fn test_metrics_collector() {
@@ -561,6 +715,11 @@ mod tests {
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH));
+        assert!(names.contains(ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO));
+        assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO));
         assert_eq!(names.len(), ENGINE_METRIC_CATALOG.len());
     }
 
@@ -596,5 +755,85 @@ mod tests {
         assert!(engine_tensor_batches_total() >= tensor_before + 1);
         assert!(engine_request_parallel_batches_total() >= parallel_before + 1);
         assert!(engine_tensor_batch_max_width() >= 3);
+    }
+
+    #[test]
+    fn physical_batch_metrics_measure_fill_padding_workspace_and_rejection() {
+        let lane = BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "ragged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test.v1".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "token.1".to_string(),
+        };
+        let row = |plan: PlanId, request: &str| ReadyQuantum {
+            plan_id: plan,
+            session: SessionKey::new(request.to_string(), plan),
+            lane: lane.clone(),
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+            cost: WorkCost::new(1, 10, 0),
+        };
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(5),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Static,
+            budget: BatchBudget {
+                max_rows: 4,
+                max_logical_units: 4,
+                max_tensor_elements: 40,
+                max_workspace_bytes: 8,
+                max_padding_basis_points: 5_000,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![row(1, "a"), row(2, "b")],
+            materialized_tensor_elements: 30,
+            workspace_bytes: 8,
+        };
+        batch.validate().unwrap();
+
+        let before = engine_batch_metrics_snapshot();
+        record_engine_physical_batch(
+            &batch,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, 2),
+        );
+        let dispatched = engine_batch_metrics_snapshot();
+        assert!(dispatched.tensor_static_batches_total >= before.tensor_static_batches_total + 1);
+        assert!(dispatched.tensor_batch_rows_total >= before.tensor_batch_rows_total + 2);
+        assert!(
+            dispatched.tensor_batch_capacity_rows_total
+                >= before.tensor_batch_capacity_rows_total + 4
+        );
+        assert!(
+            dispatched.tensor_batch_useful_elements_total
+                >= before.tensor_batch_useful_elements_total + 20
+        );
+        assert!(
+            dispatched.tensor_batch_materialized_elements_total
+                >= before.tensor_batch_materialized_elements_total + 30
+        );
+        assert!(dispatched.batch_workspace_bytes_total >= before.batch_workspace_bytes_total + 8);
+
+        record_engine_physical_batch(&batch, BatchDispatch::not_dispatched(2));
+        let rejected = engine_batch_metrics_snapshot();
+        assert!(
+            rejected.physical_batch_rejections_total
+                >= dispatched.physical_batch_rejections_total + 1
+        );
+        assert!(rejected.batch_workspace_bytes_total >= dispatched.batch_workspace_bytes_total);
     }
 }

@@ -60,8 +60,18 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub kv_cache_prefix_reuse_blocks_total: u64,
     pub stream_backpressure_total: u64,
     pub tensor_batches_total: u64,
+    pub tensor_static_batches_total: u64,
+    pub tensor_continuous_batches_total: u64,
     pub request_parallel_batches_total: u64,
+    pub physical_batch_rejections_total: u64,
     pub tensor_batch_max_width: u64,
+    pub tensor_batch_rows_total: u64,
+    pub tensor_batch_capacity_rows_total: u64,
+    pub tensor_batch_useful_elements_total: u64,
+    pub tensor_batch_materialized_elements_total: u64,
+    pub batch_workspace_bytes_total: u64,
+    pub tensor_batch_fill_ratio: f64,
+    pub tensor_batch_padding_ratio: f64,
     pub kv_cache: EngineKvCacheRuntimeSnapshot,
 }
 
