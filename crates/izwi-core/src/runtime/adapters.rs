@@ -366,7 +366,7 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
 }
 
 fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_audio_chat() || model_variant.is_voxtral() {
+    if model_variant.is_audio_chat() {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
@@ -416,6 +416,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 capability: CapabilityKind::Asr,
                 model_variant,
                 streaming_mode: if model_variant.is_audio_chat()
+                    || model_variant.is_voxtral()
                     || model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
                 {
                     StreamingMode::Chunked
@@ -778,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_exposes_voxtral_only_as_direct_asr_for_now() {
+    fn built_in_registry_routes_voxtral_streaming_through_the_token_engine() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::VoxtralMini4BRealtime2602;
 
@@ -787,14 +788,14 @@ mod tests {
                 .require(CapabilityKind::Asr, variant)
                 .expect("voxtral asr adapter")
                 .execution_target,
-            ExecutionTargetKind::DirectModel
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
                 .require(CapabilityKind::Asr, variant)
                 .expect("voxtral asr adapter")
                 .streaming_mode,
-            StreamingMode::None
+            StreamingMode::Chunked
         );
         assert!(registry
             .require(CapabilityKind::RealtimeAsr, variant)

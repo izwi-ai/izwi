@@ -485,6 +485,7 @@ impl LoadedModelBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::adapters::ExecutionTargetKind;
     use crate::runtime::rollout::ExecutionRolloutPolicy;
 
     #[test]
@@ -526,6 +527,27 @@ mod tests {
                 assert_eq!(binding.capability_id, metadata.capability.as_str());
             }
         }
+    }
+
+    #[test]
+    fn voxtral_streaming_binds_to_its_exact_token_engine_adapter() {
+        let variant = ModelVariant::VoxtralMini4BRealtime2602;
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        let contract = bundle.contract(CapabilityKind::Asr, true).unwrap();
+        assert_eq!(
+            contract.metadata.execution_target,
+            ExecutionTargetKind::TokenEngine
+        );
+        assert_eq!(contract.metadata.streaming_mode, StreamingMode::Chunked);
+        assert!(contract.execution_profile.resolved_from_loaded_model);
     }
 
     #[test]
