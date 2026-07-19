@@ -3,14 +3,14 @@
 use crate::catalog::{
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
 };
-use crate::engine::{ResourceAmount, ResourceVector};
+use crate::engine::{ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
 use crate::models::architectures::sortformer::diarization::{
     production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
-use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size, MAX_AUDIO_SOURCE_BYTES,
 };
@@ -265,7 +265,15 @@ impl RuntimeService {
         variant: ModelVariant,
         config: DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let residency_lease = self.load_model_for_job(job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                job,
+                variant,
+                CapabilityKind::Diarization,
+                false,
+                ExecutionTargetKind::PipelineRunner,
+            )
+            .await?;
         let model = self
             .model_registry
             .get_diarization(variant)
@@ -289,34 +297,42 @@ impl RuntimeService {
         let expected_workspace = workspace;
         let observation_job = job.clone();
         self.coordinator
-            .run_blocking_stage(job, move || {
-                let _residency_lease = residency_lease;
-                model.diarize_with_workspace_observer(
-                    &audio.samples,
-                    audio.sample_rate,
-                    &config,
-                    move |event| match event {
-                        SortformerWorkspaceEvent::Materialized { workspace } => {
-                            if workspace != expected_workspace {
-                                return Err(Error::InferenceError(format!(
-                                    "Sortformer materialized workspace {workspace:?} after estimating {expected_workspace:?}"
-                                )));
+            .run_loaded_blocking_stage(
+                job,
+                execution_contract,
+                WorkUnit::PipelineStage {
+                    name: "diarization.infer".to_string(),
+                    ordinal: 0,
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    model.diarize_with_workspace_observer(
+                        &audio.samples,
+                        audio.sample_rate,
+                        &config,
+                        move |event| match event {
+                            SortformerWorkspaceEvent::Materialized { workspace } => {
+                                if workspace != expected_workspace {
+                                    return Err(Error::InferenceError(format!(
+                                        "Sortformer materialized workspace {workspace:?} after estimating {expected_workspace:?}"
+                                    )));
+                                }
+                                observation_job.record_materialized_usage(
+                                    diarization_workspace_observation(steady_usage, workspace)?,
+                                )
                             }
-                            observation_job.record_materialized_usage(
-                                diarization_workspace_observation(steady_usage, workspace)?,
-                            )
-                        }
-                        SortformerWorkspaceEvent::Releasing { workspace } => {
-                            if workspace != expected_workspace {
-                                return Err(Error::InferenceError(format!(
-                                    "Sortformer released workspace {workspace:?} after estimating {expected_workspace:?}"
-                                )));
+                            SortformerWorkspaceEvent::Releasing { workspace } => {
+                                if workspace != expected_workspace {
+                                    return Err(Error::InferenceError(format!(
+                                        "Sortformer released workspace {workspace:?} after estimating {expected_workspace:?}"
+                                    )));
+                                }
+                                observation_job.prepare_materialized_release(steady_usage)
                             }
-                            observation_job.prepare_materialized_release(steady_usage)
-                        }
-                    },
-                )
-            })
+                        },
+                    )
+                },
+            )
             .await
     }
 
