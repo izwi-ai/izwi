@@ -6,7 +6,7 @@ use crate::engine::resources::ResourceLease;
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 
-const DEFAULT_QWEN35_PREFIX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_QWEN35_PREFIX_CACHE_BYTES: u64 = 0;
 const MAX_QWEN35_PREFIX_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 pub(super) fn configured_qwen35_prefix_cache_bytes() -> u64 {
@@ -22,8 +22,8 @@ pub(super) trait ExactPrefixSnapshot: Send + Sync + 'static {
 
     fn positions(&self) -> &[[usize; 3]];
 
-    /// All storage retained exclusively by this cache entry, including tensor
-    /// backing allocations and owned token/position metadata.
+    /// Storage whose lifetime this cache entry can prolong, including shared
+    /// tensor backing allocations and owned token/position metadata.
     fn retained_bytes(&self) -> Option<u64>;
 }
 
@@ -107,8 +107,8 @@ impl<O, S> Default for ExactPrefixCacheState<O, S> {
 /// Bounded LRU of immutable exact-prefix snapshots.
 ///
 /// The owner is weakly referenced so an unloaded model cannot keep cache state
-/// discoverable. Lookups clone only an `Arc` while holding the mutex; fallible
-/// Candle storage copies happen after the cache lock is released.
+/// discoverable. Lookups clone only an `Arc` while holding the mutex; restored
+/// Qwen state structurally shares immutable Candle tensor storage.
 pub(super) struct ExactPrefixCache<O, S> {
     max_retained_bytes: u64,
     state: Mutex<ExactPrefixCacheState<O, S>>,
@@ -395,6 +395,23 @@ mod tests {
         fn retained_bytes(&self) -> Option<u64> {
             Some(self.bytes)
         }
+    }
+
+    #[test]
+    fn qwen35_prefix_cache_is_opt_in_and_bounded() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        std::env::remove_var("IZWI_QWEN35_PREFIX_CACHE_BYTES");
+        assert_eq!(configured_qwen35_prefix_cache_bytes(), 0);
+
+        std::env::set_var("IZWI_QWEN35_PREFIX_CACHE_BYTES", "1048576");
+        assert_eq!(configured_qwen35_prefix_cache_bytes(), 1_048_576);
+
+        std::env::set_var("IZWI_QWEN35_PREFIX_CACHE_BYTES", u64::MAX.to_string());
+        assert_eq!(
+            configured_qwen35_prefix_cache_bytes(),
+            MAX_QWEN35_PREFIX_CACHE_BYTES
+        );
+        std::env::remove_var("IZWI_QWEN35_PREFIX_CACHE_BYTES");
     }
 
     fn scope_for(variant: ModelVariant) -> ExactPrefixScope {

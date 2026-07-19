@@ -43,20 +43,19 @@ pub struct Qwen35TextModel {
     finite_diagnostics_enabled: bool,
 }
 
+#[derive(Clone)]
 pub struct Qwen35TextRuntimeState {
     layers: Vec<Qwen35LayerRuntimeState>,
 }
 
 impl Qwen35TextRuntimeState {
-    /// Fork all persistent tensors into independent Candle backing storage.
-    pub(crate) fn fork_for_prefix(&self) -> Result<Self> {
-        Ok(Self {
-            layers: self
-                .layers
-                .iter()
-                .map(Qwen35LayerRuntimeState::fork_for_prefix)
-                .collect::<Result<Vec<_>>>()?,
-        })
+    /// Fork immutable persistent state by sharing Candle tensor storage.
+    ///
+    /// Every Qwen3.5 state transition replaces tensor handles or page entries;
+    /// it never mutates a backing allocation in place. A future in-place kernel
+    /// must add copy-on-write at its mutation boundary before using this path.
+    pub(crate) fn fork_shared_for_prefix(&self) -> Self {
+        self.clone()
     }
 
     /// Backing allocations retained by the per-request text runtime state.
@@ -109,23 +108,13 @@ impl Qwen35TextRuntimeState {
     }
 }
 
+#[derive(Clone)]
 struct ConvRingState {
     slots: Vec<Tensor>,
     next_idx: usize,
 }
 
 impl ConvRingState {
-    fn fork_for_prefix(&self) -> Result<Self> {
-        Ok(Self {
-            slots: self
-                .slots
-                .iter()
-                .map(deep_copy_tensor_storage)
-                .collect::<candle_core::Result<Vec<_>>>()?,
-            next_idx: self.next_idx,
-        })
-    }
-
     /// Move every logical history slot into independent fixed-history storage.
     ///
     /// Sequence-prefill slots are views into the entire projected token span.
@@ -163,6 +152,7 @@ impl ConvRingState {
     }
 }
 
+#[derive(Clone)]
 enum Qwen35LayerRuntimeState {
     Linear {
         conv_state: Option<ConvRingState>,
@@ -175,51 +165,6 @@ enum Qwen35LayerRuntimeState {
         dense_v_cache_h: Option<Tensor>,
         dense_kv_tokens: usize,
     },
-}
-
-impl Qwen35LayerRuntimeState {
-    fn fork_for_prefix(&self) -> Result<Self> {
-        match self {
-            Self::Linear {
-                conv_state,
-                recurrent_state,
-            } => Ok(Self::Linear {
-                conv_state: conv_state
-                    .as_ref()
-                    .map(ConvRingState::fork_for_prefix)
-                    .transpose()?,
-                recurrent_state: recurrent_state
-                    .as_ref()
-                    .map(deep_copy_tensor_storage)
-                    .transpose()?,
-            }),
-            Self::Full {
-                k_pages,
-                v_pages,
-                dense_k_cache_h,
-                dense_v_cache_h,
-                dense_kv_tokens,
-            } => Ok(Self::Full {
-                k_pages: k_pages
-                    .iter()
-                    .map(KvPage::deep_copy)
-                    .collect::<Result<Vec<_>>>()?,
-                v_pages: v_pages
-                    .iter()
-                    .map(KvPage::deep_copy)
-                    .collect::<Result<Vec<_>>>()?,
-                dense_k_cache_h: dense_k_cache_h
-                    .as_ref()
-                    .map(deep_copy_tensor_storage)
-                    .transpose()?,
-                dense_v_cache_h: dense_v_cache_h
-                    .as_ref()
-                    .map(deep_copy_tensor_storage)
-                    .transpose()?,
-                dense_kv_tokens: *dense_kv_tokens,
-            }),
-        }
-    }
 }
 
 fn full_attention_state_has_cached_prefix(state: &Qwen35LayerRuntimeState) -> Result<bool> {
@@ -2412,11 +2357,11 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_dense_kv_cache_h, apply_rotary_emb, build_mrope,
+        append_dense_kv_cache_h, append_to_pages, apply_rotary_emb, build_mrope,
         full_attention_state_has_cached_prefix, non_finite_counts, owned_zero_tensor,
         qwen35_dense_decode_max_pages, qwen35_page_count_for_tokens, repeat_head_states,
-        repeat_head_states_seq, softplus, unfused_causal_attention, ConvRingState, KvPage,
-        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        repeat_head_states_seq, softplus, unfused_causal_attention, ConvRingState,
+        KvCacheQuantization, KvPage, Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
     };
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
@@ -2461,7 +2406,7 @@ mod tests {
         }));
     }
 
-    fn assert_prefix_forks_have_independent_hybrid_state_storage(device: &Device) {
+    fn assert_prefix_forks_share_immutable_hybrid_state_storage(device: &Device) {
         let state = Qwen35TextRuntimeState {
             layers: vec![
                 Qwen35LayerRuntimeState::Linear {
@@ -2484,8 +2429,8 @@ mod tests {
                 },
             ],
         };
-        let mut first = state.fork_for_prefix().unwrap();
-        let second = state.fork_for_prefix().unwrap();
+        let mut first = state.fork_shared_for_prefix();
+        let second = state.fork_shared_for_prefix();
 
         let (
             Qwen35LayerRuntimeState::Linear {
@@ -2500,11 +2445,11 @@ mod tests {
         else {
             panic!("linear states")
         };
-        assert_ne!(
+        assert_eq!(
             tensor_storage_address(&first_conv.slots[0]),
             tensor_storage_address(&second_conv.slots[0])
         );
-        assert_ne!(
+        assert_eq!(
             tensor_storage_address(first_recurrent),
             tensor_storage_address(second_recurrent)
         );
@@ -2527,48 +2472,69 @@ mod tests {
             vec![1.0; 4]
         );
 
-        let (
-            Qwen35LayerRuntimeState::Full {
-                k_pages: first_pages,
-                dense_k_cache_h: Some(first_dense),
-                ..
-            },
-            Qwen35LayerRuntimeState::Full {
-                k_pages: second_pages,
-                dense_k_cache_h: Some(second_dense),
-                ..
-            },
-        ) = (&first.layers[1], &second.layers[1])
+        let Qwen35LayerRuntimeState::Full {
+            k_pages: first_pages,
+            dense_k_cache_h: first_dense_cache,
+            ..
+        } = &mut first.layers[1]
         else {
-            panic!("full states")
+            panic!("first full state")
+        };
+        let Qwen35LayerRuntimeState::Full {
+            k_pages: second_pages,
+            dense_k_cache_h: Some(second_dense),
+            ..
+        } = &second.layers[1]
+        else {
+            panic!("second full state")
         };
         let (KvPage::Dense(first_page), KvPage::Dense(second_page)) =
             (&first_pages[0], &second_pages[0])
         else {
             panic!("dense pages")
         };
-        assert_ne!(
+        let first_dense = first_dense_cache.as_ref().expect("first dense cache");
+        assert_eq!(
             tensor_storage_address(first_page),
             tensor_storage_address(second_page)
         );
-        assert_ne!(
+        assert_eq!(
             tensor_storage_address(first_dense),
             tensor_storage_address(second_dense)
         );
+
+        append_dense_kv_cache_h(
+            first_dense_cache,
+            &Tensor::zeros((1, 1, 1, 2), DType::F32, device).unwrap(),
+        )
+        .unwrap();
+        append_to_pages(
+            2,
+            first_pages,
+            &Tensor::zeros((1, 1, 1, 2), DType::F32, device).unwrap(),
+            KvCacheQuantization::None,
+        )
+        .unwrap();
+        let KvPage::Dense(second_page) = &second_pages[0] else {
+            panic!("second dense page")
+        };
+        assert_eq!(first_dense_cache.as_ref().unwrap().dim(2).unwrap(), 2);
+        assert_eq!(second_page.dim(1).unwrap(), 1);
+        assert_eq!(second_dense.dim(2).unwrap(), 1);
     }
 
     #[test]
-    fn prefix_forks_have_independent_hybrid_state_storage() {
-        assert_prefix_forks_have_independent_hybrid_state_storage(&Device::Cpu);
+    fn prefix_forks_share_immutable_hybrid_state_storage() {
+        assert_prefix_forks_share_immutable_hybrid_state_storage(&Device::Cpu);
     }
 
     #[cfg(feature = "metal")]
     #[test]
-    fn prefix_forks_have_independent_hybrid_state_storage_on_metal() {
+    fn prefix_forks_share_immutable_hybrid_state_storage_on_metal() {
         let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
             return;
         };
-        assert_prefix_forks_have_independent_hybrid_state_storage(&device);
+        assert_prefix_forks_share_immutable_hybrid_state_storage(&device);
     }
 
     #[cfg(feature = "metal")]

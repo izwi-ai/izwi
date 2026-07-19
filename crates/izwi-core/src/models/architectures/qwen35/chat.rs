@@ -693,10 +693,10 @@ impl Qwen35ChatModel {
 
         let reusable_prefix = prefix.filter(|prefix| prefix.matches(prepared_prompt));
         let (mut text_state, reused_prefix_tokens) = match reusable_prefix {
-            Some(prefix) => match prefix.text_state.fork_for_prefix() {
-                Ok(state) => (state, prefix.token_ids.len()),
-                Err(_) => (self.text_model.new_state(), 0),
-            },
+            Some(prefix) => (
+                prefix.text_state.fork_shared_for_prefix(),
+                prefix.token_ids.len(),
+            ),
             None => (self.text_model.new_state(), 0),
         };
         let (logits, pending_prefix_snapshot) = if prepared_prompt.vision_inputs.is_none() {
@@ -836,24 +836,21 @@ impl Qwen35ChatModel {
         }
 
         let pending = match (checkpoint, capture_prefix_max_bytes) {
-            (Some(checkpoint), Some(max_bytes)) if max_bytes > 0 => text_state
-                .fork_for_prefix()
-                .ok()
-                .map(|text_state| Qwen35PrefixSnapshot {
-                    text_state,
-                    token_ids: prepared.prompt_ids[..checkpoint]
-                        .to_vec()
-                        .into_boxed_slice(),
-                    positions: prepared.prompt_positions[..checkpoint]
-                        .to_vec()
-                        .into_boxed_slice(),
-                    next_text_position: checkpoint,
-                })
-                .filter(|snapshot| {
-                    snapshot
-                        .retained_bytes()
-                        .is_some_and(|bytes| bytes <= max_bytes)
-                }),
+            (Some(checkpoint), Some(max_bytes)) if max_bytes > 0 => Some(Qwen35PrefixSnapshot {
+                text_state: text_state.fork_shared_for_prefix(),
+                token_ids: prepared.prompt_ids[..checkpoint]
+                    .to_vec()
+                    .into_boxed_slice(),
+                positions: prepared.prompt_positions[..checkpoint]
+                    .to_vec()
+                    .into_boxed_slice(),
+                next_text_position: checkpoint,
+            })
+            .filter(|snapshot| {
+                snapshot
+                    .retained_bytes()
+                    .is_some_and(|bytes| bytes <= max_bytes)
+            }),
             _ => None,
         };
 
