@@ -20,7 +20,7 @@ use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, LoadedExecutionContract};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
@@ -300,6 +300,7 @@ fn positive_u64_env_or_default(name: &str, default: u64) -> Result<u64> {
 struct RuntimeAsrRealtimeResources {
     model: Option<Arc<NativeAsrModel>>,
     state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    execution_contract: Option<LoadedExecutionContract>,
     residency_lease: Option<ModelResidencyLease>,
     job: Option<JobLease>,
     session_lease: Option<Arc<RealtimeAsrSessionLease>>,
@@ -346,6 +347,7 @@ impl RuntimeAsrRealtimeResources {
         Some(RealtimeAsrDetachedResources {
             state: self.state.take(),
             model: self.model.take(),
+            execution_contract: self.execution_contract.take(),
             residency_lease: self.residency_lease.take(),
             job: self.job.take(),
             session_lease: self.session_lease.take(),
@@ -368,6 +370,7 @@ impl RuntimeAsrRealtimeResources {
 struct RealtimeAsrDetachedResources {
     state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
     model: Option<Arc<NativeAsrModel>>,
+    execution_contract: Option<LoadedExecutionContract>,
     residency_lease: Option<ModelResidencyLease>,
     job: Option<JobLease>,
     session_lease: Option<Arc<RealtimeAsrSessionLease>>,
@@ -379,6 +382,7 @@ impl RealtimeAsrDetachedResources {
         // authorization and quota are released for another session.
         self.state.take();
         self.model.take();
+        self.execution_contract.take();
         self.residency_lease.take();
         self.job.take();
         self.session_lease.take();
@@ -399,6 +403,7 @@ fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) 
 struct RealtimeAsrOperationHandles {
     model: Arc<NativeAsrModel>,
     state: Arc<StdMutex<NativeAsrRealtimeState>>,
+    execution_contract: LoadedExecutionContract,
     job: JobLease,
     session_lease: Arc<RealtimeAsrSessionLease>,
     _guard: RealtimeAsrOperationGuard,
@@ -450,6 +455,16 @@ impl RuntimeAsrRealtimeStream {
         let state = resources.state.as_ref().cloned().ok_or_else(|| {
             Error::InferenceError("realtime ASR stream state is unavailable".to_string())
         })?;
+        let execution_contract =
+            resources
+                .execution_contract
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "realtime ASR stream execution contract is unavailable".to_string(),
+                    )
+                })?;
         let job = resources.job.as_ref().cloned().ok_or_else(|| {
             Error::InferenceError("realtime ASR stream job is unavailable".to_string())
         })?;
@@ -470,6 +485,7 @@ impl RuntimeAsrRealtimeStream {
         Ok(RealtimeAsrOperationHandles {
             model,
             state,
+            execution_contract,
             job,
             session_lease,
             _guard: RealtimeAsrOperationGuard {
@@ -692,7 +708,9 @@ fn validate_realtime_input_copy(samples: usize, max_samples: usize) -> Result<()
 async fn run_realtime_blocking_operation<T, B, F>(
     coordinator: &Arc<InferenceCoordinator>,
     job: &JobLease,
+    execution_contract: LoadedExecutionContract,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
+    operation_kind: &'static str,
     build_operation: B,
 ) -> Result<T>
 where
@@ -705,10 +723,17 @@ where
         .await?;
     let operation = build_operation()?;
     coordinator
-        .run_blocking_stage(job, move || {
-            let _operation_gate = operation_gate;
-            operation()
-        })
+        .run_loaded_blocking_stage(
+            job,
+            execution_contract,
+            WorkUnit::AtomicJob {
+                kind: operation_kind.to_string(),
+            },
+            move || {
+                let _operation_gate = operation_gate;
+                operation()
+            },
+        )
         .await
 }
 
@@ -791,7 +816,15 @@ impl RuntimeService {
             .coordinator
             .admit_observed(job_spec, host_input_observation(metadata_bytes)?)
             .await?;
-        let lease = self.load_asr_model_for_job(&job, variant).await?;
+        let (lease, execution_contract) = self
+            .load_capability_for_job(
+                &job,
+                variant,
+                CapabilityKind::RealtimeAsr,
+                true,
+                ExecutionTargetKind::RealtimeRunner,
+            )
+            .await?;
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
                 Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -818,17 +851,24 @@ impl RuntimeService {
         let task_session_lease = session_lease.clone();
         let (state, language, prompt) = self
             .coordinator
-            .run_blocking_stage(&job, move || {
-                let _operation_lease = operation_lease;
-                let _session_lease = task_session_lease;
-                let state = task_model.start_realtime_stream_state_with_reservation(
-                    language.as_deref(),
-                    prompt.as_deref(),
-                    None,
-                    reservation,
-                )?;
-                Ok((state, language, prompt))
-            })
+            .run_loaded_blocking_stage(
+                &job,
+                execution_contract.clone(),
+                WorkUnit::AtomicJob {
+                    kind: "asr.realtime.start".to_string(),
+                },
+                move || {
+                    let _operation_lease = operation_lease;
+                    let _session_lease = task_session_lease;
+                    let state = task_model.start_realtime_stream_state_with_reservation(
+                        language.as_deref(),
+                        prompt.as_deref(),
+                        None,
+                        reservation,
+                    )?;
+                    Ok((state, language, prompt))
+                },
+            )
             .await?;
         let steady_usage = realtime_state_observation(&state)?;
         job.record_materialized_usage(add_retained_host_bytes(
@@ -841,6 +881,7 @@ impl RuntimeService {
         let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
             model: Some(model),
             state: Some(Arc::new(StdMutex::new(state))),
+            execution_contract: Some(execution_contract),
             residency_lease: Some(lease),
             job: Some(job),
             session_lease: Some(session_lease),
@@ -894,13 +935,19 @@ impl RuntimeService {
         let RealtimeAsrOperationHandles {
             model,
             state,
+            execution_contract,
             job,
             session_lease,
             _guard: operation_guard,
         } = handles;
         let observation_job = job.clone();
-        let result =
-            run_realtime_blocking_operation(&self.coordinator, &job, operation_gate, || {
+        let result = run_realtime_blocking_operation(
+            &self.coordinator,
+            &job,
+            execution_contract,
+            operation_gate,
+            "asr.realtime.push",
+            || {
                 // The ordering guard is held before this allocation, bounding
                 // each stream to one owned packet even after caller timeout.
                 let samples = samples.to_vec();
@@ -927,8 +974,9 @@ impl RuntimeService {
                     drop(samples);
                     events
                 })
-            })
-            .await;
+            },
+        )
+        .await;
         if let Err(err) = &result {
             if matches!(err, Error::Timeout(_)) {
                 stream.close_due_to_timeout();
@@ -962,13 +1010,19 @@ impl RuntimeService {
         let RealtimeAsrOperationHandles {
             model,
             state,
+            execution_contract,
             job,
             session_lease,
             _guard: operation_guard,
         } = handles;
         let observation_job = job.clone();
-        let result =
-            run_realtime_blocking_operation(&self.coordinator, &job, operation_gate, || {
+        let result = run_realtime_blocking_operation(
+            &self.coordinator,
+            &job,
+            execution_contract,
+            operation_gate,
+            "asr.realtime.finish",
+            || {
                 Ok(move || {
                     let _operation_lease = operation_lease;
                     let _session_lease = session_lease;
@@ -980,8 +1034,9 @@ impl RuntimeService {
                         .prepare_materialized_release(JobResourceObservation::default())?;
                     model.finish_realtime_stream(&mut state)
                 })
-            })
-            .await;
+            },
+        )
+        .await;
         if matches!(&result, Err(Error::Timeout(_))) {
             stream.close_due_to_timeout();
         } else {
@@ -3424,7 +3479,8 @@ mod tests {
     use super::*;
     use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
-    use crate::engine::{Priority, WorkloadClass};
+    use crate::engine::{ModelInstanceId, Priority, WorkloadClass};
+    use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
     use crate::runtime::coordinator::JobSpec;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
@@ -3544,6 +3600,7 @@ mod tests {
         let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
             model: None,
             state: None,
+            execution_contract: None,
             residency_lease: None,
             job: None,
             session_lease: Some(session_lease),
@@ -3599,6 +3656,23 @@ mod tests {
         }
     }
 
+    fn realtime_test_contract(
+        coordinator: &InferenceCoordinator,
+        backend: BackendKind,
+    ) -> LoadedExecutionContract {
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            coordinator.execution_group_id(),
+            ModelInstanceId::new(1),
+            ModelVariant::Nemotron35AsrStreaming06B,
+            backend,
+        )
+        .expect("realtime test bundle");
+        bundle
+            .contract(CapabilityKind::RealtimeAsr, true)
+            .expect("realtime test contract")
+    }
+
     #[test]
     fn oversized_realtime_packet_is_rejected_before_copy_or_model_work() {
         let side_effects = AtomicUsize::new(0);
@@ -3631,20 +3705,28 @@ mod tests {
         let task_release = release.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let task_coordinator = coordinator.clone();
+        let execution_contract = realtime_test_contract(&coordinator, BackendKind::Cpu);
         let runner = tokio::spawn(async move {
-            run_realtime_blocking_operation(&task_coordinator, &runner_job, gate, move || {
-                Ok(move || {
-                    let _ = started_tx.send(());
-                    let (lock, wake) = &*task_release;
-                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
-                    while !*released {
-                        released = wake
-                            .wait(released)
-                            .unwrap_or_else(|poison| poison.into_inner());
-                    }
-                    Ok(())
-                })
-            })
+            run_realtime_blocking_operation(
+                &task_coordinator,
+                &runner_job,
+                execution_contract,
+                gate,
+                "asr.realtime.test",
+                move || {
+                    Ok(move || {
+                        let _ = started_tx.send(());
+                        let (lock, wake) = &*task_release;
+                        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                        while !*released {
+                            released = wake
+                                .wait(released)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        Ok(())
+                    })
+                },
+            )
             .await
         });
 
@@ -3702,22 +3784,30 @@ mod tests {
         let first_gate = gate.clone();
         let first_release = release.clone();
         let first_stage = stage.clone();
+        let first_contract = realtime_test_contract(&coordinator, BackendKind::Cuda);
         let first = tokio::spawn(async move {
-            run_realtime_blocking_operation(&first_coordinator, &first_job, first_gate, move || {
-                Ok(move || {
-                    assert_eq!(first_stage.fetch_add(1, Ordering::SeqCst), 0);
-                    let _ = started_tx.send(());
-                    let (lock, wake) = &*first_release;
-                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
-                    while !*released {
-                        released = wake
-                            .wait(released)
-                            .unwrap_or_else(|poison| poison.into_inner());
-                    }
-                    assert_eq!(first_stage.fetch_add(1, Ordering::SeqCst), 1);
-                    Ok(())
-                })
-            })
+            run_realtime_blocking_operation(
+                &first_coordinator,
+                &first_job,
+                first_contract,
+                first_gate,
+                "asr.realtime.test",
+                move || {
+                    Ok(move || {
+                        assert_eq!(first_stage.fetch_add(1, Ordering::SeqCst), 0);
+                        let _ = started_tx.send(());
+                        let (lock, wake) = &*first_release;
+                        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                        while !*released {
+                            released = wake
+                                .wait(released)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        assert_eq!(first_stage.fetch_add(1, Ordering::SeqCst), 1);
+                        Ok(())
+                    })
+                },
+            )
             .await
         });
         started_rx.await.unwrap();
@@ -3728,11 +3818,14 @@ mod tests {
         let second_job = job.clone();
         let second_gate = gate.clone();
         let second_stage = stage.clone();
+        let second_contract = realtime_test_contract(&coordinator, BackendKind::Cuda);
         let second = tokio::spawn(async move {
             run_realtime_blocking_operation(
                 &second_coordinator,
                 &second_job,
+                second_contract,
                 second_gate,
+                "asr.realtime.test",
                 move || {
                     Ok(move || {
                         assert_eq!(second_stage.fetch_add(1, Ordering::SeqCst), 2);
