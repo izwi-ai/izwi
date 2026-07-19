@@ -446,6 +446,80 @@ impl ExecutorStepResult {
 }
 
 /// Model executor trait - abstracts the model inference backend.
+pub struct PhysicalBatchExecution<'a> {
+    pub batch: &'a PhysicalBatch,
+    pub requests: &'a [&'a EngineCoreRequest],
+    pub scheduled: &'a [ScheduledRequest],
+}
+
+impl PhysicalBatchExecution<'_> {
+    pub fn validate(&self) -> Result<()> {
+        self.batch.validate()?;
+        if self.batch.rows.len() != self.scheduled.len()
+            || self.scheduled.len() != self.requests.len()
+        {
+            return Err(Error::InferenceError(
+                "physical executor inputs do not match the batch width".to_string(),
+            ));
+        }
+
+        let expected = self
+            .batch
+            .rows
+            .iter()
+            .map(|row| ((row.plan_id, row.session.clone()), &row.work))
+            .collect::<HashMap<_, _>>();
+        let mut scheduled_ids = HashSet::with_capacity(self.scheduled.len());
+        for scheduled in self.scheduled {
+            let key = (scheduled.plan_id, scheduled.session_key());
+            let work = expected.get(&key).ok_or_else(|| {
+                Error::InferenceError(
+                    "scheduled work is not present in the physical batch envelope".to_string(),
+                )
+            })?;
+            if **work != scheduled.work {
+                return Err(Error::InferenceError(
+                    "scheduled work differs from the physical batch quantum".to_string(),
+                ));
+            }
+            if !scheduled_ids.insert(scheduled.request_id.as_str()) {
+                return Err(Error::InferenceError(
+                    "physical executor inputs contain a duplicate request".to_string(),
+                ));
+            }
+        }
+
+        let request_ids = self
+            .requests
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<HashSet<_>>();
+        if request_ids.len() != self.requests.len() || request_ids != scheduled_ids {
+            return Err(Error::InferenceError(
+                "physical executor request snapshots do not match scheduled rows".to_string(),
+            ));
+        }
+
+        let is_prefill = self.scheduled[0].is_prefill;
+        if self
+            .scheduled
+            .iter()
+            .any(|scheduled| scheduled.is_prefill != is_prefill)
+        {
+            return Err(Error::InferenceError(
+                "one physical batch cannot mix prefill and decode dispatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_prefill(&self) -> bool {
+        self.scheduled
+            .first()
+            .is_some_and(|scheduled| scheduled.is_prefill)
+    }
+}
+
 pub trait ModelExecutor: Send + Sync {
     /// Effective loaded-model/request/backend execution profile. Executors
     /// that cannot prove their behavior return `None` and therefore remain on
@@ -460,6 +534,21 @@ pub trait ModelExecutor: Send + Sync {
         self.execution_profile(request)
             .map(|profile| profile.capabilities())
             .unwrap_or_default()
+    }
+
+    /// Execute one already-validated physical batch transaction. Native
+    /// tensor adapters override this boundary; compatibility executors retain
+    /// their existing phase methods at width one.
+    fn execute_physical_batch(
+        &self,
+        execution: PhysicalBatchExecution<'_>,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        execution.validate()?;
+        if execution.is_prefill() {
+            self.execute_prefill(execution.requests, execution.scheduled)
+        } else {
+            self.execute_decode(execution.requests, execution.scheduled)
+        }
     }
 
     /// Execute prefill pass for newly admitted or in-progress prefill requests.
@@ -1381,6 +1470,21 @@ impl UnifiedExecutor {
     ) -> Result<Vec<ExecutorStepResult>> {
         let executor = self.inner.read().await;
         executor.execute_decode(requests, scheduled)
+    }
+
+    /// Execute one exact physical batch envelope.
+    pub async fn execute_physical_batch(
+        &self,
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let executor = self.inner.read().await;
+        executor.execute_physical_batch(PhysicalBatchExecution {
+            batch,
+            requests,
+            scheduled,
+        })
     }
 
     pub async fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {

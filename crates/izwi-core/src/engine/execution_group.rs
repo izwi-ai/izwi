@@ -95,14 +95,9 @@ impl ExecutionGroupRunner {
         // Physical device work is deliberately serialized for every backend.
         // Tensor adapters may still fan out inside one physical batch.
         let (mut batches, decode_elapsed) =
-            execute_batches(&prepared.executor, "decode", prepared.decode_batches, false).await;
-        let (mut prefill_batches, prefill_elapsed) = execute_batches(
-            &prepared.executor,
-            "prefill",
-            prepared.prefill_batches,
-            true,
-        )
-        .await;
+            execute_batches(&prepared.executor, "decode", prepared.decode_batches).await;
+        let (mut prefill_batches, prefill_elapsed) =
+            execute_batches(&prepared.executor, "prefill", prepared.prefill_batches).await;
         batches.append(&mut prefill_batches);
 
         ExecutedEngineStep {
@@ -127,7 +122,6 @@ async fn execute_batches(
     executor: &UnifiedExecutor,
     phase: &'static str,
     batches: Vec<PreparedExecutionBatch>,
-    is_prefill: bool,
 ) -> (Vec<ExecutedPhysicalBatch>, Duration) {
     if batches.is_empty() {
         return (Vec::new(), Duration::ZERO);
@@ -158,15 +152,9 @@ async fn execute_batches(
             }
         };
         let request_refs: Vec<_> = batch.requests.iter().map(Arc::as_ref).collect();
-        let result = if is_prefill {
-            executor
-                .execute_prefill(&request_refs, &batch.scheduled)
-                .await
-        } else {
-            executor
-                .execute_decode(&request_refs, &batch.scheduled)
-                .await
-        };
+        let result = executor
+            .execute_physical_batch(&batch.physical_batch, &request_refs, &batch.scheduled)
+            .await;
         let results = reconcile_executor_outputs(phase, &batch.scheduled, result);
         executed.push(executed_batch(batch, results, batch_started.elapsed()));
         drop(workspace);
@@ -322,7 +310,8 @@ mod tests {
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatchKind, BatchId,
         BatchLaneKey, ExecutionGroupId, InputRange, ModelExecutor, ModelInstanceId,
-        NativeBatchMode, ReadyQuantum, SequencePhase, SessionKey, StageId, WorkCost, WorkUnit,
+        NativeBatchMode, PhysicalBatchExecution, ReadyQuantum, SequencePhase, SessionKey, StageId,
+        WorkCost, WorkUnit,
     };
 
     struct CountingExecutor {
@@ -345,6 +334,57 @@ mod tests {
             _scheduled: &[ScheduledRequest],
         ) -> Result<Vec<ExecutorStepResult>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PhysicalBoundaryExecutor {
+        physical_calls: Arc<AtomicUsize>,
+        legacy_calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelExecutor for PhysicalBoundaryExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> Result<Vec<ExecutorStepResult>> {
+            execution.validate()?;
+            self.physical_calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(execution.batch.batch_id, BatchId::new(9));
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| failed_step_result(scheduled, "physical boundary observed"))
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.legacy_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.legacy_calls.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
         }
 
@@ -443,5 +483,67 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("workspace admission failed"));
+    }
+
+    #[tokio::test]
+    async fn runner_dispatches_the_exact_physical_batch_envelope() {
+        let physical_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(PhysicalBoundaryExecutor {
+            physical_calls: physical_calls.clone(),
+            legacy_calls: legacy_calls.clone(),
+        }));
+        let mut request = EngineCoreRequest::tts("physical");
+        request.id = "physical".to_string();
+        let scheduled = ScheduledRequest {
+            plan_id: 5,
+            request_id: request.id.clone(),
+            sequence_id: 2,
+            num_tokens: 1,
+            is_prefill: true,
+            block_ids: Vec::new(),
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 1 },
+                max_output_steps: 1,
+            },
+        };
+        let lane = lane();
+        let physical_batch = PhysicalBatch {
+            batch_id: BatchId::new(9),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: BatchBudget::width_one(),
+            rows: vec![ReadyQuantum {
+                plan_id: scheduled.plan_id,
+                session: scheduled.session_key(),
+                lane,
+                work: scheduled.work.clone(),
+                cost: WorkCost::new(1, 1, 0),
+            }],
+            materialized_tensor_elements: 1,
+            workspace_bytes: 0,
+        };
+        let prepared = PreparedEngineStep::new(
+            executor,
+            Vec::new(),
+            vec![PreparedExecutionBatch::new(
+                physical_batch,
+                vec![Arc::new(request)],
+                vec![scheduled],
+            )],
+        );
+
+        let executed = ExecutionGroupRunner::execute(prepared).await;
+        assert_eq!(physical_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(legacy_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(executed.batches.len(), 1);
+        assert!(executed.batches[0].results[0]
+            .output
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("physical boundary observed"));
     }
 }

@@ -51,12 +51,12 @@ pub use execution::{
     FinishReason, HealthImpact, InputRange, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
     OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId,
     PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase, SessionEpoch, SessionKey,
-    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
-    StageWorkSelector, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
-    WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
+    PhysicalBatchExecution, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
 };
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
