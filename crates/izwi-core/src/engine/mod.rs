@@ -43,13 +43,15 @@ pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchDispatchKind, BatchId,
-    BatchKey, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
-    ExecutionDisposition, ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode,
-    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
-    FailureKind, FailureScope, FinishReason, HealthImpact, InputRange, MembershipSafePoint,
-    ModelInstanceId, NativeBatchMode, OutputVisibility, PlanId, PrefillMode, RetryDisposition,
-    SequencePhase, SessionEpoch, SessionKey, StageDescriptor, StageId, StageProgressKind,
-    StageShapePolicy, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    BatchKey, BatchLaneKey, CacheMode, CancellationGranularity, ConcurrencyClass,
+    ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
+    ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport,
+    ExecutionState, ExecutionTracker, FailureKind, FailureScope, FinishReason, HealthImpact,
+    InputRange, MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutputVisibility,
+    PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, PrefillMode, ReadyQuantum,
+    RetryDisposition, SequencePhase, SessionEpoch, SessionKey, StageDescriptor, StageId,
+    StageProgressKind, StageShapePolicy, StateDisposition, TerminalOutcome, WorkCost, WorkUnit,
+    YieldReason,
 };
 pub use executor::{
     CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,

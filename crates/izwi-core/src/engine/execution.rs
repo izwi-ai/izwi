@@ -1,5 +1,6 @@
 //! Authoritative execution plans, reports, capabilities, and lifecycle states.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -541,6 +542,261 @@ pub struct BatchKey {
     pub adapter_id: Option<String>,
 }
 
+/// Canonical compatibility identity for one physical tensor-batch lane. Every
+/// field participates in equality: models loaded on opposite sides of a reload
+/// boundary, adapter upgrades, or incompatible tensor/state layouts can never
+/// share one native batch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BatchLaneKey {
+    pub execution_group: ExecutionGroupId,
+    pub model_instance: ModelInstanceId,
+    pub adapter_instance: AdapterInstanceId,
+    pub adapter_abi: AdapterAbiRevision,
+    pub capability_id: String,
+    pub stage_id: StageId,
+    pub backend: BackendKind,
+    pub device_ordinal: Option<u32>,
+    pub compute_dtype: String,
+    pub state_dtype: String,
+    pub tensor_layout: String,
+    pub quantization: String,
+    pub state_schema: String,
+    pub kernel_mode: String,
+    pub semantic_mode: String,
+    pub shape_bucket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyQuantum {
+    pub plan_id: PlanId,
+    pub session: SessionKey,
+    pub lane: BatchLaneKey,
+    pub work: WorkUnit,
+    pub cost: WorkCost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalBatch {
+    pub batch_id: BatchId,
+    pub lane: BatchLaneKey,
+    pub mode: NativeBatchMode,
+    pub budget: BatchBudget,
+    pub rows: Vec<ReadyQuantum>,
+    /// Materialized elements including padding. Ragged/packed adapters report
+    /// the useful tensor element count here.
+    pub materialized_tensor_elements: u64,
+    pub workspace_bytes: u64,
+}
+
+impl PhysicalBatch {
+    pub fn validate(&self) -> Result<()> {
+        self.budget.validate()?;
+        if self.rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "physical batch cannot be empty".to_string(),
+            ));
+        }
+        if self.mode == NativeBatchMode::None && self.rows.len() != 1 {
+            return Err(Error::InvalidInput(
+                "non-tensor physical dispatch must have width one".to_string(),
+            ));
+        }
+
+        let mut keys = HashSet::with_capacity(self.rows.len());
+        let mut cost = WorkCost::default();
+        let mut row_count = 0usize;
+        for row in &self.rows {
+            if row.lane != self.lane {
+                return Err(Error::InvalidInput(
+                    "physical batch contains an incompatible lane".to_string(),
+                ));
+            }
+            if !keys.insert((row.session.clone(), row.plan_id)) {
+                return Err(Error::InvalidInput(
+                    "physical batch contains a duplicate session plan".to_string(),
+                ));
+            }
+            if !self.budget.admits(row_count, cost, row.cost) {
+                return Err(Error::InvalidInput(
+                    "physical batch exceeds its declared work budget".to_string(),
+                ));
+            }
+            cost = cost.checked_add(row.cost).ok_or_else(|| {
+                Error::InvalidInput("physical batch work accounting overflowed".to_string())
+            })?;
+            row_count += 1;
+        }
+
+        if self.materialized_tensor_elements < cost.tensor_elements {
+            return Err(Error::InvalidInput(
+                "physical batch materialization is smaller than useful tensor work".to_string(),
+            ));
+        }
+        if self.workspace_bytes > self.budget.max_workspace_bytes {
+            return Err(Error::InvalidInput(
+                "physical batch workspace exceeds its declared budget".to_string(),
+            ));
+        }
+        let padded = self
+            .materialized_tensor_elements
+            .saturating_sub(cost.tensor_elements);
+        if cost.tensor_elements == 0 {
+            if padded > 0 {
+                return Err(Error::InvalidInput(
+                    "physical batch cannot pad empty tensor work".to_string(),
+                ));
+            }
+        } else if u128::from(padded) * 10_000
+            > u128::from(cost.tensor_elements) * u128::from(self.budget.max_padding_basis_points)
+        {
+            return Err(Error::InvalidInput(
+                "physical batch exceeds its declared padding budget".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateDisposition {
+    Unchanged,
+    ValidNext,
+    RolledBack,
+    Poisoned,
+}
+
+#[derive(Debug, Clone)]
+pub struct PhysicalBatchRowReport {
+    pub execution: ExecutionReport,
+    pub state: StateDisposition,
+}
+
+impl PhysicalBatchRowReport {
+    fn validate_state(&self) -> Result<()> {
+        match &self.execution.disposition {
+            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_)
+                if self.state != StateDisposition::ValidNext =>
+            {
+                return Err(Error::InferenceError(
+                    "continuing execution must publish valid next model state".to_string(),
+                ));
+            }
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::RetrySameSession
+                    && !matches!(
+                        self.state,
+                        StateDisposition::Unchanged | StateDisposition::RolledBack
+                    ) =>
+            {
+                return Err(Error::InferenceError(
+                    "same-session retry requires unchanged or rolled-back model state".to_string(),
+                ));
+            }
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::Recompute
+                    && self.state == StateDisposition::ValidNext =>
+            {
+                return Err(Error::InferenceError(
+                    "recompute retry cannot publish advanced model state".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PhysicalBatchReport {
+    pub batch_id: BatchId,
+    pub lane: BatchLaneKey,
+    pub dispatch: BatchDispatch,
+    pub observed_resources: ResourceVector,
+    pub elapsed: Duration,
+    pub rows: Vec<PhysicalBatchRowReport>,
+}
+
+impl PhysicalBatchReport {
+    pub fn validate_against(
+        &self,
+        batch: &PhysicalBatch,
+        active_plans: &HashMap<PlanId, ExecutionPlan>,
+    ) -> Result<()> {
+        batch.validate()?;
+        if self.batch_id != batch.batch_id || self.lane != batch.lane {
+            return Err(Error::InferenceError(
+                "physical batch report does not match its dispatch envelope".to_string(),
+            ));
+        }
+        if self.dispatch.width != batch.rows.len() || self.rows.len() != batch.rows.len() {
+            return Err(Error::InferenceError(
+                "physical batch report width does not match its planned rows".to_string(),
+            ));
+        }
+        match self.dispatch.kind {
+            BatchDispatchKind::Serial if batch.rows.len() != 1 => {
+                return Err(Error::InferenceError(
+                    "serial physical dispatch must have width one".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorStatic if batch.mode != NativeBatchMode::Static => {
+                return Err(Error::InferenceError(
+                    "physical batch reported undeclared static tensor execution".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorContinuous if batch.mode != NativeBatchMode::Continuous => {
+                return Err(Error::InferenceError(
+                    "physical batch reported undeclared continuous tensor execution".to_string(),
+                ));
+            }
+            BatchDispatchKind::RequestParallel => {
+                return Err(Error::InferenceError(
+                    "request parallelism is not a physical tensor batch".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        let expected = batch
+            .rows
+            .iter()
+            .map(|row| ((row.session.clone(), row.plan_id), row))
+            .collect::<HashMap<_, _>>();
+        let mut reported = HashSet::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let key = (row.execution.session.clone(), row.execution.plan_id);
+            if !reported.insert(key.clone()) {
+                return Err(Error::InferenceError(
+                    "physical batch report contains a duplicate session plan".to_string(),
+                ));
+            }
+            if !expected.contains_key(&key) {
+                return Err(Error::InferenceError(
+                    "physical batch report contains a foreign session plan".to_string(),
+                ));
+            }
+            if row.execution.dispatch != self.dispatch {
+                return Err(Error::InferenceError(
+                    "physical batch row disagrees with envelope dispatch metadata".to_string(),
+                ));
+            }
+            let plan = active_plans.get(&row.execution.plan_id).ok_or_else(|| {
+                Error::InferenceError(
+                    "physical batch report references an inactive execution plan".to_string(),
+                )
+            })?;
+            row.execution.validate_against(plan)?;
+            row.validate_state()?;
+        }
+        if reported.len() != expected.len() {
+            return Err(Error::InferenceError(
+                "physical batch report omitted a planned session".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalOutcome {
     Completed,
@@ -588,9 +844,9 @@ pub enum FailureKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureScope {
-    Request,
-    Batch,
-    Worker,
+    Row,
+    PhysicalBatch,
+    ExecutionGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,7 +876,7 @@ impl ExecutionFailure {
     pub fn invalid_output(message: impl Into<String>) -> Self {
         Self {
             kind: FailureKind::InvalidOutput,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::Never,
             health: HealthImpact::None,
             message: message.into(),
@@ -943,6 +1199,27 @@ impl ExecutionTracker {
 mod tests {
     use super::*;
 
+    fn lane() -> BatchLaneKey {
+        BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "dense".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test.v1".to_string(),
+            kernel_mode: "reference".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "tokens.1".to_string(),
+        }
+    }
+
     #[test]
     fn execution_id_newtypes_do_not_alias_domains() {
         let group = ExecutionGroupId::new(7);
@@ -1016,6 +1293,191 @@ mod tests {
         assert!(!budget.admits(1, current, WorkCost::new(6, 20, 40)));
         assert!(!budget.admits(2, current, WorkCost::new(1, 1, 1)));
         assert!(!budget.admits(1, WorkCost::new(u64::MAX, 0, 0), WorkCost::new(1, 0, 0),));
+    }
+
+    #[test]
+    fn physical_batch_requires_exact_lanes_and_padding_budget() {
+        let lane = lane();
+        let row = ReadyQuantum {
+            plan_id: 1,
+            session: SessionKey::new("one".to_string(), 1),
+            lane: lane.clone(),
+            work: WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+            cost: WorkCost::new(1, 10, 8),
+        };
+        let mut batch = PhysicalBatch {
+            batch_id: BatchId::new(1),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Static,
+            budget: BatchBudget {
+                max_rows: 2,
+                max_logical_units: 2,
+                max_tensor_elements: 20,
+                max_workspace_bytes: 32,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![row],
+            materialized_tensor_elements: 10,
+            workspace_bytes: 8,
+        };
+        assert!(batch.validate().is_ok());
+
+        batch.materialized_tensor_elements = 11;
+        assert!(batch.validate().is_err());
+        batch.materialized_tensor_elements = 10;
+        batch.rows[0].lane.shape_bucket = "tokens.2".to_string();
+        assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn physical_batch_reports_are_keyed_instead_of_positional() {
+        let lane = lane();
+        let mut first = plan_for(
+            SessionKey::new("one".to_string(), 1),
+            WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+        );
+        first.plan_id = 1;
+        first.batch_mode = NativeBatchMode::Static;
+        first.max_batch_size = 2;
+        let mut second = plan_for(
+            SessionKey::new("two".to_string(), 2),
+            WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+        );
+        second.plan_id = 2;
+        second.batch_mode = NativeBatchMode::Static;
+        second.max_batch_size = 2;
+
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(9),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Static,
+            budget: BatchBudget {
+                max_rows: 2,
+                max_logical_units: 2,
+                max_tensor_elements: 20,
+                max_workspace_bytes: 32,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![
+                ReadyQuantum {
+                    plan_id: first.plan_id,
+                    session: first.session.clone(),
+                    lane: lane.clone(),
+                    work: first.work.clone(),
+                    cost: WorkCost::new(1, 10, 8),
+                },
+                ReadyQuantum {
+                    plan_id: second.plan_id,
+                    session: second.session.clone(),
+                    lane: lane.clone(),
+                    work: second.work.clone(),
+                    cost: WorkCost::new(1, 10, 8),
+                },
+            ],
+            materialized_tensor_elements: 20,
+            workspace_bytes: 16,
+        };
+        let dispatch = BatchDispatch::new(BatchDispatchKind::TensorStatic, 2);
+        let mut first_report = report_for(
+            &first,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        first_report.dispatch = dispatch;
+        let mut second_report = report_for(
+            &second,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        second_report.dispatch = dispatch;
+        let active = HashMap::from([(first.plan_id, first), (second.plan_id, second)]);
+        let mut report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane: lane.clone(),
+            dispatch,
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: vec![
+                // Reverse order deliberately: identity, not position, reconciles rows.
+                PhysicalBatchRowReport {
+                    execution: second_report.clone(),
+                    state: StateDisposition::ValidNext,
+                },
+                PhysicalBatchRowReport {
+                    execution: first_report.clone(),
+                    state: StateDisposition::ValidNext,
+                },
+            ],
+        };
+        assert!(report.validate_against(&batch, &active).is_ok());
+
+        report.rows[1] = report.rows[0].clone();
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[1] = PhysicalBatchRowReport {
+            execution: first_report,
+            state: StateDisposition::ValidNext,
+        };
+        report.rows[1].execution.session = SessionKey::new("foreign".to_string(), 99);
+        assert!(report.validate_against(&batch, &active).is_err());
+    }
+
+    #[test]
+    fn same_session_retry_requires_reusable_model_state() {
+        let lane = lane();
+        let mut plan = plan_for(
+            SessionKey::new("retry".to_string(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        plan.batch_mode = NativeBatchMode::Continuous;
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(10),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Continuous,
+            budget: BatchBudget::width_one(),
+            rows: vec![ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: plan.session.clone(),
+                lane: lane.clone(),
+                work: plan.work.clone(),
+                cost: WorkCost::new(1, 1, 1),
+            }],
+            materialized_tensor_elements: 1,
+            workspace_bytes: 1,
+        };
+        let failure = ExecutionFailure {
+            kind: FailureKind::Backend,
+            scope: FailureScope::Row,
+            retry: RetryDisposition::RetrySameSession,
+            health: HealthImpact::Degraded,
+            message: "retry".to_string(),
+        };
+        let mut execution = report_for(&plan, ExecutionDisposition::Failed(failure));
+        execution.dispatch = BatchDispatch::new(BatchDispatchKind::TensorContinuous, 1);
+        let active = HashMap::from([(plan.plan_id, plan)]);
+        let mut report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane,
+            dispatch: execution.dispatch,
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: vec![PhysicalBatchRowReport {
+                execution,
+                state: StateDisposition::ValidNext,
+            }],
+        };
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[0].state = StateDisposition::RolledBack;
+        assert!(report.validate_against(&batch, &active).is_ok());
     }
 
     #[test]
@@ -1286,7 +1748,7 @@ mod tests {
         tracker.begin_plan(&plan).unwrap();
         let retryable = ExecutionFailure {
             kind: FailureKind::Backend,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::RetrySameSession,
             health: HealthImpact::Degraded,
             message: "transient".to_string(),
@@ -1335,7 +1797,7 @@ mod tests {
 
         let retry = ExecutionFailure {
             kind: FailureKind::Backend,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::RetrySameSession,
             health: HealthImpact::Degraded,
             message: "transient".to_string(),
@@ -1363,7 +1825,7 @@ mod tests {
 
         let recompute = ExecutionFailure {
             kind: FailureKind::Backend,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::Recompute,
             health: HealthImpact::Degraded,
             message: "cache invalidated".to_string(),

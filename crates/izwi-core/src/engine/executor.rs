@@ -338,7 +338,7 @@ impl ModelSessionResult {
     fn executor_failure(message: String) -> ExecutionDisposition {
         ExecutionDisposition::Failed(ExecutionFailure {
             kind: FailureKind::Executor,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::Never,
             health: HealthImpact::None,
             message,

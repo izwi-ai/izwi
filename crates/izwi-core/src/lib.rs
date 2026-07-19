@@ -44,18 +44,19 @@ pub mod tokenizer;
 // Re-export main types from the new engine module
 pub use engine::{
     AdapterAbiRevision, AdapterInstanceId, AsrEngineInput, AsrProgress, AsrProgressPhase,
-    AudioChatEngineInput, BatchBudget, BatchId, BatchKey, CacheResidency, ChatEngineInput, Engine,
-    EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics, EngineOutput,
-    EngineTask, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
-    ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport,
-    ExecutionState, ExecutorStepResult, FailureKind, FailureScope, FinishReason, GenerationParams,
-    HealthImpact, KVCacheManager, MembershipSafePoint, ModelExecutor, ModelInstanceId,
-    ModelSessionResult, OutputProcessor, OutputVisibility, PinnedBlockHandle, Priority,
-    RequestProcessor, RequestStatus, ResourceAmount, ResourceEstimate, ResourceLedger,
-    ResourceReservation, ResourceVector, RetryDisposition, Scheduler, SchedulerConfig,
-    SchedulingPolicy, SessionEpoch, SessionKey, StageDescriptor, StageId, StageProgressKind,
-    StageShapePolicy, StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit,
-    WorkloadClass, YieldReason,
+    AudioChatEngineInput, BatchBudget, BatchId, BatchKey, BatchLaneKey, CacheResidency,
+    ChatEngineInput, Engine, EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest,
+    EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities, ExecutionDisposition,
+    ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind,
+    FailureScope, FinishReason, GenerationParams, HealthImpact, KVCacheManager,
+    MembershipSafePoint, ModelExecutor, ModelInstanceId, ModelSessionResult, OutputProcessor,
+    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PinnedBlockHandle,
+    PlanId, Priority, ReadyQuantum, RequestProcessor, RequestStatus, ResourceAmount,
+    ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector, RetryDisposition,
+    Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, StageDescriptor,
+    StageId, StageProgressKind, StageShapePolicy, StateDisposition, StreamingOutput,
+    TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass, YieldReason,
 };
 
 // Legacy re-exports for backward compatibility

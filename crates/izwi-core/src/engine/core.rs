@@ -2809,7 +2809,7 @@ mod tests {
                 },
                 disposition: ExecutionDisposition::Failed(ExecutionFailure {
                     kind: super::super::execution::FailureKind::Backend,
-                    scope: super::super::execution::FailureScope::Request,
+                    scope: super::super::execution::FailureScope::Row,
                     retry,
                     health: super::super::execution::HealthImpact::Degraded,
                     message: "transient backend failure".to_string(),
