@@ -1050,21 +1050,6 @@ impl RuntimeService {
         stream.variant
     }
 
-    async fn load_asr_model_for_job(
-        &self,
-        job: &JobLease,
-        variant: ModelVariant,
-    ) -> Result<ModelResidencyLease> {
-        match job.spec.deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline.into(), self.load_model_for_inference(variant))
-                    .await
-                    .map_err(|_| Error::Timeout(job.spec.request_id.clone()))?
-            }
-            None => self.load_model_for_inference(variant).await,
-        }
-    }
-
     async fn asr_transcribe_audio_chat<F>(
         &self,
         variant: ModelVariant,

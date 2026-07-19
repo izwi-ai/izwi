@@ -519,7 +519,8 @@ impl InferenceCoordinator {
     /// Execute synchronous model work off Tokio workers while retaining the
     /// execution permit and job reservation until physical work really ends.
     /// Deadline expiry detaches the blocking task instead of cancelling it.
-    pub async fn run_blocking_stage<T, F>(
+    #[cfg(test)]
+    pub(crate) async fn run_blocking_stage<T, F>(
         self: &Arc<Self>,
         job: &JobLease,
         operation: F,
