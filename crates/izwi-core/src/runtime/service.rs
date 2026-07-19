@@ -1336,17 +1336,11 @@ impl RuntimeService {
                     idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                     continue;
                 }
-                let _execution = match coordinator.acquire_engine_step().await {
-                    Ok(lease) => lease,
-                    Err(err) => {
-                        error!("Inference coordinator closed: {err}");
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                };
-                let step_result = std::panic::AssertUnwindSafe(engine.step_for_dispatch())
-                    .catch_unwind()
-                    .await;
+                let step_result = std::panic::AssertUnwindSafe(
+                    coordinator.run_engine_step(engine.step_for_dispatch()),
+                )
+                .catch_unwind()
+                .await;
                 match step_result {
                     Ok(Ok(outputs)) => {
                         if outputs.is_empty() {

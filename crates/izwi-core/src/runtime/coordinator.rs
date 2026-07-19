@@ -307,7 +307,7 @@ impl InferenceCoordinator {
         })
     }
 
-    pub async fn acquire_execution(
+    async fn acquire_execution(
         self: &Arc<Self>,
         deadline: Option<Instant>,
     ) -> Result<ExecutionLease> {
@@ -318,13 +318,25 @@ impl InferenceCoordinator {
     /// A CUDA step may fan out across `request_parallelism` worker threads, so
     /// holding a single permit would allow unrelated direct work to exceed the
     /// configured device concurrency. CPU and Metal have capacity one.
-    pub async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
+    async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
         self.acquire_execution_units(self.capacity, None).await
     }
 
+    /// Run one scheduler step while exclusively owning this backend's complete
+    /// execution budget. Callers provide work, but never receive or retain a
+    /// raw device permit; all model-forward routes therefore share this one
+    /// coordinator-owned execution boundary.
+    pub(crate) async fn run_engine_step<T, F>(self: &Arc<Self>, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let _execution = self.acquire_engine_step().await?;
+        future.await
+    }
+
     /// Reserve scratch memory for one physical tensor dispatch. This does not
-    /// acquire execution capacity; the execution-group runner owns exactly one
-    /// execution permit independently for the duration of device work.
+    /// acquire execution capacity; the coordinator-owned engine or direct
+    /// runner retains execution capacity independently for the device work.
     pub(crate) fn reserve_batch_workspace(
         &self,
         execution_group: ExecutionGroupId,
@@ -341,7 +353,7 @@ impl InferenceCoordinator {
             .reserve_batch_workspace(execution_group, batch_id, resources)
     }
 
-    pub async fn acquire_execution_units(
+    async fn acquire_execution_units(
         self: &Arc<Self>,
         units: usize,
         deadline: Option<Instant>,
@@ -1289,7 +1301,7 @@ fn cuda_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySo
 }
 
 #[derive(Debug)]
-pub struct ExecutionLease {
+struct ExecutionLease {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
 }
@@ -2100,7 +2112,19 @@ Pages free: 10.\n";
     #[tokio::test]
     async fn engine_step_reserves_all_cuda_execution_units() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
-        let engine_step = coordinator.acquire_engine_step().await.unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let runner_coordinator = coordinator.clone();
+        let runner = tokio::spawn(async move {
+            runner_coordinator
+                .run_engine_step(async move {
+                    release_rx.await.unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        while coordinator.snapshot().active_executions == 0 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(coordinator.snapshot().active_executions, 1);
 
         let competing = coordinator
@@ -2108,7 +2132,8 @@ Pages free: 10.\n";
             .await;
         assert!(matches!(competing, Err(Error::Timeout(_))));
 
-        drop(engine_step);
+        release_tx.send(()).unwrap();
+        runner.await.unwrap().unwrap();
         coordinator.acquire_execution(None).await.unwrap();
     }
 
