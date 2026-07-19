@@ -8,7 +8,9 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
-use crate::engine::{AsrProgress, AsrProgressPhase, ResourceAmount, ResourceVector, TaskType};
+use crate::engine::{
+    AsrProgress, AsrProgressPhase, ResourceAmount, ResourceVector, TaskType, WorkUnit,
+};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
@@ -18,7 +20,7 @@ use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
-use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
@@ -1013,6 +1015,7 @@ impl RuntimeService {
         variant: ModelVariant,
         audio_input: AsrAudioInput<'_>,
         max_tokens: Option<usize>,
+        streaming_required: bool,
         on_delta: F,
         request_id: String,
         runtime_context: RuntimeRequestContext,
@@ -1047,7 +1050,15 @@ impl RuntimeService {
             audio_input.retained_bytes(),
         ])?)?;
 
-        let residency_lease = self.load_asr_model_for_job(&job, variant).await?;
+        let (residency_lease, execution_contract) = self
+            .load_capability_for_job(
+                &job,
+                variant,
+                CapabilityKind::Asr,
+                streaming_required,
+                ExecutionTargetKind::DirectModel,
+            )
+            .await?;
         let model = self
             .model_registry
             .get_audio_chat(variant)
@@ -1057,42 +1068,49 @@ impl RuntimeService {
             })?;
         let observation_job = job.clone();
         self.coordinator
-            .run_blocking_stage(&job, move || {
-                let _residency_lease = residency_lease;
-                let retained_audio_bytes = audio_input.retained_bytes();
-                let (samples, sample_rate) = audio_input.decode()?;
-                let steady_usage = decoded_audio_observation(input_bytes, samples.capacity())?;
-                observation_job.record_materialized_usage(add_retained_host_bytes(
-                    steady_usage,
-                    retained_audio_bytes,
-                )?)?;
-                observation_job.prepare_materialized_release(steady_usage)?;
-                drop(audio_input);
-                let duration_secs = if sample_rate > 0 {
-                    samples.len() as f32 / sample_rate as f32
-                } else {
-                    0.0
-                };
-                let mut on_delta = on_delta;
-                let mut delta_sink = |delta: &str| {
-                    if !delta.is_empty() {
-                        on_delta(delta.to_string());
-                    }
-                };
-                let output = model.transcribe_with_callback_and_max_tokens(
-                    &samples,
-                    sample_rate,
-                    max_tokens,
-                    &mut delta_sink,
-                )?;
+            .run_loaded_blocking_stage(
+                &job,
+                execution_contract,
+                WorkUnit::AtomicJob {
+                    kind: "asr.audio_chat".to_string(),
+                },
+                move || {
+                    let _residency_lease = residency_lease;
+                    let retained_audio_bytes = audio_input.retained_bytes();
+                    let (samples, sample_rate) = audio_input.decode()?;
+                    let steady_usage = decoded_audio_observation(input_bytes, samples.capacity())?;
+                    observation_job.record_materialized_usage(add_retained_host_bytes(
+                        steady_usage,
+                        retained_audio_bytes,
+                    )?)?;
+                    observation_job.prepare_materialized_release(steady_usage)?;
+                    drop(audio_input);
+                    let duration_secs = if sample_rate > 0 {
+                        samples.len() as f32 / sample_rate as f32
+                    } else {
+                        0.0
+                    };
+                    let mut on_delta = on_delta;
+                    let mut delta_sink = |delta: &str| {
+                        if !delta.is_empty() {
+                            on_delta(delta.to_string());
+                        }
+                    };
+                    let output = model.transcribe_with_callback_and_max_tokens(
+                        &samples,
+                        sample_rate,
+                        max_tokens,
+                        &mut delta_sink,
+                    )?;
 
-                Ok(AsrTranscription {
-                    text: output.text,
-                    language: output.language,
-                    duration_secs,
-                    asr_diagnostics: output.diagnostics,
-                })
-            })
+                    Ok(AsrTranscription {
+                        text: output.text,
+                        language: output.language,
+                        duration_secs,
+                        asr_diagnostics: output.diagnostics,
+                    })
+                },
+            )
             .await
     }
 
@@ -1249,6 +1267,7 @@ impl RuntimeService {
                     variant,
                     AsrAudioInput::Base64(audio_base64),
                     max_tokens,
+                    false,
                     |_delta| {},
                     correlation_id
                         .map(ToOwned::to_owned)
@@ -1348,6 +1367,7 @@ impl RuntimeService {
                     variant,
                     AsrAudioInput::Base64(audio_base64),
                     max_tokens,
+                    true,
                     on_delta,
                     correlation_id
                         .map(ToOwned::to_owned)
@@ -1466,6 +1486,7 @@ impl RuntimeService {
                     variant,
                     AsrAudioInput::Bytes(audio_bytes),
                     max_tokens,
+                    false,
                     |_delta| {},
                     correlation_id
                         .map(ToOwned::to_owned)
@@ -1633,6 +1654,7 @@ impl RuntimeService {
                     variant,
                     AsrAudioInput::Bytes(audio_bytes),
                     max_tokens,
+                    broker_streaming_required,
                     on_delta,
                     correlation_id
                         .map(ToOwned::to_owned)
