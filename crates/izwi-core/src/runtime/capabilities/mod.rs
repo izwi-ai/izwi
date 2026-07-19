@@ -6,14 +6,12 @@
 //! this capability under this stream mode?
 
 use crate::backends::BackendKind;
-use crate::catalog::{ModelFamily, ModelVariant};
-use crate::engine::{
-    CacheMode, CancellationGranularity, ExecutionMode, ExecutionProfile, NativeBatchMode,
-    PrefillMode,
-};
+use crate::catalog::ModelVariant;
+use crate::engine::ExecutionProfile;
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{
-    AdapterMetadata, CapabilityKind, ExecutionTargetKind, RuntimeAdapterRegistry, StreamingMode,
+    compatibility_execution_profile, AdapterMetadata, CapabilityKind, ExecutionTargetKind,
+    RuntimeAdapterRegistry, StreamingMode,
 };
 use serde::Serialize;
 
@@ -62,7 +60,7 @@ impl CapabilityExecutionPlan {
         streaming_required: bool,
     ) -> Self {
         let mut execution_profile =
-            route_execution_profile(metadata, backend_kind, streaming_required);
+            compatibility_execution_profile(metadata, backend_kind, streaming_required);
         execution_profile.resolved_from_loaded_model = false;
         Self {
             adapter_id: metadata.id,
@@ -73,64 +71,6 @@ impl CapabilityExecutionPlan {
             execution_profile,
         }
     }
-}
-
-fn route_execution_profile(
-    metadata: AdapterMetadata,
-    backend_kind: BackendKind,
-    streaming_required: bool,
-) -> ExecutionProfile {
-    let variant = metadata.model_variant;
-    let family = variant.family();
-    let sequence = match metadata.capability {
-        CapabilityKind::Chat => {
-            matches!(family, ModelFamily::Qwen35Chat)
-                || matches!(
-                    variant,
-                    ModelVariant::Qwen306B
-                        | ModelVariant::Qwen306B4Bit
-                        | ModelVariant::Qwen317B
-                        | ModelVariant::Qwen317B4Bit
-                )
-        }
-        CapabilityKind::Tts | CapabilityKind::StreamingTts => family == ModelFamily::Qwen3Tts,
-        CapabilityKind::Asr => family == ModelFamily::Qwen3Asr && streaming_required,
-        _ => false,
-    };
-    let mode = if sequence {
-        ExecutionMode::Sequence
-    } else {
-        match metadata.execution_target {
-            ExecutionTargetKind::RealtimeRunner => ExecutionMode::Realtime,
-            ExecutionTargetKind::PipelineRunner => ExecutionMode::Pipeline,
-            ExecutionTargetKind::Artifact => ExecutionMode::Artifact,
-            ExecutionTargetKind::TokenEngine
-            | ExecutionTargetKind::BatchRunner
-            | ExecutionTargetKind::DirectModel => ExecutionMode::Atomic,
-        }
-    };
-    let mut profile = ExecutionProfile::fail_closed(backend_kind, Some(variant), mode);
-    if sequence {
-        profile.prefill = PrefillMode::Full;
-        profile.incremental_decode = true;
-        profile.cache_mode = CacheMode::OpaqueModelOwned;
-    }
-    if metadata.capability == CapabilityKind::Asr {
-        profile.cancellation = CancellationGranularity::OperationBoundary;
-    }
-    // The existing Qwen TTS batch API is static and request-shape dependent;
-    // the runtime route cannot prove those conditions, so it remains disabled
-    // here and is enabled only by the loaded executor profile.
-    profile.prefill_batch = NativeBatchMode::None;
-    profile.compute_dtype = "loaded_model_default".to_string();
-    profile.kv_dtype = if sequence {
-        "loaded_model_default".to_string()
-    } else {
-        "none".to_string()
-    };
-    profile.cache_namespace =
-        sequence.then(|| format!("{}:{}:opaque", variant, backend_kind.as_str()));
-    profile
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +109,7 @@ impl<'a> CapabilityExecutionRegistry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ExecutionMode;
     use crate::model::ModelVariant;
 
     #[test]

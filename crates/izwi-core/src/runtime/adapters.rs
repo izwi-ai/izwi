@@ -1,15 +1,21 @@
-//! Runtime capability adapter registry.
-//!
-//! The registry is intentionally metadata-first for now. It gives runtime
-//! orchestration one stable place to ask whether a model can satisfy a
-//! capability before dispatch reaches concrete model-family code.
+//! Runtime capability adapters and loaded-model execution bindings.
 
 use std::collections::HashMap;
 
 use serde::Serialize;
 
+use crate::backends::BackendKind;
+use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
+use crate::engine::{
+    CacheMode, CancellationGranularity, ExecutionMode, ExecutionProfile, NativeBatchMode,
+    PrefillMode,
+};
 use crate::error::{Error, Result};
+
+mod loaded;
+
+pub(crate) use loaded::LoadedModelBundle;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -27,6 +33,25 @@ pub(crate) enum CapabilityKind {
     Vad,
     Endpointing,
     Tokenizer,
+}
+
+impl CapabilityKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asr => "asr",
+            Self::RealtimeAsr => "realtime_asr",
+            Self::Tts => "tts",
+            Self::StreamingTts => "streaming_tts",
+            Self::Chat => "chat",
+            Self::AudioChat => "audio_chat",
+            Self::SpeechToSpeech => "speech_to_speech",
+            Self::Diarization => "diarization",
+            Self::ForcedAlignment => "forced_alignment",
+            Self::Vad => "vad",
+            Self::Endpointing => "endpointing",
+            Self::Tokenizer => "tokenizer",
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -121,6 +146,63 @@ impl RuntimeAdapterRegistry {
             }
         }
     }
+}
+
+pub(crate) fn compatibility_execution_profile(
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    streaming_required: bool,
+) -> ExecutionProfile {
+    let variant = metadata.model_variant;
+    let family = variant.family();
+    let sequence = match metadata.capability {
+        CapabilityKind::Chat => {
+            matches!(family, ModelFamily::Qwen35Chat)
+                || matches!(
+                    variant,
+                    ModelVariant::Qwen306B
+                        | ModelVariant::Qwen306B4Bit
+                        | ModelVariant::Qwen317B
+                        | ModelVariant::Qwen317B4Bit
+                )
+        }
+        CapabilityKind::Tts | CapabilityKind::StreamingTts => family == ModelFamily::Qwen3Tts,
+        CapabilityKind::Asr => family == ModelFamily::Qwen3Asr && streaming_required,
+        _ => false,
+    };
+    let mode = if sequence {
+        ExecutionMode::Sequence
+    } else {
+        match metadata.execution_target {
+            ExecutionTargetKind::RealtimeRunner => ExecutionMode::Realtime,
+            ExecutionTargetKind::PipelineRunner => ExecutionMode::Pipeline,
+            ExecutionTargetKind::Artifact => ExecutionMode::Artifact,
+            ExecutionTargetKind::TokenEngine
+            | ExecutionTargetKind::BatchRunner
+            | ExecutionTargetKind::DirectModel => ExecutionMode::Atomic,
+        }
+    };
+    let mut profile = ExecutionProfile::fail_closed(backend_kind, Some(variant), mode);
+    if sequence {
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.cache_mode = CacheMode::OpaqueModelOwned;
+    }
+    if metadata.capability == CapabilityKind::Asr {
+        profile.cancellation = CancellationGranularity::OperationBoundary;
+    }
+    profile.prefill_batch = NativeBatchMode::None;
+    profile.decode_batch = NativeBatchMode::None;
+    profile.max_batch_size = 1;
+    profile.compute_dtype = "loaded_model_default".to_string();
+    profile.kv_dtype = if sequence {
+        "loaded_model_default".to_string()
+    } else {
+        "none".to_string()
+    };
+    profile.cache_namespace =
+        sequence.then(|| format!("{}:{}:opaque", variant, backend_kind.as_str()));
+    profile
 }
 
 fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {

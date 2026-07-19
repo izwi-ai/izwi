@@ -316,6 +316,7 @@ impl ModelLifecycleController {
             // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
             self.publish_loaded_model(instantiated).await?;
+            self.bind_loaded_model_bundle(variant, model_instance_id)?;
             // The physical allocation is now visible to the live provider.
             // Reconcile before Ready publication so it is no longer counted as
             // both pending ledger work and observed backend memory. CUDA drops
@@ -971,6 +972,17 @@ mod tests {
             .expect("ready instance lease");
         assert_eq!(lease.model_instance_id(), Some(installed_instance));
         drop(lease);
+        let bundle = runtime
+            .model_lifecycle
+            .try_get_ready_bundle(variant)
+            .expect("ready execution bundle");
+        assert_eq!(bundle.model_instance_id(), installed_instance);
+        assert_eq!(bundle.model_variant(), variant);
+        assert_eq!(
+            bundle.execution_group_id(),
+            runtime.coordinator.execution_group_id()
+        );
+        assert!(bundle.adapter_count() > 0);
         let unload_controller = runtime.model_lifecycle.clone();
         let unload_events = events.clone();
         let mut unload = tokio::spawn(async move {

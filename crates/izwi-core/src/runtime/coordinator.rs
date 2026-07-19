@@ -20,6 +20,8 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 
+static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoordinatorLane {
     Realtime,
@@ -79,6 +81,7 @@ pub struct CoordinatorSnapshot {
 
 #[derive(Debug)]
 pub struct InferenceCoordinator {
+    execution_group_id: ExecutionGroupId,
     capacity: usize,
     backend: BackendKind,
     jobs: Arc<Semaphore>,
@@ -135,6 +138,9 @@ impl InferenceCoordinator {
             BackendKind::Cuda => execution_parallelism.max(1),
         };
         Self {
+            execution_group_id: ExecutionGroupId::new(
+                NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed),
+            ),
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
@@ -154,6 +160,10 @@ impl InferenceCoordinator {
 
     pub fn resource_authority(&self) -> Arc<ResourceAuthority> {
         self.resources.clone()
+    }
+
+    pub(crate) fn execution_group_id(&self) -> ExecutionGroupId {
+        self.execution_group_id
     }
 
     pub fn snapshot(&self) -> CoordinatorSnapshot {

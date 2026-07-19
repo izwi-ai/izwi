@@ -660,7 +660,7 @@ pub struct RuntimeService {
     pub(crate) config: EngineConfig,
     pub(crate) backend_router: BackendRouter,
     pub(crate) inference_broker: InferenceBroker,
-    pub(crate) adapter_registry: RuntimeAdapterRegistry,
+    pub(crate) adapter_registry: Arc<RuntimeAdapterRegistry>,
     pub(crate) model_manager: Arc<ModelManager>,
     pub(crate) model_registry: Arc<ModelRegistry>,
     pub(crate) tokenizer: Arc<RwLock<Option<Tokenizer>>>,
@@ -979,9 +979,11 @@ impl RuntimeService {
         let tokenizer = Arc::new(RwLock::new(None));
         let codec = Arc::new(RwLock::new(AudioCodec::new()));
         let loaded_tts_variant = Arc::new(RwLock::new(None));
+        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in());
         let model_lifecycle = Arc::new(ModelLifecycleController::new(
             config.clone(),
             backend_router.clone(),
+            adapter_registry.clone(),
             model_manager.clone(),
             model_registry.clone(),
             core_engine.clone(),
@@ -995,7 +997,7 @@ impl RuntimeService {
             config,
             backend_router,
             inference_broker: InferenceBroker::from_env(),
-            adapter_registry: RuntimeAdapterRegistry::built_in(),
+            adapter_registry,
             model_manager,
             model_registry,
             tokenizer,
