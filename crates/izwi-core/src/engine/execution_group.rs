@@ -249,9 +249,13 @@ pub(super) fn reconcile_executor_outputs(
     let outputs = match result {
         Ok(outputs) => outputs,
         Err(err) => {
+            let dispatch = super::BatchDispatch::not_dispatched(scheduled.len());
             return scheduled
                 .iter()
-                .map(|entry| failed_step_result(entry, format!("{phase} executor failed: {err}")))
+                .map(|entry| {
+                    failed_step_result(entry, format!("{phase} executor failed: {err}"))
+                        .with_dispatch(dispatch)
+                })
                 .collect();
         }
     };
@@ -474,6 +478,30 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("did not return"));
+    }
+
+    #[test]
+    fn executor_batch_error_is_reported_as_one_failed_physical_dispatch() {
+        let scheduled = vec![scheduled("req-a", 1, 0), scheduled("req-b", 2, 1)];
+
+        let reconciled = reconcile_executor_outputs(
+            "decode",
+            &scheduled,
+            Err(crate::error::Error::InferenceError(
+                "tensor kernel failed".to_string(),
+            )),
+        );
+
+        assert_eq!(reconciled.len(), 2);
+        assert!(reconciled.iter().all(|result| {
+            result.dispatch.kind == BatchDispatchKind::NotDispatched
+                && result.dispatch.width == 2
+                && result
+                    .output
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("tensor kernel failed"))
+        }));
     }
 
     #[tokio::test]
