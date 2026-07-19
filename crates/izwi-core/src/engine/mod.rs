@@ -52,7 +52,7 @@ pub use execution::{
     OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId,
     PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase, SessionEpoch, SessionKey,
     StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
-    TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    StageWorkSelector, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
@@ -1299,6 +1299,11 @@ mod tests {
 
             self.max_batch_width
                 .fetch_max(scheduled.len(), Ordering::Relaxed);
+            let dispatch = if scheduled.len() > 1 {
+                BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len())
+            } else {
+                BatchDispatch::serial()
+            };
             scheduled
                 .iter()
                 .map(|entry| {
@@ -1317,10 +1322,7 @@ mod tests {
                             error: None,
                         },
                     )
-                    .with_dispatch(BatchDispatch::new(
-                        BatchDispatchKind::TensorStatic,
-                        scheduled.len(),
-                    ))
+                    .with_dispatch(dispatch)
                 })
                 .collect()
         }
@@ -1834,7 +1836,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_dispatches_batched_terminal_outputs_to_registered_mailboxes() {
+    async fn run_routes_scalar_terminal_outputs_to_registered_mailboxes() {
         let max_batch_width = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = Arc::new(engine_with_test_executor(Box::new(
             ImmediateTerminalExecutor::new(max_batch_width.clone()),
@@ -1877,8 +1879,8 @@ mod tests {
         assert_eq!(second.request_id, "run-second");
         assert_eq!(
             max_batch_width.load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "run must route every output from the shared terminal batch"
+            1,
+            "unbound direct callers must remain on width-one compatibility execution"
         );
 
         // Exact-session acknowledgement happens after the mailboxes are routed,

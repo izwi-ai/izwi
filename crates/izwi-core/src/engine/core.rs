@@ -13,10 +13,10 @@ use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, BatchKey, CacheMode, ExecutionDisposition, ExecutionFailure, ExecutionMode,
-    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
-    FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode, RetryDisposition,
-    WorkUnit,
+    BatchDispatch, BatchKey, CacheMode, ConcurrencyClass, ExecutionDisposition, ExecutionFailure,
+    ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState,
+    ExecutionTracker, FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode,
+    RetryDisposition, WorkUnit,
 };
 use super::execution_group::{
     reconcile_executor_outputs, ExecutedEngineStep, ExecutionGroupRunner, PreparedEngineStep,
@@ -211,13 +211,98 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
+    fn force_scalar_execution(mut profile: ExecutionProfile) -> ExecutionProfile {
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::None;
+        profile.max_batch_size = 1;
+        profile.concurrency = ConcurrencyClass::Exclusive;
+        profile
+    }
+
+    fn apply_adapter_execution_contract(
+        request: &EngineCoreRequest,
+        mut profile: ExecutionProfile,
+    ) -> Result<ExecutionProfile> {
+        let Some(binding) = request.execution_adapter_binding() else {
+            return Ok(Self::force_scalar_execution(profile));
+        };
+
+        let prefill_work = WorkUnit::SequenceStep {
+            phase: super::SequencePhase::Prefill,
+            input: super::InputRange { start: 0, end: 0 },
+            max_output_steps: 1,
+        };
+        let decode_work = WorkUnit::SequenceStep {
+            phase: super::SequencePhase::Decode,
+            input: super::InputRange { start: 0, end: 0 },
+            max_output_steps: 1,
+        };
+        let atomic_work = WorkUnit::AtomicJob {
+            kind: format!("{:?}", request.task_type).to_ascii_lowercase(),
+        };
+        let pipeline_work = WorkUnit::PipelineStage {
+            name: format!("{:?}", request.task_type).to_ascii_lowercase(),
+            ordinal: 0,
+        };
+
+        let (prefill_stage, decode_stage) = match profile.mode {
+            ExecutionMode::Sequence | ExecutionMode::Realtime => (
+                Some(binding.stage_for_work(&prefill_work)?),
+                Some(binding.stage_for_work(&decode_work)?),
+            ),
+            ExecutionMode::Atomic | ExecutionMode::Artifact => {
+                (Some(binding.stage_for_work(&atomic_work)?), None)
+            }
+            ExecutionMode::Pipeline => (Some(binding.stage_for_work(&pipeline_work)?), None),
+        };
+
+        let verify_mode = |phase: &str,
+                           declared: NativeBatchMode,
+                           stage: Option<&super::StageDescriptor>|
+         -> Result<NativeBatchMode> {
+            let Some(stage) = stage else {
+                return Ok(NativeBatchMode::None);
+            };
+            if stage.batch_mode == NativeBatchMode::None {
+                return Ok(NativeBatchMode::None);
+            }
+            if stage.batch_mode != declared {
+                return Err(Error::InferenceError(format!(
+                    "loaded adapter stage {} advertises {:?} {phase} batching, but the executor declared {:?}",
+                    stage.name, stage.batch_mode, declared
+                )));
+            }
+            Ok(stage.batch_mode)
+        };
+
+        profile.prefill_batch = verify_mode("prefill", profile.prefill_batch, prefill_stage)?;
+        profile.decode_batch = verify_mode("decode", profile.decode_batch, decode_stage)?;
+        let max_batch_size = [prefill_stage, decode_stage]
+            .into_iter()
+            .flatten()
+            .filter(|stage| stage.batch_mode != NativeBatchMode::None)
+            .map(|stage| stage.max_batch_size)
+            .min();
+        profile.max_batch_size = max_batch_size
+            .map(|maximum| profile.max_batch_size.min(maximum).max(1))
+            .unwrap_or(1);
+        profile.concurrency = if profile.prefill_batch != NativeBatchMode::None
+            || profile.decode_batch != NativeBatchMode::None
+        {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        Ok(profile)
+    }
+
     async fn refresh_scheduler_execution_profiles(&mut self) {
         let requests: Vec<_> = self.requests.values().cloned().collect();
         for request in requests {
             let Some(epoch) = self.scheduler.get_sequence_id(&request.id) else {
                 continue;
             };
-            let profile = self
+            let raw_profile = self
                 .executor
                 .execution_profile(&request)
                 .await
@@ -228,6 +313,20 @@ impl EngineCore {
                         ExecutionMode::Atomic,
                     )
                 });
+            let profile = match Self::apply_adapter_execution_contract(
+                &request,
+                raw_profile.clone(),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    warn!(
+                        request_id = %request.id,
+                        error = %error,
+                        "Loaded adapter contract disagrees with executor; forcing scalar scheduling"
+                    );
+                    Self::force_scalar_execution(raw_profile)
+                }
+            };
             self.scheduler.update_execution_profile(
                 &super::SessionKey::new(request.id.clone(), epoch),
                 &profile,
@@ -249,7 +348,7 @@ impl EngineCore {
                     scheduled.request_id
                 ))
             })?;
-        let profile = self
+        let raw_profile = self
             .executor
             .execution_profile(&request)
             .await
@@ -260,6 +359,7 @@ impl EngineCore {
                     ExecutionMode::Atomic,
                 )
             });
+        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)?;
         if scheduled.is_prefill
             && profile.prefill == PrefillMode::Full
             && (scheduled.num_computed_tokens != 0
@@ -315,11 +415,21 @@ impl EngineCore {
         };
         let bound_stage = request
             .execution_adapter_binding()
-            .map(|binding| binding.primary_stage().clone());
+            .map(|binding| binding.stage_for_work(&work).cloned())
+            .transpose()?;
         let bound_adapter = request
             .execution_adapter_binding()
-            .map(|binding| binding.key_for_stage(binding.primary_stage().id))
+            .zip(bound_stage.as_ref())
+            .map(|(binding, stage)| binding.key_for_stage(stage.id))
             .transpose()?;
+        let batch_mode = bound_stage
+            .as_ref()
+            .map_or(NativeBatchMode::None, |stage| stage.batch_mode);
+        let max_batch_size = bound_stage
+            .as_ref()
+            .filter(|stage| stage.batch_mode != NativeBatchMode::None)
+            .map(|stage| stage.max_batch_size.min(profile.max_batch_size).max(1))
+            .unwrap_or(1);
         let plan = ExecutionPlan {
             plan_id: scheduled.plan_id,
             session: scheduled.session_key(),
@@ -336,12 +446,8 @@ impl EngineCore {
                     .unwrap_or_else(|| "none".to_string()),
                 adapter: bound_adapter,
             },
-            batch_mode: if scheduled.is_prefill {
-                profile.prefill_batch
-            } else {
-                profile.decode_batch
-            },
-            max_batch_size: profile.max_batch_size.max(1),
+            batch_mode,
+            max_batch_size,
             estimate,
             stage: bound_stage,
         };
@@ -2573,6 +2679,42 @@ mod tests {
             vec![1, 1, 1],
             "opposite model generations must never share a native batch"
         );
+    }
+
+    #[test]
+    fn loaded_stage_contract_is_authoritative_over_legacy_executor_batching() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let model_instance = super::super::ModelInstanceId::new(2);
+        let mut request = EngineCoreRequest::tts("contract").with_model_variant(variant);
+        request.bind_model_instance(model_instance).unwrap();
+        let mut declared =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        declared.prefill_batch = NativeBatchMode::Static;
+        declared.max_batch_size = 8;
+        declared.concurrency = ConcurrencyClass::Batchable;
+        let compatibility_stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(0),
+            "tts.compatibility",
+            &declared,
+            NativeBatchMode::None,
+        );
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: super::super::ExecutionGroupId::new(1),
+                model_instance_id: model_instance,
+                adapter_instance_id: super::super::AdapterInstanceId::new(3),
+                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "tts".to_string(),
+                stages: Arc::from([compatibility_stage]),
+            })
+            .unwrap();
+
+        let effective = EngineCore::apply_adapter_execution_contract(&request, declared).unwrap();
+        assert_eq!(effective.prefill_batch, NativeBatchMode::None);
+        assert_eq!(effective.decode_batch, NativeBatchMode::None);
+        assert_eq!(effective.max_batch_size, 1);
+        assert_eq!(effective.concurrency, ConcurrencyClass::Exclusive);
     }
 
     #[test]

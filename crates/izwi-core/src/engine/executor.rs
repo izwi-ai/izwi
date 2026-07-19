@@ -973,6 +973,12 @@ fn static_qwen_tts_batch_eligible(
             .is_some_and(|capabilities| capabilities.supports_builtin_voices)
         && loaded_has_speakers
         && rollout_enabled
+        && request.execution_adapter_binding().is_some_and(|binding| {
+            binding
+                .stages
+                .iter()
+                .any(|stage| stage.batch_mode == NativeBatchMode::Static)
+        })
 }
 
 impl ModelExecutor for NativeExecutor {
@@ -1560,8 +1566,36 @@ mod tests {
 
     #[test]
     fn static_tts_batch_eligibility_is_fail_closed() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let mut request = EngineCoreRequest::tts("hello")
-            .with_model_variant(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+            .with_model_variant(variant);
+        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
+
+        let model_instance = super::super::ModelInstanceId::new(1);
+        request.bind_model_instance(model_instance).unwrap();
+        let mut profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(variant),
+            ExecutionMode::Atomic,
+        );
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "tts.generate",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: super::super::ExecutionGroupId::new(1),
+                model_instance_id: model_instance,
+                adapter_instance_id: super::super::AdapterInstanceId::new(1),
+                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "tts".to_string(),
+                stages: Arc::from([stage]),
+            })
+            .unwrap();
         assert!(static_qwen_tts_batch_eligible(&request, true, true));
         assert!(!static_qwen_tts_batch_eligible(&request, true, false));
         assert!(!static_qwen_tts_batch_eligible(&request, false, true));

@@ -163,6 +163,49 @@ pub enum StageProgressKind {
     InputDriven,
 }
 
+/// Model-owned routing from a scheduler work quantum to one execution stage.
+/// Exact selectors take precedence over a single compatibility fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StageWorkSelector {
+    Any,
+    SequencePrefill,
+    SequenceDecode,
+    Atomic,
+    Pipeline { ordinal: Option<usize> },
+}
+
+impl StageWorkSelector {
+    fn matches(self, work: &WorkUnit) -> bool {
+        match (self, work) {
+            (Self::Any, _) => true,
+            (
+                Self::SequencePrefill,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Prefill,
+                    ..
+                },
+            )
+            | (
+                Self::SequenceDecode,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    ..
+                },
+            )
+            | (Self::Atomic, WorkUnit::AtomicJob { .. }) => true,
+            (
+                Self::Pipeline { ordinal },
+                WorkUnit::PipelineStage {
+                    ordinal: work_ordinal,
+                    ..
+                },
+            ) => ordinal.is_none_or(|ordinal| ordinal == *work_ordinal),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageShapePolicy {
@@ -194,12 +237,15 @@ pub enum OutputVisibility {
 pub struct StageDescriptor {
     pub id: StageId,
     pub name: String,
+    pub selector: StageWorkSelector,
     pub domain: ExecutionDomain,
     pub progress: StageProgressKind,
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub max_work_units: u64,
     pub max_workspace_bytes: u64,
+    pub max_padding_basis_points: u16,
+    pub max_formation_delay: Duration,
     pub shape_policy: StageShapePolicy,
     pub membership_safe_point: MembershipSafePoint,
     pub output_visibility: OutputVisibility,
@@ -236,6 +282,7 @@ impl StageDescriptor {
         Self {
             id,
             name: name.into(),
+            selector: StageWorkSelector::Any,
             domain: if profile.mode == ExecutionMode::Artifact {
                 ExecutionDomain::Host
             } else {
@@ -248,8 +295,14 @@ impl StageDescriptor {
             } else {
                 profile.max_batch_size.max(1)
             },
-            max_work_units: 1,
+            max_work_units: u64::MAX,
             max_workspace_bytes: 0,
+            max_padding_basis_points: if shape_policy == StageShapePolicy::Padded {
+                10_000
+            } else {
+                0
+            },
+            max_formation_delay: Duration::ZERO,
             shape_policy,
             membership_safe_point,
             output_visibility: OutputVisibility::AfterQuantumCommit,
@@ -267,9 +320,19 @@ impl StageDescriptor {
                 "execution stage budgets must be greater than zero".to_string(),
             ));
         }
+        if self.max_padding_basis_points > 10_000 {
+            return Err(Error::InvalidInput(
+                "execution stage padding budget cannot exceed 100 percent".to_string(),
+            ));
+        }
         if self.batch_mode == NativeBatchMode::None && self.max_batch_size != 1 {
             return Err(Error::InvalidInput(
                 "non-batchable execution stages must have width one".to_string(),
+            ));
+        }
+        if self.shape_policy != StageShapePolicy::Padded && self.max_padding_basis_points != 0 {
+            return Err(Error::InvalidInput(
+                "only padded execution stages may declare padding overhead".to_string(),
             ));
         }
         if self.batch_mode == NativeBatchMode::Continuous
@@ -344,6 +407,34 @@ impl ExecutionAdapterBinding {
         &self.stages[0]
     }
 
+    pub fn stage_for_work(&self, work: &WorkUnit) -> Result<&StageDescriptor> {
+        let mut exact = self.stages.iter().filter(|stage| {
+            stage.selector != StageWorkSelector::Any && stage.selector.matches(work)
+        });
+        if let Some(stage) = exact.next() {
+            if exact.next().is_some() {
+                return Err(Error::InvalidInput(
+                    "execution adapter has ambiguous exact stage selectors".to_string(),
+                ));
+            }
+            return Ok(stage);
+        }
+
+        let mut fallback = self
+            .stages
+            .iter()
+            .filter(|stage| stage.selector == StageWorkSelector::Any);
+        let stage = fallback.next().ok_or_else(|| {
+            Error::InvalidInput("execution adapter has no stage for scheduled work".to_string())
+        })?;
+        if fallback.next().is_some() {
+            return Err(Error::InvalidInput(
+                "execution adapter has multiple fallback stages".to_string(),
+            ));
+        }
+        Ok(stage)
+    }
+
     pub fn key_for_stage(&self, stage_id: StageId) -> Result<AdapterBindingKey> {
         if !self.stages.iter().any(|stage| stage.id == stage_id) {
             return Err(Error::InvalidInput(
@@ -413,11 +504,7 @@ impl BatchBudget {
     }
 
     pub fn validate(self) -> Result<()> {
-        if self.max_rows == 0
-            || self.max_logical_units == 0
-            || self.max_tensor_elements == 0
-            || self.max_workspace_bytes == 0
-        {
+        if self.max_rows == 0 || self.max_logical_units == 0 || self.max_tensor_elements == 0 {
             return Err(Error::InvalidInput(
                 "physical batch budgets must be greater than zero".to_string(),
             ));
@@ -1331,16 +1418,70 @@ mod tests {
     }
 
     #[test]
+    fn adapter_routes_work_to_exact_model_owned_stages() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "text.prefill",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "text.decode",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::Qwen306B,
+            capability_id: "chat".to_string(),
+            stages: Arc::from([prefill, decode]),
+        };
+        binding.validate().unwrap();
+
+        let prefill_work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange { start: 0, end: 8 },
+            max_output_steps: 1,
+        };
+        let decode_work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Decode,
+            input: InputRange { start: 8, end: 9 },
+            max_output_steps: 1,
+        };
+        assert_eq!(
+            binding.stage_for_work(&prefill_work).unwrap().id,
+            StageId::new(1)
+        );
+        assert_eq!(
+            binding.stage_for_work(&decode_work).unwrap().id,
+            StageId::new(2)
+        );
+    }
+
+    #[test]
     fn continuous_stage_requires_repeatable_safe_points() {
         let invalid = StageDescriptor {
             id: StageId::new(2),
             name: "atomic".to_string(),
+            selector: StageWorkSelector::Atomic,
             domain: ExecutionDomain::ExecutionGroup,
             progress: StageProgressKind::Atomic,
             batch_mode: NativeBatchMode::Continuous,
             max_batch_size: 2,
             max_work_units: 2,
             max_workspace_bytes: 1,
+            max_padding_basis_points: 0,
+            max_formation_delay: Duration::ZERO,
             shape_policy: StageShapePolicy::Ragged,
             membership_safe_point: MembershipSafePoint::OperationBoundary,
             output_visibility: OutputVisibility::AfterQuantumCommit,
