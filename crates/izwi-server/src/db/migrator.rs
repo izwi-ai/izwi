@@ -37,6 +37,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         model_id TEXT NULL,
+        system_prompt TEXT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     );
@@ -539,6 +540,11 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "chat_threads",
+        column: "system_prompt",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "media_assets",
         column: "source_asset_id",

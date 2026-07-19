@@ -42,7 +42,8 @@ use crate::models::architectures::qwen3::chat::{
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
+    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PrefixSnapshot,
+    Qwen35PreparedPrompt,
 };
 use crate::models::architectures::sortformer::diarization::{
     SortformerDiarizerModel, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
@@ -1819,6 +1820,20 @@ impl NativeChatDecodeState {
             Self::Qwen35(state) => state.session_cache_bytes(),
         }
     }
+
+    pub(crate) fn take_pending_qwen35_prefix_snapshot(&mut self) -> Option<Qwen35PrefixSnapshot> {
+        match self {
+            Self::Qwen35(state) => state.take_pending_prefix_snapshot(),
+            Self::Qwen3(_) => None,
+        }
+    }
+
+    pub(crate) fn reused_qwen35_prefix_tokens(&self) -> usize {
+        match self {
+            Self::Qwen35(state) => state.reused_prefix_tokens(),
+            Self::Qwen3(_) => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2004,9 +2019,28 @@ impl NativeChatModel {
         config: &ChatGenerationConfig,
         prepared_qwen35: Option<&Qwen35PreparedPrompt>,
     ) -> Result<NativeChatDecodeState> {
+        self.start_decode_state_with_prefix(
+            messages,
+            max_new_tokens,
+            config,
+            prepared_qwen35,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn start_decode_state_with_prefix(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared_qwen35: Option<&Qwen35PreparedPrompt>,
+        prefix: Option<&Qwen35PrefixSnapshot>,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => {
-                if prepared_qwen35.is_some() {
+                if prepared_qwen35.is_some() || prefix.is_some() {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared prompt was routed to a Qwen3 model".to_string(),
                     ));
@@ -2016,11 +2050,13 @@ impl NativeChatModel {
                 ))
             }
             Self::Qwen35(model) => {
-                let state = model.start_decode_state_with_optional_prepared(
+                let state = model.start_decode_state_with_optional_prepared_and_prefix(
                     messages,
                     max_new_tokens,
                     config,
                     prepared_qwen35,
+                    prefix,
+                    capture_prefix_max_bytes,
                 )?;
                 Ok(NativeChatDecodeState::Qwen35(state))
             }

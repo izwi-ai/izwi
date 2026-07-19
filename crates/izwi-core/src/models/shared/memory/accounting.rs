@@ -4,6 +4,16 @@ use std::collections::HashSet;
 
 use candle_core::{CpuStorage, Storage, Tensor};
 
+/// Materialize a tensor in independent Candle-managed storage.
+///
+/// `contiguous` alone may preserve an already-contiguous narrow view, while an
+/// identity affine always produces a new output. Keeping this allocation in
+/// Candle's normal pool is essential: application-created Metal private
+/// buffers bypass Candle's pooled reclamation and residency-set lifecycle.
+pub(crate) fn deep_copy_tensor_storage(tensor: &Tensor) -> candle_core::Result<Tensor> {
+    tensor.contiguous()?.affine(1.0, 0.0)
+}
+
 /// Accumulates the backing allocations retained by a set of Candle tensors.
 ///
 /// Tensor views share a Candle storage allocation. Accounting logical tensor
@@ -110,6 +120,7 @@ fn metal_storage_bytes(_storage: &candle_core::MetalStorage) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::deep_copy_tensor_storage;
     use super::TensorStorageAccounting;
     use candle_core::{Device, IndexOp, Tensor};
 
@@ -146,9 +157,62 @@ mod tests {
     }
 
     #[test]
+    fn detached_cpu_copy_drops_source_backing() {
+        let backing = Tensor::from_vec(vec![1f32; 128], (8, 16), &Device::Cpu).unwrap();
+        let view = backing.i((7, ..4)).unwrap();
+        let compact = deep_copy_tensor_storage(&view).unwrap();
+
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&compact).unwrap();
+
+        assert_eq!(accounting.bytes(), 4 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(compact.to_vec1::<f32>().unwrap(), vec![1.0; 4]);
+    }
+
+    #[test]
     fn byte_overflow_fails_closed() {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_bytes(u64::MAX).unwrap();
         assert!(accounting.add_bytes(1).is_none());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn persistent_metal_copy_uses_accounted_pooled_backing() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let pooled = Tensor::zeros((3,), candle_core::DType::F32, &device).unwrap();
+        let compact = deep_copy_tensor_storage(&pooled).unwrap();
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&compact).unwrap();
+
+        assert!(accounting.bytes() >= 3 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(compact.to_vec1::<f32>().unwrap(), vec![0.0; 3]);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn persistent_metal_copy_materializes_non_contiguous_views() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+        let source = Tensor::from_vec(values, (3, 4), &device).unwrap();
+        let view = source.transpose(0, 1).unwrap();
+        let compact = deep_copy_tensor_storage(&view).unwrap();
+        let mut accounting = TensorStorageAccounting::default();
+        accounting.add_tensor(&compact).unwrap();
+
+        assert!(accounting.bytes() >= 12 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(
+            compact.to_vec2::<f32>().unwrap(),
+            vec![
+                vec![0.0, 4.0, 8.0],
+                vec![1.0, 5.0, 9.0],
+                vec![2.0, 6.0, 10.0],
+                vec![3.0, 7.0, 11.0],
+            ]
+        );
     }
 }

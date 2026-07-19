@@ -18,6 +18,8 @@ mod handler_audio_chat;
 mod handler_chat;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
+#[path = "executor/prefix_cache.rs"]
+mod prefix_cache;
 #[path = "executor/state.rs"]
 mod state;
 #[path = "executor/streaming.rs"]
@@ -44,8 +46,10 @@ use crate::backends::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
+use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::ModelRegistry;
+use prefix_cache::{configured_qwen35_prefix_cache_bytes, ExactPrefixCache};
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
@@ -518,6 +522,11 @@ pub trait ModelExecutor: Send + Sync {
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         self.cleanup_request(&session.request_id)
     }
+
+    /// Purge model-owned reusable cache state before one model is unloaded.
+    fn purge_model_cache(&self, _variant: ModelVariant) -> CacheReleaseReport {
+        CacheReleaseReport::unconfirmed()
+    }
 }
 
 /// Proof returned after an executor cache cleanup request. Preemption may only
@@ -557,6 +566,7 @@ pub struct NativeExecutor {
     initialized: bool,
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
     chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
+    qwen35_prefix_cache: ExactPrefixCache<NativeChatModel, Qwen35PrefixSnapshot>,
     asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
     qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
     cache_resource_leases: Mutex<HashMap<SessionKey, CacheResourceReservation>>,
@@ -565,11 +575,13 @@ pub struct NativeExecutor {
 impl NativeExecutor {
     /// Create a new native executor.
     pub fn new(config: WorkerConfig) -> Self {
+        let qwen35_prefix_cache = ExactPrefixCache::new(configured_qwen35_prefix_cache_bytes());
         Self {
             config,
             initialized: false,
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
+            qwen35_prefix_cache,
             asr_decode_states: Mutex::new(HashMap::new()),
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
             cache_resource_leases: Mutex::new(HashMap::new()),
@@ -722,13 +734,15 @@ impl NativeExecutor {
         // lock so concurrent executor entry cannot repeat it or double-reserve.
         // Later decode steps reuse this lease until exact-session cleanup.
         let authorized_bytes = authorize()?;
-        let lease = authority.reserve(
-            ReservationOwner::new(
-                ReservationClass::Cache,
-                format!("{}:{}", session.request_id, session.epoch),
-            ),
-            cache_resource_vector(self.config.backend, authorized_bytes),
-        )?;
+        let owner = ReservationOwner::new(
+            ReservationClass::Cache,
+            format!("{}:{}", session.request_id, session.epoch),
+        );
+        let resources = cache_resource_vector(self.config.backend, authorized_bytes);
+        let lease = match self.config.backend {
+            BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources)?,
+            BackendKind::Cuda => authority.reserve(owner, resources)?,
+        };
         reservations.insert(
             session.clone(),
             CacheResourceReservation {
@@ -861,14 +875,43 @@ impl NativeExecutor {
         let reservation = reservations.get_mut(&session).ok_or_else(|| {
             Error::InferenceError("cache allocation has no exact-session reservation".to_string())
         })?;
-        let lease = reservation.lease.as_ref().ok_or_else(|| {
-            Error::InferenceError("cache allocation has no physical resource lease".to_string())
-        })?;
         if observed_bytes > 0 {
-            lease.record_materialized_usage(cache_resource_vector(
-                self.config.backend,
-                observed_bytes,
-            ))?;
+            if observed_bytes > reservation.reserved_bytes {
+                if matches!(self.config.backend, BackendKind::Cpu | BackendKind::Metal) {
+                    // CPU and unified-memory Metal use advisory capacity. Candle
+                    // can reuse a larger pooled allocation than the requested
+                    // power-of-two bucket, so grow the tracked lease to the
+                    // exact observed backing rather than failing inference
+                    // after the allocation already exists.
+                    reservation
+                        .lease
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::InferenceError(
+                                "cache allocation has no physical resource lease".to_string(),
+                            )
+                        })?
+                        .resize(cache_resource_vector(self.config.backend, observed_bytes))?;
+                    reservation.reserved_bytes = observed_bytes;
+                } else {
+                    return Err(Error::InferenceError(format!(
+                        "materialized session cache uses {observed_bytes} bytes, exceeding its {}-byte authorization for request {} epoch {}",
+                        reservation.reserved_bytes, session.request_id, session.epoch
+                    )));
+                }
+            }
+            reservation
+                .lease
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "cache allocation has no physical resource lease".to_string(),
+                    )
+                })?
+                .record_materialized_usage(cache_resource_vector(
+                    self.config.backend,
+                    observed_bytes,
+                ))?;
         }
         reservation.observed_blocks = scheduled.block_ids.len();
         Ok(observation)
@@ -1166,6 +1209,7 @@ impl ModelExecutor for NativeExecutor {
             lease.prepare_materialized_release(zero)?;
         }
         chat.clear();
+        self.qwen35_prefix_cache.clear();
         asr.clear();
         tts.clear();
         reservations.clear();
@@ -1232,6 +1276,10 @@ impl ModelExecutor for NativeExecutor {
             .saturating_add(usize::from(tts.remove(session).is_some()))
             .saturating_add(usize::from(reservations.remove(session).is_some()));
         CacheReleaseReport::confirmed(released)
+    }
+
+    fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        CacheReleaseReport::confirmed(self.qwen35_prefix_cache.purge_variant(variant))
     }
 }
 
@@ -1317,6 +1365,11 @@ impl UnifiedExecutor {
     pub async fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
         let executor = self.inner.read().await;
         executor.cleanup_session(session)
+    }
+
+    pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        let executor = self.inner.read().await;
+        executor.purge_model_cache(variant)
     }
 }
 
@@ -1696,6 +1749,42 @@ mod tests {
                 .unwrap();
             assert_eq!(authorizations.load(Ordering::Relaxed), 2);
         }
+    }
+
+    #[test]
+    fn cpu_and_metal_cache_authorization_is_advisory_while_cuda_is_guarded() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let capacity = cache_resource_vector(backend, 8);
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity,
+            })));
+            let mut config = WorkerConfig::default();
+            config.backend = backend;
+            let executor = NativeExecutor::new(config);
+            let session = SessionKey::new(format!("{backend:?}"), 1);
+
+            executor
+                .reserve_exact_session_cache(&authority, &session, || Ok(16))
+                .expect("advisory unified-memory cache claim");
+            assert_eq!(
+                authority.snapshot().reserved,
+                cache_resource_vector(backend, 16)
+            );
+        }
+
+        let backend = BackendKind::Cuda;
+        let capacity = cache_resource_vector(backend, 8);
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+            capacity,
+        })));
+        let mut config = WorkerConfig::default();
+        config.backend = backend;
+        let executor = NativeExecutor::new(config);
+        let session = SessionKey::new("cuda".to_string(), 1);
+        assert!(matches!(
+            executor.reserve_exact_session_cache(&authority, &session, || Ok(16)),
+            Err(Error::Overloaded(_))
+        ));
     }
 
     #[test]

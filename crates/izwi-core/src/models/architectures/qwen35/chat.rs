@@ -3,14 +3,14 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
+use std::mem::size_of;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
 use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
@@ -19,13 +19,24 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
+const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
+const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
+
+fn qwen35_prefill_chunk_size() -> usize {
+    std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
+        .min(MAX_PREFILL_CHUNK_SIZE)
+}
 
 /// Fully prepared Qwen3.5 prefill input. The runtime carries this exact
 /// artifact into the executor so media loading and vision encoding happen once.
@@ -34,12 +45,21 @@ pub struct Qwen35PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
+    reusable_prefix_len: Option<usize>,
     vision_inputs: Option<PreparedVisionInputs>,
 }
 
 impl Qwen35PreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         &self.prompt_ids
+    }
+
+    pub(crate) fn prompt_positions(&self) -> &[[usize; 3]] {
+        &self.prompt_positions
+    }
+
+    pub(crate) fn supports_exact_prefix_reuse(&self) -> bool {
+        self.vision_inputs.is_none() && self.reusable_prefix_len.is_some()
     }
 }
 
@@ -56,6 +76,20 @@ where
     }
 }
 
+fn initial_penalty_history(
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    track_history: bool,
+) -> Vec<u32> {
+    if !track_history {
+        return Vec::new();
+    }
+
+    let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(max_new_tokens.max(1)));
+    history.extend_from_slice(prompt_ids);
+    history
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
     pub text: String,
@@ -66,12 +100,15 @@ pub struct ChatDecodeState {
     text_state: Qwen35TextRuntimeState,
     logits: Tensor,
     history_ids: Vec<u32>,
+    decoder: IncrementalDecoder,
     tokens_generated: usize,
     track_history: bool,
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
     next_text_position: usize,
+    pending_prefix_snapshot: Option<Qwen35PrefixSnapshot>,
+    reused_prefix_tokens: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
 }
@@ -89,6 +126,59 @@ impl ChatDecodeState {
     /// Complete per-session scheduler accounting.
     pub fn session_cache_bytes(&self) -> Option<u64> {
         self.allocated_session_bytes()
+    }
+
+    pub(crate) fn take_pending_prefix_snapshot(&mut self) -> Option<Qwen35PrefixSnapshot> {
+        self.pending_prefix_snapshot.take()
+    }
+
+    pub(crate) fn reused_prefix_tokens(&self) -> usize {
+        self.reused_prefix_tokens
+    }
+}
+
+/// Immutable checkpoint at an exact rendered-token boundary. Request-specific
+/// sampler, history, RNG, and stream state are rebuilt on every restore.
+pub struct Qwen35PrefixSnapshot {
+    text_state: Qwen35TextRuntimeState,
+    token_ids: Box<[u32]>,
+    positions: Box<[[usize; 3]]>,
+    next_text_position: usize,
+}
+
+impl Qwen35PrefixSnapshot {
+    pub(crate) fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+
+    pub(crate) fn positions(&self) -> &[[usize; 3]] {
+        &self.positions
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<u64> {
+        let mut accounting = TensorStorageAccounting::default();
+        self.text_state.account_storage(&mut accounting)?;
+        accounting
+            .add_bytes(u64::try_from(self.token_ids.len().checked_mul(size_of::<u32>())?).ok()?)?;
+        accounting.add_bytes(
+            u64::try_from(self.positions.len().checked_mul(size_of::<[usize; 3]>())?).ok()?,
+        )?;
+        accounting.add_bytes(u64::try_from(size_of::<Self>()).ok()?)?;
+        Some(accounting.bytes())
+    }
+
+    fn matches(&self, prepared: &Qwen35PreparedPrompt) -> bool {
+        let prefix_len = self.token_ids.len();
+        prepared.vision_inputs.is_none()
+            && prefix_len > 0
+            && prefix_len == self.positions.len()
+            && self.next_text_position == prefix_len
+            && prepared.prompt_ids.starts_with(&self.token_ids)
+            && prepared.prompt_positions.starts_with(&self.positions)
+            && prepared
+                .prompt_positions
+                .get(prefix_len)
+                .is_some_and(|position| *position == [self.next_text_position; 3])
     }
 }
 
@@ -158,12 +248,12 @@ struct Qwen35Tokenizer {
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
-    decode_piece_cache: Mutex<HashMap<u32, String>>,
 }
 
 #[derive(Debug)]
 struct GgufTokenizerMetadata {
     tokens: Vec<String>,
+    token_types: Vec<u32>,
     merges: Vec<String>,
     pre_tokenizer: Option<String>,
     chat_template: String,
@@ -174,7 +264,7 @@ impl Qwen35Tokenizer {
     fn load(model_dir: &Path, variant: ModelVariant, loader: &GgufLoader) -> Result<Self> {
         let gguf_meta = parse_gguf_tokenizer_metadata(loader)?;
         let config = load_tokenizer_config_file(model_dir)?;
-        let inner = match Tokenizer::from_path(model_dir) {
+        let mut inner = match Tokenizer::from_path(model_dir) {
             Ok(inner) => inner,
             Err(_) => Tokenizer::from_gguf_bpe(
                 &gguf_meta.tokens,
@@ -183,6 +273,7 @@ impl Qwen35Tokenizer {
                 false,
             )?,
         };
+        inner.register_gguf_token_types(&gguf_meta.tokens, &gguf_meta.token_types)?;
         let vocab_size = inner.vocab_size();
 
         let mut token_to_id: HashMap<String, u32> = HashMap::new();
@@ -226,15 +317,24 @@ impl Qwen35Tokenizer {
             .unwrap_or_else(|| gguf_meta.chat_template.clone());
         let default_enable_thinking = resolve_default_enable_thinking(&chat_template, variant);
 
-        let mut literal_special_tokens: Vec<(String, u32)> = token_to_id
+        let mut literal_special_tokens: Vec<(String, u32)> = gguf_meta
+            .tokens
             .iter()
-            .filter_map(|(token, id)| {
-                (token.starts_with("<|") && token.ends_with("|>")).then_some((token.clone(), *id))
+            .zip(&gguf_meta.token_types)
+            .enumerate()
+            .filter_map(|(id, (token, token_type))| {
+                matches!(token_type, 3 | 4).then_some((token.clone(), id as u32))
             })
             .collect();
+        if let Some(cfg) = &config {
+            literal_special_tokens.extend(cfg.added_tokens_decoder.iter().filter_map(
+                |(id, entry)| id.parse::<u32>().ok().map(|id| (entry.content.clone(), id)),
+            ));
+        }
         literal_special_tokens.sort_by(|(left, _), (right, _)| {
             right.len().cmp(&left.len()).then_with(|| left.cmp(right))
         });
+        literal_special_tokens.dedup_by(|(left, _), (right, _)| left == right);
 
         Ok(Self {
             inner,
@@ -251,7 +351,6 @@ impl Qwen35Tokenizer {
             chat_template,
             default_enable_thinking,
             bos_token: config.and_then(|cfg| cfg.bos_token),
-            decode_piece_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -296,30 +395,19 @@ impl Qwen35Tokenizer {
         Ok(ids)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
-    }
-
-    fn decode_token_piece(&self, token_id: u32) -> Result<String> {
+    fn decode_token_delta(
+        &self,
+        decoder: &mut IncrementalDecoder,
+        token_id: u32,
+    ) -> Result<String> {
         if token_id as usize >= self.vocab_size {
             return Ok(String::new());
         }
-        if let Ok(cache) = self.decode_piece_cache.lock() {
-            if let Some(piece) = cache.get(&token_id) {
-                return Ok(piece.clone());
-            }
-        }
+        self.inner.decode_incrementally(decoder, token_id)
+    }
 
-        let piece = self.decode_text(&[token_id])?;
-        if let Ok(mut cache) = self.decode_piece_cache.lock() {
-            cache.insert(token_id, piece.clone());
-        }
-        Ok(piece)
+    fn finish_decode(&self, decoder: &mut IncrementalDecoder) -> Result<String> {
+        self.inner.finish_incremental_decode(decoder)
     }
 }
 
@@ -368,6 +456,7 @@ impl Qwen35ChatModel {
         }
 
         let text_config = parse_text_config(&text_loader)?;
+        debug!(variant = %variant, ?text_config, "Resolved Qwen3.5 text configuration");
         let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
         let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
 
@@ -543,9 +632,34 @@ impl Qwen35ChatModel {
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen35PreparedPrompt>,
     ) -> Result<ChatDecodeState> {
+        self.start_decode_state_with_optional_prepared_and_prefix(
+            messages,
+            max_new_tokens,
+            config,
+            prepared,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn start_decode_state_with_optional_prepared_and_prefix(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        prefix: Option<&Qwen35PrefixSnapshot>,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<ChatDecodeState> {
         let prepared_prompt =
             resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
-        self.start_decode_state_with_prepared(&prepared_prompt, max_new_tokens, config)
+        self.start_decode_state_with_prepared_and_prefix(
+            &prepared_prompt,
+            max_new_tokens,
+            config,
+            prefix,
+            capture_prefix_max_bytes,
+        )
     }
 
     pub fn start_decode_state_with_prepared(
@@ -554,31 +668,67 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
     ) -> Result<ChatDecodeState> {
+        self.start_decode_state_with_prepared_and_prefix(
+            prepared_prompt,
+            max_new_tokens,
+            config,
+            None,
+            None,
+        )
+    }
+
+    fn start_decode_state_with_prepared_and_prefix(
+        &self,
+        prepared_prompt: &Qwen35PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prefix: Option<&Qwen35PrefixSnapshot>,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<ChatDecodeState> {
         if prepared_prompt.prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one tokenizable message".to_string(),
             ));
         }
 
-        let mut text_state = self.text_model.new_state();
-        let logits = self.prefill_prompt(&prepared_prompt, &mut text_state)?;
+        let reusable_prefix = prefix.filter(|prefix| prefix.matches(prepared_prompt));
+        let (mut text_state, reused_prefix_tokens) = match reusable_prefix {
+            Some(prefix) => (
+                prefix.text_state.fork_shared_for_prefix(),
+                prefix.token_ids.len(),
+            ),
+            None => (self.text_model.new_state(), 0),
+        };
+        let (logits, pending_prefix_snapshot) = if prepared_prompt.vision_inputs.is_none() {
+            self.prefill_text_prompt_with_prefix_checkpoint(
+                prepared_prompt,
+                &mut text_state,
+                reused_prefix_tokens,
+                capture_prefix_max_bytes,
+            )?
+        } else {
+            (self.prefill_prompt(prepared_prompt, &mut text_state)?, None)
+        };
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
 
         Ok(ChatDecodeState {
             text_state,
             logits,
-            history_ids: if track_history {
-                Vec::with_capacity(max_new_tokens.max(1))
-            } else {
-                Vec::new()
-            },
+            history_ids: initial_penalty_history(
+                &prepared_prompt.prompt_ids,
+                max_new_tokens,
+                track_history,
+            ),
+            decoder: IncrementalDecoder::new(true),
             tokens_generated: 0,
             track_history,
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared_prompt.next_text_position,
+            pending_prefix_snapshot,
+            reused_prefix_tokens,
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
         })
@@ -587,9 +737,11 @@ impl Qwen35ChatModel {
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
             return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
+                delta,
+                text: state.assembled.clone(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
             });
@@ -609,15 +761,19 @@ impl Qwen35ChatModel {
         )?;
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
             return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
+                delta,
+                text: state.assembled.clone(),
                 tokens_generated: state.tokens_generated,
                 finished: true,
             });
         }
 
-        let delta = self.tokenizer.decode_token_piece(next)?;
+        let mut delta = self
+            .tokenizer
+            .decode_token_delta(&mut state.decoder, next)?;
         if state.track_history {
             state.history_ids.push(next);
         }
@@ -631,9 +787,12 @@ impl Qwen35ChatModel {
         state.next_text_position += 1;
         if state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
+            let suffix = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&suffix);
+            delta.push_str(&suffix);
         }
         let final_text = if state.finished {
-            state.assembled.trim().to_string()
+            state.assembled.clone()
         } else {
             String::new()
         };
@@ -651,6 +810,83 @@ impl Qwen35ChatModel {
             || token_id == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(token_id)
             || config.stop_token_ids.contains(&token_id)
+    }
+
+    fn prefill_text_prompt_with_prefix_checkpoint(
+        &self,
+        prepared: &Qwen35PreparedPrompt,
+        text_state: &mut Qwen35TextRuntimeState,
+        reused_prefix_tokens: usize,
+        capture_prefix_max_bytes: Option<u64>,
+    ) -> Result<(Tensor, Option<Qwen35PrefixSnapshot>)> {
+        let token_count = prepared.prompt_ids.len();
+        if reused_prefix_tokens >= token_count {
+            return Err(Error::InferenceError(
+                "Qwen3.5 cached prefix leaves no prompt suffix for logits".to_string(),
+            ));
+        }
+
+        let checkpoint = prepared
+            .reusable_prefix_len
+            .filter(|checkpoint| *checkpoint > reused_prefix_tokens && *checkpoint < token_count);
+        let mut cursor = reused_prefix_tokens;
+        if let Some(checkpoint) = checkpoint {
+            self.prefill_text_range(prepared, text_state, cursor, checkpoint, false)?;
+            cursor = checkpoint;
+        }
+
+        let pending = match (checkpoint, capture_prefix_max_bytes) {
+            (Some(checkpoint), Some(max_bytes)) if max_bytes > 0 => Some(Qwen35PrefixSnapshot {
+                text_state: text_state.fork_shared_for_prefix(),
+                token_ids: prepared.prompt_ids[..checkpoint]
+                    .to_vec()
+                    .into_boxed_slice(),
+                positions: prepared.prompt_positions[..checkpoint]
+                    .to_vec()
+                    .into_boxed_slice(),
+                next_text_position: checkpoint,
+            })
+            .filter(|snapshot| {
+                snapshot
+                    .retained_bytes()
+                    .is_some_and(|bytes| bytes <= max_bytes)
+            }),
+            _ => None,
+        };
+
+        let logits = self
+            .prefill_text_range(prepared, text_state, cursor, token_count, true)?
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 text suffix prefill produced no logits".to_string())
+            })?;
+        Ok((logits, pending))
+    }
+
+    fn prefill_text_range(
+        &self,
+        prepared: &Qwen35PreparedPrompt,
+        text_state: &mut Qwen35TextRuntimeState,
+        start: usize,
+        end: usize,
+        compute_final_logits: bool,
+    ) -> Result<Option<Tensor>> {
+        let mut logits = None;
+        let mut chunk_start = start;
+        let chunk_size = qwen35_prefill_chunk_size();
+        while chunk_start < end {
+            let chunk_end = (chunk_start + chunk_size).min(end);
+            let compute_logits = compute_final_logits && chunk_end == end;
+            if let Some(chunk_logits) = self.text_model.prefill_token_ids(
+                &prepared.prompt_ids[chunk_start..chunk_end],
+                &prepared.prompt_positions[chunk_start..chunk_end],
+                text_state,
+                compute_logits,
+            )? {
+                logits = Some(chunk_logits);
+            }
+            chunk_start = chunk_end;
+        }
+        Ok(logits)
     }
 
     fn prefill_prompt(
@@ -712,14 +948,20 @@ impl Qwen35ChatModel {
                     run_end += 1;
                 }
 
-                let compute_logits = run_end == prepared_prompt.prompt_ids.len();
-                if let Some(run_logits) = self.text_model.prefill_token_ids(
-                    &prepared_prompt.prompt_ids[idx..run_end],
-                    &prepared_prompt.prompt_positions[idx..run_end],
-                    text_state,
-                    compute_logits,
-                )? {
-                    logits = Some(run_logits);
+                let chunk_size = qwen35_prefill_chunk_size();
+                let mut chunk_start = idx;
+                while chunk_start < run_end {
+                    let chunk_end = (chunk_start + chunk_size).min(run_end);
+                    let compute_logits = chunk_end == prepared_prompt.prompt_ids.len();
+                    if let Some(run_logits) = self.text_model.prefill_token_ids(
+                        &prepared_prompt.prompt_ids[chunk_start..chunk_end],
+                        &prepared_prompt.prompt_positions[chunk_start..chunk_end],
+                        text_state,
+                        compute_logits,
+                    )? {
+                        logits = Some(run_logits);
+                    }
+                    chunk_start = chunk_end;
                 }
                 idx = run_end;
                 continue;
@@ -766,11 +1008,14 @@ impl Qwen35ChatModel {
                 ));
             }
             let prompt_ids = self.tokenizer.encode_text(&prompt)?;
+            let reusable_prefix_len =
+                reusable_prefix_token_len(&self.tokenizer, &prompt, &prompt_ids)?;
             let prompt_positions = build_text_positions(prompt_ids.len());
             return Ok(Qwen35PreparedPrompt {
                 next_text_position: prompt_positions.len(),
                 prompt_ids,
                 prompt_positions,
+                reusable_prefix_len,
                 vision_inputs: None,
             });
         };
@@ -801,6 +1046,7 @@ impl Qwen35ChatModel {
             prompt_ids,
             prompt_positions,
             next_text_position,
+            reusable_prefix_len: None,
             vision_inputs: Some(vision_inputs),
         })
     }
@@ -844,17 +1090,28 @@ fn qwen35_session_cache_upper_bound_bytes(
         cfg.block_count / cfg.full_attention_interval
     };
     let linear_layers = cfg.block_count.checked_sub(full_layers)?;
-    let as_u64 = |value: usize| u64::try_from(value).ok();
     let bytes_per_element = 4u64;
 
-    let kv_width = cfg
-        .attention_key_length
-        .checked_add(cfg.attention_value_length)?
-        .checked_mul(cfg.attention_head_count_kv)?;
-    let one_kv_copy = as_u64(full_layers)?
-        .checked_mul(as_u64(cache_capacity)?)?
-        .checked_mul(as_u64(kv_width)?)?
-        .checked_mul(bytes_per_element)?;
+    // Candle's Metal allocator rounds pooled buffers to byte-sized powers of
+    // two. Reserve each persistent tensor at that physical bucket rather than
+    // forcing a second exact-size allocation after every operation. This is
+    // conservative on backends whose allocator returns the logical size.
+    let allocation_bucket = |elements: usize| {
+        let bytes = u64::try_from(elements)
+            .ok()?
+            .checked_mul(bytes_per_element)?;
+        bytes.checked_next_power_of_two()
+    };
+
+    let key_elements = cache_capacity
+        .checked_mul(cfg.attention_head_count_kv)?
+        .checked_mul(cfg.attention_key_length)?;
+    let value_elements = cache_capacity
+        .checked_mul(cfg.attention_head_count_kv)?
+        .checked_mul(cfg.attention_value_length)?;
+    let one_kv_copy = allocation_bucket(key_elements)?
+        .checked_add(allocation_bucket(value_elements)?)?
+        .checked_mul(u64::try_from(full_layers).ok()?)?;
     // Account for both representations even though normal migration takes the
     // dense tensors before publishing pages. This keeps authorization safe if
     // a backend retains either backing allocation across the conversion.
@@ -867,13 +1124,13 @@ fn qwen35_session_cache_upper_bound_bytes(
         .checked_add(cfg.ssm_inner_size)?;
     let conv_slots = cfg.ssm_conv_kernel.saturating_sub(1);
     let recurrent_width = cfg.ssm_state_size.checked_mul(cfg.ssm_inner_size)?;
-    let linear_state_width = conv_width
-        .checked_mul(conv_slots)?
-        .checked_add(recurrent_width)?;
-    let linear_bytes = as_u64(linear_layers)?
-        .checked_mul(as_u64(linear_state_width)?)?
-        .checked_mul(bytes_per_element)?;
-    let logits_bytes = as_u64(vocab_size)?.checked_mul(bytes_per_element)?;
+    let one_linear_layer = allocation_bucket(conv_width)?
+        .checked_mul(u64::try_from(conv_slots).ok()?)?
+        .checked_add(allocation_bucket(recurrent_width)?)?;
+    let linear_bytes = u64::try_from(linear_layers)
+        .ok()?
+        .checked_mul(one_linear_layer)?;
+    let logits_bytes = allocation_bucket(vocab_size)?;
 
     kv_bytes
         .checked_add(linear_bytes)?
@@ -882,6 +1139,26 @@ fn qwen35_session_cache_upper_bound_bytes(
 
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
     (0..token_count).map(|idx| [idx; 3]).collect()
+}
+
+fn reusable_prefix_token_len(
+    tokenizer: &Qwen35Tokenizer,
+    rendered_prompt: &str,
+    full_ids: &[u32],
+) -> Result<Option<usize>> {
+    const ASSISTANT_HEADER: &str = "<|im_start|>assistant\n";
+    let Some(header_start) = rendered_prompt.rfind(ASSISTANT_HEADER) else {
+        return Ok(None);
+    };
+    let boundary_end = header_start + ASSISTANT_HEADER.len();
+    let boundary_ids = tokenizer.encode_text(&rendered_prompt[..boundary_end])?;
+    // Tokenizers may merge across an arbitrary string boundary. Reuse is only
+    // valid when the independently encoded boundary is literally the full
+    // prompt's token prefix.
+    Ok(
+        (!boundary_ids.is_empty() && full_ids.starts_with(&boundary_ids))
+            .then_some(boundary_ids.len()),
+    )
 }
 
 fn expand_image_placeholders(prompt: &str, token_counts: &[usize]) -> Result<String> {
@@ -1177,22 +1454,17 @@ fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str> {
     }
 }
 
-fn resolve_default_enable_thinking(chat_template: &str, variant: ModelVariant) -> bool {
-    if chat_template.contains("enable_thinking is defined and enable_thinking is false") {
-        true
-    } else if chat_template.contains("enable_thinking is defined and enable_thinking is true") {
-        false
-    } else {
-        matches!(
-            variant,
-            ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
-        )
-    }
+fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) -> bool {
+    matches!(
+        variant,
+        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
+    )
 }
 
 fn parse_gguf_tokenizer_metadata(loader: &GgufLoader) -> Result<GgufTokenizerMetadata> {
     Ok(GgufTokenizerMetadata {
         tokens: required_string_array(loader, "tokenizer.ggml.tokens")?,
+        token_types: required_u32_array(loader, "tokenizer.ggml.token_type")?,
         merges: required_string_array(loader, "tokenizer.ggml.merges")?,
         pre_tokenizer: loader.get_metadata_string("tokenizer.ggml.pre"),
         chat_template: loader
@@ -1287,6 +1559,31 @@ fn required_usize_array(loader: &GgufLoader, key: &str) -> Result<Vec<usize>> {
     Ok(values)
 }
 
+fn required_u32_array(loader: &GgufLoader, key: &str) -> Result<Vec<u32>> {
+    let value = loader
+        .metadata_value(key)
+        .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))?;
+    let GgufValue::Array(items) = value else {
+        return Err(Error::ModelLoadError(format!(
+            "Expected GGUF array metadata for {key}"
+        )));
+    };
+
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(raw) = gguf_to_u64(item) else {
+            return Err(Error::ModelLoadError(format!(
+                "Expected integer array values for {key}"
+            )));
+        };
+        let value = u32::try_from(raw).map_err(|_| {
+            Error::ModelLoadError(format!("Array value out of range for {key}: {raw}"))
+        })?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
 fn required_string_array(loader: &GgufLoader, key: &str) -> Result<Vec<String>> {
     let value = loader
         .metadata_value(key)
@@ -1371,7 +1668,7 @@ fn sample_next_token(
     }
 
     let mut values = logits_to_vec(logits)?;
-    clamp_logits_to_vocab(&mut values, vocab_size);
+    truncate_logits_to_vocab(&mut values, vocab_size);
 
     if config.repetition_penalty > 1.0 && !history.is_empty() {
         let mut seen = vec![false; values.len()];
@@ -1519,10 +1816,30 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
         .map_err(Error::from)
 }
 
-fn clamp_logits_to_vocab(values: &mut [f32], vocab_size: usize) {
+fn truncate_logits_to_vocab(values: &mut Vec<f32>, vocab_size: usize) {
     if vocab_size < values.len() {
-        values[vocab_size..].fill(f32::NEG_INFINITY);
+        values.truncate(vocab_size);
     }
+}
+
+fn no_valid_logits_error(values: &[f32]) -> Error {
+    let mut nan = 0usize;
+    let mut positive_infinity = 0usize;
+    let mut negative_infinity = 0usize;
+    for value in values {
+        if value.is_nan() {
+            nan = nan.saturating_add(1);
+        } else if *value == f32::INFINITY {
+            positive_infinity = positive_infinity.saturating_add(1);
+        } else if *value == f32::NEG_INFINITY {
+            negative_infinity = negative_infinity.saturating_add(1);
+        }
+    }
+    Error::InferenceError(format!(
+        "No valid Qwen3.5 logits to sample: 0 finite, {nan} NaN, \
+         {positive_infinity} +Inf, {negative_infinity} -Inf across {} in-vocabulary logits",
+        values.len()
+    ))
 }
 
 fn argmax_values(values: &[f32]) -> Result<u32> {
@@ -1538,7 +1855,7 @@ fn argmax_values(values: &[f32]) -> Result<u32> {
 
     max_idx
         .map(|idx| idx as u32)
-        .ok_or_else(|| Error::InferenceError("No valid Qwen3.5 logits to sample".to_string()))
+        .ok_or_else(|| no_valid_logits_error(values))
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -1604,7 +1921,21 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     } else {
         logits
     };
-    argmax(&clamped)
+    let selected = argmax(&clamped)?;
+    let selected_logit = clamped
+        .i(selected as usize)?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()?;
+    if selected_logit.is_finite() {
+        return Ok(selected);
+    }
+
+    // Some device argmax kernels do not define useful ordering for NaNs. This
+    // slow path runs only after the selected value is non-finite: it recovers a
+    // finite candidate when one exists and otherwise returns useful counts for
+    // the exact in-vocabulary row in every sampling mode.
+    let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    argmax_values(&values)
 }
 
 struct SimpleRng {
@@ -1648,6 +1979,80 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    fn byte_level_char_for_test(byte: u8) -> char {
+        let mut bytes: Vec<u8> = (b'!'..=b'~')
+            .chain(b'\xA1'..=b'\xAC')
+            .chain(b'\xAE'..=b'\xFF')
+            .collect();
+        let mut codepoints: Vec<u32> = bytes.iter().map(|byte| u32::from(*byte)).collect();
+        let mut next = 0u32;
+        for candidate in 0..=u8::MAX {
+            if !bytes.contains(&candidate) {
+                bytes.push(candidate);
+                codepoints.push(256 + next);
+                next += 1;
+            }
+        }
+        let index = bytes
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .expect("byte-level alphabet contains every byte");
+        char::from_u32(codepoints[index]).expect("byte-level codepoint is valid")
+    }
+
+    fn synthetic_qwen35_tokenizer() -> Qwen35Tokenizer {
+        let mut tokens: Vec<String> = (0..=u8::MAX)
+            .map(|byte| byte_level_char_for_test(byte).to_string())
+            .collect();
+        let im_start = tokens.len() as u32;
+        tokens.push("<|im_start|>".to_string());
+        let im_end = tokens.len() as u32;
+        tokens.push("<|im_end|>".to_string());
+        let image_pad = tokens.len() as u32;
+        tokens.push("<|image_pad|>".to_string());
+        let video_pad = tokens.len() as u32;
+        tokens.push("<|video_pad|>".to_string());
+        let eos_alt = tokens.len() as u32;
+        tokens.push("<|endoftext|>".to_string());
+        let think_open = tokens.len() as u32;
+        tokens.push("<think>".to_string());
+        let think_close = tokens.len() as u32;
+        tokens.push("</think>".to_string());
+
+        let mut token_types = vec![1; 256];
+        token_types.extend([3, 3, 3, 3, 3, 4, 4]);
+        let mut inner =
+            Tokenizer::from_gguf_bpe(&tokens, &[], Some("qwen35"), false).expect("tokenizer");
+        inner
+            .register_gguf_token_types(&tokens, &token_types)
+            .expect("atomic tokens");
+
+        Qwen35Tokenizer {
+            vocab_size: inner.vocab_size(),
+            inner,
+            specials: SpecialTokenIds {
+                im_start,
+                im_end,
+                image_pad,
+                video_pad,
+                eos: im_end,
+                eos_alt: Some(eos_alt),
+            },
+            literal_special_tokens: vec![
+                ("<|im_start|>".to_string(), im_start),
+                ("<|endoftext|>".to_string(), eos_alt),
+                ("<|image_pad|>".to_string(), image_pad),
+                ("<|video_pad|>".to_string(), video_pad),
+                ("<|im_end|>".to_string(), im_end),
+                ("</think>".to_string(), think_close),
+                ("<think>".to_string(), think_open),
+            ],
+            chat_template: String::new(),
+            default_enable_thinking: false,
+            bos_token: None,
+        }
+    }
+
     fn local_model_dir(name: &str) -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         PathBuf::from(home)
@@ -1661,6 +2066,7 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prompt_positions: build_text_positions(3),
             next_text_position: 3,
+            reusable_prefix_len: Some(2),
             vision_inputs: None,
         };
         let preparation_calls = AtomicUsize::new(0);
@@ -1674,6 +2080,61 @@ mod tests {
 
         assert_eq!(resolved.prompt_ids(), prepared.prompt_ids());
         assert_eq!(preparation_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reusable_prefix_boundary_is_an_exact_assistant_header_token_prefix() {
+        let tokenizer = synthetic_qwen35_tokenizer();
+        let rendered = "<|im_start|>user\nFirst question<|im_end|>\n\
+                        <|im_start|>assistant\nFirst answer<|im_end|>\n\
+                        <|im_start|>user\nFollow-up<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let full_ids = tokenizer.encode_text(rendered).unwrap();
+        let boundary_len = reusable_prefix_token_len(&tokenizer, rendered, &full_ids)
+            .unwrap()
+            .expect("assistant header should be an exact token boundary");
+        let boundary_end = rendered.rfind("<think>").unwrap();
+        let boundary_ids = tokenizer.encode_text(&rendered[..boundary_end]).unwrap();
+
+        assert_eq!(boundary_len, boundary_ids.len());
+        assert_eq!(&full_ids[..boundary_len], boundary_ids.as_slice());
+        assert!(boundary_len < full_ids.len());
+
+        let mut mismatched = full_ids;
+        mismatched[0] = u32::MAX;
+        assert_eq!(
+            reusable_prefix_token_len(&tokenizer, rendered, &mismatched).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn penalty_history_starts_with_exact_prompt_ids() {
+        let prompt_ids = vec![248_000, 17, 23, 248_001];
+        let mut history = initial_penalty_history(&prompt_ids, 8, true);
+        assert_eq!(history, prompt_ids);
+        history.push(99);
+        assert_eq!(&history[..prompt_ids.len()], prompt_ids.as_slice());
+        assert!(initial_penalty_history(&prompt_ids, 8, false).is_empty());
+    }
+
+    #[test]
+    fn prefill_chunk_size_is_bounded_and_rejects_zero() {
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+
+        std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
+        assert_eq!(qwen35_prefill_chunk_size(), DEFAULT_PREFILL_CHUNK_SIZE);
+
+        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "0");
+        assert_eq!(qwen35_prefill_chunk_size(), DEFAULT_PREFILL_CHUNK_SIZE);
+
+        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "64");
+        assert_eq!(qwen35_prefill_chunk_size(), 64);
+
+        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "999999");
+        assert_eq!(qwen35_prefill_chunk_size(), MAX_PREFILL_CHUNK_SIZE);
+
+        std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
     }
 
     #[test]
@@ -1730,18 +2191,57 @@ mod tests {
     }
 
     #[test]
-    fn resolve_default_thinking_matches_variant_templates() {
+    fn resolve_default_thinking_depends_on_variant_not_template_signature() {
         let small = "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is true %}<think>\n{%- endif %}{%- endif %}";
         let large = "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is false %}{%- else %}<think>\n{%- endif %}{%- endif %}";
 
         assert!(!resolve_default_enable_thinking(
-            small,
+            large,
             ModelVariant::Qwen3508BGguf
         ));
-        assert!(resolve_default_enable_thinking(
+        assert!(!resolve_default_enable_thinking(
             large,
+            ModelVariant::Qwen352BGguf
+        ));
+        assert!(resolve_default_enable_thinking(
+            small,
             ModelVariant::Qwen354BGguf
         ));
+        assert!(resolve_default_enable_thinking(
+            small,
+            ModelVariant::Qwen359BGguf
+        ));
+    }
+
+    #[test]
+    fn explicit_thinking_override_wins_over_variant_default() {
+        let messages = [ChatMessage {
+            role: ChatRole::User,
+            content: "Answer briefly.".to_string(),
+        }];
+        let enable = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(true),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+        let disable = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+
+        assert!(render_prompt(&messages, &enable, false)
+            .expect("enable thinking")
+            .ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(render_prompt(&messages, &disable, true)
+            .expect("disable thinking")
+            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -1842,6 +2342,59 @@ mod tests {
     }
 
     #[test]
+    fn multi_turn_rendering_preserves_unicode_assistant_content() {
+        let previous_answer = "café 中文 🌍 👨‍👩‍👧‍👦";
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+            },
+            ..ChatGenerationConfig::default()
+        };
+        let prompt = render_prompt(
+            &[
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "First turn".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: previous_answer.to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "Second turn".to_string(),
+                },
+            ],
+            &config,
+            false,
+        )
+        .expect("render multi-turn prompt");
+
+        assert!(prompt.contains(&format!(
+            "<|im_start|>assistant\n{previous_answer}<|im_end|>\n"
+        )));
+        assert!(!prompt.contains('\u{fffd}'));
+
+        let tokenizer = synthetic_qwen35_tokenizer();
+        let ids = tokenizer
+            .encode_text(&prompt)
+            .expect("encode rendered prompt");
+        assert!(ids.contains(&tokenizer.specials.im_start));
+        assert!(ids.contains(&tokenizer.specials.im_end));
+        assert!(ids.contains(&tokenizer.inner.token_to_id("<think>").unwrap()));
+        assert!(ids.contains(&tokenizer.inner.token_to_id("</think>").unwrap()));
+        assert_eq!(
+            tokenizer
+                .inner
+                .decode_with_special_tokens(&ids)
+                .expect("decode rendered ids"),
+            prompt
+        );
+    }
+
+    #[test]
     fn sample_next_token_masks_logits_above_vocab_limit() {
         let logits = Tensor::from_vec(
             vec![0.1f32, 0.2, 0.3, 12.0, 9.0],
@@ -1881,6 +2434,38 @@ mod tests {
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sampler_reports_non_finite_counts_for_greedy_and_probabilistic_modes() {
+        let logits = Tensor::from_vec(
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 42.0],
+            (4,),
+            &candle_core::Device::Cpu,
+        )
+        .expect("logits");
+
+        for temperature in [0.0, 0.7] {
+            let config = ChatGenerationConfig {
+                temperature,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                presence_penalty: 0.0,
+                stop_token_ids: Vec::new(),
+                seed: 7,
+                request: ChatRequestConfig::default(),
+            };
+            let mut rng = SimpleRng::new(7);
+            let error = sample_next_token(&logits, 3, &config, &[], &mut rng)
+                .expect_err("all in-vocabulary logits are non-finite");
+            let message = error.to_string();
+            assert!(message.contains("0 finite"));
+            assert!(message.contains("1 NaN"));
+            assert!(message.contains("1 +Inf"));
+            assert!(message.contains("1 -Inf"));
+            assert!(message.contains("3 in-vocabulary logits"));
+        }
     }
 
     #[test]

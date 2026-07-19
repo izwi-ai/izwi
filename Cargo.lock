@@ -3710,6 +3710,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
+ "cudaforge",
  "dirs 5.0.1",
  "flate2",
  "futures",

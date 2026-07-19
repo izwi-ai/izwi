@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -61,6 +61,22 @@ pub enum ChatStreamEvent {
     Completed(ChatGeneration),
     Failed(String),
     ShuttingDown,
+}
+
+/// Completion acknowledgement for a stream whose producer owns an external
+/// lifecycle guard. Dropping this value also acknowledges cancellation, while
+/// an explicit acknowledgement records that terminal handling (including any
+/// persistence) completed successfully in the response consumer.
+pub struct ChatStreamCompletion {
+    sender: Option<oneshot::Sender<()>>,
+}
+
+impl ChatStreamCompletion {
+    pub fn acknowledge(mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 const CHAT_STREAM_CAPACITY: usize = 64;
@@ -191,6 +207,40 @@ pub fn spawn_chat_stream(
     state: AppState,
     request: ChatExecutionRequest,
 ) -> mpsc::Receiver<ChatStreamEvent> {
+    spawn_chat_stream_inner(state, request, (), None)
+}
+
+/// Spawn a chat stream while retaining `keepalive` until inference has fully
+/// unwound and the response consumer has handled the terminal event. This is
+/// used by persisted thread chats to keep their per-thread turn lock through
+/// cancellation and atomic terminal persistence.
+pub fn spawn_chat_stream_with_keepalive<K>(
+    state: AppState,
+    request: ChatExecutionRequest,
+    keepalive: K,
+) -> (mpsc::Receiver<ChatStreamEvent>, ChatStreamCompletion)
+where
+    K: Send + 'static,
+{
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let events = spawn_chat_stream_inner(state, request, keepalive, Some(completion_rx));
+    (
+        events,
+        ChatStreamCompletion {
+            sender: Some(completion_tx),
+        },
+    )
+}
+
+fn spawn_chat_stream_inner<K>(
+    state: AppState,
+    request: ChatExecutionRequest,
+    keepalive: K,
+    completion_rx: Option<oneshot::Receiver<()>>,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    K: Send + 'static,
+{
     let runtime = state.runtime.clone();
     let params = request.resolved_generation_params();
     let chat_config = request.resolved_chat_config();
@@ -201,41 +251,49 @@ pub fn spawn_chat_stream(
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     let backpressure = Arc::new(ChatStreamBackpressure::default());
     tokio::spawn(async move {
-        let permit = match state
-            .acquire_owned_workload_permit(WorkloadClass::Streaming)
-            .await
-        {
-            Ok(permit) => permit,
-            Err(_) => {
-                send_chat_terminal(event_tx, ChatStreamEvent::ShuttingDown).await;
+        async move {
+            let permit = match state
+                .acquire_owned_workload_permit(WorkloadClass::Streaming)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    send_chat_terminal(event_tx, ChatStreamEvent::ShuttingDown).await;
+                    return;
+                }
+            };
+
+            if event_tx.send(ChatStreamEvent::Started).await.is_err() {
                 return;
             }
-        };
 
-        if event_tx.send(ChatStreamEvent::Started).await.is_err() {
-            return;
+            let generation = runtime.chat_generate_streaming_with_runtime_context(
+                variant,
+                messages,
+                params,
+                chat_config,
+                correlation_id.as_deref(),
+                permit.runtime_context(),
+                {
+                    let event_tx = event_tx.clone();
+                    let backpressure = backpressure.clone();
+                    move |delta| {
+                        try_send_chat_delta(&event_tx, &backpressure, delta);
+                    }
+                },
+            );
+            let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+            drop(permit);
+            if let Some(terminal) = terminal {
+                send_chat_terminal(event_tx, terminal).await;
+            }
         }
+        .await;
 
-        let generation = runtime.chat_generate_streaming_with_runtime_context(
-            variant,
-            messages,
-            params,
-            chat_config,
-            correlation_id.as_deref(),
-            permit.runtime_context(),
-            {
-                let event_tx = event_tx.clone();
-                let backpressure = backpressure.clone();
-                move |delta| {
-                    try_send_chat_delta(&event_tx, &backpressure, delta);
-                }
-            },
-        );
-        let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
-        drop(permit);
-        if let Some(terminal) = terminal {
-            send_chat_terminal(event_tx, terminal).await;
+        if let Some(completion_rx) = completion_rx {
+            let _ = completion_rx.await;
         }
+        drop(keepalive);
     });
 
     event_rx
@@ -279,9 +337,52 @@ where
 }
 
 #[cfg(test)]
+fn spawn_chat_stream_with_task_and_keepalive<G, Fut, K>(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    keepalive: K,
+    generation_task: G,
+) -> (mpsc::Receiver<ChatStreamEvent>, ChatStreamCompletion)
+where
+    G: FnOnce(mpsc::Sender<ChatStreamEvent>, Arc<ChatStreamBackpressure>) -> Fut + Send + 'static,
+    Fut: Future<Output = izwi_core::Result<ChatGeneration>> + Send + 'static,
+    K: Send + 'static,
+{
+    let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let backpressure = Arc::new(ChatStreamBackpressure::default());
+
+    tokio::spawn(async move {
+        async move {
+            let permit = semaphore.acquire_owned().await.expect("test semaphore");
+            if event_tx.send(ChatStreamEvent::Started).await.is_err() {
+                return;
+            }
+            let generation = generation_task(event_tx.clone(), backpressure.clone());
+            let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+            drop(permit);
+            if let Some(terminal) = terminal {
+                send_chat_terminal(event_tx, terminal).await;
+            }
+        }
+        .await;
+
+        let _ = completion_rx.await;
+        drop(keepalive);
+    });
+
+    (
+        event_rx,
+        ChatStreamCompletion {
+            sender: Some(completion_tx),
+        },
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use izwi_core::ChatRole;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
@@ -442,5 +543,69 @@ mod tests {
             Some(ChatStreamEvent::Started)
         ));
         assert!(event_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_unwinds_generation_before_releasing_stream_keepalive() {
+        struct GenerationDrop(Arc<AtomicBool>);
+        impl Drop for GenerationDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct KeepaliveDrop {
+            generation_dropped: Arc<AtomicBool>,
+            released: Arc<AtomicBool>,
+            released_early: Arc<AtomicBool>,
+        }
+        impl Drop for KeepaliveDrop {
+            fn drop(&mut self) {
+                if !self.generation_dropped.load(Ordering::Acquire) {
+                    self.released_early.store(true, Ordering::Release);
+                }
+                self.released.store(true, Ordering::Release);
+            }
+        }
+
+        let generation_started = Arc::new(Notify::new());
+        let generation_dropped = Arc::new(AtomicBool::new(false));
+        let keepalive_released = Arc::new(AtomicBool::new(false));
+        let keepalive_released_early = Arc::new(AtomicBool::new(false));
+        let started = generation_started.clone();
+        let generation_drop_for_task = generation_dropped.clone();
+        let keepalive = KeepaliveDrop {
+            generation_dropped: generation_dropped.clone(),
+            released: keepalive_released.clone(),
+            released_early: keepalive_released_early.clone(),
+        };
+        let (mut event_rx, completion) = spawn_chat_stream_with_task_and_keepalive(
+            Arc::new(Semaphore::new(1)),
+            keepalive,
+            move |_event_tx, _backpressure| async move {
+                let _drop = GenerationDrop(generation_drop_for_task);
+                started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("pending generation should be cancelled")
+            },
+        );
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ChatStreamEvent::Started)
+        ));
+        generation_started.notified().await;
+        drop(event_rx);
+        drop(completion);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !keepalive_released.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("keepalive should release after cancellation");
+        assert!(generation_dropped.load(Ordering::Acquire));
+        assert!(!keepalive_released_early.load(Ordering::Acquire));
     }
 }

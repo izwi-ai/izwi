@@ -458,6 +458,139 @@ kernel void izwi_decode_gqa_attention_f16(
     }
 }
 
+kernel void izwi_qwen35_causal_conv_sequence_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* history [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& conv_dim [[buffer(4)]],
+    constant uint& seq_len [[buffer(5)]],
+    constant uint& kernel_size [[buffer(6)]],
+    constant uint& output_elem_count [[buffer(7)]],
+    constant uint& total_elem_count [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total_elem_count) {
+        return;
+    }
+
+    const uint history_len = kernel_size - 1;
+    if (gid < output_elem_count) {
+        const uint token = gid / conv_dim;
+        const uint channel = gid - token * conv_dim;
+        const uint weight_base = channel * kernel_size;
+        float value = 0.0f;
+        for (uint tap = 0; tap < kernel_size; tap++) {
+            const uint source_pos = token + tap;
+            const float source = source_pos < history_len
+                ? history[channel * history_len + source_pos]
+                : input[(source_pos - history_len) * conv_dim + channel];
+            value += source * weight[weight_base + tap];
+        }
+        output[gid] = value / (1.0f + exp(-value));
+        return;
+    }
+
+    // Persist the last `kernel_size - 1` raw inputs in oldest-to-newest order.
+    // This also handles chunks shorter than the history window by retaining the
+    // still-live suffix of the incoming history.
+    const uint state_idx = gid - output_elem_count;
+    const uint channel = state_idx / history_len;
+    const uint history_pos = state_idx - channel * history_len;
+    const uint source_pos = seq_len + history_pos;
+    output[gid] = source_pos < history_len
+        ? history[channel * history_len + source_pos]
+        : input[(source_pos - history_len) * conv_dim + channel];
+}
+
+kernel void izwi_qwen35_gated_delta_sequence_f32(
+    device const float* qkv [[buffer(0)]],
+    device const float* gates [[buffer(1)]],
+    device const float* initial_state [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    constant uint& num_k_heads [[buffer(5)]],
+    constant uint& num_v_heads [[buffer(6)]],
+    constant uint& head_k_dim [[buffer(7)]],
+    constant uint& head_v_dim [[buffer(8)]],
+    constant uint& qkv_width [[buffer(9)]],
+    constant uint& output_elem_count [[buffer(10)]],
+    constant float& query_scale [[buffer(11)]],
+    constant uint& token_start [[buffer(12)]],
+    constant uint& token_count [[buffer(13)]],
+    constant uint& initialize_state [[buffer(14)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]]
+) {
+    threadgroup float delta[256];
+
+    if (head >= num_v_heads) {
+        return;
+    }
+
+    const uint state_head_size = head_k_dim * head_v_dim;
+    const uint state_base = output_elem_count + head * state_head_size;
+    const uint initial_state_base = head * state_head_size;
+    if (initialize_state != 0) {
+        for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
+            output[state_base + idx] = initial_state[initial_state_base + idx];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    // GGUF conversion stores V heads in tiled order, so the matching K head is
+    // `v_head % num_k_heads` for both 16K/16V and 16K/32V layouts.
+    const uint key_head = head % num_k_heads;
+    const uint key_width = num_k_heads * head_k_dim;
+    const uint value_offset = key_width * 2;
+
+    const uint token_end = min(token_start + token_count, seq_len);
+    for (uint token = token_start; token < token_end; token++) {
+        const uint qkv_base = token * qkv_width;
+        const uint query_base = qkv_base + key_head * head_k_dim;
+        const uint key_base = qkv_base + key_width + key_head * head_k_dim;
+        const uint value_base = qkv_base + value_offset + head * head_v_dim;
+        const uint gate_base = token * num_v_heads * 2;
+        const float decay = exp(gates[gate_base + head]);
+        const float beta = gates[gate_base + num_v_heads + head];
+
+        for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
+            output[state_base + idx] *= decay;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        for (uint value_dim = tid; value_dim < head_v_dim; value_dim += threads_per_threadgroup) {
+            float memory = 0.0f;
+            for (uint key_dim = 0; key_dim < head_k_dim; key_dim++) {
+                memory += output[state_base + key_dim * head_v_dim + value_dim]
+                    * qkv[key_base + key_dim];
+            }
+            delta[value_dim] = (qkv[value_base + value_dim] - memory) * beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        for (uint idx = tid; idx < state_head_size; idx += threads_per_threadgroup) {
+            const uint key_dim = idx / head_v_dim;
+            const uint value_dim = idx - key_dim * head_v_dim;
+            output[state_base + idx] += qkv[key_base + key_dim] * delta[value_dim];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        for (uint value_dim = tid; value_dim < head_v_dim; value_dim += threads_per_threadgroup) {
+            float recurrent_value = 0.0f;
+            for (uint key_dim = 0; key_dim < head_k_dim; key_dim++) {
+                recurrent_value += output[state_base + key_dim * head_v_dim + value_dim]
+                    * (qkv[query_base + key_dim] * query_scale);
+            }
+            output[(token * num_v_heads + head) * head_v_dim + value_dim] = recurrent_value;
+        }
+        // No thread may begin decaying the next state until every output read
+        // for the current token has completed.
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    }
+}
+
 kernel void izwi_lfm_shortconv_decode3_f32(
     device const float* cache [[buffer(0)]],
     device const float* bx [[buffer(1)]],
@@ -1734,6 +1867,404 @@ fn lfm_shortconv_sequence3_pipeline(device: &MetalDevice) -> CandleResult<Comput
     Ok(pipeline)
 }
 
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct Qwen35CausalConvSequenceOp {
+    conv_dim: usize,
+    seq_len: usize,
+    kernel_size: usize,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for Qwen35CausalConvSequenceOp {
+    fn name(&self) -> &'static str {
+        "izwi-qwen35-causal-conv-sequence-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-qwen35-causal-conv-sequence-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        input_storage: &MetalStorage,
+        input_layout: &Layout,
+        weight_storage: &MetalStorage,
+        weight_layout: &Layout,
+        history_storage: &MetalStorage,
+        history_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if input_storage.dtype() != DType::F32
+            || weight_storage.dtype() != DType::F32
+            || history_storage.dtype() != DType::F32
+        {
+            bail!("izwi-qwen35-causal-conv-sequence-metal only supports F32 tensors")
+        }
+        if !input_layout.is_contiguous()
+            || !weight_layout.is_contiguous()
+            || !history_layout.is_contiguous()
+        {
+            bail!("izwi-qwen35-causal-conv-sequence-metal requires contiguous tensors")
+        }
+        if self.conv_dim == 0 || self.seq_len == 0 || self.kernel_size < 2 {
+            bail!(
+                "izwi-qwen35-causal-conv-sequence-metal requires non-empty dimensions and kernel_size >= 2"
+            )
+        }
+        let history_len = self.kernel_size - 1;
+        let Some(output_elem_count) = self.seq_len.checked_mul(self.conv_dim) else {
+            bail!("izwi-qwen35-causal-conv-sequence-metal output size overflow")
+        };
+        let Some(state_elem_count) = history_len.checked_mul(self.conv_dim) else {
+            bail!("izwi-qwen35-causal-conv-sequence-metal state size overflow")
+        };
+        let Some(weight_elem_count) = self.kernel_size.checked_mul(self.conv_dim) else {
+            bail!("izwi-qwen35-causal-conv-sequence-metal weight size overflow")
+        };
+        let Some(total_elem_count) = output_elem_count.checked_add(state_elem_count) else {
+            bail!("izwi-qwen35-causal-conv-sequence-metal packed output size overflow")
+        };
+        if input_layout.shape().elem_count() != output_elem_count
+            || weight_layout.shape().elem_count() != weight_elem_count
+            || history_layout.shape().elem_count() != state_elem_count
+        {
+            bail!("izwi-qwen35-causal-conv-sequence-metal input shape mismatch")
+        }
+        if total_elem_count > u32::MAX as usize
+            || output_elem_count > u32::MAX as usize
+            || self.conv_dim > u32::MAX as usize
+            || self.seq_len > u32::MAX as usize
+            || self.kernel_size > u32::MAX as usize
+        {
+            bail!("izwi-qwen35-causal-conv-sequence-metal tensor is too large")
+        }
+
+        let device = input_storage.device().clone();
+        let output = device.new_buffer(
+            total_elem_count,
+            DType::F32,
+            "izwi-qwen35-causal-conv-sequence",
+        )?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-qwen35-causal-conv-sequence");
+        let pipeline = qwen35_causal_conv_sequence_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_input_buffer(
+            0,
+            Some(input_storage.buffer()),
+            input_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            1,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(history_storage.buffer()),
+            history_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(self.conv_dim as u32));
+        encoder.set_bytes(5, &(self.seq_len as u32));
+        encoder.set_bytes(6, &(self.kernel_size as u32));
+        encoder.set_bytes(7, &(output_elem_count as u32));
+        encoder.set_bytes(8, &(total_elem_count as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: total_elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, total_elem_count, DType::F32),
+            Shape::from(total_elem_count),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn qwen35_causal_conv_sequence_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("izwi_qwen35_causal_conv_sequence_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct Qwen35GatedDeltaSequenceOp {
+    seq_len: usize,
+    tile_size: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    qkv_width: usize,
+    query_scale: f32,
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
+    fn name(&self) -> &'static str {
+        "izwi-qwen35-gated-delta-sequence-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-qwen35-gated-delta-sequence-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        qkv_storage: &MetalStorage,
+        qkv_layout: &Layout,
+        gates_storage: &MetalStorage,
+        gates_layout: &Layout,
+        state_storage: &MetalStorage,
+        state_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if qkv_storage.dtype() != DType::F32
+            || gates_storage.dtype() != DType::F32
+            || state_storage.dtype() != DType::F32
+        {
+            bail!("izwi-qwen35-gated-delta-sequence-metal only supports F32 tensors")
+        }
+        if !qkv_layout.is_contiguous()
+            || !gates_layout.is_contiguous()
+            || !state_layout.is_contiguous()
+        {
+            bail!("izwi-qwen35-gated-delta-sequence-metal requires contiguous tensors")
+        }
+        if self.seq_len == 0
+            || self.tile_size == 0
+            || self.num_k_heads != 16
+            || !matches!(self.num_v_heads, 16 | 32)
+            || self.num_v_heads % self.num_k_heads != 0
+            || self.head_k_dim == 0
+            || self.head_v_dim == 0
+            || self.head_v_dim > 256
+        {
+            bail!(
+                "izwi-qwen35-gated-delta-sequence-metal requires Qwen3.5 16K/16V or 16K/32V non-empty heads with head_v_dim <= 256"
+            )
+        }
+        let Some(key_width) = self.num_k_heads.checked_mul(self.head_k_dim) else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal key width overflow")
+        };
+        let Some(value_width) = self.num_v_heads.checked_mul(self.head_v_dim) else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal value width overflow")
+        };
+        let Some(expected_qkv_width) = key_width
+            .checked_mul(2)
+            .and_then(|width| width.checked_add(value_width))
+        else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal qkv width overflow")
+        };
+        if self.qkv_width != expected_qkv_width {
+            bail!("izwi-qwen35-gated-delta-sequence-metal qkv width mismatch")
+        }
+        let Some(qkv_elem_count) = self.seq_len.checked_mul(self.qkv_width) else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal qkv size overflow")
+        };
+        let Some(gate_elem_count) = self
+            .seq_len
+            .checked_mul(self.num_v_heads)
+            .and_then(|count| count.checked_mul(2))
+        else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal gate size overflow")
+        };
+        let Some(output_elem_count) = self
+            .seq_len
+            .checked_mul(self.num_v_heads)
+            .and_then(|count| count.checked_mul(self.head_v_dim))
+        else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal output size overflow")
+        };
+        let Some(state_elem_count) = self
+            .num_v_heads
+            .checked_mul(self.head_k_dim)
+            .and_then(|count| count.checked_mul(self.head_v_dim))
+        else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal state size overflow")
+        };
+        let Some(total_elem_count) = output_elem_count.checked_add(state_elem_count) else {
+            bail!("izwi-qwen35-gated-delta-sequence-metal packed output size overflow")
+        };
+        if qkv_layout.shape().elem_count() != qkv_elem_count
+            || gates_layout.shape().elem_count() != gate_elem_count
+            || state_layout.shape().elem_count() != state_elem_count
+        {
+            bail!("izwi-qwen35-gated-delta-sequence-metal input shape mismatch")
+        }
+        if total_elem_count > u32::MAX as usize
+            || output_elem_count > u32::MAX as usize
+            || self.seq_len > u32::MAX as usize
+            || self.num_k_heads > u32::MAX as usize
+            || self.num_v_heads > u32::MAX as usize
+            || self.head_k_dim > u32::MAX as usize
+            || self.head_v_dim > u32::MAX as usize
+            || self.qkv_width > u32::MAX as usize
+        {
+            bail!("izwi-qwen35-gated-delta-sequence-metal tensor is too large")
+        }
+
+        let device = qkv_storage.device().clone();
+        let output = device.new_buffer(
+            total_elem_count,
+            DType::F32,
+            "izwi-qwen35-gated-delta-sequence",
+        )?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-qwen35-gated-delta-sequence");
+        let pipeline = qwen35_gated_delta_sequence_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_input_buffer(
+            0,
+            Some(qkv_storage.buffer()),
+            qkv_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            1,
+            Some(gates_storage.buffer()),
+            gates_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(state_storage.buffer()),
+            state_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(self.seq_len as u32));
+        encoder.set_bytes(5, &(self.num_k_heads as u32));
+        encoder.set_bytes(6, &(self.num_v_heads as u32));
+        encoder.set_bytes(7, &(self.head_k_dim as u32));
+        encoder.set_bytes(8, &(self.head_v_dim as u32));
+        encoder.set_bytes(9, &(self.qkv_width as u32));
+        encoder.set_bytes(10, &(output_elem_count as u32));
+        encoder.set_bytes(11, &self.query_scale);
+
+        let threads_per_threadgroup = self
+            .head_v_dim
+            .next_power_of_two()
+            .min(pipeline.max_total_threads_per_threadgroup())
+            .min(256)
+            .max(1);
+        let threadgroups = objc2_metal::MTLSize {
+            width: self.num_v_heads,
+            height: 1,
+            depth: 1,
+        };
+        let threads = objc2_metal::MTLSize {
+            width: threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
+        let tile_size = self.tile_size.min(self.seq_len);
+        for token_start in (0..self.seq_len).step_by(tile_size) {
+            if token_start != 0 {
+                // Each tile consumes the recurrent state written into the
+                // packed output buffer by the preceding dispatch.
+                encoder.insert_memory_barrier();
+            }
+            let token_count = tile_size.min(self.seq_len - token_start);
+            encoder.set_bytes(12, &(token_start as u32));
+            encoder.set_bytes(13, &(token_count as u32));
+            encoder.set_bytes(14, &u32::from(token_start == 0));
+            encoder.dispatch_thread_groups(threadgroups, threads);
+        }
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, total_elem_count, DType::F32),
+            Shape::from(total_elem_count),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn qwen35_gated_delta_sequence_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("izwi_qwen35_gated_delta_sequence_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
+    Ok(pipeline)
+}
+
 /// Try fused gated delta recurrent computation.
 ///
 /// This fuses multiple operations:
@@ -2341,6 +2872,78 @@ pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor>
     None
 }
 
+/// Run Qwen3.5's stateful causal depthwise-convolution sequence path in one
+/// Metal dispatch. Inputs use token-major `[1, sequence, channels]` layout;
+/// history is `[channels, kernel_size - 1]` in oldest-to-newest order.
+pub fn try_qwen35_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (input, weight, history);
+
+    if !use_fused_kernels() {
+        return None;
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        let (batch, seq_len, conv_dim) = input.dims3().ok()?;
+        let (weight_channels, kernel_size) = weight.dims2().ok()?;
+        let (history_channels, history_len) = history.dims2().ok()?;
+        if batch != 1
+            || seq_len == 0
+            || conv_dim == 0
+            || kernel_size < 2
+            || weight_channels != conv_dim
+            || history_channels != conv_dim
+            || history_len != kernel_size - 1
+            || !input.device().is_metal()
+            || !weight.device().is_metal()
+            || !history.device().is_metal()
+            || !input.device().same_device(weight.device())
+            || !input.device().same_device(history.device())
+            || input.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || history.dtype() != DType::F32
+            || !input.is_contiguous()
+            || !weight.is_contiguous()
+            || !history.is_contiguous()
+        {
+            return None;
+        }
+
+        let output_elem_count = seq_len.checked_mul(conv_dim)?;
+        let state_elem_count = history_len.checked_mul(conv_dim)?;
+        let packed = input
+            .apply_op3_no_bwd(
+                weight,
+                history,
+                &Qwen35CausalConvSequenceOp {
+                    conv_dim,
+                    seq_len,
+                    kernel_size,
+                },
+            )
+            .ok()?;
+        let output = packed
+            .narrow(0, 0, output_elem_count)
+            .ok()?
+            .reshape((1, seq_len, conv_dim))
+            .ok()?;
+        let final_history = packed
+            .narrow(0, output_elem_count, state_elem_count)
+            .ok()?
+            .reshape((conv_dim, history_len))
+            .ok()?;
+        return Some((output, final_history));
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Try fused gated RMS normalization.
 ///
 /// Computes: rms_norm(x) * silu(gate)
@@ -2359,27 +2962,21 @@ pub fn try_fused_gated_rms_norm(
     rms_out.broadcast_mul(&silu_gate).ok()
 }
 
-/// Try tiled DeltaNet recurrence using Metal tile memory.
+/// Try the reference Qwen3.5 Gated DeltaNet recurrence in bounded Metal dispatches.
 ///
-/// This processes multiple tokens (tile_size, typically 32 or 64) while keeping
-/// the hidden state in fast tile memory instead of VRAM. This eliminates
-/// memory round-trips for the recurrence h_t = A * h_{t-1} + B.
-///
-/// The tile memory is high-speed memory local to the GPU shader. By loading
-/// the hidden state into tile memory, we can process an entire sequence of
-/// tokens without writing the state back to main VRAM.
-///
-/// This is the primary optimization that enables llama.cpp to achieve 3x
-/// higher TPS than naive implementations.
+/// The shader keeps token causality inside each value-head threadgroup and
+/// evaluates state decay, delta correction, state update, and output reduction
+/// in F32. Q/K retain the converted GGUF's 16-head tiled layout while V may
+/// contain either 16 or 32 heads.
 ///
 /// # Arguments
-/// * `queries` - Query tensors [batch, seq, num_heads, head_dim]
-/// * `keys` - Key tensors [batch, seq, num_heads, head_dim]
+/// * `queries` - Query tensors [1, seq, 16, head_k_dim]
+/// * `keys` - Key tensors [1, seq, 16, head_k_dim]
 /// * `values` - Value tensors [batch, seq, num_v_heads, head_v_dim]
 /// * `g` - Pre-computed gate values [batch, seq, num_v_heads]
 /// * `beta` - Beta values [batch, seq, num_v_heads]
 /// * `initial_state` - Initial recurrent state [batch, num_v_heads, head_k_dim, head_v_dim]
-/// * `tile_size` - Number of tokens to process per tile (32 or 64 recommended)
+/// * `tile_size` - Maximum number of tokens processed by one Metal dispatch.
 ///
 /// # Returns
 /// (outputs, final_state) where outputs is [batch, seq, num_v_heads, head_v_dim]
@@ -2392,72 +2989,117 @@ pub fn try_tiled_deltanet_recurrence(
     initial_state: &Tensor,
     tile_size: usize,
 ) -> Option<(Tensor, Tensor)> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (queries, keys, values, g, beta, initial_state, tile_size);
+
     if !use_fused_kernels() {
         return None;
     }
 
-    // Only supported for F32 on Metal devices
-    if queries.dtype() != DType::F32 {
-        return None;
-    }
-
-    if !queries.device().is_metal() {
-        return None;
-    }
-
-    let (batch, seq_len, num_heads, head_k_dim) = queries.dims4().ok()?;
-    let (k_batch, k_seq_len, k_num_heads, k_head_k_dim) = keys.dims4().ok()?;
-    let (v_batch, v_seq_len, v_num_heads, _v_head_dim) = values.dims4().ok()?;
-    let (g_batch, g_seq_len, g_heads) = g.dims3().ok()?;
-    let (b_batch, b_seq_len, b_heads) = beta.dims3().ok()?;
-    let (s_batch, s_heads, s_head_k_dim, _s_head_v_dim) = initial_state.dims4().ok()?;
-
-    if batch != 1
-        || k_batch != batch
-        || v_batch != batch
-        || g_batch != batch
-        || b_batch != batch
-        || s_batch != batch
+    #[cfg(feature = "metal")]
     {
-        return None;
-    }
-    if k_seq_len != seq_len || v_seq_len != seq_len || g_seq_len != seq_len || b_seq_len != seq_len
-    {
-        return None;
-    }
-    if k_num_heads != num_heads || g_heads != num_heads || b_heads != num_heads {
-        return None;
-    }
-    if k_head_k_dim != head_k_dim || s_heads != num_heads || s_head_k_dim != head_k_dim {
-        return None;
-    }
-    if v_num_heads != num_heads {
-        return None;
-    }
+        let (batch, seq_len, num_k_heads, head_k_dim) = queries.dims4().ok()?;
+        let (k_batch, k_seq_len, k_num_heads, k_head_k_dim) = keys.dims4().ok()?;
+        let (v_batch, v_seq_len, num_v_heads, head_v_dim) = values.dims4().ok()?;
+        let (g_batch, g_seq_len, g_heads) = g.dims3().ok()?;
+        let (b_batch, b_seq_len, b_heads) = beta.dims3().ok()?;
+        let (s_batch, s_heads, s_head_k_dim, s_head_v_dim) = initial_state.dims4().ok()?;
 
-    let tile_size = tile_size.max(1).min(seq_len.max(1));
-    let mut outputs = Vec::with_capacity(seq_len);
-    let mut state = initial_state.clone();
-
-    for tile_start in (0..seq_len).step_by(tile_size) {
-        let tile_end = (tile_start + tile_size).min(seq_len);
-        for token_idx in tile_start..tile_end {
-            let query = queries.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
-            let key = keys.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
-            let value = values.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
-            let g_t = g.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
-            let beta_t = beta.narrow(1, token_idx, 1).ok()?.squeeze(1).ok()?;
-
-            let (output, next_state) =
-                fused_gated_delta_sequential(&query, &key, &value, &g_t, &beta_t, &state).ok()?;
-            outputs.push(output.unsqueeze(1).ok()?);
-            state = next_state;
+        if batch != 1
+            || seq_len == 0
+            || tile_size == 0
+            || k_batch != batch
+            || v_batch != batch
+            || g_batch != batch
+            || b_batch != batch
+            || s_batch != batch
+            || k_seq_len != seq_len
+            || v_seq_len != seq_len
+            || g_seq_len != seq_len
+            || b_seq_len != seq_len
+            || num_k_heads != 16
+            || k_num_heads != num_k_heads
+            || !matches!(num_v_heads, 16 | 32)
+            || num_v_heads % num_k_heads != 0
+            || g_heads != num_v_heads
+            || b_heads != num_v_heads
+            || s_heads != num_v_heads
+            || k_head_k_dim != head_k_dim
+            || s_head_k_dim != head_k_dim
+            || s_head_v_dim != head_v_dim
+            || head_k_dim == 0
+            || head_v_dim == 0
+            || head_v_dim > 256
+            || !queries.device().is_metal()
+            || !keys.device().is_metal()
+            || !values.device().is_metal()
+            || !g.device().is_metal()
+            || !beta.device().is_metal()
+            || !initial_state.device().is_metal()
+            || !queries.device().same_device(keys.device())
+            || !queries.device().same_device(values.device())
+            || !queries.device().same_device(g.device())
+            || !queries.device().same_device(beta.device())
+            || !queries.device().same_device(initial_state.device())
+            || queries.dtype() != DType::F32
+            || keys.dtype() != DType::F32
+            || values.dtype() != DType::F32
+            || g.dtype() != DType::F32
+            || beta.dtype() != DType::F32
+            || initial_state.dtype() != DType::F32
+            || !queries.is_contiguous()
+            || !keys.is_contiguous()
+            || !values.is_contiguous()
+            || !g.is_contiguous()
+            || !beta.is_contiguous()
+            || !initial_state.is_contiguous()
+        {
+            return None;
         }
+
+        let key_width = num_k_heads.checked_mul(head_k_dim)?;
+        let value_width = num_v_heads.checked_mul(head_v_dim)?;
+        let qkv_width = key_width.checked_mul(2)?.checked_add(value_width)?;
+        let query_flat = queries.reshape((1, seq_len, key_width)).ok()?;
+        let key_flat = keys.reshape((1, seq_len, key_width)).ok()?;
+        let value_flat = values.reshape((1, seq_len, value_width)).ok()?;
+        let qkv = Tensor::cat(&[&query_flat, &key_flat, &value_flat], 2).ok()?;
+        let gates = Tensor::cat(&[g, beta], 2).ok()?;
+        let output_elem_count = seq_len.checked_mul(num_v_heads)?.checked_mul(head_v_dim)?;
+        let state_elem_count = num_v_heads
+            .checked_mul(head_k_dim)?
+            .checked_mul(head_v_dim)?;
+        let packed = qkv
+            .apply_op3_no_bwd(
+                &gates,
+                initial_state,
+                &Qwen35GatedDeltaSequenceOp {
+                    seq_len,
+                    tile_size: tile_size.min(seq_len),
+                    num_k_heads,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    qkv_width,
+                    query_scale: 1.0 / (head_k_dim as f32).sqrt(),
+                },
+            )
+            .ok()?;
+        let output = packed
+            .narrow(0, 0, output_elem_count)
+            .ok()?
+            .reshape((1, seq_len, num_v_heads, head_v_dim))
+            .ok()?;
+        let final_state = packed
+            .narrow(0, output_elem_count, state_elem_count)
+            .ok()?
+            .reshape((1, num_v_heads, head_k_dim, head_v_dim))
+            .ok()?;
+        return Some((output, final_state));
     }
 
-    let output_refs: Vec<&Tensor> = outputs.iter().collect();
-    let outputs = Tensor::cat(&output_refs, 1).ok()?;
-    Some((outputs, state))
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Try SIMD-group softmax for attention.
@@ -2656,6 +3298,117 @@ mod tests {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     use candle_nn::Module;
 
+    fn qwen35_causal_conv_reference(
+        input: &[f32],
+        weight: &[f32],
+        history: &[f32],
+        seq_len: usize,
+        conv_dim: usize,
+        kernel_size: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let history_len = kernel_size - 1;
+        let mut output = vec![0f32; seq_len * conv_dim];
+        for token in 0..seq_len {
+            for channel in 0..conv_dim {
+                let mut value = 0f32;
+                for tap in 0..kernel_size {
+                    let source_pos = token + tap;
+                    let source = if source_pos < history_len {
+                        history[channel * history_len + source_pos]
+                    } else {
+                        input[(source_pos - history_len) * conv_dim + channel]
+                    };
+                    value += source * weight[channel * kernel_size + tap];
+                }
+                output[token * conv_dim + channel] = value / (1.0 + (-value).exp());
+            }
+        }
+
+        let mut final_history = vec![0f32; conv_dim * history_len];
+        for channel in 0..conv_dim {
+            for history_pos in 0..history_len {
+                let source_pos = seq_len + history_pos;
+                final_history[channel * history_len + history_pos] = if source_pos < history_len {
+                    history[channel * history_len + source_pos]
+                } else {
+                    input[(source_pos - history_len) * conv_dim + channel]
+                };
+            }
+        }
+        (output, final_history)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_gated_delta_reference(
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        initial_state: &[f32],
+        seq_len: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut state = initial_state.to_vec();
+        let mut output = vec![0f32; seq_len * num_v_heads * head_v_dim];
+        let query_scale = 1.0f32 / (head_k_dim as f32).sqrt();
+        let state_head_size = head_k_dim * head_v_dim;
+        for token in 0..seq_len {
+            for value_head in 0..num_v_heads {
+                let key_head = value_head % num_k_heads;
+                let state_base = value_head * state_head_size;
+                let key_base = (token * num_k_heads + key_head) * head_k_dim;
+                let value_base = (token * num_v_heads + value_head) * head_v_dim;
+                let decay = g[token * num_v_heads + value_head].exp();
+                for state_value in &mut state[state_base..state_base + state_head_size] {
+                    *state_value *= decay;
+                }
+
+                let mut delta = vec![0f32; head_v_dim];
+                for value_dim in 0..head_v_dim {
+                    let mut memory = 0f32;
+                    for key_dim in 0..head_k_dim {
+                        memory += state[state_base + key_dim * head_v_dim + value_dim]
+                            * key[key_base + key_dim];
+                    }
+                    delta[value_dim] = (value[value_base + value_dim] - memory)
+                        * beta[token * num_v_heads + value_head];
+                }
+
+                for key_dim in 0..head_k_dim {
+                    for value_dim in 0..head_v_dim {
+                        state[state_base + key_dim * head_v_dim + value_dim] +=
+                            key[key_base + key_dim] * delta[value_dim];
+                    }
+                }
+
+                for value_dim in 0..head_v_dim {
+                    let mut recurrent_value = 0f32;
+                    for key_dim in 0..head_k_dim {
+                        recurrent_value += state[state_base + key_dim * head_v_dim + value_dim]
+                            * (query[key_base + key_dim] * query_scale);
+                    }
+                    output[value_base + value_dim] = recurrent_value;
+                }
+            }
+        }
+        (output, state)
+    }
+
+    fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32, context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context} length mismatch");
+        for (idx, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            let bound = tolerance * (1.0 + expected.abs());
+            assert!(
+                actual.is_finite() && (actual - expected).abs() <= bound,
+                "{context} mismatch at {idx}: {actual} != {expected} (bound {bound})"
+            );
+        }
+    }
+
     #[test]
     fn test_l2_norm_matches_reference() {
         let device = Device::Cpu;
@@ -2812,6 +3565,200 @@ mod tests {
         let bx = Tensor::zeros((1, 2, 1), DType::F32, &device).unwrap();
 
         assert!(try_lfm_shortconv_update3(&cache, &bx).is_none());
+    }
+
+    #[test]
+    fn qwen35_sequence_kernels_reject_cpu_tensors() {
+        let device = Device::Cpu;
+        let conv_input = Tensor::zeros((1, 2, 8), DType::F32, &device).unwrap();
+        let conv_weight = Tensor::zeros((8, 4), DType::F32, &device).unwrap();
+        let conv_history = Tensor::zeros((8, 3), DType::F32, &device).unwrap();
+        assert!(
+            try_qwen35_causal_conv_sequence(&conv_input, &conv_weight, &conv_history).is_none()
+        );
+
+        let query = Tensor::zeros((1, 2, 16, 2), DType::F32, &device).unwrap();
+        let key = Tensor::zeros((1, 2, 16, 2), DType::F32, &device).unwrap();
+        let value = Tensor::zeros((1, 2, 16, 3), DType::F32, &device).unwrap();
+        let g = Tensor::zeros((1, 2, 16), DType::F32, &device).unwrap();
+        let beta = Tensor::zeros((1, 2, 16), DType::F32, &device).unwrap();
+        let state = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        assert!(
+            try_tiled_deltanet_recurrence(&query, &key, &value, &g, &beta, &state, 64).is_none()
+        );
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_qwen35_causal_conv_sequence_matches_cpu_reference_if_available() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let seq_len = 2;
+        let conv_dim = 5;
+        let kernel_size = 4;
+        let input: Vec<f32> = (0..seq_len * conv_dim)
+            .map(|idx| ((idx % 9) as f32 - 4.0) * 0.13)
+            .collect();
+        let weight: Vec<f32> = (0..conv_dim * kernel_size)
+            .map(|idx| ((idx % 7) as f32 - 3.0) * 0.09)
+            .collect();
+        let history: Vec<f32> = (0..conv_dim * (kernel_size - 1))
+            .map(|idx| ((idx % 11) as f32 - 5.0) * 0.07)
+            .collect();
+        let (expected_output, expected_history) =
+            qwen35_causal_conv_reference(&input, &weight, &history, seq_len, conv_dim, kernel_size);
+
+        let input_tensor = Tensor::from_vec(input, (1, seq_len, conv_dim), &device).expect("input");
+        let weight_tensor =
+            Tensor::from_vec(weight, (conv_dim, kernel_size), &device).expect("weight");
+        let history_tensor =
+            Tensor::from_vec(history, (conv_dim, kernel_size - 1), &device).expect("history");
+        let (output, final_history) =
+            try_qwen35_causal_conv_sequence(&input_tensor, &weight_tensor, &history_tensor)
+                .expect("Qwen3.5 causal conv custom Metal op should run");
+        let output = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let final_history = final_history
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_f32_close(&output, &expected_output, 2e-5, "causal conv output");
+        assert_f32_close(
+            &final_history,
+            &expected_history,
+            1e-6,
+            "causal conv history",
+        );
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_qwen35_gated_delta_matches_cpu_reference_for_both_layouts_if_available() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        // Cross several tile boundaries so the test also verifies that each
+        // dispatch observes the recurrent state written by the preceding one.
+        let seq_len = 17;
+        let tile_size = 4;
+        let num_k_heads = 16;
+        let head_k_dim = 3;
+        let head_v_dim = 5;
+
+        for num_v_heads in [16usize, 32] {
+            let query: Vec<f32> = (0..seq_len * num_k_heads * head_k_dim)
+                .map(|idx| ((idx % 17) as f32 - 8.0) * 0.025)
+                .collect();
+            let key: Vec<f32> = (0..seq_len * num_k_heads * head_k_dim)
+                .map(|idx| ((idx % 13) as f32 - 6.0) * 0.021)
+                .collect();
+            let value: Vec<f32> = (0..seq_len * num_v_heads * head_v_dim)
+                .map(|idx| ((idx % 19) as f32 - 9.0) * 0.018)
+                .collect();
+            let g: Vec<f32> = (0..seq_len * num_v_heads)
+                .map(|idx| -0.015 * ((idx % 5) + 1) as f32)
+                .collect();
+            let beta: Vec<f32> = (0..seq_len * num_v_heads)
+                .map(|idx| 0.2 + 0.03 * (idx % 4) as f32)
+                .collect();
+            let initial_state: Vec<f32> = (0..num_v_heads * head_k_dim * head_v_dim)
+                .map(|idx| ((idx % 23) as f32 - 11.0) * 0.004)
+                .collect();
+            let (expected_output, expected_state) = qwen35_gated_delta_reference(
+                &query,
+                &key,
+                &value,
+                &g,
+                &beta,
+                &initial_state,
+                seq_len,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+            );
+
+            let query_tensor =
+                Tensor::from_vec(query, (1, seq_len, num_k_heads, head_k_dim), &device).unwrap();
+            let key_tensor =
+                Tensor::from_vec(key, (1, seq_len, num_k_heads, head_k_dim), &device).unwrap();
+            let value_tensor =
+                Tensor::from_vec(value, (1, seq_len, num_v_heads, head_v_dim), &device).unwrap();
+            let g_tensor = Tensor::from_vec(g, (1, seq_len, num_v_heads), &device).unwrap();
+            let beta_tensor = Tensor::from_vec(beta, (1, seq_len, num_v_heads), &device).unwrap();
+            let state_tensor = Tensor::from_vec(
+                initial_state,
+                (1, num_v_heads, head_k_dim, head_v_dim),
+                &device,
+            )
+            .unwrap();
+
+            let (output, final_state) = try_tiled_deltanet_recurrence(
+                &query_tensor,
+                &key_tensor,
+                &value_tensor,
+                &g_tensor,
+                &beta_tensor,
+                &state_tensor,
+                tile_size,
+            )
+            .expect("Qwen3.5 Gated DeltaNet custom Metal op should run");
+            assert_eq!(output.dtype(), DType::F32);
+            assert_eq!(final_state.dtype(), DType::F32);
+            let output = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let final_state = final_state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let layout = format!("16K/{num_v_heads}V");
+            assert_f32_close(&output, &expected_output, 2e-4, &format!("{layout} output"));
+            assert_f32_close(
+                &final_state,
+                &expected_state,
+                2e-4,
+                &format!("{layout} state"),
+            );
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_qwen35_gated_delta_rejects_invalid_dtype_and_head_layout_if_available() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let query = Tensor::zeros((1, 2, 16, 2), DType::F32, &device).unwrap();
+        let key = Tensor::zeros((1, 2, 16, 2), DType::F32, &device).unwrap();
+        let value = Tensor::zeros((1, 2, 16, 3), DType::F32, &device).unwrap();
+        let g = Tensor::zeros((1, 2, 16), DType::F32, &device).unwrap();
+        let beta = Tensor::zeros((1, 2, 16), DType::F32, &device).unwrap();
+        let state = Tensor::zeros((1, 16, 2, 3), DType::F32, &device).unwrap();
+        assert!(try_tiled_deltanet_recurrence(
+            &query.to_dtype(DType::F16).unwrap(),
+            &key,
+            &value,
+            &g,
+            &beta,
+            &state,
+            64,
+        )
+        .is_none());
+        assert!(
+            try_tiled_deltanet_recurrence(&query, &key, &value, &g, &beta, &state, 0,).is_none()
+        );
+
+        let invalid_value = Tensor::zeros((1, 2, 24, 3), DType::F32, &device).unwrap();
+        let invalid_g = Tensor::zeros((1, 2, 24), DType::F32, &device).unwrap();
+        let invalid_beta = Tensor::zeros((1, 2, 24), DType::F32, &device).unwrap();
+        let invalid_state = Tensor::zeros((1, 24, 2, 3), DType::F32, &device).unwrap();
+        assert!(try_tiled_deltanet_recurrence(
+            &query,
+            &key,
+            &invalid_value,
+            &invalid_g,
+            &invalid_beta,
+            &invalid_state,
+            64,
+        )
+        .is_none());
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]

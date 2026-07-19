@@ -5,6 +5,7 @@ pub(crate) trait IzwiMetalCommandEncoderExt {
     fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize);
     fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize);
     fn set_bytes<T>(&self, index: usize, data: &T);
+    fn insert_memory_barrier(&self);
     fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize);
     fn dispatch_thread_groups(
         &self,
@@ -24,6 +25,10 @@ impl IzwiMetalCommandEncoderExt for CommandsGuard<'_> {
 
     fn set_bytes<T>(&self, index: usize, data: &T) {
         self.as_ref().set_bytes(index, data);
+    }
+
+    fn insert_memory_barrier(&self) {
+        self.as_ref().insert_memory_barrier();
     }
 
     fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
