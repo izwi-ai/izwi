@@ -29,13 +29,13 @@ use super::config::EngineCoreConfig;
 use super::execution::{
     BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
     ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile, FailureKind,
-    FailureScope, FinishReason, HealthImpact, NativeBatchMode, PlanId, PrefillMode,
+    FailureScope, FinishReason, HealthImpact, NativeBatchMode, PhysicalBatch, PlanId, PrefillMode,
     RetryDisposition, SessionKey, YieldReason,
 };
 use super::request::EngineCoreRequest;
 use super::resources::{
-    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
-    ResourceVector,
+    BatchWorkspaceLease, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
+    ResourceLease, ResourceVector,
 };
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
@@ -1291,15 +1291,31 @@ impl ModelExecutor for NativeExecutor {
 
 /// Unified executor that wraps a model executor implementation.
 #[derive(Clone)]
+struct BatchWorkspaceContext {
+    backend: BackendKind,
+    authority: Arc<ResourceAuthority>,
+}
+
+#[derive(Clone)]
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
+    batch_workspace: Option<BatchWorkspaceContext>,
 }
 
 impl UnifiedExecutor {
     /// Create a new unified executor with native backend.
     pub fn new_native(config: WorkerConfig) -> Self {
+        let batch_workspace =
+            config
+                .resource_authority
+                .as_ref()
+                .map(|authority| BatchWorkspaceContext {
+                    backend: config.backend,
+                    authority: authority.clone(),
+                });
         Self {
             inner: Arc::new(RwLock::new(Box::new(NativeExecutor::new(config)))),
+            batch_workspace,
         }
     }
 
@@ -1307,7 +1323,34 @@ impl UnifiedExecutor {
     pub(crate) fn new_for_test(executor: Box<dyn ModelExecutor>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(executor)),
+            batch_workspace: None,
         }
+    }
+
+    pub(super) fn reserve_batch_workspace(
+        &self,
+        batch: &PhysicalBatch,
+    ) -> Result<Option<BatchWorkspaceLease>> {
+        if batch.workspace_bytes == 0 {
+            return Ok(None);
+        }
+        let context = self.batch_workspace.as_ref().ok_or_else(|| {
+            Error::Overloaded(
+                "physical batch requires workspace but no resource authority is installed"
+                    .to_string(),
+            )
+        })?;
+        let mut resources = ResourceVector::zero();
+        let workspace = ResourceAmount::Known(batch.workspace_bytes);
+        match context.backend {
+            BackendKind::Cpu => resources.host_bytes = workspace,
+            BackendKind::Metal => resources.unified_bytes = workspace,
+            BackendKind::Cuda => resources.device_bytes = workspace,
+        }
+        context
+            .authority
+            .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, resources)
+            .map(Some)
     }
 
     /// Execute requests.
@@ -1565,19 +1608,97 @@ mod tests {
     }
 
     #[test]
+    fn physical_batch_workspace_uses_the_backend_resource_domain_and_releases() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let mut capacity = ResourceVector::zero();
+            match backend {
+                BackendKind::Cpu => capacity.host_bytes = ResourceAmount::Known(64),
+                BackendKind::Metal => capacity.unified_bytes = ResourceAmount::Known(64),
+                BackendKind::Cuda => capacity.device_bytes = ResourceAmount::Known(64),
+            }
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity,
+            })));
+            let mut executor = UnifiedExecutor::new_for_test(Box::new(NativeExecutor::new(
+                WorkerConfig::default(),
+            )));
+            executor.batch_workspace = Some(BatchWorkspaceContext {
+                backend,
+                authority: authority.clone(),
+            });
+            let lane = super::super::BatchLaneKey {
+                execution_group: super::super::ExecutionGroupId::new(7),
+                model_instance: super::super::ModelInstanceId::new(8),
+                adapter_instance: super::super::AdapterInstanceId::new(9),
+                adapter_abi: super::super::AdapterAbiRevision::new(1),
+                capability_id: "test".to_string(),
+                stage_id: super::super::StageId::new(1),
+                backend,
+                device_ordinal: None,
+                compute_dtype: "f32".to_string(),
+                state_dtype: "f32".to_string(),
+                tensor_layout: "exact".to_string(),
+                quantization: "none".to_string(),
+                state_schema: "none".to_string(),
+                kernel_mode: "test".to_string(),
+                semantic_mode: "test".to_string(),
+                shape_bucket: "exact.1".to_string(),
+            };
+            let batch = PhysicalBatch {
+                batch_id: super::super::BatchId::new(10),
+                lane: lane.clone(),
+                mode: NativeBatchMode::None,
+                budget: super::super::BatchBudget::width_one(),
+                rows: vec![super::super::ReadyQuantum {
+                    plan_id: 1,
+                    session: SessionKey::new("workspace".to_string(), 1),
+                    lane,
+                    work: super::super::WorkUnit::AtomicJob {
+                        kind: "test".to_string(),
+                    },
+                    cost: super::super::WorkCost::new(1, 1, 8),
+                }],
+                materialized_tensor_elements: 1,
+                workspace_bytes: 8,
+            };
+
+            let workspace = executor
+                .reserve_batch_workspace(&batch)
+                .unwrap()
+                .expect("workspace lease");
+            assert_eq!(
+                workspace.resources(),
+                match backend {
+                    BackendKind::Cpu => ResourceVector {
+                        host_bytes: ResourceAmount::Known(8),
+                        ..ResourceVector::zero()
+                    },
+                    BackendKind::Metal => ResourceVector {
+                        unified_bytes: ResourceAmount::Known(8),
+                        ..ResourceVector::zero()
+                    },
+                    BackendKind::Cuda => ResourceVector {
+                        device_bytes: ResourceAmount::Known(8),
+                        ..ResourceVector::zero()
+                    },
+                }
+            );
+            assert_eq!(authority.snapshot().reservations, 1);
+            drop(workspace);
+            assert_eq!(authority.snapshot().reservations, 0);
+        }
+    }
+
+    #[test]
     fn static_tts_batch_eligibility_is_fail_closed() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let mut request = EngineCoreRequest::tts("hello")
-            .with_model_variant(variant);
+        let mut request = EngineCoreRequest::tts("hello").with_model_variant(variant);
         assert!(!static_qwen_tts_batch_eligible(&request, true, true));
 
         let model_instance = super::super::ModelInstanceId::new(1);
         request.bind_model_instance(model_instance).unwrap();
-        let mut profile = ExecutionProfile::fail_closed(
-            BackendKind::Cpu,
-            Some(variant),
-            ExecutionMode::Atomic,
-        );
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
         profile.max_batch_size = 2;
         let stage = super::super::StageDescriptor::from_execution_profile(
             super::super::StageId::new(1),

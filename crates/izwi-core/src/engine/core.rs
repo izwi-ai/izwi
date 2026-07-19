@@ -133,6 +133,7 @@ struct PhysicalBatchAssembly {
     requests: Vec<Arc<EngineCoreRequest>>,
     scheduled: Vec<super::scheduler::ScheduledRequest>,
     shape_policy: StageShapePolicy,
+    workspace_base_bytes: u64,
 }
 
 impl PhysicalBatchAssembly {
@@ -150,8 +151,8 @@ impl PhysicalBatchAssembly {
         }
     }
 
-    fn workspace_bytes(rows: &[ReadyQuantum]) -> Option<u64> {
-        rows.iter().try_fold(0u64, |total, row| {
+    fn workspace_bytes(base_bytes: u64, rows: &[ReadyQuantum]) -> Option<u64> {
+        rows.iter().try_fold(base_bytes, |total, row| {
             total.checked_add(row.cost.workspace_bytes)
         })
     }
@@ -169,7 +170,9 @@ impl PhysicalBatchAssembly {
         else {
             return false;
         };
-        let Some(workspace_bytes) = Self::workspace_bytes(&candidate.rows) else {
+        let Some(workspace_bytes) =
+            Self::workspace_bytes(self.workspace_base_bytes, &candidate.rows)
+        else {
             return false;
         };
         candidate.materialized_tensor_elements = materialized;
@@ -820,7 +823,7 @@ impl EngineCore {
         outputs
     }
 
-    fn work_cost(work: &WorkUnit) -> Result<WorkCost> {
+    fn work_cost(work: &WorkUnit, stage: Option<&super::StageDescriptor>) -> Result<WorkCost> {
         let logical_units = match work {
             WorkUnit::SequenceStep {
                 input,
@@ -837,7 +840,14 @@ impl EngineCore {
             }
             WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
         };
-        Ok(WorkCost::new(logical_units, logical_units, 0))
+        let workspace_bytes = stage.map_or(Ok(0), |stage| {
+            stage
+                .workspace_per_work_unit_bytes
+                .checked_mul(logical_units)
+                .and_then(|bytes| bytes.checked_add(stage.workspace_per_row_bytes))
+                .ok_or_else(|| Error::Overloaded("batch workspace estimate overflow".to_string()))
+        })?;
+        Ok(WorkCost::new(logical_units, logical_units, workspace_bytes))
     }
 
     fn batch_lane(plan: &ExecutionPlan, cost: WorkCost) -> BatchLaneKey {
@@ -959,7 +969,7 @@ impl EngineCore {
                         scheduled.plan_id
                     ))
                 })?;
-            let cost = Self::work_cost(&plan.work)?;
+            let cost = Self::work_cost(&plan.work, plan.stage.as_ref())?;
             let lane = Self::batch_lane(&plan, cost);
             let (budget, shape_policy) = Self::batch_budget(&plan)?;
             let row = ReadyQuantum {
@@ -992,7 +1002,16 @@ impl EngineCore {
 
             if let Some((request, scheduled, row)) = pending {
                 let materialized_tensor_elements = row.cost.tensor_elements;
-                let workspace_bytes = row.cost.workspace_bytes;
+                let workspace_base_bytes = plan
+                    .stage
+                    .as_ref()
+                    .map(|stage| stage.workspace_base_bytes)
+                    .unwrap_or(0);
+                let workspace_bytes = workspace_base_bytes
+                    .checked_add(row.cost.workspace_bytes)
+                    .ok_or_else(|| {
+                        Error::Overloaded("batch workspace estimate overflow".to_string())
+                    })?;
                 let physical_batch = PhysicalBatch {
                     batch_id: self.allocate_batch_id()?,
                     lane,
@@ -1008,6 +1027,7 @@ impl EngineCore {
                     requests: vec![request],
                     scheduled: vec![scheduled],
                     shape_policy,
+                    workspace_base_bytes,
                 });
             }
         }
@@ -3014,12 +3034,16 @@ mod tests {
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
         profile.max_batch_size = 2;
-        let stage = super::super::StageDescriptor::from_execution_profile(
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
             super::super::StageId::new(4),
             "tts.generate",
             &profile,
             NativeBatchMode::Static,
         );
+        stage.workspace_base_bytes = 4;
+        stage.workspace_per_row_bytes = 2;
+        stage.workspace_per_work_unit_bytes = 1;
+        stage.max_workspace_bytes = 10;
         let adapter_key = super::super::AdapterBindingKey {
             execution_group_id: super::super::ExecutionGroupId::new(1),
             model_instance_id: super::super::ModelInstanceId::new(2),
@@ -3060,6 +3084,7 @@ mod tests {
         let joined = core.form_physical_batches(&requests, &scheduled).unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].physical_batch().rows.len(), 2);
+        assert_eq!(joined[0].physical_batch().workspace_bytes, 10);
         assert_eq!(
             joined[0].physical_batch().lane.model_instance,
             super::super::ModelInstanceId::new(2)

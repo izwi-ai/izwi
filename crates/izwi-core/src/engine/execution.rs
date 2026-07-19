@@ -243,6 +243,9 @@ pub struct StageDescriptor {
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub max_work_units: u64,
+    pub workspace_base_bytes: u64,
+    pub workspace_per_row_bytes: u64,
+    pub workspace_per_work_unit_bytes: u64,
     pub max_workspace_bytes: u64,
     pub max_padding_basis_points: u16,
     pub max_formation_delay: Duration,
@@ -296,6 +299,9 @@ impl StageDescriptor {
                 profile.max_batch_size.max(1)
             },
             max_work_units: u64::MAX,
+            workspace_base_bytes: 0,
+            workspace_per_row_bytes: 0,
+            workspace_per_work_unit_bytes: 0,
             max_workspace_bytes: 0,
             max_padding_basis_points: if shape_policy == StageShapePolicy::Padded {
                 10_000
@@ -323,6 +329,14 @@ impl StageDescriptor {
         if self.max_padding_basis_points > 10_000 {
             return Err(Error::InvalidInput(
                 "execution stage padding budget cannot exceed 100 percent".to_string(),
+            ));
+        }
+        if self.workspace_base_bytes > self.max_workspace_bytes
+            || self.workspace_per_row_bytes > self.max_workspace_bytes
+            || self.workspace_per_work_unit_bytes > self.max_workspace_bytes
+        {
+            return Err(Error::InvalidInput(
+                "execution stage workspace estimate exceeds its maximum".to_string(),
             ));
         }
         if self.batch_mode == NativeBatchMode::None && self.max_batch_size != 1 {
@@ -537,6 +551,7 @@ impl BatchBudget {
 pub enum BatchDispatchKind {
     #[default]
     Serial,
+    NotDispatched,
     RequestParallel,
     TensorStatic,
     TensorContinuous,
@@ -558,6 +573,13 @@ impl BatchDispatch {
 
     pub const fn new(kind: BatchDispatchKind, width: usize) -> Self {
         Self { kind, width }
+    }
+
+    pub const fn not_dispatched(width: usize) -> Self {
+        Self {
+            kind: BatchDispatchKind::NotDispatched,
+            width,
+        }
     }
 }
 
@@ -899,6 +921,15 @@ impl PhysicalBatchReport {
             ));
         }
         match self.dispatch.kind {
+            BatchDispatchKind::NotDispatched
+                if self.rows.iter().any(|row| {
+                    !matches!(row.execution.disposition, ExecutionDisposition::Failed(_))
+                }) =>
+            {
+                return Err(Error::InferenceError(
+                    "a non-dispatched batch may only report failed rows".to_string(),
+                ));
+            }
             BatchDispatchKind::Serial if batch.rows.len() != 1 => {
                 return Err(Error::InferenceError(
                     "serial physical dispatch must have width one".to_string(),
@@ -1158,6 +1189,13 @@ impl ExecutionReport {
             ));
         }
         match self.dispatch.kind {
+            BatchDispatchKind::NotDispatched
+                if !matches!(self.disposition, ExecutionDisposition::Failed(_)) =>
+            {
+                return Err(Error::InferenceError(
+                    "non-dispatched execution must report failure".to_string(),
+                ));
+            }
             BatchDispatchKind::Serial if self.dispatch.width != 1 => {
                 return Err(Error::InferenceError(
                     "serial executor dispatch must have width one".to_string(),
@@ -1479,6 +1517,9 @@ mod tests {
             batch_mode: NativeBatchMode::Continuous,
             max_batch_size: 2,
             max_work_units: 2,
+            workspace_base_bytes: 0,
+            workspace_per_row_bytes: 0,
+            workspace_per_work_unit_bytes: 0,
             max_workspace_bytes: 1,
             max_padding_basis_points: 0,
             max_formation_delay: Duration::ZERO,

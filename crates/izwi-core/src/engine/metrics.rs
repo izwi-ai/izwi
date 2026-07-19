@@ -171,7 +171,7 @@ pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
         BatchDispatchKind::RequestParallel => {
             ENGINE_REQUEST_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
         }
-        BatchDispatchKind::Serial => {}
+        BatchDispatchKind::Serial | BatchDispatchKind::NotDispatched => {}
     }
 }
 
