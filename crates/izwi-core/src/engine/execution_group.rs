@@ -22,7 +22,6 @@ use super::executor::{
 };
 use super::request::EngineCoreRequest;
 use super::scheduler::ScheduledRequest;
-use super::types::RequestId;
 #[cfg(test)]
 use crate::error::Result;
 
@@ -76,13 +75,25 @@ impl PreparedEngineStep {
 /// Results that can only be applied by the engine's commit phase.
 pub(super) struct ExecutedEngineStep {
     pub(super) batches: Vec<ExecutedPhysicalBatch>,
-    pub(super) decode_ids: HashSet<RequestId>,
-    pub(super) prefill_ids: HashSet<RequestId>,
-    pub(super) decode_elapsed: Duration,
-    pub(super) prefill_elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExecutionPhase {
+    Decode,
+    Prefill,
+}
+
+impl ExecutionPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Prefill => "prefill",
+        }
+    }
 }
 
 pub(super) struct ExecutedPhysicalBatch {
+    pub(super) phase: ExecutionPhase,
     pub(super) physical_batch: PhysicalBatch,
     pub(super) report: PhysicalBatchReport,
     pub(super) results: Vec<ExecutorStepResult>,
@@ -93,50 +104,41 @@ pub(super) struct ExecutionGroupRunner;
 
 impl ExecutionGroupRunner {
     pub(super) async fn execute(prepared: PreparedEngineStep) -> ExecutedEngineStep {
-        let decode_ids = request_ids(&prepared.decode_batches);
-        let prefill_ids = request_ids(&prepared.prefill_batches);
-
         // Physical device work is deliberately serialized for every backend.
         // Tensor adapters may still fan out inside one physical batch.
-        let (mut batches, decode_elapsed) =
-            execute_batches(&prepared.executor, "decode", prepared.decode_batches).await;
-        let (mut prefill_batches, prefill_elapsed) =
-            execute_batches(&prepared.executor, "prefill", prepared.prefill_batches).await;
+        let mut batches = execute_batches(
+            &prepared.executor,
+            ExecutionPhase::Decode,
+            prepared.decode_batches,
+        )
+        .await;
+        let mut prefill_batches = execute_batches(
+            &prepared.executor,
+            ExecutionPhase::Prefill,
+            prepared.prefill_batches,
+        )
+        .await;
         batches.append(&mut prefill_batches);
 
-        ExecutedEngineStep {
-            batches,
-            decode_ids,
-            prefill_ids,
-            decode_elapsed,
-            prefill_elapsed,
-        }
+        ExecutedEngineStep { batches }
     }
-}
-
-fn request_ids(batches: &[PreparedExecutionBatch]) -> HashSet<RequestId> {
-    batches
-        .iter()
-        .flat_map(|batch| batch.scheduled.iter())
-        .map(|scheduled| scheduled.request_id.clone())
-        .collect()
 }
 
 async fn execute_batches(
     executor: &UnifiedExecutor,
-    phase: &'static str,
+    phase: ExecutionPhase,
     batches: Vec<PreparedExecutionBatch>,
-) -> (Vec<ExecutedPhysicalBatch>, Duration) {
+) -> Vec<ExecutedPhysicalBatch> {
     if batches.is_empty() {
-        return (Vec::new(), Duration::ZERO);
+        return Vec::new();
     }
 
-    let started = Instant::now();
     let mut executed = Vec::new();
     for batch in batches {
         let batch_started = Instant::now();
         if let Some(results) = pre_dispatch_deadline_results(&batch, Instant::now()) {
             executed.push(executed_batch(
+                phase,
                 batch,
                 results,
                 batch_started.elapsed(),
@@ -165,6 +167,7 @@ async fn execute_batches(
                     })
                     .collect();
                 executed.push(executed_batch(
+                    phase,
                     batch,
                     results,
                     batch_started.elapsed(),
@@ -176,6 +179,7 @@ async fn execute_batches(
         if let Some(results) = pre_dispatch_deadline_results(&batch, Instant::now()) {
             drop(workspace);
             executed.push(executed_batch(
+                phase,
                 batch,
                 results,
                 batch_started.elapsed(),
@@ -190,9 +194,10 @@ async fn execute_batches(
             .execute_physical_batch(&batch.physical_batch, &request_refs, &batch.scheduled)
             .await;
         let mut results =
-            reconcile_executor_outputs(phase, &batch.scheduled, expected_dispatch, result);
+            reconcile_executor_outputs(phase.label(), &batch.scheduled, expected_dispatch, result);
         apply_post_dispatch_deadlines(&batch, Instant::now(), &mut results);
         executed.push(executed_batch(
+            phase,
             batch,
             results,
             batch_started.elapsed(),
@@ -200,7 +205,7 @@ async fn execute_batches(
         ));
         drop(workspace);
     }
-    (executed, started.elapsed())
+    executed
 }
 
 fn pre_dispatch_deadline_results(
@@ -309,6 +314,7 @@ fn apply_post_dispatch_deadlines(
 }
 
 fn executed_batch(
+    phase: ExecutionPhase,
     batch: PreparedExecutionBatch,
     results: Vec<ExecutorStepResult>,
     elapsed: Duration,
@@ -334,6 +340,7 @@ fn executed_batch(
         rows,
     };
     ExecutedPhysicalBatch {
+        phase,
         physical_batch: batch.physical_batch,
         report,
         results,

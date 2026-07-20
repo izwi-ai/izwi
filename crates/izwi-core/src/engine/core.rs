@@ -22,7 +22,8 @@ use super::execution::{
     WorkCost, WorkUnit,
 };
 use super::execution_group::{
-    ExecutedEngineStep, ExecutionGroupRunner, PreparedEngineStep, PreparedExecutionBatch,
+    ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
+    PreparedExecutionBatch,
 };
 #[cfg(test)]
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
@@ -1618,32 +1619,7 @@ impl EngineCore {
         &mut self,
         executed: ExecutedEngineStep,
     ) -> Result<CommittedEngineStep> {
-        let ExecutedEngineStep {
-            batches,
-            decode_ids,
-            prefill_ids,
-            decode_elapsed,
-            prefill_elapsed,
-        } = executed;
-        let decode_step_ms = decode_elapsed.as_secs_f64() * 1000.0;
-        let prefill_step_ms = prefill_elapsed.as_secs_f64() * 1000.0;
-
-        for request_id in &decode_ids {
-            let timing = self
-                .request_phase_timings
-                .entry(request_id.clone())
-                .or_default();
-            timing.decode_ms += decode_step_ms;
-            timing.decode_steps = timing.decode_steps.saturating_add(1);
-        }
-        for request_id in &prefill_ids {
-            let timing = self
-                .request_phase_timings
-                .entry(request_id.clone())
-                .or_default();
-            timing.prefill_ms += prefill_step_ms;
-            timing.prefill_steps = timing.prefill_steps.saturating_add(1);
-        }
+        let ExecutedEngineStep { batches } = executed;
 
         let result_capacity = batches
             .iter()
@@ -1692,11 +1668,29 @@ impl EngineCore {
             }
 
             for result in batch.results {
-                let step_time_ms = if decode_ids.contains(&result.session.request_id) {
-                    decode_step_ms
+                let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
+                let step_time_ms = if entered_model {
+                    batch.report.elapsed.as_secs_f64() * 1000.0
                 } else {
-                    prefill_step_ms
+                    0.0
                 };
+                if entered_model {
+                    if let Some(timing) = self
+                        .request_phase_timings
+                        .get_mut(&result.session.request_id)
+                    {
+                        match batch.phase {
+                            ExecutionPhase::Decode => {
+                                timing.decode_ms += step_time_ms;
+                                timing.decode_steps = timing.decode_steps.saturating_add(1);
+                            }
+                            ExecutionPhase::Prefill => {
+                                timing.prefill_ms += step_time_ms;
+                                timing.prefill_steps = timing.prefill_steps.saturating_add(1);
+                            }
+                        }
+                    }
+                }
                 if let Some(committed) = self.commit_executor_result(result, step_time_ms).await {
                     executor_outputs.push(committed);
                 }
@@ -4302,6 +4296,69 @@ mod tests {
             .unwrap();
         core.add_request(bounded).unwrap();
         assert_eq!(core.requests["bounded-context"].params.max_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn serialized_physical_batches_only_charge_each_request_its_own_elapsed_time() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        for request_id in ["fast-batch", "slow-batch"] {
+            let mut request = EngineCoreRequest::tts(request_id);
+            request.id = request_id.to_string();
+            request.prompt_tokens = vec![1];
+            core.add_request(request).unwrap();
+        }
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prepared physical batches");
+        let mut executed = ExecutionGroupRunner::execute(prepared).await;
+        assert_eq!(executed.batches.len(), 2);
+        for batch in &mut executed.batches {
+            let request_id = batch.results[0].session.request_id.as_str();
+            let elapsed = match request_id {
+                "fast-batch" => Duration::from_millis(7),
+                "slow-batch" => Duration::from_millis(31),
+                other => panic!("unexpected batch row {other}"),
+            };
+            batch.report.elapsed = elapsed;
+            for row in &mut batch.report.rows {
+                row.execution.elapsed = elapsed;
+            }
+        }
+
+        let committed = core.commit_step(executed).await.unwrap();
+        let prefill_ms = committed
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.request_id.as_str(),
+                    output
+                        .latency_breakdown
+                        .as_ref()
+                        .expect("latency breakdown")
+                        .prefill_ms,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert!((prefill_ms["fast-batch"] - 7.0).abs() < 0.001);
+        assert!((prefill_ms["slow-batch"] - 31.0).abs() < 0.001);
     }
 
     #[tokio::test]
