@@ -474,6 +474,9 @@ export class ChatApiClient {
 
           try {
             const event = JSON.parse(data) as ChatThreadStreamEvent;
+            if (streamStatus !== "open") {
+              return false;
+            }
             switch (event.event) {
               case "start":
                 callbacks.onStart?.({
@@ -666,6 +669,9 @@ export class ChatApiClient {
 
           try {
             const payload = JSON.parse(data) as unknown;
+            if (streamStatus !== "open") {
+              return false;
+            }
             const streamError = openAiChatStreamError(payload);
             if (streamError) {
               if (streamStatus === "open") {
@@ -791,6 +797,10 @@ export class ChatApiClient {
               delta?: string;
               error?: { message?: string };
             };
+
+            if (streamStatus !== "open") {
+              return false;
+            }
 
             if (event.type === "response.created" && event.response) {
               callbacks.onCreated?.(this.mapResponseObject(event.response));

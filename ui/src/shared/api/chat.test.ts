@@ -103,6 +103,7 @@ describe("ChatApiClient OpenAI streaming", () => {
       vi.fn().mockResolvedValue(
         sseResponse([
           { error: { message: "Inference failed", type: "server_error" } },
+          chatChunk("late delta"),
           "[DONE]",
         ]),
       ),
@@ -112,16 +113,18 @@ describe("ChatApiClient OpenAI streaming", () => {
       new ApiHttpClient("http://localhost/v1"),
     );
     const onDone = vi.fn();
+    const onDelta = vi.fn();
     const onError = vi.fn();
     client.chatCompletionsStream(
       { messages: [{ role: "user", content: "Hello" }] },
-      { onDone, onError },
+      { onDelta, onDone, onError },
     );
 
     await vi.waitFor(() => {
       expect(onError).toHaveBeenCalledWith("Inference failed");
     });
     expect(onError).toHaveBeenCalledTimes(1);
+    expect(onDelta).not.toHaveBeenCalled();
     expect(onDone).not.toHaveBeenCalled();
   });
 
@@ -192,6 +195,13 @@ describe("ChatApiClient thread streaming", () => {
         sseResponse([
           { event: "delta", delta: "partial" },
           { event: "error", error: "Inference failed" },
+          {
+            event: "done",
+            thread_id: "thread-1",
+            model_id: "test-model",
+            assistant_message: {},
+            stats: { tokens_generated: 1, generation_time_ms: 1 },
+          },
           "[DONE]",
         ]),
       ),
@@ -261,6 +271,7 @@ describe("ChatApiClient Responses streaming", () => {
             response_id: "resp-1",
             error: { message: "Response failed" },
           },
+          { type: "response.completed", response: {} },
           "[DONE]",
         ]),
       ),

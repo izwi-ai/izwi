@@ -20,8 +20,8 @@ use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
     engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, Engine as CoreEngine,
-    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineTask,
-    GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
+    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy,
+    EngineTask, GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
     StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
@@ -98,13 +98,22 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
     Ok(output)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StreamOutputOrder {
     last_sequence: Option<usize>,
     final_seen: bool,
+    allow_gaps: bool,
 }
 
 impl StreamOutputOrder {
+    fn new(policy: EngineStreamPolicy) -> Self {
+        Self {
+            last_sequence: None,
+            final_seen: false,
+            allow_gaps: policy == EngineStreamPolicy::DropNewest,
+        }
+    }
+
     fn observe(&mut self, request_id: &str, chunk: &StreamingOutput) -> Result<()> {
         if chunk.request_id != request_id {
             return Err(Error::InferenceError(format!(
@@ -123,6 +132,13 @@ impl StreamOutputOrder {
         {
             return Err(Error::InferenceError(format!(
                 "stream output sequence {} for {request_id} was not greater than its predecessor",
+                chunk.sequence
+            )));
+        }
+        let expected = self.last_sequence.map_or(0, |last| last.saturating_add(1));
+        if !self.allow_gaps && chunk.sequence != expected {
+            return Err(Error::InferenceError(format!(
+                "stream output sequence {} for {request_id} did not match expected {expected}",
                 chunk.sequence
             )));
         }
@@ -2330,7 +2346,7 @@ impl RuntimeService {
             }
         };
         tokio::pin!(deadline_wait);
-        let mut stream_order = StreamOutputOrder::default();
+        let mut stream_order = StreamOutputOrder::new(observation_request.stream_policy);
 
         loop {
             tokio::select! {
@@ -2948,7 +2964,7 @@ mod tests {
     #[test]
     fn stream_output_order_rejects_wrong_identity_reordering_and_truncation() {
         let request_id = "ordered-stream";
-        let mut order = StreamOutputOrder::default();
+        let mut order = StreamOutputOrder::new(EngineStreamPolicy::FailOnFull);
         let first = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
         order.observe(request_id, &first).unwrap();
 
@@ -2970,8 +2986,17 @@ mod tests {
             .to_string()
             .contains("without a final marker"));
 
-        // Gaps remain valid for an explicitly lossy DropNewest transport, but
-        // every observed sequence must still advance monotonically.
+        let gap = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
+        assert!(order
+            .observe(request_id, &gap)
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 1"));
+
+        // Gaps remain valid only for an explicitly lossy DropNewest transport,
+        // while every observed sequence must still advance monotonically.
+        let mut order = StreamOutputOrder::new(EngineStreamPolicy::DropNewest);
+        order.observe(request_id, &first).unwrap();
         let mut final_output = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
         final_output.is_final = true;
         order.observe(request_id, &final_output).unwrap();
