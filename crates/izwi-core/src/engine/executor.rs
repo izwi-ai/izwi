@@ -1957,6 +1957,7 @@ mod tests {
             &profile,
             NativeBatchMode::Static,
         );
+        let stage_id = stage.id;
         request
             .bind_execution_adapter(super::super::ExecutionAdapterBinding {
                 execution_group_id: super::super::ExecutionGroupId::new(1),
@@ -1967,6 +1968,10 @@ mod tests {
                 capability_id: "tts".to_string(),
                 stages: Arc::from([stage]),
             })
+            .unwrap();
+        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
+        request
+            .install_prepared_stage_cost(stage_id, super::super::WorkCost::new(1, 1, 0))
             .unwrap();
         assert!(static_qwen_tts_batch_eligible(&request, true, true));
         assert!(!static_qwen_tts_batch_eligible(&request, true, false));

@@ -2017,7 +2017,7 @@ Pages free: 10.\n";
 
     #[tokio::test]
     async fn queue_is_bounded_and_raii_reconciles_counts() {
-        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 8, 1));
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
         let lease = coordinator.admit(job("first")).await.unwrap();
         assert_eq!(
             coordinator.snapshot().reserved_memory_bytes,
@@ -2033,6 +2033,16 @@ Pages free: 10.\n";
         drop(second);
         assert_eq!(coordinator.snapshot().active_jobs, 0);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+
+        let parallel = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 1));
+        let first = parallel.admit(job("parallel-first")).await.unwrap();
+        let second = parallel.admit(job("parallel-second")).await.unwrap();
+        assert!(matches!(
+            parallel.admit(job("parallel-third")).await,
+            Err(Error::Overloaded(_))
+        ));
+        drop((first, second));
+        assert_eq!(parallel.snapshot().active_jobs, 0);
     }
 
     #[tokio::test]
@@ -2189,8 +2199,17 @@ Pages free: 10.\n";
             cpu.acquire_execution_units(0, None).await,
             Err(Error::InvalidInput(_))
         ));
+        let cpu_lease = cpu.acquire_execution_units(2, None).await.unwrap();
+        assert_eq!(cpu.snapshot().active_executions, 1);
+        drop(cpu_lease);
         assert!(matches!(
-            cpu.acquire_execution_units(2, None).await,
+            cpu.acquire_execution_units(9, None).await,
+            Err(Error::InvalidInput(_))
+        ));
+
+        let metal = Arc::new(InferenceCoordinator::new(BackendKind::Metal, 8, 8));
+        assert!(matches!(
+            metal.acquire_execution_units(2, None).await,
             Err(Error::InvalidInput(_))
         ));
 
