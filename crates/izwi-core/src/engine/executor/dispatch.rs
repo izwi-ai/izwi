@@ -221,23 +221,7 @@ impl NativeExecutor {
         // finish, abort, failure cleanup, or recompute preemption.
         self.reserve_scheduled_cache(requests, scheduled)?;
         self.prepare_scheduled_cache(scheduled)?;
-        let (outputs, dispatch) = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled)
-        {
-            let result = result?;
-            let dispatch = if result.tensor_width > 1 {
-                BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width)
-            } else {
-                BatchDispatch::serial()
-            };
-            (
-                result
-                    .outputs
-                    .into_iter()
-                    .map(ModelSessionResult::atomic)
-                    .collect(),
-                dispatch,
-            )
-        } else if self.can_parallelize_requests(scheduled.len()) {
+        let (outputs, dispatch) = if self.can_parallelize_requests(scheduled.len()) {
             (
                 self.execute_requests_parallel(requests, scheduled)?,
                 BatchDispatch::new(BatchDispatchKind::RequestParallel, scheduled.len()),
@@ -252,6 +236,35 @@ impl NativeExecutor {
             )
         };
         self.finish_scheduled_execution(requests, scheduled, outputs, dispatch)
+    }
+
+    pub(super) fn execute_static_tts_requests(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ExecutorStepResult>> {
+        self.reserve_scheduled_cache(requests, scheduled)?;
+        self.prepare_scheduled_cache(scheduled)?;
+        let result = self
+            .try_qwen_tts_batch(requests, scheduled)
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "planned static TTS batch is not eligible for tensor dispatch".to_string(),
+                )
+            })??;
+        if result.tensor_width != scheduled.len() {
+            return Err(Error::InferenceError(format!(
+                "static TTS executor dispatched width {}, expected {}",
+                result.tensor_width,
+                scheduled.len()
+            )));
+        }
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            result.outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width),
+        )
     }
 
     pub(super) fn execute_continuous_chat_requests(

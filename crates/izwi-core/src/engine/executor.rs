@@ -1036,10 +1036,10 @@ fn static_qwen_tts_batch_eligible(
         && loaded_has_speakers
         && rollout_enabled
         && request.execution_adapter_binding().is_some_and(|binding| {
-            binding
-                .stages
-                .iter()
-                .any(|stage| stage.batch_mode == NativeBatchMode::Static)
+            binding.stages.iter().any(|stage| {
+                stage.batch_mode == NativeBatchMode::Static
+                    && request.prepared_stage_cost(stage.id).is_some()
+            })
         })
 }
 
@@ -1217,6 +1217,25 @@ impl ModelExecutor for NativeExecutor {
         execution.validate()?;
         if !self.initialized {
             return Err(Error::InferenceError("Executor not initialized".into()));
+        }
+        if execution.batch.mode == NativeBatchMode::Static {
+            if !execution.is_prefill()
+                || execution.batch.lane.capability_id != "tts"
+                || execution
+                    .requests
+                    .iter()
+                    .any(|request| request.task_type != super::types::TaskType::TTS)
+            {
+                return Err(Error::InferenceError(
+                    "static tensor batch was routed to an incompatible native stage".to_string(),
+                ));
+            }
+            if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
+                return Err(Error::Overloaded(
+                    "static tensor batch exceeds the backend width cap".to_string(),
+                ));
+            }
+            return self.execute_static_tts_requests(execution.requests, execution.scheduled);
         }
         if execution.batch.mode == NativeBatchMode::Continuous {
             if execution.is_prefill()

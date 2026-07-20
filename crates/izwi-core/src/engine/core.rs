@@ -742,7 +742,14 @@ impl EngineCore {
         })
     }
 
-    fn work_cost(work: &WorkUnit, stage: Option<&super::StageDescriptor>) -> Result<WorkCost> {
+    fn work_cost(
+        request: &EngineCoreRequest,
+        work: &WorkUnit,
+        stage: Option<&super::StageDescriptor>,
+    ) -> Result<WorkCost> {
+        if let Some(prepared) = stage.and_then(|stage| request.prepared_stage_cost(stage.id)) {
+            return Ok(prepared);
+        }
         let logical_units = match work {
             WorkUnit::SequenceStep {
                 input,
@@ -888,7 +895,7 @@ impl EngineCore {
                         scheduled.plan_id
                     ))
                 })?;
-            let cost = Self::work_cost(&plan.work, plan.stage.as_ref())?;
+            let cost = Self::work_cost(&request, &plan.work, plan.stage.as_ref())?;
             let lane = Self::batch_lane(&plan, cost);
             let (budget, shape_policy) = Self::batch_budget(&plan)?;
             let planned_work = plan.work.clone();
@@ -2827,6 +2834,99 @@ mod tests {
         assert!(split
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
+    }
+
+    #[test]
+    fn prepared_exact_shapes_split_static_physical_batches() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.max_batch_size = 2;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(7),
+            "tts.generate.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage.max_padding_basis_points = 0;
+        stage.max_work_units = 2;
+        stage.max_workspace_bytes = 64;
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage.clone()]),
+        };
+        for (id, tensor_elements) in [("shape-a", 8), ("shape-b", 9)] {
+            let mut request =
+                EngineCoreRequest::tts("exact static shape").with_model_variant(variant);
+            request.id = id.to_string();
+            request.bind_execution_adapter(binding.clone()).unwrap();
+            request
+                .install_prepared_stage_cost(
+                    stage.id,
+                    WorkCost::new(1, tensor_elements, tensor_elements),
+                )
+                .unwrap();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ["shape-a", "shape-b"]
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_prefill(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let adapter_key = binding.key_for_stage(stage.id).unwrap();
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: WorkUnit::AtomicJob {
+                        kind: "tts".to_string(),
+                    },
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: Some(variant),
+                        task_type: TaskType::TTS,
+                        work_kind: "tts".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::Static,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.physical_batch().rows.len() == 1));
+        assert_eq!(batches[0].physical_batch().workspace_bytes, 8);
+        assert_eq!(batches[1].physical_batch().workspace_bytes, 9);
     }
 
     #[test]

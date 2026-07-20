@@ -22,6 +22,7 @@ use super::{
 const WIDTH_ONE_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(2);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(3);
+const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -238,7 +239,21 @@ impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
             NativeBatchMode::Static,
         );
         stage.selector = StageWorkSelector::Atomic;
+        stage.shape_policy = crate::engine::StageShapePolicy::Exact;
+        stage.max_padding_basis_points = 0;
+        stage.max_work_units = u64::try_from(stage.max_batch_size).map_err(|_| {
+            Error::Overloaded("static TTS batch width exceeds work accounting".to_string())
+        })?;
+        stage.max_workspace_bytes = STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES;
+        let mut compatibility = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.generate.compatibility",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        compatibility.selector = StageWorkSelector::Any;
         stage.validate()?;
+        compatibility.validate()?;
 
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
@@ -247,7 +262,7 @@ impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([stage]),
+            stages: Arc::from([stage, compatibility]),
         })
     }
 }
@@ -617,10 +632,16 @@ mod tests {
             NativeBatchMode::Static
         );
         assert_eq!(batch.execution_profile.max_batch_size, 4);
-        assert_eq!(batch.stages.len(), 1);
+        assert_eq!(batch.stages.len(), 2);
         assert_eq!(batch.stages[0].selector, StageWorkSelector::Atomic);
         assert_eq!(batch.stages[0].batch_mode, NativeBatchMode::Static);
         assert_eq!(batch.stages[0].max_batch_size, 4);
+        assert_eq!(
+            batch.stages[0].shape_policy,
+            crate::engine::StageShapePolicy::Exact
+        );
+        assert_eq!(batch.stages[1].selector, StageWorkSelector::Any);
+        assert_eq!(batch.stages[1].batch_mode, NativeBatchMode::None);
 
         let streaming = bundle.contract(CapabilityKind::Tts, true).unwrap();
         assert_eq!(streaming.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);

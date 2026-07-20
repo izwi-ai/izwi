@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::config::EngineCoreConfig;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
+use super::{StageId, WorkCost};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -226,6 +227,15 @@ pub(super) struct IncrementalModelExecutionReady {
     model: PreparedIncrementalModel,
 }
 
+/// Exact, host-prepared cost for one loaded adapter stage. Model preparation
+/// may publish shape and transient collation requirements here, but it must not
+/// allocate device tensors before physical-batch admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PreparedStageCost {
+    stage_id: StageId,
+    cost: WorkCost,
+}
+
 impl fmt::Debug for PreparedChatModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -358,6 +368,10 @@ pub struct EngineCoreRequest {
     /// Exact loaded capability adapter selected by the runtime. Direct engine
     /// callers without a lifecycle bundle remain on compatibility dispatch.
     pub(super) execution_adapter_binding: Option<super::ExecutionAdapterBinding>,
+    /// Request-specific shape/workspace facts produced by the exact loaded
+    /// model. The engine remains model-neutral and keys these facts by the
+    /// opaque stage identity from the loaded adapter contract.
+    pub(super) prepared_stage_costs: Vec<PreparedStageCost>,
     /// Input text (for TTS)
     pub text: Option<String>,
     /// Chat input messages.
@@ -1308,7 +1322,8 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        self.validate_incremental_model_execution_preparation()
+        self.validate_incremental_model_execution_preparation()?;
+        self.validate_prepared_stage_costs()
     }
 
     /// Validate once at the mutable core admission boundary. Requests are
@@ -1397,10 +1412,66 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        self.prepared_stage_costs.clear();
+        let static_stage = self.execution_adapter_binding.as_ref().and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Static)
+                .cloned()
+        });
+        let model_arc = model.model_arc();
+        let prepared_static_cost = static_stage
+            .filter(|_| {
+                !self.streaming
+                    && !self.has_tts_reference_for_execution()
+                    && self
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty())
+                    && model_variant
+                        .speech_capabilities()
+                        .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+            })
+            .map(|stage| {
+                let speakers = model_arc.available_speakers();
+                let requested = self
+                    .params
+                    .speaker
+                    .as_deref()
+                    .or(self.params.voice.as_deref())
+                    .filter(|speaker| !speaker.trim().is_empty())
+                    .or_else(|| speakers.first().map(|speaker| speaker.as_str()))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "Qwen TTS request {} requires a loaded preset speaker",
+                            self.id
+                        ))
+                    })?;
+                let layout = model_arc.preset_speaker_batch_layout(
+                    self.text.as_deref().unwrap_or_default(),
+                    requested,
+                    self.language.as_deref(),
+                    self.voice_description.as_deref(),
+                )?;
+                let tensor_elements = u64::try_from(layout.prefill_tokens).map_err(|_| {
+                    Error::Overloaded(
+                        "Qwen3-TTS static prefill shape exceeds work accounting".to_string(),
+                    )
+                })?;
+                Ok::<(StageId, WorkCost), Error>((
+                    stage.id,
+                    WorkCost::new(1, tensor_elements, layout.collation_workspace_bytes),
+                ))
+            })
+            .transpose()?;
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::QwenTts(model),
         });
+        if let Some((stage_id, cost)) = prepared_static_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
@@ -1518,6 +1589,7 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
             text: Some(text),
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1563,6 +1635,7 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1608,6 +1681,7 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1650,6 +1724,7 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
             text: None,
             chat_messages: Some(messages),
             chat_config: ChatRequestConfig::default(),
@@ -1693,6 +1768,7 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1736,6 +1812,7 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1815,6 +1892,67 @@ impl EngineCoreRequest {
 
     pub(crate) fn execution_adapter_binding(&self) -> Option<&super::ExecutionAdapterBinding> {
         self.execution_adapter_binding.as_ref()
+    }
+
+    fn validate_prepared_stage_costs(&self) -> Result<()> {
+        if self.prepared_stage_costs.is_empty() {
+            return Ok(());
+        }
+        let binding = self.execution_adapter_binding.as_ref().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Request {} carries prepared stage costs without a loaded adapter binding",
+                self.id
+            ))
+        })?;
+        let mut stage_ids = std::collections::HashSet::new();
+        for prepared in &self.prepared_stage_costs {
+            if !stage_ids.insert(prepared.stage_id) {
+                return Err(Error::InvalidInput(format!(
+                    "Request {} carries duplicate prepared costs for one stage",
+                    self.id
+                )));
+            }
+            let stage = binding
+                .stages
+                .iter()
+                .find(|stage| stage.id == prepared.stage_id)
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Request {} prepared an unknown adapter stage",
+                        self.id
+                    ))
+                })?;
+            if stage.batch_mode == super::NativeBatchMode::None
+                || prepared.cost.logical_units == 0
+                || prepared.cost.tensor_elements == 0
+                || prepared.cost.workspace_bytes > stage.max_workspace_bytes
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Request {} carries an invalid prepared tensor-stage cost",
+                    self.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_prepared_stage_cost(
+        &mut self,
+        stage_id: StageId,
+        cost: WorkCost,
+    ) -> Result<()> {
+        self.prepared_stage_costs
+            .retain(|prepared| prepared.stage_id != stage_id);
+        self.prepared_stage_costs
+            .push(PreparedStageCost { stage_id, cost });
+        self.validate_prepared_stage_costs()
+    }
+
+    pub(crate) fn prepared_stage_cost(&self, stage_id: StageId) -> Option<WorkCost> {
+        self.prepared_stage_costs
+            .iter()
+            .find(|prepared| prepared.stage_id == stage_id)
+            .map(|prepared| prepared.cost)
     }
 
     pub fn is_cancelled(&self) -> bool {

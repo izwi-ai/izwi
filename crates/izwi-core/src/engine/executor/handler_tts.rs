@@ -14,7 +14,7 @@ use super::state::ActiveQwenTtsDecode;
 use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
 pub(super) struct QwenTtsBatchResult {
-    pub(super) outputs: Vec<ExecutorOutput>,
+    pub(super) outputs: Vec<ModelSessionResult>,
     pub(super) tensor_width: usize,
 }
 
@@ -34,7 +34,6 @@ impl NativeExecutor {
                 .copied()
                 .find(|request| request.id == item.request_id)?;
             if request.streaming
-                || request.is_cancelled()
                 || request
                     .text
                     .as_deref()
@@ -150,26 +149,33 @@ impl NativeExecutor {
                 .iter()
                 .zip(scheduled)
                 .zip(generated.outputs)
-                .map(|((request, _scheduled), output)| ExecutorOutput {
-                    request_id: request.id.clone(),
-                    audio: Some(AudioOutput::new(output.samples, 24_000)),
-                    text: None,
-                    input_transcription: None,
-                    tokens_processed: request.num_prompt_tokens(),
-                    tokens_generated: output.frames_generated,
-                    finished: true,
-                    phase_timing_override: Some(ExecutorPhaseTiming {
-                        decode_ms: Some(per_request_ms),
-                        decode_steps: Some(output.frames_generated as u32),
-                        ..Default::default()
-                    }),
-                    asr_diagnostics: None,
-                    error: None,
+                .map(|((request, _scheduled), output)| {
+                    if request.is_cancelled() {
+                        return ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                            request.id.clone(),
+                        ));
+                    }
+                    ModelSessionResult::atomic(ExecutorOutput {
+                        request_id: request.id.clone(),
+                        audio: Some(AudioOutput::new(output.samples, 24_000)),
+                        text: None,
+                        input_transcription: None,
+                        tokens_processed: request.num_prompt_tokens(),
+                        tokens_generated: output.frames_generated,
+                        finished: true,
+                        phase_timing_override: Some(ExecutorPhaseTiming {
+                            decode_ms: Some(per_request_ms),
+                            decode_steps: Some(output.frames_generated as u32),
+                            ..Default::default()
+                        }),
+                        asr_diagnostics: None,
+                        error: None,
+                    })
                 })
                 .collect();
             Ok(QwenTtsBatchResult {
                 outputs,
-                tensor_width: generated.max_tensor_batch_width,
+                tensor_width: generated.tensor_batch_width,
             })
         })())
     }
