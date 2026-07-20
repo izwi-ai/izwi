@@ -34,7 +34,7 @@ use super::executor::{
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
-use super::metrics::record_engine_physical_batch;
+use super::metrics::{record_engine_execution_outcome, record_engine_physical_batch};
 use super::output::OutputProcessor;
 use super::request::{EngineCoreRequest, RequestStatus};
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
@@ -1668,6 +1668,7 @@ impl EngineCore {
             }
 
             for result in batch.results {
+                let provenance = result.provenance;
                 let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
                 let step_time_ms = if entered_model {
                     batch.report.elapsed.as_secs_f64() * 1000.0
@@ -1691,8 +1692,9 @@ impl EngineCore {
                         }
                     }
                 }
-                if let Some(committed) = self.commit_executor_result(result, step_time_ms).await {
-                    executor_outputs.push(committed);
+                match self.commit_executor_result(result, step_time_ms).await {
+                    Some(committed) => executor_outputs.push(committed),
+                    None => record_engine_execution_outcome(provenance),
                 }
             }
         }
@@ -1705,6 +1707,7 @@ impl EngineCore {
         let mut outputs = Vec::new();
 
         for committed in executor_outputs {
+            record_engine_execution_outcome(committed.provenance);
             let CommittedExecutorOutput {
                 session,
                 output: exec_output,
@@ -4032,6 +4035,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_deadline_returns_one_terminal_output_with_original_sequence() {
+        let metrics_before = crate::engine::engine_batch_metrics_snapshot();
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
@@ -4053,6 +4057,15 @@ mod tests {
         assert_eq!(
             outputs[0].provenance,
             OutcomeProvenance::deadline(DeadlinePhase::SchedulerQueue, DispatchState::NotStarted,)
+        );
+        let metrics_after = crate::engine::engine_batch_metrics_snapshot();
+        assert!(
+            metrics_after.dispatch_states.not_started
+                >= metrics_before.dispatch_states.not_started + 1
+        );
+        assert!(
+            metrics_after.deadline_phases.scheduler_queue
+                >= metrics_before.deadline_phases.scheduler_queue + 1
         );
         assert!(!core.has_request(&"expired".to_string()));
         assert_eq!(

@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use super::{BatchDispatch, BatchDispatchKind, PhysicalBatch};
+use super::{
+    BatchDispatch, BatchDispatchKind, DeadlinePhase, DispatchState, FailureOrigin,
+    OutcomeProvenance, PhysicalBatch, ResourceAmount,
+};
 
 /// Stable metric names for scheduler and KV-cache observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -64,6 +67,14 @@ pub const ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL: &str =
     "engine.executor.tensor_batch_materialized_elements_total";
 pub const ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL: &str =
     "engine.executor.batch_workspace_bytes_total";
+pub const ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL: &str =
+    "engine.executor.dispatch_state_rows_total";
+pub const ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL: &str =
+    "engine.executor.failure_origin_rows_total";
+pub const ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL: &str =
+    "engine.executor.deadline_phase_rows_total";
+pub const ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL: &str =
+    "engine.executor.batch_workspace_domain_bytes_total";
 pub const ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO: &str = "engine.executor.tensor_batch_fill_ratio";
 pub const ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO: &str =
     "engine.executor.tensor_batch_padding_ratio";
@@ -194,6 +205,22 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         description: "Transient workspace bytes admitted for dispatched physical batches.",
     },
     EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+        description: "Execution rows by bounded dispatch-state label.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+        description: "Failed execution rows by bounded failure-origin label.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
+        description: "Timed-out execution rows by bounded deadline-phase label.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
+        description: "Transient physical-batch workspace bytes by bounded memory-domain label.",
+    },
+    EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
         description: "Cumulative tensor-batch row utilization against configured capacity.",
     },
@@ -215,6 +242,118 @@ static ENGINE_TENSOR_BATCH_CAPACITY_ROWS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_BATCH_WORKSPACE_BYTES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_DISPATCH_STATE_ROWS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static ENGINE_FAILURE_ORIGIN_ROWS: [AtomicU64; 9] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ENGINE_DEADLINE_PHASE_ROWS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ENGINE_WORKSPACE_DOMAIN_BYTES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineDispatchStateMetricsSnapshot {
+    pub not_started: u64,
+    pub started: u64,
+    pub produced_output: u64,
+}
+
+impl EngineDispatchStateMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 3] {
+        [
+            ("not_started", self.not_started),
+            ("started", self.started),
+            ("produced_output", self.produced_output),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineFailureOriginMetricsSnapshot {
+    pub adapter_planning: u64,
+    pub dispatch_coordination: u64,
+    pub workspace_admission: u64,
+    pub executor_validation: u64,
+    pub model: u64,
+    pub stream_delivery: u64,
+    pub state_commit: u64,
+    pub cleanup: u64,
+    pub panic: u64,
+}
+
+impl EngineFailureOriginMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 9] {
+        [
+            ("adapter_planning", self.adapter_planning),
+            ("dispatch_coordination", self.dispatch_coordination),
+            ("workspace_admission", self.workspace_admission),
+            ("executor_validation", self.executor_validation),
+            ("model", self.model),
+            ("stream_delivery", self.stream_delivery),
+            ("state_commit", self.state_commit),
+            ("cleanup", self.cleanup),
+            ("panic", self.panic),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineDeadlinePhaseMetricsSnapshot {
+    pub scheduler_queue: u64,
+    pub dispatch_wait: u64,
+    pub model_execution: u64,
+    pub stream_delivery: u64,
+    pub terminal_delivery: u64,
+}
+
+impl EngineDeadlinePhaseMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 5] {
+        [
+            ("scheduler_queue", self.scheduler_queue),
+            ("dispatch_wait", self.dispatch_wait),
+            ("model_execution", self.model_execution),
+            ("stream_delivery", self.stream_delivery),
+            ("terminal_delivery", self.terminal_delivery),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineWorkspaceDomainMetricsSnapshot {
+    pub host: u64,
+    pub device: u64,
+    pub unified: u64,
+    pub temporary: u64,
+}
+
+impl EngineWorkspaceDomainMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 4] {
+        [
+            ("host", self.host),
+            ("device", self.device),
+            ("unified", self.unified),
+            ("temporary", self.temporary),
+        ]
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineBatchMetricsSnapshot {
@@ -229,6 +368,10 @@ pub struct EngineBatchMetricsSnapshot {
     pub tensor_batch_useful_elements_total: u64,
     pub tensor_batch_materialized_elements_total: u64,
     pub batch_workspace_bytes_total: u64,
+    pub dispatch_states: EngineDispatchStateMetricsSnapshot,
+    pub failure_origins: EngineFailureOriginMetricsSnapshot,
+    pub deadline_phases: EngineDeadlinePhaseMetricsSnapshot,
+    pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
 }
@@ -243,6 +386,41 @@ pub(crate) fn record_engine_stream_backpressure() {
 
 pub fn engine_stream_backpressure_total() -> u64 {
     ENGINE_STREAM_BACKPRESSURE_EVENTS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn record_engine_execution_outcome(provenance: OutcomeProvenance) {
+    let dispatch_index = match provenance.dispatch_state {
+        DispatchState::NotStarted => 0,
+        DispatchState::Started => 1,
+        DispatchState::ProducedOutput => 2,
+    };
+    ENGINE_DISPATCH_STATE_ROWS[dispatch_index].fetch_add(1, Ordering::Relaxed);
+
+    if let Some(origin) = provenance.failure_origin {
+        let origin_index = match origin {
+            FailureOrigin::AdapterPlanning => 0,
+            FailureOrigin::DispatchCoordination => 1,
+            FailureOrigin::WorkspaceAdmission => 2,
+            FailureOrigin::ExecutorValidation => 3,
+            FailureOrigin::Model => 4,
+            FailureOrigin::StreamDelivery => 5,
+            FailureOrigin::StateCommit => 6,
+            FailureOrigin::Cleanup => 7,
+            FailureOrigin::Panic => 8,
+        };
+        ENGINE_FAILURE_ORIGIN_ROWS[origin_index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    if let Some(phase) = provenance.deadline_phase {
+        let phase_index = match phase {
+            DeadlinePhase::SchedulerQueue => 0,
+            DeadlinePhase::DispatchWait => 1,
+            DeadlinePhase::ModelExecution => 2,
+            DeadlinePhase::StreamDelivery => 3,
+            DeadlinePhase::TerminalDelivery => 4,
+        };
+        ENGINE_DEADLINE_PHASE_ROWS[phase_index].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
@@ -272,6 +450,19 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
 
     let workspace_bytes = batch.workspace.workspace_bytes().unwrap_or(0);
     ENGINE_BATCH_WORKSPACE_BYTES.fetch_add(workspace_bytes, Ordering::Relaxed);
+    for (index, amount) in [
+        batch.workspace.host_bytes,
+        batch.workspace.device_bytes,
+        batch.workspace.unified_bytes,
+        batch.workspace.temporary_bytes,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let ResourceAmount::Known(bytes) = amount {
+            ENGINE_WORKSPACE_DOMAIN_BYTES[index].fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
     if !matches!(
         dispatch.kind,
         BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous
@@ -320,6 +511,35 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         tensor_batch_useful_elements_total: useful_elements,
         tensor_batch_materialized_elements_total: materialized_elements,
         batch_workspace_bytes_total: ENGINE_BATCH_WORKSPACE_BYTES.load(Ordering::Relaxed),
+        dispatch_states: EngineDispatchStateMetricsSnapshot {
+            not_started: ENGINE_DISPATCH_STATE_ROWS[0].load(Ordering::Relaxed),
+            started: ENGINE_DISPATCH_STATE_ROWS[1].load(Ordering::Relaxed),
+            produced_output: ENGINE_DISPATCH_STATE_ROWS[2].load(Ordering::Relaxed),
+        },
+        failure_origins: EngineFailureOriginMetricsSnapshot {
+            adapter_planning: ENGINE_FAILURE_ORIGIN_ROWS[0].load(Ordering::Relaxed),
+            dispatch_coordination: ENGINE_FAILURE_ORIGIN_ROWS[1].load(Ordering::Relaxed),
+            workspace_admission: ENGINE_FAILURE_ORIGIN_ROWS[2].load(Ordering::Relaxed),
+            executor_validation: ENGINE_FAILURE_ORIGIN_ROWS[3].load(Ordering::Relaxed),
+            model: ENGINE_FAILURE_ORIGIN_ROWS[4].load(Ordering::Relaxed),
+            stream_delivery: ENGINE_FAILURE_ORIGIN_ROWS[5].load(Ordering::Relaxed),
+            state_commit: ENGINE_FAILURE_ORIGIN_ROWS[6].load(Ordering::Relaxed),
+            cleanup: ENGINE_FAILURE_ORIGIN_ROWS[7].load(Ordering::Relaxed),
+            panic: ENGINE_FAILURE_ORIGIN_ROWS[8].load(Ordering::Relaxed),
+        },
+        deadline_phases: EngineDeadlinePhaseMetricsSnapshot {
+            scheduler_queue: ENGINE_DEADLINE_PHASE_ROWS[0].load(Ordering::Relaxed),
+            dispatch_wait: ENGINE_DEADLINE_PHASE_ROWS[1].load(Ordering::Relaxed),
+            model_execution: ENGINE_DEADLINE_PHASE_ROWS[2].load(Ordering::Relaxed),
+            stream_delivery: ENGINE_DEADLINE_PHASE_ROWS[3].load(Ordering::Relaxed),
+            terminal_delivery: ENGINE_DEADLINE_PHASE_ROWS[4].load(Ordering::Relaxed),
+        },
+        workspace_domains: EngineWorkspaceDomainMetricsSnapshot {
+            host: ENGINE_WORKSPACE_DOMAIN_BYTES[0].load(Ordering::Relaxed),
+            device: ENGINE_WORKSPACE_DOMAIN_BYTES[1].load(Ordering::Relaxed),
+            unified: ENGINE_WORKSPACE_DOMAIN_BYTES[2].load(Ordering::Relaxed),
+            temporary: ENGINE_WORKSPACE_DOMAIN_BYTES[3].load(Ordering::Relaxed),
+        },
         tensor_batch_fill_ratio: ratio(rows, capacity_rows),
         tensor_batch_padding_ratio: ratio(
             materialized_elements.saturating_sub(useful_elements),
@@ -719,6 +939,10 @@ mod tests {
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL));
+        assert!(names.contains(ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO));
         assert_eq!(names.len(), ENGINE_METRIC_CATALOG.len());
@@ -756,6 +980,36 @@ mod tests {
         assert!(engine_tensor_batches_total() >= tensor_before + 1);
         assert!(engine_request_parallel_batches_total() >= parallel_before + 1);
         assert!(engine_tensor_batch_max_width() >= 3);
+    }
+
+    #[test]
+    fn execution_outcome_metrics_use_only_bounded_provenance_dimensions() {
+        let before = engine_batch_metrics_snapshot();
+        record_engine_execution_outcome(OutcomeProvenance::failure(
+            FailureOrigin::WorkspaceAdmission,
+            DispatchState::NotStarted,
+        ));
+        record_engine_execution_outcome(OutcomeProvenance::deadline(
+            DeadlinePhase::ModelExecution,
+            DispatchState::Started,
+        ));
+        record_engine_execution_outcome(OutcomeProvenance::produced_output());
+        let after = engine_batch_metrics_snapshot();
+
+        assert!(after.dispatch_states.not_started >= before.dispatch_states.not_started + 1);
+        assert!(after.dispatch_states.started >= before.dispatch_states.started + 1);
+        assert!(
+            after.dispatch_states.produced_output >= before.dispatch_states.produced_output + 1
+        );
+        assert!(
+            after.failure_origins.workspace_admission
+                >= before.failure_origins.workspace_admission + 1
+        );
+        assert!(
+            after.deadline_phases.model_execution >= before.deadline_phases.model_execution + 1
+        );
+        assert_eq!(after.failure_origins.labeled_values().len(), 9);
+        assert_eq!(after.deadline_phases.labeled_values().len(), 5);
     }
 
     #[test]
@@ -803,7 +1057,13 @@ mod tests {
             },
             rows: vec![row(1, "a"), row(2, "b")],
             materialized_tensor_elements: 30,
-            workspace: ResourceVector::temporary_workspace(8),
+            workspace: ResourceVector {
+                host_bytes: ResourceAmount::Known(1),
+                device_bytes: ResourceAmount::Known(2),
+                unified_bytes: ResourceAmount::Known(3),
+                temporary_bytes: ResourceAmount::Known(2),
+                ..ResourceVector::zero()
+            },
         };
         batch.validate().unwrap();
 
@@ -828,6 +1088,10 @@ mod tests {
                 >= before.tensor_batch_materialized_elements_total + 30
         );
         assert!(dispatched.batch_workspace_bytes_total >= before.batch_workspace_bytes_total + 8);
+        assert!(dispatched.workspace_domains.host >= before.workspace_domains.host + 1);
+        assert!(dispatched.workspace_domains.device >= before.workspace_domains.device + 2);
+        assert!(dispatched.workspace_domains.unified >= before.workspace_domains.unified + 3);
+        assert!(dispatched.workspace_domains.temporary >= before.workspace_domains.temporary + 2);
 
         record_engine_physical_batch(&batch, BatchDispatch::not_dispatched(2));
         let rejected = engine_batch_metrics_snapshot();

@@ -10,7 +10,9 @@ use tokio::sync::Mutex;
 
 use crate::engine::{
     engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
-    EngineMetricDescriptor, EngineOutput,
+    EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
+    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineOutput,
+    EngineWorkspaceDomainMetricsSnapshot,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
@@ -70,6 +72,10 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub tensor_batch_useful_elements_total: u64,
     pub tensor_batch_materialized_elements_total: u64,
     pub batch_workspace_bytes_total: u64,
+    pub dispatch_states: EngineDispatchStateMetricsSnapshot,
+    pub failure_origins: EngineFailureOriginMetricsSnapshot,
+    pub deadline_phases: EngineDeadlinePhaseMetricsSnapshot,
+    pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
     pub kv_cache: EngineKvCacheRuntimeSnapshot,
@@ -1088,6 +1094,23 @@ pub(crate) fn push_engine_metric_f64(payload: &mut String, name: &str, value: f6
     ));
 }
 
+pub(crate) fn push_engine_labeled_metric(
+    payload: &mut String,
+    name: &str,
+    label_name: &str,
+    values: &[(&str, u64)],
+) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
+    payload.push_str(&format!("# TYPE {prometheus_name} {metric_type}\n"));
+    for (label_value, value) in values {
+        payload.push_str(&format!(
+            "{prometheus_name}{{{label_name}=\"{label_value}\"}} {value}\n"
+        ));
+    }
+}
+
 fn push_engine_metric_help(payload: &mut String, name: &str, prometheus_name: &str) {
     if let Some(descriptor) = engine_metric_catalog()
         .iter()
@@ -1144,7 +1167,10 @@ fn prometheus_label_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{ExecutorOutput, OutputProcessor, ENGINE_SCHEDULER_QUEUE_DEPTH};
+    use crate::engine::{
+        ExecutorOutput, OutputProcessor, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+        ENGINE_SCHEDULER_QUEUE_DEPTH,
+    };
     use std::time::Duration;
 
     fn terminal_output(request_id: &str, error: Option<&str>) -> EngineOutput {
@@ -1428,6 +1454,27 @@ mod tests {
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth 7"));
         assert!(payload.contains("# HELP izwi_engine_scheduler_queue_depth"));
+    }
+
+    #[test]
+    fn labeled_engine_metric_helper_emits_one_bounded_family() {
+        let mut payload = String::new();
+        push_engine_labeled_metric(
+            &mut payload,
+            ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+            "state",
+            &[("not_started", 2), ("started", 3), ("produced_output", 5)],
+        );
+
+        assert_eq!(
+            payload
+                .matches("# TYPE izwi_engine_executor_dispatch_state_rows_total counter")
+                .count(),
+            1
+        );
+        assert!(payload.contains(
+            "izwi_engine_executor_dispatch_state_rows_total{state=\"produced_output\"} 5"
+        ));
     }
 
     #[tokio::test]

@@ -23,7 +23,10 @@ use crate::engine::{
     EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineTask,
     GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
     StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
-    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
+    ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL, ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
@@ -60,10 +63,10 @@ use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::rollout::ExecutionRolloutPolicy;
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_metric, push_engine_metric_f64, EngineKvCacheRuntimeSnapshot,
-    EngineRuntimeTelemetrySnapshot, RuntimeObservationContext, RuntimeStageObservation,
-    RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot,
+    push_engine_labeled_metric, push_engine_metric, push_engine_metric_f64,
+    EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
+    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
+    RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
 };
 use crate::runtime::types::RuntimeRequestContext;
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
@@ -2479,6 +2482,10 @@ impl RuntimeService {
             tensor_batch_materialized_elements_total: batch
                 .tensor_batch_materialized_elements_total,
             batch_workspace_bytes_total: batch.batch_workspace_bytes_total,
+            dispatch_states: batch.dispatch_states,
+            failure_origins: batch.failure_origins,
+            deadline_phases: batch.deadline_phases,
+            workspace_domains: batch.workspace_domains,
             tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
             tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
             kv_cache: kv_cache_snapshot,
@@ -2631,6 +2638,30 @@ impl RuntimeService {
             payload,
             ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
             snapshot.batch_workspace_bytes_total,
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+            "state",
+            &snapshot.dispatch_states.labeled_values(),
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+            "origin",
+            &snapshot.failure_origins.labeled_values(),
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
+            "phase",
+            &snapshot.deadline_phases.labeled_values(),
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
+            "domain",
+            &snapshot.workspace_domains.labeled_values(),
         );
         push_engine_metric_f64(
             payload,
@@ -2864,8 +2895,7 @@ mod tests {
         assert_eq!(request.model_instance_id(), Some(instance));
         assert!(request.execution_adapter_binding().is_some());
 
-        let mut wrong =
-            EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
+        let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
         assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle)).is_err());
         assert_eq!(wrong.model_instance_id(), None);
 
@@ -4060,6 +4090,16 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_tensor_static_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_continuous_batches_total"));
         assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
+        assert!(payload
+            .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));
+        assert!(
+            payload.contains("izwi_engine_executor_failure_origin_rows_total{origin=\"model\"}")
+        );
+        assert!(payload
+            .contains("izwi_engine_executor_deadline_phase_rows_total{phase=\"dispatch_wait\"}"));
+        assert!(payload.contains(
+            "izwi_engine_executor_batch_workspace_domain_bytes_total{domain=\"device\"}"
+        ));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_fill_ratio"));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_padding_ratio"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
