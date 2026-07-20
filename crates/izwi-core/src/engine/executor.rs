@@ -1331,11 +1331,6 @@ impl ModelExecutor for NativeExecutor {
                 FailureOrigin::ExecutorValidation,
             ));
         }
-        for request in execution.requests {
-            request.begin_stream_staging().map_err(|error| {
-                PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
-            })?;
-        }
         if execution.batch.mode == NativeBatchMode::Static {
             if !execution.is_prefill()
                 || execution.batch.lane.capability_id != "tts"

@@ -6,7 +6,8 @@ use crate::error::{Error, Result};
 use super::super::metrics::record_engine_stream_backpressure;
 use super::super::output::{AsrProgress, StreamingOutput};
 use super::super::request::{
-    EngineCoreRequest, EngineStreamPolicy, StreamPushOutcome, StreamStagingBuffer,
+    EngineCoreRequest, EngineStreamPolicy, FencedStreamProgress, StreamProgressPermit,
+    StreamPushOutcome, StreamStagingBuffer,
 };
 use super::super::SessionKey;
 use super::NativeExecutor;
@@ -33,7 +34,13 @@ pub(crate) struct CommittedStreamDelivery {
     pub(crate) session: SessionKey,
     tx: mpsc::Sender<StreamingOutput>,
     policy: StreamBackpressurePolicy,
-    outputs: Vec<StreamingOutput>,
+    outputs: Vec<CommittedStreamOutput>,
+}
+
+#[derive(Debug)]
+struct CommittedStreamOutput {
+    output: StreamingOutput,
+    _progress_permit: Option<StreamProgressPermit>,
 }
 
 impl CommittedStreamDelivery {
@@ -47,12 +54,36 @@ impl CommittedStreamDelivery {
             session,
             tx,
             policy,
-            outputs,
+            outputs: outputs
+                .into_iter()
+                .map(|output| CommittedStreamOutput {
+                    output,
+                    _progress_permit: None,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn from_progress(
+        session: SessionKey,
+        tx: mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        progress: FencedStreamProgress,
+    ) -> Self {
+        Self {
+            session,
+            tx,
+            policy,
+            outputs: vec![CommittedStreamOutput {
+                output: progress.output,
+                _progress_permit: Some(progress.budget_permit),
+            }],
         }
     }
 
     async fn deliver(self) -> std::result::Result<(), StreamDeliveryFailureKind> {
-        for output in self.outputs {
+        for committed in self.outputs {
+            let output = committed.output;
             if output.request_id != self.session.request_id {
                 return Err(StreamDeliveryFailureKind::Delivery);
             }

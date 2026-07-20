@@ -587,6 +587,14 @@ impl StreamStagingBuffer {
         Ok(std::mem::take(&mut state.staged))
     }
 
+    #[cfg(test)]
+    pub(super) fn has_incremental_binding(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.binding.is_some())
+            .unwrap_or(false)
+    }
+
     fn clear_binding(&self, plan_id: PlanId, session: &SessionKey) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -2408,6 +2416,27 @@ impl EngineCoreRequest {
 
     pub(super) fn begin_stream_staging(&self) -> Result<()> {
         self.stream_staging.clear()
+    }
+
+    pub(super) fn bind_stream_quantum(
+        &self,
+        batch_id: BatchId,
+        lane: BatchLaneKey,
+        plan_id: PlanId,
+        session: SessionKey,
+        visibility: OutputVisibility,
+        progress_tx: mpsc::Sender<FencedStreamProgress>,
+        budget: Arc<StreamProgressBudget>,
+    ) -> Result<StreamBindingGuard> {
+        self.stream_staging.bind_quantum(
+            batch_id,
+            lane,
+            plan_id,
+            session,
+            visibility,
+            progress_tx,
+            budget,
+        )
     }
 
     pub(super) fn stream_staging_buffer(&self) -> StreamStagingBuffer {

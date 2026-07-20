@@ -10,17 +10,22 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::execution::{
     DeadlinePhase, DispatchState, ExecutionDisposition, ExecutionFailure, ExecutionReport,
     FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, OutcomeProvenance,
-    PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, RetryDisposition, StateDisposition,
+    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, RetryDisposition,
+    StateDisposition,
 };
 use super::executor::{
-    ExecutorOutput, ExecutorStepResult, PhysicalDispatchResult, UnifiedExecutor,
+    ExecutorOutput, ExecutorStepResult, PhysicalDispatchResult, StreamDeliveryFailure,
+    StreamDeliveryFailureKind, UnifiedExecutor,
 };
-use super::request::EngineCoreRequest;
+use super::request::{
+    EngineCoreRequest, FencedStreamProgress, StreamBindingGuard, StreamProgressBudget,
+};
 use super::scheduler::ScheduledRequest;
 #[cfg(test)]
 use crate::error::Result;
@@ -30,6 +35,7 @@ pub(super) struct PreparedExecutionBatch {
     physical_batch: PhysicalBatch,
     requests: Vec<Arc<EngineCoreRequest>>,
     scheduled: Vec<ScheduledRequest>,
+    output_visibility: OutputVisibility,
 }
 
 impl PreparedExecutionBatch {
@@ -37,11 +43,13 @@ impl PreparedExecutionBatch {
         physical_batch: PhysicalBatch,
         requests: Vec<Arc<EngineCoreRequest>>,
         scheduled: Vec<ScheduledRequest>,
+        output_visibility: OutputVisibility,
     ) -> Self {
         Self {
             physical_batch,
             requests,
             scheduled,
+            output_visibility,
         }
     }
 
@@ -77,6 +85,57 @@ pub(super) struct ExecutedEngineStep {
     pub(super) batches: Vec<ExecutedPhysicalBatch>,
 }
 
+impl ExecutedEngineStep {
+    pub(super) fn apply_stream_delivery_failures(&mut self, failures: &[StreamDeliveryFailure]) {
+        let failed = failures
+            .iter()
+            .map(|failure| (failure.session.clone(), failure.kind))
+            .collect::<HashMap<_, _>>();
+        for batch in &mut self.batches {
+            let mut changed = false;
+            for result in &mut batch.results {
+                let Some(kind) = failed.get(&result.session).copied() else {
+                    continue;
+                };
+                changed = true;
+                result.safe_point = true;
+                result.staged_stream_outputs.clear();
+                match kind {
+                    StreamDeliveryFailureKind::Delivery => {
+                        let message = "committed stream delivery failed";
+                        result.output =
+                            ExecutorOutput::error(result.session.request_id.clone(), message);
+                        result.disposition =
+                            ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+                        result.provenance = OutcomeProvenance::failure(
+                            FailureOrigin::StreamDelivery,
+                            DispatchState::ProducedOutput,
+                        );
+                    }
+                    StreamDeliveryFailureKind::Deadline => {
+                        result.output = ExecutorOutput::terminal(result.session.request_id.clone());
+                        result.disposition = ExecutionDisposition::Finished(FinishReason::TimedOut);
+                        result.provenance = OutcomeProvenance::deadline(
+                            DeadlinePhase::StreamDelivery,
+                            DispatchState::ProducedOutput,
+                        );
+                    }
+                }
+            }
+            if changed {
+                batch.report.rows = batch
+                    .results
+                    .iter()
+                    .map(|result| PhysicalBatchRowReport {
+                        execution: execution_report_from_result(result, batch.report.elapsed),
+                        state: state_disposition(&result.disposition),
+                    })
+                    .collect();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExecutionPhase {
     Decode,
@@ -103,19 +162,27 @@ pub(super) struct ExecutedPhysicalBatch {
 pub(super) struct ExecutionGroupRunner;
 
 impl ExecutionGroupRunner {
-    pub(super) async fn execute(prepared: PreparedEngineStep) -> ExecutedEngineStep {
+    pub(super) async fn execute(
+        prepared: PreparedEngineStep,
+        progress_tx: mpsc::Sender<FencedStreamProgress>,
+        progress_budget: Arc<StreamProgressBudget>,
+    ) -> ExecutedEngineStep {
         // Physical device work is deliberately serialized for every backend.
         // Tensor adapters may still fan out inside one physical batch.
         let mut batches = execute_batches(
             &prepared.executor,
             ExecutionPhase::Decode,
             prepared.decode_batches,
+            &progress_tx,
+            &progress_budget,
         )
         .await;
         let mut prefill_batches = execute_batches(
             &prepared.executor,
             ExecutionPhase::Prefill,
             prepared.prefill_batches,
+            &progress_tx,
+            &progress_budget,
         )
         .await;
         batches.append(&mut prefill_batches);
@@ -128,6 +195,8 @@ async fn execute_batches(
     executor: &UnifiedExecutor,
     phase: ExecutionPhase,
     batches: Vec<PreparedExecutionBatch>,
+    progress_tx: &mpsc::Sender<FencedStreamProgress>,
+    progress_budget: &Arc<StreamProgressBudget>,
 ) -> Vec<ExecutedPhysicalBatch> {
     if batches.is_empty() {
         return Vec::new();
@@ -187,6 +256,36 @@ async fn execute_batches(
             ));
             continue;
         }
+        let stream_bindings = match bind_stream_quantum(&batch, progress_tx, progress_budget) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                drop(workspace);
+                let dispatch = super::BatchDispatch::not_dispatched(batch.scheduled.len().max(1));
+                let results = batch
+                    .scheduled
+                    .iter()
+                    .map(|scheduled| {
+                        failed_step_result(
+                            scheduled,
+                            format!("stream quantum binding failed: {error}"),
+                        )
+                        .with_dispatch(dispatch)
+                        .with_provenance(OutcomeProvenance::failure(
+                            FailureOrigin::ExecutorValidation,
+                            DispatchState::NotStarted,
+                        ))
+                    })
+                    .collect();
+                executed.push(executed_batch(
+                    phase,
+                    batch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ));
+                continue;
+            }
+        };
         let observed_workspace = batch.physical_batch.workspace;
         let expected_dispatch = batch.physical_batch.expected_dispatch();
         let request_refs: Vec<_> = batch.requests.iter().map(Arc::as_ref).collect();
@@ -196,6 +295,7 @@ async fn execute_batches(
         let mut results =
             reconcile_executor_outputs(phase.label(), &batch.scheduled, expected_dispatch, result);
         apply_post_dispatch_deadlines(&batch, Instant::now(), &mut results);
+        drop(stream_bindings);
         executed.push(executed_batch(
             phase,
             batch,
@@ -206,6 +306,37 @@ async fn execute_batches(
         drop(workspace);
     }
     executed
+}
+
+fn bind_stream_quantum(
+    batch: &PreparedExecutionBatch,
+    progress_tx: &mpsc::Sender<FencedStreamProgress>,
+    progress_budget: &Arc<StreamProgressBudget>,
+) -> crate::error::Result<Vec<StreamBindingGuard>> {
+    if batch.requests.len() != batch.physical_batch.rows.len()
+        || batch.scheduled.len() != batch.physical_batch.rows.len()
+    {
+        return Err(crate::error::Error::InferenceError(
+            "physical batch rows do not match stream binding inputs".to_string(),
+        ));
+    }
+
+    batch
+        .requests
+        .iter()
+        .zip(&batch.physical_batch.rows)
+        .map(|(request, row)| {
+            request.bind_stream_quantum(
+                batch.physical_batch.batch_id,
+                batch.physical_batch.lane.clone(),
+                row.plan_id,
+                row.session.clone(),
+                batch.output_visibility,
+                progress_tx.clone(),
+                progress_budget.clone(),
+            )
+        })
+        .collect()
 }
 
 fn pre_dispatch_deadline_results(
@@ -724,7 +855,18 @@ mod tests {
             },
             vec![Arc::new(request)],
             vec![scheduled],
+            OutputVisibility::AfterQuantumCommit,
         )
+    }
+
+    async fn execute_prepared(prepared: PreparedEngineStep) -> ExecutedEngineStep {
+        let (progress_tx, _progress_rx) = mpsc::channel(64);
+        ExecutionGroupRunner::execute(
+            prepared,
+            progress_tx,
+            StreamProgressBudget::new(1024 * 1024),
+        )
+        .await
     }
 
     #[test]
@@ -842,10 +984,11 @@ mod tests {
                 physical_batch,
                 vec![Arc::new(request)],
                 vec![scheduled],
+                OutputVisibility::AfterQuantumCommit,
             )],
         );
 
-        let executed = ExecutionGroupRunner::execute(prepared).await;
+        let executed = execute_prepared(prepared).await;
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(executed.batches.len(), 1);
         assert_eq!(
@@ -888,7 +1031,7 @@ mod tests {
             ],
         );
 
-        let executed = ExecutionGroupRunner::execute(prepared).await;
+        let executed = execute_prepared(prepared).await;
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(executed.batches.len(), 2);
@@ -952,10 +1095,11 @@ mod tests {
                 physical_batch,
                 vec![Arc::new(expired_request), Arc::new(live_request)],
                 vec![expired, live],
+                OutputVisibility::AfterQuantumCommit,
             )],
         );
 
-        let executed = ExecutionGroupRunner::execute(prepared).await;
+        let executed = execute_prepared(prepared).await;
 
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         let results = &executed.batches[0].results;
@@ -1005,7 +1149,7 @@ mod tests {
             )],
         );
 
-        let executed = ExecutionGroupRunner::execute(prepared).await;
+        let executed = execute_prepared(prepared).await;
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         let expired = &executed.batches[0].results[0];
@@ -1070,10 +1214,11 @@ mod tests {
                 physical_batch,
                 vec![Arc::new(request)],
                 vec![scheduled],
+                OutputVisibility::AfterQuantumCommit,
             )],
         );
 
-        let executed = ExecutionGroupRunner::execute(prepared).await;
+        let executed = execute_prepared(prepared).await;
         assert_eq!(physical_calls.load(Ordering::Relaxed), 1);
         assert_eq!(legacy_calls.load(Ordering::Relaxed), 0);
         assert_eq!(executed.batches.len(), 1);

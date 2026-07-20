@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
@@ -18,8 +19,8 @@ use super::execution::{
     ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
     ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
-    PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId, StageShapePolicy,
-    WorkCost, WorkUnit,
+    OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
+    StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
@@ -36,7 +37,10 @@ use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::metrics::{record_engine_execution_outcome, record_engine_physical_batch};
 use super::output::OutputProcessor;
-use super::request::{EngineCoreRequest, RequestStatus};
+use super::request::{
+    EngineCoreRequest, FencedStreamProgress, RequestStatus, StreamProgressBudget,
+    STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
+};
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
 use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
 use super::{ResourceAmount, ResourceVector};
@@ -142,8 +146,16 @@ struct PhysicalBatchAssembly {
     physical_batch: PhysicalBatch,
     requests: Vec<Arc<EngineCoreRequest>>,
     scheduled: Vec<super::scheduler::ScheduledRequest>,
+    output_visibility: super::OutputVisibility,
     shape_policy: StageShapePolicy,
     workspace_base_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ActiveStreamBatch {
+    lane: BatchLaneKey,
+    output_visibility: OutputVisibility,
+    rows: HashMap<u64, super::SessionKey>,
 }
 
 impl PhysicalBatchAssembly {
@@ -305,6 +317,12 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
+    /// Exact physical envelopes allowed to publish pre-quantum progress.
+    active_stream_batches: HashMap<BatchId, ActiveStreamBatch>,
+    /// Next sequence number accepted for each exact streaming session.
+    stream_sequence_cursors: HashMap<super::SessionKey, usize>,
+    /// Sessions that have committed progress before their physical quantum.
+    incremental_stream_sessions: HashSet<super::SessionKey>,
     /// Durable typed terminal events created outside a committed executor
     /// result (for example cancellation, deadline expiry, or failed
     /// preemption) and delivered by the next successful engine step.
@@ -610,6 +628,16 @@ impl EngineCore {
     }
 
     fn rollback_unexecuted_schedule(&mut self, scheduled: &[super::scheduler::ScheduledRequest]) {
+        let rolled_back_plans = scheduled
+            .iter()
+            .map(|scheduled| scheduled.plan_id)
+            .collect::<HashSet<_>>();
+        self.active_stream_batches.retain(|_, batch| {
+            !batch
+                .rows
+                .keys()
+                .any(|plan_id| rolled_back_plans.contains(plan_id))
+        });
         for scheduled in scheduled {
             let session = scheduled.session_key();
             if let Some(plan) = self.active_plans.remove(&scheduled.plan_id) {
@@ -691,6 +719,42 @@ impl EngineCore {
                 "Ignoring executor result for an inactive or already committed plan"
             );
             return None;
+        };
+
+        if self.incremental_stream_sessions.contains(&plan.session) {
+            if let ExecutionDisposition::Failed(failure) = &mut result.disposition {
+                if failure.retry != RetryDisposition::Never {
+                    let message = format!(
+                        "executor failed after committed stream progress; retry is unsafe: {}",
+                        failure.message
+                    );
+                    failure.retry = RetryDisposition::Never;
+                    failure.message = message.clone();
+                    result.output.finished = true;
+                    result.output.error = Some(message);
+                    result.staged_stream_outputs.clear();
+                }
+            }
+        }
+
+        let staged_next_sequence = match self
+            .validate_staged_stream_outputs(&plan.session, &result.staged_stream_outputs)
+        {
+            Ok(next) => Some(next),
+            Err(error) => {
+                let message = format!("invalid staged stream output: {error}");
+                result.output =
+                    ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+                result.disposition =
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+                result.safe_point = true;
+                result.provenance = OutcomeProvenance::failure(
+                    FailureOrigin::ExecutorValidation,
+                    result.provenance.dispatch_state,
+                );
+                result.staged_stream_outputs.clear();
+                None
+            }
         };
 
         let retry_attempt = match &mut result.disposition {
@@ -870,6 +934,12 @@ impl EngineCore {
             ExecutionDisposition::Failed(_) => {}
         }
         result.output.request_id = plan.session.request_id.clone();
+        if !result.staged_stream_outputs.is_empty() {
+            if let Some(next_sequence) = staged_next_sequence {
+                self.stream_sequence_cursors
+                    .insert(plan.session.clone(), next_sequence);
+            }
+        }
         Some(CommittedExecutorOutput {
             session: plan.session,
             output: result.output,
@@ -1039,6 +1109,12 @@ impl EngineCore {
             let cost = Self::work_cost(&request, &plan.work, plan.stage.as_ref())?;
             let lane = Self::batch_lane(&plan, cost);
             let (budget, shape_policy) = Self::batch_budget(&plan)?;
+            let output_visibility = plan
+                .stage
+                .as_ref()
+                .map_or(super::OutputVisibility::AfterQuantumCommit, |stage| {
+                    stage.output_visibility
+                });
             let planned_work = plan.work.clone();
             let row = ReadyQuantum {
                 plan_id: plan.plan_id,
@@ -1056,6 +1132,7 @@ impl EngineCore {
                     if assembly.physical_batch.lane != lane
                         || assembly.physical_batch.mode != plan.batch_mode
                         || assembly.physical_batch.budget != budget
+                        || assembly.output_visibility != output_visibility
                         || assembly.shape_policy != shape_policy
                     {
                         continue;
@@ -1099,22 +1176,45 @@ impl EngineCore {
                     physical_batch,
                     requests: vec![request],
                     scheduled: vec![scheduled],
+                    output_visibility,
                     shape_policy,
                     workspace_base_bytes,
                 });
             }
         }
 
-        Ok(assemblies
-            .into_iter()
-            .map(|assembly| {
-                PreparedExecutionBatch::new(
-                    assembly.physical_batch,
-                    assembly.requests,
-                    assembly.scheduled,
-                )
-            })
-            .collect())
+        let mut prepared = Vec::with_capacity(assemblies.len());
+        for assembly in assemblies {
+            if assembly.output_visibility == OutputVisibility::IncrementalCommitted {
+                let rows = assembly
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .map(|row| (row.plan_id, row.session.clone()))
+                    .collect();
+                let fence = ActiveStreamBatch {
+                    lane: assembly.physical_batch.lane.clone(),
+                    output_visibility: assembly.output_visibility,
+                    rows,
+                };
+                if self
+                    .active_stream_batches
+                    .insert(assembly.physical_batch.batch_id, fence)
+                    .is_some()
+                {
+                    return Err(Error::InferenceError(
+                        "physical stream batch identity was registered twice".to_string(),
+                    ));
+                }
+            }
+            prepared.push(PreparedExecutionBatch::new(
+                assembly.physical_batch,
+                assembly.requests,
+                assembly.scheduled,
+                assembly.output_visibility,
+            ));
+        }
+        Ok(prepared)
     }
 
     fn merge_audio_output(
@@ -1249,6 +1349,9 @@ impl EngineCore {
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
+            active_stream_batches: HashMap::new(),
+            stream_sequence_cursors: HashMap::new(),
+            incremental_stream_sessions: HashSet::new(),
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
@@ -1355,7 +1458,159 @@ impl EngineCore {
             self.execution_trackers.remove(&session.request_id);
         }
         self.active_plans.retain(|_, plan| plan.session != *session);
+        self.active_stream_batches
+            .retain(|_, batch| !batch.rows.values().any(|row| row == session));
         self.execution_retry_attempts.remove(session);
+        self.stream_sequence_cursors.remove(session);
+        self.incremental_stream_sessions.remove(session);
+    }
+
+    fn validate_staged_stream_outputs(
+        &self,
+        session: &super::SessionKey,
+        outputs: &[super::output::StreamingOutput],
+    ) -> Result<usize> {
+        let mut expected = self
+            .stream_sequence_cursors
+            .get(session)
+            .copied()
+            .unwrap_or(0);
+        for (index, output) in outputs.iter().enumerate() {
+            if output.request_id != session.request_id {
+                return Err(Error::InferenceError(
+                    "stream output request ID does not match its session".to_string(),
+                ));
+            }
+            if output.sequence != expected {
+                return Err(Error::InferenceError(format!(
+                    "stream output sequence {} did not match expected {}",
+                    output.sequence, expected
+                )));
+            }
+            if output.is_final && index + 1 != outputs.len() {
+                return Err(Error::InferenceError(
+                    "final stream output must be the last committed event".to_string(),
+                ));
+            }
+            expected = expected.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("stream output sequence space was exhausted".to_string())
+            })?;
+        }
+        Ok(expected)
+    }
+
+    pub(super) fn commit_incremental_stream_progress(
+        &mut self,
+        progress: FencedStreamProgress,
+    ) -> Result<CommittedStreamDelivery> {
+        let plan = self.active_plans.get(&progress.plan_id).ok_or_else(|| {
+            Error::InferenceError("stream progress references an inactive plan".to_string())
+        })?;
+        if plan.session != progress.session {
+            return Err(Error::InferenceError(
+                "stream progress session does not match its active plan".to_string(),
+            ));
+        }
+        if plan.stage.as_ref().map(|stage| stage.output_visibility)
+            != Some(OutputVisibility::IncrementalCommitted)
+        {
+            return Err(Error::InferenceError(
+                "stream progress is not authorized by the active adapter stage".to_string(),
+            ));
+        }
+
+        let batch = self
+            .active_stream_batches
+            .get(&progress.batch_id)
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "stream progress references an inactive physical batch".to_string(),
+                )
+            })?;
+        if batch.output_visibility != OutputVisibility::IncrementalCommitted
+            || batch.lane != progress.lane
+            || batch.rows.get(&progress.plan_id) != Some(&progress.session)
+        {
+            return Err(Error::InferenceError(
+                "stream progress does not match its physical batch fence".to_string(),
+            ));
+        }
+
+        let tracker = self
+            .execution_trackers
+            .get(&progress.session.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError("stream progress has no execution tracker".to_string())
+            })?;
+        if tracker.session() != &progress.session
+            || tracker.active_plan_id() != Some(progress.plan_id)
+        {
+            return Err(Error::InferenceError(
+                "stream progress does not match the active lifecycle transaction".to_string(),
+            ));
+        }
+        if self.scheduler.get_sequence_id(&progress.session.request_id)
+            != Some(progress.session.epoch)
+        {
+            return Err(Error::InferenceError(
+                "stream progress belongs to a stale scheduler session".to_string(),
+            ));
+        }
+        if progress.output.request_id != progress.session.request_id || progress.output.is_final {
+            return Err(Error::InferenceError(
+                "incremental progress must be non-final output for its exact request".to_string(),
+            ));
+        }
+
+        let request = self
+            .requests
+            .get(&progress.session.request_id)
+            .ok_or_else(|| {
+                Error::InferenceError("stream progress request is no longer active".to_string())
+            })?;
+        if request.is_cancelled() {
+            return Err(Error::InferenceError(
+                "stream progress request was cancelled".to_string(),
+            ));
+        }
+        if request
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(Error::InferenceError(
+                "stream progress request deadline elapsed".to_string(),
+            ));
+        }
+        let tx = request.streaming_tx.clone().ok_or_else(|| {
+            Error::InferenceError("stream progress request has no delivery channel".to_string())
+        })?;
+        let policy = request.stream_policy;
+
+        let expected = self
+            .stream_sequence_cursors
+            .get(&progress.session)
+            .copied()
+            .unwrap_or(0);
+        if progress.output.sequence != expected {
+            return Err(Error::InferenceError(format!(
+                "stream progress sequence {} did not match expected {}",
+                progress.output.sequence, expected
+            )));
+        }
+        let next = expected.checked_add(1).ok_or_else(|| {
+            Error::InferenceError("stream progress sequence space was exhausted".to_string())
+        })?;
+        self.stream_sequence_cursors
+            .insert(progress.session.clone(), next);
+        self.incremental_stream_sessions
+            .insert(progress.session.clone());
+
+        Ok(CommittedStreamDelivery::from_progress(
+            progress.session.clone(),
+            tx,
+            policy,
+            progress,
+        ))
     }
 
     fn record_unconfirmed_cleanup(&mut self, session: &super::SessionKey) {
@@ -1426,13 +1681,108 @@ impl EngineCore {
         let Some(prepared) = self.prepare_step().await? else {
             return Ok(Vec::new());
         };
-        let executed = ExecutionGroupRunner::execute(prepared).await;
+        let executed = self.execute_prepared_with_progress(prepared).await?;
         let committed = self.commit_step(executed).await?;
         let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
         for failure in failed_streams {
             self.handle_stream_delivery_failure(failure).await;
         }
         Ok(committed.outputs)
+    }
+
+    async fn execute_prepared_with_progress(
+        &mut self,
+        prepared: PreparedEngineStep,
+    ) -> Result<ExecutedEngineStep> {
+        let (progress_tx, mut progress_rx) = mpsc::channel(STREAM_PROGRESS_QUEUE_CAPACITY);
+        let progress_budget = StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES);
+        let mut runner = tokio::spawn(ExecutionGroupRunner::execute(
+            prepared,
+            progress_tx,
+            progress_budget,
+        ));
+        let mut failures = HashMap::new();
+        let mut progress_closed = false;
+
+        let mut executed = loop {
+            tokio::select! {
+                result = &mut runner => {
+                    break match result {
+                        Ok(executed) => executed,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(error) => {
+                            return Err(Error::InferenceError(format!(
+                                "execution group task was cancelled: {error}"
+                            )));
+                        }
+                    };
+                }
+                progress = progress_rx.recv(), if !progress_closed => {
+                    match progress {
+                        Some(progress) => {
+                            if failures.contains_key(&progress.session) {
+                                continue;
+                            }
+                            if let Some(failure) = self.route_incremental_progress(progress).await {
+                                failures.insert(failure.session.clone(), failure);
+                            }
+                        }
+                        None => progress_closed = true,
+                    }
+                }
+            }
+        };
+
+        while let Some(progress) = progress_rx.recv().await {
+            if failures.contains_key(&progress.session) {
+                continue;
+            }
+            if let Some(failure) = self.route_incremental_progress(progress).await {
+                failures.insert(failure.session.clone(), failure);
+            }
+        }
+        let failures = failures.into_values().collect::<Vec<_>>();
+        executed.apply_stream_delivery_failures(&failures);
+        Ok(executed)
+    }
+
+    async fn route_incremental_progress(
+        &mut self,
+        progress: FencedStreamProgress,
+    ) -> Option<StreamDeliveryFailure> {
+        let session = progress.session.clone();
+        let failure = match self.commit_incremental_stream_progress(progress) {
+            Ok(delivery) => deliver_committed_streams(vec![delivery])
+                .await
+                .into_iter()
+                .next(),
+            Err(error) => {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    error = %error,
+                    "Rejecting invalid incremental stream progress"
+                );
+                Some(StreamDeliveryFailure {
+                    session,
+                    kind: StreamDeliveryFailureKind::Delivery,
+                })
+            }
+        };
+        if let Some(failure) = failure.as_ref() {
+            if let Some(request) = self.requests.get(&failure.session.request_id) {
+                if self.scheduler.get_sequence_id(&failure.session.request_id)
+                    == Some(failure.session.epoch)
+                {
+                    if let Some(cancellation) = request.cancellation.as_ref() {
+                        cancellation.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+        }
+        failure
     }
 
     /// Prepare an immutable execution transaction under the engine state lock.
@@ -1629,6 +1979,8 @@ impl EngineCore {
             Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
         let mut stream_deliveries = Vec::new();
         for mut batch in batches {
+            self.active_stream_batches
+                .remove(&batch.physical_batch.batch_id);
             if let Err(error) = batch
                 .report
                 .validate_against(&batch.physical_batch, &self.active_plans)
@@ -2114,6 +2466,9 @@ impl EngineCore {
         self.request_phase_timings.clear();
         self.execution_trackers.clear();
         self.active_plans.clear();
+        self.active_stream_batches.clear();
+        self.stream_sequence_cursors.clear();
+        self.incremental_stream_sessions.clear();
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
 
@@ -2176,6 +2531,19 @@ mod tests {
                 input: crate::engine::InputRange { start: 1, end: 2 },
                 max_output_steps: 1,
             },
+        }
+    }
+
+    fn text_progress(request_id: &str, sequence: usize) -> super::super::StreamingOutput {
+        super::super::StreamingOutput {
+            request_id: request_id.to_string(),
+            sequence,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some(format!("delta-{sequence}")),
+            stats: None,
+            asr_progress: None,
         }
     }
 
@@ -3052,6 +3420,145 @@ mod tests {
         assert_eq!(effective.decode_batch, NativeBatchMode::None);
         assert_eq!(effective.max_batch_size, 8);
         assert_eq!(effective.concurrency, ConcurrencyClass::Batchable);
+    }
+
+    #[test]
+    fn incremental_progress_requires_exact_batch_plan_session_lane_and_sequence() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        let request_id = "fenced-progress".to_string();
+        let mut request = EngineCoreRequest::tts("fenced progress");
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        request.streaming = true;
+        let (delivery_tx, _delivery_rx) = mpsc::channel(8);
+        request.streaming_tx = Some(delivery_tx);
+        core.add_request(request).unwrap();
+        let session = core.get_session_key(&request_id).unwrap();
+
+        let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(51),
+            "test.atomic.incremental",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let plan_id = 7001;
+        let plan = ExecutionPlan {
+            plan_id,
+            session: session.clone(),
+            work: WorkUnit::AtomicJob {
+                kind: "tts".to_string(),
+            },
+            batch_key: BatchKey {
+                backend: BackendKind::Cpu,
+                model_variant: None,
+                task_type: TaskType::TTS,
+                work_kind: "tts".to_string(),
+                compute_dtype: "f32".to_string(),
+                kv_dtype: "none".to_string(),
+                cache_namespace: "none".to_string(),
+                adapter: None,
+            },
+            batch_mode: NativeBatchMode::None,
+            max_batch_size: 1,
+            estimate: ResourceVector::zero(),
+            stage: Some(stage),
+        };
+        let mut tracker = ExecutionTracker::new(session.clone());
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::AtomicRunning).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+        core.execution_trackers.insert(request_id.clone(), tracker);
+        core.active_plans.insert(plan_id, plan.clone());
+
+        let lane = EngineCore::batch_lane(&plan, WorkCost::new(1, 1, 0));
+        let batch_id = BatchId::new(81);
+        core.active_stream_batches.insert(
+            batch_id,
+            ActiveStreamBatch {
+                lane: lane.clone(),
+                output_visibility: OutputVisibility::IncrementalCommitted,
+                rows: HashMap::from([(plan_id, session.clone())]),
+            },
+        );
+        let request = core.requests.get(&request_id).unwrap().clone();
+        let staging = request.stream_staging_buffer();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let _binding = request
+            .bind_stream_quantum(
+                batch_id,
+                lane.clone(),
+                plan_id,
+                session.clone(),
+                OutputVisibility::IncrementalCommitted,
+                progress_tx,
+                StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES),
+            )
+            .unwrap();
+        let mut next_progress = |sequence| {
+            staging
+                .push_with_policy(text_progress(&request_id, sequence), request.stream_policy)
+                .unwrap();
+            progress_rx.try_recv().expect("fenced progress")
+        };
+
+        let mut wrong_batch = next_progress(0);
+        wrong_batch.batch_id = BatchId::new(82);
+        assert!(core
+            .commit_incremental_stream_progress(wrong_batch)
+            .unwrap_err()
+            .to_string()
+            .contains("inactive physical batch"));
+
+        let mut wrong_plan = next_progress(0);
+        wrong_plan.plan_id += 1;
+        assert!(core
+            .commit_incremental_stream_progress(wrong_plan)
+            .unwrap_err()
+            .to_string()
+            .contains("inactive plan"));
+
+        let mut wrong_session = next_progress(0);
+        wrong_session.session.epoch += 1;
+        assert!(core
+            .commit_incremental_stream_progress(wrong_session)
+            .unwrap_err()
+            .to_string()
+            .contains("session does not match"));
+
+        let mut wrong_lane = next_progress(0);
+        wrong_lane.lane.shape_bucket.push_str(".stale");
+        assert!(core
+            .commit_incremental_stream_progress(wrong_lane)
+            .unwrap_err()
+            .to_string()
+            .contains("physical batch fence"));
+
+        let wrong_sequence = next_progress(4);
+        assert!(core
+            .commit_incremental_stream_progress(wrong_sequence)
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 0"));
+
+        let delivery = core
+            .commit_incremental_stream_progress(next_progress(0))
+            .expect("exact progress must commit");
+        drop(delivery);
+        assert_eq!(core.stream_sequence_cursors.get(&session), Some(&1));
+        assert!(core.incremental_stream_sessions.contains(&session));
+
+        assert!(core
+            .commit_incremental_stream_progress(next_progress(0))
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 1"));
     }
 
     #[test]
@@ -4339,7 +4846,7 @@ mod tests {
             .await
             .unwrap()
             .expect("prepared physical batches");
-        let mut executed = ExecutionGroupRunner::execute(prepared).await;
+        let mut executed = core.execute_prepared_with_progress(prepared).await.unwrap();
         assert_eq!(executed.batches.len(), 2);
         for batch in &mut executed.batches {
             let request_id = batch.results[0].session.request_id.as_str();

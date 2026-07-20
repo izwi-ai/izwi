@@ -287,6 +287,112 @@ impl OwnedStepContext {
             .map(|mailbox| mailbox.sender)
     }
 
+    fn cancel_failed_stream(&self, failure: &executor::StreamDeliveryFailure) {
+        let controls = self
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(control) = controls.get(&failure.session.request_id) {
+            if control.session_epoch == failure.session.epoch {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    async fn route_incremental_progress(
+        &self,
+        progress: request::FencedStreamProgress,
+    ) -> Option<executor::StreamDeliveryFailure> {
+        let session = progress.session.clone();
+        let delivery = {
+            let mut core = self.core.write().await;
+            core.commit_incremental_stream_progress(progress)
+        };
+        let failure = match delivery {
+            Ok(delivery) => executor::deliver_committed_streams(vec![delivery])
+                .await
+                .into_iter()
+                .next(),
+            Err(error) => {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    error = %error,
+                    "Rejecting invalid incremental stream progress"
+                );
+                Some(executor::StreamDeliveryFailure {
+                    session,
+                    kind: executor::StreamDeliveryFailureKind::Delivery,
+                })
+            }
+        };
+        if let Some(failure) = failure.as_ref() {
+            self.cancel_failed_stream(failure);
+        }
+        failure
+    }
+
+    async fn execute_prepared(
+        &self,
+        prepared: execution_group::PreparedEngineStep,
+    ) -> Result<execution_group::ExecutedEngineStep> {
+        let (progress_tx, mut progress_rx) = mpsc::channel(request::STREAM_PROGRESS_QUEUE_CAPACITY);
+        let progress_budget =
+            request::StreamProgressBudget::new(request::STREAM_PROGRESS_MAX_BUFFERED_BYTES);
+        let mut runner = tokio::spawn(execution_group::ExecutionGroupRunner::execute(
+            prepared,
+            progress_tx,
+            progress_budget,
+        ));
+        let mut failures = HashMap::new();
+        let mut progress_closed = false;
+
+        let mut executed = loop {
+            tokio::select! {
+                result = &mut runner => {
+                    break match result {
+                        Ok(executed) => executed,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(error) => {
+                            return Err(Error::InferenceError(format!(
+                                "execution group task was cancelled: {error}"
+                            )));
+                        }
+                    };
+                }
+                progress = progress_rx.recv(), if !progress_closed => {
+                    match progress {
+                        Some(progress) => {
+                            if failures.contains_key(&progress.session) {
+                                continue;
+                            }
+                            if let Some(failure) = self.route_incremental_progress(progress).await {
+                                failures.insert(failure.session.clone(), failure);
+                            }
+                        }
+                        None => progress_closed = true,
+                    }
+                }
+            }
+        };
+
+        while let Some(progress) = progress_rx.recv().await {
+            if failures.contains_key(&progress.session) {
+                continue;
+            }
+            if let Some(failure) = self.route_incremental_progress(progress).await {
+                failures.insert(failure.session.clone(), failure);
+            }
+        }
+        let failures = failures.into_values().collect::<Vec<_>>();
+        executed.apply_stream_delivery_failures(&failures);
+        Ok(executed)
+    }
+
     async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
         let _step = self.step_gate.lock().await;
         let prepared = {
@@ -294,7 +400,7 @@ impl OwnedStepContext {
             core.prepare_step().await?
         };
         let executed = match prepared {
-            Some(prepared) => Some(execution_group::ExecutionGroupRunner::execute(prepared).await),
+            Some(prepared) => Some(self.execute_prepared(prepared).await?),
             None => None,
         };
         let (outputs, stream_deliveries) = {
@@ -1427,6 +1533,138 @@ mod tests {
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     }
 
+    struct IncrementalBlockingExecutor {
+        emitted: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        variant: ModelVariant,
+    }
+
+    impl IncrementalBlockingExecutor {
+        fn execute(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            let request = requests
+                .first()
+                .copied()
+                .ok_or_else(|| Error::InferenceError("missing test request".to_string()))?;
+            let scheduled = scheduled
+                .first()
+                .ok_or_else(|| Error::InferenceError("missing test schedule".to_string()))?;
+            let staging = request.stream_staging_buffer();
+            if !staging.has_incremental_binding() {
+                return Err(Error::InferenceError(
+                    "test request was not bound for incremental publication".to_string(),
+                ));
+            }
+            staging.push_with_policy(
+                StreamingOutput {
+                    request_id: request.id.clone(),
+                    sequence: 0,
+                    samples: Vec::new(),
+                    sample_rate: 0,
+                    is_final: false,
+                    text: Some("first delta".to_string()),
+                    stats: None,
+                    asr_progress: None,
+                },
+                request.stream_policy,
+            )?;
+            if let Some(emitted) = self
+                .emitted
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = emitted.send(());
+            }
+
+            tokio::task::block_in_place(|| {
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            });
+
+            staging.push_with_policy(
+                StreamingOutput {
+                    request_id: request.id.clone(),
+                    sequence: 1,
+                    samples: Vec::new(),
+                    sample_rate: 0,
+                    is_final: true,
+                    text: None,
+                    stats: None,
+                    asr_progress: None,
+                },
+                request.stream_policy,
+            )?;
+            let mut result = ExecutorStepResult::new(
+                scheduled,
+                ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: None,
+                    text: Some("first delta".to_string()),
+                    input_transcription: None,
+                    tokens_processed: scheduled.num_tokens.max(1),
+                    tokens_generated: 1,
+                    finished: true,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                },
+            );
+            result.staged_stream_outputs = request.take_staged_stream_outputs()?;
+            Ok(vec![result])
+        }
+    }
+
+    impl ModelExecutor for IncrementalBlockingExecutor {
+        fn execution_profile(&self, _request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            Some(ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                Some(self.variant),
+                ExecutionMode::Atomic,
+            ))
+        }
+
+        fn execute_prefill(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.execute(requests, scheduled)
+        }
+
+        fn execute_decode(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.execute(requests, scheduled)
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_session(&self, _session: &SessionKey) -> CacheReleaseReport {
+            CacheReleaseReport::confirmed(1)
+        }
+    }
+
     impl BlockingForwardExecutor {
         fn execute(&self, scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
             if let Some(entered) = self
@@ -1583,6 +1821,87 @@ mod tests {
             .expect("engine step failed");
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].request_id, request_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_atomic_delta_is_delivered_before_model_completion() {
+        let (emitted_tx, emitted_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            IncrementalBlockingExecutor {
+                emitted: std::sync::Mutex::new(Some(emitted_tx)),
+                release: release.clone(),
+                variant,
+            },
+        )));
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.prefill = PrefillMode::None;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(41),
+            "test.atomic.incremental",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(11),
+            model_instance_id: ModelInstanceId::new(12),
+            adapter_instance_id: AdapterInstanceId::new(13),
+            adapter_abi_revision: AdapterAbiRevision::new(8),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let mut request =
+            EngineCoreRequest::tts("stream while running").with_model_variant(variant);
+        request.id = "incremental-before-completion".to_string();
+        request.prompt_tokens = vec![1];
+        request.bind_execution_adapter(binding).unwrap();
+        request.streaming = true;
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        request.streaming_tx = Some(stream_tx);
+        engine.core.write().await.add_request(request).unwrap();
+
+        let stepping_engine = engine.clone();
+        let step = tokio::spawn(async move { stepping_engine.step().await });
+        let emitted = tokio::time::timeout(Duration::from_secs(1), emitted_rx).await;
+        let first = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv()).await;
+        let completed_early = step.is_finished();
+
+        // Always release the blocking fake before asserting so a failing
+        // temporal check cannot strand a Tokio worker during test teardown.
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+
+        let outputs = tokio::time::timeout(Duration::from_secs(1), step)
+            .await
+            .expect("engine step did not complete")
+            .expect("engine step task panicked")
+            .expect("engine step failed");
+        emitted
+            .expect("model did not emit its first delta")
+            .expect("model emission signal was dropped");
+        let first = first.unwrap_or_else(|error| {
+            panic!("delta remained buffered until model completion: {error}; outputs={outputs:?}")
+        });
+        let first = first.expect("stream closed before its first delta");
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.text.as_deref(), Some("first delta"));
+        assert!(!first.is_final);
+        assert!(!completed_early, "model completed before it was released");
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_finished);
+
+        let final_output = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("final marker was not delivered")
+            .expect("stream closed before its final marker");
+        assert_eq!(final_output.sequence, 1);
+        assert!(final_output.is_final);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
