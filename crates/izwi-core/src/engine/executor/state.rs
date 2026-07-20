@@ -15,6 +15,10 @@ pub(super) struct ActiveChatDecode {
     pub(super) state: NativeChatDecodeState,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
+    /// Text already made authoritative through append-only public deltas.
+    /// Tokenizer decoders may normalize or rewrite their cumulative terminal
+    /// string, but an SSE delta cannot be retracted after publication.
+    pub(super) streamed_text: String,
     pub(super) pending_prefix_snapshot: Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>>,
 }
 

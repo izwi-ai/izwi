@@ -67,6 +67,14 @@ impl StreamDeltaBatch {
     }
 }
 
+fn canonical_chat_terminal_text(streamed_text: &str, terminal_text: String) -> String {
+    if streamed_text.is_empty() {
+        terminal_text
+    } else {
+        streamed_text.to_string()
+    }
+}
+
 impl NativeExecutor {
     pub(super) fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
         request.chat_generation_config()
@@ -115,6 +123,7 @@ impl NativeExecutor {
                 let mut sequence = 0usize;
                 let mut stream_err: Option<Error> = None;
                 let mut stream_batch = StreamDeltaBatch::default();
+                let mut streamed_text = String::new();
 
                 let mut emit = |delta: &str| {
                     if first_output_ms_since_start.is_none() && !delta.is_empty() {
@@ -123,6 +132,7 @@ impl NativeExecutor {
                     }
                     if let Some(tx) = stream_tx.as_ref() {
                         if stream_err.is_none() {
+                            streamed_text.push_str(delta);
                             if let Some(chunk) = stream_batch.push(delta) {
                                 if let Err(err) = Self::stream_text_with_policy(
                                     tx,
@@ -138,7 +148,7 @@ impl NativeExecutor {
                     }
                 };
 
-                let output = model.generate_with_callback_and_config(
+                let mut output = model.generate_with_callback_and_config(
                     messages,
                     max_new_tokens,
                     &generation_config,
@@ -170,6 +180,7 @@ impl NativeExecutor {
                         &request.id,
                         &mut sequence,
                     )?;
+                    output.text = canonical_chat_terminal_text(&streamed_text, output.text);
                 }
 
                 let total_ms = generation_started.elapsed().as_secs_f64() * 1000.0;
@@ -289,6 +300,7 @@ impl NativeExecutor {
                 state: decode_state,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
+                streamed_text: String::new(),
                 pending_prefix_snapshot,
             }
         };
@@ -333,6 +345,7 @@ impl NativeExecutor {
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
                     )?;
+                    active_state.streamed_text.push_str(&step.delta);
                 }
                 if step.finished {
                     Self::stream_final_marker_with_policy(
@@ -341,6 +354,8 @@ impl NativeExecutor {
                         &request.id,
                         &mut active_state.stream_sequence,
                     )?;
+                    final_text =
+                        canonical_chat_terminal_text(&active_state.streamed_text, final_text);
                 }
             }
 
@@ -494,6 +509,7 @@ impl NativeExecutor {
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
                     )?;
+                    active_state.streamed_text.push_str(&step.delta);
                 }
                 if step.finished {
                     Self::stream_final_marker_with_policy(
@@ -508,7 +524,11 @@ impl NativeExecutor {
             outputs.push(ModelSessionResult::sequence(ExecutorOutput {
                 request_id: request.id.clone(),
                 audio: Some(AudioOutput::empty(24_000)),
-                text: Some(step.text),
+                text: Some(if step.finished {
+                    canonical_chat_terminal_text(&active_state.streamed_text, step.text)
+                } else {
+                    step.text
+                }),
                 input_transcription: None,
                 tokens_processed: 1,
                 tokens_generated: step_tokens_generated,
@@ -735,5 +755,21 @@ mod tests {
         assert_eq!(batch.push("intro"), Some("intro".to_string()));
         assert_eq!(batch.push(" line"), None);
         assert_eq!(batch.push("\n"), Some(" line\n".to_string()));
+    }
+
+    #[test]
+    fn visible_chat_deltas_are_the_canonical_terminal_text() {
+        assert_eq!(
+            canonical_chat_terminal_text(" raw visible text ", "raw visible text".to_string()),
+            " raw visible text "
+        );
+        assert_eq!(
+            canonical_chat_terminal_text("prefix replacement", "prefix rewritten".to_string()),
+            "prefix replacement"
+        );
+        assert_eq!(
+            canonical_chat_terminal_text("", "terminal-only".to_string()),
+            "terminal-only"
+        );
     }
 }
