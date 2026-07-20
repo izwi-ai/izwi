@@ -1028,9 +1028,10 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         let execution_rollout = ExecutionRolloutPolicy::from_env()?;
-        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_rollout(
+        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_execution_limits(
             execution_rollout,
             worker_config.max_tensor_batch_size,
+            worker_config.request_parallelism,
         )?);
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));

@@ -137,8 +137,8 @@ impl InferenceCoordinator {
         resources: Arc<ResourceAuthority>,
     ) -> Self {
         let capacity = match backend {
-            BackendKind::Cpu | BackendKind::Metal => 1,
-            BackendKind::Cuda => execution_parallelism.max(1),
+            BackendKind::Metal => 1,
+            BackendKind::Cpu | BackendKind::Cuda => execution_parallelism.max(1),
         };
         Self {
             execution_group_id: ExecutionGroupId::new(
@@ -319,9 +319,9 @@ impl InferenceCoordinator {
     }
 
     /// Reserve the complete backend execution budget for one scheduler step.
-    /// A CUDA step may fan out across `request_parallelism` worker threads, so
+    /// A CPU or CUDA step may fan out across `request_parallelism` worker threads, so
     /// holding a single permit would allow unrelated direct work to exceed the
-    /// configured device concurrency. CPU and Metal have capacity one.
+    /// configured backend concurrency. Metal remains strictly singleton.
     async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
         self.acquire_execution_units(self.capacity, None).await
     }
@@ -2079,10 +2079,10 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn cpu_and_metal_serialize_while_cuda_uses_configured_capacity() {
+    async fn cpu_and_cuda_use_configured_capacity_while_metal_serializes() {
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Cpu, 8, 8).capacity,
-            1
+            8
         );
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Metal, 8, 8).capacity,

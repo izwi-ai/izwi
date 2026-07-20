@@ -349,14 +349,21 @@ impl EngineCore {
         let max_batch_size = [prefill_stage, decode_stage]
             .into_iter()
             .flatten()
-            .filter(|stage| stage.batch_mode != NativeBatchMode::None)
-            .map(|stage| stage.max_batch_size)
-            .min();
+            .map(|stage| {
+                if stage.concurrency == ConcurrencyClass::Batchable {
+                    stage.max_batch_size
+                } else {
+                    1
+                }
+            })
+            .max();
         profile.max_batch_size = max_batch_size
             .map(|maximum| profile.max_batch_size.min(maximum).max(1))
             .unwrap_or(1);
-        profile.concurrency = if profile.prefill_batch != NativeBatchMode::None
-            || profile.decode_batch != NativeBatchMode::None
+        profile.concurrency = if [prefill_stage, decode_stage]
+            .into_iter()
+            .flatten()
+            .any(|stage| stage.concurrency == ConcurrencyClass::Batchable)
         {
             ConcurrencyClass::Batchable
         } else {
@@ -494,11 +501,13 @@ impl EngineCore {
         let batch_mode = bound_stage
             .as_ref()
             .map_or(NativeBatchMode::None, |stage| stage.batch_mode);
-        let max_batch_size = bound_stage
-            .as_ref()
-            .filter(|stage| stage.batch_mode != NativeBatchMode::None)
-            .map(|stage| stage.max_batch_size.min(profile.max_batch_size).max(1))
-            .unwrap_or(1);
+        let max_batch_size = bound_stage.as_ref().map_or(1, |stage| {
+            if stage.concurrency == ConcurrencyClass::Batchable {
+                stage.max_batch_size.min(profile.max_batch_size).max(1)
+            } else {
+                1
+            }
+        });
         let plan = ExecutionPlan {
             plan_id: scheduled.plan_id,
             session: scheduled.session_key(),
@@ -819,6 +828,7 @@ impl EngineCore {
             .map(|stage| stage.shape_policy)
             .unwrap_or(StageShapePolicy::Exact);
         let shape_bucket = match shape_policy {
+            StageShapePolicy::Independent => "independent".to_string(),
             StageShapePolicy::Exact => format!("exact.{}", cost.tensor_elements),
             StageShapePolicy::Bucketed => format!(
                 "bucket.{}",
@@ -868,14 +878,17 @@ impl EngineCore {
     }
 
     fn batch_budget(plan: &ExecutionPlan) -> Result<(BatchBudget, StageShapePolicy)> {
-        if plan.batch_mode == NativeBatchMode::None {
-            return Ok((BatchBudget::width_one(), StageShapePolicy::Exact));
-        }
-        let stage = plan.stage.as_ref().ok_or_else(|| {
-            Error::InferenceError(
+        let Some(stage) = plan.stage.as_ref() else {
+            if plan.batch_mode == NativeBatchMode::None {
+                return Ok((BatchBudget::width_one(), StageShapePolicy::Exact));
+            }
+            return Err(Error::InferenceError(
                 "native tensor batch plan is missing its loaded stage contract".to_string(),
-            )
-        })?;
+            ));
+        };
+        if stage.concurrency == ConcurrencyClass::Exclusive {
+            return Ok((BatchBudget::width_one(), stage.shape_policy));
+        }
         let budget = BatchBudget {
             max_rows: plan.max_batch_size.min(stage.max_batch_size).max(1),
             max_logical_units: stage.max_work_units,
@@ -946,7 +959,7 @@ impl EngineCore {
             executable.work = planned_work;
 
             let mut pending = Some((request, executable, row));
-            if plan.batch_mode != NativeBatchMode::None {
+            if budget.max_rows > 1 {
                 for assembly in &mut assemblies {
                     if assembly.physical_batch.lane != lane
                         || assembly.physical_batch.mode != plan.batch_mode
@@ -2794,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_stage_contract_is_authoritative_over_legacy_executor_batching() {
+    fn loaded_stage_contract_preserves_independent_request_parallelism() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let model_instance = super::super::ModelInstanceId::new(2);
         let mut request = EngineCoreRequest::tts("contract").with_model_variant(variant);
@@ -2825,8 +2838,8 @@ mod tests {
         let effective = EngineCore::apply_adapter_execution_contract(&request, declared).unwrap();
         assert_eq!(effective.prefill_batch, NativeBatchMode::None);
         assert_eq!(effective.decode_batch, NativeBatchMode::None);
-        assert_eq!(effective.max_batch_size, 1);
-        assert_eq!(effective.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(effective.max_batch_size, 8);
+        assert_eq!(effective.concurrency, ConcurrencyClass::Batchable);
     }
 
     #[test]
@@ -2920,6 +2933,93 @@ mod tests {
         assert!(split
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
+    }
+
+    #[test]
+    fn independent_compatibility_rows_form_bounded_parallel_batches() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        let ids = [
+            "parallel-a",
+            "parallel-b",
+            "parallel-c",
+            "parallel-d",
+            "parallel-e",
+        ];
+        for id in ids {
+            let mut request = EngineCoreRequest::tts(format!("independent {id}"));
+            request.id = id.to_string();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ids
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_prefill(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(6),
+            "tts.compatibility",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let adapter_key = super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "tts".to_string(),
+            stage_id: stage.id,
+        };
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: item.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::TTS,
+                        work_kind: "prefill".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::None,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let widths = batches
+            .iter()
+            .map(|batch| batch.physical_batch().rows.len())
+            .collect::<Vec<_>>();
+        assert_eq!(widths, vec![2, 2, 1]);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.physical_batch().mode == NativeBatchMode::None));
+        assert!(batches
+            .iter()
+            .all(|batch| { batch.physical_batch().lane.shape_bucket == "independent" }));
     }
 
     #[test]

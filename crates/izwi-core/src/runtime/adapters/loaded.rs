@@ -19,11 +19,19 @@ use super::{
     StreamingMode,
 };
 
-const WIDTH_ONE_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
+const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(2);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(3);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn compatible_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
+    if backend_kind == BackendKind::Metal {
+        1
+    } else {
+        configured.max(1)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedExecutionContract {
@@ -60,20 +68,22 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug)]
-struct WidthOneExecutionAdapter {
+struct CompatibilityExecutionAdapter {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
     adapter_instance_id: AdapterInstanceId,
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
+    request_parallelism: usize,
 }
 
-impl WidthOneExecutionAdapter {
+impl CompatibilityExecutionAdapter {
     fn new(
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
+        request_parallelism: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -83,11 +93,12 @@ impl WidthOneExecutionAdapter {
             ),
             metadata,
             backend_kind,
+            request_parallelism: compatible_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
 
-impl LoadedExecutionAdapter for WidthOneExecutionAdapter {
+impl LoadedExecutionAdapter for CompatibilityExecutionAdapter {
     fn metadata(&self) -> AdapterMetadata {
         self.metadata
     }
@@ -97,29 +108,31 @@ impl LoadedExecutionAdapter for WidthOneExecutionAdapter {
     }
 
     fn adapter_abi_revision(&self) -> AdapterAbiRevision {
-        WIDTH_ONE_ADAPTER_ABI
+        COMPATIBILITY_ADAPTER_ABI
     }
 
     fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
-        width_one_contract(
+        compatibility_contract(
             self.execution_group_id,
             self.model_instance_id,
             self.adapter_instance_id(),
             self.adapter_abi_revision(),
             self.metadata(),
             self.backend_kind,
+            self.request_parallelism,
             streaming_required,
         )
     }
 }
 
-fn width_one_contract(
+fn compatibility_contract(
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
     adapter_instance_id: AdapterInstanceId,
     adapter_abi_revision: AdapterAbiRevision,
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
+    request_parallelism: usize,
     streaming_required: bool,
 ) -> Result<LoadedExecutionContract> {
     if streaming_required && metadata.streaming_mode == StreamingMode::None {
@@ -134,8 +147,12 @@ fn width_one_contract(
     execution_profile.resolved_from_loaded_model = true;
     execution_profile.prefill_batch = NativeBatchMode::None;
     execution_profile.decode_batch = NativeBatchMode::None;
-    execution_profile.max_batch_size = 1;
-    execution_profile.concurrency = ConcurrencyClass::Exclusive;
+    execution_profile.max_batch_size = request_parallelism.max(1);
+    execution_profile.concurrency = if execution_profile.max_batch_size > 1 {
+        ConcurrencyClass::Batchable
+    } else {
+        ConcurrencyClass::Exclusive
+    };
 
     let stage = StageDescriptor::from_execution_profile(
         StageId::new(0),
@@ -164,6 +181,7 @@ struct StaticQwenTtsExecutionAdapter {
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     max_batch_size: usize,
+    request_parallelism: usize,
 }
 
 impl StaticQwenTtsExecutionAdapter {
@@ -173,6 +191,7 @@ impl StaticQwenTtsExecutionAdapter {
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
         max_batch_size: usize,
+        request_parallelism: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -183,6 +202,7 @@ impl StaticQwenTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            request_parallelism: compatible_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
@@ -202,13 +222,14 @@ impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
 
     fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
         if streaming_required {
-            return width_one_contract(
+            return compatibility_contract(
                 self.execution_group_id,
                 self.model_instance_id,
                 self.adapter_instance_id(),
                 self.adapter_abi_revision(),
                 self.metadata(),
                 self.backend_kind,
+                self.request_parallelism,
                 true,
             );
         }
@@ -252,6 +273,17 @@ impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
             NativeBatchMode::None,
         );
         compatibility.selector = StageWorkSelector::Any;
+        compatibility.max_batch_size = self.request_parallelism;
+        compatibility.concurrency = if self.request_parallelism > 1 {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        compatibility.shape_policy = if self.request_parallelism > 1 {
+            crate::engine::StageShapePolicy::Independent
+        } else {
+            crate::engine::StageShapePolicy::Exact
+        };
         stage.validate()?;
         compatibility.validate()?;
 
@@ -275,6 +307,7 @@ struct ContinuousQwenChatExecutionAdapter {
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     max_batch_size: usize,
+    request_parallelism: usize,
 }
 
 impl ContinuousQwenChatExecutionAdapter {
@@ -284,6 +317,7 @@ impl ContinuousQwenChatExecutionAdapter {
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
         max_batch_size: usize,
+        request_parallelism: usize,
     ) -> Self {
         Self {
             execution_group_id,
@@ -294,6 +328,7 @@ impl ContinuousQwenChatExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
+            request_parallelism: compatible_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
@@ -334,6 +369,17 @@ impl LoadedExecutionAdapter for ContinuousQwenChatExecutionAdapter {
             NativeBatchMode::None,
         );
         prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_batch_size = self.request_parallelism;
+        prefill.concurrency = if self.request_parallelism > 1 {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        prefill.shape_policy = if self.request_parallelism > 1 {
+            crate::engine::StageShapePolicy::Independent
+        } else {
+            crate::engine::StageShapePolicy::Exact
+        };
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
             "chat.decode.tensor_continuous",
@@ -413,6 +459,7 @@ impl LoadedModelBundle {
                     metadata,
                     backend_kind,
                     registry.max_tensor_batch_size(),
+                    registry.request_parallelism(),
                 ))
             } else if metadata.capability == CapabilityKind::Chat
                 && registry.execution_mode_for(model_variant, backend_kind)
@@ -425,13 +472,15 @@ impl LoadedModelBundle {
                     metadata,
                     backend_kind,
                     registry.max_tensor_batch_size(),
+                    registry.request_parallelism(),
                 ))
             } else {
-                Arc::new(WidthOneExecutionAdapter::new(
+                Arc::new(CompatibilityExecutionAdapter::new(
                     execution_group_id,
                     model_instance_id,
                     metadata,
                     backend_kind,
+                    registry.request_parallelism(),
                 ))
             };
             adapter.contract(false)?;
@@ -534,7 +583,7 @@ mod tests {
                 assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
                 assert_eq!(contract.model_instance_id, instance);
                 assert_eq!(contract.metadata, metadata);
-                assert_eq!(contract.adapter_abi_revision, WIDTH_ONE_ADAPTER_ABI);
+                assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
                 assert_eq!(contract.stages.len(), 1);
                 assert_eq!(contract.stages[0].max_batch_size, 1);
                 assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
@@ -548,6 +597,58 @@ mod tests {
                 assert_eq!(binding.capability_id, metadata.capability.as_str());
             }
         }
+    }
+
+    #[test]
+    fn every_compatibility_adapter_uses_the_configured_independent_row_width() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(
+            ExecutionRolloutPolicy::default(),
+            1,
+            3,
+        )
+        .unwrap();
+
+        for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+            let bundle = LoadedModelBundle::bind(
+                &registry,
+                ExecutionGroupId::new(9),
+                ModelInstanceId::new(index as u64 + 1),
+                variant,
+                BackendKind::Cpu,
+            )
+            .unwrap_or_else(|error| panic!("failed to bind {variant}: {error}"));
+            for metadata in registry.capabilities_for(variant) {
+                let contract = bundle
+                    .contract(metadata.capability, false)
+                    .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
+                assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
+                assert_eq!(contract.execution_profile.max_batch_size, 3);
+                assert_eq!(
+                    contract.execution_profile.concurrency,
+                    ConcurrencyClass::Batchable
+                );
+                assert_eq!(contract.stages[0].max_batch_size, 3);
+                assert_eq!(
+                    contract.stages[0].shape_policy,
+                    crate::engine::StageShapePolicy::Independent
+                );
+            }
+        }
+
+        let metal = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(9),
+            ModelInstanceId::new(999),
+            ModelVariant::Qwen306B,
+            BackendKind::Metal,
+        )
+        .unwrap();
+        let contract = metal.contract(CapabilityKind::Chat, false).unwrap();
+        assert_eq!(contract.execution_profile.max_batch_size, 1);
+        assert_eq!(
+            contract.execution_profile.concurrency,
+            ConcurrencyClass::Exclusive
+        );
     }
 
     #[test]
@@ -657,7 +758,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             streaming_capability.adapter_abi_revision,
-            WIDTH_ONE_ADAPTER_ABI
+            COMPATIBILITY_ADAPTER_ABI
         );
     }
 
@@ -678,7 +779,7 @@ mod tests {
         .unwrap();
 
         let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
-        assert_eq!(contract.adapter_abi_revision, WIDTH_ONE_ADAPTER_ABI);
+        assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
         assert_eq!(contract.execution_profile.max_batch_size, 1);
         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
     }

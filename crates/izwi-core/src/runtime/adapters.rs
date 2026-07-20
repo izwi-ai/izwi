@@ -107,6 +107,7 @@ pub(crate) struct RuntimeAdapterRegistry {
     adapters: HashMap<(CapabilityKind, ModelVariant), AdapterMetadata>,
     execution_rollout: ExecutionRolloutPolicy,
     max_tensor_batch_size: usize,
+    request_parallelism: usize,
 }
 
 impl Default for RuntimeAdapterRegistry {
@@ -115,6 +116,7 @@ impl Default for RuntimeAdapterRegistry {
             adapters: HashMap::new(),
             execution_rollout: ExecutionRolloutPolicy::default(),
             max_tensor_batch_size: 1,
+            request_parallelism: 1,
         }
     }
 }
@@ -129,10 +131,19 @@ impl RuntimeAdapterRegistry {
         execution_rollout: ExecutionRolloutPolicy,
         max_tensor_batch_size: usize,
     ) -> Result<Self> {
+        Self::built_in_with_execution_limits(execution_rollout, max_tensor_batch_size, 1)
+    }
+
+    pub(crate) fn built_in_with_execution_limits(
+        execution_rollout: ExecutionRolloutPolicy,
+        max_tensor_batch_size: usize,
+        request_parallelism: usize,
+    ) -> Result<Self> {
         let mut registry = Self {
             adapters: HashMap::new(),
             execution_rollout,
             max_tensor_batch_size: max_tensor_batch_size.max(1),
+            request_parallelism: request_parallelism.max(1),
         };
         registry.register_adapter(TtsCapabilityAdapter);
         registry.register_adapter(StreamingTtsCapabilityAdapter);
@@ -183,6 +194,10 @@ impl RuntimeAdapterRegistry {
 
     pub(crate) fn max_tensor_batch_size(&self) -> usize {
         self.max_tensor_batch_size
+    }
+
+    pub(crate) fn request_parallelism(&self) -> usize {
+        self.request_parallelism
     }
 
     pub(crate) fn static_tensor_batch_variants(
