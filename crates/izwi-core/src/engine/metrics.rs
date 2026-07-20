@@ -270,7 +270,8 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
         return;
     }
 
-    ENGINE_BATCH_WORKSPACE_BYTES.fetch_add(batch.workspace_bytes, Ordering::Relaxed);
+    let workspace_bytes = batch.workspace.workspace_bytes().unwrap_or(0);
+    ENGINE_BATCH_WORKSPACE_BYTES.fetch_add(workspace_bytes, Ordering::Relaxed);
     if !matches!(
         dispatch.kind,
         BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous
@@ -668,7 +669,7 @@ mod tests {
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchId, BatchLaneKey,
         ExecutionGroupId, InputRange, ModelInstanceId, NativeBatchMode, PlanId, ReadyQuantum,
-        SequencePhase, SessionKey, StageId, WorkCost, WorkUnit,
+        ResourceVector, SequencePhase, SessionKey, StageId, WorkCost, WorkUnit,
     };
 
     #[tokio::test]
@@ -802,7 +803,7 @@ mod tests {
             },
             rows: vec![row(1, "a"), row(2, "b")],
             materialized_tensor_elements: 30,
-            workspace_bytes: 8,
+            workspace: ResourceVector::temporary_workspace(8),
         };
         batch.validate().unwrap();
 

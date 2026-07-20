@@ -23,6 +23,7 @@ const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1)
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(2);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(3);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn compatible_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
@@ -394,6 +395,7 @@ impl LoadedExecutionAdapter for ContinuousQwenChatExecutionAdapter {
         decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
             Error::Overloaded("continuous decode batch width exceeds work accounting".to_string())
         })?;
+        decode.max_workspace_bytes = CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES;
         prefill.validate()?;
         decode.validate()?;
 
@@ -826,5 +828,9 @@ mod tests {
         assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(contract.stages[1].max_batch_size, 8);
         assert_eq!(contract.stages[1].max_work_units, 8);
+        assert_eq!(
+            contract.stages[1].max_workspace_bytes,
+            CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES
+        );
     }
 }

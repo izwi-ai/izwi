@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::config::EngineCoreConfig;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
-use super::{StageId, WorkCost};
+use super::{ResourceAmount, ResourceVector, StageId, WorkCost};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -1245,8 +1245,15 @@ impl EngineCoreRequest {
             }
         }
 
+        let prepared_continuous_cost =
+            Self::continuous_chat_stage_cost(self.execution_adapter_binding.as_ref(), &model)?;
+
         let fingerprint =
             chat_execution_fingerprint(model_variant, messages, &self.chat_config, &prompt_tokens)?;
+        self.prepared_stage_costs.clear();
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         self.prompt_tokens = prompt_tokens;
         self.sync_task_from_fields();
         self.chat_execution_ready = Some(ChatExecutionReady {
@@ -1257,6 +1264,57 @@ impl EngineCoreRequest {
             core_validated: false,
         });
         Ok(())
+    }
+
+    fn continuous_chat_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &PreparedChatModel,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        let model = match model {
+            PreparedChatModel::Exact(model) => model,
+            #[cfg(test)]
+            PreparedChatModel::ValidationOnly => return Ok(None),
+        };
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded adapter selected continuous decode for an incompatible chat model"
+                    .to_string(),
+            ));
+        }
+        let accelerator_bytes = model.continuous_decode_batch_workspace_per_row_bytes()?;
+        let host_bytes = u64::try_from(
+            std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>(),
+        )
+        .map_err(|_| {
+            Error::Overloaded("continuous decode host workspace estimate overflow".to_string())
+        })?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "continuous decode workspace exceeds its loaded adapter budget".to_string(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
     }
 
     /// Validate the private preparation marker and both legacy/typed payload
@@ -1929,7 +1987,16 @@ impl EngineCoreRequest {
                 "engine request is already bound to a different execution adapter".to_string(),
             ));
         }
+        let prepared_continuous_cost = self
+            .chat_execution_ready
+            .as_ref()
+            .map(|ready| Self::continuous_chat_stage_cost(Some(&binding), &ready.model))
+            .transpose()?
+            .flatten();
         self.execution_adapter_binding = Some(binding);
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
@@ -1968,7 +2035,11 @@ impl EngineCoreRequest {
             if stage.batch_mode == super::NativeBatchMode::None
                 || prepared.cost.logical_units == 0
                 || prepared.cost.tensor_elements == 0
-                || prepared.cost.workspace_bytes > stage.max_workspace_bytes
+                || !prepared
+                    .cost
+                    .workspace
+                    .workspace_bytes()
+                    .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
             {
                 return Err(Error::InvalidInput(format!(
                     "Request {} carries an invalid prepared tensor-stage cost",

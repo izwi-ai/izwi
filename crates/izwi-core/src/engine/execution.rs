@@ -489,11 +489,11 @@ impl ExecutionAdapterBinding {
 
 /// Backend-neutral cost of one safe execution quantum. Logical units may be
 /// tokens, audio frames, samples, codec frames, or another adapter-defined unit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkCost {
     pub logical_units: u64,
     pub tensor_elements: u64,
-    pub workspace_bytes: u64,
+    pub workspace: ResourceVector,
 }
 
 impl WorkCost {
@@ -501,7 +501,19 @@ impl WorkCost {
         Self {
             logical_units,
             tensor_elements,
-            workspace_bytes,
+            workspace: ResourceVector::temporary_workspace(workspace_bytes),
+        }
+    }
+
+    pub const fn with_workspace(
+        logical_units: u64,
+        tensor_elements: u64,
+        workspace: ResourceVector,
+    ) -> Self {
+        Self {
+            logical_units,
+            tensor_elements,
+            workspace,
         }
     }
 
@@ -509,8 +521,14 @@ impl WorkCost {
         Some(Self {
             logical_units: self.logical_units.checked_add(other.logical_units)?,
             tensor_elements: self.tensor_elements.checked_add(other.tensor_elements)?,
-            workspace_bytes: self.workspace_bytes.checked_add(other.workspace_bytes)?,
+            workspace: self.workspace.checked_add(other.workspace).ok()?,
         })
+    }
+}
+
+impl Default for WorkCost {
+    fn default() -> Self {
+        Self::with_workspace(0, 0, ResourceVector::zero())
     }
 }
 
@@ -562,7 +580,10 @@ impl BatchBudget {
         rows <= self.max_rows
             && total.logical_units <= self.max_logical_units
             && total.tensor_elements <= self.max_tensor_elements
-            && total.workspace_bytes <= self.max_workspace_bytes
+            && total
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= self.max_workspace_bytes)
     }
 }
 
@@ -793,7 +814,7 @@ pub struct PhysicalBatch {
     /// Materialized elements including padding. Ragged/packed adapters report
     /// the useful tensor element count here.
     pub materialized_tensor_elements: u64,
-    pub workspace_bytes: u64,
+    pub workspace: ResourceVector,
 }
 
 impl PhysicalBatch {
@@ -843,7 +864,13 @@ impl PhysicalBatch {
                 "physical batch materialization is smaller than useful tensor work".to_string(),
             ));
         }
-        if self.workspace_bytes > self.budget.max_workspace_bytes {
+        let workspace_bytes = self.workspace.workspace_bytes()?;
+        if workspace_bytes < cost.workspace.workspace_bytes()? {
+            return Err(Error::InvalidInput(
+                "physical batch workspace is smaller than its row estimates".to_string(),
+            ));
+        }
+        if workspace_bytes > self.budget.max_workspace_bytes {
             return Err(Error::InvalidInput(
                 "physical batch workspace exceeds its declared budget".to_string(),
             ));
@@ -942,6 +969,12 @@ impl PhysicalBatchReport {
         if self.dispatch.width != batch.rows.len() || self.rows.len() != batch.rows.len() {
             return Err(Error::InferenceError(
                 "physical batch report width does not match its planned rows".to_string(),
+            ));
+        }
+        self.observed_resources.workspace_bytes()?;
+        if !self.observed_resources.fits_within(batch.workspace) {
+            return Err(Error::InferenceError(
+                "physical batch used more workspace than it reserved".to_string(),
             ));
         }
         match self.dispatch.kind {
@@ -1619,7 +1652,7 @@ mod tests {
             },
             rows: vec![row],
             materialized_tensor_elements: 10,
-            workspace_bytes: 8,
+            workspace: ResourceVector::temporary_workspace(8),
         };
         assert!(batch.validate().is_ok());
 
@@ -1681,7 +1714,7 @@ mod tests {
                 },
             ],
             materialized_tensor_elements: 20,
-            workspace_bytes: 16,
+            workspace: ResourceVector::temporary_workspace(16),
         };
         let dispatch = BatchDispatch::new(BatchDispatchKind::TensorStatic, 2);
         let mut first_report = report_for(
@@ -1768,7 +1801,7 @@ mod tests {
             },
             rows,
             materialized_tensor_elements: 0,
-            workspace_bytes: 0,
+            workspace: ResourceVector::zero(),
         };
         let dispatch = BatchDispatch::new(BatchDispatchKind::RequestParallel, 2);
         let report = PhysicalBatchReport {
@@ -1823,7 +1856,7 @@ mod tests {
                 cost: WorkCost::new(1, 1, 1),
             }],
             materialized_tensor_elements: 1,
-            workspace_bytes: 1,
+            workspace: ResourceVector::temporary_workspace(1),
         };
         let failure = ExecutionFailure {
             kind: FailureKind::Backend,

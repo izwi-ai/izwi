@@ -157,10 +157,45 @@ impl PhysicalBatchAssembly {
         }
     }
 
-    fn workspace_bytes(base_bytes: u64, rows: &[ReadyQuantum]) -> Option<u64> {
-        rows.iter().try_fold(base_bytes, |total, row| {
-            total.checked_add(row.cost.workspace_bytes)
-        })
+    fn workspace_resources(
+        backend: BackendKind,
+        base_bytes: u64,
+        rows: &[ReadyQuantum],
+    ) -> Option<ResourceVector> {
+        let generic = rows.iter().try_fold(
+            ResourceVector {
+                temporary_bytes: ResourceAmount::Known(base_bytes),
+                ..ResourceVector::zero()
+            },
+            |total, row| total.checked_add(row.cost.workspace).ok(),
+        )?;
+        if generic.kv_bytes != ResourceAmount::Known(0)
+            || generic.compute_slots != ResourceAmount::Known(0)
+        {
+            return None;
+        }
+        let known = |amount| match amount {
+            ResourceAmount::Known(value) => Some(value),
+            ResourceAmount::Unknown => None,
+        };
+        let host = known(generic.host_bytes)?;
+        let accelerator = known(generic.device_bytes)?
+            .checked_add(known(generic.unified_bytes)?)?
+            .checked_add(known(generic.temporary_bytes)?)?;
+        let mut workspace = ResourceVector::zero();
+        match backend {
+            BackendKind::Cpu => {
+                workspace.host_bytes = ResourceAmount::Known(host.checked_add(accelerator)?)
+            }
+            BackendKind::Metal => {
+                workspace.unified_bytes = ResourceAmount::Known(host.checked_add(accelerator)?)
+            }
+            BackendKind::Cuda => {
+                workspace.host_bytes = ResourceAmount::Known(host);
+                workspace.device_bytes = ResourceAmount::Known(accelerator);
+            }
+        }
+        Some(workspace)
     }
 
     fn try_push(
@@ -176,13 +211,15 @@ impl PhysicalBatchAssembly {
         else {
             return false;
         };
-        let Some(workspace_bytes) =
-            Self::workspace_bytes(self.workspace_base_bytes, &candidate.rows)
-        else {
+        let Some(workspace) = Self::workspace_resources(
+            candidate.lane.backend,
+            self.workspace_base_bytes,
+            &candidate.rows,
+        ) else {
             return false;
         };
         candidate.materialized_tensor_elements = materialized;
-        candidate.workspace_bytes = workspace_bytes;
+        candidate.workspace = workspace;
         if candidate.validate().is_err() {
             return false;
         }
@@ -985,11 +1022,14 @@ impl EngineCore {
                     .as_ref()
                     .map(|stage| stage.workspace_base_bytes)
                     .unwrap_or(0);
-                let workspace_bytes = workspace_base_bytes
-                    .checked_add(row.cost.workspace_bytes)
-                    .ok_or_else(|| {
-                        Error::Overloaded("batch workspace estimate overflow".to_string())
-                    })?;
+                let workspace = PhysicalBatchAssembly::workspace_resources(
+                    lane.backend,
+                    workspace_base_bytes,
+                    std::slice::from_ref(&row),
+                )
+                .ok_or_else(|| {
+                    Error::Overloaded("batch workspace estimate overflow".to_string())
+                })?;
                 let physical_batch = PhysicalBatch {
                     batch_id: self.allocate_batch_id()?,
                     lane,
@@ -997,7 +1037,7 @@ impl EngineCore {
                     budget,
                     rows: vec![row],
                     materialized_tensor_elements,
-                    workspace_bytes,
+                    workspace,
                 };
                 physical_batch.validate()?;
                 assemblies.push(PhysicalBatchAssembly {
@@ -2914,7 +2954,13 @@ mod tests {
         let joined = core.form_physical_batches(&requests, &scheduled).unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].physical_batch().rows.len(), 2);
-        assert_eq!(joined[0].physical_batch().workspace_bytes, 10);
+        assert_eq!(
+            joined[0].physical_batch().workspace,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(10),
+                ..ResourceVector::zero()
+            }
+        );
         assert_eq!(
             joined[0].physical_batch().lane.model_instance,
             super::super::ModelInstanceId::new(2)
@@ -2933,6 +2979,60 @@ mod tests {
         assert!(split
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
+    }
+
+    #[test]
+    fn cuda_batch_workspace_preserves_host_and_device_domains() {
+        let lane = BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(1),
+            model_instance: super::super::ModelInstanceId::new(2),
+            adapter_instance: super::super::AdapterInstanceId::new(3),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: super::super::StageId::new(4),
+            backend: BackendKind::Cuda,
+            device_ordinal: None,
+            compute_dtype: "f16".to_string(),
+            state_dtype: "f16".to_string(),
+            tensor_layout: "ragged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test".to_string(),
+            kernel_mode: "continuous".to_string(),
+            semantic_mode: "decode".to_string(),
+            shape_bucket: "ragged".to_string(),
+        };
+        let row = ReadyQuantum {
+            plan_id: 1,
+            session: super::super::SessionKey::new("workspace".to_string(), 1),
+            lane,
+            work: WorkUnit::SequenceStep {
+                phase: super::super::SequencePhase::Decode,
+                input: super::super::InputRange { start: 1, end: 2 },
+                max_output_steps: 1,
+            },
+            cost: WorkCost::with_workspace(
+                1,
+                1,
+                ResourceVector {
+                    host_bytes: ResourceAmount::Known(32),
+                    temporary_bytes: ResourceAmount::Known(8_192),
+                    ..ResourceVector::zero()
+                },
+            ),
+        };
+
+        assert_eq!(
+            PhysicalBatchAssembly::workspace_resources(
+                BackendKind::Cuda,
+                16,
+                std::slice::from_ref(&row),
+            ),
+            Some(ResourceVector {
+                host_bytes: ResourceAmount::Known(32),
+                device_bytes: ResourceAmount::Known(8_208),
+                ..ResourceVector::zero()
+            })
+        );
     }
 
     #[test]
@@ -3111,8 +3211,22 @@ mod tests {
         assert!(batches
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
-        assert_eq!(batches[0].physical_batch().workspace_bytes, 8);
-        assert_eq!(batches[1].physical_batch().workspace_bytes, 9);
+        assert_eq!(
+            batches[0]
+                .physical_batch()
+                .workspace
+                .workspace_bytes()
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            batches[1]
+                .physical_batch()
+                .workspace
+                .workspace_bytes()
+                .unwrap(),
+            9
+        );
     }
 
     #[test]

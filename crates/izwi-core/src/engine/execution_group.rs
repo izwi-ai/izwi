@@ -147,16 +147,27 @@ async fn execute_batches(
                         result
                     })
                     .collect();
-                executed.push(executed_batch(batch, results, batch_started.elapsed()));
+                executed.push(executed_batch(
+                    batch,
+                    results,
+                    batch_started.elapsed(),
+                    super::ResourceVector::zero(),
+                ));
                 continue;
             }
         };
+        let observed_workspace = batch.physical_batch.workspace;
         let request_refs: Vec<_> = batch.requests.iter().map(Arc::as_ref).collect();
         let result = executor
             .execute_physical_batch(&batch.physical_batch, &request_refs, &batch.scheduled)
             .await;
         let results = reconcile_executor_outputs(phase, &batch.scheduled, result);
-        executed.push(executed_batch(batch, results, batch_started.elapsed()));
+        executed.push(executed_batch(
+            batch,
+            results,
+            batch_started.elapsed(),
+            observed_workspace,
+        ));
         drop(workspace);
     }
     (executed, started.elapsed())
@@ -166,6 +177,7 @@ fn executed_batch(
     batch: PreparedExecutionBatch,
     results: Vec<ExecutorStepResult>,
     elapsed: Duration,
+    observed_resources: super::ResourceVector,
 ) -> ExecutedPhysicalBatch {
     let dispatch = results
         .first()
@@ -182,7 +194,7 @@ fn executed_batch(
         batch_id: batch.physical_batch.batch_id,
         lane: batch.physical_batch.lane.clone(),
         dispatch,
-        observed_resources: super::ResourceVector::zero(),
+        observed_resources,
         elapsed,
         rows,
     };
@@ -314,8 +326,8 @@ mod tests {
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatchKind, BatchId,
         BatchLaneKey, ExecutionGroupId, InputRange, ModelExecutor, ModelInstanceId,
-        NativeBatchMode, PhysicalBatchExecution, ReadyQuantum, SequencePhase, SessionKey, StageId,
-        WorkCost, WorkUnit,
+        NativeBatchMode, PhysicalBatchExecution, ReadyQuantum, ResourceVector, SequencePhase,
+        SessionKey, StageId, WorkCost, WorkUnit,
     };
 
     struct CountingExecutor {
@@ -540,7 +552,7 @@ mod tests {
                 cost: WorkCost::new(1, 1, 1),
             }],
             materialized_tensor_elements: 1,
-            workspace_bytes: 1,
+            workspace: ResourceVector::temporary_workspace(1),
         };
         let prepared = PreparedEngineStep::new(
             executor,
@@ -605,7 +617,7 @@ mod tests {
                 cost: WorkCost::new(1, 1, 0),
             }],
             materialized_tensor_elements: 1,
-            workspace_bytes: 0,
+            workspace: ResourceVector::zero(),
         };
         let prepared = PreparedEngineStep::new(
             executor,

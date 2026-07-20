@@ -1470,7 +1470,7 @@ impl UnifiedExecutor {
         &self,
         batch: &PhysicalBatch,
     ) -> Result<Option<BatchWorkspaceLease>> {
-        if batch.workspace_bytes == 0 {
+        if batch.workspace.workspace_bytes()? == 0 {
             return Ok(None);
         }
         let context = self.batch_workspace.as_ref().ok_or_else(|| {
@@ -1479,16 +1479,14 @@ impl UnifiedExecutor {
                     .to_string(),
             )
         })?;
-        let mut resources = ResourceVector::zero();
-        let workspace = ResourceAmount::Known(batch.workspace_bytes);
-        match context.backend {
-            BackendKind::Cpu => resources.host_bytes = workspace,
-            BackendKind::Metal => resources.unified_bytes = workspace,
-            BackendKind::Cuda => resources.device_bytes = workspace,
+        if batch.lane.backend != context.backend {
+            return Err(Error::InvalidInput(
+                "physical batch workspace backend does not match its executor".to_string(),
+            ));
         }
         context
             .authority
-            .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, resources)
+            .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, batch.workspace)
             .map(Some)
     }
 
@@ -1737,7 +1735,10 @@ mod tests {
             match backend {
                 BackendKind::Cpu => capacity.host_bytes = ResourceAmount::Known(64),
                 BackendKind::Metal => capacity.unified_bytes = ResourceAmount::Known(64),
-                BackendKind::Cuda => capacity.device_bytes = ResourceAmount::Known(64),
+                BackendKind::Cuda => {
+                    capacity.host_bytes = ResourceAmount::Known(64);
+                    capacity.device_bytes = ResourceAmount::Known(64);
+                }
             }
             let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
                 capacity,
@@ -1767,6 +1768,21 @@ mod tests {
                 semantic_mode: "test".to_string(),
                 shape_bucket: "exact.1".to_string(),
             };
+            let expected_workspace = match backend {
+                BackendKind::Cpu => ResourceVector {
+                    host_bytes: ResourceAmount::Known(8),
+                    ..ResourceVector::zero()
+                },
+                BackendKind::Metal => ResourceVector {
+                    unified_bytes: ResourceAmount::Known(8),
+                    ..ResourceVector::zero()
+                },
+                BackendKind::Cuda => ResourceVector {
+                    host_bytes: ResourceAmount::Known(3),
+                    device_bytes: ResourceAmount::Known(8),
+                    ..ResourceVector::zero()
+                },
+            };
             let batch = PhysicalBatch {
                 batch_id: super::super::BatchId::new(10),
                 lane: lane.clone(),
@@ -1782,30 +1798,14 @@ mod tests {
                     cost: super::super::WorkCost::new(1, 1, 8),
                 }],
                 materialized_tensor_elements: 1,
-                workspace_bytes: 8,
+                workspace: expected_workspace,
             };
 
             let workspace = executor
                 .reserve_batch_workspace(&batch)
                 .unwrap()
                 .expect("workspace lease");
-            assert_eq!(
-                workspace.resources(),
-                match backend {
-                    BackendKind::Cpu => ResourceVector {
-                        host_bytes: ResourceAmount::Known(8),
-                        ..ResourceVector::zero()
-                    },
-                    BackendKind::Metal => ResourceVector {
-                        unified_bytes: ResourceAmount::Known(8),
-                        ..ResourceVector::zero()
-                    },
-                    BackendKind::Cuda => ResourceVector {
-                        device_bytes: ResourceAmount::Known(8),
-                        ..ResourceVector::zero()
-                    },
-                }
-            );
+            assert_eq!(workspace.resources(), expected_workspace);
             assert_eq!(authority.snapshot().reservations, 1);
             drop(workspace);
             assert_eq!(authority.snapshot().reservations, 0);

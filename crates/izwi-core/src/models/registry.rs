@@ -1983,6 +1983,15 @@ impl NativeChatModel {
         }
     }
 
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        match self {
+            Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
+                "loaded chat model has no continuous decode workspace contract".to_string(),
+            )),
+        }
+    }
+
     pub fn session_cache_reservation_bytes(
         &self,
         prompt_tokens: usize,

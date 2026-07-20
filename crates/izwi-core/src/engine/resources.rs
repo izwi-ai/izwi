@@ -83,6 +83,15 @@ impl ResourceVector {
         }
     }
 
+    /// Backend-neutral transient memory. Physical planning resolves this into
+    /// host, unified, or device memory before reservation.
+    pub const fn temporary_workspace(bytes: u64) -> Self {
+        Self {
+            temporary_bytes: ResourceAmount::Known(bytes),
+            ..Self::zero()
+        }
+    }
+
     pub fn checked_add(self, other: Self) -> Result<Self> {
         Ok(Self {
             host_bytes: self.host_bytes.checked_add(other.host_bytes)?,
@@ -125,6 +134,34 @@ impl ResourceVector {
         ]
         .into_iter()
         .all(|amount| matches!(amount, ResourceAmount::Known(_)))
+    }
+
+    /// Return the total transient workspace represented across memory domains.
+    /// Persistent KV and compute-slot quantities are not valid batch scratch.
+    pub fn workspace_bytes(self) -> Result<u64> {
+        if self.kv_bytes != ResourceAmount::Known(0)
+            || self.compute_slots != ResourceAmount::Known(0)
+        {
+            return Err(Error::InvalidInput(
+                "batch workspace cannot contain persistent KV or compute-slot resources"
+                    .to_string(),
+            ));
+        }
+        [
+            self.host_bytes,
+            self.device_bytes,
+            self.unified_bytes,
+            self.temporary_bytes,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, amount| match amount {
+            ResourceAmount::Known(value) => total
+                .checked_add(value)
+                .ok_or_else(|| Error::Overloaded("batch workspace total overflow".to_string())),
+            ResourceAmount::Unknown => Err(Error::InvalidInput(
+                "batch workspace contains an unresolved quantity".to_string(),
+            )),
+        })
     }
 
     fn positive_growth_over(self, current: Self) -> Result<Self> {

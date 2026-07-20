@@ -499,6 +499,22 @@ impl Qwen3ChatModel {
         matches!(&self.backend, Qwen3ChatBackend::Native { .. })
     }
 
+    /// Additional per-row tensor materialization used only by the continuous
+    /// path when ragged attention rows are concatenated back into one batch.
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        let Qwen3ChatBackend::Native { text_model } = &self.backend else {
+            return Err(Error::InvalidInput(
+                "continuous decode workspace is unavailable for GGUF chat models".to_string(),
+            ));
+        };
+        let dtype = self.compute_dtype.ok_or_else(|| {
+            Error::InvalidInput(
+                "continuous decode workspace requires a resolved model dtype".to_string(),
+            )
+        })?;
+        continuous_decode_collation_workspace_bytes(text_model.hidden_size(), dtype.size_in_bytes())
+    }
+
     fn generate_with_callback_gguf(
         &self,
         messages: &[ChatMessage],
@@ -703,6 +719,18 @@ fn select_qwen3_dense_dtype(
     }
 }
 
+fn continuous_decode_collation_workspace_bytes(
+    hidden_size: usize,
+    dtype_bytes: usize,
+) -> Result<u64> {
+    u64::try_from(hidden_size)
+        .ok()
+        .and_then(|hidden| hidden.checked_mul(u64::try_from(dtype_bytes).ok()?))
+        .ok_or_else(|| {
+            Error::Overloaded("continuous decode workspace estimate overflow".to_string())
+        })
+}
+
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -746,7 +774,9 @@ fn text_delta(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_qwen3_dense_dtype, strip_think_blocks};
+    use super::{
+        continuous_decode_collation_workspace_bytes, select_qwen3_dense_dtype, strip_think_blocks,
+    };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device};
 
@@ -760,6 +790,18 @@ mod tests {
     fn strip_think_blocks_handles_implicit_open_pattern() {
         let stripped = strip_think_blocks("reasoning only</think>\nFinal answer");
         assert_eq!(stripped, "Final answer");
+    }
+
+    #[test]
+    fn continuous_decode_workspace_tracks_loaded_hidden_size_and_dtype() {
+        assert_eq!(
+            continuous_decode_collation_workspace_bytes(1_024, 2).unwrap(),
+            2_048
+        );
+        assert_eq!(
+            continuous_decode_collation_workspace_bytes(3_584, 4).unwrap(),
+            14_336
+        );
     }
 
     #[test]

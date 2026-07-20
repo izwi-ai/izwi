@@ -2209,6 +2209,10 @@ impl Qwen3Model {
         self.cfg.head_dim()
     }
 
+    pub fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+
     /// Conservative retained-session allocation bound for a complete decode.
     ///
     /// Candle cache pages may use any supported compute dtype or KV
