@@ -229,7 +229,12 @@ pub enum MembershipSafePoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputVisibility {
+    /// Executor output remains private until the physical report and the
+    /// corresponding model/scheduler state transition commit together.
     AfterQuantumCommit,
+    /// A non-tensor stage may commit fenced, non-terminal progress records
+    /// while its physical operation is still running. The authoritative final
+    /// marker remains gated by the normal physical report and state commit.
     IncrementalCommitted,
 }
 
@@ -376,6 +381,13 @@ impl StageDescriptor {
         {
             return Err(Error::InvalidInput(
                 "continuous batching requires a repeatable membership safe point".to_string(),
+            ));
+        }
+        if self.output_visibility == OutputVisibility::IncrementalCommitted
+            && self.batch_mode != NativeBatchMode::None
+        {
+            return Err(Error::InvalidInput(
+                "native tensor stages cannot publish in-flight output checkpoints".to_string(),
             ));
         }
         Ok(())
@@ -1767,6 +1779,32 @@ mod tests {
             ..invalid
         };
         assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn incremental_output_visibility_is_restricted_to_non_tensor_stages() {
+        let profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Atomic,
+        );
+        let mut compatibility = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "chat.compatibility",
+            &profile,
+            NativeBatchMode::None,
+        );
+        compatibility.output_visibility = OutputVisibility::IncrementalCommitted;
+        assert!(compatibility.validate().is_ok());
+
+        let mut tensor = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "chat.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        tensor.output_visibility = OutputVisibility::IncrementalCommitted;
+        assert!(tensor.validate().is_err());
     }
 
     #[test]

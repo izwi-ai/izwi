@@ -7,7 +7,7 @@ use crate::backends::BackendKind;
 use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity, ConcurrencyClass,
     ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile, ModelInstanceId,
-    NativeBatchMode, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
+    NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -18,12 +18,32 @@ use super::{
     StreamingMode,
 };
 
-const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(4);
-const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(5);
-const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(6);
+const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(7);
+const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(8);
+const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(9);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn output_visibility_for(
+    metadata: AdapterMetadata,
+    streaming_required: bool,
+    execution_mode: ExecutionMode,
+    batch_mode: NativeBatchMode,
+) -> OutputVisibility {
+    if batch_mode == NativeBatchMode::None
+        && streaming_required
+        && execution_mode == ExecutionMode::Atomic
+        && matches!(
+            metadata.streaming_mode,
+            StreamingMode::Chunked | StreamingMode::Realtime
+        )
+    {
+        OutputVisibility::IncrementalCommitted
+    } else {
+        OutputVisibility::AfterQuantumCommit
+    }
+}
 
 fn compatible_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
     if backend_kind == BackendKind::Metal {
@@ -257,10 +277,16 @@ fn compatibility_contract(
         ConcurrencyClass::Exclusive
     };
 
-    let stage = StageDescriptor::from_execution_profile(
+    let mut stage = StageDescriptor::from_execution_profile(
         StageId::new(0),
         format!("{}.compatibility", metadata.capability.as_str()),
         &execution_profile,
+        NativeBatchMode::None,
+    );
+    stage.output_visibility = output_visibility_for(
+        metadata,
+        streaming_required,
+        execution_profile.mode,
         NativeBatchMode::None,
     );
     stage.validate()?;
@@ -483,6 +509,12 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
         } else {
             crate::engine::StageShapePolicy::Exact
         };
+        prefill.output_visibility = output_visibility_for(
+            metadata,
+            streaming_required,
+            execution_profile.mode,
+            NativeBatchMode::None,
+        );
         let mut decode = StageDescriptor::from_execution_profile(
             StageId::new(2),
             "chat.decode.tensor_continuous",
@@ -880,6 +912,55 @@ mod tests {
         );
         assert_eq!(contract.metadata.streaming_mode, StreamingMode::Chunked);
         assert!(contract.execution_profile.resolved_from_loaded_model);
+        assert_eq!(
+            contract.stages[0].output_visibility,
+            OutputVisibility::IncrementalCommitted
+        );
+    }
+
+    #[test]
+    fn atomic_chunked_chat_opt_in_is_streaming_specific() {
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::Lfm2512BThinkingGguf,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        let non_streaming = bundle.contract(CapabilityKind::Chat, false).unwrap();
+        assert_eq!(non_streaming.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(
+            non_streaming.stages[0].output_visibility,
+            OutputVisibility::AfterQuantumCommit
+        );
+
+        let streaming = bundle.contract(CapabilityKind::Chat, true).unwrap();
+        assert_eq!(streaming.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(
+            streaming.stages[0].output_visibility,
+            OutputVisibility::IncrementalCommitted
+        );
+    }
+
+    #[test]
+    fn sequence_chat_remains_quantum_committed_when_streaming() {
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::Qwen3508BGguf,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        let streaming = bundle.contract(CapabilityKind::Chat, true).unwrap();
+        assert_eq!(streaming.execution_profile.mode, ExecutionMode::Sequence);
+        assert!(streaming
+            .stages
+            .iter()
+            .all(|stage| { stage.output_visibility == OutputVisibility::AfterQuantumCommit }));
     }
 
     #[test]
@@ -1100,6 +1181,10 @@ mod tests {
         assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(contract.stages[1].max_batch_size, 8);
         assert_eq!(contract.stages[1].max_work_units, 8);
+        assert!(contract
+            .stages
+            .iter()
+            .all(|stage| { stage.output_visibility == OutputVisibility::AfterQuantumCommit }));
         assert_eq!(
             contract.stages[1].max_workspace_bytes,
             CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES
