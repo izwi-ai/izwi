@@ -1,0 +1,313 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { ChatApiClient } from "@/shared/api/chat";
+import { ApiHttpClient } from "@/shared/api/http";
+
+function sseResponse(events: Array<Record<string, unknown> | string>): Response {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const event of events) {
+          const payload =
+            typeof event === "string" ? event : JSON.stringify(event);
+          controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+        }
+        controller.close();
+      },
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+      },
+    },
+  );
+}
+
+function chatChunk(content: string): Record<string, unknown> {
+  return {
+    id: "chatcmpl-1",
+    model: "LFM2.5-1.2B-Thinking-GGUF",
+    choices: [
+      {
+        index: 0,
+        delta: { content },
+        finish_reason: null,
+      },
+    ],
+  };
+}
+
+describe("ChatApiClient OpenAI streaming", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("completes only after the OpenAI done sentinel", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([
+          chatChunk("Hello "),
+          chatChunk("world"),
+          {
+            id: "chatcmpl-1",
+            model: "LFM2.5-1.2B-Thinking-GGUF",
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: "stop",
+              },
+            ],
+            usage: { completion_tokens: 2 },
+            izwi_generation_time_ms: 42,
+          },
+          "[DONE]",
+        ]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onDelta = vi.fn();
+    const onError = vi.fn();
+    const result = await new Promise<{
+      text: string;
+      stats: { tokens_generated: number; generation_time_ms: number };
+    }>((resolve) => {
+      client.chatCompletionsStream(
+        { messages: [{ role: "user", content: "Hello" }] },
+        {
+          onDelta,
+          onError,
+          onDone: (text, stats) => resolve({ text, stats }),
+        },
+      );
+    });
+
+    expect(onDelta.mock.calls).toEqual([["Hello "], ["world"]]);
+    expect(onError).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      text: "Hello world",
+      stats: { tokens_generated: 2, generation_time_ms: 42 },
+    });
+  });
+
+  it("surfaces an OpenAI error frame and does not complete on done", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([
+          { error: { message: "Inference failed", type: "server_error" } },
+          "[DONE]",
+        ]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onDone = vi.fn();
+    const onError = vi.fn();
+    client.chatCompletionsStream(
+      { messages: [{ role: "user", content: "Hello" }] },
+      { onDone, onError },
+    );
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith("Inference failed");
+    });
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it("reports a truncated stream that closes without done", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(sseResponse([chatChunk("partial response")])),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onDelta = vi.fn();
+    const onDone = vi.fn();
+    const onError = vi.fn();
+    client.chatCompletionsStream(
+      { messages: [{ role: "user", content: "Hello" }] },
+      { onDelta, onDone, onError },
+    );
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        "Chat stream ended before a terminal event",
+      );
+    });
+    expect(onDelta).toHaveBeenCalledWith("partial response");
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it("rejects done without an OpenAI terminal chunk", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([chatChunk("partial response"), "[DONE]"]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onDone = vi.fn();
+    const onError = vi.fn();
+    client.chatCompletionsStream(
+      { messages: [{ role: "user", content: "Hello" }] },
+      { onDone, onError },
+    );
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        "Chat stream ended before a terminal event",
+      );
+    });
+    expect(onDone).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatApiClient thread streaming", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("does not turn an explicit terminal error into success", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([
+          { event: "delta", delta: "partial" },
+          { event: "error", error: "Inference failed" },
+          "[DONE]",
+        ]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onDone = vi.fn();
+    const onError = vi.fn();
+    const onClose = vi.fn();
+    client.sendChatThreadMessageStream(
+      "thread-1",
+      { content: "Hello" },
+      { onDone, onError, onClose },
+    );
+
+    await vi.waitFor(() => {
+      expect(onClose).toHaveBeenCalledOnce();
+    });
+    expect(onError).toHaveBeenCalledWith("Inference failed");
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it("reports closure before a terminal thread event", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([{ event: "delta", delta: "partial" }]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onDone = vi.fn();
+    const onError = vi.fn();
+    client.sendChatThreadMessageStream(
+      "thread-1",
+      { content: "Hello" },
+      { onDone, onError },
+    );
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        "Chat stream ended before a terminal event",
+      );
+    });
+    expect(onDone).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatApiClient Responses streaming", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps a failed response terminal after the done sentinel", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([
+          {
+            type: "response.failed",
+            response_id: "resp-1",
+            error: { message: "Response failed" },
+          },
+          "[DONE]",
+        ]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onCompleted = vi.fn();
+    const onError = vi.fn();
+    const onDone = vi.fn();
+    client.createResponseStream(
+      { input: "Hello" },
+      { onCompleted, onError, onDone },
+    );
+
+    await vi.waitFor(() => {
+      expect(onDone).toHaveBeenCalledOnce();
+    });
+    expect(onError).toHaveBeenCalledWith("Response failed");
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onCompleted).not.toHaveBeenCalled();
+  });
+
+  it("reports closure before a terminal response event", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseResponse([{ type: "response.output_text.delta", delta: "partial" }]),
+      ),
+    );
+
+    const client = new ChatApiClient(
+      new ApiHttpClient("http://localhost/v1"),
+    );
+    const onCompleted = vi.fn();
+    const onError = vi.fn();
+    client.createResponseStream(
+      { input: "Hello" },
+      { onCompleted, onError },
+    );
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        "Response stream ended before a terminal event",
+      );
+    });
+    expect(onCompleted).not.toHaveBeenCalled();
+  });
+});

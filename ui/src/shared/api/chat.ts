@@ -5,6 +5,10 @@ import {
 } from "@/shared/api/http";
 
 const DEFAULT_CHAT_MODEL = "Qwen3-8B-GGUF";
+const CHAT_STREAM_TRUNCATED_ERROR =
+  "Chat stream ended before a terminal event";
+const RESPONSE_STREAM_TRUNCATED_ERROR =
+  "Response stream ended before a terminal event";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -280,6 +284,25 @@ interface OpenAiChatChunk {
   izwi_generation_time_ms?: number;
 }
 
+function openAiChatStreamError(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || !("error" in payload)) {
+    return null;
+  }
+
+  const error = (payload as { error?: unknown }).error;
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+  }
+
+  return "Chat stream failed";
+}
+
 interface OpenAiResponseObject {
   id: string;
   status: string;
@@ -403,6 +426,7 @@ export class ChatApiClient {
     const abortController = new AbortController();
 
     const startStream = async () => {
+      let streamStatus: "open" | "completed" | "failed" = "open";
       try {
         const response = await fetch(
           this.http.url(
@@ -441,6 +465,10 @@ export class ChatApiClient {
 
         await consumeDataStream(response, (data) => {
           if (data === "[DONE]") {
+            if (streamStatus === "open") {
+              streamStatus = "failed";
+              callbacks.onError?.(CHAT_STREAM_TRUNCATED_ERROR);
+            }
             return true;
           }
 
@@ -458,6 +486,7 @@ export class ChatApiClient {
                 callbacks.onDelta?.(event.delta);
                 break;
               case "done":
+                streamStatus = "completed";
                 callbacks.onDone?.({
                   threadId: event.thread_id,
                   modelId: event.model_id,
@@ -466,7 +495,10 @@ export class ChatApiClient {
                 });
                 break;
               case "error":
-                callbacks.onError?.(event.error);
+                if (streamStatus === "open") {
+                  streamStatus = "failed";
+                  callbacks.onError?.(event.error);
+                }
                 break;
             }
           } catch {
@@ -475,6 +507,11 @@ export class ChatApiClient {
 
           return false;
         });
+
+        if (streamStatus === "open" && !abortController.signal.aborted) {
+          streamStatus = "failed";
+          callbacks.onError?.(CHAT_STREAM_TRUNCATED_ERROR);
+        }
 
         callbacks.onClose?.();
       } catch (error) {
@@ -601,30 +638,54 @@ export class ChatApiClient {
         const streamStartedAt = performance.now();
         let completionTokens: number | null = null;
         let generationTimeMs: number | null = null;
+        let streamStatus: "open" | "completed" | "failed" = "open";
+        let sawTerminalChunk = false;
 
         await consumeDataStream(response, (data) => {
           if (data === "[DONE]") {
-            const elapsedMs = Math.max(
-              1,
-              Math.round(performance.now() - streamStartedAt),
-            );
-            callbacks.onDone?.(fullText, {
-              tokens_generated:
-                completionTokens ?? Math.max(1, Math.floor(fullText.length / 4)),
-              generation_time_ms: generationTimeMs ?? elapsedMs,
-            });
+            if (streamStatus === "open") {
+              if (!sawTerminalChunk) {
+                streamStatus = "failed";
+                callbacks.onError?.(CHAT_STREAM_TRUNCATED_ERROR);
+              } else {
+                streamStatus = "completed";
+                const elapsedMs = Math.max(
+                  1,
+                  Math.round(performance.now() - streamStartedAt),
+                );
+                callbacks.onDone?.(fullText, {
+                  tokens_generated:
+                    completionTokens ??
+                    Math.max(1, Math.floor(fullText.length / 4)),
+                  generation_time_ms: generationTimeMs ?? elapsedMs,
+                });
+              }
+            }
             return true;
           }
 
           try {
-            const payload = JSON.parse(data) as OpenAiChatChunk;
-            if (typeof payload.izwi_generation_time_ms === "number") {
-              generationTimeMs = payload.izwi_generation_time_ms;
+            const payload = JSON.parse(data) as unknown;
+            const streamError = openAiChatStreamError(payload);
+            if (streamError) {
+              if (streamStatus === "open") {
+                streamStatus = "failed";
+                callbacks.onError?.(streamError);
+              }
+              return false;
             }
-            if (typeof payload.usage?.completion_tokens === "number") {
-              completionTokens = payload.usage.completion_tokens;
+
+            const chunk = payload as OpenAiChatChunk;
+            if (typeof chunk.izwi_generation_time_ms === "number") {
+              generationTimeMs = chunk.izwi_generation_time_ms;
             }
-            const choice = payload.choices?.[0];
+            if (typeof chunk.usage?.completion_tokens === "number") {
+              completionTokens = chunk.usage.completion_tokens;
+            }
+            const choice = chunk.choices?.[0];
+            if (choice?.finish_reason != null) {
+              sawTerminalChunk = true;
+            }
             const delta = choice?.delta?.content;
             if (delta) {
               fullText += delta;
@@ -636,6 +697,11 @@ export class ChatApiClient {
 
           return false;
         });
+
+        if (streamStatus === "open" && !abortController.signal.aborted) {
+          streamStatus = "failed";
+          callbacks.onError?.(CHAT_STREAM_TRUNCATED_ERROR);
+        }
       } catch (error) {
         if (!isAbortError(error)) {
           callbacks.onError?.(
@@ -674,6 +740,8 @@ export class ChatApiClient {
     const abortController = new AbortController();
 
     const startStream = async () => {
+      let streamStatus: "open" | "completed" | "failed" = "open";
+      let sawDone = false;
       try {
         const response = await fetch(this.http.url("/responses"), {
           method: "POST",
@@ -707,6 +775,11 @@ export class ChatApiClient {
 
         await consumeDataStream(response, (data) => {
           if (data === "[DONE]") {
+            sawDone = true;
+            if (streamStatus === "open") {
+              streamStatus = "failed";
+              callbacks.onError?.(RESPONSE_STREAM_TRUNCATED_ERROR);
+            }
             callbacks.onDone?.();
             return true;
           }
@@ -724,11 +797,15 @@ export class ChatApiClient {
             } else if (event.type === "response.output_text.delta") {
               callbacks.onDelta?.(event.delta ?? "");
             } else if (event.type === "response.completed" && event.response) {
+              streamStatus = "completed";
               callbacks.onCompleted?.(this.mapResponseObject(event.response));
             } else if (event.type === "response.failed") {
-              callbacks.onError?.(
-                event.error?.message ?? "Responses request failed",
-              );
+              if (streamStatus === "open") {
+                streamStatus = "failed";
+                callbacks.onError?.(
+                  event.error?.message ?? "Responses request failed",
+                );
+              }
             }
           } catch {
             // Skip malformed SSE payloads.
@@ -736,6 +813,15 @@ export class ChatApiClient {
 
           return false;
         });
+
+        if (
+          !sawDone &&
+          streamStatus === "open" &&
+          !abortController.signal.aborted
+        ) {
+          streamStatus = "failed";
+          callbacks.onError?.(RESPONSE_STREAM_TRUNCATED_ERROR);
+        }
       } catch (error) {
         if (!isAbortError(error)) {
           callbacks.onError?.(

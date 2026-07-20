@@ -30,6 +30,22 @@ use super::dto::{
     ResponseUsage, ResponsesCreateRequest,
 };
 
+const RESPONSE_STREAM_INTERRUPTED_ERROR: &str = "Response stream ended before a terminal event";
+
+fn response_stream_failure_payload(response_id: &str, message: impl Into<String>) -> String {
+    serde_json::json!({
+        "type": "response.failed",
+        "response_id": response_id,
+        "error": {"message": message.into()}
+    })
+    .to_string()
+}
+
+fn response_stream_interruption_payload(response_id: &str, saw_terminal: bool) -> Option<String> {
+    (!saw_terminal)
+        .then(|| response_stream_failure_payload(response_id, RESPONSE_STREAM_INTERRUPTED_ERROR))
+}
+
 pub async fn create_response(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
@@ -282,19 +298,23 @@ async fn create_streaming_response(
         ));
 
         let mut full_text = String::new();
+        let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
-            let payload = match event {
+            let (payload, terminal) = match event {
                 ChatStreamEvent::Started => continue,
                 ChatStreamEvent::Delta(delta) => {
                     full_text.push_str(&delta);
-                    serde_json::to_string(&ResponseStreamEnvelope {
-                        event_type: "response.output_text.delta",
-                        payload: ResponseStreamDeltaPayload {
-                            response_id: response_id_for_task.clone(),
-                            delta,
-                        },
-                    })
-                    .unwrap_or_default()
+                    (
+                        serde_json::to_string(&ResponseStreamEnvelope {
+                            event_type: "response.output_text.delta",
+                            payload: ResponseStreamDeltaPayload {
+                                response_id: response_id_for_task.clone(),
+                                delta,
+                            },
+                        })
+                        .unwrap_or_default(),
+                        false,
+                    )
                 }
                 ChatStreamEvent::Completed(generation) => {
                     let output_text = if generation.text.is_empty() {
@@ -392,16 +412,10 @@ async fn create_streaming_response(
                         },
                     })
                     .unwrap_or_default();
-                    yield Ok::<_, Infallible>(sse_event("response.completed", &payload));
-                    break;
+                    (payload, true)
                 }
                 ChatStreamEvent::Failed(error) => {
-                    let failed = serde_json::json!({
-                        "type": "response.failed",
-                        "response_id": response_id_for_task.clone(),
-                        "error": {"message": error}
-                    })
-                    .to_string();
+                    let failed = response_stream_failure_payload(&response_id_for_task, error);
                     persist_response(
                         &store_state,
                         StoredResponseRecord {
@@ -419,15 +433,13 @@ async fn create_streaming_response(
                         req.store,
                     )
                     .await;
-                    failed
+                    (failed, true)
                 }
                 ChatStreamEvent::ShuttingDown => {
-                    let failed = serde_json::json!({
-                        "type": "response.failed",
-                        "response_id": response_id_for_task.clone(),
-                        "error": {"message": "Server is shutting down"}
-                    })
-                    .to_string();
+                    let failed = response_stream_failure_payload(
+                        &response_id_for_task,
+                        "Server is shutting down",
+                    );
                     persist_response(
                         &store_state,
                         StoredResponseRecord {
@@ -445,7 +457,7 @@ async fn create_streaming_response(
                         req.store,
                     )
                     .await;
-                    failed
+                    (failed, true)
                 }
             };
             let event_type = match serde_json::from_str::<serde_json::Value>(&payload)
@@ -456,9 +468,32 @@ async fn create_streaming_response(
                 None => "response.event".to_string(),
             };
             yield Ok::<_, Infallible>(sse_event(&event_type, &payload));
-            if payload.contains("\"type\":\"response.failed\"") {
+            if terminal {
+                saw_terminal = true;
                 break;
             }
+        }
+        if let Some(payload) =
+            response_stream_interruption_payload(&response_id_for_task, saw_terminal)
+        {
+            persist_response(
+                &store_state,
+                StoredResponseRecord {
+                    id: response_id_for_task.clone(),
+                    created_at,
+                    status: "failed".to_string(),
+                    model: model_name.clone(),
+                    input_items: input_items.clone(),
+                    output_text: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    error: Some(RESPONSE_STREAM_INTERRUPTED_ERROR.to_string()),
+                    metadata: metadata.clone(),
+                },
+                req.store,
+            )
+            .await;
+            yield Ok::<_, Infallible>(sse_event("response.failed", &payload));
         }
         yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
     };
@@ -827,6 +862,29 @@ mod tests {
     use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use serde_json::json;
+
+    #[test]
+    fn closed_response_stream_emits_explicit_terminal_failure() {
+        let payload = response_stream_interruption_payload("resp_test", false)
+            .expect("an interrupted response stream should fail");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("valid failure payload");
+
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("response.failed")
+        );
+        assert_eq!(
+            json.get("response_id").and_then(|value| value.as_str()),
+            Some("resp_test")
+        );
+        assert_eq!(
+            json.pointer("/error/message")
+                .and_then(|value| value.as_str()),
+            Some(RESPONSE_STREAM_INTERRUPTED_ERROR)
+        );
+        assert!(response_stream_interruption_payload("resp_test", true).is_none());
+    }
 
     #[test]
     fn builds_messages_from_text_and_instructions() {

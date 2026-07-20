@@ -23,6 +23,8 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole};
 
+const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
+
 #[derive(Debug, Serialize)]
 pub struct ChatThreadListResponse {
     pub threads: Vec<ChatThreadSummary>,
@@ -123,6 +125,18 @@ struct ThreadStreamDoneEvent {
 struct ThreadStreamErrorEvent {
     event: &'static str,
     error: String,
+}
+
+fn thread_stream_error_payload(error: impl Into<String>) -> String {
+    serde_json::to_string(&ThreadStreamErrorEvent {
+        event: "error",
+        error: error.into(),
+    })
+    .unwrap_or_default()
+}
+
+fn thread_stream_interruption_payload(saw_terminal: bool) -> Option<String> {
+    (!saw_terminal).then(|| thread_stream_error_payload(CHAT_STREAM_INTERRUPTED_ERROR))
 }
 
 pub async fn list_threads(
@@ -351,6 +365,7 @@ async fn create_streaming_thread_message(
 
     let stream = async_stream::stream! {
         let mut stream_completion = Some(stream_completion);
+        let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => (
@@ -394,32 +409,23 @@ async fn create_streaming_thread_message(
                             },
                         })
                         .unwrap_or_default(),
-                        Err(err) => serde_json::to_string(&ThreadStreamErrorEvent {
-                            event: "error",
-                            error: format!("Failed to persist assistant message: {err}"),
-                        })
-                        .unwrap_or_default(),
+                        Err(err) => thread_stream_error_payload(format!(
+                            "Failed to persist assistant message: {err}"
+                        )),
                     };
                     (payload, true)
                 }
                 ChatStreamEvent::Failed(error) => (
-                    serde_json::to_string(&ThreadStreamErrorEvent {
-                        event: "error",
-                        error,
-                    })
-                    .unwrap_or_default(),
+                    thread_stream_error_payload(error),
                     true,
                 ),
                 ChatStreamEvent::ShuttingDown => (
-                    serde_json::to_string(&ThreadStreamErrorEvent {
-                        event: "error",
-                        error: "Server is shutting down".to_string(),
-                    })
-                    .unwrap_or_default(),
+                    thread_stream_error_payload("Server is shutting down"),
                     true,
                 ),
             };
             if terminal {
+                saw_terminal = true;
                 if let Some(completion) = stream_completion.take() {
                     completion.acknowledge();
                 }
@@ -428,6 +434,9 @@ async fn create_streaming_thread_message(
             if terminal {
                 break;
             }
+        }
+        if let Some(payload) = thread_stream_interruption_payload(saw_terminal) {
+            yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
         }
         yield Ok::<_, Infallible>("data: [DONE]\n\n".to_string());
     };
@@ -535,6 +544,23 @@ mod tests {
 
         assert_eq!(flattened.runtime_text, "Look  now");
         assert_eq!(flattened.display_text, "Look  now");
+    }
+
+    #[test]
+    fn closed_thread_stream_emits_explicit_error_without_terminal_event() {
+        let payload = thread_stream_interruption_payload(false)
+            .expect("an interrupted stream should emit an error");
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("valid error payload");
+
+        assert_eq!(
+            json.get("event").and_then(|value| value.as_str()),
+            Some("error")
+        );
+        assert_eq!(
+            json.get("error").and_then(|value| value.as_str()),
+            Some(CHAT_STREAM_INTERRUPTED_ERROR)
+        );
+        assert!(thread_stream_interruption_payload(true).is_none());
     }
 
     #[test]

@@ -26,6 +26,22 @@ use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole, ModelVariant};
 
+const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
+
+fn openai_chat_stream_error_payload(message: impl Into<String>) -> String {
+    serde_json::json!({
+        "error": {
+            "message": message.into(),
+            "type": "server_error"
+        }
+    })
+    .to_string()
+}
+
+fn openai_chat_stream_interruption_payload(saw_terminal: bool) -> Option<String> {
+    (!saw_terminal).then(|| openai_chat_stream_error_payload(CHAT_STREAM_INTERRUPTED_ERROR))
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -692,6 +708,7 @@ async fn complete_stream(
     let mut event_rx = spawn_chat_stream(state, execution_request);
 
     let stream = async_stream::stream! {
+        let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => (
@@ -775,30 +792,24 @@ async fn complete_stream(
                     )
                 }
                 ChatStreamEvent::Failed(error) => (
-                    serde_json::json!({
-                        "error": {
-                            "message": error,
-                            "type": "server_error"
-                        }
-                    })
-                    .to_string(),
+                    openai_chat_stream_error_payload(error),
                     true,
                 ),
                 ChatStreamEvent::ShuttingDown => (
-                    serde_json::json!({
-                        "error": {
-                            "message": "Server is shutting down",
-                            "type": "server_error"
-                        }
-                    })
-                    .to_string(),
+                    openai_chat_stream_error_payload("Server is shutting down"),
                     true,
                 ),
             };
+            if terminal {
+                saw_terminal = true;
+            }
             yield Ok(Event::default().data(payload));
             if terminal {
                 break;
             }
+        }
+        if let Some(payload) = openai_chat_stream_interruption_payload(saw_terminal) {
+            yield Ok(Event::default().data(payload));
         }
         yield Ok(Event::default().data("[DONE]"));
     };
@@ -841,6 +852,24 @@ mod tests {
 
         assert_eq!(flattened.runtime_text, "helloworld");
         assert!(!flattened.has_media());
+    }
+
+    #[test]
+    fn closed_chat_stream_emits_explicit_error_without_terminal_event() {
+        let payload = openai_chat_stream_interruption_payload(false)
+            .expect("an interrupted stream should emit an error");
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("valid error payload");
+
+        assert_eq!(
+            json.pointer("/error/message")
+                .and_then(|value| value.as_str()),
+            Some(CHAT_STREAM_INTERRUPTED_ERROR)
+        );
+        assert_eq!(
+            json.pointer("/error/type").and_then(|value| value.as_str()),
+            Some("server_error")
+        );
+        assert!(openai_chat_stream_interruption_payload(true).is_none());
     }
 
     #[test]
