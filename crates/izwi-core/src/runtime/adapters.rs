@@ -1,6 +1,7 @@
 //! Runtime capability adapters and loaded-model execution bindings.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -88,6 +89,23 @@ pub(crate) enum ExecutionTargetKind {
     Artifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceExecutionMode {
+    None,
+    Always,
+    StreamingOnly,
+}
+
+impl SequenceExecutionMode {
+    const fn enabled(self, streaming_required: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Always => true,
+            Self::StreamingOnly => streaming_required,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdapterMetadata {
@@ -96,6 +114,7 @@ pub(crate) struct AdapterMetadata {
     pub(crate) model_variant: ModelVariant,
     pub(crate) streaming_mode: StreamingMode,
     pub(crate) execution_target: ExecutionTargetKind,
+    pub(crate) sequence_execution: SequenceExecutionMode,
 }
 
 pub(crate) trait ModelCapabilityAdapter {
@@ -108,6 +127,7 @@ pub(crate) struct RuntimeAdapterRegistry {
     execution_rollout: ExecutionRolloutPolicy,
     max_tensor_batch_size: usize,
     request_parallelism: usize,
+    loaded_adapter_factories: Vec<Arc<dyn loaded::LoadedExecutionAdapterFactory>>,
 }
 
 impl Default for RuntimeAdapterRegistry {
@@ -117,6 +137,7 @@ impl Default for RuntimeAdapterRegistry {
             execution_rollout: ExecutionRolloutPolicy::default(),
             max_tensor_batch_size: 1,
             request_parallelism: 1,
+            loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
         }
     }
 }
@@ -144,6 +165,7 @@ impl RuntimeAdapterRegistry {
             execution_rollout,
             max_tensor_batch_size: max_tensor_batch_size.max(1),
             request_parallelism: request_parallelism.max(1),
+            loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
         };
         registry.register_adapter(TtsCapabilityAdapter);
         registry.register_adapter(StreamingTtsCapabilityAdapter);
@@ -204,28 +226,14 @@ impl RuntimeAdapterRegistry {
         &self,
         backend_kind: BackendKind,
     ) -> HashSet<ModelVariant> {
-        ModelVariant::all()
-            .iter()
-            .copied()
-            .filter(|variant| {
-                self.execution_mode_for(*variant, backend_kind) == ExecutionRolloutMode::Static
-                    && supports_static_tensor_execution(*variant)
-            })
-            .collect()
+        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Static)
     }
 
     pub(crate) fn continuous_tensor_batch_variants(
         &self,
         backend_kind: BackendKind,
     ) -> HashSet<ModelVariant> {
-        ModelVariant::all()
-            .iter()
-            .copied()
-            .filter(|variant| {
-                self.execution_mode_for(*variant, backend_kind) == ExecutionRolloutMode::Continuous
-                    && supports_continuous_tensor_execution(*variant)
-            })
-            .collect()
+        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Continuous)
     }
 
     fn validate_execution_rollout(&self) -> Result<()> {
@@ -236,21 +244,18 @@ impl RuntimeAdapterRegistry {
             for backend_kind in BACKENDS {
                 match self.execution_mode_for(model_variant, backend_kind) {
                     ExecutionRolloutMode::Off => {}
-                    ExecutionRolloutMode::Static
-                        if supports_static_tensor_execution(model_variant) => {}
-                    ExecutionRolloutMode::Static => {
+                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous)
+                        if self.supports_loaded_rollout(model_variant, backend_kind, mode)? => {}
+                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous) => {
+                        let adapter_kind = match mode {
+                            ExecutionRolloutMode::Static => "static tensor",
+                            ExecutionRolloutMode::Continuous => "continuous tensor",
+                            ExecutionRolloutMode::Off => unreachable!("guarded rollout mode"),
+                        };
                         return Err(Error::InvalidInput(format!(
-                            "Model {model_variant} has no static tensor adapter on {}",
+                            "Model {model_variant} has no {adapter_kind} adapter on {}",
                             backend_kind.as_str()
-                        )))
-                    }
-                    ExecutionRolloutMode::Continuous
-                        if supports_continuous_tensor_execution(model_variant) => {}
-                    ExecutionRolloutMode::Continuous => {
-                        return Err(Error::InvalidInput(format!(
-                            "Model {model_variant} has no continuous tensor adapter on {}",
-                            backend_kind.as_str()
-                        )))
+                        )));
                     }
                 }
             }
@@ -271,45 +276,13 @@ impl RuntimeAdapterRegistry {
     }
 }
 
-pub(crate) fn supports_static_tensor_execution(model_variant: ModelVariant) -> bool {
-    model_variant.family() == ModelFamily::Qwen3Tts
-        && model_variant
-            .speech_capabilities()
-            .is_some_and(|capabilities| capabilities.supports_builtin_voices)
-}
-
-pub(crate) fn supports_continuous_tensor_execution(model_variant: ModelVariant) -> bool {
-    matches!(
-        model_variant,
-        ModelVariant::Qwen306B
-            | ModelVariant::Qwen306B4Bit
-            | ModelVariant::Qwen317B
-            | ModelVariant::Qwen317B4Bit
-    )
-}
-
 pub(crate) fn compatibility_execution_profile(
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     streaming_required: bool,
 ) -> ExecutionProfile {
     let variant = metadata.model_variant;
-    let family = variant.family();
-    let sequence = match metadata.capability {
-        CapabilityKind::Chat => {
-            matches!(family, ModelFamily::Qwen35Chat)
-                || matches!(
-                    variant,
-                    ModelVariant::Qwen306B
-                        | ModelVariant::Qwen306B4Bit
-                        | ModelVariant::Qwen317B
-                        | ModelVariant::Qwen317B4Bit
-                )
-        }
-        CapabilityKind::Tts | CapabilityKind::StreamingTts => family == ModelFamily::Qwen3Tts,
-        CapabilityKind::Asr => family == ModelFamily::Qwen3Asr && streaming_required,
-        _ => false,
-    };
+    let sequence = metadata.sequence_execution.enabled(streaming_required);
     let mode = if sequence {
         ExecutionMode::Sequence
     } else {
@@ -388,6 +361,22 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
     }
 }
 
+fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
+    if matches!(model_variant.family(), ModelFamily::Qwen35Chat)
+        || matches!(
+            model_variant,
+            ModelVariant::Qwen306B
+                | ModelVariant::Qwen306B4Bit
+                | ModelVariant::Qwen317B
+                | ModelVariant::Qwen317B4Bit
+        )
+    {
+        SequenceExecutionMode::Always
+    } else {
+        SequenceExecutionMode::None
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TtsCapabilityAdapter;
 
@@ -400,6 +389,11 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             model_variant,
             streaming_mode: tts_streaming_mode(model_variant),
             execution_target: tts_execution_target(model_variant),
+            sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
+                SequenceExecutionMode::Always
+            } else {
+                SequenceExecutionMode::None
+            },
         })
     }
 }
@@ -416,6 +410,11 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: tts_execution_target(model_variant),
+            sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
+                SequenceExecutionMode::Always
+            } else {
+                SequenceExecutionMode::None
+            },
         })
     }
 }
@@ -439,6 +438,11 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     StreamingMode::None
                 },
                 execution_target: asr_execution_target(model_variant),
+                sequence_execution: if model_variant.family() == ModelFamily::Qwen3Asr {
+                    SequenceExecutionMode::StreamingOnly
+                } else {
+                    SequenceExecutionMode::None
+                },
             })
     }
 }
@@ -456,6 +460,7 @@ impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
                 model_variant,
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
+                sequence_execution: SequenceExecutionMode::None,
             })
     }
 }
@@ -471,6 +476,7 @@ impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Realtime,
             execution_target: ExecutionTargetKind::RealtimeRunner,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -486,6 +492,7 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
+            sequence_execution: chat_sequence_execution(model_variant),
         })
     }
 }
@@ -501,6 +508,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -516,6 +524,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -533,6 +542,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
                 model_variant,
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
+                sequence_execution: SequenceExecutionMode::None,
             })
     }
 }
@@ -550,6 +560,7 @@ impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
                 model_variant,
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::BatchRunner,
+                sequence_execution: SequenceExecutionMode::None,
             })
     }
 }
@@ -565,6 +576,7 @@ impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::None,
             execution_target: ExecutionTargetKind::Artifact,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -655,6 +667,39 @@ mod tests {
                 "capability registry mismatch for {variant:?}"
             );
         }
+    }
+
+    #[test]
+    fn capability_metadata_owns_compatibility_sequence_semantics() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let qwen_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
+            .unwrap();
+        let gemma_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
+            .unwrap();
+        let qwen_tts = *registry
+            .require(CapabilityKind::Tts, ModelVariant::Qwen3Tts12Hz06BBase)
+            .unwrap();
+        let qwen_asr = *registry
+            .require(CapabilityKind::Asr, ModelVariant::Qwen3Asr06BGguf)
+            .unwrap();
+
+        assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(qwen_tts.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            qwen_asr.sequence_execution,
+            SequenceExecutionMode::StreamingOnly
+        );
+        assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
+        assert_eq!(
+            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
+            ExecutionMode::Atomic
+        );
+        assert_eq!(
+            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
+            ExecutionMode::Sequence
+        );
     }
 
     #[test]

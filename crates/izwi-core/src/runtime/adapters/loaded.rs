@@ -14,14 +14,13 @@ use crate::model::ModelVariant;
 use crate::runtime::rollout::ExecutionRolloutMode;
 
 use super::{
-    compatibility_execution_profile, supports_continuous_tensor_execution,
-    supports_static_tensor_execution, AdapterMetadata, CapabilityKind, RuntimeAdapterRegistry,
+    compatibility_execution_profile, AdapterMetadata, CapabilityKind, RuntimeAdapterRegistry,
     StreamingMode,
 };
 
-const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(1);
-const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(2);
-const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(3);
+const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(4);
+const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(5);
+const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(6);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,6 +65,109 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn adapter_instance_id(&self) -> AdapterInstanceId;
     fn adapter_abi_revision(&self) -> AdapterAbiRevision;
     fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LoadedAdapterFactoryContext {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    backend_kind: BackendKind,
+    max_tensor_batch_size: usize,
+    request_parallelism: usize,
+}
+
+pub(super) trait LoadedExecutionAdapterFactory: fmt::Debug + Send + Sync {
+    fn id(&self) -> &'static str;
+    fn rollout_mode(&self) -> ExecutionRolloutMode;
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool;
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StaticQwenTtsAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for StaticQwenTtsAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.qwen_tts.tensor_static"
+    }
+
+    fn rollout_mode(&self) -> ExecutionRolloutMode {
+        ExecutionRolloutMode::Static
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        metadata.capability == CapabilityKind::Tts
+            && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+            && metadata
+                .model_variant
+                .speech_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(StaticTtsExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+            context.request_parallelism,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContinuousQwenChatAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.qwen_chat.tensor_continuous"
+    }
+
+    fn rollout_mode(&self) -> ExecutionRolloutMode {
+        ExecutionRolloutMode::Continuous
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        metadata.capability == CapabilityKind::Chat
+            && matches!(
+                metadata.model_variant,
+                ModelVariant::Qwen306B
+                    | ModelVariant::Qwen306B4Bit
+                    | ModelVariant::Qwen317B
+                    | ModelVariant::Qwen317B4Bit
+            )
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(ContinuousChatExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.max_tensor_batch_size,
+            context.request_parallelism,
+        )))
+    }
+}
+
+pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecutionAdapterFactory>> {
+    vec![
+        Arc::new(StaticQwenTtsAdapterFactory),
+        Arc::new(ContinuousQwenChatAdapterFactory),
+    ]
 }
 
 #[derive(Debug)]
@@ -175,7 +277,7 @@ fn compatibility_contract(
 }
 
 #[derive(Debug)]
-struct StaticQwenTtsExecutionAdapter {
+struct StaticTtsExecutionAdapter {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
     adapter_instance_id: AdapterInstanceId,
@@ -185,7 +287,7 @@ struct StaticQwenTtsExecutionAdapter {
     request_parallelism: usize,
 }
 
-impl StaticQwenTtsExecutionAdapter {
+impl StaticTtsExecutionAdapter {
     fn new(
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
@@ -208,7 +310,7 @@ impl StaticQwenTtsExecutionAdapter {
     }
 }
 
-impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
+impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
     fn metadata(&self) -> AdapterMetadata {
         self.metadata
     }
@@ -301,7 +403,7 @@ impl LoadedExecutionAdapter for StaticQwenTtsExecutionAdapter {
 }
 
 #[derive(Debug)]
-struct ContinuousQwenChatExecutionAdapter {
+struct ContinuousChatExecutionAdapter {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
     adapter_instance_id: AdapterInstanceId,
@@ -311,7 +413,7 @@ struct ContinuousQwenChatExecutionAdapter {
     request_parallelism: usize,
 }
 
-impl ContinuousQwenChatExecutionAdapter {
+impl ContinuousChatExecutionAdapter {
     fn new(
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
@@ -334,7 +436,7 @@ impl ContinuousQwenChatExecutionAdapter {
     }
 }
 
-impl LoadedExecutionAdapter for ContinuousQwenChatExecutionAdapter {
+impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
     fn metadata(&self) -> AdapterMetadata {
         self.metadata
     }
@@ -411,6 +513,107 @@ impl LoadedExecutionAdapter for ContinuousQwenChatExecutionAdapter {
     }
 }
 
+impl RuntimeAdapterRegistry {
+    fn loaded_adapter_factory(
+        &self,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+        rollout_mode: ExecutionRolloutMode,
+    ) -> Result<Option<&dyn LoadedExecutionAdapterFactory>> {
+        if rollout_mode == ExecutionRolloutMode::Off {
+            return Ok(None);
+        }
+        let mut matches = self.loaded_adapter_factories.iter().filter(|factory| {
+            factory.rollout_mode() == rollout_mode && factory.supports(metadata, backend_kind)
+        });
+        let Some(selected) = matches.next() else {
+            return Ok(None);
+        };
+        if let Some(ambiguous) = matches.next() {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {} capability {:?} matches both `{}` and `{}` for {rollout_mode:?} rollout",
+                metadata.model_variant,
+                metadata.capability,
+                selected.id(),
+                ambiguous.id(),
+            )));
+        }
+        Ok(Some(selected.as_ref()))
+    }
+
+    pub(super) fn supports_loaded_rollout(
+        &self,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+        rollout_mode: ExecutionRolloutMode,
+    ) -> Result<bool> {
+        if rollout_mode == ExecutionRolloutMode::Off {
+            return Ok(true);
+        }
+        for metadata in self.capabilities_for(model_variant) {
+            if self
+                .loaded_adapter_factory(metadata, backend_kind, rollout_mode)?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn loaded_rollout_variants(
+        &self,
+        backend_kind: BackendKind,
+        rollout_mode: ExecutionRolloutMode,
+    ) -> std::collections::HashSet<ModelVariant> {
+        ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| {
+                self.execution_mode_for(*variant, backend_kind) == rollout_mode
+                    && self
+                        .supports_loaded_rollout(*variant, backend_kind, rollout_mode)
+                        .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn bind_loaded_adapter(
+        &self,
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        let rollout_mode = self.execution_mode_for(metadata.model_variant, backend_kind);
+        let context = LoadedAdapterFactoryContext {
+            execution_group_id,
+            model_instance_id,
+            backend_kind,
+            max_tensor_batch_size: self.max_tensor_batch_size(),
+            request_parallelism: self.request_parallelism(),
+        };
+        let adapter = match self.loaded_adapter_factory(metadata, backend_kind, rollout_mode)? {
+            Some(factory) => factory.create(context, metadata)?,
+            None => Arc::new(CompatibilityExecutionAdapter::new(
+                execution_group_id,
+                model_instance_id,
+                metadata,
+                backend_kind,
+                self.request_parallelism(),
+            )),
+        };
+        if adapter.metadata() != metadata {
+            return Err(Error::ModelLoadError(format!(
+                "loaded adapter factory returned mismatched metadata for {} capability {:?}",
+                metadata.model_variant, metadata.capability
+            )));
+        }
+        adapter.contract(false)?;
+        Ok(adapter)
+    }
+}
+
 pub(crate) struct LoadedModelBundle {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
@@ -449,43 +652,12 @@ impl LoadedModelBundle {
 
         let mut adapters = HashMap::with_capacity(metadata.len());
         for metadata in metadata {
-            let adapter: Arc<dyn LoadedExecutionAdapter> = if metadata.capability
-                == CapabilityKind::Tts
-                && registry.execution_mode_for(model_variant, backend_kind)
-                    == ExecutionRolloutMode::Static
-                && supports_static_tensor_execution(model_variant)
-            {
-                Arc::new(StaticQwenTtsExecutionAdapter::new(
-                    execution_group_id,
-                    model_instance_id,
-                    metadata,
-                    backend_kind,
-                    registry.max_tensor_batch_size(),
-                    registry.request_parallelism(),
-                ))
-            } else if metadata.capability == CapabilityKind::Chat
-                && registry.execution_mode_for(model_variant, backend_kind)
-                    == ExecutionRolloutMode::Continuous
-                && supports_continuous_tensor_execution(model_variant)
-            {
-                Arc::new(ContinuousQwenChatExecutionAdapter::new(
-                    execution_group_id,
-                    model_instance_id,
-                    metadata,
-                    backend_kind,
-                    registry.max_tensor_batch_size(),
-                    registry.request_parallelism(),
-                ))
-            } else {
-                Arc::new(CompatibilityExecutionAdapter::new(
-                    execution_group_id,
-                    model_instance_id,
-                    metadata,
-                    backend_kind,
-                    registry.request_parallelism(),
-                ))
-            };
-            adapter.contract(false)?;
+            let adapter = registry.bind_loaded_adapter(
+                execution_group_id,
+                model_instance_id,
+                metadata,
+                backend_kind,
+            )?;
             if adapters.insert(metadata.capability, adapter).is_some() {
                 return Err(Error::ModelLoadError(format!(
                     "loaded model {model_variant} has duplicate {:?} adapters",
@@ -559,6 +731,42 @@ mod tests {
     use super::*;
     use crate::runtime::adapters::ExecutionTargetKind;
     use crate::runtime::rollout::ExecutionRolloutPolicy;
+
+    #[derive(Debug)]
+    struct TestStaticTtsFactory {
+        id: &'static str,
+        model_variant: ModelVariant,
+    }
+
+    impl LoadedExecutionAdapterFactory for TestStaticTtsFactory {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn rollout_mode(&self) -> ExecutionRolloutMode {
+            ExecutionRolloutMode::Static
+        }
+
+        fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+            metadata.model_variant == self.model_variant
+                && metadata.capability == CapabilityKind::Tts
+        }
+
+        fn create(
+            &self,
+            context: LoadedAdapterFactoryContext,
+            metadata: AdapterMetadata,
+        ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+            Ok(Arc::new(StaticTtsExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
+                context.max_tensor_batch_size,
+                context.request_parallelism,
+            )))
+        }
+    }
 
     #[test]
     fn every_supported_model_capability_binds_to_an_exact_width_one_contract() {
@@ -709,6 +917,70 @@ mod tests {
 
         assert_ne!(first_asr, first_tts);
         assert_ne!(first_asr, second_asr);
+    }
+
+    #[test]
+    fn registering_a_factory_adds_an_optimized_model_without_bundle_branching() {
+        let variant = ModelVariant::Kokoro82M;
+        let rollout = ExecutionRolloutPolicy::try_from_raw(
+            Some("off"),
+            Some(&format!("{variant}@cpu=static")),
+        )
+        .unwrap();
+        let mut registry = RuntimeAdapterRegistry::built_in();
+        registry.execution_rollout = rollout;
+        registry
+            .loaded_adapter_factories
+            .push(Arc::new(TestStaticTtsFactory {
+                id: "test.kokoro.tensor_static",
+                model_variant: variant,
+            }));
+        registry.validate_execution_rollout().unwrap();
+
+        let bundle = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+
+        assert_eq!(contract.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+        assert!(registry
+            .static_tensor_batch_variants(BackendKind::Cpu)
+            .contains(&variant));
+    }
+
+    #[test]
+    fn overlapping_loaded_factories_fail_closed() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let rollout = ExecutionRolloutPolicy::try_from_raw(
+            Some("off"),
+            Some(&format!("{variant}@cpu=static")),
+        )
+        .unwrap();
+        let mut registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 2).unwrap();
+        registry
+            .loaded_adapter_factories
+            .push(Arc::new(TestStaticTtsFactory {
+                id: "test.overlapping.tensor_static",
+                model_variant: variant,
+            }));
+
+        let error = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            variant,
+            BackendKind::Cpu,
+        )
+        .expect_err("ambiguous factories must not depend on registration order");
+
+        assert!(error.to_string().contains("matches both"));
+        assert!(error.to_string().contains("test.overlapping.tensor_static"));
     }
 
     #[test]
