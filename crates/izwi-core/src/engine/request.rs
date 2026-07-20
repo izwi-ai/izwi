@@ -5,7 +5,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -236,6 +236,40 @@ pub(super) struct PreparedStageCost {
     cost: WorkCost,
 }
 
+/// Invisible host-side stream outbox used while one executor transaction is
+/// in flight. Clones intentionally share the same buffer because requests are
+/// wrapped in `Arc` before scheduling.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StreamStagingBuffer {
+    events: Arc<Mutex<Vec<StreamingOutput>>>,
+}
+
+impl StreamStagingBuffer {
+    pub(super) fn clear(&self) -> Result<()> {
+        self.events
+            .lock()
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?
+            .clear();
+        Ok(())
+    }
+
+    pub(super) fn push(&self, output: StreamingOutput) -> Result<()> {
+        self.events
+            .lock()
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?
+            .push(output);
+        Ok(())
+    }
+
+    pub(super) fn take(&self) -> Result<Vec<StreamingOutput>> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+        Ok(std::mem::take(&mut *events))
+    }
+}
+
 impl fmt::Debug for PreparedChatModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -372,6 +406,9 @@ pub struct EngineCoreRequest {
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
     pub(super) prepared_stage_costs: Vec<PreparedStageCost>,
+    /// Executor-produced stream events remain invisible until their exact
+    /// execution report has committed.
+    pub(super) stream_staging: StreamStagingBuffer,
     /// Input text (for TTS)
     pub text: Option<String>,
     /// Chat input messages.
@@ -1590,6 +1627,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1636,6 +1674,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1682,6 +1721,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1725,6 +1765,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: Some(messages),
             chat_config: ChatRequestConfig::default(),
@@ -1769,6 +1810,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1813,6 +1855,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1953,6 +1996,18 @@ impl EngineCoreRequest {
             .iter()
             .find(|prepared| prepared.stage_id == stage_id)
             .map(|prepared| prepared.cost)
+    }
+
+    pub(super) fn begin_stream_staging(&self) -> Result<()> {
+        self.stream_staging.clear()
+    }
+
+    pub(super) fn stream_staging_buffer(&self) -> StreamStagingBuffer {
+        self.stream_staging.clone()
+    }
+
+    pub(super) fn take_staged_stream_outputs(&self) -> Result<Vec<StreamingOutput>> {
+        self.stream_staging.take()
     }
 
     pub fn is_cancelled(&self) -> bool {

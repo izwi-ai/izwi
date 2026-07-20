@@ -315,10 +315,20 @@ impl NativeExecutor {
                     )
                     .with_dispatch(dispatch);
                 };
-                match self.reconcile_scheduled_cache(request, scheduled, &output.output) {
-                    Ok(observed) => ExecutorStepResult::from_session(scheduled, output)
-                        .with_dispatch(dispatch)
-                        .with_observed_resources(observed),
+                let reconciled = self
+                    .reconcile_scheduled_cache(request, scheduled, &output.output)
+                    .and_then(|observed| {
+                        request
+                            .take_staged_stream_outputs()
+                            .map(|staged| (observed, staged))
+                    });
+                match reconciled {
+                    Ok((observed, staged)) => ExecutorStepResult::from_session(
+                        scheduled,
+                        output.with_staged_stream_outputs(staged),
+                    )
+                    .with_dispatch(dispatch)
+                    .with_observed_resources(observed),
                     Err(err) => {
                         let release =
                             ModelExecutor::cleanup_session(self, &scheduled.session_key());

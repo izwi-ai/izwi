@@ -25,6 +25,8 @@ mod state;
 #[path = "executor/streaming.rs"]
 mod streaming;
 
+pub(crate) use streaming::{deliver_committed_streams, CommittedStreamDelivery};
+
 use super::config::EngineCoreConfig;
 use super::execution::{
     BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
@@ -32,6 +34,7 @@ use super::execution::{
     FailureScope, FinishReason, HealthImpact, NativeBatchMode, PhysicalBatch, PlanId, PrefillMode,
     RetryDisposition, SessionKey, YieldReason,
 };
+use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
 use super::resources::{
     BatchWorkspaceLease, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
@@ -332,6 +335,7 @@ pub struct ModelSessionResult {
     pub output: ExecutorOutput,
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
+    pub staged_stream_outputs: Vec<StreamingOutput>,
 }
 
 impl ModelSessionResult {
@@ -357,6 +361,7 @@ impl ModelSessionResult {
             output,
             disposition,
             safe_point: true,
+            staged_stream_outputs: Vec::new(),
         }
     }
 
@@ -365,6 +370,7 @@ impl ModelSessionResult {
             output,
             disposition: ExecutionDisposition::Yielded(reason),
             safe_point: true,
+            staged_stream_outputs: Vec::new(),
         }
     }
 
@@ -374,6 +380,7 @@ impl ModelSessionResult {
             output,
             disposition: ExecutionDisposition::Finished(FinishReason::Cancelled),
             safe_point: true,
+            staged_stream_outputs: Vec::new(),
         }
     }
 
@@ -392,7 +399,13 @@ impl ModelSessionResult {
             output,
             disposition,
             safe_point: true,
+            staged_stream_outputs: Vec::new(),
         }
+    }
+
+    fn with_staged_stream_outputs(mut self, outputs: Vec<StreamingOutput>) -> Self {
+        self.staged_stream_outputs = outputs;
+        self
     }
 }
 
@@ -408,6 +421,7 @@ pub struct ExecutorStepResult {
     /// reported explicitly when a backend/model cannot observe all storage.
     pub observed_resources: ResourceVector,
     pub output: ExecutorOutput,
+    pub staged_stream_outputs: Vec<StreamingOutput>,
 }
 
 impl ExecutorStepResult {
@@ -431,6 +445,7 @@ impl ExecutorStepResult {
             dispatch: BatchDispatch::serial(),
             observed_resources: ResourceVector::zero(),
             output: session_result.output,
+            staged_stream_outputs: session_result.staged_stream_outputs,
         }
     }
 
@@ -1218,6 +1233,9 @@ impl ModelExecutor for NativeExecutor {
         if !self.initialized {
             return Err(Error::InferenceError("Executor not initialized".into()));
         }
+        for request in execution.requests {
+            request.begin_stream_staging()?;
+        }
         if execution.batch.mode == NativeBatchMode::Static {
             if !execution.is_prefill()
                 || execution.batch.lane.capability_id != "tts"
@@ -1547,13 +1565,12 @@ fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::output::StreamingOutput;
     use super::*;
+    use crate::engine::request::StreamStagingBuffer;
     use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
     use crate::model::ModelVariant;
     use base64::Engine;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::mpsc;
 
     #[derive(Debug)]
     struct FixedCapacityProvider {
@@ -2122,14 +2139,14 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_audio_send_is_safe_inside_current_thread_runtime() {
+    fn test_stream_audio_stages_inside_current_thread_runtime() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build runtime");
 
         let result = runtime.block_on(async {
-            let (tx, mut rx) = mpsc::channel(4);
+            let tx = StreamStagingBuffer::default();
             let mut sequence = 0usize;
             NativeExecutor::stream_audio(
                 &tx,
@@ -2139,10 +2156,11 @@ mod tests {
                 24_000,
                 false,
             )?;
-            let chunk = rx
-                .recv()
-                .await
-                .ok_or_else(|| Error::InferenceError("missing streamed chunk".to_string()))?;
+            let chunk = tx
+                .take()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::InferenceError("missing staged chunk".to_string()))?;
             if chunk.request_id != "req-1" || chunk.sequence != 0 || chunk.samples.len() != 2 {
                 return Err(Error::InferenceError(
                     "unexpected streamed chunk payload".to_string(),
@@ -2151,57 +2169,6 @@ mod tests {
             Ok::<(), Error>(())
         });
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_stream_audio_send_returns_error_when_channel_closed() {
-        let (tx, rx) = mpsc::channel::<StreamingOutput>(1);
-        drop(rx);
-
-        let mut sequence = 0usize;
-        let result = NativeExecutor::stream_audio(
-            &tx,
-            "req-closed",
-            &mut sequence,
-            vec![0.2],
-            24_000,
-            false,
-        );
-        let Err(Error::InferenceError(message)) = result else {
-            panic!("expected inference error when streaming channel is closed");
-        };
-        assert!(message.contains("Streaming output channel closed"));
-    }
-
-    #[test]
-    fn test_stream_audio_send_returns_backpressure_error_when_queue_full() {
-        let (tx, _rx) = mpsc::channel::<StreamingOutput>(1);
-
-        let mut first_sequence = 0usize;
-        NativeExecutor::stream_audio(
-            &tx,
-            "req-full",
-            &mut first_sequence,
-            vec![0.1],
-            24_000,
-            false,
-        )
-        .expect("first chunk should fit");
-
-        let mut second_sequence = 1usize;
-        let result = NativeExecutor::stream_audio(
-            &tx,
-            "req-full",
-            &mut second_sequence,
-            vec![0.2],
-            24_000,
-            false,
-        );
-
-        let Err(Error::InferenceError(message)) = result else {
-            panic!("expected inference error when streaming queue is full");
-        };
-        assert!(message.contains("backpressure"));
     }
 
     #[test]

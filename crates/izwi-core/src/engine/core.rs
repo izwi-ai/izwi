@@ -26,7 +26,8 @@ use super::execution_group::{
 #[cfg(test)]
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
-    CacheReleaseReport, ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig,
+    deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
+    ExecutorStepResult, UnifiedExecutor, WorkerConfig,
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
@@ -125,6 +126,12 @@ struct CommittedExecutorOutput {
     session: super::SessionKey,
     output: ExecutorOutput,
     disposition: ExecutionDisposition,
+    staged_stream_outputs: Vec<super::output::StreamingOutput>,
+}
+
+pub(super) struct CommittedEngineStep {
+    pub(super) outputs: Vec<EngineOutput>,
+    pub(super) stream_deliveries: Vec<CommittedStreamDelivery>,
 }
 
 struct PhysicalBatchAssembly {
@@ -645,6 +652,7 @@ impl EngineCore {
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                     message,
                 )),
+                staged_stream_outputs: Vec::new(),
             });
         }
 
@@ -670,6 +678,7 @@ impl EngineCore {
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
+                    staged_stream_outputs: Vec::new(),
                 });
             }
             ExecutionDisposition::Failed(failure)
@@ -694,6 +703,7 @@ impl EngineCore {
                             disposition: ExecutionDisposition::Failed(
                                 ExecutionFailure::invalid_output(message),
                             ),
+                            staged_stream_outputs: Vec::new(),
                         });
                     }
                     self.execution_trackers.remove(&plan.session.request_id);
@@ -719,6 +729,7 @@ impl EngineCore {
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
+                    staged_stream_outputs: Vec::new(),
                 });
             }
             ExecutionDisposition::Progress
@@ -739,6 +750,7 @@ impl EngineCore {
             session: plan.session,
             output: result.output,
             disposition: result.disposition,
+            staged_stream_outputs: result.staged_stream_outputs,
         })
     }
 
@@ -1283,7 +1295,12 @@ impl EngineCore {
             return Ok(Vec::new());
         };
         let executed = ExecutionGroupRunner::execute(prepared).await;
-        self.commit_step(executed).await
+        let committed = self.commit_step(executed).await?;
+        let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
+        for session in failed_streams {
+            self.abort_request_session(&session).await;
+        }
+        Ok(committed.outputs)
     }
 
     /// Prepare an immutable execution transaction under the engine state lock.
@@ -1339,6 +1356,7 @@ impl EngineCore {
                                 disposition: ExecutionDisposition::Failed(
                                     ExecutionFailure::invalid_output(message),
                                 ),
+                                staged_stream_outputs: Vec::new(),
                             });
                     }
                 }
@@ -1354,6 +1372,7 @@ impl EngineCore {
                         disposition: ExecutionDisposition::Failed(
                             ExecutionFailure::invalid_output(message),
                         ),
+                        staged_stream_outputs: Vec::new(),
                     });
             }
             self.clear_exact_execution_state(session);
@@ -1368,6 +1387,7 @@ impl EngineCore {
                     session: request.session_key(),
                     output: ExecutorOutput::terminal(request.request_id.clone()),
                     disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                    staged_stream_outputs: Vec::new(),
                 });
         }
 
@@ -1433,7 +1453,7 @@ impl EngineCore {
     pub(super) async fn commit_step(
         &mut self,
         executed: ExecutedEngineStep,
-    ) -> Result<Vec<EngineOutput>> {
+    ) -> Result<CommittedEngineStep> {
         let ExecutedEngineStep {
             batches,
             decode_ids,
@@ -1467,6 +1487,7 @@ impl EngineCore {
             .sum::<usize>();
         let mut executor_outputs =
             Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
+        let mut stream_deliveries = Vec::new();
         for mut batch in batches {
             if let Err(error) = batch
                 .report
@@ -1487,6 +1508,7 @@ impl EngineCore {
                     result.safe_point = true;
                     result.dispatch = BatchDispatch::serial();
                     result.observed_resources = ResourceVector::zero();
+                    result.staged_stream_outputs.clear();
                 }
             } else {
                 record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
@@ -1516,8 +1538,22 @@ impl EngineCore {
                 session,
                 output: exec_output,
                 disposition,
+                staged_stream_outputs,
             } = committed;
             let request_id = exec_output.request_id.clone();
+
+            if !staged_stream_outputs.is_empty() {
+                if let Some(request) = self.requests.get(&request_id) {
+                    if let Some(tx) = request.streaming_tx.clone() {
+                        stream_deliveries.push(CommittedStreamDelivery::new(
+                            session.clone(),
+                            tx,
+                            request.stream_policy,
+                            staged_stream_outputs,
+                        ));
+                    }
+                }
+            }
 
             // Get timing info
             let generation_time = self
@@ -1630,7 +1666,10 @@ impl EngineCore {
             outputs.push(engine_output);
         }
 
-        Ok(outputs)
+        Ok(CommittedEngineStep {
+            outputs,
+            stream_deliveries,
+        })
     }
 
     /// Confirm that a terminal output has been routed outside the core.
@@ -1745,6 +1784,7 @@ impl EngineCore {
                 session: session.clone(),
                 output: ExecutorOutput::terminal(session.request_id.clone()),
                 disposition: ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                staged_stream_outputs: Vec::new(),
             });
         debug!(
             request_id = %session.request_id,
@@ -3090,6 +3130,7 @@ mod tests {
                     message: "transient backend failure".to_string(),
                 }),
                 safe_point: true,
+                staged_stream_outputs: Vec::new(),
             },
         )
     }

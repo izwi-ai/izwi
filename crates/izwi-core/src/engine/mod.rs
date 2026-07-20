@@ -879,11 +879,23 @@ impl Engine {
             Some(prepared) => Some(execution_group::ExecutionGroupRunner::execute(prepared).await),
             None => None,
         };
-        let mut core = self.core.write().await;
-        let outputs = match executed {
-            Some(executed) => core.commit_step(executed).await?,
-            None => Vec::new(),
+        let (outputs, stream_deliveries) = {
+            let mut core = self.core.write().await;
+            match executed {
+                Some(executed) => {
+                    let committed = core.commit_step(executed).await?;
+                    (committed.outputs, committed.stream_deliveries)
+                }
+                None => (Vec::new(), Vec::new()),
+            }
         };
+        let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
+        if !failed_streams.is_empty() {
+            let mut core = self.core.write().await;
+            for session in failed_streams {
+                core.abort_request_session(&session).await;
+            }
+        }
 
         // Keep every await before terminal dispatch. Once a completion sender
         // is notified, routing and exact-session acknowledgement must finish
@@ -895,6 +907,7 @@ impl Engine {
             metrics.requests_processed += outputs.len() as u64;
         }
 
+        let mut core = self.core.write().await;
         if outputs.iter().any(|output| output.is_finished) {
             for output in &outputs {
                 if output.is_finished {
