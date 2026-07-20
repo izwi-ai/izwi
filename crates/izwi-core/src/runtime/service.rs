@@ -19,7 +19,7 @@ use crate::backends::{
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    engine_batch_metrics_snapshot, engine_stream_backpressure_total, Engine as CoreEngine,
+    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, Engine as CoreEngine,
     EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineTask,
     GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
     StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
@@ -41,7 +41,9 @@ use crate::engine::{
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
     ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO,
     ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL, REQUEST_DEADLINE_EXCEEDED,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
+    REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -94,6 +96,50 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
         });
     }
     Ok(output)
+}
+
+#[derive(Debug, Default)]
+struct StreamOutputOrder {
+    last_sequence: Option<usize>,
+    final_seen: bool,
+}
+
+impl StreamOutputOrder {
+    fn observe(&mut self, request_id: &str, chunk: &StreamingOutput) -> Result<()> {
+        if chunk.request_id != request_id {
+            return Err(Error::InferenceError(format!(
+                "stream output for {request_id} carried request ID {}",
+                chunk.request_id
+            )));
+        }
+        if self.final_seen {
+            return Err(Error::InferenceError(format!(
+                "stream output for {request_id} arrived after its final marker"
+            )));
+        }
+        if self
+            .last_sequence
+            .is_some_and(|last| chunk.sequence <= last)
+        {
+            return Err(Error::InferenceError(format!(
+                "stream output sequence {} for {request_id} was not greater than its predecessor",
+                chunk.sequence
+            )));
+        }
+        self.last_sequence = Some(chunk.sequence);
+        self.final_seen = chunk.is_final;
+        Ok(())
+    }
+
+    fn require_final(&self, request_id: &str) -> Result<()> {
+        if self.final_seen {
+            Ok(())
+        } else {
+            Err(Error::InferenceError(format!(
+                "stream for {request_id} closed without a final marker"
+            )))
+        }
+    }
 }
 
 struct RuntimeCompletionWaiter {
@@ -2284,6 +2330,7 @@ impl RuntimeService {
             }
         };
         tokio::pin!(deadline_wait);
+        let mut stream_order = StreamOutputOrder::default();
 
         loop {
             tokio::select! {
@@ -2292,8 +2339,12 @@ impl RuntimeService {
                         break;
                     };
 
-                    if chunk.request_id != stream_request_id {
-                        continue;
+                    if let Err(err) = stream_order.observe(&stream_request_id, &chunk) {
+                        return Err(self.defer_streaming_failure(
+                            &mut guard,
+                            &observation_request,
+                            err,
+                        ));
                     }
 
                     if let Err(err) = self
@@ -2379,6 +2430,9 @@ impl RuntimeService {
             let err = Error::Timeout(stream_request_id.clone());
             return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
         }
+        if let Err(err) = stream_order.require_final(&stream_request_id) {
+            return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
+        }
         self.record_engine_output_observation(&observation_request, &output, true);
         guard.disarm();
         // Allow pending tasks to progress before returning to upper layers.
@@ -2427,7 +2481,7 @@ impl RuntimeService {
         let queue_depth = self.core_engine.pending_requests().await as u64;
         let running_requests = self.core_engine.running_requests().await as u64;
         let kv_cache = self.core_engine.kv_cache_stats().await;
-        let stream_backpressure_total = engine_stream_backpressure_total();
+        let stream = engine_stream_metrics_snapshot();
         let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
         let kv_cache_misses_total = kv_cache.telemetry.shared_prefix_misses;
         let backend_kind = self.backend_context().backend_kind;
@@ -2469,7 +2523,10 @@ impl RuntimeService {
             kv_cache_evictions_total: kv_cache.telemetry.persistent_prefix_evictions,
             kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
             kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
-            stream_backpressure_total,
+            stream_backpressure_total: stream.backpressure_total,
+            stream_checkpoints_committed_total: stream.checkpoints_committed_total,
+            stream_checkpoint_rejections_total: stream.checkpoint_rejections_total,
+            stream_delivery_failures_total: stream.delivery_failures_total,
             tensor_batches_total: batch.tensor_batches_total,
             tensor_static_batches_total: batch.tensor_static_batches_total,
             tensor_continuous_batches_total: batch.tensor_continuous_batches_total,
@@ -2583,6 +2640,21 @@ impl RuntimeService {
             payload,
             ENGINE_STREAM_BACKPRESSURE_TOTAL,
             snapshot.stream_backpressure_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+            snapshot.stream_checkpoints_committed_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+            snapshot.stream_checkpoint_rejections_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
+            snapshot.stream_delivery_failures_total,
         );
         push_engine_metric(
             payload,
@@ -2871,6 +2943,46 @@ mod tests {
             7,
             std::time::Duration::ZERO,
         )
+    }
+
+    #[test]
+    fn stream_output_order_rejects_wrong_identity_reordering_and_truncation() {
+        let request_id = "ordered-stream";
+        let mut order = StreamOutputOrder::default();
+        let first = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+        order.observe(request_id, &first).unwrap();
+
+        let duplicate = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+        assert!(order
+            .observe(request_id, &duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("not greater"));
+        let wrong_request = StreamingOutput::new("stale".to_string(), 1, vec![0.0], 24_000);
+        assert!(order
+            .observe(request_id, &wrong_request)
+            .unwrap_err()
+            .to_string()
+            .contains("carried request ID"));
+        assert!(order
+            .require_final(request_id)
+            .unwrap_err()
+            .to_string()
+            .contains("without a final marker"));
+
+        // Gaps remain valid for an explicitly lossy DropNewest transport, but
+        // every observed sequence must still advance monotonically.
+        let mut final_output = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
+        final_output.is_final = true;
+        order.observe(request_id, &final_output).unwrap();
+        order.require_final(request_id).unwrap();
+
+        let after_final = StreamingOutput::new(request_id.to_string(), 5, vec![0.0], 24_000);
+        assert!(order
+            .observe(request_id, &after_final)
+            .unwrap_err()
+            .to_string()
+            .contains("after its final marker"));
     }
 
     #[test]
@@ -4084,6 +4196,9 @@ mod tests {
         assert!(payload.contains("allocated logical KV-cache blocks"));
         assert!(payload.contains("Estimated KV-cache bytes"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+        assert!(payload.contains("izwi_engine_stream_checkpoints_committed_total"));
+        assert!(payload.contains("izwi_engine_stream_checkpoint_rejections_total"));
+        assert!(payload.contains("izwi_engine_stream_delivery_failures_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_batches_total"));
         assert!(payload.contains("izwi_engine_executor_request_parallel_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_max_width"));

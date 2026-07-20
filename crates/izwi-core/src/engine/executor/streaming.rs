@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 
-use super::super::metrics::record_engine_stream_backpressure;
+use super::super::metrics::{
+    record_engine_stream_backpressure, record_engine_stream_delivery_failure,
+};
 use super::super::output::{AsrProgress, StreamingOutput};
 use super::super::request::{
     EngineCoreRequest, EngineStreamPolicy, FencedStreamProgress, StreamProgressPermit,
@@ -91,9 +93,13 @@ impl CommittedStreamDelivery {
         for committed in self.outputs {
             let output = committed.output;
             if output.request_id != self.session.request_id {
+                record_engine_stream_delivery_failure();
                 return Err(StreamDeliveryFailureKind::Delivery);
             }
-            send_committed_output(&self.tx, self.policy, output).await?;
+            if let Err(kind) = send_committed_output(&self.tx, self.policy, output).await {
+                record_engine_stream_delivery_failure();
+                return Err(kind);
+            }
         }
         Ok(())
     }

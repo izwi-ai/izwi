@@ -48,6 +48,11 @@ pub const ENGINE_KV_CACHE_CHURN_RATIO: &str = "engine.kv_cache.churn_ratio";
 pub const ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS: &str = "engine.kv_cache.gpu_resident_blocks";
 pub const ENGINE_KV_CACHE_PINNED_BLOCKS: &str = "engine.kv_cache.pinned_blocks";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
+pub const ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL: &str =
+    "engine.stream.checkpoints_committed_total";
+pub const ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL: &str =
+    "engine.stream.checkpoint_rejections_total";
+pub const ENGINE_STREAM_DELIVERY_FAILURES_TOTAL: &str = "engine.stream.delivery_failures_total";
 pub const ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL: &str = "engine.executor.tensor_batches_total";
 pub const ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL: &str =
     "engine.executor.request_parallel_batches_total";
@@ -161,6 +166,18 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         description: "Engine stream backpressure events.",
     },
     EngineMetricDescriptor {
+        name: ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+        description: "Incremental stream checkpoints accepted by exact engine transaction fences.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+        description: "Incremental stream checkpoints rejected by lifecycle or protocol validation.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
+        description: "Committed stream outboxes that could not be delivered to their consumer.",
+    },
+    EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
         description: "Observed model-native tensor batch dispatches.",
     },
@@ -231,6 +248,9 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
 ];
 
 static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_STREAM_CHECKPOINTS_COMMITTED: AtomicU64 = AtomicU64::new(0);
+static ENGINE_STREAM_CHECKPOINT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_STREAM_DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_REQUEST_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_MAX_WIDTH: AtomicU64 = AtomicU64::new(0);
@@ -344,6 +364,14 @@ pub struct EngineWorkspaceDomainMetricsSnapshot {
     pub temporary: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineStreamMetricsSnapshot {
+    pub backpressure_total: u64,
+    pub checkpoints_committed_total: u64,
+    pub checkpoint_rejections_total: u64,
+    pub delivery_failures_total: u64,
+}
+
 impl EngineWorkspaceDomainMetricsSnapshot {
     pub fn labeled_values(self) -> [(&'static str, u64); 4] {
         [
@@ -386,6 +414,27 @@ pub(crate) fn record_engine_stream_backpressure() {
 
 pub fn engine_stream_backpressure_total() -> u64 {
     ENGINE_STREAM_BACKPRESSURE_EVENTS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn record_engine_stream_checkpoint_committed() {
+    ENGINE_STREAM_CHECKPOINTS_COMMITTED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_engine_stream_checkpoint_rejection() {
+    ENGINE_STREAM_CHECKPOINT_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_engine_stream_delivery_failure() {
+    ENGINE_STREAM_DELIVERY_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn engine_stream_metrics_snapshot() -> EngineStreamMetricsSnapshot {
+    EngineStreamMetricsSnapshot {
+        backpressure_total: engine_stream_backpressure_total(),
+        checkpoints_committed_total: ENGINE_STREAM_CHECKPOINTS_COMMITTED.load(Ordering::Relaxed),
+        checkpoint_rejections_total: ENGINE_STREAM_CHECKPOINT_REJECTIONS.load(Ordering::Relaxed),
+        delivery_failures_total: ENGINE_STREAM_DELIVERY_FAILURES.load(Ordering::Relaxed),
+    }
 }
 
 pub(crate) fn record_engine_execution_outcome(provenance: OutcomeProvenance) {
@@ -933,6 +982,9 @@ mod tests {
         assert!(names.contains(ENGINE_KV_CACHE_HITS_TOTAL));
         assert!(names.contains(ENGINE_KV_CACHE_EVICTIONS_TOTAL));
         assert!(names.contains(ENGINE_STREAM_BACKPRESSURE_TOTAL));
+        assert!(names.contains(ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL));
+        assert!(names.contains(ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL));
+        assert!(names.contains(ENGINE_STREAM_DELIVERY_FAILURES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH));
@@ -965,10 +1017,26 @@ mod tests {
     }
 
     #[test]
-    fn engine_stream_backpressure_counter_is_observable() {
-        let before = engine_stream_backpressure_total();
+    fn engine_stream_counters_are_observable() {
+        let before = engine_stream_metrics_snapshot();
         record_engine_stream_backpressure();
-        assert_eq!(engine_stream_backpressure_total(), before + 1);
+        record_engine_stream_checkpoint_committed();
+        record_engine_stream_checkpoint_rejection();
+        record_engine_stream_delivery_failure();
+        let after = engine_stream_metrics_snapshot();
+        assert_eq!(after.backpressure_total, before.backpressure_total + 1);
+        assert_eq!(
+            after.checkpoints_committed_total,
+            before.checkpoints_committed_total + 1
+        );
+        assert_eq!(
+            after.checkpoint_rejections_total,
+            before.checkpoint_rejections_total + 1
+        );
+        assert_eq!(
+            after.delivery_failures_total,
+            before.delivery_failures_total + 1
+        );
     }
 
     #[test]

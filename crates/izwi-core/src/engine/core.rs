@@ -34,7 +34,10 @@ use super::executor::{
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
-use super::metrics::{record_engine_execution_outcome, record_engine_physical_batch};
+use super::metrics::{
+    record_engine_execution_outcome, record_engine_physical_batch,
+    record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
+};
 use super::output::OutputProcessor;
 use super::request::{
     EngineCoreRequest, FencedStreamProgress, RequestStatus, StreamProgressBudget,
@@ -151,6 +154,7 @@ pub(super) struct StreamProgressRejection {
 
 impl StreamProgressRejection {
     fn invalid(message: impl Into<String>) -> Self {
+        record_engine_stream_checkpoint_rejection();
         Self {
             kind: StreamDeliveryFailureKind::InvalidProgress,
             message: message.into(),
@@ -158,6 +162,7 @@ impl StreamProgressRejection {
     }
 
     fn cancelled() -> Self {
+        record_engine_stream_checkpoint_rejection();
         Self {
             kind: StreamDeliveryFailureKind::Cancelled,
             message: "stream progress request was cancelled".to_string(),
@@ -165,6 +170,7 @@ impl StreamProgressRejection {
     }
 
     fn deadline() -> Self {
+        record_engine_stream_checkpoint_rejection();
         Self {
             kind: StreamDeliveryFailureKind::RequestDeadline,
             message: "stream progress request deadline elapsed".to_string(),
@@ -1636,6 +1642,7 @@ impl EngineCore {
             .insert(progress.session.clone(), next);
         self.incremental_stream_sessions
             .insert(progress.session.clone());
+        record_engine_stream_checkpoint_committed();
 
         Ok(CommittedStreamDelivery::from_progress(
             progress.session.clone(),

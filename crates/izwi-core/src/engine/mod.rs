@@ -66,10 +66,11 @@ pub use kv_cache::{
 };
 pub use metrics::{
     engine_batch_metrics_snapshot, engine_metric_catalog, engine_request_parallel_batches_total,
-    engine_stream_backpressure_total, engine_tensor_batch_max_width, engine_tensor_batches_total,
-    prometheus_engine_metric_name, prometheus_engine_metric_type, BenchmarkResult,
-    EngineBatchMetricsSnapshot, EngineDeadlinePhaseMetricsSnapshot,
-    EngineDispatchStateMetricsSnapshot, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
+    engine_stream_backpressure_total, engine_stream_metrics_snapshot,
+    engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
+    prometheus_engine_metric_type, BenchmarkResult, EngineBatchMetricsSnapshot,
+    EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
+    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineStreamMetricsSnapshot,
     EngineWorkspaceDomainMetricsSnapshot, MetricsCollector, MetricsSnapshot,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
@@ -90,7 +91,8 @@ pub use metrics::{
     ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
     ENGINE_SCHEDULER_PREEMPTIONS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
