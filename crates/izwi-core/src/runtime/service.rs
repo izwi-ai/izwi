@@ -50,7 +50,7 @@ use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
     CapabilityKind, ExecutionTargetKind, LoadedExecutionContract, LoadedModelBundle,
-    RuntimeAdapterRegistry,
+    RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
@@ -763,6 +763,7 @@ fn bind_request_to_residency(
     request: &mut EngineCoreRequest,
     residency_lease: Option<&ModelResidencyLease>,
     loaded_bundle: Option<&LoadedModelBundle>,
+    model_streaming_required: bool,
 ) -> Result<()> {
     let Some(lease) = residency_lease else {
         return Ok(());
@@ -786,9 +787,14 @@ fn bind_request_to_residency(
             "loaded execution bundle does not match authoritative model residency".to_string(),
         ));
     }
-    let binding = bundle.adapter_binding(
+    let streaming = if request.streaming && !model_streaming_required {
+        StreamingRequirements::transport_only()
+    } else {
+        StreamingRequirements::native(model_streaming_required)
+    };
+    let binding = bundle.adapter_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
-        request.streaming,
+        streaming,
     )?;
     request.bind_execution_adapter(binding)?;
     Ok(())
@@ -1989,6 +1995,7 @@ impl RuntimeService {
             &mut request,
             residency_lease.as_ref(),
             loaded_bundle.as_deref(),
+            false,
         )?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
@@ -2209,8 +2216,14 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
-        self.run_streaming_request_after_admission(request, on_chunk, job, Some(residency_lease))
-            .await
+        self.run_streaming_request_after_admission(
+            request,
+            on_chunk,
+            job,
+            Some(residency_lease),
+            broker_streaming_required,
+        )
+        .await
     }
 
     async fn run_streaming_request_with_broker_streaming<F, Fut>(
@@ -2238,8 +2251,14 @@ impl RuntimeService {
             Some(variant) => Some(self.load_model_for_job(&job, variant).await?),
             None => None,
         };
-        self.run_streaming_request_after_admission(request, on_chunk, job, _residency_lease)
-            .await
+        self.run_streaming_request_after_admission(
+            request,
+            on_chunk,
+            job,
+            _residency_lease,
+            broker_streaming_required,
+        )
+        .await
     }
 
     async fn run_streaming_request_after_admission<F, Fut>(
@@ -2248,6 +2267,7 @@ impl RuntimeService {
         mut on_chunk: F,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
+        model_streaming_required: bool,
     ) -> Result<EngineOutput>
     where
         F: FnMut(StreamingOutput) -> Fut,
@@ -2260,6 +2280,7 @@ impl RuntimeService {
             &mut request,
             residency_lease.as_ref(),
             loaded_bundle.as_deref(),
+            model_streaming_required,
         )?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
@@ -3027,19 +3048,50 @@ mod tests {
         let mut request =
             EngineCoreRequest::tts("bind me").with_model_variant(ModelVariant::Kokoro82M);
 
-        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle))
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
             .expect("matching residency");
         assert_eq!(request.model_instance_id(), Some(instance));
         assert!(request.execution_adapter_binding().is_some());
 
         let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
-        assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle)).is_err());
+        assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle), false).is_err());
         assert_eq!(wrong.model_instance_id(), None);
 
         let mut missing_bundle =
             EngineCoreRequest::tts("missing").with_model_variant(ModelVariant::Kokoro82M);
-        assert!(bind_request_to_residency(&mut missing_bundle, Some(&lease), None).is_err());
+        assert!(bind_request_to_residency(&mut missing_bundle, Some(&lease), None, false).is_err());
         assert_eq!(missing_bundle.model_instance_id(), None);
+    }
+
+    #[test]
+    fn residency_binding_separates_transport_from_model_streaming() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(18);
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let lease = residency.acquire_instance_lease(variant, instance);
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+        )
+        .expect("loaded bundle");
+
+        let mut transport = EngineCoreRequest::asr_bytes(vec![1])
+            .with_model_variant(variant)
+            .with_streaming(true);
+        bind_request_to_residency(&mut transport, Some(&lease), Some(&bundle), false)
+            .expect("transport-only ASR binding");
+        assert_eq!(
+            transport.execution_adapter_binding().unwrap().stages[0].output_visibility,
+            crate::engine::OutputVisibility::IncrementalCommitted
+        );
+
+        let mut native = EngineCoreRequest::asr_bytes(vec![1])
+            .with_model_variant(variant)
+            .with_streaming(true);
+        assert!(bind_request_to_residency(&mut native, Some(&lease), Some(&bundle), true).is_err());
     }
 
     #[test]
@@ -3529,6 +3581,7 @@ mod tests {
                 |_| std::future::ready(Ok(())),
                 job,
                 Some(residency_lease),
+                true,
             ),
         )
         .await

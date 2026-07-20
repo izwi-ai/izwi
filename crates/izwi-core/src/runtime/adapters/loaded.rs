@@ -25,19 +25,44 @@ const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Streaming has two independent meanings at the loaded-adapter boundary:
+/// a transport may publish executor progress even when the model itself does
+/// not require a native chunked/realtime decode contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingRequirements {
+    pub(crate) transport_output: bool,
+    pub(crate) model_native: bool,
+}
+
+impl StreamingRequirements {
+    pub(crate) const NONE: Self = Self {
+        transport_output: false,
+        model_native: false,
+    };
+
+    pub(crate) const fn native(required: bool) -> Self {
+        Self {
+            transport_output: required,
+            model_native: required,
+        }
+    }
+
+    pub(crate) const fn transport_only() -> Self {
+        Self {
+            transport_output: true,
+            model_native: false,
+        }
+    }
+}
+
 fn output_visibility_for(
-    metadata: AdapterMetadata,
-    streaming_required: bool,
+    transport_output: bool,
     execution_mode: ExecutionMode,
     batch_mode: NativeBatchMode,
 ) -> OutputVisibility {
     if batch_mode == NativeBatchMode::None
-        && streaming_required
+        && transport_output
         && execution_mode == ExecutionMode::Atomic
-        && matches!(
-            metadata.streaming_mode,
-            StreamingMode::Chunked | StreamingMode::Realtime
-        )
     {
         OutputVisibility::IncrementalCommitted
     } else {
@@ -84,7 +109,7 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn metadata(&self) -> AdapterMetadata;
     fn adapter_instance_id(&self) -> AdapterInstanceId;
     fn adapter_abi_revision(&self) -> AdapterAbiRevision;
-    fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract>;
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,7 +259,7 @@ impl LoadedExecutionAdapter for CompatibilityExecutionAdapter {
         COMPATIBILITY_ADAPTER_ABI
     }
 
-    fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         compatibility_contract(
             self.execution_group_id,
             self.model_instance_id,
@@ -243,7 +268,7 @@ impl LoadedExecutionAdapter for CompatibilityExecutionAdapter {
             self.metadata(),
             self.backend_kind,
             self.request_parallelism,
-            streaming_required,
+            streaming,
         )
     }
 }
@@ -256,9 +281,9 @@ fn compatibility_contract(
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     request_parallelism: usize,
-    streaming_required: bool,
+    streaming: StreamingRequirements,
 ) -> Result<LoadedExecutionContract> {
-    if streaming_required && metadata.streaming_mode == StreamingMode::None {
+    if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
         return Err(Error::InvalidInput(format!(
             "Model {} supports {:?}, but not streaming execution for that capability",
             metadata.model_variant, metadata.capability
@@ -266,7 +291,7 @@ fn compatibility_contract(
     }
 
     let mut execution_profile =
-        compatibility_execution_profile(metadata, backend_kind, streaming_required);
+        compatibility_execution_profile(metadata, backend_kind, streaming.model_native);
     execution_profile.resolved_from_loaded_model = true;
     execution_profile.prefill_batch = NativeBatchMode::None;
     execution_profile.decode_batch = NativeBatchMode::None;
@@ -284,8 +309,7 @@ fn compatibility_contract(
         NativeBatchMode::None,
     );
     stage.output_visibility = output_visibility_for(
-        metadata,
-        streaming_required,
+        streaming.transport_output,
         execution_profile.mode,
         NativeBatchMode::None,
     );
@@ -349,8 +373,8 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
         STATIC_TENSOR_ADAPTER_ABI
     }
 
-    fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
-        if streaming_required {
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        if streaming.model_native {
             return compatibility_contract(
                 self.execution_group_id,
                 self.model_instance_id,
@@ -359,7 +383,7 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
                 self.metadata(),
                 self.backend_kind,
                 self.request_parallelism,
-                true,
+                streaming,
             );
         }
 
@@ -413,6 +437,11 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
         } else {
             crate::engine::StageShapePolicy::Exact
         };
+        compatibility.output_visibility = output_visibility_for(
+            streaming.transport_output,
+            execution_profile.mode,
+            NativeBatchMode::None,
+        );
         stage.validate()?;
         compatibility.validate()?;
 
@@ -475,16 +504,16 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
         CONTINUOUS_TENSOR_ADAPTER_ABI
     }
 
-    fn contract(&self, streaming_required: bool) -> Result<LoadedExecutionContract> {
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let metadata = self.metadata();
-        if streaming_required && metadata.streaming_mode == StreamingMode::None {
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
             return Err(Error::InvalidInput(format!(
                 "Model {} has no streaming chat contract",
                 metadata.model_variant
             )));
         }
         let mut execution_profile =
-            compatibility_execution_profile(metadata, self.backend_kind, streaming_required);
+            compatibility_execution_profile(metadata, self.backend_kind, streaming.model_native);
         execution_profile.prefill_batch = NativeBatchMode::None;
         execution_profile.decode_batch = NativeBatchMode::Continuous;
         execution_profile.concurrency = ConcurrencyClass::Batchable;
@@ -510,8 +539,7 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
             crate::engine::StageShapePolicy::Exact
         };
         prefill.output_visibility = output_visibility_for(
-            metadata,
-            streaming_required,
+            streaming.transport_output,
             execution_profile.mode,
             NativeBatchMode::None,
         );
@@ -641,7 +669,7 @@ impl RuntimeAdapterRegistry {
                 metadata.model_variant, metadata.capability
             )));
         }
-        adapter.contract(false)?;
+        adapter.contract(StreamingRequirements::NONE)?;
         Ok(adapter)
     }
 }
@@ -744,8 +772,18 @@ impl LoadedModelBundle {
         capability: CapabilityKind,
         streaming_required: bool,
     ) -> Result<LoadedExecutionContract> {
-        self.require_adapter(capability)?
-            .contract(streaming_required)
+        self.contract_for_streaming(
+            capability,
+            StreamingRequirements::native(streaming_required),
+        )
+    }
+
+    pub(crate) fn contract_for_streaming(
+        &self,
+        capability: CapabilityKind,
+        streaming: StreamingRequirements,
+    ) -> Result<LoadedExecutionContract> {
+        self.require_adapter(capability)?.contract(streaming)
     }
 
     pub(crate) fn adapter_binding(
@@ -754,6 +792,15 @@ impl LoadedModelBundle {
         streaming_required: bool,
     ) -> Result<ExecutionAdapterBinding> {
         self.contract(capability, streaming_required)?
+            .adapter_binding()
+    }
+
+    pub(crate) fn adapter_binding_for_streaming(
+        &self,
+        capability: CapabilityKind,
+        streaming: StreamingRequirements,
+    ) -> Result<ExecutionAdapterBinding> {
+        self.contract_for_streaming(capability, streaming)?
             .adapter_binding()
     }
 }
@@ -837,6 +884,29 @@ mod tests {
                 assert_eq!(binding.model_variant, variant);
                 assert_eq!(binding.model_instance_id, instance);
                 assert_eq!(binding.capability_id, metadata.capability.as_str());
+
+                let transport = bundle
+                    .contract_for_streaming(
+                        metadata.capability,
+                        StreamingRequirements::transport_only(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("failed transport-only contract for {variant}: {error}")
+                    });
+                assert_eq!(transport.metadata, metadata);
+
+                let native_streaming = bundle.contract(metadata.capability, true);
+                if metadata.streaming_mode == StreamingMode::None {
+                    assert!(
+                        native_streaming.is_err(),
+                        "{variant} {:?} unexpectedly advertised native streaming",
+                        metadata.capability
+                    );
+                } else {
+                    native_streaming.unwrap_or_else(|error| {
+                        panic!("failed native-streaming contract for {variant}: {error}")
+                    });
+                }
             }
         }
     }
@@ -914,6 +984,29 @@ mod tests {
         assert!(contract.execution_profile.resolved_from_loaded_model);
         assert_eq!(
             contract.stages[0].output_visibility,
+            OutputVisibility::IncrementalCommitted
+        );
+    }
+
+    #[test]
+    fn offline_asr_transport_progress_does_not_require_native_streaming() {
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(7),
+            ModelInstanceId::new(1),
+            ModelVariant::ParakeetTdt06BV3,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        assert!(bundle.contract(CapabilityKind::Asr, true).is_err());
+        let transport = bundle
+            .contract_for_streaming(CapabilityKind::Asr, StreamingRequirements::transport_only())
+            .expect("offline ASR must expose atomic executor progress");
+        assert_eq!(transport.metadata.streaming_mode, StreamingMode::None);
+        assert_eq!(transport.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(
+            transport.stages[0].output_visibility,
             OutputVisibility::IncrementalCommitted
         );
     }
