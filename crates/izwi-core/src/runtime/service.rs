@@ -19,28 +19,39 @@ use crate::backends::{
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::EngineConfig;
 use crate::engine::{
-    engine_request_parallel_batches_total, engine_stream_backpressure_total,
-    engine_tensor_batch_max_width, engine_tensor_batches_total, Engine as CoreEngine,
-    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineTask,
-    GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
+    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, Engine as CoreEngine,
+    EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy,
+    EngineTask, GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
     StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
+    ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL, ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-    ENGINE_KV_CACHE_CHURN_RATIO, ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
-    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
+    ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
+    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
+    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
     ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
     ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO,
     ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL, REQUEST_DEADLINE_EXCEEDED,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
+    REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
-use crate::runtime::adapters::CapabilityKind;
-use crate::runtime::adapters::RuntimeAdapterRegistry;
+use crate::runtime::adapters::{
+    CapabilityKind, ExecutionTargetKind, LoadedExecutionContract, LoadedModelBundle,
+    RuntimeAdapterRegistry, StreamingRequirements,
+};
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
@@ -54,10 +65,10 @@ use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::rollout::ExecutionRolloutPolicy;
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_metric, push_engine_metric_f64, EngineKvCacheRuntimeSnapshot,
-    EngineRuntimeTelemetrySnapshot, RuntimeObservationContext, RuntimeStageObservation,
-    RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot,
+    push_engine_labeled_metric, push_engine_metric, push_engine_metric_f64,
+    EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
+    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
+    RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
 };
 use crate::runtime::types::RuntimeRequestContext;
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
@@ -85,6 +96,66 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
         });
     }
     Ok(output)
+}
+
+#[derive(Debug)]
+struct StreamOutputOrder {
+    last_sequence: Option<usize>,
+    final_seen: bool,
+    allow_gaps: bool,
+}
+
+impl StreamOutputOrder {
+    fn new(policy: EngineStreamPolicy) -> Self {
+        Self {
+            last_sequence: None,
+            final_seen: false,
+            allow_gaps: policy == EngineStreamPolicy::DropNewest,
+        }
+    }
+
+    fn observe(&mut self, request_id: &str, chunk: &StreamingOutput) -> Result<()> {
+        if chunk.request_id != request_id {
+            return Err(Error::InferenceError(format!(
+                "stream output for {request_id} carried request ID {}",
+                chunk.request_id
+            )));
+        }
+        if self.final_seen {
+            return Err(Error::InferenceError(format!(
+                "stream output for {request_id} arrived after its final marker"
+            )));
+        }
+        if self
+            .last_sequence
+            .is_some_and(|last| chunk.sequence <= last)
+        {
+            return Err(Error::InferenceError(format!(
+                "stream output sequence {} for {request_id} was not greater than its predecessor",
+                chunk.sequence
+            )));
+        }
+        let expected = self.last_sequence.map_or(0, |last| last.saturating_add(1));
+        if !self.allow_gaps && chunk.sequence != expected {
+            return Err(Error::InferenceError(format!(
+                "stream output sequence {} for {request_id} did not match expected {expected}",
+                chunk.sequence
+            )));
+        }
+        self.last_sequence = Some(chunk.sequence);
+        self.final_seen = chunk.is_final;
+        Ok(())
+    }
+
+    fn require_final(&self, request_id: &str) -> Result<()> {
+        if self.final_seen {
+            Ok(())
+        } else {
+            Err(Error::InferenceError(format!(
+                "stream for {request_id} closed without a final marker"
+            )))
+        }
+    }
 }
 
 struct RuntimeCompletionWaiter {
@@ -660,7 +731,7 @@ pub struct RuntimeService {
     pub(crate) config: EngineConfig,
     pub(crate) backend_router: BackendRouter,
     pub(crate) inference_broker: InferenceBroker,
-    pub(crate) adapter_registry: RuntimeAdapterRegistry,
+    pub(crate) adapter_registry: Arc<RuntimeAdapterRegistry>,
     pub(crate) model_manager: Arc<ModelManager>,
     pub(crate) model_registry: Arc<ModelRegistry>,
     pub(crate) tokenizer: Arc<RwLock<Option<Tokenizer>>>,
@@ -686,6 +757,98 @@ pub(crate) struct AdmittedEngineRequest {
     request: EngineCoreRequest,
     job: JobLease,
     residency_lease: ModelResidencyLease,
+}
+
+fn bind_request_to_residency(
+    request: &mut EngineCoreRequest,
+    residency_lease: Option<&ModelResidencyLease>,
+    loaded_bundle: Option<&LoadedModelBundle>,
+    model_streaming_required: bool,
+) -> Result<()> {
+    let Some(lease) = residency_lease else {
+        return Ok(());
+    };
+    if request.model_variant != Some(lease.variant()) {
+        return Err(Error::InvalidInput(
+            "engine request model does not match its residency lease".to_string(),
+        ));
+    }
+    let Some(model_instance_id) = lease.model_instance_id() else {
+        return Ok(());
+    };
+    let bundle = loaded_bundle.ok_or_else(|| {
+        Error::InferenceError(
+            "authoritative model residency is missing its loaded execution bundle".to_string(),
+        )
+    })?;
+    if bundle.model_variant() != lease.variant() || bundle.model_instance_id() != model_instance_id
+    {
+        return Err(Error::InferenceError(
+            "loaded execution bundle does not match authoritative model residency".to_string(),
+        ));
+    }
+    let streaming = if request.streaming && !model_streaming_required {
+        StreamingRequirements::transport_only()
+    } else {
+        StreamingRequirements::native(model_streaming_required)
+    };
+    let binding = bundle.adapter_binding_for_streaming(
+        CapabilityKind::for_engine_task(request.task_type),
+        streaming,
+    )?;
+    request.bind_execution_adapter(binding)?;
+    Ok(())
+}
+
+fn loaded_contract_for_residency(
+    lease: &ModelResidencyLease,
+    bundle: Option<&LoadedModelBundle>,
+    capability: CapabilityKind,
+    streaming_required: bool,
+    execution_group_id: crate::engine::ExecutionGroupId,
+    backend_kind: BackendKind,
+    expected_target: Option<ExecutionTargetKind>,
+) -> Result<LoadedExecutionContract> {
+    let model_instance_id = lease.model_instance_id().ok_or_else(|| {
+        Error::InferenceError(
+            "model residency lease has no authoritative load generation".to_string(),
+        )
+    })?;
+    let bundle = bundle.ok_or_else(|| {
+        Error::InferenceError(
+            "authoritative model residency is missing its loaded execution bundle".to_string(),
+        )
+    })?;
+    if bundle.model_variant() != lease.variant()
+        || bundle.model_instance_id() != model_instance_id
+        || bundle.execution_group_id() != execution_group_id
+        || bundle.backend_kind() != backend_kind
+    {
+        return Err(Error::InferenceError(
+            "loaded execution bundle does not match authoritative runtime residency".to_string(),
+        ));
+    }
+    let contract = bundle.contract(capability, streaming_required)?;
+    if contract.execution_group_id != execution_group_id
+        || contract.model_instance_id != model_instance_id
+        || contract.metadata.model_variant != lease.variant()
+        || contract.execution_profile.backend != backend_kind
+        || !contract.execution_profile.resolved_from_loaded_model
+    {
+        return Err(Error::InferenceError(
+            "loaded capability contract does not match its runtime execution identity".to_string(),
+        ));
+    }
+    if expected_target.is_some_and(|target| contract.metadata.execution_target != target) {
+        return Err(Error::InvalidInput(format!(
+            "loaded capability {:?} for {} targets {:?}, not {:?}",
+            capability,
+            lease.variant(),
+            contract.metadata.execution_target,
+            expected_target.expect("checked as some")
+        )));
+    }
+    Ok(contract)
 }
 
 struct WaiterRegistrationGuard {
@@ -936,17 +1099,13 @@ impl RuntimeService {
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
         let execution_rollout = ExecutionRolloutPolicy::from_env()?;
-        worker_config.static_tensor_batch_variants = Arc::new(
-            ModelVariant::all()
-                .iter()
-                .copied()
-                .filter(|variant| {
-                    execution_rollout
-                        .mode_for(*variant, selected_backend_kind)
-                        .executes()
-                })
-                .collect(),
-        );
+        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_execution_limits(
+            execution_rollout,
+            worker_config.max_tensor_batch_size,
+            worker_config.request_parallelism,
+        )?);
+        worker_config.static_tensor_batch_variants =
+            Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
         let execution_parallelism = worker_config.request_parallelism;
         let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
@@ -964,6 +1123,7 @@ impl RuntimeService {
         let model_lifecycle = Arc::new(ModelLifecycleController::new(
             config.clone(),
             backend_router.clone(),
+            adapter_registry.clone(),
             model_manager.clone(),
             model_registry.clone(),
             core_engine.clone(),
@@ -977,7 +1137,7 @@ impl RuntimeService {
             config,
             backend_router,
             inference_broker: InferenceBroker::from_env(),
-            adapter_registry: RuntimeAdapterRegistry::built_in(),
+            adapter_registry,
             model_manager,
             model_registry,
             tokenizer,
@@ -1302,17 +1462,11 @@ impl RuntimeService {
                     idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                     continue;
                 }
-                let _execution = match coordinator.acquire_engine_step().await {
-                    Ok(lease) => lease,
-                    Err(err) => {
-                        error!("Inference coordinator closed: {err}");
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                };
-                let step_result = std::panic::AssertUnwindSafe(engine.step_for_dispatch())
-                    .catch_unwind()
-                    .await;
+                let step_result = std::panic::AssertUnwindSafe(
+                    coordinator.run_engine_step(engine.step_for_dispatch()),
+                )
+                .catch_unwind()
+                .await;
                 match step_result {
                     Ok(Ok(outputs)) => {
                         if outputs.is_empty() {
@@ -1340,22 +1494,10 @@ impl RuntimeService {
                         }
                     }
                     Ok(Err(err)) => {
-                        let error_message = match err {
-                            Error::InferenceError(message) => message,
-                            other => other.to_string(),
-                        };
-                        let mut w = waiters.lock().await;
-                        let pending: Vec<_> = w.drain().collect();
-                        drop(w);
-                        let request_ids: Vec<_> =
-                            pending.iter().map(|(id, _)| id.as_str()).collect();
-                        telemetry.record_forced_failures(request_ids).await;
-                        let _ = engine.abort_all_requests().await;
-                        for (_, waiter) in pending {
-                            let _ = waiter
-                                .sender
-                                .send(Err(Error::InferenceError(error_message.clone())));
-                        }
+                        error!(
+                            error = %err,
+                            "Engine step failed before commit; scheduled quanta were rolled back"
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
                     }
                     Err(payload) => {
@@ -1682,7 +1824,7 @@ impl RuntimeService {
         let registry = self.model_registry.clone();
         let (residency_lease, mut request) = self
             .coordinator
-            .run_blocking_stage(&job, move || {
+            .run_host_blocking_stage(&job, move || {
                 let request = build(registry, prepared_input)?;
                 Ok((residency_lease, request))
             })
@@ -1766,6 +1908,32 @@ impl RuntimeService {
         }
     }
 
+    /// Load and pin the exact model generation selected for a non-engine
+    /// capability stage, then resolve its immutable loaded-adapter contract.
+    /// Returning both values makes it impossible for direct runners to execute
+    /// against catalog metadata or a different load generation.
+    pub(crate) async fn load_capability_for_job(
+        &self,
+        job: &JobLease,
+        variant: ModelVariant,
+        capability: CapabilityKind,
+        streaming_required: bool,
+        expected_target: ExecutionTargetKind,
+    ) -> Result<(ModelResidencyLease, LoadedExecutionContract)> {
+        let lease = self.load_model_for_job(job, variant).await?;
+        let bundle = self.model_lifecycle.try_get_ready_bundle(variant);
+        let contract = loaded_contract_for_residency(
+            &lease,
+            bundle.as_deref(),
+            capability,
+            streaming_required,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(expected_target),
+        )?;
+        Ok((lease, contract))
+    }
+
     /// Bound the pre-session Engine admission transaction by the request's
     /// absolute deadline. Cancelling this future before the core write lock is
     /// acquired cannot create a scheduler session; once that lock is acquired,
@@ -1816,10 +1984,19 @@ impl RuntimeService {
 
     async fn run_request_after_admission(
         &self,
-        request: EngineCoreRequest,
+        mut request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
+        let loaded_bundle = residency_lease
+            .as_ref()
+            .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
+        bind_request_to_residency(
+            &mut request,
+            residency_lease.as_ref(),
+            loaded_bundle.as_deref(),
+            false,
+        )?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
                 "engine request does not match its coordinator admission".to_string(),
@@ -2039,8 +2216,14 @@ impl RuntimeService {
         } else {
             self.observe_broker_request_with_transport_streaming(&request)?;
         }
-        self.run_streaming_request_after_admission(request, on_chunk, job, Some(residency_lease))
-            .await
+        self.run_streaming_request_after_admission(
+            request,
+            on_chunk,
+            job,
+            Some(residency_lease),
+            broker_streaming_required,
+        )
+        .await
     }
 
     async fn run_streaming_request_with_broker_streaming<F, Fut>(
@@ -2068,21 +2251,37 @@ impl RuntimeService {
             Some(variant) => Some(self.load_model_for_job(&job, variant).await?),
             None => None,
         };
-        self.run_streaming_request_after_admission(request, on_chunk, job, _residency_lease)
-            .await
+        self.run_streaming_request_after_admission(
+            request,
+            on_chunk,
+            job,
+            _residency_lease,
+            broker_streaming_required,
+        )
+        .await
     }
 
     async fn run_streaming_request_after_admission<F, Fut>(
         &self,
-        request: EngineCoreRequest,
+        mut request: EngineCoreRequest,
         mut on_chunk: F,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
+        model_streaming_required: bool,
     ) -> Result<EngineOutput>
     where
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let loaded_bundle = residency_lease
+            .as_ref()
+            .and_then(|lease| self.model_lifecycle.try_get_ready_bundle(lease.variant()));
+        bind_request_to_residency(
+            &mut request,
+            residency_lease.as_ref(),
+            loaded_bundle.as_deref(),
+            model_streaming_required,
+        )?;
         if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
             return Err(Error::InvalidInput(
                 "streaming engine request does not match its coordinator admission".to_string(),
@@ -2168,6 +2367,7 @@ impl RuntimeService {
             }
         };
         tokio::pin!(deadline_wait);
+        let mut stream_order = StreamOutputOrder::new(observation_request.stream_policy);
 
         loop {
             tokio::select! {
@@ -2176,8 +2376,12 @@ impl RuntimeService {
                         break;
                     };
 
-                    if chunk.request_id != stream_request_id {
-                        continue;
+                    if let Err(err) = stream_order.observe(&stream_request_id, &chunk) {
+                        return Err(self.defer_streaming_failure(
+                            &mut guard,
+                            &observation_request,
+                            err,
+                        ));
                     }
 
                     if let Err(err) = self
@@ -2263,6 +2467,9 @@ impl RuntimeService {
             let err = Error::Timeout(stream_request_id.clone());
             return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
         }
+        if let Err(err) = stream_order.require_final(&stream_request_id) {
+            return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
+        }
         self.record_engine_output_observation(&observation_request, &output, true);
         guard.disarm();
         // Allow pending tasks to progress before returning to upper layers.
@@ -2311,7 +2518,7 @@ impl RuntimeService {
         let queue_depth = self.core_engine.pending_requests().await as u64;
         let running_requests = self.core_engine.running_requests().await as u64;
         let kv_cache = self.core_engine.kv_cache_stats().await;
-        let stream_backpressure_total = engine_stream_backpressure_total();
+        let stream = engine_stream_metrics_snapshot();
         let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
         let kv_cache_misses_total = kv_cache.telemetry.shared_prefix_misses;
         let backend_kind = self.backend_context().backend_kind;
@@ -2344,6 +2551,7 @@ impl RuntimeService {
             last_churn_ratio: kv_cache.telemetry.last_churn_ratio,
         };
 
+        let batch = engine_batch_metrics_snapshot();
         EngineRuntimeTelemetrySnapshot {
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
@@ -2352,10 +2560,28 @@ impl RuntimeService {
             kv_cache_evictions_total: kv_cache.telemetry.persistent_prefix_evictions,
             kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
             kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
-            stream_backpressure_total,
-            tensor_batches_total: engine_tensor_batches_total(),
-            request_parallel_batches_total: engine_request_parallel_batches_total(),
-            tensor_batch_max_width: engine_tensor_batch_max_width(),
+            stream_backpressure_total: stream.backpressure_total,
+            stream_checkpoints_committed_total: stream.checkpoints_committed_total,
+            stream_checkpoint_rejections_total: stream.checkpoint_rejections_total,
+            stream_delivery_failures_total: stream.delivery_failures_total,
+            tensor_batches_total: batch.tensor_batches_total,
+            tensor_static_batches_total: batch.tensor_static_batches_total,
+            tensor_continuous_batches_total: batch.tensor_continuous_batches_total,
+            request_parallel_batches_total: batch.request_parallel_batches_total,
+            physical_batch_rejections_total: batch.physical_batch_rejections_total,
+            tensor_batch_max_width: batch.tensor_batch_max_width,
+            tensor_batch_rows_total: batch.tensor_batch_rows_total,
+            tensor_batch_capacity_rows_total: batch.tensor_batch_capacity_rows_total,
+            tensor_batch_useful_elements_total: batch.tensor_batch_useful_elements_total,
+            tensor_batch_materialized_elements_total: batch
+                .tensor_batch_materialized_elements_total,
+            batch_workspace_bytes_total: batch.batch_workspace_bytes_total,
+            dispatch_states: batch.dispatch_states,
+            failure_origins: batch.failure_origins,
+            deadline_phases: batch.deadline_phases,
+            workspace_domains: batch.workspace_domains,
+            tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
+            tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
             kv_cache: kv_cache_snapshot,
         }
     }
@@ -2454,6 +2680,21 @@ impl RuntimeService {
         );
         push_engine_metric(
             payload,
+            ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+            snapshot.stream_checkpoints_committed_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+            snapshot.stream_checkpoint_rejections_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
+            snapshot.stream_delivery_failures_total,
+        );
+        push_engine_metric(
+            payload,
             ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
             snapshot.tensor_batches_total,
         );
@@ -2466,6 +2707,80 @@ impl RuntimeService {
             payload,
             ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
             snapshot.tensor_batch_max_width,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
+            snapshot.tensor_static_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+            snapshot.tensor_continuous_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+            snapshot.physical_batch_rejections_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL,
+            snapshot.tensor_batch_rows_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL,
+            snapshot.tensor_batch_capacity_rows_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
+            snapshot.tensor_batch_useful_elements_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+            snapshot.tensor_batch_materialized_elements_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+            snapshot.batch_workspace_bytes_total,
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+            "state",
+            &snapshot.dispatch_states.labeled_values(),
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+            "origin",
+            &snapshot.failure_origins.labeled_values(),
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
+            "phase",
+            &snapshot.deadline_phases.labeled_values(),
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
+            "domain",
+            &snapshot.workspace_domains.labeled_values(),
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
+            snapshot.tensor_batch_fill_ratio,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
+            snapshot.tensor_batch_padding_ratio,
         );
     }
 
@@ -2665,6 +2980,169 @@ mod tests {
             7,
             std::time::Duration::ZERO,
         )
+    }
+
+    #[test]
+    fn stream_output_order_rejects_wrong_identity_reordering_and_truncation() {
+        let request_id = "ordered-stream";
+        let mut order = StreamOutputOrder::new(EngineStreamPolicy::FailOnFull);
+        let first = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+        order.observe(request_id, &first).unwrap();
+
+        let duplicate = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
+        assert!(order
+            .observe(request_id, &duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("not greater"));
+        let wrong_request = StreamingOutput::new("stale".to_string(), 1, vec![0.0], 24_000);
+        assert!(order
+            .observe(request_id, &wrong_request)
+            .unwrap_err()
+            .to_string()
+            .contains("carried request ID"));
+        assert!(order
+            .require_final(request_id)
+            .unwrap_err()
+            .to_string()
+            .contains("without a final marker"));
+
+        let gap = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
+        assert!(order
+            .observe(request_id, &gap)
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 1"));
+
+        // Gaps remain valid only for an explicitly lossy DropNewest transport,
+        // while every observed sequence must still advance monotonically.
+        let mut order = StreamOutputOrder::new(EngineStreamPolicy::DropNewest);
+        order.observe(request_id, &first).unwrap();
+        let mut final_output = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
+        final_output.is_final = true;
+        order.observe(request_id, &final_output).unwrap();
+        order.require_final(request_id).unwrap();
+
+        let after_final = StreamingOutput::new(request_id.to_string(), 5, vec![0.0], 24_000);
+        assert!(order
+            .observe(request_id, &after_final)
+            .unwrap_err()
+            .to_string()
+            .contains("after its final marker"));
+    }
+
+    #[test]
+    fn residency_binding_carries_exact_instance_and_rejects_wrong_variant() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(17);
+        let lease = residency.acquire_instance_lease(ModelVariant::Kokoro82M, instance);
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .expect("loaded bundle");
+        let mut request =
+            EngineCoreRequest::tts("bind me").with_model_variant(ModelVariant::Kokoro82M);
+
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
+            .expect("matching residency");
+        assert_eq!(request.model_instance_id(), Some(instance));
+        assert!(request.execution_adapter_binding().is_some());
+
+        let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
+        assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle), false).is_err());
+        assert_eq!(wrong.model_instance_id(), None);
+
+        let mut missing_bundle =
+            EngineCoreRequest::tts("missing").with_model_variant(ModelVariant::Kokoro82M);
+        assert!(bind_request_to_residency(&mut missing_bundle, Some(&lease), None, false).is_err());
+        assert_eq!(missing_bundle.model_instance_id(), None);
+    }
+
+    #[test]
+    fn residency_binding_separates_transport_from_model_streaming() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(18);
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let lease = residency.acquire_instance_lease(variant, instance);
+        let bundle = LoadedModelBundle::bind(
+            &RuntimeAdapterRegistry::built_in(),
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+        )
+        .expect("loaded bundle");
+
+        let mut transport = EngineCoreRequest::asr_bytes(vec![1])
+            .with_model_variant(variant)
+            .with_streaming(true);
+        bind_request_to_residency(&mut transport, Some(&lease), Some(&bundle), false)
+            .expect("transport-only ASR binding");
+        assert_eq!(
+            transport.execution_adapter_binding().unwrap().stages[0].output_visibility,
+            crate::engine::OutputVisibility::IncrementalCommitted
+        );
+
+        let mut native = EngineCoreRequest::asr_bytes(vec![1])
+            .with_model_variant(variant)
+            .with_streaming(true);
+        assert!(bind_request_to_residency(&mut native, Some(&lease), Some(&bundle), true).is_err());
+    }
+
+    #[test]
+    fn direct_loaded_contract_requires_exact_generation_group_backend_and_target() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(21);
+        let group = crate::engine::ExecutionGroupId::new(8);
+        let lease = residency.acquire_instance_lease(ModelVariant::Kokoro82M, instance);
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            group,
+            instance,
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+
+        let contract = loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            group,
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::DirectModel),
+        )
+        .unwrap();
+        assert_eq!(contract.model_instance_id, instance);
+        assert_eq!(contract.execution_group_id, group);
+
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            group,
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::TokenEngine),
+        )
+        .is_err());
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Tts,
+            false,
+            crate::engine::ExecutionGroupId::new(group.get() + 1),
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::DirectModel),
+        )
+        .is_err());
     }
 
     async fn pending_streaming_guard_fixture(
@@ -3103,6 +3581,7 @@ mod tests {
                 |_| std::future::ready(Ok(())),
                 job,
                 Some(residency_lease),
+                true,
             ),
         )
         .await
@@ -3795,9 +4274,27 @@ mod tests {
         assert!(payload.contains("allocated logical KV-cache blocks"));
         assert!(payload.contains("Estimated KV-cache bytes"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
+        assert!(payload.contains("izwi_engine_stream_checkpoints_committed_total"));
+        assert!(payload.contains("izwi_engine_stream_checkpoint_rejections_total"));
+        assert!(payload.contains("izwi_engine_stream_delivery_failures_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_batches_total"));
         assert!(payload.contains("izwi_engine_executor_request_parallel_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_max_width"));
+        assert!(payload.contains("izwi_engine_executor_tensor_static_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_continuous_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
+        assert!(payload
+            .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));
+        assert!(
+            payload.contains("izwi_engine_executor_failure_origin_rows_total{origin=\"model\"}")
+        );
+        assert!(payload
+            .contains("izwi_engine_executor_deadline_phase_rows_total{phase=\"dispatch_wait\"}"));
+        assert!(payload.contains(
+            "izwi_engine_executor_batch_workspace_domain_bytes_total{domain=\"device\"}"
+        ));
+        assert!(payload.contains("izwi_engine_executor_tensor_batch_fill_ratio"));
+        assert!(payload.contains("izwi_engine_executor_tensor_batch_padding_ratio"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));

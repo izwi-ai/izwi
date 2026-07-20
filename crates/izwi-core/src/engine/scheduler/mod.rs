@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::config::EngineCoreConfig;
-use super::execution::{CacheMode, ExecutionProfile, PrefillMode};
+use super::execution::{CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode};
 use super::kv_cache::{CacheResidency, KVCacheManager};
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{BlockId, Priority, RequestId, SequenceId, TaskType};
@@ -424,6 +424,7 @@ struct RequestMetadata {
 struct RequestCachePolicy {
     mode: Option<CacheMode>,
     prefill: PrefillMode,
+    decode_batch: NativeBatchMode,
     recompute_safe: bool,
     cache_release_safe: bool,
     prefix_reuse_safe: bool,
@@ -434,6 +435,7 @@ impl Default for RequestCachePolicy {
         Self {
             mode: None,
             prefill: PrefillMode::Incremental,
+            decode_batch: NativeBatchMode::None,
             recompute_safe: false,
             cache_release_safe: false,
             prefix_reuse_safe: false,
@@ -585,6 +587,7 @@ impl Scheduler {
         metadata.cache_policy = RequestCachePolicy {
             mode: Some(profile.cache_mode),
             prefill: profile.prefill,
+            decode_batch: profile.decode_batch,
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
             prefix_reuse_safe: profile.prefix_reuse_safe,
@@ -685,6 +688,7 @@ impl Scheduler {
                     r.paused,
                     metadata.workload_class,
                     overdue_ms,
+                    metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
                 ))
             })
             .collect();
@@ -759,6 +763,7 @@ impl Scheduler {
             _paused,
             workload_class,
             overdue_ms,
+            continuous_decode,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -784,6 +789,12 @@ impl Scheduler {
                 overdue_ms,
                 workload_class,
             );
+            if continuous_decode {
+                // Membership can change only between committed model quanta.
+                // Keep each scheduler transaction to one decode token so new
+                // rows may join and finished/cancelled rows may leave promptly.
+                num_tokens = num_tokens.min(1);
+            }
             if num_tokens == 0 {
                 continue;
             }
@@ -3396,6 +3407,56 @@ mod tests {
                 phase: SequencePhase::Prefill,
                 input: InputRange { start: 0, end: 8 },
                 max_output_steps: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn continuous_decode_profiles_schedule_one_token_membership_quanta() {
+        let config = SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: false,
+            enable_preemption: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 16,
+            block_size: 4,
+            ..Default::default()
+        });
+        let request_id = "continuous-decode".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile,));
+
+        let prefill = scheduler.schedule(&mut kv_cache);
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, request.num_prompt_tokens(), 1, Vec::new(), 1.0);
+        let decode = scheduler.schedule(&mut kv_cache);
+
+        assert_eq!(decode.decode_requests.len(), 1);
+        assert_eq!(decode.decode_requests[0].num_tokens, 1);
+        assert_eq!(
+            decode.decode_requests[0].work,
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange {
+                    start: request.num_prompt_tokens(),
+                    end: request.num_prompt_tokens() + 1,
+                },
+                max_output_steps: 1,
             }
         );
     }

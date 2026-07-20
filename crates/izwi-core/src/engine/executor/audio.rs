@@ -4,15 +4,14 @@ use izwi_asr_toolkit::{
 };
 use serde_json::json;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
 
-use super::super::output::{AsrProgress, AsrProgressPhase, StreamingOutput};
-use super::super::request::EngineStreamPolicy;
+use super::super::output::{AsrProgress, AsrProgressPhase};
+use super::super::request::{EngineStreamPolicy, StreamStagingBuffer};
 use super::NativeExecutor;
 
 const DEFAULT_STREAM_SHORT_TARGET_CHUNK_SECS: f32 = 2.4;
@@ -454,7 +453,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan<F>(
         request_id: &str,
-        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
         samples: &[f32],
@@ -487,7 +486,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_details<F>(
         request_id: &str,
-        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
         samples: &[f32],
@@ -514,7 +513,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_context_and_details<F>(
         request_id: &str,
-        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
         samples: &[f32],
@@ -542,7 +541,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_details_and_options<F>(
         request_id: &str,
-        stream_tx: Option<&mpsc::Sender<StreamingOutput>>,
+        stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
         samples: &[f32],
@@ -922,9 +921,9 @@ fn is_boundary_noise_delta(delta: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use izwi_asr_toolkit::AudioChunk;
-    use tokio::sync::mpsc;
 
     use crate::engine::output::AsrProgressPhase;
+    use crate::engine::request::StreamStagingBuffer;
     use crate::engine::EngineStreamPolicy;
 
     use super::{AsrChunkPlannerKind, AsrChunkTranscription, NativeExecutor};
@@ -1209,7 +1208,7 @@ mod tests {
         let sr = 16_000u32;
         let samples = Vec::<f32>::new();
         let chunk_plan = Vec::<AudioChunk>::new();
-        let (tx, mut rx) = mpsc::channel(8);
+        let tx = StreamStagingBuffer::default();
         let mut sequence = 0usize;
         let merged = NativeExecutor::transcribe_with_chunk_plan(
             "req-empty",
@@ -1225,7 +1224,12 @@ mod tests {
         .expect("empty no-speech plan should complete");
 
         assert!(merged.is_empty());
-        let event = rx.try_recv().expect("final marker");
+        let event = tx
+            .take()
+            .expect("staged events")
+            .into_iter()
+            .next()
+            .expect("final marker");
         assert!(event.is_final);
     }
 
@@ -1314,7 +1318,7 @@ mod tests {
                 end_sample: sr as usize * 2,
             },
         ];
-        let (tx, mut rx) = mpsc::channel(16);
+        let tx = StreamStagingBuffer::default();
         let mut chunk_idx = 0usize;
         let mut sequence = 0usize;
 
@@ -1343,7 +1347,7 @@ mod tests {
 
         let mut progress_events = Vec::new();
         let mut final_seen = false;
-        while let Ok(event) = rx.try_recv() {
+        for event in tx.take().expect("staged events") {
             if let Some(progress) = event.asr_progress {
                 progress_events.push(progress);
             }
@@ -1466,7 +1470,7 @@ mod tests {
             },
         ];
 
-        let (tx, mut rx) = mpsc::channel(128);
+        let tx = StreamStagingBuffer::default();
         let mut sequence = 0usize;
         let mut chunk_idx = 0usize;
         let merged = NativeExecutor::transcribe_with_chunk_plan(
@@ -1495,7 +1499,7 @@ mod tests {
 
         let mut streamed = String::new();
         let mut saw_final = false;
-        while let Ok(event) = rx.try_recv() {
+        for event in tx.take().expect("staged events") {
             if event.is_final {
                 saw_final = true;
                 continue;
@@ -1518,7 +1522,7 @@ mod tests {
             end_sample: samples.len(),
         }];
         let long_delta = "word ".repeat(1024);
-        let (tx, mut rx) = mpsc::channel(6);
+        let tx = StreamStagingBuffer::default();
         let mut sequence = 0usize;
 
         let merged = NativeExecutor::transcribe_with_chunk_plan(
@@ -1537,10 +1541,7 @@ mod tests {
         assert_eq!(merged, long_delta.trim());
         assert_eq!(sequence, 6);
 
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
+        let events = tx.take().expect("staged events");
 
         assert_eq!(events.len(), 6);
         assert_eq!(

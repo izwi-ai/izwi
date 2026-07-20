@@ -1,21 +1,30 @@
-//! Runtime capability adapter registry.
-//!
-//! The registry is intentionally metadata-first for now. It gives runtime
-//! orchestration one stable place to ask whether a model can satisfy a
-//! capability before dispatch reaches concrete model-family code.
+//! Runtime capability adapters and loaded-model execution bindings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::backends::BackendKind;
+use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
+use crate::engine::{
+    CacheMode, CancellationGranularity, ExecutionMode, ExecutionProfile, NativeBatchMode,
+    PrefillMode, TaskType,
+};
 use crate::error::{Error, Result};
+use crate::runtime::rollout::{ExecutionRolloutMode, ExecutionRolloutPolicy};
+
+mod loaded;
+
+pub(crate) use loaded::{LoadedExecutionContract, LoadedModelBundle, StreamingRequirements};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilityKind {
     Asr,
+    SpeakerAttributedAsr,
     RealtimeAsr,
     Tts,
     StreamingTts,
@@ -27,6 +36,35 @@ pub(crate) enum CapabilityKind {
     Vad,
     Endpointing,
     Tokenizer,
+}
+
+impl CapabilityKind {
+    pub(crate) const fn for_engine_task(task_type: TaskType) -> Self {
+        match task_type {
+            TaskType::TTS => Self::Tts,
+            TaskType::ASR => Self::Asr,
+            TaskType::Chat => Self::Chat,
+            TaskType::SpeechToSpeech => Self::SpeechToSpeech,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asr => "asr",
+            Self::SpeakerAttributedAsr => "speaker_attributed_asr",
+            Self::RealtimeAsr => "realtime_asr",
+            Self::Tts => "tts",
+            Self::StreamingTts => "streaming_tts",
+            Self::Chat => "chat",
+            Self::AudioChat => "audio_chat",
+            Self::SpeechToSpeech => "speech_to_speech",
+            Self::Diarization => "diarization",
+            Self::ForcedAlignment => "forced_alignment",
+            Self::Vad => "vad",
+            Self::Endpointing => "endpointing",
+            Self::Tokenizer => "tokenizer",
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -51,6 +89,23 @@ pub(crate) enum ExecutionTargetKind {
     Artifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceExecutionMode {
+    None,
+    Always,
+    StreamingOnly,
+}
+
+impl SequenceExecutionMode {
+    const fn enabled(self, streaming_required: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Always => true,
+            Self::StreamingOnly => streaming_required,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdapterMetadata {
@@ -59,23 +114,63 @@ pub(crate) struct AdapterMetadata {
     pub(crate) model_variant: ModelVariant,
     pub(crate) streaming_mode: StreamingMode,
     pub(crate) execution_target: ExecutionTargetKind,
+    pub(crate) sequence_execution: SequenceExecutionMode,
 }
 
 pub(crate) trait ModelCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RuntimeAdapterRegistry {
     adapters: HashMap<(CapabilityKind, ModelVariant), AdapterMetadata>,
+    execution_rollout: ExecutionRolloutPolicy,
+    max_tensor_batch_size: usize,
+    request_parallelism: usize,
+    loaded_adapter_factories: Vec<Arc<dyn loaded::LoadedExecutionAdapterFactory>>,
+}
+
+impl Default for RuntimeAdapterRegistry {
+    fn default() -> Self {
+        Self {
+            adapters: HashMap::new(),
+            execution_rollout: ExecutionRolloutPolicy::default(),
+            max_tensor_batch_size: 1,
+            request_parallelism: 1,
+            loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
+        }
+    }
 }
 
 impl RuntimeAdapterRegistry {
     pub(crate) fn built_in() -> Self {
-        let mut registry = Self::default();
+        Self::built_in_with_rollout(ExecutionRolloutPolicy::default(), 1)
+            .expect("the fail-closed built-in adapter registry must be valid")
+    }
+
+    pub(crate) fn built_in_with_rollout(
+        execution_rollout: ExecutionRolloutPolicy,
+        max_tensor_batch_size: usize,
+    ) -> Result<Self> {
+        Self::built_in_with_execution_limits(execution_rollout, max_tensor_batch_size, 1)
+    }
+
+    pub(crate) fn built_in_with_execution_limits(
+        execution_rollout: ExecutionRolloutPolicy,
+        max_tensor_batch_size: usize,
+        request_parallelism: usize,
+    ) -> Result<Self> {
+        let mut registry = Self {
+            adapters: HashMap::new(),
+            execution_rollout,
+            max_tensor_batch_size: max_tensor_batch_size.max(1),
+            request_parallelism: request_parallelism.max(1),
+            loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
+        };
         registry.register_adapter(TtsCapabilityAdapter);
         registry.register_adapter(StreamingTtsCapabilityAdapter);
         registry.register_adapter(AsrCapabilityAdapter);
+        registry.register_adapter(SpeakerAttributedAsrCapabilityAdapter);
         registry.register_adapter(RealtimeAsrCapabilityAdapter);
         registry.register_adapter(ChatCapabilityAdapter);
         registry.register_adapter(AudioChatCapabilityAdapter);
@@ -83,7 +178,8 @@ impl RuntimeAdapterRegistry {
         registry.register_adapter(DiarizationCapabilityAdapter);
         registry.register_adapter(ForcedAlignmentCapabilityAdapter);
         registry.register_adapter(TokenizerCapabilityAdapter);
-        registry
+        registry.validate_execution_rollout()?;
+        Ok(registry)
     }
 
     pub(crate) fn capabilities_for(&self, model_variant: ModelVariant) -> Vec<AdapterMetadata> {
@@ -110,6 +206,63 @@ impl RuntimeAdapterRegistry {
             })
     }
 
+    pub(crate) fn execution_mode_for(
+        &self,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+    ) -> ExecutionRolloutMode {
+        self.execution_rollout.mode_for(model_variant, backend_kind)
+    }
+
+    pub(crate) fn max_tensor_batch_size(&self) -> usize {
+        self.max_tensor_batch_size
+    }
+
+    pub(crate) fn request_parallelism(&self) -> usize {
+        self.request_parallelism
+    }
+
+    pub(crate) fn static_tensor_batch_variants(
+        &self,
+        backend_kind: BackendKind,
+    ) -> HashSet<ModelVariant> {
+        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Static)
+    }
+
+    pub(crate) fn continuous_tensor_batch_variants(
+        &self,
+        backend_kind: BackendKind,
+    ) -> HashSet<ModelVariant> {
+        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Continuous)
+    }
+
+    fn validate_execution_rollout(&self) -> Result<()> {
+        const BACKENDS: [BackendKind; 3] =
+            [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+
+        for model_variant in ModelVariant::all().iter().copied() {
+            for backend_kind in BACKENDS {
+                match self.execution_mode_for(model_variant, backend_kind) {
+                    ExecutionRolloutMode::Off => {}
+                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous)
+                        if self.supports_loaded_rollout(model_variant, backend_kind, mode)? => {}
+                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous) => {
+                        let adapter_kind = match mode {
+                            ExecutionRolloutMode::Static => "static tensor",
+                            ExecutionRolloutMode::Continuous => "continuous tensor",
+                            ExecutionRolloutMode::Off => unreachable!("guarded rollout mode"),
+                        };
+                        return Err(Error::InvalidInput(format!(
+                            "Model {model_variant} has no {adapter_kind} adapter on {}",
+                            backend_kind.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn register_adapter<A>(&mut self, adapter: A)
     where
         A: ModelCapabilityAdapter,
@@ -121,6 +274,48 @@ impl RuntimeAdapterRegistry {
             }
         }
     }
+}
+
+pub(crate) fn compatibility_execution_profile(
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    streaming_required: bool,
+) -> ExecutionProfile {
+    let variant = metadata.model_variant;
+    let sequence = metadata.sequence_execution.enabled(streaming_required);
+    let mode = if sequence {
+        ExecutionMode::Sequence
+    } else {
+        match metadata.execution_target {
+            ExecutionTargetKind::RealtimeRunner => ExecutionMode::Realtime,
+            ExecutionTargetKind::PipelineRunner => ExecutionMode::Pipeline,
+            ExecutionTargetKind::Artifact => ExecutionMode::Artifact,
+            ExecutionTargetKind::TokenEngine
+            | ExecutionTargetKind::BatchRunner
+            | ExecutionTargetKind::DirectModel => ExecutionMode::Atomic,
+        }
+    };
+    let mut profile = ExecutionProfile::fail_closed(backend_kind, Some(variant), mode);
+    if sequence {
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.cache_mode = CacheMode::OpaqueModelOwned;
+    }
+    if metadata.capability == CapabilityKind::Asr {
+        profile.cancellation = CancellationGranularity::OperationBoundary;
+    }
+    profile.prefill_batch = NativeBatchMode::None;
+    profile.decode_batch = NativeBatchMode::None;
+    profile.max_batch_size = 1;
+    profile.compute_dtype = "loaded_model_default".to_string();
+    profile.kv_dtype = if sequence {
+        "loaded_model_default".to_string()
+    } else {
+        "none".to_string()
+    };
+    profile.cache_namespace =
+        sequence.then(|| format!("{}:{}:opaque", variant, backend_kind.as_str()));
+    profile
 }
 
 fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
@@ -159,10 +354,26 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
 }
 
 fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_audio_chat() || model_variant.is_voxtral() {
+    if model_variant.is_audio_chat() {
         ExecutionTargetKind::DirectModel
     } else {
         ExecutionTargetKind::TokenEngine
+    }
+}
+
+fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
+    if matches!(model_variant.family(), ModelFamily::Qwen35Chat)
+        || matches!(
+            model_variant,
+            ModelVariant::Qwen306B
+                | ModelVariant::Qwen306B4Bit
+                | ModelVariant::Qwen317B
+                | ModelVariant::Qwen317B4Bit
+        )
+    {
+        SequenceExecutionMode::Always
+    } else {
+        SequenceExecutionMode::None
     }
 }
 
@@ -178,6 +389,11 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             model_variant,
             streaming_mode: tts_streaming_mode(model_variant),
             execution_target: tts_execution_target(model_variant),
+            sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
+                SequenceExecutionMode::Always
+            } else {
+                SequenceExecutionMode::None
+            },
         })
     }
 }
@@ -194,6 +410,11 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: tts_execution_target(model_variant),
+            sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
+                SequenceExecutionMode::Always
+            } else {
+                SequenceExecutionMode::None
+            },
         })
     }
 }
@@ -209,6 +430,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 capability: CapabilityKind::Asr,
                 model_variant,
                 streaming_mode: if model_variant.is_audio_chat()
+                    || model_variant.is_voxtral()
                     || model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
                 {
                     StreamingMode::Chunked
@@ -216,6 +438,29 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     StreamingMode::None
                 },
                 execution_target: asr_execution_target(model_variant),
+                sequence_execution: if model_variant.family() == ModelFamily::Qwen3Asr {
+                    SequenceExecutionMode::StreamingOnly
+                } else {
+                    SequenceExecutionMode::None
+                },
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpeakerAttributedAsrCapabilityAdapter;
+
+impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
+    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
+        model_variant
+            .supports_speaker_attributed_asr()
+            .then_some(AdapterMetadata {
+                id: "builtin.speaker_attributed_asr",
+                capability: CapabilityKind::SpeakerAttributedAsr,
+                model_variant,
+                streaming_mode: StreamingMode::None,
+                execution_target: ExecutionTargetKind::PipelineRunner,
+                sequence_execution: SequenceExecutionMode::None,
             })
     }
 }
@@ -231,6 +476,7 @@ impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Realtime,
             execution_target: ExecutionTargetKind::RealtimeRunner,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -246,6 +492,7 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
+            sequence_execution: chat_sequence_execution(model_variant),
         })
     }
 }
@@ -261,6 +508,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -276,6 +524,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -293,6 +542,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
                 model_variant,
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
+                sequence_execution: SequenceExecutionMode::None,
             })
     }
 }
@@ -310,6 +560,7 @@ impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
                 model_variant,
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::BatchRunner,
+                sequence_execution: SequenceExecutionMode::None,
             })
     }
 }
@@ -325,6 +576,7 @@ impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
             model_variant,
             streaming_mode: StreamingMode::None,
             execution_target: ExecutionTargetKind::Artifact,
+            sequence_execution: SequenceExecutionMode::None,
         })
     }
 }
@@ -348,6 +600,9 @@ mod tests {
         }
         if model_variant.is_asr() || model_variant.is_voxtral() || model_variant.is_audio_chat() {
             expected.insert(CapabilityKind::Asr);
+        }
+        if model_variant.supports_speaker_attributed_asr() {
+            expected.insert(CapabilityKind::SpeakerAttributedAsr);
         }
         if model_variant == ModelVariant::Nemotron35AsrStreaming06B {
             expected.insert(CapabilityKind::RealtimeAsr);
@@ -412,6 +667,98 @@ mod tests {
                 "capability registry mismatch for {variant:?}"
             );
         }
+    }
+
+    #[test]
+    fn capability_metadata_owns_compatibility_sequence_semantics() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let qwen_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
+            .unwrap();
+        let gemma_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
+            .unwrap();
+        let qwen_tts = *registry
+            .require(CapabilityKind::Tts, ModelVariant::Qwen3Tts12Hz06BBase)
+            .unwrap();
+        let qwen_asr = *registry
+            .require(CapabilityKind::Asr, ModelVariant::Qwen3Asr06BGguf)
+            .unwrap();
+
+        assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(qwen_tts.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            qwen_asr.sequence_execution,
+            SequenceExecutionMode::StreamingOnly
+        );
+        assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
+        assert_eq!(
+            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
+            ExecutionMode::Atomic
+        );
+        assert_eq!(
+            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
+            ExecutionMode::Sequence
+        );
+    }
+
+    #[test]
+    fn exact_static_rollout_only_publishes_proven_native_variants() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let override_value = format!("{}@metal=static", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+
+        assert_eq!(registry.max_tensor_batch_size(), 4);
+        assert_eq!(
+            registry.static_tensor_batch_variants(BackendKind::Metal),
+            HashSet::from([variant])
+        );
+        assert!(registry
+            .static_tensor_batch_variants(BackendKind::Cpu)
+            .is_empty());
+    }
+
+    #[test]
+    fn rollout_cannot_advertise_a_missing_static_adapter() {
+        let variant = ModelVariant::Qwen306B;
+        let override_value = format!("{}@metal=static", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
+            .expect_err("chat has no static tensor adapter");
+
+        assert!(error.to_string().contains("no static tensor adapter"));
+    }
+
+    #[test]
+    fn exact_continuous_rollout_only_publishes_proven_native_variants() {
+        let variant = ModelVariant::Qwen306B;
+        let override_value = format!("{}@cuda=continuous", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 8).unwrap();
+
+        assert_eq!(
+            registry.continuous_tensor_batch_variants(BackendKind::Cuda),
+            HashSet::from([variant])
+        );
+        assert!(registry
+            .continuous_tensor_batch_variants(BackendKind::Metal)
+            .is_empty());
+    }
+
+    #[test]
+    fn rollout_cannot_advertise_a_missing_continuous_adapter() {
+        let variant = ModelVariant::Qwen3508BGguf;
+        let override_value = format!("{}@metal=continuous", variant);
+        let rollout =
+            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
+        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
+            .expect_err("Qwen3.5 has no continuous tensor adapter");
+
+        assert!(error.to_string().contains("no continuous tensor adapter"));
     }
 
     #[test]
@@ -492,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_exposes_voxtral_only_as_direct_asr_for_now() {
+    fn built_in_registry_routes_voxtral_streaming_through_the_token_engine() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::VoxtralMini4BRealtime2602;
 
@@ -501,14 +848,14 @@ mod tests {
                 .require(CapabilityKind::Asr, variant)
                 .expect("voxtral asr adapter")
                 .execution_target,
-            ExecutionTargetKind::DirectModel
+            ExecutionTargetKind::TokenEngine
         );
         assert_eq!(
             registry
                 .require(CapabilityKind::Asr, variant)
                 .expect("voxtral asr adapter")
                 .streaming_mode,
-            StreamingMode::None
+            StreamingMode::Chunked
         );
         assert!(registry
             .require(CapabilityKind::RealtimeAsr, variant)
@@ -522,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_granite_speech_as_token_engine_asr_without_diarization() {
+    fn built_in_registry_separates_granite_asr_and_speaker_attribution_execution() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::GraniteSpeech412BPlus;
 
@@ -531,6 +878,13 @@ mod tests {
             .expect("granite speech asr adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
+        assert_eq!(
+            registry
+                .require(CapabilityKind::SpeakerAttributedAsr, variant)
+                .expect("granite speaker-attributed ASR adapter")
+                .execution_target,
+            ExecutionTargetKind::PipelineRunner
+        );
         assert!(registry
             .require(CapabilityKind::Diarization, variant)
             .is_err());

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
+use crate::engine::ModelInstanceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ModelResidencyState {
@@ -75,12 +76,17 @@ pub struct ModelResidency {
 #[derive(Debug)]
 pub struct ModelResidencyLease {
     variant: ModelVariant,
+    model_instance_id: Option<ModelInstanceId>,
     lease_counts: Arc<Mutex<HashMap<ModelVariant, usize>>>,
     active: bool,
 }
 
 impl ModelResidencyLease {
-    fn new(variant: ModelVariant, lease_counts: Arc<Mutex<HashMap<ModelVariant, usize>>>) -> Self {
+    fn new(
+        variant: ModelVariant,
+        model_instance_id: Option<ModelInstanceId>,
+        lease_counts: Arc<Mutex<HashMap<ModelVariant, usize>>>,
+    ) -> Self {
         {
             let mut counts = lease_counts
                 .lock()
@@ -90,6 +96,7 @@ impl ModelResidencyLease {
 
         Self {
             variant,
+            model_instance_id,
             lease_counts,
             active: true,
         }
@@ -97,6 +104,13 @@ impl ModelResidencyLease {
 
     pub fn variant(&self) -> ModelVariant {
         self.variant
+    }
+
+    /// Exact authoritative load generation when the lease came from the
+    /// runtime lifecycle controller. Legacy manager-only leases remain
+    /// unscoped and may not participate in physical tensor batching.
+    pub fn model_instance_id(&self) -> Option<ModelInstanceId> {
+        self.model_instance_id
     }
 }
 
@@ -123,7 +137,19 @@ impl Drop for ModelResidencyLease {
 
 impl ModelResidency {
     pub fn acquire_lease(&self, variant: ModelVariant) -> ModelResidencyLease {
-        ModelResidencyLease::new(variant, self.lease_counts.clone())
+        ModelResidencyLease::new(variant, None, self.lease_counts.clone())
+    }
+
+    pub fn acquire_instance_lease(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> ModelResidencyLease {
+        ModelResidencyLease::new(
+            variant,
+            Some(model_instance_id),
+            self.lease_counts.clone(),
+        )
     }
 
     pub fn active_leases(&self, variant: ModelVariant) -> usize {
@@ -216,6 +242,7 @@ mod tests {
 
         let first = residency.acquire_lease(ModelVariant::Kokoro82M);
         assert_eq!(first.variant(), ModelVariant::Kokoro82M);
+        assert_eq!(first.model_instance_id(), None);
         assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 1);
         assert!(residency.has_active_leases(ModelVariant::Kokoro82M));
 
@@ -228,6 +255,18 @@ mod tests {
         drop(first);
         assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 0);
         assert!(!residency.has_active_leases(ModelVariant::Kokoro82M));
+    }
+
+    #[test]
+    fn authoritative_lease_retains_exact_model_instance() {
+        let residency = ModelResidency::default();
+        let instance = ModelInstanceId::new(42);
+
+        let lease = residency.acquire_instance_lease(ModelVariant::Kokoro82M, instance);
+
+        assert_eq!(lease.variant(), ModelVariant::Kokoro82M);
+        assert_eq!(lease.model_instance_id(), Some(instance));
+        assert_eq!(residency.active_leases(ModelVariant::Kokoro82M), 1);
     }
 
     #[tokio::test]

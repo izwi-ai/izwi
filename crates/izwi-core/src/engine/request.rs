@@ -5,14 +5,19 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
+use super::metrics::record_engine_stream_backpressure;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
+use super::{
+    BatchId, BatchLaneKey, OutputVisibility, PlanId, ResourceAmount, ResourceVector, SessionKey,
+    StageId, WorkCost,
+};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -55,6 +60,20 @@ pub enum EngineStreamPolicy {
 impl Default for EngineStreamPolicy {
     fn default() -> Self {
         Self::FailOnFull
+    }
+}
+
+impl EngineStreamPolicy {
+    fn validate(self) -> Result<()> {
+        if let Self::BlockWithDeadline { timeout_ms } = self {
+            if timeout_ms > STREAM_BACKPRESSURE_MAX_TIMEOUT_MS {
+                return Err(Error::InvalidInput(format!(
+                    "stream backpressure timeout {timeout_ms}ms exceeds the {}ms limit",
+                    STREAM_BACKPRESSURE_MAX_TIMEOUT_MS
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -226,6 +245,401 @@ pub(super) struct IncrementalModelExecutionReady {
     model: PreparedIncrementalModel,
 }
 
+/// Exact, host-prepared cost for one loaded adapter stage. Model preparation
+/// may publish shape and transient collation requirements here, but it must not
+/// allocate device tensors before physical-batch admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PreparedStageCost {
+    stage_id: StageId,
+    cost: WorkCost,
+}
+
+pub(super) const STREAM_PROGRESS_QUEUE_CAPACITY: usize = 64;
+pub(super) const STREAM_PROGRESS_MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
+const STREAM_PROGRESS_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const STREAM_BACKPRESSURE_MAX_TIMEOUT_MS: u64 = 60_000;
+
+pub(super) fn checked_stream_backpressure_deadline(timeout_ms: u64) -> Result<Instant> {
+    EngineStreamPolicy::BlockWithDeadline { timeout_ms }.validate()?;
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "stream backpressure timeout {timeout_ms}ms exceeds the supported deadline range"
+        ))
+    })
+}
+const STREAM_STAGED_MAX_EVENTS: usize = 4096;
+
+#[derive(Debug)]
+pub(super) struct StreamProgressBudget {
+    max_bytes: usize,
+    state: Mutex<usize>,
+    available: Condvar,
+}
+
+impl StreamProgressBudget {
+    pub(super) fn new(max_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_bytes: max_bytes.max(1),
+            state: Mutex::new(0),
+            available: Condvar::new(),
+        })
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        policy: EngineStreamPolicy,
+    ) -> Result<Option<StreamProgressPermit>> {
+        if bytes > STREAM_PROGRESS_MAX_EVENT_BYTES || bytes > self.max_bytes {
+            return Err(Error::Overloaded(format!(
+                "stream progress event requires {bytes} bytes, exceeding its bounded budget"
+            )));
+        }
+
+        let mut used = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("stream progress budget mutex poisoned".into()))?;
+        let admits = |used: usize| {
+            used.checked_add(bytes)
+                .is_some_and(|next| next <= self.max_bytes)
+        };
+
+        match policy {
+            EngineStreamPolicy::FailOnFull => {
+                if !admits(*used) {
+                    record_engine_stream_backpressure();
+                    return Err(Error::Overloaded(
+                        "stream progress byte budget is full".to_string(),
+                    ));
+                }
+            }
+            EngineStreamPolicy::DropNewest => {
+                if !admits(*used) {
+                    record_engine_stream_backpressure();
+                    return Ok(None);
+                }
+            }
+            EngineStreamPolicy::BlockWithDeadline { timeout_ms } => {
+                let deadline = checked_stream_backpressure_deadline(timeout_ms)?;
+                while !admits(*used) {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        record_engine_stream_backpressure();
+                        return Err(Error::Overloaded(
+                            "stream progress byte-budget deadline elapsed".to_string(),
+                        ));
+                    }
+                    let wait = deadline.saturating_duration_since(now);
+                    let (next, result) = self.available.wait_timeout(used, wait).map_err(|_| {
+                        Error::InferenceError("stream progress budget mutex poisoned".into())
+                    })?;
+                    used = next;
+                    if result.timed_out() && !admits(*used) {
+                        record_engine_stream_backpressure();
+                        return Err(Error::Overloaded(
+                            "stream progress byte-budget deadline elapsed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        *used = used.checked_add(bytes).ok_or_else(|| {
+            Error::Overloaded("stream progress byte accounting overflowed".to_string())
+        })?;
+        Ok(Some(StreamProgressPermit {
+            budget: self.clone(),
+            bytes,
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct StreamProgressPermit {
+    budget: Arc<StreamProgressBudget>,
+    bytes: usize,
+}
+
+impl Drop for StreamProgressPermit {
+    fn drop(&mut self) {
+        let Ok(mut used) = self.budget.state.lock() else {
+            return;
+        };
+        *used = used.saturating_sub(self.bytes);
+        self.budget.available.notify_all();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct FencedStreamProgress {
+    pub(super) batch_id: BatchId,
+    pub(super) lane: BatchLaneKey,
+    pub(super) plan_id: PlanId,
+    pub(super) session: SessionKey,
+    pub(super) output: StreamingOutput,
+    pub(super) budget_permit: StreamProgressPermit,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalStreamBinding {
+    batch_id: BatchId,
+    lane: BatchLaneKey,
+    plan_id: PlanId,
+    session: SessionKey,
+    progress_tx: mpsc::Sender<FencedStreamProgress>,
+    budget: Arc<StreamProgressBudget>,
+}
+
+impl IncrementalStreamBinding {
+    fn send(
+        &self,
+        output: StreamingOutput,
+        policy: EngineStreamPolicy,
+    ) -> Result<StreamPushOutcome> {
+        let payload_bytes = stream_payload_bytes(&output)?;
+        let Some(budget_permit) = self.budget.reserve(payload_bytes, policy)? else {
+            return Ok(StreamPushOutcome::Dropped);
+        };
+        let mut progress = FencedStreamProgress {
+            batch_id: self.batch_id,
+            lane: self.lane.clone(),
+            plan_id: self.plan_id,
+            session: self.session.clone(),
+            output,
+            budget_permit,
+        };
+
+        match policy {
+            EngineStreamPolicy::FailOnFull => self
+                .progress_tx
+                .try_send(progress)
+                .map(|_| StreamPushOutcome::Accepted)
+                .map_err(stream_progress_send_error),
+            EngineStreamPolicy::DropNewest => match self.progress_tx.try_send(progress) {
+                Ok(()) => Ok(StreamPushOutcome::Accepted),
+                Err(mpsc::error::TrySendError::Closed(progress)) => Err(
+                    stream_progress_send_error(mpsc::error::TrySendError::Closed(progress)),
+                ),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    record_engine_stream_backpressure();
+                    Ok(StreamPushOutcome::Dropped)
+                }
+            },
+            EngineStreamPolicy::BlockWithDeadline { timeout_ms } => {
+                let deadline = checked_stream_backpressure_deadline(timeout_ms)?;
+                loop {
+                    match self.progress_tx.try_send(progress) {
+                        Ok(()) => return Ok(StreamPushOutcome::Accepted),
+                        Err(mpsc::error::TrySendError::Closed(progress)) => {
+                            return Err(stream_progress_send_error(
+                                mpsc::error::TrySendError::Closed(progress),
+                            ));
+                        }
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            progress = returned;
+                            let now = Instant::now();
+                            if now >= deadline {
+                                record_engine_stream_backpressure();
+                                return Err(Error::Overloaded(
+                                    "stream progress queue deadline elapsed".to_string(),
+                                ));
+                            }
+                            std::thread::sleep(
+                                deadline
+                                    .saturating_duration_since(now)
+                                    .min(Duration::from_millis(1)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn stream_progress_send_error(err: mpsc::error::TrySendError<FencedStreamProgress>) -> Error {
+    match err {
+        mpsc::error::TrySendError::Closed(_) => {
+            Error::InferenceError("stream progress channel closed".to_string())
+        }
+        mpsc::error::TrySendError::Full(_) => {
+            record_engine_stream_backpressure();
+            Error::Overloaded("stream progress queue is full".to_string())
+        }
+    }
+}
+
+fn stream_payload_bytes(output: &StreamingOutput) -> Result<usize> {
+    let sample_bytes = output
+        .samples
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::Overloaded("stream sample byte size overflowed".to_string()))?;
+    output
+        .request_id
+        .len()
+        .checked_add(output.text.as_ref().map_or(0, String::len))
+        .and_then(|bytes| bytes.checked_add(sample_bytes))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| Error::Overloaded("stream payload byte size overflowed".to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamPushOutcome {
+    Accepted,
+    Dropped,
+}
+
+#[derive(Debug, Default)]
+struct StreamBufferState {
+    staged: Vec<StreamingOutput>,
+    staged_bytes: usize,
+    binding: Option<IncrementalStreamBinding>,
+}
+
+/// Bounded stream outbox and transaction-scoped progress binding. Clones
+/// intentionally share state because requests are wrapped in `Arc` before
+/// scheduling.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StreamStagingBuffer {
+    state: Arc<Mutex<StreamBufferState>>,
+}
+
+#[derive(Debug)]
+pub(super) struct StreamBindingGuard {
+    buffer: StreamStagingBuffer,
+    plan_id: PlanId,
+    session: SessionKey,
+}
+
+impl StreamStagingBuffer {
+    pub(super) fn clear(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+        state.staged.clear();
+        state.staged_bytes = 0;
+        state.binding = None;
+        Ok(())
+    }
+
+    pub(super) fn bind_quantum(
+        &self,
+        batch_id: BatchId,
+        lane: BatchLaneKey,
+        plan_id: PlanId,
+        session: SessionKey,
+        visibility: OutputVisibility,
+        progress_tx: mpsc::Sender<FencedStreamProgress>,
+        budget: Arc<StreamProgressBudget>,
+    ) -> Result<StreamBindingGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+        if state.binding.is_some() {
+            return Err(Error::InferenceError(
+                "stream progress binding is already active".to_string(),
+            ));
+        }
+        state.staged.clear();
+        state.staged_bytes = 0;
+        if visibility == OutputVisibility::IncrementalCommitted {
+            state.binding = Some(IncrementalStreamBinding {
+                batch_id,
+                lane,
+                plan_id,
+                session: session.clone(),
+                progress_tx,
+                budget,
+            });
+        }
+        Ok(StreamBindingGuard {
+            buffer: self.clone(),
+            plan_id,
+            session,
+        })
+    }
+
+    pub(super) fn push_with_policy(
+        &self,
+        output: StreamingOutput,
+        policy: EngineStreamPolicy,
+    ) -> Result<StreamPushOutcome> {
+        let binding = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+            if output.is_final || state.binding.is_none() {
+                let payload_bytes = stream_payload_bytes(&output)?;
+                let next_bytes =
+                    state
+                        .staged_bytes
+                        .checked_add(payload_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded("stream staging size overflowed".to_string())
+                        })?;
+                if state.staged.len() >= STREAM_STAGED_MAX_EVENTS
+                    || next_bytes > STREAM_PROGRESS_MAX_BUFFERED_BYTES
+                {
+                    record_engine_stream_backpressure();
+                    if policy == EngineStreamPolicy::DropNewest && !output.is_final {
+                        return Ok(StreamPushOutcome::Dropped);
+                    }
+                    return Err(Error::Overloaded(
+                        "stream staging outbox exceeded its bounded capacity".to_string(),
+                    ));
+                }
+                state.staged.push(output);
+                state.staged_bytes = next_bytes;
+                return Ok(StreamPushOutcome::Accepted);
+            }
+            state.binding.clone().expect("binding checked above")
+        };
+        binding.send(output, policy)
+    }
+
+    pub(super) fn take(&self) -> Result<Vec<StreamingOutput>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+        state.staged_bytes = 0;
+        Ok(std::mem::take(&mut state.staged))
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_incremental_binding(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.binding.is_some())
+            .unwrap_or(false)
+    }
+
+    fn clear_binding(&self, plan_id: PlanId, session: &SessionKey) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.plan_id == plan_id && &binding.session == session)
+        {
+            state.binding = None;
+        }
+    }
+}
+
+impl Drop for StreamBindingGuard {
+    fn drop(&mut self) {
+        self.buffer.clear_binding(self.plan_id, &self.session);
+    }
+}
+
 impl fmt::Debug for PreparedChatModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -352,6 +766,19 @@ pub struct EngineCoreRequest {
     pub task_type: TaskType,
     /// Specific model variant to route to.
     pub model_variant: Option<ModelVariant>,
+    /// Exact authoritative load generation. Requests without this lifecycle
+    /// fence remain eligible only for scalar compatibility execution.
+    pub(super) model_instance_id: Option<super::ModelInstanceId>,
+    /// Exact loaded capability adapter selected by the runtime. Direct engine
+    /// callers without a lifecycle bundle remain on compatibility dispatch.
+    pub(super) execution_adapter_binding: Option<super::ExecutionAdapterBinding>,
+    /// Request-specific shape/workspace facts produced by the exact loaded
+    /// model. The engine remains model-neutral and keys these facts by the
+    /// opaque stage identity from the loaded adapter contract.
+    pub(super) prepared_stage_costs: Vec<PreparedStageCost>,
+    /// Executor-produced stream events remain invisible until their exact
+    /// execution report has committed.
+    pub(super) stream_staging: StreamStagingBuffer,
     /// Input text (for TTS)
     pub text: Option<String>,
     /// Chat input messages.
@@ -1188,8 +1615,15 @@ impl EngineCoreRequest {
             }
         }
 
+        let prepared_continuous_cost =
+            Self::continuous_chat_stage_cost(self.execution_adapter_binding.as_ref(), &model)?;
+
         let fingerprint =
             chat_execution_fingerprint(model_variant, messages, &self.chat_config, &prompt_tokens)?;
+        self.prepared_stage_costs.clear();
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         self.prompt_tokens = prompt_tokens;
         self.sync_task_from_fields();
         self.chat_execution_ready = Some(ChatExecutionReady {
@@ -1200,6 +1634,57 @@ impl EngineCoreRequest {
             core_validated: false,
         });
         Ok(())
+    }
+
+    fn continuous_chat_stage_cost(
+        binding: Option<&super::ExecutionAdapterBinding>,
+        model: &PreparedChatModel,
+    ) -> Result<Option<(StageId, WorkCost)>> {
+        let Some(stage) = binding.and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Continuous)
+        }) else {
+            return Ok(None);
+        };
+        let model = match model {
+            PreparedChatModel::Exact(model) => model,
+            #[cfg(test)]
+            PreparedChatModel::ValidationOnly => return Ok(None),
+        };
+        if !model.supports_continuous_decode_batch() {
+            return Err(Error::InvalidInput(
+                "loaded adapter selected continuous decode for an incompatible chat model"
+                    .to_string(),
+            ));
+        }
+        let accelerator_bytes = model.continuous_decode_batch_workspace_per_row_bytes()?;
+        let host_bytes = u64::try_from(
+            std::mem::size_of::<u32>() + 4 * std::mem::size_of::<usize>(),
+        )
+        .map_err(|_| {
+            Error::Overloaded("continuous decode host workspace estimate overflow".to_string())
+        })?;
+        let cost = WorkCost::with_workspace(
+            1,
+            1,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(host_bytes),
+                temporary_bytes: ResourceAmount::Known(accelerator_bytes),
+                ..ResourceVector::zero()
+            },
+        );
+        if !cost
+            .workspace
+            .workspace_bytes()
+            .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+        {
+            return Err(Error::Overloaded(
+                "continuous decode workspace exceeds its loaded adapter budget".to_string(),
+            ));
+        }
+        Ok(Some((stage.id, cost)))
     }
 
     /// Validate the private preparation marker and both legacy/typed payload
@@ -1302,7 +1787,8 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        self.validate_incremental_model_execution_preparation()
+        self.validate_incremental_model_execution_preparation()?;
+        self.validate_prepared_stage_costs()
     }
 
     /// Validate once at the mutable core admission boundary. Requests are
@@ -1391,10 +1877,66 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        self.prepared_stage_costs.clear();
+        let static_stage = self.execution_adapter_binding.as_ref().and_then(|binding| {
+            binding
+                .stages
+                .iter()
+                .find(|stage| stage.batch_mode == super::NativeBatchMode::Static)
+                .cloned()
+        });
+        let model_arc = model.model_arc();
+        let prepared_static_cost = static_stage
+            .filter(|_| {
+                !self.streaming
+                    && !self.has_tts_reference_for_execution()
+                    && self
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty())
+                    && model_variant
+                        .speech_capabilities()
+                        .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+            })
+            .map(|stage| {
+                let speakers = model_arc.available_speakers();
+                let requested = self
+                    .params
+                    .speaker
+                    .as_deref()
+                    .or(self.params.voice.as_deref())
+                    .filter(|speaker| !speaker.trim().is_empty())
+                    .or_else(|| speakers.first().map(|speaker| speaker.as_str()))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "Qwen TTS request {} requires a loaded preset speaker",
+                            self.id
+                        ))
+                    })?;
+                let layout = model_arc.preset_speaker_batch_layout(
+                    self.text.as_deref().unwrap_or_default(),
+                    requested,
+                    self.language.as_deref(),
+                    self.voice_description.as_deref(),
+                )?;
+                let tensor_elements = u64::try_from(layout.prefill_tokens).map_err(|_| {
+                    Error::Overloaded(
+                        "Qwen3-TTS static prefill shape exceeds work accounting".to_string(),
+                    )
+                })?;
+                Ok::<(StageId, WorkCost), Error>((
+                    stage.id,
+                    WorkCost::new(1, tensor_elements, layout.collation_workspace_bytes),
+                ))
+            })
+            .transpose()?;
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::QwenTts(model),
         });
+        if let Some((stage_id, cost)) = prepared_static_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
@@ -1510,6 +2052,10 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::TTS,
             model_variant: None,
+            model_instance_id: None,
+            execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1553,6 +2099,10 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::ASR,
             model_variant: None,
+            model_instance_id: None,
+            execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1596,6 +2146,10 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::ASR,
             model_variant: None,
+            model_instance_id: None,
+            execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1636,6 +2190,10 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::Chat,
             model_variant: None,
+            model_instance_id: None,
+            execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: Some(messages),
             chat_config: ChatRequestConfig::default(),
@@ -1677,6 +2235,10 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
+            model_instance_id: None,
+            execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1718,6 +2280,10 @@ impl EngineCoreRequest {
             }),
             task_type: TaskType::SpeechToSpeech,
             model_variant: None,
+            model_instance_id: None,
+            execution_adapter_binding: None,
+            prepared_stage_costs: Vec::new(),
+            stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
             chat_config: ChatRequestConfig::default(),
@@ -1749,6 +2315,161 @@ impl EngineCoreRequest {
 
     pub(crate) fn set_cancellation_signal(&mut self, signal: Arc<AtomicBool>) {
         self.cancellation = Some(signal);
+    }
+
+    pub(crate) fn bind_model_instance(
+        &mut self,
+        model_instance_id: super::ModelInstanceId,
+    ) -> Result<()> {
+        if self
+            .model_instance_id
+            .is_some_and(|current| current != model_instance_id)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different model instance".to_string(),
+            ));
+        }
+        self.model_instance_id = Some(model_instance_id);
+        Ok(())
+    }
+
+    pub(crate) fn model_instance_id(&self) -> Option<super::ModelInstanceId> {
+        self.model_instance_id
+    }
+
+    pub(crate) fn bind_execution_adapter(
+        &mut self,
+        binding: super::ExecutionAdapterBinding,
+    ) -> Result<()> {
+        binding.validate()?;
+        if self.model_variant != Some(binding.model_variant) {
+            return Err(Error::InvalidInput(
+                "engine request model does not match its execution adapter".to_string(),
+            ));
+        }
+        self.bind_model_instance(binding.model_instance_id)?;
+        if self
+            .execution_adapter_binding
+            .as_ref()
+            .is_some_and(|current| current != &binding)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different execution adapter".to_string(),
+            ));
+        }
+        let prepared_continuous_cost = self
+            .chat_execution_ready
+            .as_ref()
+            .map(|ready| Self::continuous_chat_stage_cost(Some(&binding), &ready.model))
+            .transpose()?
+            .flatten();
+        self.execution_adapter_binding = Some(binding);
+        if let Some((stage_id, cost)) = prepared_continuous_cost {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execution_adapter_binding(&self) -> Option<&super::ExecutionAdapterBinding> {
+        self.execution_adapter_binding.as_ref()
+    }
+
+    fn validate_prepared_stage_costs(&self) -> Result<()> {
+        if self.prepared_stage_costs.is_empty() {
+            return Ok(());
+        }
+        let binding = self.execution_adapter_binding.as_ref().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Request {} carries prepared stage costs without a loaded adapter binding",
+                self.id
+            ))
+        })?;
+        let mut stage_ids = std::collections::HashSet::new();
+        for prepared in &self.prepared_stage_costs {
+            if !stage_ids.insert(prepared.stage_id) {
+                return Err(Error::InvalidInput(format!(
+                    "Request {} carries duplicate prepared costs for one stage",
+                    self.id
+                )));
+            }
+            let stage = binding
+                .stages
+                .iter()
+                .find(|stage| stage.id == prepared.stage_id)
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Request {} prepared an unknown adapter stage",
+                        self.id
+                    ))
+                })?;
+            if stage.batch_mode == super::NativeBatchMode::None
+                || prepared.cost.logical_units == 0
+                || prepared.cost.tensor_elements == 0
+                || !prepared
+                    .cost
+                    .workspace
+                    .workspace_bytes()
+                    .is_ok_and(|bytes| bytes <= stage.max_workspace_bytes)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Request {} carries an invalid prepared tensor-stage cost",
+                    self.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_prepared_stage_cost(
+        &mut self,
+        stage_id: StageId,
+        cost: WorkCost,
+    ) -> Result<()> {
+        self.prepared_stage_costs
+            .retain(|prepared| prepared.stage_id != stage_id);
+        self.prepared_stage_costs
+            .push(PreparedStageCost { stage_id, cost });
+        self.validate_prepared_stage_costs()
+    }
+
+    pub(crate) fn prepared_stage_cost(&self, stage_id: StageId) -> Option<WorkCost> {
+        self.prepared_stage_costs
+            .iter()
+            .find(|prepared| prepared.stage_id == stage_id)
+            .map(|prepared| prepared.cost)
+    }
+
+    pub(super) fn begin_stream_staging(&self) -> Result<()> {
+        self.stream_staging.clear()
+    }
+
+    pub(super) fn bind_stream_quantum(
+        &self,
+        batch_id: BatchId,
+        lane: BatchLaneKey,
+        plan_id: PlanId,
+        session: SessionKey,
+        visibility: OutputVisibility,
+        progress_tx: mpsc::Sender<FencedStreamProgress>,
+        budget: Arc<StreamProgressBudget>,
+    ) -> Result<StreamBindingGuard> {
+        self.stream_staging.bind_quantum(
+            batch_id,
+            lane,
+            plan_id,
+            session,
+            visibility,
+            progress_tx,
+            budget,
+        )
+    }
+
+    pub(super) fn stream_staging_buffer(&self) -> StreamStagingBuffer {
+        self.stream_staging.clone()
+    }
+
+    pub(super) fn take_staged_stream_outputs(&self) -> Result<Vec<StreamingOutput>> {
+        self.stream_staging.take()
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -1949,6 +2670,8 @@ impl RequestProcessor {
                 }
             }
         }
+
+        request.stream_policy.validate()?;
 
         // Validate and clamp parameters
         self.validate_params(
@@ -2218,6 +2941,79 @@ mod tests {
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::ChatRole;
+
+    #[test]
+    fn maximal_stream_backpressure_timeout_fails_without_panicking() {
+        let error = checked_stream_backpressure_deadline(u64::MAX)
+            .expect_err("oversized public timeout must fail closed");
+        assert!(matches!(error, Error::InvalidInput(message) if message.contains("60000ms limit")));
+        assert!(checked_stream_backpressure_deadline(STREAM_BACKPRESSURE_MAX_TIMEOUT_MS).is_ok());
+
+        let mut request = EngineCoreRequest::tts("bounded policy").with_stream_policy(
+            EngineStreamPolicy::BlockWithDeadline {
+                timeout_ms: u64::MAX,
+            },
+        );
+        request.streaming = true;
+        assert!(matches!(
+            RequestProcessor::new(EngineCoreConfig::default()).process(request),
+            Err(Error::InvalidInput(message)) if message.contains("60000ms limit")
+        ));
+    }
+
+    #[test]
+    fn model_instance_binding_is_idempotent_and_fenced() {
+        let mut request = EngineCoreRequest::tts("hello");
+        let first = super::super::ModelInstanceId::new(7);
+        let second = super::super::ModelInstanceId::new(8);
+
+        assert_eq!(request.model_instance_id(), None);
+        request.bind_model_instance(first).expect("initial binding");
+        request.bind_model_instance(first).expect("idempotent binding");
+        assert_eq!(request.model_instance_id(), Some(first));
+        assert!(request.bind_model_instance(second).is_err());
+        assert_eq!(request.model_instance_id(), Some(first));
+    }
+
+    #[test]
+    fn execution_adapter_binding_is_exact_and_idempotent() {
+        let variant = ModelVariant::Kokoro82M;
+        let instance = super::super::ModelInstanceId::new(7);
+        let profile = super::super::ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cpu,
+            Some(variant),
+            super::super::ExecutionMode::Atomic,
+        );
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(0),
+            "tts.compatibility",
+            &profile,
+            super::super::NativeBatchMode::None,
+        );
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(2),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: std::sync::Arc::from([stage]),
+        };
+        let mut request = EngineCoreRequest::tts("hello").with_model_variant(variant);
+
+        request
+            .bind_execution_adapter(binding.clone())
+            .expect("initial binding");
+        request
+            .bind_execution_adapter(binding.clone())
+            .expect("idempotent binding");
+
+        assert_eq!(request.model_instance_id(), Some(instance));
+        assert_eq!(request.execution_adapter_binding(), Some(&binding));
+        let mut mismatched = binding;
+        mismatched.adapter_instance_id = super::super::AdapterInstanceId::new(3);
+        assert!(request.bind_execution_adapter(mismatched).is_err());
+    }
 
     #[test]
     fn test_tts_request() {

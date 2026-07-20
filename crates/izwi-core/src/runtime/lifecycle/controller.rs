@@ -11,9 +11,10 @@ use crate::artifacts::ModelManager;
 use crate::audio::AudioCodec;
 use crate::backends::BackendRouter;
 use crate::config::EngineConfig;
-use crate::engine::{Engine as CoreEngine, ResourceLease, ResourceVector};
+use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
+use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
 use crate::runtime::coordinator::InferenceCoordinator;
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -29,6 +30,8 @@ pub(super) enum ResidentPhase {
 #[derive(Debug)]
 struct ResidentSlot {
     phase: ResidentPhase,
+    model_instance_id: ModelInstanceId,
+    bundle: Option<Arc<LoadedModelBundle>>,
     resource_lease: ResourceLease,
 }
 
@@ -119,6 +122,7 @@ pub(crate) struct LoadLeader {
 pub(crate) struct ModelLifecycleController {
     pub(super) config: EngineConfig,
     pub(super) backend_router: BackendRouter,
+    pub(super) adapter_registry: Arc<RuntimeAdapterRegistry>,
     pub(super) model_manager: Arc<ModelManager>,
     pub(super) model_registry: Arc<ModelRegistry>,
     pub(super) core_engine: Arc<CoreEngine>,
@@ -142,6 +146,7 @@ impl ModelLifecycleController {
     pub(crate) fn new(
         config: EngineConfig,
         backend_router: BackendRouter,
+        adapter_registry: Arc<RuntimeAdapterRegistry>,
         model_manager: Arc<ModelManager>,
         model_registry: Arc<ModelRegistry>,
         core_engine: Arc<CoreEngine>,
@@ -153,6 +158,7 @@ impl ModelLifecycleController {
         Self {
             config,
             backend_router,
+            adapter_registry,
             model_manager,
             model_registry,
             core_engine,
@@ -183,11 +189,32 @@ impl ModelLifecycleController {
         variant: ModelVariant,
     ) -> Option<ModelResidencyLease> {
         let state = self.state();
-        matches!(
-            state.residents.get(&variant).map(|slot| slot.phase),
-            Some(ResidentPhase::Ready)
-        )
-        .then(|| self.model_manager.acquire_residency_lease(variant))
+        let slot = state.residents.get(&variant)?;
+        (slot.phase == ResidentPhase::Ready).then(|| {
+            self.model_manager
+                .acquire_instance_residency_lease(variant, slot.model_instance_id)
+        })
+    }
+
+    pub(super) fn resident_instance_id(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<ModelInstanceId> {
+        self.state()
+            .residents
+            .get(&variant)
+            .map(|slot| slot.model_instance_id)
+    }
+
+    pub(crate) fn try_get_ready_bundle(
+        &self,
+        variant: ModelVariant,
+    ) -> Option<Arc<LoadedModelBundle>> {
+        let state = self.state();
+        let slot = state.residents.get(&variant)?;
+        (slot.phase == ResidentPhase::Ready)
+            .then(|| slot.bundle.clone())
+            .flatten()
     }
 
     pub(super) fn resident_phase(&self, variant: ModelVariant) -> Option<ResidentPhase> {
@@ -204,24 +231,90 @@ impl ModelLifecycleController {
         &self,
         variant: ModelVariant,
         resource_lease: ResourceLease,
-    ) -> Result<()> {
+    ) -> Result<ModelInstanceId> {
         let mut state = self.state();
         if state.residents.contains_key(&variant) {
             return Err(Error::ModelLoadError(format!(
                 "model {variant} already has authoritative residency state"
             )));
         }
+        let generation = if let Some(load) = state.loads.get(&variant) {
+            load.generation
+        } else {
+            // Tests and legacy manager projections can install an authoritative
+            // slot without first joining the detached-load protocol. They
+            // still receive a unique lifecycle instance identity.
+            state.next_generation = state.next_generation.wrapping_add(1).max(1);
+            state.next_generation
+        };
+        let model_instance_id = ModelInstanceId::new(generation);
         state.residents.insert(
             variant,
             ResidentSlot {
                 phase: ResidentPhase::Loading,
+                model_instance_id,
+                bundle: None,
                 resource_lease,
             },
         );
-        Ok(())
+        Ok(model_instance_id)
     }
 
+    #[cfg(test)]
     pub(super) fn mark_slot_ready(&self, variant: ModelVariant) -> Result<()> {
+        let model_instance_id = self.resident_instance_id(variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "model {variant} lost its resource lease before publication"
+            ))
+        })?;
+        if self
+            .state()
+            .residents
+            .get(&variant)
+            .is_some_and(|slot| slot.bundle.is_none())
+        {
+            self.bind_loaded_model_bundle(variant, model_instance_id)?;
+        }
+        self.mark_slot_ready_for_instance(variant, model_instance_id)
+    }
+
+    pub(super) fn bind_loaded_model_bundle(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<Arc<LoadedModelBundle>> {
+        let bundle = Arc::new(LoadedModelBundle::bind(
+            &self.adapter_registry,
+            self.coordinator.execution_group_id(),
+            model_instance_id,
+            variant,
+            self.backend_router.context().backend_kind,
+        )?);
+        let mut state = self.state();
+        let slot = state.residents.get_mut(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "model {variant} lost its resource lease before adapter binding"
+            ))
+        })?;
+        if slot.phase != ResidentPhase::Loading || slot.model_instance_id != model_instance_id {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} changed lifecycle identity before adapter binding"
+            )));
+        }
+        if slot.bundle.is_some() {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} already has a loaded execution bundle"
+            )));
+        }
+        slot.bundle = Some(bundle.clone());
+        Ok(bundle)
+    }
+
+    pub(super) fn mark_slot_ready_for_instance(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<()> {
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
@@ -232,6 +325,21 @@ impl ModelLifecycleController {
             return Err(Error::ModelLoadError(format!(
                 "model {variant} cannot transition from {:?} to ready",
                 slot.phase
+            )));
+        }
+        if slot.model_instance_id != model_instance_id {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} load generation changed before ready publication"
+            )));
+        }
+        let bundle = slot.bundle.as_ref().ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "model {variant} cannot become ready without an execution bundle"
+            ))
+        })?;
+        if bundle.model_instance_id() != model_instance_id || bundle.model_variant() != variant {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} execution bundle does not match its lifecycle slot"
             )));
         }
         slot.phase = ResidentPhase::Ready;

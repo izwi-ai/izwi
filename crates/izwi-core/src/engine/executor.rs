@@ -25,17 +25,24 @@ mod state;
 #[path = "executor/streaming.rs"]
 mod streaming;
 
+pub(crate) use streaming::{
+    deliver_committed_streams, CommittedStreamDelivery, IncrementalStreamDeliveryWorkers,
+    StreamDeliveryFailure, StreamDeliveryFailureKind,
+};
+
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
-    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile, FailureKind,
-    FailureScope, FinishReason, HealthImpact, NativeBatchMode, PlanId, PrefillMode,
-    RetryDisposition, SessionKey, YieldReason,
+    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, DispatchState,
+    ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile,
+    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, NativeBatchMode,
+    OutcomeProvenance, PhysicalBatch, PlanId, PrefillMode, RetryDisposition, SessionKey,
+    YieldReason,
 };
+use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
 use super::resources::{
-    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
-    ResourceVector,
+    BatchWorkspaceLease, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
+    ResourceLease, ResourceVector,
 };
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
@@ -332,13 +339,15 @@ pub struct ModelSessionResult {
     pub output: ExecutorOutput,
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
+    pub provenance: OutcomeProvenance,
+    pub staged_stream_outputs: Vec<StreamingOutput>,
 }
 
 impl ModelSessionResult {
     fn executor_failure(message: String) -> ExecutionDisposition {
         ExecutionDisposition::Failed(ExecutionFailure {
             kind: FailureKind::Executor,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::Never,
             health: HealthImpact::None,
             message,
@@ -353,10 +362,17 @@ impl ModelSessionResult {
         } else {
             ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
         };
+        let provenance = if matches!(disposition, ExecutionDisposition::Failed(_)) {
+            OutcomeProvenance::failure(FailureOrigin::Model, DispatchState::Started)
+        } else {
+            OutcomeProvenance::produced_output()
+        };
         Self {
             output,
             disposition,
             safe_point: true,
+            provenance,
+            staged_stream_outputs: Vec::new(),
         }
     }
 
@@ -365,6 +381,8 @@ impl ModelSessionResult {
             output,
             disposition: ExecutionDisposition::Yielded(reason),
             safe_point: true,
+            provenance: OutcomeProvenance::produced_output(),
+            staged_stream_outputs: Vec::new(),
         }
     }
 
@@ -374,6 +392,19 @@ impl ModelSessionResult {
             output,
             disposition: ExecutionDisposition::Finished(FinishReason::Cancelled),
             safe_point: true,
+            provenance: OutcomeProvenance::started(),
+            staged_stream_outputs: Vec::new(),
+        }
+    }
+
+    pub fn cancelled_before_dispatch(mut output: ExecutorOutput) -> Self {
+        output.finished = true;
+        Self {
+            output,
+            disposition: ExecutionDisposition::Finished(FinishReason::Cancelled),
+            safe_point: true,
+            provenance: OutcomeProvenance::not_started(),
+            staged_stream_outputs: Vec::new(),
         }
     }
 
@@ -388,11 +419,23 @@ impl ModelSessionResult {
             output.finished = true;
             ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message))
         };
+        let provenance = if matches!(disposition, ExecutionDisposition::Failed(_)) {
+            OutcomeProvenance::failure(FailureOrigin::Model, DispatchState::Started)
+        } else {
+            OutcomeProvenance::produced_output()
+        };
         Self {
             output,
             disposition,
             safe_point: true,
+            provenance,
+            staged_stream_outputs: Vec::new(),
         }
+    }
+
+    fn with_staged_stream_outputs(mut self, outputs: Vec<StreamingOutput>) -> Self {
+        self.staged_stream_outputs = outputs;
+        self
     }
 }
 
@@ -404,10 +447,12 @@ pub struct ExecutorStepResult {
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
     pub dispatch: BatchDispatch,
+    pub provenance: OutcomeProvenance,
     /// Physical model-owned cache retained after this safe point. Unknown is
     /// reported explicitly when a backend/model cannot observe all storage.
     pub observed_resources: ResourceVector,
     pub output: ExecutorOutput,
+    pub staged_stream_outputs: Vec<StreamingOutput>,
 }
 
 impl ExecutorStepResult {
@@ -429,13 +474,20 @@ impl ExecutorStepResult {
             disposition: session_result.disposition,
             safe_point: session_result.safe_point,
             dispatch: BatchDispatch::serial(),
+            provenance: session_result.provenance,
             observed_resources: ResourceVector::zero(),
             output: session_result.output,
+            staged_stream_outputs: session_result.staged_stream_outputs,
         }
     }
 
     pub fn with_dispatch(mut self, dispatch: BatchDispatch) -> Self {
         self.dispatch = dispatch;
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: OutcomeProvenance) -> Self {
+        self.provenance = provenance;
         self
     }
 
@@ -446,6 +498,112 @@ impl ExecutorStepResult {
 }
 
 /// Model executor trait - abstracts the model inference backend.
+pub struct PhysicalBatchExecution<'a> {
+    pub batch: &'a PhysicalBatch,
+    pub requests: &'a [&'a EngineCoreRequest],
+    pub scheduled: &'a [ScheduledRequest],
+}
+
+#[derive(Debug)]
+pub struct PhysicalDispatchError {
+    pub error: Error,
+    pub dispatch: BatchDispatch,
+    pub provenance: OutcomeProvenance,
+}
+
+impl PhysicalDispatchError {
+    pub(crate) fn not_started(error: Error, width: usize, origin: FailureOrigin) -> Self {
+        Self {
+            error,
+            dispatch: BatchDispatch::not_dispatched(width),
+            provenance: OutcomeProvenance::failure(origin, DispatchState::NotStarted),
+        }
+    }
+
+    pub(crate) fn started(error: Error, dispatch: BatchDispatch, origin: FailureOrigin) -> Self {
+        Self {
+            error,
+            dispatch,
+            provenance: OutcomeProvenance::failure(origin, DispatchState::Started),
+        }
+    }
+}
+
+pub type PhysicalDispatchResult =
+    std::result::Result<Vec<ExecutorStepResult>, PhysicalDispatchError>;
+
+impl PhysicalBatchExecution<'_> {
+    pub fn expected_dispatch(&self) -> BatchDispatch {
+        self.batch.expected_dispatch()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.batch.validate()?;
+        if self.batch.rows.len() != self.scheduled.len()
+            || self.scheduled.len() != self.requests.len()
+        {
+            return Err(Error::InferenceError(
+                "physical executor inputs do not match the batch width".to_string(),
+            ));
+        }
+
+        let expected = self
+            .batch
+            .rows
+            .iter()
+            .map(|row| ((row.plan_id, row.session.clone()), &row.work))
+            .collect::<HashMap<_, _>>();
+        let mut scheduled_ids = HashSet::with_capacity(self.scheduled.len());
+        for scheduled in self.scheduled {
+            let key = (scheduled.plan_id, scheduled.session_key());
+            let work = expected.get(&key).ok_or_else(|| {
+                Error::InferenceError(
+                    "scheduled work is not present in the physical batch envelope".to_string(),
+                )
+            })?;
+            if **work != scheduled.work {
+                return Err(Error::InferenceError(
+                    "scheduled work differs from the physical batch quantum".to_string(),
+                ));
+            }
+            if !scheduled_ids.insert(scheduled.request_id.as_str()) {
+                return Err(Error::InferenceError(
+                    "physical executor inputs contain a duplicate request".to_string(),
+                ));
+            }
+        }
+
+        let request_ids = self
+            .requests
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<HashSet<_>>();
+        if request_ids.len() != self.requests.len() || request_ids != scheduled_ids {
+            return Err(Error::InferenceError(
+                "physical executor request snapshots do not match scheduled rows".to_string(),
+            ));
+        }
+
+        let is_prefill = self.scheduled[0].is_prefill;
+        if self
+            .scheduled
+            .iter()
+            .any(|scheduled| scheduled.is_prefill != is_prefill)
+        {
+            return Err(Error::InferenceError(
+                "one physical batch cannot mix prefill and decode dispatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_prefill(&self) -> bool {
+        self.scheduled
+            .first()
+            .is_some_and(|scheduled| scheduled.is_prefill)
+    }
+}
+
 pub trait ModelExecutor: Send + Sync {
     /// Effective loaded-model/request/backend execution profile. Executors
     /// that cannot prove their behavior return `None` and therefore remain on
@@ -462,6 +620,42 @@ pub trait ModelExecutor: Send + Sync {
             .unwrap_or_default()
     }
 
+    /// Execute one already-validated physical batch transaction. Native
+    /// tensor adapters override this boundary; compatibility executors retain
+    /// their existing phase methods at width one.
+    fn execute_physical_batch(
+        &self,
+        execution: PhysicalBatchExecution<'_>,
+    ) -> PhysicalDispatchResult {
+        let width = execution.scheduled.len().max(1);
+        execution.validate().map_err(|error| {
+            PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+        })?;
+        let dispatch = execution.expected_dispatch();
+        let result = if execution.is_prefill() {
+            self.execute_prefill(execution.requests, execution.scheduled)
+        } else {
+            self.execute_decode(execution.requests, execution.scheduled)
+        };
+        result
+            .map(|mut outputs| {
+                let actual_dispatch = if !outputs.is_empty()
+                    && outputs
+                        .iter()
+                        .all(|output| output.provenance.dispatch_state == DispatchState::NotStarted)
+                {
+                    BatchDispatch::not_dispatched(width)
+                } else {
+                    dispatch
+                };
+                for output in &mut outputs {
+                    output.dispatch = actual_dispatch;
+                }
+                outputs
+            })
+            .map_err(|error| PhysicalDispatchError::started(error, dispatch, FailureOrigin::Model))
+    }
+
     /// Execute prefill pass for newly admitted or in-progress prefill requests.
     fn execute_prefill(
         &self,
@@ -475,33 +669,6 @@ pub trait ModelExecutor: Send + Sync {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ExecutorStepResult>>;
-
-    /// Execute forward pass for scheduled requests.
-    /// Compatibility helper that executes decode and prefill paths.
-    fn execute(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
-        let mut decode = Vec::new();
-        let mut prefill = Vec::new();
-        for req in scheduled {
-            if req.is_prefill {
-                prefill.push(req.clone());
-            } else {
-                decode.push(req.clone());
-            }
-        }
-
-        let mut outputs = Vec::new();
-        if !decode.is_empty() {
-            outputs.extend(self.execute_decode(requests, &decode)?);
-        }
-        if !prefill.is_empty() {
-            outputs.extend(self.execute_prefill(requests, &prefill)?);
-        }
-        Ok(outputs)
-    }
 
     /// Check if the executor is ready.
     fn is_ready(&self) -> bool;
@@ -973,6 +1140,12 @@ fn static_qwen_tts_batch_eligible(
             .is_some_and(|capabilities| capabilities.supports_builtin_voices)
         && loaded_has_speakers
         && rollout_enabled
+        && request.execution_adapter_binding().is_some_and(|binding| {
+            binding.stages.iter().any(|stage| {
+                stage.batch_mode == NativeBatchMode::Static
+                    && request.prepared_stage_cost(stage.id).is_some()
+            })
+        })
 }
 
 impl ModelExecutor for NativeExecutor {
@@ -1054,6 +1227,17 @@ impl ModelExecutor for NativeExecutor {
             loaded_has_speakers,
             self.config.static_tensor_batch_variants.contains(&variant),
         );
+        let continuous_chat_batch = matches!(request.task_type, super::types::TaskType::Chat)
+            && request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .is_some_and(|model| model.supports_continuous_decode_batch())
+            && request.execution_adapter_binding().is_some_and(|binding| {
+                binding
+                    .stages
+                    .iter()
+                    .any(|stage| stage.batch_mode == NativeBatchMode::Continuous)
+            });
         profile.resolved_from_loaded_model = loaded_incremental.is_some();
         let implementation_incremental =
             loaded_incremental.unwrap_or_else(|| match request.task_type {
@@ -1108,6 +1292,11 @@ impl ModelExecutor for NativeExecutor {
             profile.decode_batch = NativeBatchMode::None;
             profile.concurrency = ConcurrencyClass::Batchable;
             profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
+        } else if continuous_chat_batch {
+            profile.prefill_batch = NativeBatchMode::None;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
         } else {
             let request_parallel_width = if can_parallelize_requests(self.config.backend) {
                 self.config.request_parallelism.max(1)
@@ -1126,6 +1315,96 @@ impl ModelExecutor for NativeExecutor {
         Some(profile)
     }
 
+    fn execute_physical_batch(
+        &self,
+        execution: PhysicalBatchExecution<'_>,
+    ) -> PhysicalDispatchResult {
+        let width = execution.scheduled.len().max(1);
+        let expected_dispatch = execution.expected_dispatch();
+        execution.validate().map_err(|error| {
+            PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+        })?;
+        if !self.initialized {
+            return Err(PhysicalDispatchError::not_started(
+                Error::InferenceError("Executor not initialized".into()),
+                width,
+                FailureOrigin::ExecutorValidation,
+            ));
+        }
+        if execution.batch.mode == NativeBatchMode::Static {
+            if !execution.is_prefill()
+                || execution.batch.lane.capability_id != "tts"
+                || execution
+                    .requests
+                    .iter()
+                    .any(|request| request.task_type != super::types::TaskType::TTS)
+            {
+                return Err(PhysicalDispatchError::not_started(
+                    Error::InferenceError(
+                        "static tensor batch was routed to an incompatible native stage"
+                            .to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
+                ));
+            }
+            if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
+                return Err(PhysicalDispatchError::not_started(
+                    Error::Overloaded(
+                        "static tensor batch exceeds the backend width cap".to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
+                ));
+            }
+            return self
+                .execute_static_tts_requests(execution.requests, execution.scheduled)
+                .map_err(|error| {
+                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+                });
+        }
+        if execution.batch.mode == NativeBatchMode::Continuous {
+            if execution.is_prefill()
+                || execution.batch.lane.capability_id != "chat"
+                || execution
+                    .requests
+                    .iter()
+                    .any(|request| request.task_type != super::types::TaskType::Chat)
+            {
+                return Err(PhysicalDispatchError::not_started(
+                    Error::InferenceError(
+                        "continuous tensor batch was routed to an incompatible native stage"
+                            .to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
+                ));
+            }
+            if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
+                return Err(PhysicalDispatchError::not_started(
+                    Error::Overloaded(
+                        "continuous tensor batch exceeds the backend width cap".to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
+                ));
+            }
+            return self
+                .execute_continuous_chat_requests(execution.requests, execution.scheduled)
+                .map_err(|error| {
+                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+                });
+        }
+        let result = if execution.is_prefill() {
+            self.execute_prefill(execution.requests, execution.scheduled)
+        } else {
+            self.execute_decode(execution.requests, execution.scheduled)
+        };
+        result.map_err(|error| {
+            PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+        })
+    }
+
     fn execute_prefill(
         &self,
         requests: &[&EngineCoreRequest],
@@ -1138,17 +1417,6 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn execute_decode(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
-        if !self.initialized {
-            return Err(Error::InferenceError("Executor not initialized".into()));
-        }
-        self.execute_requests(requests, scheduled)
-    }
-
-    fn execute(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
@@ -1284,15 +1552,32 @@ impl ModelExecutor for NativeExecutor {
 }
 
 /// Unified executor that wraps a model executor implementation.
+#[derive(Clone)]
+struct BatchWorkspaceContext {
+    backend: BackendKind,
+    authority: Arc<ResourceAuthority>,
+}
+
+#[derive(Clone)]
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
+    batch_workspace: Option<BatchWorkspaceContext>,
 }
 
 impl UnifiedExecutor {
     /// Create a new unified executor with native backend.
     pub fn new_native(config: WorkerConfig) -> Self {
+        let batch_workspace =
+            config
+                .resource_authority
+                .as_ref()
+                .map(|authority| BatchWorkspaceContext {
+                    backend: config.backend,
+                    authority: authority.clone(),
+                });
         Self {
             inner: Arc::new(RwLock::new(Box::new(NativeExecutor::new(config)))),
+            batch_workspace,
         }
     }
 
@@ -1300,37 +1585,47 @@ impl UnifiedExecutor {
     pub(crate) fn new_for_test(executor: Box<dyn ModelExecutor>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(executor)),
+            batch_workspace: None,
         }
     }
 
-    /// Execute requests.
-    pub async fn execute(
+    pub(super) fn reserve_batch_workspace(
         &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
-        let executor = self.inner.read().await;
-        executor.execute(requests, scheduled)
+        batch: &PhysicalBatch,
+    ) -> Result<Option<BatchWorkspaceLease>> {
+        if batch.workspace.workspace_bytes()? == 0 {
+            return Ok(None);
+        }
+        let context = self.batch_workspace.as_ref().ok_or_else(|| {
+            Error::Overloaded(
+                "physical batch requires workspace but no resource authority is installed"
+                    .to_string(),
+            )
+        })?;
+        if batch.lane.backend != context.backend {
+            return Err(Error::InvalidInput(
+                "physical batch workspace backend does not match its executor".to_string(),
+            ));
+        }
+        context
+            .authority
+            .reserve_batch_workspace(batch.lane.execution_group, batch.batch_id, batch.workspace)
+            .map(Some)
     }
 
-    /// Execute prefill requests.
-    pub async fn execute_prefill(
+    /// Execute one exact physical batch envelope.
+    pub async fn execute_physical_batch(
         &self,
+        batch: &PhysicalBatch,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
+    ) -> PhysicalDispatchResult {
         let executor = self.inner.read().await;
-        executor.execute_prefill(requests, scheduled)
-    }
-
-    /// Execute decode requests.
-    pub async fn execute_decode(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
-        let executor = self.inner.read().await;
-        executor.execute_decode(requests, scheduled)
+        executor.execute_physical_batch(PhysicalBatchExecution {
+            batch,
+            requests,
+            scheduled,
+        })
     }
 
     pub async fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
@@ -1391,13 +1686,12 @@ fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::output::StreamingOutput;
     use super::*;
+    use crate::engine::request::StreamStagingBuffer;
     use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
     use crate::model::ModelVariant;
     use base64::Engine;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::mpsc;
 
     #[derive(Debug)]
     struct FixedCapacityProvider {
@@ -1558,9 +1852,122 @@ mod tests {
     }
 
     #[test]
+    fn physical_batch_workspace_uses_the_backend_resource_domain_and_releases() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let mut capacity = ResourceVector::zero();
+            match backend {
+                BackendKind::Cpu => capacity.host_bytes = ResourceAmount::Known(64),
+                BackendKind::Metal => capacity.unified_bytes = ResourceAmount::Known(64),
+                BackendKind::Cuda => {
+                    capacity.host_bytes = ResourceAmount::Known(64);
+                    capacity.device_bytes = ResourceAmount::Known(64);
+                }
+            }
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity,
+            })));
+            let mut executor = UnifiedExecutor::new_for_test(Box::new(NativeExecutor::new(
+                WorkerConfig::default(),
+            )));
+            executor.batch_workspace = Some(BatchWorkspaceContext {
+                backend,
+                authority: authority.clone(),
+            });
+            let lane = super::super::BatchLaneKey {
+                execution_group: super::super::ExecutionGroupId::new(7),
+                model_instance: super::super::ModelInstanceId::new(8),
+                adapter_instance: super::super::AdapterInstanceId::new(9),
+                adapter_abi: super::super::AdapterAbiRevision::new(1),
+                capability_id: "test".to_string(),
+                stage_id: super::super::StageId::new(1),
+                backend,
+                device_ordinal: None,
+                compute_dtype: "f32".to_string(),
+                state_dtype: "f32".to_string(),
+                tensor_layout: "exact".to_string(),
+                quantization: "none".to_string(),
+                state_schema: "none".to_string(),
+                kernel_mode: "test".to_string(),
+                semantic_mode: "test".to_string(),
+                shape_bucket: "exact.1".to_string(),
+            };
+            let expected_workspace = match backend {
+                BackendKind::Cpu => ResourceVector {
+                    host_bytes: ResourceAmount::Known(8),
+                    ..ResourceVector::zero()
+                },
+                BackendKind::Metal => ResourceVector {
+                    unified_bytes: ResourceAmount::Known(8),
+                    ..ResourceVector::zero()
+                },
+                BackendKind::Cuda => ResourceVector {
+                    host_bytes: ResourceAmount::Known(3),
+                    device_bytes: ResourceAmount::Known(8),
+                    ..ResourceVector::zero()
+                },
+            };
+            let batch = PhysicalBatch {
+                batch_id: super::super::BatchId::new(10),
+                lane: lane.clone(),
+                mode: NativeBatchMode::None,
+                budget: super::super::BatchBudget::width_one(),
+                rows: vec![super::super::ReadyQuantum {
+                    plan_id: 1,
+                    session: SessionKey::new("workspace".to_string(), 1),
+                    lane,
+                    work: super::super::WorkUnit::AtomicJob {
+                        kind: "test".to_string(),
+                    },
+                    cost: super::super::WorkCost::new(1, 1, 8),
+                }],
+                materialized_tensor_elements: 1,
+                workspace: expected_workspace,
+            };
+
+            let workspace = executor
+                .reserve_batch_workspace(&batch)
+                .unwrap()
+                .expect("workspace lease");
+            assert_eq!(workspace.resources(), expected_workspace);
+            assert_eq!(authority.snapshot().reservations, 1);
+            drop(workspace);
+            assert_eq!(authority.snapshot().reservations, 0);
+        }
+    }
+
+    #[test]
     fn static_tts_batch_eligibility_is_fail_closed() {
-        let mut request = EngineCoreRequest::tts("hello")
-            .with_model_variant(ModelVariant::Qwen3Tts12Hz06BCustomVoice);
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let mut request = EngineCoreRequest::tts("hello").with_model_variant(variant);
+        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
+
+        let model_instance = super::super::ModelInstanceId::new(1);
+        request.bind_model_instance(model_instance).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "tts.generate",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        let stage_id = stage.id;
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: super::super::ExecutionGroupId::new(1),
+                model_instance_id: model_instance,
+                adapter_instance_id: super::super::AdapterInstanceId::new(1),
+                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "tts".to_string(),
+                stages: Arc::from([stage]),
+            })
+            .unwrap();
+        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
+        request
+            .install_prepared_stage_cost(stage_id, super::super::WorkCost::new(1, 1, 0))
+            .unwrap();
         assert!(static_qwen_tts_batch_eligible(&request, true, true));
         assert!(!static_qwen_tts_batch_eligible(&request, true, false));
         assert!(!static_qwen_tts_batch_eligible(&request, false, true));
@@ -1860,14 +2267,14 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_audio_send_is_safe_inside_current_thread_runtime() {
+    fn test_stream_audio_stages_inside_current_thread_runtime() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build runtime");
 
         let result = runtime.block_on(async {
-            let (tx, mut rx) = mpsc::channel(4);
+            let tx = StreamStagingBuffer::default();
             let mut sequence = 0usize;
             NativeExecutor::stream_audio(
                 &tx,
@@ -1877,10 +2284,11 @@ mod tests {
                 24_000,
                 false,
             )?;
-            let chunk = rx
-                .recv()
-                .await
-                .ok_or_else(|| Error::InferenceError("missing streamed chunk".to_string()))?;
+            let chunk = tx
+                .take()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::InferenceError("missing staged chunk".to_string()))?;
             if chunk.request_id != "req-1" || chunk.sequence != 0 || chunk.samples.len() != 2 {
                 return Err(Error::InferenceError(
                     "unexpected streamed chunk payload".to_string(),
@@ -1889,57 +2297,6 @@ mod tests {
             Ok::<(), Error>(())
         });
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_stream_audio_send_returns_error_when_channel_closed() {
-        let (tx, rx) = mpsc::channel::<StreamingOutput>(1);
-        drop(rx);
-
-        let mut sequence = 0usize;
-        let result = NativeExecutor::stream_audio(
-            &tx,
-            "req-closed",
-            &mut sequence,
-            vec![0.2],
-            24_000,
-            false,
-        );
-        let Err(Error::InferenceError(message)) = result else {
-            panic!("expected inference error when streaming channel is closed");
-        };
-        assert!(message.contains("Streaming output channel closed"));
-    }
-
-    #[test]
-    fn test_stream_audio_send_returns_backpressure_error_when_queue_full() {
-        let (tx, _rx) = mpsc::channel::<StreamingOutput>(1);
-
-        let mut first_sequence = 0usize;
-        NativeExecutor::stream_audio(
-            &tx,
-            "req-full",
-            &mut first_sequence,
-            vec![0.1],
-            24_000,
-            false,
-        )
-        .expect("first chunk should fit");
-
-        let mut second_sequence = 1usize;
-        let result = NativeExecutor::stream_audio(
-            &tx,
-            "req-full",
-            &mut second_sequence,
-            vec![0.2],
-            24_000,
-            false,
-        );
-
-        let Err(Error::InferenceError(message)) = result else {
-            panic!("expected inference error when streaming queue is full");
-        };
-        assert!(message.contains("backpressure"));
     }
 
     #[test]

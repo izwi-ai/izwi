@@ -80,6 +80,27 @@ fn bounded_chat_completion_tokens(
     })
 }
 
+fn reconcile_streamed_chat_text(
+    streamed_text: String,
+    terminal_text: Option<String>,
+) -> Result<String> {
+    let Some(terminal_text) = terminal_text.filter(|text| !text.is_empty()) else {
+        return Ok(streamed_text);
+    };
+    if streamed_text.is_empty() {
+        return Ok(terminal_text);
+    }
+    if streamed_text == terminal_text {
+        return Ok(streamed_text);
+    }
+
+    Err(Error::InferenceError(format!(
+        "Streaming chat text did not match terminal output (streamed {} bytes, terminal {} bytes)",
+        streamed_text.len(),
+        terminal_text.len()
+    )))
+}
+
 impl RuntimeService {
     fn prompt_token_config(
         params: &GenerationParams,
@@ -469,8 +490,9 @@ impl RuntimeService {
             })
             .await?;
 
+        let text = reconcile_streamed_chat_text(streamed_text, output.text)?;
         Ok(ChatGeneration {
-            text: output.text.unwrap_or(streamed_text),
+            text,
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
@@ -577,8 +599,9 @@ impl RuntimeService {
             })
             .await?;
 
+        let text = reconcile_streamed_chat_text(streamed_text, output.text)?;
         Ok(ChatGeneration {
-            text: output.text.unwrap_or(streamed_text),
+            text,
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
@@ -590,6 +613,7 @@ impl RuntimeService {
 mod tests {
     use super::{
         bounded_chat_completion_tokens, chat_messages_after_prefix, complete_chat_turn_prefix_ends,
+        reconcile_streamed_chat_text,
     };
     use crate::models::shared::chat::{ChatMessage, ChatRole};
 
@@ -635,5 +659,48 @@ mod tests {
         assert_eq!(bounded_chat_completion_tokens(90, 32, 100), Some(10));
         assert_eq!(bounded_chat_completion_tokens(90, 0, 100), Some(1));
         assert_eq!(bounded_chat_completion_tokens(100, 1, 100), None);
+    }
+
+    #[test]
+    fn streamed_chat_text_accepts_matching_terminal_text() {
+        let text = reconcile_streamed_chat_text(
+            "complete response".to_string(),
+            Some("complete response".to_string()),
+        )
+        .expect("matching text should reconcile");
+
+        assert_eq!(text, "complete response");
+    }
+
+    #[test]
+    fn streamed_chat_text_rejects_terminal_mismatch() {
+        let err = reconcile_streamed_chat_text(
+            "streamed response".to_string(),
+            Some("different response".to_string()),
+        )
+        .expect_err("conflicting public and terminal text must fail");
+
+        assert!(err.to_string().contains("did not match terminal output"));
+    }
+
+    #[test]
+    fn streamed_chat_text_accepts_terminal_only_adapters() {
+        let text =
+            reconcile_streamed_chat_text(String::new(), Some("terminal response".to_string()))
+                .expect("terminal-only text should reconcile");
+
+        assert_eq!(text, "terminal response");
+    }
+
+    #[test]
+    fn streamed_chat_text_accepts_delta_only_adapters() {
+        let text = reconcile_streamed_chat_text("delta response".to_string(), None)
+            .expect("delta-only text should reconcile");
+        let empty_terminal =
+            reconcile_streamed_chat_text("delta response".to_string(), Some(String::new()))
+                .expect("an empty terminal payload should not discard deltas");
+
+        assert_eq!(text, "delta response");
+        assert_eq!(empty_terminal, "delta response");
     }
 }

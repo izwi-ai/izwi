@@ -83,6 +83,15 @@ impl ResourceVector {
         }
     }
 
+    /// Backend-neutral transient memory. Physical planning resolves this into
+    /// host, unified, or device memory before reservation.
+    pub const fn temporary_workspace(bytes: u64) -> Self {
+        Self {
+            temporary_bytes: ResourceAmount::Known(bytes),
+            ..Self::zero()
+        }
+    }
+
     pub fn checked_add(self, other: Self) -> Result<Self> {
         Ok(Self {
             host_bytes: self.host_bytes.checked_add(other.host_bytes)?,
@@ -125,6 +134,34 @@ impl ResourceVector {
         ]
         .into_iter()
         .all(|amount| matches!(amount, ResourceAmount::Known(_)))
+    }
+
+    /// Return the total transient workspace represented across memory domains.
+    /// Persistent KV and compute-slot quantities are not valid batch scratch.
+    pub fn workspace_bytes(self) -> Result<u64> {
+        if self.kv_bytes != ResourceAmount::Known(0)
+            || self.compute_slots != ResourceAmount::Known(0)
+        {
+            return Err(Error::InvalidInput(
+                "batch workspace cannot contain persistent KV or compute-slot resources"
+                    .to_string(),
+            ));
+        }
+        [
+            self.host_bytes,
+            self.device_bytes,
+            self.unified_bytes,
+            self.temporary_bytes,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, amount| match amount {
+            ResourceAmount::Known(value) => total
+                .checked_add(value)
+                .ok_or_else(|| Error::Overloaded("batch workspace total overflow".to_string())),
+            ResourceAmount::Unknown => Err(Error::InvalidInput(
+                "batch workspace contains an unresolved quantity".to_string(),
+            )),
+        })
     }
 
     fn positive_growth_over(self, current: Self) -> Result<Self> {
@@ -321,6 +358,7 @@ pub enum ReservationClass {
     Request,
     Cache,
     Pipeline,
+    BatchWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -448,6 +486,37 @@ impl ResourceAuthority {
         resources: ResourceVector,
     ) -> Result<ResourceLease> {
         self.reserve_with_initial_materialized(owner, resources, ResourceVector::zero())
+    }
+
+    /// Reserve transient physical workspace for exactly one physical batch.
+    /// Persistent KV/session state must use a cache lease instead, so a batch
+    /// workspace can always be released when its dispatch transaction ends.
+    pub(crate) fn reserve_batch_workspace(
+        self: &Arc<Self>,
+        execution_group: crate::engine::ExecutionGroupId,
+        batch_id: crate::engine::BatchId,
+        resources: ResourceVector,
+    ) -> Result<BatchWorkspaceLease> {
+        if !matches!(resources.kv_bytes, ResourceAmount::Known(0)) {
+            return Err(Error::InvalidInput(
+                "batch workspace cannot own persistent KV resources".to_string(),
+            ));
+        }
+        if !matches!(resources.compute_slots, ResourceAmount::Known(0)) {
+            return Err(Error::InvalidInput(
+                "batch workspace cannot own execution permits".to_string(),
+            ));
+        }
+        let owner = ReservationOwner::new(
+            ReservationClass::BatchWorkspace,
+            format!("{}:{}", execution_group.get(), batch_id.get()),
+        );
+        let lease = self.reserve(owner, resources)?;
+        Ok(BatchWorkspaceLease {
+            execution_group,
+            batch_id,
+            lease,
+        })
     }
 
     /// Atomically establish immutable authorization for a resource claim whose
@@ -698,6 +767,38 @@ pub struct ResourceLease {
     resources: ResourceVector,
 }
 
+/// Short-lived resource authorization scoped to one physical batch dispatch.
+/// Dropping this value releases the workspace reservation; it must never be
+/// stored in per-session state or an [`crate::engine::ExecutionPlan`].
+#[derive(Debug)]
+pub struct BatchWorkspaceLease {
+    execution_group: crate::engine::ExecutionGroupId,
+    batch_id: crate::engine::BatchId,
+    lease: ResourceLease,
+}
+
+impl BatchWorkspaceLease {
+    pub fn execution_group(&self) -> crate::engine::ExecutionGroupId {
+        self.execution_group
+    }
+
+    pub fn batch_id(&self) -> crate::engine::BatchId {
+        self.batch_id
+    }
+
+    pub fn resources(&self) -> ResourceVector {
+        self.lease.resources()
+    }
+
+    pub fn record_materialized_usage(&self, resources: ResourceVector) -> Result<()> {
+        self.lease.record_materialized_usage(resources)
+    }
+
+    pub(crate) fn prepare_materialized_release(&self, resources: ResourceVector) -> Result<()> {
+        self.lease.prepare_materialized_release(resources)
+    }
+}
+
 impl ResourceLease {
     pub fn resources(&self) -> ResourceVector {
         self.resources
@@ -802,6 +903,13 @@ mod tests {
         }
     }
 
+    fn host_bytes(value: u64) -> ResourceVector {
+        ResourceVector {
+            host_bytes: ResourceAmount::Known(value),
+            ..ResourceVector::zero()
+        }
+    }
+
     #[test]
     fn reservation_is_transactional_and_releases_exactly_once() {
         let mut ledger = ResourceLedger::new(slots(2));
@@ -861,6 +969,68 @@ mod tests {
         assert_eq!(authority.snapshot().reserved, slots(2));
         drop((model, request));
         assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn batch_workspace_is_exactly_scoped_and_released_on_drop() {
+        let provider = Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: host_bytes(16),
+                available: host_bytes(16),
+                source: CapacitySource::Test,
+            },
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+
+        let workspace = authority
+            .reserve_batch_workspace(
+                crate::engine::ExecutionGroupId::new(3),
+                crate::engine::BatchId::new(9),
+                host_bytes(8),
+            )
+            .expect("batch workspace");
+
+        assert_eq!(workspace.execution_group().get(), 3);
+        assert_eq!(workspace.batch_id().get(), 9);
+        assert_eq!(workspace.resources(), host_bytes(8));
+        assert_eq!(authority.snapshot().reservations, 1);
+        drop(workspace);
+        assert_eq!(authority.snapshot().reservations, 0);
+        assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+    }
+
+    #[test]
+    fn batch_workspace_cannot_hide_persistent_state_or_execution_permits() {
+        let provider = Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: host_bytes(16),
+                available: host_bytes(16),
+                source: CapacitySource::Test,
+            },
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let mut persistent = host_bytes(4);
+        persistent.kv_bytes = ResourceAmount::Known(1);
+        let mut permit = host_bytes(4);
+        permit.compute_slots = ResourceAmount::Known(1);
+
+        assert!(matches!(
+            authority.reserve_batch_workspace(
+                crate::engine::ExecutionGroupId::new(1),
+                crate::engine::BatchId::new(1),
+                persistent,
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            authority.reserve_batch_workspace(
+                crate::engine::ExecutionGroupId::new(1),
+                crate::engine::BatchId::new(2),
+                permit,
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(authority.snapshot().reservations, 0);
     }
 
     #[test]

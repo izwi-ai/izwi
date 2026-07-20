@@ -73,6 +73,7 @@ impl NativeExecutor {
             if let Some(tx) = stream_tx.as_ref() {
                 let stream_sequence = std::cell::Cell::new(0usize);
                 let stream_err = std::cell::RefCell::new(None::<Error>);
+                let streamed_text = std::cell::RefCell::new(String::new());
                 let mut emit_text = |delta: &str| {
                     if delta.is_empty() || stream_err.borrow().is_some() {
                         return;
@@ -85,7 +86,10 @@ impl NativeExecutor {
                         &mut sequence,
                         delta.to_string(),
                     ) {
-                        Ok(()) => stream_sequence.set(sequence),
+                        Ok(()) => {
+                            stream_sequence.set(sequence);
+                            streamed_text.borrow_mut().push_str(delta);
+                        }
                         Err(err) => {
                             *stream_err.borrow_mut() = Some(err);
                         }
@@ -111,7 +115,7 @@ impl NativeExecutor {
                         }
                     }
                 };
-                let output = model.generate_interleaved_with_config_and_callback(
+                let mut output = model.generate_interleaved_with_config_and_callback(
                     history_messages,
                     &samples,
                     sample_rate,
@@ -132,6 +136,10 @@ impl NativeExecutor {
                     &request.id,
                     &mut sequence,
                 )?;
+                let streamed_text = streamed_text.into_inner();
+                if !streamed_text.is_empty() {
+                    output.text = streamed_text;
+                }
                 Ok(output)
             } else {
                 let mut no_text = |_delta: &str| {};

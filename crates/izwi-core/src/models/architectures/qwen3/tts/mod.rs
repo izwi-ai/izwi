@@ -198,8 +198,17 @@ pub struct BatchedSpeakerOutput {
 #[derive(Debug, Clone)]
 pub struct BatchedSpeakerGeneration {
     pub outputs: Vec<BatchedSpeakerOutput>,
-    /// Largest exact-shape group that actually entered a tensor batch.
-    pub max_tensor_batch_width: usize,
+    /// Exact number of rows that entered the single physical tensor batch.
+    pub tensor_batch_width: usize,
+}
+
+/// Host-only facts needed to form a truthful static tensor batch. This is
+/// deliberately limited to shape and incremental batch-collation workspace;
+/// no device tensor is created while planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetSpeakerBatchLayout {
+    pub prefill_tokens: usize,
+    pub collation_workspace_bytes: u64,
 }
 
 impl TtsGenerationParams {
@@ -765,6 +774,65 @@ impl Qwen3TtsModel {
         .ok_or_else(|| Error::Overloaded("Qwen3-TTS session cache bound overflow".to_string()))
     }
 
+    /// Prepare the exact static-batch shape for preset-speaker generation.
+    /// The returned workspace covers the additional contiguous embedding
+    /// buffer materialized by `Tensor::cat` for the physical batch. Per-request
+    /// generation state remains covered by the request's ordinary admission
+    /// reservation.
+    pub fn preset_speaker_batch_layout(
+        &self,
+        text: &str,
+        speaker: &str,
+        language: Option<&str>,
+        instruct: Option<&str>,
+    ) -> Result<PresetSpeakerBatchLayout> {
+        let prompt_ids = self.encode_assistant_prompt_ids(text)?;
+        if self.tokenizer.get_speaker_id(speaker).is_none() {
+            return Err(Error::InvalidInput(format!(
+                "Unknown speaker '{speaker}'. Available speakers: {}",
+                self.tokenizer
+                    .available_speakers()
+                    .into_iter()
+                    .map(|speaker| speaker.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let instruct_tokens = self
+            .encode_instruction_ids(instruct)?
+            .map_or(0, |tokens| tokens.len());
+        let prefill_tokens = conditioned_prefill_tokens(
+            prompt_ids.len(),
+            self.resolve_language_id(language).is_some(),
+            true,
+            instruct_tokens,
+        )
+        .ok_or_else(cache_layout_overflow)?;
+        if prefill_tokens.checked_add(1).is_none_or(|first_decode| {
+            first_decode >= self.config.talker_config.max_position_embeddings
+        }) {
+            return Err(Error::InferenceError(
+                "Input is too long for model context; no room left for audio generation"
+                    .to_string(),
+            ));
+        }
+        let collation_workspace_bytes = u64::try_from(prefill_tokens)
+            .ok()
+            .and_then(|tokens| {
+                tokens.checked_mul(u64::try_from(self.config.talker_config.hidden_size).ok()?)
+            })
+            .and_then(|elements| {
+                elements.checked_mul(u64::try_from(self.dtype.size_in_bytes()).ok()?)
+            })
+            .ok_or_else(|| {
+                Error::Overloaded("Qwen3-TTS static batch workspace overflow".to_string())
+            })?;
+        Ok(PresetSpeakerBatchLayout {
+            prefill_tokens,
+            collation_workspace_bytes,
+        })
+    }
+
     pub fn diagnostics(&self) -> Qwen3TtsDiagnostics {
         Qwen3TtsDiagnostics {
             model_family: "qwen3_tts",
@@ -902,7 +970,7 @@ impl Qwen3TtsModel {
         if requests.is_empty() {
             return Ok(BatchedSpeakerGeneration {
                 outputs: Vec::new(),
-                max_tensor_batch_width: 0,
+                tensor_batch_width: 0,
             });
         }
 
@@ -985,16 +1053,19 @@ impl Qwen3TtsModel {
         for item in prepared {
             groups.entry(item.prefill_len).or_default().push(item);
         }
+        if groups.len() != 1 {
+            return Err(Error::InferenceError(
+                "static Qwen3-TTS dispatch contains mixed prepared prefill shapes".to_string(),
+            ));
+        }
 
         let mut outputs: Vec<Option<BatchedSpeakerOutput>> = vec![None; requests.len()];
-        let mut max_tensor_batch_width = 0usize;
 
         for (_prefill_len, group) in groups {
             let batch_size = group.len();
             if batch_size == 0 {
                 continue;
             }
-            max_tensor_batch_width = max_tensor_batch_width.max(batch_size);
 
             let embeds: Vec<Tensor> = group.iter().map(|req| req.prefill_embeds.clone()).collect();
             let batch_embeds = Tensor::cat(&embeds, 0)?;
@@ -1163,7 +1234,7 @@ impl Qwen3TtsModel {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
-            max_tensor_batch_width,
+            tensor_batch_width: requests.len(),
         })
     }
 

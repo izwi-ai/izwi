@@ -107,7 +107,9 @@ impl NativeExecutor {
         };
 
         if request.is_cancelled() {
-            return ModelSessionResult::cancelled(ExecutorOutput::cancelled(request.id.clone()));
+            return ModelSessionResult::cancelled_before_dispatch(ExecutorOutput::cancelled(
+                request.id.clone(),
+            ));
         }
 
         let Some(route) = Self::resolve_route(request.task_type, request.model_variant) else {
@@ -221,23 +223,7 @@ impl NativeExecutor {
         // finish, abort, failure cleanup, or recompute preemption.
         self.reserve_scheduled_cache(requests, scheduled)?;
         self.prepare_scheduled_cache(scheduled)?;
-        let (outputs, dispatch) = if let Some(result) = self.try_qwen_tts_batch(requests, scheduled)
-        {
-            let result = result?;
-            let dispatch = if result.tensor_width > 1 {
-                BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width)
-            } else {
-                BatchDispatch::serial()
-            };
-            (
-                result
-                    .outputs
-                    .into_iter()
-                    .map(ModelSessionResult::atomic)
-                    .collect(),
-                dispatch,
-            )
-        } else if self.can_parallelize_requests(scheduled.len()) {
+        let (outputs, dispatch) = if self.can_parallelize_requests(scheduled.len()) {
             (
                 self.execute_requests_parallel(requests, scheduled)?,
                 BatchDispatch::new(BatchDispatchKind::RequestParallel, scheduled.len()),
@@ -250,6 +236,77 @@ impl NativeExecutor {
                     .collect(),
                 BatchDispatch::serial(),
             )
+        };
+        self.finish_scheduled_execution(requests, scheduled, outputs, dispatch)
+    }
+
+    pub(super) fn execute_static_tts_requests(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ExecutorStepResult>> {
+        self.reserve_scheduled_cache(requests, scheduled)?;
+        self.prepare_scheduled_cache(scheduled)?;
+        let result = self
+            .try_qwen_tts_batch(requests, scheduled)
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "planned static TTS batch is not eligible for tensor dispatch".to_string(),
+                )
+            })??;
+        if result.tensor_width != scheduled.len() {
+            return Err(Error::InferenceError(format!(
+                "static TTS executor dispatched width {}, expected {}",
+                result.tensor_width,
+                scheduled.len()
+            )));
+        }
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            result.outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width),
+        )
+    }
+
+    pub(super) fn execute_continuous_chat_requests(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+    ) -> Result<Vec<ExecutorStepResult>> {
+        self.reserve_scheduled_cache(requests, scheduled)?;
+        self.prepare_scheduled_cache(scheduled)?;
+        let outputs = self.chat_decode_batch(requests, scheduled)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
+        )
+    }
+
+    fn finish_scheduled_execution(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        outputs: Vec<ModelSessionResult>,
+        dispatch: BatchDispatch,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        if outputs.len() != scheduled.len() {
+            return Err(Error::InferenceError(format!(
+                "native executor produced {} session results for {} scheduled rows",
+                outputs.len(),
+                scheduled.len()
+            )));
+        }
+        let dispatch = if !outputs.is_empty()
+            && outputs
+                .iter()
+                .all(|output| output.provenance.dispatch_state == super::DispatchState::NotStarted)
+        {
+            BatchDispatch::not_dispatched(scheduled.len().max(1))
+        } else {
+            dispatch
         };
         Ok(scheduled
             .iter()
@@ -269,10 +326,20 @@ impl NativeExecutor {
                     )
                     .with_dispatch(dispatch);
                 };
-                match self.reconcile_scheduled_cache(request, scheduled, &output.output) {
-                    Ok(observed) => ExecutorStepResult::from_session(scheduled, output)
-                        .with_dispatch(dispatch)
-                        .with_observed_resources(observed),
+                let reconciled = self
+                    .reconcile_scheduled_cache(request, scheduled, &output.output)
+                    .and_then(|observed| {
+                        request
+                            .take_staged_stream_outputs()
+                            .map(|staged| (observed, staged))
+                    });
+                match reconciled {
+                    Ok((observed, staged)) => ExecutorStepResult::from_session(
+                        scheduled,
+                        output.with_staged_stream_outputs(staged),
+                    )
+                    .with_dispatch(dispatch)
+                    .with_observed_resources(observed),
                     Err(err) => {
                         let release =
                             ModelExecutor::cleanup_session(self, &scheduled.session_key());

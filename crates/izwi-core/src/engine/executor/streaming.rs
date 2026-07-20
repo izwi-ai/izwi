@@ -1,76 +1,291 @@
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Duration;
+
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 
-use super::super::metrics::record_engine_stream_backpressure;
+use super::super::metrics::{
+    record_engine_stream_backpressure, record_engine_stream_delivery_failure,
+};
 use super::super::output::{AsrProgress, StreamingOutput};
-use super::super::request::{EngineCoreRequest, EngineStreamPolicy};
+use super::super::request::{
+    checked_stream_backpressure_deadline, EngineCoreRequest, EngineStreamPolicy,
+    FencedStreamProgress, StreamProgressPermit, StreamPushOutcome, StreamStagingBuffer,
+};
+use super::super::SessionKey;
 use super::NativeExecutor;
 
 pub(super) type StreamBackpressurePolicy = EngineStreamPolicy;
 
-pub(super) struct StreamSink<'a> {
-    tx: &'a mpsc::Sender<StreamingOutput>,
-    policy: StreamBackpressurePolicy,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDeliveryFailureKind {
+    Delivery,
+    Deadline,
+    Cancelled,
+    RequestDeadline,
+    InvalidProgress,
 }
 
-impl<'a> StreamSink<'a> {
-    fn fail_on_full(tx: &'a mpsc::Sender<StreamingOutput>) -> Self {
-        Self::with_policy(tx, StreamBackpressurePolicy::FailOnFull)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamDeliveryFailure {
+    pub(crate) session: SessionKey,
+    pub(crate) kind: StreamDeliveryFailureKind,
+}
 
-    fn with_policy(
-        tx: &'a mpsc::Sender<StreamingOutput>,
+/// Stream events whose producing model state has already committed. Delivery
+/// owns a clone of the exact request channel so terminal request cleanup cannot
+/// close the channel before the outbox is flushed.
+#[derive(Debug)]
+pub(crate) struct CommittedStreamDelivery {
+    pub(crate) session: SessionKey,
+    tx: mpsc::Sender<StreamingOutput>,
+    policy: StreamBackpressurePolicy,
+    outputs: Vec<CommittedStreamOutput>,
+}
+
+#[derive(Debug)]
+struct CommittedStreamOutput {
+    output: StreamingOutput,
+    _progress_permit: Option<StreamProgressPermit>,
+}
+
+impl CommittedStreamDelivery {
+    pub(crate) fn new(
+        session: SessionKey,
+        tx: mpsc::Sender<StreamingOutput>,
         policy: StreamBackpressurePolicy,
+        outputs: Vec<StreamingOutput>,
     ) -> Self {
-        Self { tx, policy }
-    }
-
-    fn policy(&self) -> StreamBackpressurePolicy {
-        self.policy
-    }
-
-    fn send(&self, output: StreamingOutput) -> Result<()> {
-        match self.policy {
-            StreamBackpressurePolicy::FailOnFull => {
-                self.tx.try_send(output).map_err(stream_send_error)
-            }
-            StreamBackpressurePolicy::BlockWithDeadline { timeout_ms } => {
-                self.send_with_deadline(output, Duration::from_millis(timeout_ms.max(1)))
-            }
-            StreamBackpressurePolicy::DropNewest => match self.tx.try_send(output) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Closed(output)) => {
-                    Err(stream_send_error(mpsc::error::TrySendError::Closed(output)))
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    record_engine_stream_backpressure();
-                    Ok(())
-                }
-            },
+        Self {
+            session,
+            tx,
+            policy,
+            outputs: outputs
+                .into_iter()
+                .map(|output| CommittedStreamOutput {
+                    output,
+                    _progress_permit: None,
+                })
+                .collect(),
         }
     }
 
-    fn send_with_deadline(&self, mut output: StreamingOutput, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.tx.try_send(output) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::error::TrySendError::Closed(output)) => {
-                    return Err(stream_send_error(mpsc::error::TrySendError::Closed(output)));
-                }
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    output = returned;
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(stream_send_error(mpsc::error::TrySendError::Full(output)));
+    pub(crate) fn from_progress(
+        session: SessionKey,
+        tx: mpsc::Sender<StreamingOutput>,
+        policy: StreamBackpressurePolicy,
+        progress: FencedStreamProgress,
+    ) -> Self {
+        Self {
+            session,
+            tx,
+            policy,
+            outputs: vec![CommittedStreamOutput {
+                output: progress.output,
+                _progress_permit: Some(progress.budget_permit),
+            }],
+        }
+    }
+
+    async fn deliver(self) -> std::result::Result<(), StreamDeliveryFailureKind> {
+        for committed in self.outputs {
+            let output = committed.output;
+            if output.request_id != self.session.request_id {
+                record_engine_stream_delivery_failure();
+                return Err(StreamDeliveryFailureKind::Delivery);
+            }
+            if let Err(kind) = send_committed_output(&self.tx, self.policy, output).await {
+                record_engine_stream_delivery_failure();
+                return Err(kind);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Deliver every committed row independently. A failed consumer is returned
+/// for exact-session cancellation after all peer rows have had a chance to
+/// flush their own outboxes.
+pub(crate) async fn deliver_committed_streams(
+    deliveries: Vec<CommittedStreamDelivery>,
+) -> Vec<StreamDeliveryFailure> {
+    let mut pending = deliveries
+        .into_iter()
+        .map(|delivery| async move {
+            let session = delivery.session.clone();
+            delivery
+                .deliver()
+                .await
+                .map_err(|kind| StreamDeliveryFailure { session, kind })
+        })
+        .collect::<FuturesUnordered<_>>();
+    let mut failed = Vec::new();
+    while let Some(result) = pending.next().await {
+        if let Err(failure) = result {
+            failed.push(failure);
+        }
+    }
+    failed
+}
+
+/// Ordered per-session delivery lanes for progress committed while a model
+/// operation is still running. The global byte permits remain owned by each
+/// queued delivery, so these unbounded control channels cannot make payload
+/// memory unbounded.
+pub(crate) struct IncrementalStreamDeliveryWorkers {
+    senders: HashMap<SessionKey, mpsc::UnboundedSender<CommittedStreamDelivery>>,
+    tasks: HashMap<SessionKey, tokio::task::JoinHandle<()>>,
+    failure_tx: mpsc::UnboundedSender<StreamDeliveryFailure>,
+}
+
+const INCREMENTAL_COMMIT_FLUSH_GRACE: Duration = Duration::from_millis(10);
+
+impl IncrementalStreamDeliveryWorkers {
+    pub(crate) fn new() -> (Self, mpsc::UnboundedReceiver<StreamDeliveryFailure>) {
+        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                senders: HashMap::new(),
+                tasks: HashMap::new(),
+                failure_tx,
+            },
+            failure_rx,
+        )
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        delivery: CommittedStreamDelivery,
+    ) -> std::result::Result<(), StreamDeliveryFailure> {
+        let session = delivery.session.clone();
+        if !self.senders.contains_key(&session) {
+            let (tx, mut rx) = mpsc::unbounded_channel::<CommittedStreamDelivery>();
+            let failure_tx = self.failure_tx.clone();
+            let worker_session = session.clone();
+            let task = tokio::spawn(async move {
+                while let Some(delivery) = rx.recv().await {
+                    if let Err(kind) = delivery.deliver().await {
+                        let _ = failure_tx.send(StreamDeliveryFailure {
+                            session: worker_session.clone(),
+                            kind,
+                        });
+                        break;
                     }
-                    std::thread::sleep(
-                        deadline
-                            .saturating_duration_since(now)
-                            .min(Duration::from_millis(1)),
-                    );
+                }
+            });
+            self.tasks.insert(session.clone(), task);
+            self.senders.insert(session.clone(), tx);
+        }
+        let sender = self
+            .senders
+            .get(&session)
+            .expect("delivery sender inserted above");
+        sender.send(delivery).map_err(|_| StreamDeliveryFailure {
+            session,
+            kind: StreamDeliveryFailureKind::Delivery,
+        })
+    }
+
+    pub(crate) fn abandon_session(&mut self, session: &SessionKey) {
+        self.senders.remove(session);
+    }
+
+    /// Close every ordered lane at the physical commit barrier. Deliveries
+    /// that are immediately writable get a short scheduler grace to finish;
+    /// a row still blocked after that point fails independently so its public
+    /// timeout cannot hold peer terminal markers or completions hostage.
+    pub(crate) async fn finish(mut self) -> Vec<StreamDeliveryFailure> {
+        self.senders.clear();
+        drop(self.failure_tx);
+        let deadline = tokio::time::Instant::now() + INCREMENTAL_COMMIT_FLUSH_GRACE;
+        loop {
+            let finished = self
+                .tasks
+                .iter()
+                .filter_map(|(session, task)| task.is_finished().then_some(session.clone()))
+                .collect::<Vec<_>>();
+            for session in finished {
+                let task = self
+                    .tasks
+                    .remove(&session)
+                    .expect("finished delivery task remained registered");
+                match task.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_panic() => {
+                        std::panic::resume_unwind(error.into_panic());
+                    }
+                    Err(_) => {}
+                }
+            }
+            if self.tasks.is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let mut failures = Vec::with_capacity(self.tasks.len());
+        for (session, task) in self.tasks {
+            task.abort();
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_panic() => {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                Err(_) => {}
+            }
+            record_engine_stream_backpressure();
+            record_engine_stream_delivery_failure();
+            failures.push(StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Deadline,
+            });
+        }
+        failures
+    }
+}
+
+async fn send_committed_output(
+    tx: &mpsc::Sender<StreamingOutput>,
+    policy: StreamBackpressurePolicy,
+    output: StreamingOutput,
+) -> std::result::Result<(), StreamDeliveryFailureKind> {
+    match policy {
+        StreamBackpressurePolicy::FailOnFull => match tx.try_send(output) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StreamDeliveryFailureKind::Delivery),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                record_engine_stream_backpressure();
+                Err(StreamDeliveryFailureKind::Delivery)
+            }
+        },
+        StreamBackpressurePolicy::BlockWithDeadline { timeout_ms } => {
+            let deadline = checked_stream_backpressure_deadline(timeout_ms)
+                .map_err(|_| StreamDeliveryFailureKind::Deadline)?;
+            match tokio::time::timeout_at(deadline.into(), tx.send(output)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(StreamDeliveryFailureKind::Delivery),
+                Err(_) => {
+                    record_engine_stream_backpressure();
+                    Err(StreamDeliveryFailureKind::Deadline)
+                }
+            }
+        }
+        StreamBackpressurePolicy::DropNewest => {
+            let is_final = output.is_final;
+            match tx.try_send(output) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(StreamDeliveryFailureKind::Delivery)
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    record_engine_stream_backpressure();
+                    if is_final {
+                        Err(StreamDeliveryFailureKind::Delivery)
+                    } else {
+                        Ok(())
+                    }
                 }
             }
         }
@@ -78,18 +293,16 @@ impl<'a> StreamSink<'a> {
 }
 
 impl NativeExecutor {
-    pub(super) fn stream_sender(
-        request: &EngineCoreRequest,
-    ) -> Option<mpsc::Sender<StreamingOutput>> {
+    pub(super) fn stream_sender(request: &EngineCoreRequest) -> Option<StreamStagingBuffer> {
         if request.streaming {
-            request.streaming_tx.clone()
+            Some(request.stream_staging_buffer())
         } else {
             None
         }
     }
 
     pub(super) fn stream_text(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         request_id: &str,
         sequence: &mut usize,
         text: String,
@@ -104,28 +317,33 @@ impl NativeExecutor {
     }
 
     pub(super) fn stream_text_with_policy(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
         request_id: &str,
         sequence: &mut usize,
         text: String,
     ) -> Result<()> {
-        StreamSink::with_policy(tx, policy).send(StreamingOutput {
-            request_id: request_id.to_string(),
-            sequence: *sequence,
-            samples: Vec::new(),
-            sample_rate: 0,
-            is_final: false,
-            text: Some(text),
-            stats: None,
-            asr_progress: None,
-        })?;
-        *sequence += 1;
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples: Vec::new(),
+                sample_rate: 0,
+                is_final: false,
+                text: Some(text),
+                stats: None,
+                asr_progress: None,
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
         Ok(())
     }
 
     pub(super) fn stream_text_per_character(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         request_id: &str,
         sequence: &mut usize,
         text: &str,
@@ -140,7 +358,7 @@ impl NativeExecutor {
     }
 
     pub(super) fn stream_text_per_character_with_policy(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
         request_id: &str,
         sequence: &mut usize,
@@ -157,7 +375,7 @@ impl NativeExecutor {
     }
 
     pub(super) fn stream_audio(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         request_id: &str,
         sequence: &mut usize,
         samples: Vec<f32>,
@@ -176,7 +394,7 @@ impl NativeExecutor {
     }
 
     pub(super) fn stream_audio_with_policy(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
         request_id: &str,
         sequence: &mut usize,
@@ -184,43 +402,53 @@ impl NativeExecutor {
         sample_rate: u32,
         is_final: bool,
     ) -> Result<()> {
-        StreamSink::with_policy(tx, policy).send(StreamingOutput {
-            request_id: request_id.to_string(),
-            sequence: *sequence,
-            samples,
-            sample_rate,
-            is_final,
-            text: None,
-            stats: None,
-            asr_progress: None,
-        })?;
-        *sequence += 1;
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples,
+                sample_rate,
+                is_final,
+                text: None,
+                stats: None,
+                asr_progress: None,
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
         Ok(())
     }
 
     pub(super) fn stream_asr_progress_with_policy(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
         request_id: &str,
         sequence: &mut usize,
         progress: AsrProgress,
     ) -> Result<()> {
-        StreamSink::with_policy(tx, policy).send(StreamingOutput {
-            request_id: request_id.to_string(),
-            sequence: *sequence,
-            samples: Vec::new(),
-            sample_rate: 0,
-            is_final: false,
-            text: None,
-            stats: None,
-            asr_progress: Some(progress),
-        })?;
-        *sequence += 1;
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples: Vec::new(),
+                sample_rate: 0,
+                is_final: false,
+                text: None,
+                stats: None,
+                asr_progress: Some(progress),
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
         Ok(())
     }
 
     pub(super) fn stream_final_marker(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         request_id: &str,
         sequence: &mut usize,
     ) -> Result<()> {
@@ -233,7 +461,7 @@ impl NativeExecutor {
     }
 
     pub(super) fn stream_final_marker_with_policy(
-        tx: &mpsc::Sender<StreamingOutput>,
+        tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
         request_id: &str,
         sequence: &mut usize,
@@ -260,21 +488,128 @@ fn stream_send_error(err: mpsc::error::TrySendError<StreamingOutput>) -> Error {
 mod tests {
     use tokio::sync::mpsc;
 
+    use crate::backends::BackendKind;
     use crate::engine::executor::NativeExecutor;
     use crate::engine::output::StreamingOutput;
-    use crate::error::Error;
+    use crate::engine::request::{
+        StreamProgressBudget, StreamStagingBuffer, STREAM_PROGRESS_MAX_BUFFERED_BYTES,
+    };
+    use crate::engine::{
+        AdapterAbiRevision, AdapterInstanceId, BatchId, BatchLaneKey, ExecutionGroupId,
+        ModelInstanceId, OutputVisibility, SessionKey, StageId,
+    };
 
-    use super::{StreamBackpressurePolicy, StreamSink};
+    use super::{
+        deliver_committed_streams, CommittedStreamDelivery, IncrementalStreamDeliveryWorkers,
+        StreamBackpressurePolicy, StreamDeliveryFailure, StreamDeliveryFailureKind,
+    };
+
+    fn output(request_id: &str, sequence: usize) -> StreamingOutput {
+        StreamingOutput {
+            request_id: request_id.to_string(),
+            sequence,
+            samples: vec![0.0],
+            sample_rate: 24_000,
+            is_final: false,
+            text: None,
+            stats: None,
+            asr_progress: None,
+        }
+    }
+
+    fn lane() -> BatchLaneKey {
+        BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(7),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "none".to_string(),
+            tensor_layout: "exact".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "none".to_string(),
+            kernel_mode: "compatibility".to_string(),
+            semantic_mode: "chat".to_string(),
+            shape_bucket: "exact.1".to_string(),
+        }
+    }
 
     #[test]
-    fn stream_text_per_character_emits_one_delta_per_character() {
+    fn incremental_binding_routes_nonterminal_output_and_stages_final() {
+        let staging = StreamStagingBuffer::default();
+        let (progress_tx, mut progress_rx) = mpsc::channel(4);
+        let session = SessionKey::new("req-1".to_string(), 7);
+        let guard = staging
+            .bind_quantum(
+                BatchId::new(9),
+                lane(),
+                11,
+                session.clone(),
+                OutputVisibility::IncrementalCommitted,
+                progress_tx,
+                StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES),
+            )
+            .expect("incremental binding");
+        let mut sequence = 0usize;
+
+        NativeExecutor::stream_text(&staging, "req-1", &mut sequence, "hello".to_string())
+            .expect("progress output");
+        NativeExecutor::stream_final_marker(&staging, "req-1", &mut sequence)
+            .expect("final marker");
+
+        let progress = progress_rx.try_recv().expect("incremental progress");
+        assert_eq!(progress.batch_id, BatchId::new(9));
+        assert_eq!(progress.plan_id, 11);
+        assert_eq!(progress.session, session);
+        assert_eq!(progress.output.sequence, 0);
+        assert_eq!(progress.output.text.as_deref(), Some("hello"));
+        assert!(!progress.output.is_final);
+        assert!(progress_rx.try_recv().is_err());
+
+        let staged = staging.take().expect("staged final");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].sequence, 1);
+        assert!(staged[0].is_final);
+
+        drop(guard);
+        NativeExecutor::stream_text(&staging, "req-1", &mut sequence, "later".to_string())
+            .expect("post-binding staged output");
+        assert_eq!(
+            staging.take().expect("post-binding staging")[0]
+                .text
+                .as_deref(),
+            Some("later")
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_text_is_invisible_until_committed_delivery() {
+        let staging = StreamStagingBuffer::default();
         let (tx, mut rx) = mpsc::channel(8);
         let mut sequence = 0usize;
 
-        NativeExecutor::stream_text_per_character(&tx, "req-1", &mut sequence, "abé")
+        NativeExecutor::stream_text_per_character(&staging, "req-1", &mut sequence, "abé")
             .expect("stream should succeed");
 
         assert_eq!(sequence, 3);
+        assert!(
+            rx.try_recv().is_err(),
+            "staged output escaped before commit"
+        );
+
+        let session = SessionKey::new("req-1".to_string(), 7);
+        let failed = deliver_committed_streams(vec![CommittedStreamDelivery::new(
+            session,
+            tx,
+            StreamBackpressurePolicy::FailOnFull,
+            staging.take().expect("staged events"),
+        )])
+        .await;
+        assert!(failed.is_empty());
 
         let first = rx.try_recv().expect("missing first chunk");
         assert_eq!(first.sequence, 0);
@@ -291,107 +626,179 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn stream_sink_fail_on_full_preserves_current_backpressure_behavior() {
-        let (tx, _rx) = mpsc::channel(1);
-        let sink = StreamSink::fail_on_full(&tx);
-        assert_eq!(sink.policy(), StreamBackpressurePolicy::FailOnFull);
+    #[tokio::test]
+    async fn blocked_row_does_not_delay_peer_delivery() {
+        let first = SessionKey::new("full".to_string(), 1);
+        let second = SessionKey::new("open".to_string(), 2);
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        full_tx.try_send(output("full", 0)).expect("prefill queue");
+        let (open_tx, mut open_rx) = mpsc::channel(1);
 
-        sink.send(StreamingOutput {
-            request_id: "req-1".to_string(),
-            sequence: 0,
-            samples: vec![0.0],
-            sample_rate: 24_000,
-            is_final: false,
-            text: None,
-            stats: None,
-            asr_progress: None,
-        })
-        .expect("first chunk should fit");
+        let deliveries = tokio::spawn(deliver_committed_streams(vec![
+            CommittedStreamDelivery::new(
+                first.clone(),
+                full_tx,
+                StreamBackpressurePolicy::BlockWithDeadline { timeout_ms: 100 },
+                vec![output("full", 1)],
+            ),
+            CommittedStreamDelivery::new(
+                second,
+                open_tx,
+                StreamBackpressurePolicy::FailOnFull,
+                vec![output("open", 0)],
+            ),
+        ]));
 
-        let err = sink
-            .send(StreamingOutput {
-                request_id: "req-1".to_string(),
-                sequence: 1,
-                samples: vec![0.0],
-                sample_rate: 24_000,
-                is_final: false,
-                text: None,
-                stats: None,
-                asr_progress: None,
-            })
-            .expect_err("full queue should fail with default policy");
+        let peer = tokio::time::timeout(std::time::Duration::from_millis(50), open_rx.recv())
+            .await
+            .expect("blocked row delayed its peer")
+            .expect("peer stream closed");
+        assert_eq!(peer.request_id, "open");
+        let failed = deliveries.await.expect("delivery task");
 
-        let Error::InferenceError(message) = err else {
-            panic!("expected inference error for stream backpressure");
-        };
-        assert!(message.contains("backpressure"));
-    }
-
-    #[test]
-    fn stream_sink_lossy_policies_drop_when_queue_is_full() {
-        let (tx, _rx) = mpsc::channel(1);
-        let sink = StreamSink::with_policy(&tx, StreamBackpressurePolicy::DropNewest);
-
-        sink.send(StreamingOutput {
-            request_id: "req-1".to_string(),
-            sequence: 0,
-            samples: vec![0.0],
-            sample_rate: 24_000,
-            is_final: false,
-            text: None,
-            stats: None,
-            asr_progress: None,
-        })
-        .expect("first chunk should fit");
-
-        sink.send(StreamingOutput {
-            request_id: "req-1".to_string(),
-            sequence: 1,
-            samples: vec![0.0],
-            sample_rate: 24_000,
-            is_final: false,
-            text: None,
-            stats: None,
-            asr_progress: None,
-        })
-        .expect("lossy policy should drop full-queue chunk");
-    }
-
-    #[test]
-    fn stream_sink_block_with_deadline_times_out_truthfully() {
-        let (tx, _rx) = mpsc::channel(1);
-        let sink = StreamSink::with_policy(
-            &tx,
-            StreamBackpressurePolicy::BlockWithDeadline { timeout_ms: 5 },
+        assert_eq!(
+            failed,
+            vec![StreamDeliveryFailure {
+                session: first,
+                kind: StreamDeliveryFailureKind::Deadline,
+            }]
         );
-        sink.send(StreamingOutput {
-            request_id: "req-1".to_string(),
-            sequence: 0,
-            samples: vec![0.0],
-            sample_rate: 24_000,
-            is_final: false,
-            text: None,
-            stats: None,
-            asr_progress: None,
-        })
-        .expect("first chunk should fit");
+    }
+
+    #[tokio::test]
+    async fn incremental_workers_preserve_row_order_without_cross_row_blocking() {
+        let blocked = SessionKey::new("blocked".to_string(), 1);
+        let open = SessionKey::new("open".to_string(), 2);
+        let (blocked_tx, _blocked_rx) = mpsc::channel(1);
+        blocked_tx
+            .try_send(output("blocked", 0))
+            .expect("prefill blocked queue");
+        let (open_tx, mut open_rx) = mpsc::channel(2);
+        let terminal_tx = open_tx.clone();
+        let (mut workers, mut failures) = IncrementalStreamDeliveryWorkers::new();
+        workers
+            .enqueue(CommittedStreamDelivery::new(
+                blocked.clone(),
+                blocked_tx,
+                StreamBackpressurePolicy::BlockWithDeadline { timeout_ms: 100 },
+                vec![output("blocked", 1)],
+            ))
+            .unwrap();
+        workers
+            .enqueue(CommittedStreamDelivery::new(
+                open.clone(),
+                open_tx.clone(),
+                StreamBackpressurePolicy::FailOnFull,
+                vec![output("open", 0)],
+            ))
+            .unwrap();
+        workers
+            .enqueue(CommittedStreamDelivery::new(
+                open,
+                open_tx,
+                StreamBackpressurePolicy::FailOnFull,
+                vec![output("open", 1)],
+            ))
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_millis(50), open_rx.recv())
+            .await
+            .expect("blocked row delayed open worker")
+            .expect("open worker closed");
+        let second = tokio::time::timeout(std::time::Duration::from_millis(50), open_rx.recv())
+            .await
+            .expect("ordered peer output was delayed")
+            .expect("open worker closed");
+        assert_eq!((first.sequence, second.sequence), (0, 1));
 
         let started = std::time::Instant::now();
-        let error = sink
-            .send(StreamingOutput {
-                request_id: "req-1".to_string(),
-                sequence: 1,
-                samples: vec![0.0],
-                sample_rate: 24_000,
-                is_final: false,
-                text: None,
-                stats: None,
-                asr_progress: None,
-            })
-            .expect_err("deadline policy must fail after its bounded wait");
+        let barrier_failures = workers.finish().await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "blocked row held the physical commit barrier"
+        );
+        assert_eq!(
+            barrier_failures,
+            vec![StreamDeliveryFailure {
+                session: blocked,
+                kind: StreamDeliveryFailureKind::Deadline,
+            }]
+        );
+        assert!(failures.try_recv().is_err());
+
+        let mut terminal = output("open", 2);
+        terminal.is_final = true;
+        let terminal_delivery = tokio::spawn(deliver_committed_streams(vec![
+            CommittedStreamDelivery::new(
+                SessionKey::new("open".to_string(), 2),
+                terminal_tx,
+                StreamBackpressurePolicy::FailOnFull,
+                vec![terminal],
+            ),
+        ]));
+        let terminal = tokio::time::timeout(std::time::Duration::from_millis(50), open_rx.recv())
+            .await
+            .expect("blocked row delayed the peer terminal marker")
+            .expect("peer stream closed before its terminal marker");
+        assert!(terminal.is_final);
+        assert!(terminal_delivery
+            .await
+            .expect("terminal delivery task")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_blocking_delivery_uses_async_deadline() {
+        let session = SessionKey::new("req-1".to_string(), 1);
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(output("req-1", 0)).expect("prefill queue");
+        let started = std::time::Instant::now();
+        let failed = deliver_committed_streams(vec![CommittedStreamDelivery::new(
+            session.clone(),
+            tx,
+            StreamBackpressurePolicy::BlockWithDeadline { timeout_ms: 5 },
+            vec![output("req-1", 1)],
+        )])
+        .await;
 
         assert!(started.elapsed() >= std::time::Duration::from_millis(5));
-        assert!(error.to_string().contains("backpressure"));
+        assert_eq!(
+            failed,
+            vec![StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Deadline,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_newest_never_silently_drops_the_final_marker() {
+        let session = SessionKey::new("req-final".to_string(), 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(output("req-final", 0))
+            .expect("prefill downstream queue");
+        let mut final_output = output("req-final", 1);
+        final_output.is_final = true;
+
+        let failed = deliver_committed_streams(vec![CommittedStreamDelivery::new(
+            session.clone(),
+            tx,
+            StreamBackpressurePolicy::DropNewest,
+            vec![final_output],
+        )])
+        .await;
+
+        assert_eq!(
+            failed,
+            vec![StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Delivery,
+            }]
+        );
+        assert_eq!(
+            rx.recv().await.expect("queued non-final output").sequence,
+            0
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

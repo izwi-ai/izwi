@@ -28,6 +28,7 @@ mod cache;
 mod config;
 mod core;
 pub mod execution;
+mod execution_group;
 mod executor;
 mod kv_cache;
 mod metal_kv_cache;
@@ -42,27 +43,45 @@ mod types;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
-    BatchDispatch, BatchDispatchKind, BatchKey, CacheMode, CancellationGranularity,
-    ConcurrencyClass, ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode,
+    AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
+    BatchDispatchKind, BatchId, BatchKey, BatchLaneKey, CacheMode, CancellationGranularity,
+    ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionAdapterBinding, ExecutionCapabilities,
+    ExecutionDisposition, ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode,
     ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
-    FailureKind, FailureScope, FinishReason, HealthImpact, InputRange, NativeBatchMode, PlanId,
-    PrefillMode, RetryDisposition, SequencePhase, SessionEpoch, SessionKey, TerminalOutcome,
-    WorkUnit, YieldReason,
+    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, InputRange,
+    MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility,
+    PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, PrefillMode, ReadyQuantum,
+    RetryDisposition, SequencePhase, SessionEpoch, SessionKey, StageDescriptor, StageId,
+    StageProgressKind, StageShapePolicy, StageWorkSelector, StateDisposition, TerminalOutcome,
+    WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
-    WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
+    PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult, WorkerConfig,
+    REQUEST_DEADLINE_EXCEEDED,
 };
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
     PinnedBlockHandle,
 };
 pub use metrics::{
-    engine_metric_catalog, engine_request_parallel_batches_total, engine_stream_backpressure_total,
+    engine_batch_metrics_snapshot, engine_metric_catalog, engine_request_parallel_batches_total,
+    engine_stream_backpressure_total, engine_stream_metrics_snapshot,
     engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
-    prometheus_engine_metric_type, BenchmarkResult, EngineMetricDescriptor, MetricsCollector,
-    MetricsSnapshot, ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
+    prometheus_engine_metric_type, BenchmarkResult, EngineBatchMetricsSnapshot,
+    EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
+    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineStreamMetricsSnapshot,
+    EngineWorkspaceDomainMetricsSnapshot, MetricsCollector, MetricsSnapshot,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
+    ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL, ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
+    ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
     ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
     ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
     ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
@@ -72,7 +91,8 @@ pub use metrics::{
     ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
     ENGINE_SCHEDULER_PREEMPTIONS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
+    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
@@ -80,9 +100,10 @@ pub use request::{
     EngineStreamPolicy, EngineTask, RequestProcessor, RequestStatus, TtsEngineInput, WorkloadClass,
 };
 pub use resources::{
-    CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
-    ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceAuthoritySnapshot,
-    ResourceEstimate, ResourceLease, ResourceLedger, ResourceReservation, ResourceVector,
+    BatchWorkspaceLease, CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
+    ReservationClass, ReservationId, ReservationOwner, ResourceAmount, ResourceAuthority,
+    ResourceAuthoritySnapshot, ResourceEstimate, ResourceLease, ResourceLedger,
+    ResourceReservation, ResourceVector,
 };
 pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy};
 pub use types::FinishReason as OutputFinishReason;
@@ -98,7 +119,7 @@ use crate::models::registry::{ChatModelLease, ModelRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot, Notify, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Main inference engine - the primary interface for audio generation.
@@ -166,10 +187,12 @@ impl Drop for CompletionRegistration<'_> {
             return;
         };
         let core = Arc::downgrade(&self.engine.core);
+        let step_gate = self.engine.step_gate.clone();
         let controls = self.engine.request_controls.clone();
         let wake_notify = self.engine.wake_notify.clone();
         handle.spawn(async move {
             let initial_delay = {
+                let _step = step_gate.lock().await;
                 let Some(core) = core.upgrade() else {
                     return;
                 };
@@ -194,6 +217,7 @@ impl Drop for CompletionRegistration<'_> {
             let mut retry_delay = initial_delay;
             while let Some(delay) = retry_delay {
                 tokio::time::sleep(delay).await;
+                let _step = step_gate.lock().await;
                 retry_delay = {
                     let Some(core) = core.upgrade() else {
                         return;
@@ -209,6 +233,9 @@ impl Drop for CompletionRegistration<'_> {
 pub struct Engine {
     /// Engine core handles the actual inference loop
     core: Arc<RwLock<EngineCore>>,
+    /// Serializes one complete prepare/execute/commit transaction without
+    /// keeping the mutable engine state locked during device execution.
+    step_gate: Arc<Mutex<()>>,
     /// Request processor validates and preprocesses inputs
     request_processor: RequestProcessor,
     /// Output processor formats results for clients
@@ -231,6 +258,252 @@ pub struct Engine {
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
     /// Distinguishes a cancelled registration from a later reuse of the public ID.
     next_completion_registration: std::sync::atomic::AtomicU64,
+}
+
+/// Cloneable state for one owned engine transaction. The task holding this
+/// context is intentionally detached from the caller's future so cancellation
+/// cannot interrupt the prepare/execute/commit sequence.
+struct OwnedStepContext {
+    core: Arc<RwLock<EngineCore>>,
+    step_gate: Arc<Mutex<()>>,
+    metrics: Arc<RwLock<EngineMetrics>>,
+    request_controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
+    completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
+}
+
+impl OwnedStepContext {
+    fn take_completion_sender(
+        &self,
+        session: &SessionKey,
+    ) -> Option<oneshot::Sender<EngineOutput>> {
+        let mut mailboxes = self
+            .completion_mailboxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let owns_session = mailboxes
+            .get(&session.request_id)
+            .is_some_and(|mailbox| mailbox.session_epoch == Some(session.epoch));
+        owns_session
+            .then(|| mailboxes.remove(&session.request_id))
+            .flatten()
+            .map(|mailbox| mailbox.sender)
+    }
+
+    fn cancel_failed_stream(&self, failure: &executor::StreamDeliveryFailure) {
+        let controls = self
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(control) = controls.get(&failure.session.request_id) {
+            if control.session_epoch == failure.session.epoch {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    async fn commit_incremental_progress(
+        &self,
+        progress: request::FencedStreamProgress,
+    ) -> std::result::Result<executor::CommittedStreamDelivery, executor::StreamDeliveryFailure>
+    {
+        let session = progress.session.clone();
+        match {
+            let mut core = self.core.write().await;
+            core.commit_incremental_stream_progress(progress)
+        } {
+            Ok(delivery) => Ok(delivery),
+            Err(error) => {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    error = %error,
+                    "Rejecting invalid incremental stream progress"
+                );
+                Err(executor::StreamDeliveryFailure {
+                    session,
+                    kind: error.kind,
+                })
+            }
+        }
+    }
+
+    fn record_stream_failure(
+        &self,
+        failure: executor::StreamDeliveryFailure,
+        failures: &mut HashMap<SessionKey, executor::StreamDeliveryFailure>,
+        deliveries: &mut executor::IncrementalStreamDeliveryWorkers,
+    ) {
+        self.cancel_failed_stream(&failure);
+        deliveries.abandon_session(&failure.session);
+        failures.entry(failure.session.clone()).or_insert(failure);
+    }
+
+    async fn enqueue_incremental_progress(
+        &self,
+        progress: request::FencedStreamProgress,
+        failures: &mut HashMap<SessionKey, executor::StreamDeliveryFailure>,
+        deliveries: &mut executor::IncrementalStreamDeliveryWorkers,
+    ) {
+        if failures.contains_key(&progress.session) {
+            return;
+        }
+        let result = match self.commit_incremental_progress(progress).await {
+            Ok(delivery) => deliveries.enqueue(delivery),
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = result {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+    }
+
+    async fn execute_prepared(
+        &self,
+        prepared: execution_group::PreparedEngineStep,
+    ) -> Result<execution_group::ExecutedEngineStep> {
+        let (progress_tx, mut progress_rx) = mpsc::channel(request::STREAM_PROGRESS_QUEUE_CAPACITY);
+        let progress_budget =
+            request::StreamProgressBudget::new(request::STREAM_PROGRESS_MAX_BUFFERED_BYTES);
+        let mut runner = tokio::spawn(execution_group::ExecutionGroupRunner::execute(
+            prepared,
+            progress_tx,
+            progress_budget,
+        ));
+        let (mut deliveries, mut delivery_failures) =
+            executor::IncrementalStreamDeliveryWorkers::new();
+        let mut failures = HashMap::new();
+        let mut progress_closed = false;
+        let mut delivery_failures_closed = false;
+
+        let mut executed = loop {
+            tokio::select! {
+                result = &mut runner => {
+                    break match result {
+                        Ok(executed) => executed,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(error) => {
+                            return Err(Error::InferenceError(format!(
+                                "execution group task was cancelled: {error}"
+                            )));
+                        }
+                    };
+                }
+                progress = progress_rx.recv(), if !progress_closed => {
+                    match progress {
+                        Some(progress) => {
+                            self.enqueue_incremental_progress(
+                                progress,
+                                &mut failures,
+                                &mut deliveries,
+                            ).await;
+                        }
+                        None => progress_closed = true,
+                    }
+                }
+                failure = delivery_failures.recv(), if !delivery_failures_closed => {
+                    match failure {
+                        Some(failure) => self.record_stream_failure(
+                            failure,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => delivery_failures_closed = true,
+                    }
+                }
+            }
+        };
+
+        while let Some(progress) = progress_rx.recv().await {
+            self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries)
+                .await;
+        }
+        let barrier_failures = deliveries.finish().await;
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        for failure in barrier_failures {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        let failures = failures.into_values().collect::<Vec<_>>();
+        executed.apply_stream_delivery_failures(&failures);
+        Ok(executed)
+    }
+
+    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
+        let _step = self.step_gate.lock().await;
+        let prepared = {
+            let mut core = self.core.write().await;
+            core.prepare_step().await?
+        };
+        let executed = match prepared {
+            Some(prepared) => Some(self.execute_prepared(prepared).await?),
+            None => None,
+        };
+        let (mut outputs, stream_deliveries) = {
+            let mut core = self.core.write().await;
+            match executed {
+                Some(executed) => {
+                    let committed = core.commit_step(executed).await?;
+                    (committed.outputs, committed.stream_deliveries)
+                }
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
+        if !failed_streams.is_empty() {
+            let mut core = self.core.write().await;
+            core.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
+                .await;
+        }
+
+        // Keep every await before terminal dispatch. Once a completion sender
+        // is notified, routing and exact-session acknowledgement finish
+        // synchronously inside this owned transaction.
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_steps += 1;
+            metrics.requests_processed += outputs.len() as u64;
+        }
+
+        let mut core = self.core.write().await;
+        for output in outputs.iter().filter(|output| output.is_finished) {
+            let session = SessionKey::new(output.request_id.clone(), output.sequence_id);
+            let routed_to_mailbox = if let Some(sender) = self.take_completion_sender(&session) {
+                let _ = sender.send(output.clone());
+                true
+            } else {
+                false
+            };
+
+            if (routed_to_mailbox || !defer_unregistered_terminal_ack)
+                && !core.acknowledge_terminal_output(&session)
+            {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    "Terminal output had no matching delivery fence"
+                );
+            }
+
+            let mut controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if controls
+                .get(&output.request_id)
+                .is_some_and(|control| control.session_epoch == output.sequence_id)
+            {
+                controls.remove(&output.request_id);
+            }
+        }
+
+        Ok(outputs)
+    }
 }
 
 impl Engine {
@@ -285,6 +558,7 @@ impl Engine {
 
         Ok(Self {
             core: Arc::new(RwLock::new(core)),
+            step_gate: Arc::new(Mutex::new(())),
             request_processor,
             output_processor,
             config,
@@ -357,23 +631,6 @@ impl Engine {
             .filter(|mailbox| mailbox.registration_id == registration_id)
             .expect("completion registration must remain live while its request is admitted");
         mailbox.session_epoch = Some(session_epoch);
-    }
-
-    fn take_completion_sender(
-        &self,
-        session: &SessionKey,
-    ) -> Option<oneshot::Sender<EngineOutput>> {
-        let mut mailboxes = self
-            .completion_mailboxes
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let owns_session = mailboxes
-            .get(&session.request_id)
-            .is_some_and(|mailbox| mailbox.session_epoch == Some(session.epoch));
-        owns_session
-            .then(|| mailboxes.remove(&session.request_id))
-            .flatten()
-            .map(|mailbox| mailbox.sender)
     }
 
     fn resolve_generation_output(
@@ -851,62 +1108,21 @@ impl Engine {
         &self,
         defer_unregistered_terminal_ack: bool,
     ) -> Result<Vec<EngineOutput>> {
-        let mut core = self.core.write().await;
-        let outputs = core.step().await?;
-
-        // Keep every await before terminal dispatch. Once a completion sender
-        // is notified, routing and exact-session acknowledgement must finish
-        // synchronously so cancelling a competing generate future cannot leave
-        // the delivery half-committed.
+        let context = OwnedStepContext {
+            core: self.core.clone(),
+            step_gate: self.step_gate.clone(),
+            metrics: self.metrics.clone(),
+            request_controls: self.request_controls.clone(),
+            completion_mailboxes: self.completion_mailboxes.clone(),
+        };
+        match tokio::spawn(async move { context.run(defer_unregistered_terminal_ack).await }).await
         {
-            let mut metrics = self.metrics.write().await;
-            metrics.total_steps += 1;
-            metrics.requests_processed += outputs.len() as u64;
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(Error::InferenceError(format!(
+                "owned engine step task was cancelled: {error}"
+            ))),
         }
-
-        if outputs.iter().any(|output| output.is_finished) {
-            for output in &outputs {
-                if output.is_finished {
-                    let session = SessionKey::new(output.request_id.clone(), output.sequence_id);
-                    let routed_to_mailbox =
-                        if let Some(sender) = self.take_completion_sender(&session) {
-                            // A dropped receiver is a completed routing attempt: no
-                            // live caller remains, so the public ID must not stay
-                            // fenced forever.
-                            let _ = sender.send(output.clone());
-                            true
-                        } else {
-                            false
-                        };
-
-                    // Acknowledge only after the exact-session mailbox has been
-                    // routed (or the output has been placed in this step's
-                    // return batch for callers without a mailbox).
-                    if (routed_to_mailbox || !defer_unregistered_terminal_ack)
-                        && !core.acknowledge_terminal_output(&session)
-                    {
-                        warn!(
-                            request_id = %session.request_id,
-                            session_epoch = session.epoch,
-                            "Terminal output had no matching delivery fence"
-                        );
-                    }
-
-                    let mut controls = self
-                        .request_controls
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    let owns_output = controls
-                        .get(&output.request_id)
-                        .is_some_and(|control| control.session_epoch == output.sequence_id);
-                    if owns_output {
-                        controls.remove(&output.request_id);
-                    }
-                }
-            }
-        }
-
-        Ok(outputs)
     }
 
     /// Confirm delivery after an outer dispatcher has attempted to route a
@@ -1005,6 +1221,7 @@ impl Engine {
                 .cancellation
                 .store(true, std::sync::atomic::Ordering::Release);
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_request(request_id).await;
         drop(core);
@@ -1060,6 +1277,7 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_request_session(session).await;
         drop(core);
@@ -1095,6 +1313,7 @@ impl Engine {
                 }
             }
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_requests_for_variant(variant).await;
         self.request_controls
@@ -1109,6 +1328,7 @@ impl Engine {
 
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
+        let _step = self.step_gate.lock().await;
         self.core.write().await.purge_model_cache(variant).await
     }
 
@@ -1125,6 +1345,7 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        let _step = self.step_gate.lock().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_all_requests().await;
         self.request_controls
@@ -1269,6 +1490,11 @@ mod tests {
 
             self.max_batch_width
                 .fetch_max(scheduled.len(), Ordering::Relaxed);
+            let dispatch = if scheduled.len() > 1 {
+                BatchDispatch::new(BatchDispatchKind::TensorStatic, scheduled.len())
+            } else {
+                BatchDispatch::serial()
+            };
             scheduled
                 .iter()
                 .map(|entry| {
@@ -1287,10 +1513,7 @@ mod tests {
                             error: None,
                         },
                     )
-                    .with_dispatch(BatchDispatch::new(
-                        BatchDispatchKind::TensorStatic,
-                        scheduled.len(),
-                    ))
+                    .with_dispatch(dispatch)
                 })
                 .collect()
         }
@@ -1345,6 +1568,218 @@ mod tests {
         }
     }
 
+    struct BlockingForwardExecutor {
+        entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    struct IncrementalBlockingExecutor {
+        emitted: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        variant: ModelVariant,
+    }
+
+    impl IncrementalBlockingExecutor {
+        fn execute(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            let request = requests
+                .first()
+                .copied()
+                .ok_or_else(|| Error::InferenceError("missing test request".to_string()))?;
+            let scheduled = scheduled
+                .first()
+                .ok_or_else(|| Error::InferenceError("missing test schedule".to_string()))?;
+            let staging = request.stream_staging_buffer();
+            if !staging.has_incremental_binding() {
+                return Err(Error::InferenceError(
+                    "test request was not bound for incremental publication".to_string(),
+                ));
+            }
+            staging.push_with_policy(
+                StreamingOutput {
+                    request_id: request.id.clone(),
+                    sequence: 0,
+                    samples: Vec::new(),
+                    sample_rate: 0,
+                    is_final: false,
+                    text: Some("first delta".to_string()),
+                    stats: None,
+                    asr_progress: None,
+                },
+                request.stream_policy,
+            )?;
+            if let Some(emitted) = self
+                .emitted
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = emitted.send(());
+            }
+
+            tokio::task::block_in_place(|| {
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            });
+
+            staging.push_with_policy(
+                StreamingOutput {
+                    request_id: request.id.clone(),
+                    sequence: 1,
+                    samples: Vec::new(),
+                    sample_rate: 0,
+                    is_final: true,
+                    text: None,
+                    stats: None,
+                    asr_progress: None,
+                },
+                request.stream_policy,
+            )?;
+            let mut result = ExecutorStepResult::new(
+                scheduled,
+                ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: None,
+                    text: Some("first delta".to_string()),
+                    input_transcription: None,
+                    tokens_processed: scheduled.num_tokens.max(1),
+                    tokens_generated: 1,
+                    finished: true,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                },
+            );
+            result.staged_stream_outputs = request.take_staged_stream_outputs()?;
+            Ok(vec![result])
+        }
+    }
+
+    impl ModelExecutor for IncrementalBlockingExecutor {
+        fn execution_profile(&self, _request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            Some(ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                Some(self.variant),
+                ExecutionMode::Atomic,
+            ))
+        }
+
+        fn execute_prefill(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.execute(requests, scheduled)
+        }
+
+        fn execute_decode(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.execute(requests, scheduled)
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_session(&self, _session: &SessionKey) -> CacheReleaseReport {
+            CacheReleaseReport::confirmed(1)
+        }
+    }
+
+    impl BlockingForwardExecutor {
+        fn execute(&self, scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = entered.send(());
+                let (released, wake) = self.release.as_ref();
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            }
+
+            scheduled
+                .iter()
+                .map(|entry| {
+                    ExecutorStepResult::new(
+                        entry,
+                        ExecutorOutput {
+                            request_id: entry.request_id.clone(),
+                            audio: None,
+                            text: Some("done".to_string()),
+                            input_transcription: None,
+                            tokens_processed: entry.num_tokens.max(1),
+                            tokens_generated: 1,
+                            finished: true,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+
+    impl ModelExecutor for BlockingForwardExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.execute(scheduled))
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(self.execute(scheduled))
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> executor::CacheReleaseReport {
+            executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
     fn immediate_terminal_request(id: &str) -> EngineCoreRequest {
         let mut request = EngineCoreRequest::tts(format!("terminal output for {id}"));
         request.id = id.to_string();
@@ -1361,6 +1796,7 @@ mod tests {
         .unwrap();
         Engine {
             core: Arc::new(RwLock::new(core)),
+            step_gate: Arc::new(Mutex::new(())),
             request_processor: RequestProcessor::new(config.clone()),
             output_processor: OutputProcessor::new(config.sample_rate),
             direct_request_preparation_permits: Arc::new(Semaphore::new(
@@ -1382,6 +1818,170 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_forward_does_not_hold_the_engine_state_lock() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            BlockingForwardExecutor {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+            },
+        )));
+        let request_id = "forward-lock-release".to_string();
+        engine
+            .core
+            .write()
+            .await
+            .add_request(immediate_terminal_request(&request_id))
+            .unwrap();
+
+        let stepping_engine = engine.clone();
+        let step = tokio::spawn(async move { stepping_engine.step().await });
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("executor did not enter the model forward")
+            .expect("executor entry signal was dropped");
+
+        let visible =
+            tokio::time::timeout(Duration::from_millis(100), engine.has_request(&request_id))
+                .await
+                .expect("model forward retained the engine state lock");
+        assert!(visible);
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let outputs = tokio::time::timeout(Duration::from_secs(1), step)
+            .await
+            .expect("engine step did not complete")
+            .expect("engine step task panicked")
+            .expect("engine step failed");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].request_id, request_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_atomic_delta_is_delivered_before_model_completion() {
+        let (emitted_tx, emitted_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            IncrementalBlockingExecutor {
+                emitted: std::sync::Mutex::new(Some(emitted_tx)),
+                release: release.clone(),
+                variant,
+            },
+        )));
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.prefill = PrefillMode::None;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(41),
+            "test.atomic.incremental",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(11),
+            model_instance_id: ModelInstanceId::new(12),
+            adapter_instance_id: AdapterInstanceId::new(13),
+            adapter_abi_revision: AdapterAbiRevision::new(8),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let mut request =
+            EngineCoreRequest::tts("stream while running").with_model_variant(variant);
+        request.id = "incremental-before-completion".to_string();
+        request.prompt_tokens = vec![1];
+        request.bind_execution_adapter(binding).unwrap();
+        request.streaming = true;
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        request.streaming_tx = Some(stream_tx);
+        engine.core.write().await.add_request(request).unwrap();
+
+        let stepping_engine = engine.clone();
+        let step = tokio::spawn(async move { stepping_engine.step().await });
+        let emitted = tokio::time::timeout(Duration::from_secs(1), emitted_rx).await;
+        let first = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv()).await;
+        let completed_early = step.is_finished();
+
+        // Always release the blocking fake before asserting so a failing
+        // temporal check cannot strand a Tokio worker during test teardown.
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+
+        let outputs = tokio::time::timeout(Duration::from_secs(1), step)
+            .await
+            .expect("engine step did not complete")
+            .expect("engine step task panicked")
+            .expect("engine step failed");
+        emitted
+            .expect("model did not emit its first delta")
+            .expect("model emission signal was dropped");
+        let first = first.unwrap_or_else(|error| {
+            panic!("delta remained buffered until model completion: {error}; outputs={outputs:?}")
+        });
+        let first = first.expect("stream closed before its first delta");
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.text.as_deref(), Some("first delta"));
+        assert!(!first.is_final);
+        assert!(!completed_early, "model completed before it was released");
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_finished);
+
+        let final_output = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("final marker was not delivered")
+            .expect("stream closed before its final marker");
+        assert_eq!(final_output.sequence, 1);
+        assert!(final_output.is_final);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_step_future_does_not_abandon_the_owned_transaction() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            BlockingForwardExecutor {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+            },
+        )));
+        let request_id = "cancelled-step-owner".to_string();
+        engine
+            .core
+            .write()
+            .await
+            .add_request(immediate_terminal_request(&request_id))
+            .unwrap();
+
+        let stepping_engine = engine.clone();
+        let caller = tokio::spawn(async move { stepping_engine.step().await });
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("executor did not enter the model forward")
+            .expect("executor entry signal was dropped");
+        caller.abort();
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.has_request(&request_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned step transaction did not finish after its caller was dropped");
+        assert!(engine.step().await.unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1680,7 +2280,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_dispatches_batched_terminal_outputs_to_registered_mailboxes() {
+    async fn run_routes_scalar_terminal_outputs_to_registered_mailboxes() {
         let max_batch_width = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = Arc::new(engine_with_test_executor(Box::new(
             ImmediateTerminalExecutor::new(max_batch_width.clone()),
@@ -1723,8 +2323,8 @@ mod tests {
         assert_eq!(second.request_id, "run-second");
         assert_eq!(
             max_batch_width.load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "run must route every output from the shared terminal batch"
+            1,
+            "unbound direct callers must remain on width-one compatibility execution"
         );
 
         // Exact-session acknowledgement happens after the mailboxes are routed,

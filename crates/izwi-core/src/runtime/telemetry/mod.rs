@@ -4,7 +4,10 @@ mod metrics;
 mod replay;
 mod tracing;
 
-pub(crate) use metrics::{push_engine_metric, push_engine_metric_f64, RuntimeTelemetryCollector};
+pub(crate) use metrics::{
+    push_engine_labeled_metric, push_engine_metric, push_engine_metric_f64,
+    RuntimeTelemetryCollector,
+};
 pub use metrics::{
     EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot,
     InferenceBrokerRuntimeTelemetrySnapshot, PipelineRuntimeTelemetrySnapshot, RuntimeLatencyStats,

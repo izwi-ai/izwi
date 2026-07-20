@@ -7,28 +7,46 @@
 //! - Output processing
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, BatchKey, CacheMode, ExecutionDisposition, ExecutionFailure, ExecutionMode,
-    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
-    FinishReason as ExecutionFinishReason, NativeBatchMode, PrefillMode, RetryDisposition,
-    WorkUnit,
+    AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
+    BatchLaneKey, CacheMode, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
+    ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
+    FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
+    OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
+    StageShapePolicy, WorkCost, WorkUnit,
 };
-#[cfg(test)]
+use super::execution_group::{
+    ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
+    PreparedExecutionBatch,
+};
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
-    CacheReleaseReport, ExecutorOutput, ExecutorStepResult, UnifiedExecutor, WorkerConfig,
+    deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
+    ExecutorStepResult, IncrementalStreamDeliveryWorkers, StreamDeliveryFailure,
+    StreamDeliveryFailureKind, UnifiedExecutor, WorkerConfig,
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
-use super::metrics::record_engine_batch_dispatch;
+use super::metrics::{
+    record_engine_execution_outcome, record_engine_physical_batch,
+    record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
+};
 use super::output::OutputProcessor;
-use super::request::{EngineCoreRequest, RequestStatus};
+use super::request::{
+    EngineCoreRequest, FencedStreamProgress, RequestStatus, StreamProgressBudget,
+    STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
+};
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
-use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
+use super::types::{
+    AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
+};
 use super::{ResourceAmount, ResourceVector};
 use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
 use crate::error::{Error, Result};
@@ -119,6 +137,155 @@ struct CommittedExecutorOutput {
     session: super::SessionKey,
     output: ExecutorOutput,
     disposition: ExecutionDisposition,
+    provenance: OutcomeProvenance,
+    staged_stream_outputs: Vec<super::output::StreamingOutput>,
+}
+
+pub(super) struct CommittedEngineStep {
+    pub(super) outputs: Vec<EngineOutput>,
+    pub(super) stream_deliveries: Vec<CommittedStreamDelivery>,
+}
+
+#[derive(Debug)]
+pub(super) struct StreamProgressRejection {
+    pub(super) kind: StreamDeliveryFailureKind,
+    message: String,
+}
+
+impl StreamProgressRejection {
+    fn invalid(message: impl Into<String>) -> Self {
+        record_engine_stream_checkpoint_rejection();
+        Self {
+            kind: StreamDeliveryFailureKind::InvalidProgress,
+            message: message.into(),
+        }
+    }
+
+    fn cancelled() -> Self {
+        record_engine_stream_checkpoint_rejection();
+        Self {
+            kind: StreamDeliveryFailureKind::Cancelled,
+            message: "stream progress request was cancelled".to_string(),
+        }
+    }
+
+    fn deadline() -> Self {
+        record_engine_stream_checkpoint_rejection();
+        Self {
+            kind: StreamDeliveryFailureKind::RequestDeadline,
+            message: "stream progress request deadline elapsed".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProgressRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+struct PhysicalBatchAssembly {
+    physical_batch: PhysicalBatch,
+    requests: Vec<Arc<EngineCoreRequest>>,
+    scheduled: Vec<super::scheduler::ScheduledRequest>,
+    output_visibility: super::OutputVisibility,
+    shape_policy: StageShapePolicy,
+    workspace_base_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ActiveStreamBatch {
+    lane: BatchLaneKey,
+    output_visibility: OutputVisibility,
+    rows: HashMap<u64, super::SessionKey>,
+}
+
+impl PhysicalBatchAssembly {
+    fn materialized_tensor_elements(
+        shape_policy: StageShapePolicy,
+        rows: &[ReadyQuantum],
+    ) -> Option<u64> {
+        if shape_policy == StageShapePolicy::Padded {
+            let maximum = rows.iter().map(|row| row.cost.tensor_elements).max()?;
+            maximum.checked_mul(u64::try_from(rows.len()).ok()?)
+        } else {
+            rows.iter().try_fold(0u64, |total, row| {
+                total.checked_add(row.cost.tensor_elements)
+            })
+        }
+    }
+
+    fn workspace_resources(
+        backend: BackendKind,
+        base_bytes: u64,
+        rows: &[ReadyQuantum],
+    ) -> Option<ResourceVector> {
+        let generic = rows.iter().try_fold(
+            ResourceVector {
+                temporary_bytes: ResourceAmount::Known(base_bytes),
+                ..ResourceVector::zero()
+            },
+            |total, row| total.checked_add(row.cost.workspace).ok(),
+        )?;
+        if generic.kv_bytes != ResourceAmount::Known(0)
+            || generic.compute_slots != ResourceAmount::Known(0)
+        {
+            return None;
+        }
+        let known = |amount| match amount {
+            ResourceAmount::Known(value) => Some(value),
+            ResourceAmount::Unknown => None,
+        };
+        let host = known(generic.host_bytes)?;
+        let accelerator = known(generic.device_bytes)?
+            .checked_add(known(generic.unified_bytes)?)?
+            .checked_add(known(generic.temporary_bytes)?)?;
+        let mut workspace = ResourceVector::zero();
+        match backend {
+            BackendKind::Cpu => {
+                workspace.host_bytes = ResourceAmount::Known(host.checked_add(accelerator)?)
+            }
+            BackendKind::Metal => {
+                workspace.unified_bytes = ResourceAmount::Known(host.checked_add(accelerator)?)
+            }
+            BackendKind::Cuda => {
+                workspace.host_bytes = ResourceAmount::Known(host);
+                workspace.device_bytes = ResourceAmount::Known(accelerator);
+            }
+        }
+        Some(workspace)
+    }
+
+    fn try_push(
+        &mut self,
+        request: Arc<EngineCoreRequest>,
+        scheduled: super::scheduler::ScheduledRequest,
+        row: ReadyQuantum,
+    ) -> bool {
+        let mut candidate = self.physical_batch.clone();
+        candidate.rows.push(row);
+        let Some(materialized) =
+            Self::materialized_tensor_elements(self.shape_policy, &candidate.rows)
+        else {
+            return false;
+        };
+        let Some(workspace) = Self::workspace_resources(
+            candidate.lane.backend,
+            self.workspace_base_bytes,
+            &candidate.rows,
+        ) else {
+            return false;
+        };
+        candidate.materialized_tensor_elements = materialized;
+        candidate.workspace = workspace;
+        if candidate.validate().is_err() {
+            return false;
+        }
+        self.physical_batch = candidate;
+        self.requests.push(request);
+        self.scheduled.push(scheduled);
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,7 +350,7 @@ pub struct EngineCore {
     /// Output processor
     output_processor: OutputProcessor,
     /// Active requests (by ID)
-    requests: HashMap<RequestId, EngineCoreRequest>,
+    requests: HashMap<RequestId, Arc<EngineCoreRequest>>,
     /// Request start times (for timing)
     request_start_times: HashMap<RequestId, Instant>,
     /// Per-request phase timing accumulated by scheduler steps.
@@ -192,6 +359,12 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
+    /// Exact physical envelopes allowed to publish pre-quantum progress.
+    active_stream_batches: HashMap<BatchId, ActiveStreamBatch>,
+    /// Next sequence number accepted for each exact streaming session.
+    stream_sequence_cursors: HashMap<super::SessionKey, usize>,
+    /// Sessions that have committed progress before their physical quantum.
+    incremental_stream_sessions: HashSet<super::SessionKey>,
     /// Durable typed terminal events created outside a committed executor
     /// result (for example cancellation, deadline expiry, or failed
     /// preemption) and delivered by the next successful engine step.
@@ -203,16 +376,110 @@ pub struct EngineCore {
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
     maintenance_steps: u64,
+    /// Monotonic identity for physical dispatch envelopes.
+    next_batch_id: u64,
 }
 
 impl EngineCore {
+    fn force_scalar_execution(mut profile: ExecutionProfile) -> ExecutionProfile {
+        profile.prefill_batch = NativeBatchMode::None;
+        profile.decode_batch = NativeBatchMode::None;
+        profile.max_batch_size = 1;
+        profile.concurrency = ConcurrencyClass::Exclusive;
+        profile
+    }
+
+    fn apply_adapter_execution_contract(
+        request: &EngineCoreRequest,
+        mut profile: ExecutionProfile,
+    ) -> Result<ExecutionProfile> {
+        let Some(binding) = request.execution_adapter_binding() else {
+            return Ok(Self::force_scalar_execution(profile));
+        };
+
+        let prefill_work = WorkUnit::SequenceStep {
+            phase: super::SequencePhase::Prefill,
+            input: super::InputRange { start: 0, end: 0 },
+            max_output_steps: 1,
+        };
+        let decode_work = WorkUnit::SequenceStep {
+            phase: super::SequencePhase::Decode,
+            input: super::InputRange { start: 0, end: 0 },
+            max_output_steps: 1,
+        };
+        let atomic_work = WorkUnit::AtomicJob {
+            kind: format!("{:?}", request.task_type).to_ascii_lowercase(),
+        };
+        let pipeline_work = WorkUnit::PipelineStage {
+            name: format!("{:?}", request.task_type).to_ascii_lowercase(),
+            ordinal: 0,
+        };
+
+        let (prefill_stage, decode_stage) = match profile.mode {
+            ExecutionMode::Sequence | ExecutionMode::Realtime => (
+                Some(binding.stage_for_work(&prefill_work)?),
+                Some(binding.stage_for_work(&decode_work)?),
+            ),
+            ExecutionMode::Atomic | ExecutionMode::Artifact => {
+                (Some(binding.stage_for_work(&atomic_work)?), None)
+            }
+            ExecutionMode::Pipeline => (Some(binding.stage_for_work(&pipeline_work)?), None),
+        };
+
+        let verify_mode = |phase: &str,
+                           declared: NativeBatchMode,
+                           stage: Option<&super::StageDescriptor>|
+         -> Result<NativeBatchMode> {
+            let Some(stage) = stage else {
+                return Ok(NativeBatchMode::None);
+            };
+            if stage.batch_mode == NativeBatchMode::None {
+                return Ok(NativeBatchMode::None);
+            }
+            if stage.batch_mode != declared {
+                return Err(Error::InferenceError(format!(
+                    "loaded adapter stage {} advertises {:?} {phase} batching, but the executor declared {:?}",
+                    stage.name, stage.batch_mode, declared
+                )));
+            }
+            Ok(stage.batch_mode)
+        };
+
+        profile.prefill_batch = verify_mode("prefill", profile.prefill_batch, prefill_stage)?;
+        profile.decode_batch = verify_mode("decode", profile.decode_batch, decode_stage)?;
+        let max_batch_size = [prefill_stage, decode_stage]
+            .into_iter()
+            .flatten()
+            .map(|stage| {
+                if stage.concurrency == ConcurrencyClass::Batchable {
+                    stage.max_batch_size
+                } else {
+                    1
+                }
+            })
+            .max();
+        profile.max_batch_size = max_batch_size
+            .map(|maximum| profile.max_batch_size.min(maximum).max(1))
+            .unwrap_or(1);
+        profile.concurrency = if [prefill_stage, decode_stage]
+            .into_iter()
+            .flatten()
+            .any(|stage| stage.concurrency == ConcurrencyClass::Batchable)
+        {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        Ok(profile)
+    }
+
     async fn refresh_scheduler_execution_profiles(&mut self) {
         let requests: Vec<_> = self.requests.values().cloned().collect();
         for request in requests {
             let Some(epoch) = self.scheduler.get_sequence_id(&request.id) else {
                 continue;
             };
-            let profile = self
+            let raw_profile = self
                 .executor
                 .execution_profile(&request)
                 .await
@@ -223,6 +490,20 @@ impl EngineCore {
                         ExecutionMode::Atomic,
                     )
                 });
+            let profile = match Self::apply_adapter_execution_contract(
+                &request,
+                raw_profile.clone(),
+            ) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    warn!(
+                        request_id = %request.id,
+                        error = %error,
+                        "Loaded adapter contract disagrees with executor; forcing scalar scheduling"
+                    );
+                    Self::force_scalar_execution(raw_profile)
+                }
+            };
             self.scheduler.update_execution_profile(
                 &super::SessionKey::new(request.id.clone(), epoch),
                 &profile,
@@ -244,7 +525,7 @@ impl EngineCore {
                     scheduled.request_id
                 ))
             })?;
-        let profile = self
+        let raw_profile = self
             .executor
             .execution_profile(&request)
             .await
@@ -255,6 +536,7 @@ impl EngineCore {
                     ExecutionMode::Atomic,
                 )
             });
+        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)?;
         if scheduled.is_prefill
             && profile.prefill == PrefillMode::Full
             && (scheduled.num_computed_tokens != 0
@@ -308,6 +590,25 @@ impl EngineCore {
                 ..ResourceVector::zero()
             }
         };
+        let bound_stage = request
+            .execution_adapter_binding()
+            .map(|binding| binding.stage_for_work(&work).cloned())
+            .transpose()?;
+        let bound_adapter = request
+            .execution_adapter_binding()
+            .zip(bound_stage.as_ref())
+            .map(|(binding, stage)| binding.key_for_stage(stage.id))
+            .transpose()?;
+        let batch_mode = bound_stage
+            .as_ref()
+            .map_or(NativeBatchMode::None, |stage| stage.batch_mode);
+        let max_batch_size = bound_stage.as_ref().map_or(1, |stage| {
+            if stage.concurrency == ConcurrencyClass::Batchable {
+                stage.max_batch_size.min(profile.max_batch_size).max(1)
+            } else {
+                1
+            }
+        });
         let plan = ExecutionPlan {
             plan_id: scheduled.plan_id,
             session: scheduled.session_key(),
@@ -322,16 +623,12 @@ impl EngineCore {
                 cache_namespace: profile
                     .cache_namespace
                     .unwrap_or_else(|| "none".to_string()),
-                adapter_id: None,
+                adapter: bound_adapter,
             },
-            batch_mode: if scheduled.is_prefill {
-                profile.prefill_batch
-            } else {
-                profile.decode_batch
-            },
-            max_batch_size: profile.max_batch_size.max(1),
+            batch_mode,
+            max_batch_size,
             estimate,
-            reservation: None,
+            stage: bound_stage,
         };
 
         let tracker = self
@@ -372,6 +669,37 @@ impl EngineCore {
         Ok(())
     }
 
+    fn rollback_unexecuted_schedule(&mut self, scheduled: &[super::scheduler::ScheduledRequest]) {
+        let rolled_back_plans = scheduled
+            .iter()
+            .map(|scheduled| scheduled.plan_id)
+            .collect::<HashSet<_>>();
+        self.active_stream_batches.retain(|_, batch| {
+            !batch
+                .rows
+                .keys()
+                .any(|plan_id| rolled_back_plans.contains(plan_id))
+        });
+        for scheduled in scheduled {
+            let session = scheduled.session_key();
+            if let Some(plan) = self.active_plans.remove(&scheduled.plan_id) {
+                if plan.session != session {
+                    warn!(
+                        plan_id = scheduled.plan_id,
+                        request_id = %scheduled.request_id,
+                        "Unexecuted plan rollback found a mismatched session fence"
+                    );
+                }
+            }
+            if let Some(tracker) = self.execution_trackers.get_mut(&scheduled.request_id) {
+                if tracker.session() == &session {
+                    tracker.rollback_unexecuted_plan(scheduled.plan_id);
+                }
+            }
+            self.scheduler.release_execution_quantum_for_retry(&session);
+        }
+    }
+
     fn report_from_result(result: &ExecutorStepResult) -> ExecutionReport {
         let output = &result.output;
         ExecutionReport {
@@ -381,12 +709,43 @@ impl EngineCore {
             output_produced: output.tokens_generated,
             observed_resources: result.observed_resources,
             dispatch: result.dispatch,
+            provenance: result.provenance,
             elapsed: std::time::Duration::ZERO,
             safe_point: result.safe_point,
             disposition: result.disposition.clone(),
             output_finished: output.finished,
             output_has_error: output.error.is_some(),
         }
+    }
+
+    fn canonical_failure_dispatch(
+        plan: &ExecutionPlan,
+        result: &ExecutorStepResult,
+    ) -> (BatchDispatch, DispatchState) {
+        let width = result.dispatch.width.clamp(1, plan.max_batch_size.max(1));
+        if result.dispatch.kind == super::BatchDispatchKind::NotDispatched {
+            return (
+                BatchDispatch::not_dispatched(width),
+                DispatchState::NotStarted,
+            );
+        }
+        let dispatch = match plan.batch_mode {
+            NativeBatchMode::Static => {
+                BatchDispatch::new(super::BatchDispatchKind::TensorStatic, width)
+            }
+            NativeBatchMode::Continuous => {
+                BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, width)
+            }
+            NativeBatchMode::None if width > 1 => {
+                BatchDispatch::new(super::BatchDispatchKind::RequestParallel, width)
+            }
+            NativeBatchMode::None => BatchDispatch::serial(),
+        };
+        let dispatch_state = match result.provenance.dispatch_state {
+            DispatchState::NotStarted | DispatchState::Started => DispatchState::Started,
+            DispatchState::ProducedOutput => DispatchState::ProducedOutput,
+        };
+        (dispatch, dispatch_state)
     }
 
     async fn commit_executor_result(
@@ -402,6 +761,42 @@ impl EngineCore {
                 "Ignoring executor result for an inactive or already committed plan"
             );
             return None;
+        };
+
+        if self.incremental_stream_sessions.contains(&plan.session) {
+            if let ExecutionDisposition::Failed(failure) = &mut result.disposition {
+                if failure.retry != RetryDisposition::Never {
+                    let message = format!(
+                        "executor failed after committed stream progress; retry is unsafe: {}",
+                        failure.message
+                    );
+                    failure.retry = RetryDisposition::Never;
+                    failure.message = message.clone();
+                    result.output.finished = true;
+                    result.output.error = Some(message);
+                    result.staged_stream_outputs.clear();
+                }
+            }
+        }
+
+        let staged_next_sequence = match self
+            .validate_staged_stream_outputs(&plan.session, &result.staged_stream_outputs)
+        {
+            Ok(next) => Some(next),
+            Err(error) => {
+                let message = format!("invalid staged stream output: {error}");
+                result.output =
+                    ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+                result.disposition =
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+                result.safe_point = true;
+                result.provenance = OutcomeProvenance::failure(
+                    FailureOrigin::ExecutorValidation,
+                    result.provenance.dispatch_state,
+                );
+                result.staged_stream_outputs.clear();
+                None
+            }
         };
 
         let retry_attempt = match &mut result.disposition {
@@ -440,13 +835,19 @@ impl EngineCore {
             .and_then(|tracker| tracker.commit(&plan, &report));
 
         if let Err(err) = commit_result {
+            let (failure_dispatch, failure_dispatch_state) =
+                Self::canonical_failure_dispatch(&plan, &result);
             let failure_report = ExecutionReport {
                 plan_id: plan.plan_id,
                 session: plan.session.clone(),
                 input_consumed: 0,
                 output_produced: 0,
                 observed_resources: ResourceVector::zero(),
-                dispatch: BatchDispatch::serial(),
+                dispatch: failure_dispatch,
+                provenance: OutcomeProvenance::failure(
+                    FailureOrigin::StateCommit,
+                    failure_dispatch_state,
+                ),
                 elapsed: std::time::Duration::ZERO,
                 safe_point: true,
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
@@ -465,6 +866,11 @@ impl EngineCore {
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                     message,
                 )),
+                provenance: OutcomeProvenance::failure(
+                    FailureOrigin::StateCommit,
+                    failure_dispatch_state,
+                ),
+                staged_stream_outputs: Vec::new(),
             });
         }
 
@@ -490,6 +896,11 @@ impl EngineCore {
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::StateCommit,
+                        result.provenance.dispatch_state,
+                    ),
+                    staged_stream_outputs: Vec::new(),
                 });
             }
             ExecutionDisposition::Failed(failure)
@@ -514,6 +925,11 @@ impl EngineCore {
                             disposition: ExecutionDisposition::Failed(
                                 ExecutionFailure::invalid_output(message),
                             ),
+                            provenance: OutcomeProvenance::failure(
+                                FailureOrigin::StateCommit,
+                                result.provenance.dispatch_state,
+                            ),
+                            staged_stream_outputs: Vec::new(),
                         });
                     }
                     self.execution_trackers.remove(&plan.session.request_id);
@@ -539,6 +955,11 @@ impl EngineCore {
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::Cleanup,
+                        result.provenance.dispatch_state,
+                    ),
+                    staged_stream_outputs: Vec::new(),
                 });
             }
             ExecutionDisposition::Progress
@@ -555,91 +976,287 @@ impl EngineCore {
             ExecutionDisposition::Failed(_) => {}
         }
         result.output.request_id = plan.session.request_id.clone();
+        if !result.staged_stream_outputs.is_empty() {
+            if let Some(next_sequence) = staged_next_sequence {
+                self.stream_sequence_cursors
+                    .insert(plan.session.clone(), next_sequence);
+            }
+        }
         Some(CommittedExecutorOutput {
             session: plan.session,
             output: result.output,
             disposition: result.disposition,
+            provenance: result.provenance,
+            staged_stream_outputs: result.staged_stream_outputs,
         })
     }
 
-    fn build_compatible_subbatches<'a>(
-        &self,
-        request_refs: &'a [&'a EngineCoreRequest],
+    fn work_cost(
+        request: &EngineCoreRequest,
+        work: &WorkUnit,
+        stage: Option<&super::StageDescriptor>,
+    ) -> Result<WorkCost> {
+        if let Some(prepared) = stage.and_then(|stage| request.prepared_stage_cost(stage.id)) {
+            return Ok(prepared);
+        }
+        let logical_units = match work {
+            WorkUnit::SequenceStep {
+                input,
+                max_output_steps,
+                ..
+            } => {
+                let input = u64::try_from(input.len()).map_err(|_| {
+                    Error::Overloaded("execution input length exceeds work accounting".to_string())
+                })?;
+                let output = u64::try_from(*max_output_steps).map_err(|_| {
+                    Error::Overloaded("execution output bound exceeds work accounting".to_string())
+                })?;
+                input.max(output).max(1)
+            }
+            WorkUnit::AtomicJob { .. } | WorkUnit::PipelineStage { .. } => 1,
+        };
+        let workspace_bytes = stage.map_or(Ok(0), |stage| {
+            stage
+                .workspace_per_work_unit_bytes
+                .checked_mul(logical_units)
+                .and_then(|bytes| bytes.checked_add(stage.workspace_per_row_bytes))
+                .ok_or_else(|| Error::Overloaded("batch workspace estimate overflow".to_string()))
+        })?;
+        Ok(WorkCost::new(logical_units, logical_units, workspace_bytes))
+    }
+
+    fn batch_lane(plan: &ExecutionPlan, cost: WorkCost) -> BatchLaneKey {
+        let adapter = plan.batch_key.adapter.as_ref();
+        let stage = plan.stage.as_ref();
+        let shape_policy = stage
+            .map(|stage| stage.shape_policy)
+            .unwrap_or(StageShapePolicy::Exact);
+        let shape_bucket = match shape_policy {
+            StageShapePolicy::Independent => "independent".to_string(),
+            StageShapePolicy::Exact => format!("exact.{}", cost.tensor_elements),
+            StageShapePolicy::Bucketed => format!(
+                "bucket.{}",
+                cost.tensor_elements
+                    .checked_next_power_of_two()
+                    .unwrap_or(u64::MAX)
+            ),
+            StageShapePolicy::Padded => "padded".to_string(),
+            StageShapePolicy::Ragged => "ragged".to_string(),
+        };
+        BatchLaneKey {
+            execution_group: adapter
+                .map(|adapter| adapter.execution_group_id)
+                .unwrap_or(ExecutionGroupId::new(0)),
+            model_instance: adapter
+                .map(|adapter| adapter.model_instance_id)
+                .unwrap_or(ModelInstanceId::new(0)),
+            adapter_instance: adapter
+                .map(|adapter| adapter.adapter_instance_id)
+                .unwrap_or(AdapterInstanceId::new(0)),
+            adapter_abi: adapter
+                .map(|adapter| adapter.adapter_abi_revision)
+                .unwrap_or(AdapterAbiRevision::new(0)),
+            capability_id: adapter
+                .map(|adapter| adapter.capability_id.clone())
+                .unwrap_or_else(|| "compatibility".to_string()),
+            stage_id: adapter
+                .map(|adapter| adapter.stage_id)
+                .unwrap_or(StageId::new(0)),
+            backend: plan.batch_key.backend,
+            device_ordinal: None,
+            compute_dtype: plan.batch_key.compute_dtype.clone(),
+            state_dtype: plan.batch_key.kv_dtype.clone(),
+            tensor_layout: format!("{shape_policy:?}").to_ascii_lowercase(),
+            quantization: "adapter-owned".to_string(),
+            state_schema: plan.batch_key.cache_namespace.clone(),
+            kernel_mode: stage
+                .map(|stage| stage.name.clone())
+                .unwrap_or_else(|| "compatibility".to_string()),
+            semantic_mode: format!(
+                "{:?}.{}",
+                plan.batch_key.task_type, plan.batch_key.work_kind
+            )
+            .to_ascii_lowercase(),
+            shape_bucket,
+        }
+    }
+
+    fn batch_budget(plan: &ExecutionPlan) -> Result<(BatchBudget, StageShapePolicy)> {
+        let Some(stage) = plan.stage.as_ref() else {
+            if plan.batch_mode == NativeBatchMode::None {
+                return Ok((BatchBudget::width_one(), StageShapePolicy::Exact));
+            }
+            return Err(Error::InferenceError(
+                "native tensor batch plan is missing its loaded stage contract".to_string(),
+            ));
+        };
+        if stage.concurrency == ConcurrencyClass::Exclusive {
+            return Ok((BatchBudget::width_one(), stage.shape_policy));
+        }
+        let budget = BatchBudget {
+            max_rows: plan.max_batch_size.min(stage.max_batch_size).max(1),
+            max_logical_units: stage.max_work_units,
+            max_tensor_elements: u64::MAX,
+            max_workspace_bytes: stage.max_workspace_bytes,
+            max_padding_basis_points: stage.max_padding_basis_points,
+            max_formation_delay: stage.max_formation_delay,
+        };
+        budget.validate()?;
+        Ok((budget, stage.shape_policy))
+    }
+
+    fn allocate_batch_id(&mut self) -> Result<BatchId> {
+        let batch_id = BatchId::new(self.next_batch_id);
+        self.next_batch_id = self.next_batch_id.checked_add(1).ok_or_else(|| {
+            Error::InferenceError("physical batch identity space was exhausted".to_string())
+        })?;
+        Ok(batch_id)
+    }
+
+    fn form_physical_batches(
+        &mut self,
+        requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
-    ) -> Vec<(
-        Vec<&'a EngineCoreRequest>,
-        Vec<super::scheduler::ScheduledRequest>,
-    )> {
-        if request_refs.is_empty() || scheduled.is_empty() {
-            return Vec::new();
-        }
+    ) -> Result<Vec<PreparedExecutionBatch>> {
+        let available = requests
+            .iter()
+            .map(|request| request.id.clone())
+            .collect::<HashSet<_>>();
+        let mut assemblies: Vec<PhysicalBatchAssembly> = Vec::new();
 
-        let mut request_by_id = HashMap::with_capacity(request_refs.len());
-        for req in request_refs {
-            request_by_id.insert(req.id.as_str(), *req);
-        }
-
-        let mut groups: Vec<(
-            BatchKey,
-            NativeBatchMode,
-            usize,
-            Vec<super::scheduler::ScheduledRequest>,
-        )> = Vec::new();
-
-        for item in scheduled {
-            if !request_by_id.contains_key(item.request_id.as_str()) {
+        for scheduled in scheduled {
+            if !available.contains(&scheduled.request_id) {
                 continue;
             }
-            let Some((key, batch_mode, max_batch_size)) =
-                self.active_plans.get(&item.plan_id).map(|plan| {
-                    (
-                        plan.batch_key.clone(),
-                        plan.batch_mode,
-                        plan.max_batch_size.max(1),
-                    )
-                })
-            else {
-                warn!(
-                    plan_id = item.plan_id,
-                    request_id = %item.request_id,
-                    "Skipping scheduled work without an active execution plan"
-                );
-                continue;
+            let request = self
+                .requests
+                .get(&scheduled.request_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "scheduled request {} disappeared during batch formation",
+                        scheduled.request_id
+                    ))
+                })?;
+            let plan = self
+                .active_plans
+                .get(&scheduled.plan_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "scheduled plan {} disappeared during batch formation",
+                        scheduled.plan_id
+                    ))
+                })?;
+            let cost = Self::work_cost(&request, &plan.work, plan.stage.as_ref())?;
+            let lane = Self::batch_lane(&plan, cost);
+            let (budget, shape_policy) = Self::batch_budget(&plan)?;
+            let output_visibility = plan
+                .stage
+                .as_ref()
+                .map_or(super::OutputVisibility::AfterQuantumCommit, |stage| {
+                    stage.output_visibility
+                });
+            let planned_work = plan.work.clone();
+            let row = ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: plan.session.clone(),
+                lane: lane.clone(),
+                work: planned_work.clone(),
+                cost,
             };
-            if batch_mode == NativeBatchMode::None && max_batch_size == 1 {
-                groups.push((key, batch_mode, 1, vec![item.clone()]));
-            } else if let Some((_, _, _, bucket)) =
-                groups
-                    .iter_mut()
-                    .find(|(group_key, group_mode, group_max, bucket)| {
-                        *group_key == key
-                            && *group_mode == batch_mode
-                            && *group_max == max_batch_size
-                            && bucket.len() < max_batch_size
-                    })
-            {
-                bucket.push(item.clone());
-            } else {
-                groups.push((key, batch_mode, max_batch_size, vec![item.clone()]));
+            let mut executable = scheduled.clone();
+            executable.work = planned_work;
+
+            let mut pending = Some((request, executable, row));
+            if budget.max_rows > 1 {
+                for assembly in &mut assemblies {
+                    if assembly.physical_batch.lane != lane
+                        || assembly.physical_batch.mode != plan.batch_mode
+                        || assembly.physical_batch.budget != budget
+                        || assembly.output_visibility != output_visibility
+                        || assembly.shape_policy != shape_policy
+                    {
+                        continue;
+                    }
+                    let Some((request, scheduled, row)) = pending.take() else {
+                        break;
+                    };
+                    if assembly.try_push(request.clone(), scheduled.clone(), row.clone()) {
+                        break;
+                    }
+                    pending = Some((request, scheduled, row));
+                }
+            }
+
+            if let Some((request, scheduled, row)) = pending {
+                let materialized_tensor_elements = row.cost.tensor_elements;
+                let workspace_base_bytes = plan
+                    .stage
+                    .as_ref()
+                    .map(|stage| stage.workspace_base_bytes)
+                    .unwrap_or(0);
+                let workspace = PhysicalBatchAssembly::workspace_resources(
+                    lane.backend,
+                    workspace_base_bytes,
+                    std::slice::from_ref(&row),
+                )
+                .ok_or_else(|| {
+                    Error::Overloaded("batch workspace estimate overflow".to_string())
+                })?;
+                let physical_batch = PhysicalBatch {
+                    batch_id: self.allocate_batch_id()?,
+                    lane,
+                    mode: plan.batch_mode,
+                    budget,
+                    rows: vec![row],
+                    materialized_tensor_elements,
+                    workspace,
+                };
+                physical_batch.validate()?;
+                assemblies.push(PhysicalBatchAssembly {
+                    physical_batch,
+                    requests: vec![request],
+                    scheduled: vec![scheduled],
+                    output_visibility,
+                    shape_policy,
+                    workspace_base_bytes,
+                });
             }
         }
 
-        let mut outputs = Vec::new();
-        for (_, _, _, bucket) in groups {
-            let mut bucket_refs = Vec::with_capacity(bucket.len());
-            let mut seen = HashSet::new();
-            for item in &bucket {
-                if !seen.insert(item.request_id.as_str()) {
-                    continue;
-                }
-                if let Some(req) = request_by_id.get(item.request_id.as_str()) {
-                    bucket_refs.push(*req);
+        let mut prepared = Vec::with_capacity(assemblies.len());
+        for assembly in assemblies {
+            if assembly.output_visibility == OutputVisibility::IncrementalCommitted {
+                let rows = assembly
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .map(|row| (row.plan_id, row.session.clone()))
+                    .collect();
+                let fence = ActiveStreamBatch {
+                    lane: assembly.physical_batch.lane.clone(),
+                    output_visibility: assembly.output_visibility,
+                    rows,
+                };
+                if self
+                    .active_stream_batches
+                    .insert(assembly.physical_batch.batch_id, fence)
+                    .is_some()
+                {
+                    return Err(Error::InferenceError(
+                        "physical stream batch identity was registered twice".to_string(),
+                    ));
                 }
             }
-            outputs.push((bucket_refs, bucket));
+            prepared.push(PreparedExecutionBatch::new(
+                assembly.physical_batch,
+                assembly.requests,
+                assembly.scheduled,
+                assembly.output_visibility,
+            ));
         }
-
-        outputs
+        Ok(prepared)
     }
 
     fn merge_audio_output(
@@ -737,101 +1354,6 @@ impl EngineCore {
                 .is_some_and(|audio| !audio.samples.is_empty())
     }
 
-    fn failed_step_result(
-        scheduled: &super::scheduler::ScheduledRequest,
-        message: impl Into<String>,
-    ) -> ExecutorStepResult {
-        ExecutorStepResult::new(
-            scheduled,
-            ExecutorOutput::error(scheduled.request_id.clone(), message),
-        )
-    }
-
-    fn reconcile_executor_outputs(
-        phase: &str,
-        scheduled: &[super::scheduler::ScheduledRequest],
-        result: Result<Vec<ExecutorStepResult>>,
-    ) -> Vec<ExecutorStepResult> {
-        let expected: HashSet<_> = scheduled
-            .iter()
-            .map(|entry| (entry.plan_id, entry.session_key()))
-            .collect();
-        let outputs = match result {
-            Ok(outputs) => outputs,
-            Err(err) => {
-                return scheduled
-                    .iter()
-                    .map(|entry| {
-                        Self::failed_step_result(entry, format!("{phase} executor failed: {err}"))
-                    })
-                    .collect();
-            }
-        };
-
-        let mut by_transaction = HashMap::new();
-        let mut duplicates = HashSet::new();
-        for mut result in outputs {
-            let key = (result.plan_id, result.session.clone());
-            if !expected.contains(&key) {
-                warn!(
-                    phase,
-                    plan_id = result.plan_id,
-                    request_id = %result.session.request_id,
-                    session_epoch = result.session.epoch,
-                    "Ignoring executor output for an unknown or stale transaction"
-                );
-                continue;
-            }
-            if result.output.request_id != result.session.request_id {
-                result.output = ExecutorOutput::error(
-                    result.session.request_id.clone(),
-                    format!("{phase} executor output request ID did not match its session"),
-                );
-            }
-            if by_transaction.insert(key.clone(), result).is_some() {
-                duplicates.insert(key);
-            }
-        }
-
-        scheduled
-            .iter()
-            .map(|entry| {
-                let key = (entry.plan_id, entry.session_key());
-                if duplicates.contains(&key) {
-                    return Self::failed_step_result(
-                        entry,
-                        format!("{phase} executor returned duplicate outputs"),
-                    );
-                }
-                by_transaction.remove(&key).unwrap_or_else(|| {
-                    Self::failed_step_result(
-                        entry,
-                        format!("{phase} executor did not return a scheduled output"),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    async fn execute_decode_subbatch(
-        &self,
-        request_refs: &[&EngineCoreRequest],
-        scheduled: &[super::scheduler::ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
-        // A scheduler plan is dispatched exactly once. Reusing one plan ID for
-        // internal one-token rounds makes completion fencing ambiguous. A future
-        // continuous adapter must expose child quanta explicitly.
-        let result = self.executor.execute_decode(request_refs, scheduled).await;
-        if let Ok(outputs) = &result {
-            if let Some(first) = outputs.first() {
-                record_engine_batch_dispatch(first.dispatch);
-            }
-        }
-        Ok(Self::reconcile_executor_outputs(
-            "decode", scheduled, result,
-        ))
-    }
-
     /// Create a new engine core.
     pub fn new(config: EngineCoreConfig) -> Result<Self> {
         let worker_config = WorkerConfig::from(&config);
@@ -869,11 +1391,15 @@ impl EngineCore {
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
+            active_stream_batches: HashMap::new(),
+            stream_sequence_cursors: HashMap::new(),
+            incremental_stream_sessions: HashSet::new(),
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
             initialized: false,
             maintenance_steps: 0,
+            next_batch_id: 1,
         })
     }
 
@@ -930,7 +1456,7 @@ impl EngineCore {
         }
 
         // Track request
-        self.requests.insert(request_id.clone(), request);
+        self.requests.insert(request_id.clone(), Arc::new(request));
         self.request_start_times
             .insert(request_id.clone(), Instant::now());
         self.request_phase_timings
@@ -974,7 +1500,156 @@ impl EngineCore {
             self.execution_trackers.remove(&session.request_id);
         }
         self.active_plans.retain(|_, plan| plan.session != *session);
+        self.active_stream_batches
+            .retain(|_, batch| !batch.rows.values().any(|row| row == session));
         self.execution_retry_attempts.remove(session);
+        self.stream_sequence_cursors.remove(session);
+        self.incremental_stream_sessions.remove(session);
+    }
+
+    fn validate_staged_stream_outputs(
+        &self,
+        session: &super::SessionKey,
+        outputs: &[super::output::StreamingOutput],
+    ) -> Result<usize> {
+        let mut expected = self
+            .stream_sequence_cursors
+            .get(session)
+            .copied()
+            .unwrap_or(0);
+        for (index, output) in outputs.iter().enumerate() {
+            if output.request_id != session.request_id {
+                return Err(Error::InferenceError(
+                    "stream output request ID does not match its session".to_string(),
+                ));
+            }
+            if output.sequence != expected {
+                return Err(Error::InferenceError(format!(
+                    "stream output sequence {} did not match expected {}",
+                    output.sequence, expected
+                )));
+            }
+            if output.is_final && index + 1 != outputs.len() {
+                return Err(Error::InferenceError(
+                    "final stream output must be the last committed event".to_string(),
+                ));
+            }
+            expected = expected.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("stream output sequence space was exhausted".to_string())
+            })?;
+        }
+        Ok(expected)
+    }
+
+    pub(super) fn commit_incremental_stream_progress(
+        &mut self,
+        progress: FencedStreamProgress,
+    ) -> std::result::Result<CommittedStreamDelivery, StreamProgressRejection> {
+        let plan = self.active_plans.get(&progress.plan_id).ok_or_else(|| {
+            StreamProgressRejection::invalid("stream progress references an inactive plan")
+        })?;
+        if plan.session != progress.session {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress session does not match its active plan",
+            ));
+        }
+        if plan.stage.as_ref().map(|stage| stage.output_visibility)
+            != Some(OutputVisibility::IncrementalCommitted)
+        {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress is not authorized by the active adapter stage",
+            ));
+        }
+
+        let batch = self
+            .active_stream_batches
+            .get(&progress.batch_id)
+            .ok_or_else(|| {
+                StreamProgressRejection::invalid(
+                    "stream progress references an inactive physical batch",
+                )
+            })?;
+        if batch.output_visibility != OutputVisibility::IncrementalCommitted
+            || batch.lane != progress.lane
+            || batch.rows.get(&progress.plan_id) != Some(&progress.session)
+        {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress does not match its physical batch fence",
+            ));
+        }
+
+        let tracker = self
+            .execution_trackers
+            .get(&progress.session.request_id)
+            .ok_or_else(|| {
+                StreamProgressRejection::invalid("stream progress has no execution tracker")
+            })?;
+        if tracker.session() != &progress.session
+            || tracker.active_plan_id() != Some(progress.plan_id)
+        {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress does not match the active lifecycle transaction",
+            ));
+        }
+        if self.scheduler.get_sequence_id(&progress.session.request_id)
+            != Some(progress.session.epoch)
+        {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress belongs to a stale scheduler session",
+            ));
+        }
+        if progress.output.request_id != progress.session.request_id || progress.output.is_final {
+            return Err(StreamProgressRejection::invalid(
+                "incremental progress must be non-final output for its exact request",
+            ));
+        }
+
+        let request = self
+            .requests
+            .get(&progress.session.request_id)
+            .ok_or_else(|| {
+                StreamProgressRejection::invalid("stream progress request is no longer active")
+            })?;
+        if request.is_cancelled() {
+            return Err(StreamProgressRejection::cancelled());
+        }
+        if request
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(StreamProgressRejection::deadline());
+        }
+        let tx = request.streaming_tx.clone().ok_or_else(|| {
+            StreamProgressRejection::invalid("stream progress request has no delivery channel")
+        })?;
+        let policy = request.stream_policy;
+
+        let expected = self
+            .stream_sequence_cursors
+            .get(&progress.session)
+            .copied()
+            .unwrap_or(0);
+        if progress.output.sequence != expected {
+            return Err(StreamProgressRejection::invalid(format!(
+                "stream progress sequence {} did not match expected {}",
+                progress.output.sequence, expected
+            )));
+        }
+        let next = expected.checked_add(1).ok_or_else(|| {
+            StreamProgressRejection::invalid("stream progress sequence space was exhausted")
+        })?;
+        self.stream_sequence_cursors
+            .insert(progress.session.clone(), next);
+        self.incremental_stream_sessions
+            .insert(progress.session.clone());
+        record_engine_stream_checkpoint_committed();
+
+        Ok(CommittedStreamDelivery::from_progress(
+            progress.session.clone(),
+            tx,
+            policy,
+            progress,
+        ))
     }
 
     fn record_unconfirmed_cleanup(&mut self, session: &super::SessionKey) {
@@ -1042,6 +1717,156 @@ impl EngineCore {
     /// 2. Execute - run forward pass
     /// 3. Process - handle outputs, check stop conditions
     pub async fn step(&mut self) -> Result<Vec<EngineOutput>> {
+        let Some(prepared) = self.prepare_step().await? else {
+            return Ok(Vec::new());
+        };
+        let executed = self.execute_prepared_with_progress(prepared).await?;
+        let committed = self.commit_step(executed).await?;
+        let mut outputs = committed.outputs;
+        let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
+        self.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
+            .await;
+        Ok(outputs)
+    }
+
+    async fn execute_prepared_with_progress(
+        &mut self,
+        prepared: PreparedEngineStep,
+    ) -> Result<ExecutedEngineStep> {
+        let (progress_tx, mut progress_rx) = mpsc::channel(STREAM_PROGRESS_QUEUE_CAPACITY);
+        let progress_budget = StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES);
+        let mut runner = tokio::spawn(ExecutionGroupRunner::execute(
+            prepared,
+            progress_tx,
+            progress_budget,
+        ));
+        let (mut deliveries, mut delivery_failures) = IncrementalStreamDeliveryWorkers::new();
+        let mut failures = HashMap::new();
+        let mut progress_closed = false;
+        let mut delivery_failures_closed = false;
+
+        let mut executed = loop {
+            tokio::select! {
+                result = &mut runner => {
+                    break match result {
+                        Ok(executed) => executed,
+                        Err(error) if error.is_panic() => {
+                            std::panic::resume_unwind(error.into_panic())
+                        }
+                        Err(error) => {
+                            return Err(Error::InferenceError(format!(
+                                "execution group task was cancelled: {error}"
+                            )));
+                        }
+                    };
+                }
+                progress = progress_rx.recv(), if !progress_closed => {
+                    match progress {
+                        Some(progress) => {
+                            self.enqueue_incremental_progress(
+                                progress,
+                                &mut failures,
+                                &mut deliveries,
+                            );
+                        }
+                        None => progress_closed = true,
+                    }
+                }
+                failure = delivery_failures.recv(), if !delivery_failures_closed => {
+                    match failure {
+                        Some(failure) => self.record_stream_failure(
+                            failure,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => delivery_failures_closed = true,
+                    }
+                }
+            }
+        };
+
+        while let Some(progress) = progress_rx.recv().await {
+            self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries);
+        }
+        let barrier_failures = deliveries.finish().await;
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        for failure in barrier_failures {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        let failures = failures.into_values().collect::<Vec<_>>();
+        executed.apply_stream_delivery_failures(&failures);
+        Ok(executed)
+    }
+
+    fn commit_progress_delivery(
+        &mut self,
+        progress: FencedStreamProgress,
+    ) -> std::result::Result<CommittedStreamDelivery, StreamDeliveryFailure> {
+        let session = progress.session.clone();
+        match self.commit_incremental_stream_progress(progress) {
+            Ok(delivery) => Ok(delivery),
+            Err(error) => {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    error = %error,
+                    "Rejecting invalid incremental stream progress"
+                );
+                Err(StreamDeliveryFailure {
+                    session,
+                    kind: error.kind,
+                })
+            }
+        }
+    }
+
+    fn cancel_failed_stream(&self, failure: &StreamDeliveryFailure) {
+        if let Some(request) = self.requests.get(&failure.session.request_id) {
+            if self.scheduler.get_sequence_id(&failure.session.request_id)
+                == Some(failure.session.epoch)
+            {
+                if let Some(cancellation) = request.cancellation.as_ref() {
+                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn record_stream_failure(
+        &self,
+        failure: StreamDeliveryFailure,
+        failures: &mut HashMap<super::SessionKey, StreamDeliveryFailure>,
+        deliveries: &mut IncrementalStreamDeliveryWorkers,
+    ) {
+        self.cancel_failed_stream(&failure);
+        deliveries.abandon_session(&failure.session);
+        failures.entry(failure.session.clone()).or_insert(failure);
+    }
+
+    fn enqueue_incremental_progress(
+        &mut self,
+        progress: FencedStreamProgress,
+        failures: &mut HashMap<super::SessionKey, StreamDeliveryFailure>,
+        deliveries: &mut IncrementalStreamDeliveryWorkers,
+    ) {
+        if failures.contains_key(&progress.session) {
+            return;
+        }
+        let result = match self.commit_progress_delivery(progress) {
+            Ok(delivery) => deliveries.enqueue(delivery),
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = result {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
+    }
+
+    /// Prepare an immutable execution transaction under the engine state lock.
+    pub(super) async fn prepare_step(&mut self) -> Result<Option<PreparedEngineStep>> {
         // Ensure initialized
         if !self.initialized {
             self.initialize().await?;
@@ -1093,6 +1918,11 @@ impl EngineCore {
                                 disposition: ExecutionDisposition::Failed(
                                     ExecutionFailure::invalid_output(message),
                                 ),
+                                provenance: OutcomeProvenance::failure(
+                                    FailureOrigin::Cleanup,
+                                    DispatchState::NotStarted,
+                                ),
+                                staged_stream_outputs: Vec::new(),
                             });
                     }
                 }
@@ -1108,6 +1938,11 @@ impl EngineCore {
                         disposition: ExecutionDisposition::Failed(
                             ExecutionFailure::invalid_output(message),
                         ),
+                        provenance: OutcomeProvenance::failure(
+                            FailureOrigin::Cleanup,
+                            DispatchState::NotStarted,
+                        ),
+                        staged_stream_outputs: Vec::new(),
                     });
             }
             self.clear_exact_execution_state(session);
@@ -1122,11 +1957,16 @@ impl EngineCore {
                     session: request.session_key(),
                     output: ExecutorOutput::terminal(request.request_id.clone()),
                     disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                    provenance: OutcomeProvenance::deadline(
+                        DeadlinePhase::SchedulerQueue,
+                        DispatchState::NotStarted,
+                    ),
+                    staged_stream_outputs: Vec::new(),
                 });
         }
 
         if !schedule_result.has_execution_work() && self.pending_terminal_outputs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         debug!(
@@ -1137,8 +1977,16 @@ impl EngineCore {
 
         let prefill_scheduled = schedule_result.prefill_requests.clone();
         let decode_scheduled = schedule_result.decode_requests.clone();
-        for scheduled in decode_scheduled.iter().chain(prefill_scheduled.iter()) {
-            self.begin_execution_plan(scheduled).await?;
+        let all_scheduled = decode_scheduled
+            .iter()
+            .chain(prefill_scheduled.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for scheduled in &all_scheduled {
+            if let Err(error) = self.begin_execution_plan(scheduled).await {
+                self.rollback_unexecuted_schedule(&all_scheduled);
+                return Err(error);
+            }
         }
         let now = Instant::now();
 
@@ -1157,122 +2005,129 @@ impl EngineCore {
             }
         }
 
-        let prefill_request_refs: Vec<&EngineCoreRequest> = prefill_scheduled
+        let prefill_requests: Vec<Arc<EngineCoreRequest>> = prefill_scheduled
             .iter()
-            .filter_map(|s| self.requests.get(&s.request_id))
+            .filter_map(|s| self.requests.get(&s.request_id).cloned())
             .collect();
-        let decode_request_refs: Vec<&EngineCoreRequest> = decode_scheduled
+        let decode_requests: Vec<Arc<EngineCoreRequest>> = decode_scheduled
             .iter()
-            .filter_map(|s| self.requests.get(&s.request_id))
+            .filter_map(|s| self.requests.get(&s.request_id).cloned())
             .collect();
 
-        if prefill_request_refs.is_empty()
-            && decode_request_refs.is_empty()
+        if prefill_requests.is_empty()
+            && decode_requests.is_empty()
             && self.pending_terminal_outputs.is_empty()
         {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
-        // Phase 2: Execute decode/prefill. On Metal we prefer sequential execution
-        // to reduce device contention and thermal spikes on local machines.
-        let run_decode = async {
-            if decode_request_refs.is_empty() || decode_scheduled.is_empty() {
-                return Ok((Vec::new(), std::time::Duration::ZERO));
+        let decode_batches = match self.form_physical_batches(&decode_requests, &decode_scheduled) {
+            Ok(batches) => batches,
+            Err(error) => {
+                self.rollback_unexecuted_schedule(&all_scheduled);
+                return Err(error);
             }
-            let started = Instant::now();
-            let sub_batches =
-                self.build_compatible_subbatches(&decode_request_refs, &decode_scheduled);
-            let mut outputs = Vec::new();
-            for (refs, batch) in sub_batches {
-                outputs.extend(self.execute_decode_subbatch(&refs, &batch).await?);
-            }
-            Ok::<_, Error>((outputs, started.elapsed()))
         };
-        let run_prefill = async {
-            if prefill_request_refs.is_empty() || prefill_scheduled.is_empty() {
-                return Ok((Vec::new(), std::time::Duration::ZERO));
+        let prefill_batches =
+            match self.form_physical_batches(&prefill_requests, &prefill_scheduled) {
+                Ok(batches) => batches,
+                Err(error) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
+            };
+
+        Ok(Some(PreparedEngineStep::new(
+            self.executor.clone(),
+            decode_batches,
+            prefill_batches,
+        )))
+    }
+
+    /// Commit one completed execution transaction under the engine state lock.
+    pub(super) async fn commit_step(
+        &mut self,
+        executed: ExecutedEngineStep,
+    ) -> Result<CommittedEngineStep> {
+        let ExecutedEngineStep { batches } = executed;
+
+        let result_capacity = batches
+            .iter()
+            .map(|batch| batch.results.len())
+            .sum::<usize>();
+        let mut executor_outputs =
+            Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
+        let mut stream_deliveries = Vec::new();
+        for mut batch in batches {
+            self.active_stream_batches
+                .remove(&batch.physical_batch.batch_id);
+            if let Err(error) = batch
+                .report
+                .validate_against(&batch.physical_batch, &self.active_plans)
+            {
+                warn!(
+                    batch_id = batch.physical_batch.batch_id.get(),
+                    error = %error,
+                    "Rejecting an invalid physical batch report before state commit"
+                );
+                let message = format!("invalid physical batch report: {error}");
+                let dispatch_state =
+                    if batch.report.dispatch.kind == super::BatchDispatchKind::NotDispatched {
+                        DispatchState::NotStarted
+                    } else {
+                        DispatchState::Started
+                    };
+                let failure_dispatch = if dispatch_state == DispatchState::NotStarted {
+                    BatchDispatch::not_dispatched(batch.physical_batch.rows.len().max(1))
+                } else {
+                    batch.physical_batch.expected_dispatch()
+                };
+                for result in &mut batch.results {
+                    result.output =
+                        ExecutorOutput::error(result.session.request_id.clone(), message.clone());
+                    result.disposition = ExecutionDisposition::Failed(
+                        ExecutionFailure::invalid_output(message.clone()),
+                    );
+                    result.safe_point = true;
+                    result.dispatch = failure_dispatch;
+                    result.provenance =
+                        OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state);
+                    result.observed_resources = ResourceVector::zero();
+                    result.staged_stream_outputs.clear();
+                }
+            } else {
+                record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
             }
-            let started = Instant::now();
-            let sub_batches =
-                self.build_compatible_subbatches(&prefill_request_refs, &prefill_scheduled);
-            let mut outputs = Vec::new();
-            for (refs, batch) in sub_batches {
-                let result = self.executor.execute_prefill(&refs, &batch).await;
-                if let Ok(executor_outputs) = &result {
-                    if let Some(first) = executor_outputs.first() {
-                        record_engine_batch_dispatch(first.dispatch);
+
+            for result in batch.results {
+                let provenance = result.provenance;
+                let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
+                let step_time_ms = if entered_model {
+                    batch.report.elapsed.as_secs_f64() * 1000.0
+                } else {
+                    0.0
+                };
+                if entered_model {
+                    if let Some(timing) = self
+                        .request_phase_timings
+                        .get_mut(&result.session.request_id)
+                    {
+                        match batch.phase {
+                            ExecutionPhase::Decode => {
+                                timing.decode_ms += step_time_ms;
+                                timing.decode_steps = timing.decode_steps.saturating_add(1);
+                            }
+                            ExecutionPhase::Prefill => {
+                                timing.prefill_ms += step_time_ms;
+                                timing.prefill_steps = timing.prefill_steps.saturating_add(1);
+                            }
+                        }
                     }
                 }
-                outputs.extend(Self::reconcile_executor_outputs("prefill", &batch, result));
-            }
-            Ok::<_, Error>((outputs, started.elapsed()))
-        };
-
-        let (mut decode_outputs, decode_elapsed, mut prefill_outputs, prefill_elapsed) =
-            if self.config.backend == BackendKind::Metal
-                && !decode_request_refs.is_empty()
-                && !prefill_request_refs.is_empty()
-            {
-                let (decode_outputs, decode_elapsed) = run_decode.await?;
-                let (prefill_outputs, prefill_elapsed) = run_prefill.await?;
-                (
-                    decode_outputs,
-                    decode_elapsed,
-                    prefill_outputs,
-                    prefill_elapsed,
-                )
-            } else {
-                let (decode_result, prefill_result) = tokio::join!(run_decode, run_prefill);
-                let (decode_outputs, decode_elapsed) = decode_result?;
-                let (prefill_outputs, prefill_elapsed) = prefill_result?;
-                (
-                    decode_outputs,
-                    decode_elapsed,
-                    prefill_outputs,
-                    prefill_elapsed,
-                )
-            };
-
-        let decode_step_ms = decode_elapsed.as_secs_f64() * 1000.0;
-        let prefill_step_ms = prefill_elapsed.as_secs_f64() * 1000.0;
-        let decode_ids: HashSet<RequestId> = decode_scheduled
-            .iter()
-            .map(|s| s.request_id.clone())
-            .collect();
-        let prefill_ids: HashSet<RequestId> = prefill_scheduled
-            .iter()
-            .map(|s| s.request_id.clone())
-            .collect();
-
-        for request_id in &decode_ids {
-            let timing = self
-                .request_phase_timings
-                .entry(request_id.clone())
-                .or_default();
-            timing.decode_ms += decode_step_ms;
-            timing.decode_steps = timing.decode_steps.saturating_add(1);
-        }
-        for request_id in &prefill_ids {
-            let timing = self
-                .request_phase_timings
-                .entry(request_id.clone())
-                .or_default();
-            timing.prefill_ms += prefill_step_ms;
-            timing.prefill_steps = timing.prefill_steps.saturating_add(1);
-        }
-
-        decode_outputs.append(&mut prefill_outputs);
-        let executor_results = decode_outputs;
-        let mut executor_outputs =
-            Vec::with_capacity(executor_results.len() + self.pending_terminal_outputs.len());
-        for result in executor_results {
-            let step_time_ms = if decode_ids.contains(&result.session.request_id) {
-                decode_step_ms
-            } else {
-                prefill_step_ms
-            };
-            if let Some(committed) = self.commit_executor_result(result, step_time_ms).await {
-                executor_outputs.push(committed);
+                match self.commit_executor_result(result, step_time_ms).await {
+                    Some(committed) => executor_outputs.push(committed),
+                    None => record_engine_execution_outcome(provenance),
+                }
             }
         }
         // Terminal events are a durable outbox until all fallible work for the
@@ -1284,12 +2139,28 @@ impl EngineCore {
         let mut outputs = Vec::new();
 
         for committed in executor_outputs {
+            record_engine_execution_outcome(committed.provenance);
             let CommittedExecutorOutput {
                 session,
                 output: exec_output,
                 disposition,
+                provenance,
+                staged_stream_outputs,
             } = committed;
             let request_id = exec_output.request_id.clone();
+
+            if !staged_stream_outputs.is_empty() {
+                if let Some(request) = self.requests.get(&request_id) {
+                    if let Some(tx) = request.streaming_tx.clone() {
+                        stream_deliveries.push(CommittedStreamDelivery::new(
+                            session.clone(),
+                            tx,
+                            request.stream_policy,
+                            staged_stream_outputs,
+                        ));
+                    }
+                }
+            }
 
             // Get timing info
             let generation_time = self
@@ -1348,6 +2219,7 @@ impl EngineCore {
                 sequence_id,
                 generation_time,
             );
+            engine_output.provenance = provenance;
             engine_output.token_stats.prompt_tokens = self
                 .requests
                 .get(&request_id)
@@ -1402,7 +2274,10 @@ impl EngineCore {
             outputs.push(engine_output);
         }
 
-        Ok(outputs)
+        Ok(CommittedEngineStep {
+            outputs,
+            stream_deliveries,
+        })
     }
 
     /// Confirm that a terminal output has been routed outside the core.
@@ -1502,22 +2377,173 @@ impl EngineCore {
             .set_hard_deadline_for_test(request_id, deadline)
     }
 
-    /// Abort only if the caller still owns the exact request incarnation.
-    pub async fn abort_request_session(&mut self, session: &super::SessionKey) -> bool {
+    async fn terminate_request_session(
+        &mut self,
+        session: &super::SessionKey,
+        output: ExecutorOutput,
+        disposition: ExecutionDisposition,
+        provenance: OutcomeProvenance,
+    ) -> bool {
         if self.scheduler.get_sequence_id(&session.request_id) != Some(session.epoch) {
             return false;
         }
 
-        self.begin_terminal_release(session, TerminalReleaseCause::Cancelled)
-            .await;
+        let Some(cause) = Self::terminal_release_cause(&disposition) else {
+            return false;
+        };
+        self.begin_terminal_release(session, cause).await;
         self.requests.remove(&session.request_id);
         self.clear_exact_execution_state(session);
         self.pending_terminal_outputs
             .push_back(CommittedExecutorOutput {
                 session: session.clone(),
-                output: ExecutorOutput::terminal(session.request_id.clone()),
-                disposition: ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                output,
+                disposition,
+                provenance,
+                staged_stream_outputs: Vec::new(),
             });
+        true
+    }
+
+    pub(crate) async fn handle_stream_delivery_failure(
+        &mut self,
+        failure: StreamDeliveryFailure,
+    ) -> bool {
+        let session = failure.session;
+        let (output, disposition, provenance) = match failure.kind {
+            StreamDeliveryFailureKind::Delivery => {
+                let message = "committed stream delivery failed";
+                (
+                    ExecutorOutput::error(session.request_id.clone(), message),
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message)),
+                    OutcomeProvenance::failure(
+                        FailureOrigin::StreamDelivery,
+                        DispatchState::ProducedOutput,
+                    ),
+                )
+            }
+            StreamDeliveryFailureKind::Deadline => (
+                ExecutorOutput::terminal(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::StreamDelivery,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::Cancelled => (
+                ExecutorOutput::cancelled(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                OutcomeProvenance::produced_output(),
+            ),
+            StreamDeliveryFailureKind::RequestDeadline => (
+                ExecutorOutput::terminal(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::ModelExecution,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::InvalidProgress => {
+                let message = "executor emitted invalid incremental stream progress";
+                (
+                    ExecutorOutput::error(session.request_id.clone(), message),
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message)),
+                    OutcomeProvenance::failure(
+                        FailureOrigin::ExecutorValidation,
+                        DispatchState::ProducedOutput,
+                    ),
+                )
+            }
+        };
+        self.terminate_request_session(&session, output, disposition, provenance)
+            .await
+    }
+
+    fn overlay_terminal_stream_delivery_failure(
+        output: &mut EngineOutput,
+        kind: StreamDeliveryFailureKind,
+    ) {
+        let (message, finish_reason, provenance) = match kind {
+            StreamDeliveryFailureKind::Delivery => (
+                "committed stream delivery failed",
+                OutputFinishReason::Error,
+                OutcomeProvenance::failure(
+                    FailureOrigin::StreamDelivery,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::Deadline => (
+                REQUEST_DEADLINE_EXCEEDED,
+                OutputFinishReason::Error,
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::StreamDelivery,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::Cancelled => (
+                "request cancelled",
+                OutputFinishReason::Aborted,
+                OutcomeProvenance::produced_output(),
+            ),
+            StreamDeliveryFailureKind::RequestDeadline => (
+                REQUEST_DEADLINE_EXCEEDED,
+                OutputFinishReason::Error,
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::ModelExecution,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::InvalidProgress => (
+                "executor emitted invalid incremental stream progress",
+                OutputFinishReason::Error,
+                OutcomeProvenance::failure(
+                    FailureOrigin::ExecutorValidation,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+        };
+        output.is_finished = true;
+        output.finish_reason = Some(finish_reason);
+        output.error = Some(message.to_string());
+        output.provenance = provenance;
+    }
+
+    /// Reconcile failures from the committed stream outbox with the exact
+    /// public output for this step. A terminal result has already completed its
+    /// scheduler lifecycle, so replace that result in place instead of queuing
+    /// a second terminal event. Non-terminal rows still need normal exact-
+    /// session termination.
+    pub(crate) async fn reconcile_stream_delivery_failures(
+        &mut self,
+        outputs: &mut [EngineOutput],
+        failures: Vec<StreamDeliveryFailure>,
+    ) {
+        for failure in failures {
+            if let Some(output) = outputs.iter_mut().find(|output| {
+                output.is_finished
+                    && output.request_id == failure.session.request_id
+                    && output.sequence_id == failure.session.epoch
+            }) {
+                Self::overlay_terminal_stream_delivery_failure(output, failure.kind);
+            } else {
+                self.handle_stream_delivery_failure(failure).await;
+            }
+        }
+    }
+
+    /// Abort only if the caller still owns the exact request incarnation.
+    pub async fn abort_request_session(&mut self, session: &super::SessionKey) -> bool {
+        let aborted = self
+            .terminate_request_session(
+                session,
+                ExecutorOutput::terminal(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                OutcomeProvenance::not_started(),
+            )
+            .await;
+        if !aborted {
+            return false;
+        }
         debug!(
             request_id = %session.request_id,
             session_epoch = session.epoch,
@@ -1616,6 +2642,9 @@ impl EngineCore {
         self.request_phase_timings.clear();
         self.execution_trackers.clear();
         self.active_plans.clear();
+        self.active_stream_batches.clear();
+        self.stream_sequence_cursors.clear();
+        self.incremental_stream_sessions.clear();
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
 
@@ -1645,6 +2674,7 @@ mod tests {
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn scheduled_prefill(request_id: &str, sequence_id: u64) -> ScheduledRequest {
@@ -1661,6 +2691,36 @@ mod tests {
                 input: crate::engine::InputRange { start: 0, end: 1 },
                 max_output_steps: 1,
             },
+        }
+    }
+
+    fn scheduled_decode(request_id: &str, sequence_id: u64) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id: sequence_id + 101,
+            request_id: request_id.to_string(),
+            sequence_id,
+            num_tokens: 1,
+            is_prefill: false,
+            block_ids: Vec::new(),
+            num_computed_tokens: 1,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Decode,
+                input: crate::engine::InputRange { start: 1, end: 2 },
+                max_output_steps: 1,
+            },
+        }
+    }
+
+    fn text_progress(request_id: &str, sequence: usize) -> super::super::StreamingOutput {
+        super::super::StreamingOutput {
+            request_id: request_id.to_string(),
+            sequence,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: false,
+            text: Some(format!("delta-{sequence}")),
+            stats: None,
+            asr_progress: None,
         }
     }
 
@@ -1859,84 +2919,6 @@ mod tests {
             } else {
                 super::super::executor::CacheReleaseReport::unconfirmed()
             }
-        }
-    }
-
-    struct TraceDecodeExecutor {
-        decode_calls: Arc<Mutex<Vec<Vec<(String, usize)>>>>,
-    }
-
-    impl TraceDecodeExecutor {
-        fn new(decode_calls: Arc<Mutex<Vec<Vec<(String, usize)>>>>) -> Self {
-            Self { decode_calls }
-        }
-    }
-
-    impl ModelExecutor for TraceDecodeExecutor {
-        fn execute_prefill(
-            &self,
-            _requests: &[&EngineCoreRequest],
-            scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorStepResult>> {
-            let outputs = scheduled
-                .iter()
-                .map(|entry| ExecutorOutput {
-                    request_id: entry.request_id.clone(),
-                    audio: Some(AudioOutput::empty(24_000)),
-                    text: None,
-                    input_transcription: None,
-                    tokens_processed: entry.num_tokens.max(1),
-                    tokens_generated: 0,
-                    finished: false,
-                    phase_timing_override: None,
-                    asr_diagnostics: None,
-                    error: None,
-                })
-                .collect();
-            Ok(wrap_outputs(scheduled, outputs))
-        }
-
-        fn execute_decode(
-            &self,
-            _requests: &[&EngineCoreRequest],
-            scheduled: &[ScheduledRequest],
-        ) -> Result<Vec<ExecutorStepResult>> {
-            if let Ok(mut calls) = self.decode_calls.lock() {
-                calls.push(
-                    scheduled
-                        .iter()
-                        .map(|entry| (entry.request_id.clone(), entry.num_tokens))
-                        .collect(),
-                );
-            }
-            let outputs = scheduled
-                .iter()
-                .map(|entry| ExecutorOutput {
-                    request_id: entry.request_id.clone(),
-                    audio: Some(AudioOutput::empty(24_000)),
-                    text: Some(format!("step-{}", entry.request_id)),
-                    input_transcription: None,
-                    tokens_processed: entry.num_tokens.max(1),
-                    tokens_generated: entry.num_tokens.max(1),
-                    finished: false,
-                    phase_timing_override: None,
-                    asr_diagnostics: None,
-                    error: None,
-                })
-                .collect();
-            Ok(wrap_outputs(scheduled, outputs))
-        }
-
-        fn is_ready(&self) -> bool {
-            true
-        }
-
-        fn initialize(&mut self) -> Result<()> {
-            Ok(())
-        }
-
-        fn shutdown(&mut self) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -2236,6 +3218,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_backpressure_deadline_preserves_delivery_provenance() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut request = EngineCoreRequest::tts("stream deadline");
+        request.id = "stream-deadline".to_string();
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"stream-deadline".to_string())
+            .expect("exact session");
+
+        assert!(
+            core.handle_stream_delivery_failure(StreamDeliveryFailure {
+                session: session.clone(),
+                kind: StreamDeliveryFailureKind::Deadline,
+            })
+            .await
+        );
+
+        let terminal = core
+            .pending_terminal_outputs
+            .back()
+            .expect("stream terminal output");
+        assert_eq!(terminal.session, session);
+        assert_eq!(
+            terminal.disposition,
+            ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut)
+        );
+        assert_eq!(
+            terminal.provenance,
+            OutcomeProvenance::deadline(
+                DeadlinePhase::StreamDelivery,
+                DispatchState::ProducedOutput,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_delivery_failure_replaces_success_without_duplicate_terminal() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let session = super::super::SessionKey::new("terminal-stream".to_string(), 17);
+        let mut outputs = vec![core.output_processor.process_execution(
+            ExecutorOutput::terminal(session.request_id.clone()),
+            &ExecutionDisposition::Finished(ExecutionFinishReason::Completed),
+            session.epoch,
+            Duration::ZERO,
+        )];
+
+        core.reconcile_stream_delivery_failures(
+            &mut outputs,
+            vec![StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Delivery,
+            }],
+        )
+        .await;
+
+        assert!(outputs[0].is_finished);
+        assert_eq!(outputs[0].finish_reason, Some(OutputFinishReason::Error));
+        assert_eq!(
+            outputs[0].error.as_deref(),
+            Some("committed stream delivery failed")
+        );
+        assert_eq!(
+            outputs[0].provenance,
+            OutcomeProvenance::failure(
+                FailureOrigin::StreamDelivery,
+                DispatchState::ProducedOutput,
+            )
+        );
+        assert!(
+            core.pending_terminal_outputs.is_empty(),
+            "a completed scheduler session must not receive a second terminal event"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_execution_surfaces_aborted_terminal_output() {
         let executor = UnifiedExecutor::new_for_test(Box::new(CancelledExecutor));
         let mut core =
@@ -2423,8 +3488,9 @@ mod tests {
 
         core.execution_trackers.remove(&plan_fault.id);
         assert!(core
-            .scheduler
-            .release_execution_quantum_for_retry(&plan_fault_session));
+            .active_plans
+            .values()
+            .all(|plan| plan.session != plan_fault_session));
         let retry_outputs = core.step().await.unwrap();
         let aborted_outputs: Vec<_> = retry_outputs
             .iter()
@@ -2541,193 +3607,644 @@ mod tests {
     }
 
     #[test]
-    fn compatible_subbatches_respect_declared_mode_and_width() {
-        fn install_plan(
-            core: &mut EngineCore,
-            scheduled: &ScheduledRequest,
-            mode: NativeBatchMode,
-            max_batch_size: usize,
-        ) {
-            core.active_plans.insert(
-                scheduled.plan_id,
-                ExecutionPlan {
-                    plan_id: scheduled.plan_id,
-                    session: scheduled.session_key(),
-                    work: scheduled.work.clone(),
-                    batch_key: BatchKey {
-                        backend: BackendKind::Cpu,
-                        model_variant: None,
-                        task_type: TaskType::TTS,
-                        work_kind: "tts".to_string(),
-                        compute_dtype: "f32".to_string(),
-                        kv_dtype: "none".to_string(),
-                        cache_namespace: "none".to_string(),
-                        adapter_id: None,
-                    },
-                    batch_mode: mode,
-                    max_batch_size,
-                    estimate: ResourceVector::zero(),
-                    reservation: None,
-                },
-            );
-        }
+    fn loaded_stage_contract_preserves_independent_request_parallelism() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let model_instance = super::super::ModelInstanceId::new(2);
+        let mut request = EngineCoreRequest::tts("contract").with_model_variant(variant);
+        request.bind_model_instance(model_instance).unwrap();
+        let mut declared =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        declared.prefill_batch = NativeBatchMode::Static;
+        declared.max_batch_size = 8;
+        declared.concurrency = ConcurrencyClass::Batchable;
+        let compatibility_stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(0),
+            "tts.compatibility",
+            &declared,
+            NativeBatchMode::None,
+        );
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: super::super::ExecutionGroupId::new(1),
+                model_instance_id: model_instance,
+                adapter_instance_id: super::super::AdapterInstanceId::new(3),
+                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "tts".to_string(),
+                stages: Arc::from([compatibility_stage]),
+            })
+            .unwrap();
 
+        let effective = EngineCore::apply_adapter_execution_contract(&request, declared).unwrap();
+        assert_eq!(effective.prefill_batch, NativeBatchMode::None);
+        assert_eq!(effective.decode_batch, NativeBatchMode::None);
+        assert_eq!(effective.max_batch_size, 8);
+        assert_eq!(effective.concurrency, ConcurrencyClass::Batchable);
+    }
+
+    #[test]
+    fn incremental_progress_requires_exact_batch_plan_session_lane_and_sequence() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
         ))));
         let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
             .expect("core");
-        let mut requests = Vec::new();
-        let mut scheduled = Vec::new();
-        for index in 0..3 {
-            let id = format!("batch-{index}");
-            let mut request = EngineCoreRequest::tts("hello");
-            request.id = id.clone();
-            requests.push(request);
-            scheduled.push(scheduled_prefill(&id, index));
-        }
-        let refs = requests.iter().collect::<Vec<_>>();
+        let request_id = "fenced-progress".to_string();
+        let mut request = EngineCoreRequest::tts("fenced progress");
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        request.streaming = true;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        request.cancellation = Some(cancellation.clone());
+        let (delivery_tx, _delivery_rx) = mpsc::channel(8);
+        request.streaming_tx = Some(delivery_tx);
+        core.add_request(request).unwrap();
+        let session = core.get_session_key(&request_id).unwrap();
 
-        for item in &scheduled {
-            install_plan(&mut core, item, NativeBatchMode::None, 1);
-        }
-        let serial = core.build_compatible_subbatches(&refs, &scheduled);
-        assert_eq!(serial.len(), 3);
-        assert!(serial.iter().all(|(_, batch)| batch.len() == 1));
-
-        core.active_plans.clear();
-        for item in &scheduled {
-            install_plan(&mut core, item, NativeBatchMode::None, 2);
-        }
-        let request_parallel = core.build_compatible_subbatches(&refs, &scheduled);
-        assert_eq!(
-            request_parallel
-                .iter()
-                .map(|(_, batch)| batch.len())
-                .collect::<Vec<_>>(),
-            vec![2, 1]
+        let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(51),
+            "test.atomic.incremental",
+            &profile,
+            NativeBatchMode::None,
         );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let plan_id = 7001;
+        let plan = ExecutionPlan {
+            plan_id,
+            session: session.clone(),
+            work: WorkUnit::AtomicJob {
+                kind: "tts".to_string(),
+            },
+            batch_key: BatchKey {
+                backend: BackendKind::Cpu,
+                model_variant: None,
+                task_type: TaskType::TTS,
+                work_kind: "tts".to_string(),
+                compute_dtype: "f32".to_string(),
+                kv_dtype: "none".to_string(),
+                cache_namespace: "none".to_string(),
+                adapter: None,
+            },
+            batch_mode: NativeBatchMode::None,
+            max_batch_size: 1,
+            estimate: ResourceVector::zero(),
+            stage: Some(stage),
+        };
+        let mut tracker = ExecutionTracker::new(session.clone());
+        tracker.transition(ExecutionState::Admitted).unwrap();
+        tracker.transition(ExecutionState::AtomicRunning).unwrap();
+        tracker.begin_plan(&plan).unwrap();
+        core.execution_trackers.insert(request_id.clone(), tracker);
+        core.active_plans.insert(plan_id, plan.clone());
 
-        core.active_plans.clear();
-        for item in &scheduled {
-            install_plan(&mut core, item, NativeBatchMode::Static, 2);
-        }
-        let static_batches = core.build_compatible_subbatches(&refs, &scheduled);
+        let lane = EngineCore::batch_lane(&plan, WorkCost::new(1, 1, 0));
+        let batch_id = BatchId::new(81);
+        core.active_stream_batches.insert(
+            batch_id,
+            ActiveStreamBatch {
+                lane: lane.clone(),
+                output_visibility: OutputVisibility::IncrementalCommitted,
+                rows: HashMap::from([(plan_id, session.clone())]),
+            },
+        );
+        let request = core.requests.get(&request_id).unwrap().clone();
+        let staging = request.stream_staging_buffer();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let binding = request
+            .bind_stream_quantum(
+                batch_id,
+                lane.clone(),
+                plan_id,
+                session.clone(),
+                OutputVisibility::IncrementalCommitted,
+                progress_tx,
+                StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES),
+            )
+            .unwrap();
+        let mut next_progress = |sequence| {
+            staging
+                .push_with_policy(text_progress(&request_id, sequence), request.stream_policy)
+                .unwrap();
+            progress_rx.try_recv().expect("fenced progress")
+        };
+
+        let mut wrong_batch = next_progress(0);
+        wrong_batch.batch_id = BatchId::new(82);
+        assert!(core
+            .commit_incremental_stream_progress(wrong_batch)
+            .unwrap_err()
+            .to_string()
+            .contains("inactive physical batch"));
+
+        let mut wrong_plan = next_progress(0);
+        wrong_plan.plan_id += 1;
+        assert!(core
+            .commit_incremental_stream_progress(wrong_plan)
+            .unwrap_err()
+            .to_string()
+            .contains("inactive plan"));
+
+        let mut wrong_session = next_progress(0);
+        wrong_session.session.epoch += 1;
+        assert!(core
+            .commit_incremental_stream_progress(wrong_session)
+            .unwrap_err()
+            .to_string()
+            .contains("session does not match"));
+
+        let mut wrong_lane = next_progress(0);
+        wrong_lane.lane.shape_bucket.push_str(".stale");
+        assert!(core
+            .commit_incremental_stream_progress(wrong_lane)
+            .unwrap_err()
+            .to_string()
+            .contains("physical batch fence"));
+
+        let wrong_sequence = next_progress(4);
+        assert!(core
+            .commit_incremental_stream_progress(wrong_sequence)
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 0"));
+
+        let delivery = core
+            .commit_incremental_stream_progress(next_progress(0))
+            .expect("exact progress must commit");
+        drop(delivery);
+        assert_eq!(core.stream_sequence_cursors.get(&session), Some(&1));
+        assert!(core.incremental_stream_sessions.contains(&session));
+
+        assert!(core
+            .commit_incremental_stream_progress(next_progress(0))
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 1"));
+
+        cancellation.store(true, Ordering::Release);
         assert_eq!(
-            static_batches
-                .iter()
-                .map(|(_, batch)| batch.len())
-                .collect::<Vec<_>>(),
-            vec![2, 1]
+            core.commit_incremental_stream_progress(next_progress(1))
+                .unwrap_err()
+                .kind,
+            StreamDeliveryFailureKind::Cancelled
+        );
+        cancellation.store(false, Ordering::Release);
+
+        drop(next_progress);
+        drop(binding);
+        drop(request);
+        Arc::get_mut(core.requests.get_mut(&request_id).expect("active request"))
+            .expect("core owns the last request reference")
+            .deadline = Some(Instant::now());
+        let request = core.requests.get(&request_id).unwrap().clone();
+        let staging = request.stream_staging_buffer();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let _binding = request
+            .bind_stream_quantum(
+                batch_id,
+                lane,
+                plan_id,
+                session,
+                OutputVisibility::IncrementalCommitted,
+                progress_tx,
+                StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES),
+            )
+            .unwrap();
+        staging
+            .push_with_policy(text_progress(&request_id, 1), request.stream_policy)
+            .unwrap();
+        assert_eq!(
+            core.commit_incremental_stream_progress(
+                progress_rx.try_recv().expect("deadline-fenced progress")
+            )
+            .unwrap_err()
+            .kind,
+            StreamDeliveryFailureKind::RequestDeadline
         );
     }
 
     #[test]
-    fn executor_output_reconciliation_rejects_duplicates_unknowns_and_missing_ids() {
-        let scheduled = vec![scheduled_prefill("req-a", 0), scheduled_prefill("req-b", 1)];
-        let mut executor_outputs = wrap_outputs(
-            &scheduled[..1],
-            MockExecutor::build_outputs(&scheduled[..1]),
+    fn physical_batch_formation_uses_exact_loaded_lane_identity() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        for id in ["physical-a", "physical-b"] {
+            let mut request = EngineCoreRequest::tts("physical batch");
+            request.id = id.to_string();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ["physical-a", "physical-b"]
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_prefill(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.max_batch_size = 2;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(4),
+            "tts.generate",
+            &profile,
+            NativeBatchMode::Static,
         );
-        executor_outputs.push(executor_outputs[0].clone());
-        let mut unknown = executor_outputs[0].clone();
-        unknown.plan_id = 999;
-        unknown.session = crate::engine::SessionKey::new("unknown".to_string(), 999);
-        unknown.output.request_id = "unknown".to_string();
-        executor_outputs.push(unknown);
-
-        let reconciled =
-            EngineCore::reconcile_executor_outputs("prefill", &scheduled, Ok(executor_outputs));
-
-        assert_eq!(
-            reconciled
-                .iter()
-                .map(|result| result.output.request_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["req-a", "req-b"]
-        );
-        assert!(reconciled.iter().all(|result| result.output.finished));
-        assert!(reconciled
+        stage.workspace_base_bytes = 4;
+        stage.workspace_per_row_bytes = 2;
+        stage.workspace_per_work_unit_bytes = 1;
+        stage.max_workspace_bytes = 10;
+        let adapter_key = super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "tts".to_string(),
+            stage_id: stage.id,
+        };
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: item.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::TTS,
+                        work_kind: "prefill".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::Static,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
             .iter()
-            .all(|result| result.output.error.as_deref().is_some()));
-        assert!(reconciled[0]
-            .output
-            .error
-            .as_deref()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let joined = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].physical_batch().rows.len(), 2);
+        assert_eq!(
+            joined[0].physical_batch().workspace,
+            ResourceVector {
+                host_bytes: ResourceAmount::Known(10),
+                ..ResourceVector::zero()
+            }
+        );
+        assert_eq!(
+            joined[0].physical_batch().lane.model_instance,
+            super::super::ModelInstanceId::new(2)
+        );
+
+        core.active_plans
+            .get_mut(&scheduled[1].plan_id)
             .unwrap()
-            .contains("duplicate"));
-        assert!(reconciled[1]
-            .output
-            .error
-            .as_deref()
+            .batch_key
+            .adapter
+            .as_mut()
             .unwrap()
-            .contains("did not return"));
+            .model_instance_id = super::super::ModelInstanceId::new(9);
+        let split = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(split.len(), 2);
+        assert!(split
+            .iter()
+            .all(|batch| batch.physical_batch().rows.len() == 1));
     }
 
-    #[tokio::test]
-    async fn test_execute_decode_subbatch_dispatches_each_plan_exactly_once() {
-        let decode_calls = Arc::new(Mutex::new(Vec::new()));
-        let executor =
-            UnifiedExecutor::new_for_test(Box::new(TraceDecodeExecutor::new(decode_calls.clone())));
-
-        let config = EngineCoreConfig::default();
-        let core = EngineCore::new_with_unified_executor(config, executor).unwrap();
-
-        let mut req_a = EngineCoreRequest::tts("a");
-        req_a.id = "req-a".to_string();
-        let mut req_b = EngineCoreRequest::tts("b");
-        req_b.id = "req-b".to_string();
-        let req_refs = vec![&req_a, &req_b];
-
-        let scheduled = vec![
-            ScheduledRequest {
-                plan_id: 1,
-                request_id: req_a.id.clone(),
-                sequence_id: 0,
-                num_tokens: 3,
-                is_prefill: false,
-                block_ids: Vec::new(),
-                num_computed_tokens: 0,
-                work: crate::engine::WorkUnit::SequenceStep {
-                    phase: crate::engine::SequencePhase::Decode,
-                    input: crate::engine::InputRange { start: 0, end: 3 },
-                    max_output_steps: 3,
-                },
+    #[test]
+    fn cuda_batch_workspace_preserves_host_and_device_domains() {
+        let lane = BatchLaneKey {
+            execution_group: super::super::ExecutionGroupId::new(1),
+            model_instance: super::super::ModelInstanceId::new(2),
+            adapter_instance: super::super::AdapterInstanceId::new(3),
+            adapter_abi: super::super::AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: super::super::StageId::new(4),
+            backend: BackendKind::Cuda,
+            device_ordinal: None,
+            compute_dtype: "f16".to_string(),
+            state_dtype: "f16".to_string(),
+            tensor_layout: "ragged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test".to_string(),
+            kernel_mode: "continuous".to_string(),
+            semantic_mode: "decode".to_string(),
+            shape_bucket: "ragged".to_string(),
+        };
+        let row = ReadyQuantum {
+            plan_id: 1,
+            session: super::super::SessionKey::new("workspace".to_string(), 1),
+            lane,
+            work: WorkUnit::SequenceStep {
+                phase: super::super::SequencePhase::Decode,
+                input: super::super::InputRange { start: 1, end: 2 },
+                max_output_steps: 1,
             },
-            ScheduledRequest {
-                plan_id: 2,
-                request_id: req_b.id.clone(),
-                sequence_id: 1,
-                num_tokens: 2,
-                is_prefill: false,
-                block_ids: Vec::new(),
-                num_computed_tokens: 0,
-                work: crate::engine::WorkUnit::SequenceStep {
-                    phase: crate::engine::SequencePhase::Decode,
-                    input: crate::engine::InputRange { start: 0, end: 2 },
-                    max_output_steps: 2,
+            cost: WorkCost::with_workspace(
+                1,
+                1,
+                ResourceVector {
+                    host_bytes: ResourceAmount::Known(32),
+                    temporary_bytes: ResourceAmount::Known(8_192),
+                    ..ResourceVector::zero()
                 },
-            },
-        ];
+            ),
+        };
 
-        let outputs = core
-            .execute_decode_subbatch(&req_refs, &scheduled)
-            .await
-            .unwrap();
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].output.request_id, "req-a");
-        assert_eq!(outputs[0].output.tokens_processed, 3);
-        assert_eq!(outputs[0].output.tokens_generated, 3);
-        assert_eq!(outputs[1].output.request_id, "req-b");
-        assert_eq!(outputs[1].output.tokens_processed, 2);
-        assert_eq!(outputs[1].output.tokens_generated, 2);
-
-        let calls = decode_calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0],
-            vec![("req-a".to_string(), 3), ("req-b".to_string(), 2)]
+            PhysicalBatchAssembly::workspace_resources(
+                BackendKind::Cuda,
+                16,
+                std::slice::from_ref(&row),
+            ),
+            Some(ResourceVector {
+                host_bytes: ResourceAmount::Known(32),
+                device_bytes: ResourceAmount::Known(8_208),
+                ..ResourceVector::zero()
+            })
         );
+    }
+
+    #[test]
+    fn independent_compatibility_rows_form_bounded_parallel_batches() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        let ids = [
+            "parallel-a",
+            "parallel-b",
+            "parallel-c",
+            "parallel-d",
+            "parallel-e",
+        ];
+        for id in ids {
+            let mut request = EngineCoreRequest::tts(format!("independent {id}"));
+            request.id = id.to_string();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ids
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_prefill(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.max_batch_size = 2;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(6),
+            "tts.compatibility",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let adapter_key = super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "tts".to_string(),
+            stage_id: stage.id,
+        };
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: item.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::TTS,
+                        work_kind: "prefill".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::None,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let widths = batches
+            .iter()
+            .map(|batch| batch.physical_batch().rows.len())
+            .collect::<Vec<_>>();
+        assert_eq!(widths, vec![2, 2, 1]);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.physical_batch().mode == NativeBatchMode::None));
+        assert!(batches
+            .iter()
+            .all(|batch| { batch.physical_batch().lane.shape_bucket == "independent" }));
+    }
+
+    #[test]
+    fn prepared_exact_shapes_split_static_physical_batches() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.prefill_batch = NativeBatchMode::Static;
+        profile.max_batch_size = 2;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(7),
+            "tts.generate.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        stage.shape_policy = StageShapePolicy::Exact;
+        stage.max_padding_basis_points = 0;
+        stage.max_work_units = 2;
+        stage.max_workspace_bytes = 64;
+        let binding = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage.clone()]),
+        };
+        for (id, tensor_elements) in [("shape-a", 8), ("shape-b", 9)] {
+            let mut request =
+                EngineCoreRequest::tts("exact static shape").with_model_variant(variant);
+            request.id = id.to_string();
+            request.bind_execution_adapter(binding.clone()).unwrap();
+            request
+                .install_prepared_stage_cost(
+                    stage.id,
+                    WorkCost::new(1, tensor_elements, tensor_elements),
+                )
+                .unwrap();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ["shape-a", "shape-b"]
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_prefill(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let adapter_key = binding.key_for_stage(stage.id).unwrap();
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: WorkUnit::AtomicJob {
+                        kind: "tts".to_string(),
+                    },
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: Some(variant),
+                        task_type: TaskType::TTS,
+                        work_kind: "tts".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "none".to_string(),
+                        cache_namespace: "none".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::Static,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.physical_batch().rows.len() == 1));
+        assert_eq!(
+            batches[0]
+                .physical_batch()
+                .workspace
+                .workspace_bytes()
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            batches[1]
+                .physical_batch()
+                .workspace
+                .workspace_bytes()
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn one_token_continuous_budget_admits_multiple_rows() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        for id in ["continuous-a", "continuous-b"] {
+            let mut request = EngineCoreRequest::tts("continuous batch fixture");
+            request.id = id.to_string();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ["continuous-a", "continuous-b"]
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_decode(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.max_batch_size = 2;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(5),
+            "chat.decode.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        stage.max_work_units = 2;
+        let adapter_key = super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: stage.id,
+        };
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: item.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::Chat,
+                        work_kind: "decode".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "f32".to_string(),
+                        cache_namespace: "continuous".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::Continuous,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].physical_batch().mode,
+            NativeBatchMode::Continuous
+        );
+        assert_eq!(batches[0].physical_batch().rows.len(), 2);
+        assert_eq!(batches[0].physical_batch().budget.max_logical_units, 2);
     }
 
     #[tokio::test]
@@ -2809,12 +4326,17 @@ mod tests {
                 },
                 disposition: ExecutionDisposition::Failed(ExecutionFailure {
                     kind: super::super::execution::FailureKind::Backend,
-                    scope: super::super::execution::FailureScope::Request,
+                    scope: super::super::execution::FailureScope::Row,
                     retry,
                     health: super::super::execution::HealthImpact::Degraded,
                     message: "transient backend failure".to_string(),
                 }),
                 safe_point: true,
+                provenance: OutcomeProvenance::failure(
+                    FailureOrigin::Model,
+                    DispatchState::Started,
+                ),
+                staged_stream_outputs: Vec::new(),
             },
         )
     }
@@ -2872,6 +4394,63 @@ mod tests {
         let retry = retry_schedule.prefill_requests.remove(0);
         assert_eq!(retry.session_key(), session);
         assert_ne!(retry.plan_id, scheduled.plan_id);
+    }
+
+    #[tokio::test]
+    async fn committed_stream_progress_disables_all_executor_retries() {
+        for (suffix, retry) in [
+            ("same-session", RetryDisposition::RetrySameSession),
+            ("recompute", RetryDisposition::Recompute),
+        ] {
+            let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+                Mutex::new(Vec::new()),
+            ))));
+            let mut core = EngineCore::new_with_unified_executor(
+                EngineCoreConfig {
+                    max_batch_size: 1,
+                    max_tokens_per_step: 8,
+                    ..Default::default()
+                },
+                executor,
+            )
+            .unwrap();
+            core.retry_policy.execution_backoff_base = Duration::ZERO;
+            core.retry_policy.execution_backoff_max = Duration::ZERO;
+            let mut request = EngineCoreRequest::tts("visible retry");
+            request.id = format!("visible-retry-{suffix}");
+            request.prompt_tokens = vec![1];
+            core.add_request(request).unwrap();
+            core.refresh_scheduler_execution_profiles().await;
+            let scheduled = core
+                .scheduler
+                .schedule(core.kv_cache.inner_mut())
+                .prefill_requests
+                .remove(0);
+            let session = scheduled.session_key();
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            core.incremental_stream_sessions.insert(session.clone());
+
+            let committed = core
+                .commit_executor_result(retryable_step_result(&scheduled, retry), 1.0)
+                .await
+                .expect("visible progress must turn a retry into a terminal failure");
+            assert_eq!(committed.session, session);
+            assert!(committed
+                .output
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("retry is unsafe")));
+            assert!(matches!(
+                committed.disposition,
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    retry: RetryDisposition::Never,
+                    ..
+                })
+            ));
+            let retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+            assert!(retry_schedule.prefill_requests.is_empty());
+            assert!(retry_schedule.decode_requests.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -3283,6 +4862,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_deadline_returns_one_terminal_output_with_original_sequence() {
+        let metrics_before = crate::engine::engine_batch_metrics_snapshot();
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
@@ -3301,6 +4881,19 @@ mod tests {
         assert!(outputs[0].is_finished);
         assert_eq!(outputs[0].num_tokens, 0);
         assert_eq!(outputs[0].error.as_deref(), Some(REQUEST_DEADLINE_EXCEEDED));
+        assert_eq!(
+            outputs[0].provenance,
+            OutcomeProvenance::deadline(DeadlinePhase::SchedulerQueue, DispatchState::NotStarted,)
+        );
+        let metrics_after = crate::engine::engine_batch_metrics_snapshot();
+        assert!(
+            metrics_after.dispatch_states.not_started
+                >= metrics_before.dispatch_states.not_started + 1
+        );
+        assert!(
+            metrics_after.deadline_phases.scheduler_queue
+                >= metrics_before.deadline_phases.scheduler_queue + 1
+        );
         assert!(!core.has_request(&"expired".to_string()));
         assert_eq!(
             cleanup_calls
@@ -3543,6 +5136,69 @@ mod tests {
             .unwrap();
         core.add_request(bounded).unwrap();
         assert_eq!(core.requests["bounded-context"].params.max_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn serialized_physical_batches_only_charge_each_request_its_own_elapsed_time() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        for request_id in ["fast-batch", "slow-batch"] {
+            let mut request = EngineCoreRequest::tts(request_id);
+            request.id = request_id.to_string();
+            request.prompt_tokens = vec![1];
+            core.add_request(request).unwrap();
+        }
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prepared physical batches");
+        let mut executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        assert_eq!(executed.batches.len(), 2);
+        for batch in &mut executed.batches {
+            let request_id = batch.results[0].session.request_id.as_str();
+            let elapsed = match request_id {
+                "fast-batch" => Duration::from_millis(7),
+                "slow-batch" => Duration::from_millis(31),
+                other => panic!("unexpected batch row {other}"),
+            };
+            batch.report.elapsed = elapsed;
+            for row in &mut batch.report.rows {
+                row.execution.elapsed = elapsed;
+            }
+        }
+
+        let committed = core.commit_step(executed).await.unwrap();
+        let prefill_ms = committed
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.request_id.as_str(),
+                    output
+                        .latency_breakdown
+                        .as_ref()
+                        .expect("latency breakdown")
+                        .prefill_ms,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert!((prefill_ms["fast-batch"] - 7.0).abs() < 0.001);
+        assert!((prefill_ms["slow-batch"] - 31.0).abs() < 0.001);
     }
 
     #[tokio::test]

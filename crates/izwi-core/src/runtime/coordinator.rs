@@ -14,11 +14,15 @@ use serde::Serialize;
 
 use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
 use crate::engine::{
-    CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, Priority, ReservationClass,
-    ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate, ResourceLease,
-    ResourceVector, WorkloadClass,
+    BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain, ExecutionGroupId,
+    NativeBatchMode, PhysicalCapacityProvider, PhysicalCapacitySnapshot, Priority,
+    ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceEstimate,
+    ResourceLease, ResourceVector, WorkUnit, WorkloadClass,
 };
 use crate::error::{Error, Result};
+use crate::runtime::adapters::LoadedExecutionContract;
+
+static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoordinatorLane {
@@ -79,9 +83,11 @@ pub struct CoordinatorSnapshot {
 
 #[derive(Debug)]
 pub struct InferenceCoordinator {
+    execution_group_id: ExecutionGroupId,
     capacity: usize,
     backend: BackendKind,
     jobs: Arc<Semaphore>,
+    host_work: Arc<Semaphore>,
     execution: Arc<Semaphore>,
     resources: Arc<ResourceAuthority>,
     admission_gate: Mutex<()>,
@@ -131,13 +137,17 @@ impl InferenceCoordinator {
         resources: Arc<ResourceAuthority>,
     ) -> Self {
         let capacity = match backend {
-            BackendKind::Cpu | BackendKind::Metal => 1,
-            BackendKind::Cuda => execution_parallelism.max(1),
+            BackendKind::Metal => 1,
+            BackendKind::Cpu | BackendKind::Cuda => execution_parallelism.max(1),
         };
         Self {
+            execution_group_id: ExecutionGroupId::new(
+                NEXT_EXECUTION_GROUP_ID.fetch_add(1, Ordering::Relaxed),
+            ),
             capacity,
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
+            host_work: Arc::new(Semaphore::new(capacity)),
             execution: Arc::new(Semaphore::new(capacity)),
             resources,
             admission_gate: Mutex::new(()),
@@ -154,6 +164,10 @@ impl InferenceCoordinator {
 
     pub fn resource_authority(&self) -> Arc<ResourceAuthority> {
         self.resources.clone()
+    }
+
+    pub(crate) fn execution_group_id(&self) -> ExecutionGroupId {
+        self.execution_group_id
     }
 
     pub fn snapshot(&self) -> CoordinatorSnapshot {
@@ -297,7 +311,7 @@ impl InferenceCoordinator {
         })
     }
 
-    pub async fn acquire_execution(
+    async fn acquire_execution(
         self: &Arc<Self>,
         deadline: Option<Instant>,
     ) -> Result<ExecutionLease> {
@@ -305,14 +319,45 @@ impl InferenceCoordinator {
     }
 
     /// Reserve the complete backend execution budget for one scheduler step.
-    /// A CUDA step may fan out across `request_parallelism` worker threads, so
+    /// A CPU or CUDA step may fan out across `request_parallelism` worker threads, so
     /// holding a single permit would allow unrelated direct work to exceed the
-    /// configured device concurrency. CPU and Metal have capacity one.
-    pub async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
+    /// configured backend concurrency. Metal remains strictly singleton.
+    async fn acquire_engine_step(self: &Arc<Self>) -> Result<ExecutionLease> {
         self.acquire_execution_units(self.capacity, None).await
     }
 
-    pub async fn acquire_execution_units(
+    /// Run one scheduler step while exclusively owning this backend's complete
+    /// execution budget. Callers provide work, but never receive or retain a
+    /// raw device permit; all model-forward routes therefore share this one
+    /// coordinator-owned execution boundary.
+    pub(crate) async fn run_engine_step<T, F>(self: &Arc<Self>, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let _execution = self.acquire_engine_step().await?;
+        future.await
+    }
+
+    /// Reserve scratch memory for one physical tensor dispatch. This does not
+    /// acquire execution capacity; the coordinator-owned engine or direct
+    /// runner retains execution capacity independently for the device work.
+    pub(crate) fn reserve_batch_workspace(
+        &self,
+        execution_group: ExecutionGroupId,
+        batch_id: BatchId,
+        resources: ResourceVector,
+    ) -> Result<BatchWorkspaceLease> {
+        if !matches!(resources.kv_bytes, ResourceAmount::Known(0)) {
+            return Err(Error::InvalidInput(
+                "batch workspace estimate contains persistent KV resources".to_string(),
+            ));
+        }
+        let resources = effective_resources(resources, self.backend)?;
+        self.resources
+            .reserve_batch_workspace(execution_group, batch_id, resources)
+    }
+
+    async fn acquire_execution_units(
         self: &Arc<Self>,
         units: usize,
         deadline: Option<Instant>,
@@ -349,30 +394,6 @@ impl InferenceCoordinator {
             coordinator: self.clone(),
             _permit: permit,
         })
-    }
-
-    pub async fn run_direct<T, F>(self: &Arc<Self>, spec: JobSpec, future: F) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        let job = self.admit(spec).await?;
-        self.run_stage(&job, future).await
-    }
-
-    /// Run a direct job whose retained input allocation already exists when
-    /// admission completes. The observation only reconciles physical usage;
-    /// it cannot expand the authorization established by `spec`.
-    pub async fn run_direct_observed<T, F>(
-        self: &Arc<Self>,
-        spec: JobSpec,
-        observation: JobResourceObservation,
-        future: F,
-    ) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        let job = self.admit_observed(spec, observation).await?;
-        self.run_stage(&job, future).await
     }
 
     /// Admit a request before invoking its potentially expensive preparation
@@ -437,7 +458,8 @@ impl InferenceCoordinator {
         Ok((job, prepared))
     }
 
-    pub async fn run_stage<T, F>(self: &Arc<Self>, job: &JobLease, future: F) -> Result<T>
+    #[cfg(test)]
+    pub(crate) async fn run_stage<T, F>(self: &Arc<Self>, job: &JobLease, future: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {
@@ -474,7 +496,99 @@ impl InferenceCoordinator {
     /// Execute synchronous model work off Tokio workers while retaining the
     /// execution permit and job reservation until physical work really ends.
     /// Deadline expiry detaches the blocking task instead of cancelling it.
-    pub async fn run_blocking_stage<T, F>(
+    #[cfg(test)]
+    pub(crate) async fn run_blocking_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        self.run_blocking_stage_inner(job, operation).await
+    }
+
+    /// Execute admitted CPU-side preparation without spending backend device
+    /// capacity. Host work has its own bounded lane and retains the job lease
+    /// until a detached blocking task physically exits.
+    pub(crate) async fn run_host_blocking_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let acquire = self.host_work.clone().acquire_owned();
+        let permit = match job.spec.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
+                .await
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout(job.spec.request_id.clone())
+                })?
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+            None => acquire
+                .await
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+        };
+        self.run_blocking_task(job, permit, "host preparation", operation)
+            .await
+    }
+
+    /// Execute one non-batched model stage through an exact loaded adapter.
+    /// Direct, realtime, and pipeline runners use this compatibility boundary
+    /// until their model stage gains a proven native tensor adapter.
+    pub(crate) async fn run_loaded_blocking_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if !contract.execution_profile.resolved_from_loaded_model {
+            return Err(Error::InferenceError(
+                "runtime execution contract was not resolved from a loaded model".to_string(),
+            ));
+        }
+        if contract.execution_group_id != self.execution_group_id {
+            return Err(Error::InferenceError(
+                "runtime execution contract belongs to a different execution group".to_string(),
+            ));
+        }
+        if contract.execution_profile.backend != self.backend {
+            return Err(Error::InferenceError(
+                "runtime execution contract belongs to a different backend".to_string(),
+            ));
+        }
+        let binding = contract.adapter_binding()?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup {
+            return Err(Error::InvalidInput(
+                "host-only adapter stage cannot enter device execution".to_string(),
+            ));
+        }
+        if stage.batch_mode != NativeBatchMode::None || stage.max_batch_size != 1 {
+            return Err(Error::InvalidInput(
+                "runtime width-one runner cannot execute a native tensor stage".to_string(),
+            ));
+        }
+
+        self.run_blocking_stage_inner(job, move || {
+            let _contract = contract;
+            let _work = work;
+            operation()
+        })
+        .await
+    }
+
+    async fn run_blocking_stage_inner<T, F>(
         self: &Arc<Self>,
         job: &JobLease,
         operation: F,
@@ -484,12 +598,29 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         let deadline = job.spec.deadline;
-        let request_id = job.spec.request_id.clone();
         let execution = self.acquire_execution(deadline).await?;
+        self.run_blocking_task(job, execution, "inference", operation)
+            .await
+    }
+
+    async fn run_blocking_task<T, F, G>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        guard: G,
+        task_kind: &'static str,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+        G: Send + 'static,
+    {
+        let deadline = job.spec.deadline;
+        let request_id = job.spec.request_id.clone();
         let retained_job = job.clone();
         let blocking_request_id = request_id.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let _execution = execution;
+            let _guard = guard;
             let _job = retained_job;
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 return Err(Error::Timeout(blocking_request_id));
@@ -506,7 +637,7 @@ impl InferenceCoordinator {
             None => handle.await,
         };
         let result = joined.map_err(|err| {
-            Error::InferenceError(format!("blocking inference task failed: {err}"))
+            Error::InferenceError(format!("blocking {task_kind} task failed: {err}"))
         })?;
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             self.expired_total.fetch_add(1, Ordering::Relaxed);
@@ -1260,7 +1391,7 @@ fn cuda_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySo
 }
 
 #[derive(Debug)]
-pub struct ExecutionLease {
+struct ExecutionLease {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
 }
@@ -1282,6 +1413,8 @@ impl Drop for ExecutionLease {
 mod tests {
     use super::*;
     use crate::engine::ResourceVector;
+    use crate::model::ModelVariant;
+    use crate::runtime::adapters::{CapabilityKind, LoadedModelBundle, RuntimeAdapterRegistry};
 
     #[derive(Debug)]
     struct MutableCapacityProvider {
@@ -1847,9 +1980,44 @@ Pages free: 10.\n";
         assert_eq!(combine_metal_memory_snapshot(100, 120, 200, 150), (100, 0));
     }
 
+    #[test]
+    fn batch_workspace_is_transient_and_does_not_own_execution_capacity() {
+        let coordinator = InferenceCoordinator::new(BackendKind::Cpu, 8, 8);
+        let mut resources = ResourceVector::zero();
+        resources.temporary_bytes = ResourceAmount::Known(8);
+
+        let workspace = coordinator
+            .reserve_batch_workspace(ExecutionGroupId::new(4), BatchId::new(12), resources)
+            .expect("batch workspace");
+
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.reserved_host_memory_bytes, 8);
+        assert_eq!(snapshot.active_jobs, 0);
+        assert_eq!(snapshot.active_executions, 0);
+        drop(workspace);
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn batch_workspace_rejects_persistent_cache_accounting() {
+        let coordinator = InferenceCoordinator::new(BackendKind::Cpu, 1, 1);
+        let mut resources = ResourceVector::zero();
+        resources.kv_bytes = ResourceAmount::Known(1);
+
+        assert!(matches!(
+            coordinator.reserve_batch_workspace(
+                ExecutionGroupId::new(1),
+                BatchId::new(1),
+                resources,
+            ),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
     #[tokio::test]
     async fn queue_is_bounded_and_raii_reconciles_counts() {
-        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 8, 1));
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
         let lease = coordinator.admit(job("first")).await.unwrap();
         assert_eq!(
             coordinator.snapshot().reserved_memory_bytes,
@@ -1865,6 +2033,16 @@ Pages free: 10.\n";
         drop(second);
         assert_eq!(coordinator.snapshot().active_jobs, 0);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+
+        let parallel = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 1));
+        let first = parallel.admit(job("parallel-first")).await.unwrap();
+        let second = parallel.admit(job("parallel-second")).await.unwrap();
+        assert!(matches!(
+            parallel.admit(job("parallel-third")).await,
+            Err(Error::Overloaded(_))
+        ));
+        drop((first, second));
+        assert_eq!(parallel.snapshot().active_jobs, 0);
     }
 
     #[tokio::test]
@@ -1911,10 +2089,10 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn cpu_and_metal_serialize_while_cuda_uses_configured_capacity() {
+    async fn cpu_and_cuda_use_configured_capacity_while_metal_serializes() {
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Cpu, 8, 8).capacity,
-            1
+            8
         );
         assert_eq!(
             InferenceCoordinator::new(BackendKind::Metal, 8, 8).capacity,
@@ -2021,8 +2199,17 @@ Pages free: 10.\n";
             cpu.acquire_execution_units(0, None).await,
             Err(Error::InvalidInput(_))
         ));
+        let cpu_lease = cpu.acquire_execution_units(2, None).await.unwrap();
+        assert_eq!(cpu.snapshot().active_executions, 1);
+        drop(cpu_lease);
         assert!(matches!(
-            cpu.acquire_execution_units(2, None).await,
+            cpu.acquire_execution_units(9, None).await,
+            Err(Error::InvalidInput(_))
+        ));
+
+        let metal = Arc::new(InferenceCoordinator::new(BackendKind::Metal, 8, 8));
+        assert!(matches!(
+            metal.acquire_execution_units(2, None).await,
             Err(Error::InvalidInput(_))
         ));
 
@@ -2036,7 +2223,19 @@ Pages free: 10.\n";
     #[tokio::test]
     async fn engine_step_reserves_all_cuda_execution_units() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cuda, 4, 8));
-        let engine_step = coordinator.acquire_engine_step().await.unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let runner_coordinator = coordinator.clone();
+        let runner = tokio::spawn(async move {
+            runner_coordinator
+                .run_engine_step(async move {
+                    release_rx.await.unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        while coordinator.snapshot().active_executions == 0 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(coordinator.snapshot().active_executions, 1);
 
         let competing = coordinator
@@ -2044,8 +2243,73 @@ Pages free: 10.\n";
             .await;
         assert!(matches!(competing, Err(Error::Timeout(_))));
 
-        drop(engine_step);
+        release_tx.send(()).unwrap();
+        runner.await.unwrap().unwrap();
         coordinator.acquire_execution(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loaded_width_one_stage_rejects_cross_group_execution_before_model_work() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let job = coordinator.admit(job("loaded-width-one")).await.unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            coordinator.execution_group_id(),
+            crate::engine::ModelInstanceId::new(1),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+
+        let output = coordinator
+            .run_loaded_blocking_stage(
+                &job,
+                contract,
+                WorkUnit::AtomicJob {
+                    kind: "tts".to_string(),
+                },
+                move || {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(7usize)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, 7);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let wrong_group = LoadedModelBundle::bind(
+            &adapters,
+            ExecutionGroupId::new(coordinator.execution_group_id().get() + 1),
+            crate::engine::ModelInstanceId::new(1),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = wrong_group.contract(CapabilityKind::Tts, false).unwrap();
+        let task_calls = calls.clone();
+        let error = coordinator
+            .run_loaded_blocking_stage(
+                &job,
+                contract,
+                WorkUnit::AtomicJob {
+                    kind: "tts".to_string(),
+                },
+                move || {
+                    task_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("cross-group contract must fail closed");
+
+        assert!(error.to_string().contains("different execution group"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
     #[tokio::test]
@@ -2288,6 +2552,51 @@ Pages free: 10.\n";
         assert_eq!(while_blocked.active_executions, 1);
         assert_eq!(while_blocked.active_jobs, 1);
         assert_eq!(coordinator.snapshot().expired_total, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_blocking_work_does_not_consume_device_execution_capacity() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let host_job = coordinator.admit(job("host-work")).await.unwrap();
+        let device_job = coordinator.admit(job("device-work")).await.unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_coordinator = coordinator.clone();
+        let task_job = host_job.clone();
+        let host = tokio::spawn(async move {
+            task_coordinator
+                .run_host_blocking_stage(&task_job, move || {
+                    let _ = started_tx.send(());
+                    let (lock, wake) = &*task_release;
+                    let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(|poison| poison.into_inner());
+                    }
+                    Ok(())
+                })
+                .await
+        });
+
+        started_rx.await.unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            coordinator.run_blocking_stage(&device_job, || Ok(())),
+        )
+        .await
+        .expect("device work should not wait for host preparation")
+        .unwrap();
+        assert_eq!(coordinator.snapshot().active_executions, 0);
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        host.await.unwrap().unwrap();
+        drop((host_job, device_job));
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
     }
 
     #[test]

@@ -1782,6 +1782,85 @@ impl Qwen3Attention {
         let out = self.o_proj.forward(&out)?;
         Ok(out)
     }
+
+    fn forward_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut Qwen3Cache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        let seq_len = x.dim(1)?;
+        if seq_len != 1 || bsz == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 continuous decode expects [batch,1,hidden], got {:?}",
+                x.dims()
+            )));
+        }
+        if start_positions.len() != bsz || caches.len() != bsz {
+            return Err(Error::InvalidInput(
+                "Qwen3 continuous decode state count does not match tensor width".to_string(),
+            ));
+        }
+
+        // Projection and normalization remain true batch-dimension tensor
+        // operations. Ragged attention consumes each session's independently
+        // owned cache, then the output projection rejoins the physical batch.
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, 1, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
+
+        let mut row_outputs = Vec::with_capacity(bsz);
+        for row_idx in 0..bsz {
+            let cache = &mut *caches[row_idx];
+            let q_row = q.i(row_idx)?.unsqueeze(0)?;
+            let k_row = k.i(row_idx)?.unsqueeze(0)?;
+            let v_row = v.i(row_idx)?.unsqueeze(0)?;
+            let (q_row, k_row) =
+                self.apply_rope_pair(q_row, k_row, start_positions[row_idx], None, Some(cache))?;
+            cache.append(layer_idx, k_row, v_row)?;
+
+            let attention = if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
+                record_decode_attention_path(DecodeAttentionPath::Dense);
+                dense_decode_attention(
+                    &q_row,
+                    &k_heads,
+                    &v_heads,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )?
+            } else if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
+                paged_decode_attention(
+                    &q_row,
+                    k_pages,
+                    v_pages,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )?
+            } else {
+                let (k_all, v_all) = cache.materialize(layer_idx)?;
+                dense_decode_attention(
+                    &q_row,
+                    &k_all.transpose(1, 2)?.contiguous()?,
+                    &v_all.transpose(1, 2)?.contiguous()?,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )?
+            };
+            row_outputs.push(attention);
+        }
+
+        let row_outputs = row_outputs.iter().collect::<Vec<_>>();
+        let out =
+            Tensor::cat(&row_outputs, 0)?.reshape((bsz, 1, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
 }
 
 struct Qwen3Mlp {
@@ -1928,6 +2007,24 @@ impl Qwen3Layer {
         let mlp_out = self.mlp.forward(&normed)?;
         let x = x.broadcast_add(&mlp_out)?;
         Ok(x)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut Qwen3Cache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out =
+            self.self_attn
+                .forward_decode_batch(&normed, start_positions, caches, layer_idx)?;
+        let x = x.broadcast_add(&attn_out)?;
+
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
     }
 }
 
@@ -2112,6 +2209,10 @@ impl Qwen3Model {
         self.cfg.head_dim()
     }
 
+    pub fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+
     /// Conservative retained-session allocation bound for a complete decode.
     ///
     /// Candle cache pages may use any supported compute dtype or KV
@@ -2142,6 +2243,36 @@ impl Qwen3Model {
     ) -> Result<Tensor> {
         let embeds = self.embeddings(input_ids)?;
         self.forward_with_embeds(&embeds, start_pos, cache, None)
+    }
+
+    /// Execute one token for a changing set of independently cached sessions.
+    /// Dense projections and MLPs use one real batch dimension; attention
+    /// remains ragged and writes back into each exact session cache.
+    pub fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut Qwen3Cache],
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len) = input_ids.dims2()?;
+        if sequence_len != 1 || batch_size == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 continuous decode expects token IDs shaped [batch,1], got {:?}",
+                input_ids.dims()
+            )));
+        }
+        if start_positions.len() != batch_size || caches.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3 continuous decode state count does not match token batch".to_string(),
+            ));
+        }
+
+        let mut x = self.embeddings(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_decode_batch(&x, start_positions, &mut *caches, layer_idx)?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        self.logits_from_hidden(&hidden)
     }
 
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -2575,6 +2706,99 @@ mod tests {
         }
     }
 
+    fn test_projection(
+        output_size: usize,
+        input_size: usize,
+        offset: usize,
+        device: &Device,
+    ) -> Qwen3Projection {
+        let values = (0..output_size * input_size)
+            .map(|idx| {
+                let value = (idx.saturating_mul(7).saturating_add(offset)) % 23;
+                (value as f32 - 11.0) / 32.0
+            })
+            .collect::<Vec<_>>();
+        Qwen3Projection::Dense(Qwen3DenseProjection {
+            linear: Linear::new(
+                Tensor::from_vec(values, (output_size, input_size), device).unwrap(),
+                None,
+            ),
+            has_bias: false,
+        })
+    }
+
+    fn tiny_qwen3_model(device: &Device) -> Qwen3Model {
+        let cfg = Qwen3Config {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            num_key_value_heads: 1,
+            head_dim: Some(2),
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            vocab_size: 8,
+            lm_head_size: None,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            ada_rms_norm_t_cond: false,
+            ada_rms_norm_t_cond_dim: 0,
+        };
+        let embeddings = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|idx| ((idx * 5 % 17) as f32 - 8.0) / 16.0)
+            .collect::<Vec<_>>();
+        let q_proj = test_projection(4, 4, 1, device);
+        let k_proj = test_projection(2, 4, 2, device);
+        let v_proj = test_projection(2, 4, 3, device);
+        let attention = Qwen3Attention {
+            qkv_proj: Qwen3QkvProjection::new_separate(q_proj, k_proj, v_proj),
+            o_proj: test_projection(4, 4, 4, device),
+            q_norm: None,
+            k_norm: None,
+            qk_norm_weight: None,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            use_mrope: false,
+            mrope_section: None,
+            rope_inv_freqs: build_rope_inv_freqs(2, cfg.rope_theta),
+            rope_kernel_enabled: false,
+        };
+        let layer = Qwen3Layer {
+            input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
+            self_attn: attention,
+            post_attention_layernorm: RmsNorm::new(
+                Tensor::ones(4, DType::F32, device).unwrap(),
+                1e-5,
+            ),
+            mlp: Qwen3Mlp {
+                gate_up_proj: Qwen3GateUpProjection::new_separate(
+                    test_projection(8, 4, 5, device),
+                    test_projection(8, 4, 6, device),
+                ),
+                down_proj: test_projection(4, 8, 7, device),
+            },
+        };
+        Qwen3Model {
+            embed_tokens: Embedding::new(
+                Tensor::from_vec(embeddings, (cfg.vocab_size, cfg.hidden_size), device).unwrap(),
+                cfg.hidden_size,
+            ),
+            layers: vec![layer],
+            norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
+            lm_head: test_projection(cfg.vocab_size, cfg.hidden_size, 8, device),
+            device: device.clone(),
+            cfg,
+            use_mrope: false,
+        }
+    }
+
+    fn test_cache() -> Qwen3Cache {
+        Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None)
+    }
+
     #[test]
     fn session_cache_bound_is_architecture_derived_and_monotonic() {
         let cfg = Qwen3Config {
@@ -2601,6 +2825,76 @@ mod tests {
         assert!(small > 0);
         assert!(large > small);
         assert!(qwen3_session_cache_upper_bound_bytes(&cfg, usize::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn continuous_decode_batch_matches_ragged_scalar_cache_updates() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let mut serial_a = test_cache();
+        let mut serial_b = test_cache();
+        let mut batch_a = test_cache();
+        let mut batch_b = test_cache();
+        let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        for cache in [&mut serial_a, &mut batch_a] {
+            model.forward(&prompt_a, 0, Some(cache)).unwrap();
+        }
+        for cache in [&mut serial_b, &mut batch_b] {
+            model.forward(&prompt_b, 0, Some(cache)).unwrap();
+        }
+
+        let scalar_a = model
+            .forward(
+                &Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap(),
+                2,
+                Some(&mut serial_a),
+            )
+            .unwrap();
+        let scalar_b = model
+            .forward(
+                &Tensor::from_vec(vec![6u32], (1, 1), &device).unwrap(),
+                3,
+                Some(&mut serial_b),
+            )
+            .unwrap();
+        let mut caches = [&mut batch_a, &mut batch_b];
+        let batched = model
+            .forward_decode_batch(
+                &Tensor::from_vec(vec![5u32, 6], (2, 1), &device).unwrap(),
+                &[2, 3],
+                &mut caches,
+            )
+            .unwrap();
+
+        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
+        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
+
+        let scalar_a = model
+            .forward(
+                &Tensor::from_vec(vec![7u32], (1, 1), &device).unwrap(),
+                3,
+                Some(&mut serial_a),
+            )
+            .unwrap();
+        let scalar_b = model
+            .forward(
+                &Tensor::from_vec(vec![0u32], (1, 1), &device).unwrap(),
+                4,
+                Some(&mut serial_b),
+            )
+            .unwrap();
+        let mut caches = [&mut batch_a, &mut batch_b];
+        let batched = model
+            .forward_decode_batch(
+                &Tensor::from_vec(vec![7u32, 0], (2, 1), &device).unwrap(),
+                &[3, 4],
+                &mut caches,
+            )
+            .unwrap();
+
+        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
+        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
     }
 
     #[test]

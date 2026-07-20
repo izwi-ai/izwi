@@ -1,5 +1,7 @@
 //! Authoritative execution plans, reports, capabilities, and lifecycle states.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -8,11 +10,38 @@ use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
-use super::resources::{ResourceEstimate, ResourceReservation, ResourceVector};
+use super::resources::{ResourceEstimate, ResourceVector};
 use super::{RequestId, SequenceId, TaskType};
 
 pub type PlanId = u64;
 pub type SessionEpoch = SequenceId;
+
+macro_rules! execution_id {
+    ($name:ident, $value:ty) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name($value);
+
+        impl $name {
+            pub const fn new(value: $value) -> Self {
+                Self(value)
+            }
+
+            pub const fn get(self) -> $value {
+                self.0
+            }
+        }
+    };
+}
+
+execution_id!(ExecutionGroupId, u64);
+execution_id!(ModelInstanceId, u64);
+execution_id!(AdapterInstanceId, u64);
+execution_id!(AdapterAbiRevision, u32);
+execution_id!(StageId, u32);
+execution_id!(BatchId, u64);
 
 /// Identity of one request incarnation. Public request IDs may be reused after
 /// completion, so executor transactions must also carry the scheduler epoch.
@@ -115,12 +144,468 @@ pub enum NativeBatchMode {
     Continuous,
 }
 
+/// Where one model stage is executed. Host stages remain part of the same
+/// logical workflow but do not consume a device execution-group permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDomain {
+    Host,
+    ExecutionGroup,
+}
+
+/// How a stage makes observable progress. Continuous batch membership is only
+/// valid for stages that expose repeatable or input-driven safe points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageProgressKind {
+    Atomic,
+    Iterative,
+    InputDriven,
+}
+
+/// Model-owned routing from a scheduler work quantum to one execution stage.
+/// Exact selectors take precedence over a single compatibility fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StageWorkSelector {
+    Any,
+    SequencePrefill,
+    SequenceDecode,
+    Atomic,
+    Pipeline { ordinal: Option<usize> },
+}
+
+impl StageWorkSelector {
+    fn matches(self, work: &WorkUnit) -> bool {
+        match (self, work) {
+            (Self::Any, _) => true,
+            (
+                Self::SequencePrefill,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Prefill,
+                    ..
+                },
+            )
+            | (
+                Self::SequenceDecode,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    ..
+                },
+            )
+            | (Self::Atomic, WorkUnit::AtomicJob { .. }) => true,
+            (
+                Self::Pipeline { ordinal },
+                WorkUnit::PipelineStage {
+                    ordinal: work_ordinal,
+                    ..
+                },
+            ) => ordinal.is_none_or(|ordinal| ordinal == *work_ordinal),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageShapePolicy {
+    /// Rows execute independently and therefore have no shared tensor shape.
+    Independent,
+    Exact,
+    Bucketed,
+    Padded,
+    Ragged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipSafePoint {
+    OperationBoundary,
+    QuantumBoundary,
+    InputBoundary,
+    PipelineBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVisibility {
+    /// Executor output remains private until the physical report and the
+    /// corresponding model/scheduler state transition commit together.
+    AfterQuantumCommit,
+    /// A non-tensor stage may commit fenced, non-terminal progress records
+    /// while its physical operation is still running. The authoritative final
+    /// marker remains gated by the normal physical report and state commit.
+    IncrementalCommitted,
+}
+
+/// Model-owned description of one execution stage. The engine treats `id` as
+/// opaque and never branches on cache, transducer, diffusion, or codec types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageDescriptor {
+    pub id: StageId,
+    pub name: String,
+    pub selector: StageWorkSelector,
+    pub domain: ExecutionDomain,
+    pub progress: StageProgressKind,
+    pub concurrency: ConcurrencyClass,
+    pub batch_mode: NativeBatchMode,
+    pub max_batch_size: usize,
+    pub max_work_units: u64,
+    pub workspace_base_bytes: u64,
+    pub workspace_per_row_bytes: u64,
+    pub workspace_per_work_unit_bytes: u64,
+    pub max_workspace_bytes: u64,
+    pub max_padding_basis_points: u16,
+    pub max_formation_delay: Duration,
+    pub shape_policy: StageShapePolicy,
+    pub membership_safe_point: MembershipSafePoint,
+    pub output_visibility: OutputVisibility,
+}
+
+impl StageDescriptor {
+    /// Conservative bridge for existing executors. Callers choose the phase's
+    /// declared batch mode explicitly because one legacy profile can describe
+    /// different prefill and decode behavior.
+    pub fn from_execution_profile(
+        id: StageId,
+        name: impl Into<String>,
+        profile: &ExecutionProfile,
+        batch_mode: NativeBatchMode,
+    ) -> Self {
+        let progress = match profile.mode {
+            ExecutionMode::Sequence => StageProgressKind::Iterative,
+            ExecutionMode::Realtime => StageProgressKind::InputDriven,
+            ExecutionMode::Atomic | ExecutionMode::Pipeline | ExecutionMode::Artifact => {
+                StageProgressKind::Atomic
+            }
+        };
+        let membership_safe_point = match profile.cancellation {
+            CancellationGranularity::OperationBoundary => MembershipSafePoint::OperationBoundary,
+            CancellationGranularity::SequenceStep => MembershipSafePoint::QuantumBoundary,
+            CancellationGranularity::RealtimeChunk => MembershipSafePoint::InputBoundary,
+            CancellationGranularity::PipelineStage => MembershipSafePoint::PipelineBoundary,
+        };
+        let concurrency = if batch_mode == NativeBatchMode::None {
+            profile.concurrency
+        } else {
+            ConcurrencyClass::Batchable
+        };
+        let shape_policy = match (batch_mode, concurrency) {
+            (NativeBatchMode::None, ConcurrencyClass::Batchable) => StageShapePolicy::Independent,
+            (NativeBatchMode::None, ConcurrencyClass::Exclusive) => StageShapePolicy::Exact,
+            (NativeBatchMode::Static, _) => StageShapePolicy::Padded,
+            (NativeBatchMode::Continuous, _) => StageShapePolicy::Ragged,
+        };
+        Self {
+            id,
+            name: name.into(),
+            selector: StageWorkSelector::Any,
+            domain: if profile.mode == ExecutionMode::Artifact {
+                ExecutionDomain::Host
+            } else {
+                ExecutionDomain::ExecutionGroup
+            },
+            progress,
+            concurrency,
+            batch_mode,
+            max_batch_size: profile.max_batch_size.max(1),
+            max_work_units: u64::MAX,
+            workspace_base_bytes: 0,
+            workspace_per_row_bytes: 0,
+            workspace_per_work_unit_bytes: 0,
+            max_workspace_bytes: 0,
+            max_padding_basis_points: if shape_policy == StageShapePolicy::Padded {
+                10_000
+            } else {
+                0
+            },
+            max_formation_delay: Duration::ZERO,
+            shape_policy,
+            membership_safe_point,
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "execution stage name cannot be empty".to_string(),
+            ));
+        }
+        if self.max_batch_size == 0 || self.max_work_units == 0 {
+            return Err(Error::InvalidInput(
+                "execution stage budgets must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_padding_basis_points > 10_000 {
+            return Err(Error::InvalidInput(
+                "execution stage padding budget cannot exceed 100 percent".to_string(),
+            ));
+        }
+        if self.workspace_base_bytes > self.max_workspace_bytes
+            || self.workspace_per_row_bytes > self.max_workspace_bytes
+            || self.workspace_per_work_unit_bytes > self.max_workspace_bytes
+        {
+            return Err(Error::InvalidInput(
+                "execution stage workspace estimate exceeds its maximum".to_string(),
+            ));
+        }
+        if self.concurrency == ConcurrencyClass::Exclusive && self.max_batch_size != 1 {
+            return Err(Error::InvalidInput(
+                "exclusive execution stages must have width one".to_string(),
+            ));
+        }
+        if self.batch_mode != NativeBatchMode::None
+            && self.concurrency != ConcurrencyClass::Batchable
+        {
+            return Err(Error::InvalidInput(
+                "native tensor stages must be batchable".to_string(),
+            ));
+        }
+        if self.batch_mode == NativeBatchMode::None
+            && self.concurrency == ConcurrencyClass::Batchable
+            && self.shape_policy != StageShapePolicy::Independent
+        {
+            return Err(Error::InvalidInput(
+                "request-parallel stages must use independent row shapes".to_string(),
+            ));
+        }
+        if self.shape_policy != StageShapePolicy::Padded && self.max_padding_basis_points != 0 {
+            return Err(Error::InvalidInput(
+                "only padded execution stages may declare padding overhead".to_string(),
+            ));
+        }
+        if self.batch_mode == NativeBatchMode::Continuous
+            && (self.progress == StageProgressKind::Atomic
+                || self.membership_safe_point == MembershipSafePoint::OperationBoundary)
+        {
+            return Err(Error::InvalidInput(
+                "continuous batching requires a repeatable membership safe point".to_string(),
+            ));
+        }
+        if self.output_visibility == OutputVisibility::IncrementalCommitted
+            && self.batch_mode != NativeBatchMode::None
+        {
+            return Err(Error::InvalidInput(
+                "native tensor stages cannot publish in-flight output checkpoints".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AdapterBindingKey {
+    pub execution_group_id: ExecutionGroupId,
+    pub model_instance_id: ModelInstanceId,
+    pub adapter_instance_id: AdapterInstanceId,
+    pub adapter_abi_revision: AdapterAbiRevision,
+    pub capability_id: String,
+    pub stage_id: StageId,
+}
+
+/// Exact loaded adapter selected before scheduler admission. The binding is
+/// immutable for one request incarnation and survives until terminal cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionAdapterBinding {
+    pub execution_group_id: ExecutionGroupId,
+    pub model_instance_id: ModelInstanceId,
+    pub adapter_instance_id: AdapterInstanceId,
+    pub adapter_abi_revision: AdapterAbiRevision,
+    pub model_variant: ModelVariant,
+    pub capability_id: String,
+    pub stages: Arc<[StageDescriptor]>,
+}
+
+impl ExecutionAdapterBinding {
+    pub fn validate(&self) -> Result<()> {
+        if self.execution_group_id.get() == 0
+            || self.model_instance_id.get() == 0
+            || self.adapter_instance_id.get() == 0
+            || self.adapter_abi_revision.get() == 0
+        {
+            return Err(Error::InvalidInput(
+                "execution adapter binding contains a zero lifecycle identity".to_string(),
+            ));
+        }
+        if self.capability_id.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "execution adapter binding has an empty capability identity".to_string(),
+            ));
+        }
+        if self.stages.is_empty() {
+            return Err(Error::InvalidInput(
+                "execution adapter binding has no stages".to_string(),
+            ));
+        }
+        let mut stage_ids = HashSet::with_capacity(self.stages.len());
+        for stage in self.stages.iter() {
+            stage.validate()?;
+            if !stage_ids.insert(stage.id) {
+                return Err(Error::InvalidInput(
+                    "execution adapter binding contains a duplicate stage identity".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn primary_stage(&self) -> &StageDescriptor {
+        &self.stages[0]
+    }
+
+    pub fn stage_for_work(&self, work: &WorkUnit) -> Result<&StageDescriptor> {
+        let mut exact = self.stages.iter().filter(|stage| {
+            stage.selector != StageWorkSelector::Any && stage.selector.matches(work)
+        });
+        if let Some(stage) = exact.next() {
+            if exact.next().is_some() {
+                return Err(Error::InvalidInput(
+                    "execution adapter has ambiguous exact stage selectors".to_string(),
+                ));
+            }
+            return Ok(stage);
+        }
+
+        let mut fallback = self
+            .stages
+            .iter()
+            .filter(|stage| stage.selector == StageWorkSelector::Any);
+        let stage = fallback.next().ok_or_else(|| {
+            Error::InvalidInput("execution adapter has no stage for scheduled work".to_string())
+        })?;
+        if fallback.next().is_some() {
+            return Err(Error::InvalidInput(
+                "execution adapter has multiple fallback stages".to_string(),
+            ));
+        }
+        Ok(stage)
+    }
+
+    pub fn key_for_stage(&self, stage_id: StageId) -> Result<AdapterBindingKey> {
+        if !self.stages.iter().any(|stage| stage.id == stage_id) {
+            return Err(Error::InvalidInput(
+                "execution adapter binding does not contain the requested stage".to_string(),
+            ));
+        }
+        Ok(AdapterBindingKey {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id,
+            adapter_abi_revision: self.adapter_abi_revision,
+            capability_id: self.capability_id.clone(),
+            stage_id,
+        })
+    }
+}
+
+/// Backend-neutral cost of one safe execution quantum. Logical units may be
+/// tokens, audio frames, samples, codec frames, or another adapter-defined unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkCost {
+    pub logical_units: u64,
+    pub tensor_elements: u64,
+    pub workspace: ResourceVector,
+}
+
+impl WorkCost {
+    pub const fn new(logical_units: u64, tensor_elements: u64, workspace_bytes: u64) -> Self {
+        Self {
+            logical_units,
+            tensor_elements,
+            workspace: ResourceVector::temporary_workspace(workspace_bytes),
+        }
+    }
+
+    pub const fn with_workspace(
+        logical_units: u64,
+        tensor_elements: u64,
+        workspace: ResourceVector,
+    ) -> Self {
+        Self {
+            logical_units,
+            tensor_elements,
+            workspace,
+        }
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            logical_units: self.logical_units.checked_add(other.logical_units)?,
+            tensor_elements: self.tensor_elements.checked_add(other.tensor_elements)?,
+            workspace: self.workspace.checked_add(other.workspace).ok()?,
+        })
+    }
+}
+
+impl Default for WorkCost {
+    fn default() -> Self {
+        Self::with_workspace(0, 0, ResourceVector::zero())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchBudget {
+    pub max_rows: usize,
+    pub max_logical_units: u64,
+    pub max_tensor_elements: u64,
+    pub max_workspace_bytes: u64,
+    /// Maximum padded work as basis points of useful work. `10_000` permits
+    /// padding equal to the useful tensor work.
+    pub max_padding_basis_points: u16,
+    pub max_formation_delay: Duration,
+}
+
+impl BatchBudget {
+    pub const fn width_one() -> Self {
+        Self {
+            max_rows: 1,
+            max_logical_units: u64::MAX,
+            max_tensor_elements: u64::MAX,
+            max_workspace_bytes: u64::MAX,
+            max_padding_basis_points: 0,
+            max_formation_delay: Duration::ZERO,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if self.max_rows == 0 || self.max_logical_units == 0 || self.max_tensor_elements == 0 {
+            return Err(Error::InvalidInput(
+                "physical batch budgets must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_padding_basis_points > 10_000 {
+            return Err(Error::InvalidInput(
+                "physical batch padding budget cannot exceed 100 percent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn admits(self, current_rows: usize, current: WorkCost, next: WorkCost) -> bool {
+        let Some(rows) = current_rows.checked_add(1) else {
+            return false;
+        };
+        let Some(total) = current.checked_add(next) else {
+            return false;
+        };
+        rows <= self.max_rows
+            && total.logical_units <= self.max_logical_units
+            && total.tensor_elements <= self.max_tensor_elements
+            && total
+                .workspace
+                .workspace_bytes()
+                .is_ok_and(|bytes| bytes <= self.max_workspace_bytes)
+    }
+}
+
 /// Observed dispatch mechanism for one executor report. Request-parallel work
 /// is intentionally distinct from a model tensor batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BatchDispatchKind {
     #[default]
     Serial,
+    NotDispatched,
     RequestParallel,
     TensorStatic,
     TensorContinuous,
@@ -143,11 +628,107 @@ impl BatchDispatch {
     pub const fn new(kind: BatchDispatchKind, width: usize) -> Self {
         Self { kind, width }
     }
+
+    pub const fn not_dispatched(width: usize) -> Self {
+        Self {
+            kind: BatchDispatchKind::NotDispatched,
+            width,
+        }
+    }
 }
 
 impl Default for BatchDispatch {
     fn default() -> Self {
         Self::serial()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadlinePhase {
+    SchedulerQueue,
+    DispatchWait,
+    ModelExecution,
+    StreamDelivery,
+    TerminalDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchState {
+    NotStarted,
+    Started,
+    ProducedOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureOrigin {
+    AdapterPlanning,
+    DispatchCoordination,
+    WorkspaceAdmission,
+    ExecutorValidation,
+    Model,
+    StreamDelivery,
+    StateCommit,
+    Cleanup,
+    Panic,
+}
+
+/// Bounded execution provenance carried from physical dispatch through the
+/// terminal API result. Detailed error text remains separate and unlabelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeProvenance {
+    pub dispatch_state: DispatchState,
+    pub failure_origin: Option<FailureOrigin>,
+    pub deadline_phase: Option<DeadlinePhase>,
+}
+
+impl OutcomeProvenance {
+    pub const fn not_started() -> Self {
+        Self {
+            dispatch_state: DispatchState::NotStarted,
+            failure_origin: None,
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn produced_output() -> Self {
+        Self {
+            dispatch_state: DispatchState::ProducedOutput,
+            failure_origin: None,
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn started() -> Self {
+        Self {
+            dispatch_state: DispatchState::Started,
+            failure_origin: None,
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn failure(origin: FailureOrigin, dispatch_state: DispatchState) -> Self {
+        Self {
+            dispatch_state,
+            failure_origin: Some(origin),
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn deadline(phase: DeadlinePhase, dispatch_state: DispatchState) -> Self {
+        Self {
+            dispatch_state,
+            failure_origin: None,
+            deadline_phase: Some(phase),
+        }
+    }
+}
+
+impl Default for OutcomeProvenance {
+    fn default() -> Self {
+        Self::produced_output()
     }
 }
 
@@ -288,7 +869,311 @@ pub struct BatchKey {
     pub compute_dtype: String,
     pub kv_dtype: String,
     pub cache_namespace: String,
-    pub adapter_id: Option<String>,
+    pub adapter: Option<AdapterBindingKey>,
+}
+
+/// Canonical compatibility identity for one physical tensor-batch lane. Every
+/// field participates in equality: models loaded on opposite sides of a reload
+/// boundary, adapter upgrades, or incompatible tensor/state layouts can never
+/// share one native batch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BatchLaneKey {
+    pub execution_group: ExecutionGroupId,
+    pub model_instance: ModelInstanceId,
+    pub adapter_instance: AdapterInstanceId,
+    pub adapter_abi: AdapterAbiRevision,
+    pub capability_id: String,
+    pub stage_id: StageId,
+    pub backend: BackendKind,
+    pub device_ordinal: Option<u32>,
+    pub compute_dtype: String,
+    pub state_dtype: String,
+    pub tensor_layout: String,
+    pub quantization: String,
+    pub state_schema: String,
+    pub kernel_mode: String,
+    pub semantic_mode: String,
+    pub shape_bucket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyQuantum {
+    pub plan_id: PlanId,
+    pub session: SessionKey,
+    pub lane: BatchLaneKey,
+    pub work: WorkUnit,
+    pub cost: WorkCost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalBatch {
+    pub batch_id: BatchId,
+    pub lane: BatchLaneKey,
+    pub mode: NativeBatchMode,
+    pub budget: BatchBudget,
+    pub rows: Vec<ReadyQuantum>,
+    /// Materialized elements including padding. Ragged/packed adapters report
+    /// the useful tensor element count here.
+    pub materialized_tensor_elements: u64,
+    pub workspace: ResourceVector,
+}
+
+impl PhysicalBatch {
+    pub fn expected_dispatch(&self) -> BatchDispatch {
+        let width = self.rows.len().max(1);
+        match self.mode {
+            NativeBatchMode::Static => BatchDispatch::new(BatchDispatchKind::TensorStatic, width),
+            NativeBatchMode::Continuous => {
+                BatchDispatch::new(BatchDispatchKind::TensorContinuous, width)
+            }
+            NativeBatchMode::None if width > 1 => {
+                BatchDispatch::new(BatchDispatchKind::RequestParallel, width)
+            }
+            NativeBatchMode::None => BatchDispatch::serial(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.budget.validate()?;
+        if self.rows.is_empty() {
+            return Err(Error::InvalidInput(
+                "physical batch cannot be empty".to_string(),
+            ));
+        }
+        if self.mode == NativeBatchMode::None
+            && self.rows.len() > 1
+            && self.budget.max_rows < self.rows.len()
+        {
+            return Err(Error::InvalidInput(
+                "request-parallel physical dispatch exceeds its declared width".to_string(),
+            ));
+        }
+
+        let mut keys = HashSet::with_capacity(self.rows.len());
+        let mut cost = WorkCost::default();
+        let mut row_count = 0usize;
+        for row in &self.rows {
+            if row.lane != self.lane {
+                return Err(Error::InvalidInput(
+                    "physical batch contains an incompatible lane".to_string(),
+                ));
+            }
+            if !keys.insert((row.session.clone(), row.plan_id)) {
+                return Err(Error::InvalidInput(
+                    "physical batch contains a duplicate session plan".to_string(),
+                ));
+            }
+            if !self.budget.admits(row_count, cost, row.cost) {
+                return Err(Error::InvalidInput(
+                    "physical batch exceeds its declared work budget".to_string(),
+                ));
+            }
+            cost = cost.checked_add(row.cost).ok_or_else(|| {
+                Error::InvalidInput("physical batch work accounting overflowed".to_string())
+            })?;
+            row_count += 1;
+        }
+
+        if self.materialized_tensor_elements < cost.tensor_elements {
+            return Err(Error::InvalidInput(
+                "physical batch materialization is smaller than useful tensor work".to_string(),
+            ));
+        }
+        let workspace_bytes = self.workspace.workspace_bytes()?;
+        if workspace_bytes < cost.workspace.workspace_bytes()? {
+            return Err(Error::InvalidInput(
+                "physical batch workspace is smaller than its row estimates".to_string(),
+            ));
+        }
+        if workspace_bytes > self.budget.max_workspace_bytes {
+            return Err(Error::InvalidInput(
+                "physical batch workspace exceeds its declared budget".to_string(),
+            ));
+        }
+        let padded = self
+            .materialized_tensor_elements
+            .saturating_sub(cost.tensor_elements);
+        if cost.tensor_elements == 0 {
+            if padded > 0 {
+                return Err(Error::InvalidInput(
+                    "physical batch cannot pad empty tensor work".to_string(),
+                ));
+            }
+        } else if u128::from(padded) * 10_000
+            > u128::from(cost.tensor_elements) * u128::from(self.budget.max_padding_basis_points)
+        {
+            return Err(Error::InvalidInput(
+                "physical batch exceeds its declared padding budget".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateDisposition {
+    Unchanged,
+    ValidNext,
+    RolledBack,
+    Poisoned,
+}
+
+#[derive(Debug, Clone)]
+pub struct PhysicalBatchRowReport {
+    pub execution: ExecutionReport,
+    pub state: StateDisposition,
+}
+
+impl PhysicalBatchRowReport {
+    fn validate_state(&self) -> Result<()> {
+        match &self.execution.disposition {
+            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_)
+                if self.state != StateDisposition::ValidNext =>
+            {
+                return Err(Error::InferenceError(
+                    "continuing execution must publish valid next model state".to_string(),
+                ));
+            }
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::RetrySameSession
+                    && !matches!(
+                        self.state,
+                        StateDisposition::Unchanged | StateDisposition::RolledBack
+                    ) =>
+            {
+                return Err(Error::InferenceError(
+                    "same-session retry requires unchanged or rolled-back model state".to_string(),
+                ));
+            }
+            ExecutionDisposition::Failed(failure)
+                if failure.retry == RetryDisposition::Recompute
+                    && self.state == StateDisposition::ValidNext =>
+            {
+                return Err(Error::InferenceError(
+                    "recompute retry cannot publish advanced model state".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PhysicalBatchReport {
+    pub batch_id: BatchId,
+    pub lane: BatchLaneKey,
+    pub dispatch: BatchDispatch,
+    pub observed_resources: ResourceVector,
+    pub elapsed: Duration,
+    pub rows: Vec<PhysicalBatchRowReport>,
+}
+
+impl PhysicalBatchReport {
+    pub fn validate_against(
+        &self,
+        batch: &PhysicalBatch,
+        active_plans: &HashMap<PlanId, ExecutionPlan>,
+    ) -> Result<()> {
+        batch.validate()?;
+        if self.batch_id != batch.batch_id || self.lane != batch.lane {
+            return Err(Error::InferenceError(
+                "physical batch report does not match its dispatch envelope".to_string(),
+            ));
+        }
+        if self.dispatch.width != batch.rows.len() || self.rows.len() != batch.rows.len() {
+            return Err(Error::InferenceError(
+                "physical batch report width does not match its planned rows".to_string(),
+            ));
+        }
+        self.observed_resources.workspace_bytes()?;
+        if !self.observed_resources.fits_within(batch.workspace) {
+            return Err(Error::InferenceError(
+                "physical batch used more workspace than it reserved".to_string(),
+            ));
+        }
+        match self.dispatch.kind {
+            BatchDispatchKind::NotDispatched
+                if self.rows.iter().any(|row| {
+                    !matches!(
+                        row.execution.disposition,
+                        ExecutionDisposition::Failed(_)
+                            | ExecutionDisposition::Finished(
+                                FinishReason::Cancelled
+                                    | FinishReason::TimedOut
+                                    | FinishReason::Rejected
+                            )
+                    )
+                }) =>
+            {
+                return Err(Error::InferenceError(
+                    "a non-dispatched batch may only fail or terminalize rows before model entry"
+                        .to_string(),
+                ));
+            }
+            BatchDispatchKind::Serial if batch.rows.len() != 1 => {
+                return Err(Error::InferenceError(
+                    "serial physical dispatch must have width one".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorStatic if batch.mode != NativeBatchMode::Static => {
+                return Err(Error::InferenceError(
+                    "physical batch reported undeclared static tensor execution".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorContinuous if batch.mode != NativeBatchMode::Continuous => {
+                return Err(Error::InferenceError(
+                    "physical batch reported undeclared continuous tensor execution".to_string(),
+                ));
+            }
+            BatchDispatchKind::RequestParallel
+                if batch.mode != NativeBatchMode::None || batch.rows.len() < 2 =>
+            {
+                return Err(Error::InferenceError(
+                    "request-parallel dispatch requires a multi-row non-tensor batch".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        let expected = batch
+            .rows
+            .iter()
+            .map(|row| ((row.session.clone(), row.plan_id), row))
+            .collect::<HashMap<_, _>>();
+        let mut reported = HashSet::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let key = (row.execution.session.clone(), row.execution.plan_id);
+            if !reported.insert(key.clone()) {
+                return Err(Error::InferenceError(
+                    "physical batch report contains a duplicate session plan".to_string(),
+                ));
+            }
+            if !expected.contains_key(&key) {
+                return Err(Error::InferenceError(
+                    "physical batch report contains a foreign session plan".to_string(),
+                ));
+            }
+            if row.execution.dispatch != self.dispatch {
+                return Err(Error::InferenceError(
+                    "physical batch row disagrees with envelope dispatch metadata".to_string(),
+                ));
+            }
+            let plan = active_plans.get(&row.execution.plan_id).ok_or_else(|| {
+                Error::InferenceError(
+                    "physical batch report references an inactive execution plan".to_string(),
+                )
+            })?;
+            row.execution.validate_against(plan)?;
+            row.validate_state()?;
+        }
+        if reported.len() != expected.len() {
+            return Err(Error::InferenceError(
+                "physical batch report omitted a planned session".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,9 +1223,9 @@ pub enum FailureKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureScope {
-    Request,
-    Batch,
-    Worker,
+    Row,
+    PhysicalBatch,
+    ExecutionGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,7 +1255,7 @@ impl ExecutionFailure {
     pub fn invalid_output(message: impl Into<String>) -> Self {
         Self {
             kind: FailureKind::InvalidOutput,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::Never,
             health: HealthImpact::None,
             message: message.into(),
@@ -453,7 +1338,7 @@ pub struct ExecutionPlan {
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub estimate: ResourceEstimate,
-    pub reservation: Option<ResourceReservation>,
+    pub stage: Option<StageDescriptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +1349,7 @@ pub struct ExecutionReport {
     pub output_produced: usize,
     pub observed_resources: ResourceVector,
     pub dispatch: BatchDispatch,
+    pub provenance: OutcomeProvenance,
     pub elapsed: Duration,
     pub safe_point: bool,
     pub disposition: ExecutionDisposition,
@@ -487,6 +1373,22 @@ impl ExecutionReport {
             ));
         }
         match self.dispatch.kind {
+            BatchDispatchKind::NotDispatched
+                if !matches!(
+                    self.disposition,
+                    ExecutionDisposition::Failed(_)
+                        | ExecutionDisposition::Finished(
+                            FinishReason::Cancelled
+                                | FinishReason::TimedOut
+                                | FinishReason::Rejected
+                        )
+                ) =>
+            {
+                return Err(Error::InferenceError(
+                    "non-dispatched execution must fail or terminalize before model entry"
+                        .to_string(),
+                ));
+            }
             BatchDispatchKind::Serial if self.dispatch.width != 1 => {
                 return Err(Error::InferenceError(
                     "serial executor dispatch must have width one".to_string(),
@@ -513,6 +1415,45 @@ impl ExecutionReport {
                 ));
             }
             _ => {}
+        }
+        if self.dispatch.kind == BatchDispatchKind::NotDispatched
+            && self.provenance.dispatch_state != DispatchState::NotStarted
+        {
+            return Err(Error::InferenceError(
+                "non-dispatched execution cannot claim model entry".to_string(),
+            ));
+        }
+        if self.dispatch.kind != BatchDispatchKind::NotDispatched
+            && self.provenance.dispatch_state == DispatchState::NotStarted
+            && !(self.dispatch.kind == BatchDispatchKind::RequestParallel
+                && matches!(
+                    self.disposition,
+                    ExecutionDisposition::Finished(
+                        FinishReason::Cancelled | FinishReason::TimedOut | FinishReason::Rejected
+                    )
+                ))
+        {
+            return Err(Error::InferenceError(
+                "dispatched execution must record model entry unless an independent row terminated before entry"
+                    .to_string(),
+            ));
+        }
+        if self.provenance.deadline_phase.is_some()
+            != matches!(
+                self.disposition,
+                ExecutionDisposition::Finished(FinishReason::TimedOut)
+            )
+        {
+            return Err(Error::InferenceError(
+                "deadline provenance must match a timed-out disposition".to_string(),
+            ));
+        }
+        if self.provenance.failure_origin.is_some()
+            != matches!(self.disposition, ExecutionDisposition::Failed(_))
+        {
+            return Err(Error::InferenceError(
+                "failure provenance must match a failed disposition".to_string(),
+            ));
         }
         match plan.work {
             WorkUnit::SequenceStep {
@@ -655,6 +1596,17 @@ impl ExecutionTracker {
         Ok(())
     }
 
+    /// Release a plan that never entered model execution. Committed progress
+    /// and the request's lifecycle state are unchanged; the next scheduler
+    /// cycle may prepare a fresh plan identity for the same safe point.
+    pub(crate) fn rollback_unexecuted_plan(&mut self, plan_id: PlanId) -> bool {
+        if self.active_plan != Some(plan_id) {
+            return false;
+        }
+        self.active_plan = None;
+        true
+    }
+
     pub fn commit(&mut self, plan: &ExecutionPlan, report: &ExecutionReport) -> Result<()> {
         report.validate_against(plan)?;
         if self.active_plan != Some(plan.plan_id) {
@@ -693,6 +1645,444 @@ impl ExecutionTracker {
 mod tests {
     use super::*;
 
+    fn lane() -> BatchLaneKey {
+        BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "dense".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test.v1".to_string(),
+            kernel_mode: "reference".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "tokens.1".to_string(),
+        }
+    }
+
+    #[test]
+    fn execution_id_newtypes_do_not_alias_domains() {
+        let group = ExecutionGroupId::new(7);
+        let model = ModelInstanceId::new(7);
+        let adapter = AdapterInstanceId::new(7);
+        let stage = StageId::new(7);
+        let batch = BatchId::new(7);
+
+        assert_eq!(group.get(), 7);
+        assert_eq!(model.get(), 7);
+        assert_eq!(adapter.get(), 7);
+        assert_eq!(stage.get(), 7);
+        assert_eq!(batch.get(), 7);
+        assert_eq!(AdapterAbiRevision::new(1).get(), 1);
+    }
+
+    #[test]
+    fn legacy_stage_descriptor_stays_fail_closed_at_width_one() {
+        let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "legacy",
+            &profile,
+            NativeBatchMode::None,
+        );
+
+        assert_eq!(stage.max_batch_size, 1);
+        assert_eq!(stage.batch_mode, NativeBatchMode::None);
+        assert_eq!(stage.progress, StageProgressKind::Atomic);
+        assert!(stage.validate().is_ok());
+    }
+
+    #[test]
+    fn adapter_routes_work_to_exact_model_owned_stages() {
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "text.prefill",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "text.decode",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.progress = StageProgressKind::Iterative;
+        decode.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: ModelVariant::Qwen306B,
+            capability_id: "chat".to_string(),
+            stages: Arc::from([prefill, decode]),
+        };
+        binding.validate().unwrap();
+
+        let prefill_work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Prefill,
+            input: InputRange { start: 0, end: 8 },
+            max_output_steps: 1,
+        };
+        let decode_work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Decode,
+            input: InputRange { start: 8, end: 9 },
+            max_output_steps: 1,
+        };
+        assert_eq!(
+            binding.stage_for_work(&prefill_work).unwrap().id,
+            StageId::new(1)
+        );
+        assert_eq!(
+            binding.stage_for_work(&decode_work).unwrap().id,
+            StageId::new(2)
+        );
+    }
+
+    #[test]
+    fn continuous_stage_requires_repeatable_safe_points() {
+        let invalid = StageDescriptor {
+            id: StageId::new(2),
+            name: "atomic".to_string(),
+            selector: StageWorkSelector::Atomic,
+            domain: ExecutionDomain::ExecutionGroup,
+            progress: StageProgressKind::Atomic,
+            concurrency: ConcurrencyClass::Batchable,
+            batch_mode: NativeBatchMode::Continuous,
+            max_batch_size: 2,
+            max_work_units: 2,
+            workspace_base_bytes: 0,
+            workspace_per_row_bytes: 0,
+            workspace_per_work_unit_bytes: 0,
+            max_workspace_bytes: 1,
+            max_padding_basis_points: 0,
+            max_formation_delay: Duration::ZERO,
+            shape_policy: StageShapePolicy::Ragged,
+            membership_safe_point: MembershipSafePoint::OperationBoundary,
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+        };
+        assert!(invalid.validate().is_err());
+
+        let valid = StageDescriptor {
+            progress: StageProgressKind::Iterative,
+            membership_safe_point: MembershipSafePoint::QuantumBoundary,
+            ..invalid
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn incremental_output_visibility_is_restricted_to_non_tensor_stages() {
+        let profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Atomic,
+        );
+        let mut compatibility = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "chat.compatibility",
+            &profile,
+            NativeBatchMode::None,
+        );
+        compatibility.output_visibility = OutputVisibility::IncrementalCommitted;
+        assert!(compatibility.validate().is_ok());
+
+        let mut tensor = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "chat.tensor_static",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        tensor.output_visibility = OutputVisibility::IncrementalCommitted;
+        assert!(tensor.validate().is_err());
+    }
+
+    #[test]
+    fn generalized_batch_budget_rejects_overflow_and_excess_work() {
+        let budget = BatchBudget {
+            max_rows: 2,
+            max_logical_units: 8,
+            max_tensor_elements: 32,
+            max_workspace_bytes: 64,
+            max_padding_basis_points: 2_500,
+            max_formation_delay: Duration::from_micros(500),
+        };
+        assert!(budget.validate().is_ok());
+        let current = WorkCost::new(3, 12, 24);
+        assert!(budget.admits(1, current, WorkCost::new(5, 20, 40)));
+        assert!(!budget.admits(1, current, WorkCost::new(6, 20, 40)));
+        assert!(!budget.admits(2, current, WorkCost::new(1, 1, 1)));
+        assert!(!budget.admits(1, WorkCost::new(u64::MAX, 0, 0), WorkCost::new(1, 0, 0),));
+    }
+
+    #[test]
+    fn physical_batch_requires_exact_lanes_and_padding_budget() {
+        let lane = lane();
+        let row = ReadyQuantum {
+            plan_id: 1,
+            session: SessionKey::new("one".to_string(), 1),
+            lane: lane.clone(),
+            work: WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+            cost: WorkCost::new(1, 10, 8),
+        };
+        let mut batch = PhysicalBatch {
+            batch_id: BatchId::new(1),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Static,
+            budget: BatchBudget {
+                max_rows: 2,
+                max_logical_units: 2,
+                max_tensor_elements: 20,
+                max_workspace_bytes: 32,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![row],
+            materialized_tensor_elements: 10,
+            workspace: ResourceVector::temporary_workspace(8),
+        };
+        assert!(batch.validate().is_ok());
+
+        batch.materialized_tensor_elements = 11;
+        assert!(batch.validate().is_err());
+        batch.materialized_tensor_elements = 10;
+        batch.rows[0].lane.shape_bucket = "tokens.2".to_string();
+        assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn physical_batch_reports_are_keyed_instead_of_positional() {
+        let lane = lane();
+        let mut first = plan_for(
+            SessionKey::new("one".to_string(), 1),
+            WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+        );
+        first.plan_id = 1;
+        first.batch_mode = NativeBatchMode::Static;
+        first.max_batch_size = 2;
+        let mut second = plan_for(
+            SessionKey::new("two".to_string(), 2),
+            WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+        );
+        second.plan_id = 2;
+        second.batch_mode = NativeBatchMode::Static;
+        second.max_batch_size = 2;
+
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(9),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Static,
+            budget: BatchBudget {
+                max_rows: 2,
+                max_logical_units: 2,
+                max_tensor_elements: 20,
+                max_workspace_bytes: 32,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows: vec![
+                ReadyQuantum {
+                    plan_id: first.plan_id,
+                    session: first.session.clone(),
+                    lane: lane.clone(),
+                    work: first.work.clone(),
+                    cost: WorkCost::new(1, 10, 8),
+                },
+                ReadyQuantum {
+                    plan_id: second.plan_id,
+                    session: second.session.clone(),
+                    lane: lane.clone(),
+                    work: second.work.clone(),
+                    cost: WorkCost::new(1, 10, 8),
+                },
+            ],
+            materialized_tensor_elements: 20,
+            workspace: ResourceVector::temporary_workspace(16),
+        };
+        let dispatch = BatchDispatch::new(BatchDispatchKind::TensorStatic, 2);
+        let mut first_report = report_for(
+            &first,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        first_report.dispatch = dispatch;
+        let mut second_report = report_for(
+            &second,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        second_report.dispatch = dispatch;
+        let active = HashMap::from([(first.plan_id, first), (second.plan_id, second)]);
+        let mut report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane: lane.clone(),
+            dispatch,
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: vec![
+                // Reverse order deliberately: identity, not position, reconciles rows.
+                PhysicalBatchRowReport {
+                    execution: second_report.clone(),
+                    state: StateDisposition::ValidNext,
+                },
+                PhysicalBatchRowReport {
+                    execution: first_report.clone(),
+                    state: StateDisposition::ValidNext,
+                },
+            ],
+        };
+        assert!(report.validate_against(&batch, &active).is_ok());
+
+        report.rows[1] = report.rows[0].clone();
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[1] = PhysicalBatchRowReport {
+            execution: first_report,
+            state: StateDisposition::ValidNext,
+        };
+        report.rows[1].execution.session = SessionKey::new("foreign".to_string(), 99);
+        assert!(report.validate_against(&batch, &active).is_err());
+    }
+
+    #[test]
+    fn request_parallel_report_validates_for_independent_non_tensor_rows() {
+        let lane = lane();
+        let mut first = plan_for(
+            SessionKey::new("parallel-one".to_string(), 1),
+            WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+        );
+        first.plan_id = 11;
+        first.max_batch_size = 2;
+        let mut second = plan_for(
+            SessionKey::new("parallel-two".to_string(), 2),
+            WorkUnit::AtomicJob {
+                kind: "test".to_string(),
+            },
+        );
+        second.plan_id = 12;
+        second.max_batch_size = 2;
+        let rows = [&first, &second]
+            .into_iter()
+            .map(|plan| ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: plan.session.clone(),
+                lane: lane.clone(),
+                work: plan.work.clone(),
+                cost: WorkCost::new(1, 0, 0),
+            })
+            .collect::<Vec<_>>();
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(10),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: BatchBudget {
+                max_rows: 2,
+                max_logical_units: 2,
+                max_tensor_elements: u64::MAX,
+                max_workspace_bytes: 0,
+                max_padding_basis_points: 0,
+                max_formation_delay: Duration::ZERO,
+            },
+            rows,
+            materialized_tensor_elements: 0,
+            workspace: ResourceVector::zero(),
+        };
+        let dispatch = BatchDispatch::new(BatchDispatchKind::RequestParallel, 2);
+        let report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane,
+            dispatch,
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: [&first, &second]
+                .into_iter()
+                .map(|plan| {
+                    let mut execution = report_for(
+                        plan,
+                        ExecutionDisposition::Finished(FinishReason::Completed),
+                    );
+                    execution.dispatch = dispatch;
+                    PhysicalBatchRowReport {
+                        execution,
+                        state: StateDisposition::Unchanged,
+                    }
+                })
+                .collect(),
+        };
+        let active = HashMap::from([(first.plan_id, first), (second.plan_id, second)]);
+
+        assert!(batch.validate().is_ok());
+        assert!(report.validate_against(&batch, &active).is_ok());
+    }
+
+    #[test]
+    fn same_session_retry_requires_reusable_model_state() {
+        let lane = lane();
+        let mut plan = plan_for(
+            SessionKey::new("retry".to_string(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        plan.batch_mode = NativeBatchMode::Continuous;
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(10),
+            lane: lane.clone(),
+            mode: NativeBatchMode::Continuous,
+            budget: BatchBudget::width_one(),
+            rows: vec![ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: plan.session.clone(),
+                lane: lane.clone(),
+                work: plan.work.clone(),
+                cost: WorkCost::new(1, 1, 1),
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::temporary_workspace(1),
+        };
+        let failure = ExecutionFailure {
+            kind: FailureKind::Backend,
+            scope: FailureScope::Row,
+            retry: RetryDisposition::RetrySameSession,
+            health: HealthImpact::Degraded,
+            message: "retry".to_string(),
+        };
+        let mut execution = report_for(&plan, ExecutionDisposition::Failed(failure));
+        execution.dispatch = BatchDispatch::new(BatchDispatchKind::TensorContinuous, 1);
+        let active = HashMap::from([(plan.plan_id, plan)]);
+        let mut report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane,
+            dispatch: execution.dispatch,
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: vec![PhysicalBatchRowReport {
+                execution,
+                state: StateDisposition::ValidNext,
+            }],
+        };
+        assert!(report.validate_against(&batch, &active).is_err());
+        report.rows[0].state = StateDisposition::RolledBack;
+        assert!(report.validate_against(&batch, &active).is_ok());
+    }
+
     #[test]
     fn lifecycle_rejects_regressions_and_second_terminal() {
         let state = ExecutionState::Queued
@@ -725,12 +2115,12 @@ mod tests {
                 compute_dtype: "f32".to_string(),
                 kv_dtype: "f32".to_string(),
                 cache_namespace: "none".to_string(),
-                adapter_id: None,
+                adapter: None,
             },
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             estimate: ResourceVector::default(),
-            reservation: None,
+            stage: None,
         };
         let report = ExecutionReport {
             plan_id: 7,
@@ -739,6 +2129,7 @@ mod tests {
             output_produced: 0,
             observed_resources: ResourceVector::default(),
             dispatch: BatchDispatch::serial(),
+            provenance: OutcomeProvenance::produced_output(),
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition: ExecutionDisposition::Progress,
@@ -811,12 +2202,12 @@ mod tests {
                 compute_dtype: "f32".to_string(),
                 kv_dtype: "f32".to_string(),
                 cache_namespace: "none".to_string(),
-                adapter_id: None,
+                adapter: None,
             },
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             estimate: ResourceVector::zero(),
-            reservation: None,
+            stage: None,
         }
     }
 
@@ -828,6 +2219,15 @@ mod tests {
                 (failure.retry == RetryDisposition::Never, true)
             }
         };
+        let provenance = match &disposition {
+            ExecutionDisposition::Failed(_) => {
+                OutcomeProvenance::failure(FailureOrigin::Model, DispatchState::Started)
+            }
+            ExecutionDisposition::Finished(FinishReason::TimedOut) => {
+                OutcomeProvenance::deadline(DeadlinePhase::ModelExecution, DispatchState::Started)
+            }
+            _ => OutcomeProvenance::produced_output(),
+        };
         ExecutionReport {
             plan_id: plan.plan_id,
             session: plan.session.clone(),
@@ -835,6 +2235,7 @@ mod tests {
             output_produced: 0,
             observed_resources: ResourceVector::zero(),
             dispatch: BatchDispatch::serial(),
+            provenance,
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition,
@@ -961,7 +2362,7 @@ mod tests {
         tracker.begin_plan(&plan).unwrap();
         let retryable = ExecutionFailure {
             kind: FailureKind::Backend,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::RetrySameSession,
             health: HealthImpact::Degraded,
             message: "transient".to_string(),
@@ -1010,7 +2411,7 @@ mod tests {
 
         let retry = ExecutionFailure {
             kind: FailureKind::Backend,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::RetrySameSession,
             health: HealthImpact::Degraded,
             message: "transient".to_string(),
@@ -1018,6 +2419,47 @@ mod tests {
         let mut retryable = report_for(&plan, ExecutionDisposition::Failed(retry));
         retryable.output_finished = true;
         assert!(retryable.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn provenance_must_match_dispatch_failure_and_deadline_outcomes() {
+        let plan = plan_for(
+            SessionKey::new("provenance".to_string(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let mut failed = report_for(
+            &plan,
+            ExecutionDisposition::Failed(ExecutionFailure::invalid_output("failed")),
+        );
+        failed.dispatch = BatchDispatch::not_dispatched(1);
+        assert!(failed.validate_against(&plan).is_err());
+        failed.provenance = OutcomeProvenance::failure(
+            FailureOrigin::ExecutorValidation,
+            DispatchState::NotStarted,
+        );
+        assert!(failed.validate_against(&plan).is_ok());
+
+        let mut timed_out = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::TimedOut),
+        );
+        assert!(timed_out.validate_against(&plan).is_ok());
+        timed_out.provenance = OutcomeProvenance::started();
+        assert!(timed_out.validate_against(&plan).is_err());
+
+        let mut completed = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        completed.provenance = OutcomeProvenance::deadline(
+            DeadlinePhase::ModelExecution,
+            DispatchState::ProducedOutput,
+        );
+        assert!(completed.validate_against(&plan).is_err());
     }
 
     #[test]
@@ -1038,7 +2480,7 @@ mod tests {
 
         let recompute = ExecutionFailure {
             kind: FailureKind::Backend,
-            scope: FailureScope::Request,
+            scope: FailureScope::Row,
             retry: RetryDisposition::Recompute,
             health: HealthImpact::Degraded,
             message: "cache invalidated".to_string(),

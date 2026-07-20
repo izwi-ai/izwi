@@ -10,7 +10,9 @@ use tokio::sync::Mutex;
 
 use crate::engine::{
     engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
-    EngineMetricDescriptor, EngineOutput,
+    EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
+    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineOutput,
+    EngineWorkspaceDomainMetricsSnapshot,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
@@ -59,9 +61,26 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub kv_cache_allocated_blocks: u64,
     pub kv_cache_prefix_reuse_blocks_total: u64,
     pub stream_backpressure_total: u64,
+    pub stream_checkpoints_committed_total: u64,
+    pub stream_checkpoint_rejections_total: u64,
+    pub stream_delivery_failures_total: u64,
     pub tensor_batches_total: u64,
+    pub tensor_static_batches_total: u64,
+    pub tensor_continuous_batches_total: u64,
     pub request_parallel_batches_total: u64,
+    pub physical_batch_rejections_total: u64,
     pub tensor_batch_max_width: u64,
+    pub tensor_batch_rows_total: u64,
+    pub tensor_batch_capacity_rows_total: u64,
+    pub tensor_batch_useful_elements_total: u64,
+    pub tensor_batch_materialized_elements_total: u64,
+    pub batch_workspace_bytes_total: u64,
+    pub dispatch_states: EngineDispatchStateMetricsSnapshot,
+    pub failure_origins: EngineFailureOriginMetricsSnapshot,
+    pub deadline_phases: EngineDeadlinePhaseMetricsSnapshot,
+    pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
+    pub tensor_batch_fill_ratio: f64,
+    pub tensor_batch_padding_ratio: f64,
     pub kv_cache: EngineKvCacheRuntimeSnapshot,
 }
 
@@ -429,7 +448,6 @@ impl RuntimeTelemetryCollector {
         if output.error.is_some() {
             self.requests_failed.fetch_add(1, Ordering::Relaxed);
         }
-        self.requests_active.fetch_sub(1, Ordering::Relaxed);
 
         if let Some(latency) = output.latency_breakdown.as_ref() {
             Self::push_sample(
@@ -1079,6 +1097,23 @@ pub(crate) fn push_engine_metric_f64(payload: &mut String, name: &str, value: f6
     ));
 }
 
+pub(crate) fn push_engine_labeled_metric(
+    payload: &mut String,
+    name: &str,
+    label_name: &str,
+    values: &[(&str, u64)],
+) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
+    payload.push_str(&format!("# TYPE {prometheus_name} {metric_type}\n"));
+    for (label_value, value) in values {
+        payload.push_str(&format!(
+            "{prometheus_name}{{{label_name}=\"{label_value}\"}} {value}\n"
+        ));
+    }
+}
+
 fn push_engine_metric_help(payload: &mut String, name: &str, prometheus_name: &str) {
     if let Some(descriptor) = engine_metric_catalog()
         .iter()
@@ -1135,7 +1170,19 @@ fn prometheus_label_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ENGINE_SCHEDULER_QUEUE_DEPTH;
+    use crate::engine::{
+        ExecutorOutput, OutputProcessor, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+        ENGINE_SCHEDULER_QUEUE_DEPTH,
+    };
+    use std::time::Duration;
+
+    fn terminal_output(request_id: &str, error: Option<&str>) -> EngineOutput {
+        let output = match error {
+            Some(message) => ExecutorOutput::error(request_id.to_string(), message),
+            None => ExecutorOutput::terminal(request_id.to_string()),
+        };
+        OutputProcessor::new(24_000).process(output, 1, Duration::ZERO)
+    }
 
     #[tokio::test]
     async fn request_terminal_accounting_is_exactly_once() {
@@ -1151,6 +1198,41 @@ mod tests {
         assert_eq!(snapshot.requests_completed, 1);
         assert_eq!(snapshot.requests_cancelled, 1);
         assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.requests_active, 0);
+    }
+
+    #[tokio::test]
+    async fn completed_request_releases_active_gauge_once() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_request_queued("request-1").await;
+        let output = terminal_output("request-1", None);
+
+        telemetry.record_request_finished(&output).await;
+        telemetry.record_request_finished(&output).await;
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.requests_queued, 1);
+        assert_eq!(snapshot.requests_completed, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.requests_active, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_and_forced_terminal_paths_release_exact_requests() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_request_queued("failed").await;
+        telemetry.record_request_queued("forced").await;
+
+        telemetry
+            .record_request_finished(&terminal_output("failed", Some("boom")))
+            .await;
+        telemetry
+            .record_forced_failures(["forced", "unknown"])
+            .await;
+
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.requests_completed, 2);
+        assert_eq!(snapshot.requests_failed, 2);
         assert_eq!(snapshot.requests_active, 0);
     }
 
@@ -1375,6 +1457,27 @@ mod tests {
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth 7"));
         assert!(payload.contains("# HELP izwi_engine_scheduler_queue_depth"));
+    }
+
+    #[test]
+    fn labeled_engine_metric_helper_emits_one_bounded_family() {
+        let mut payload = String::new();
+        push_engine_labeled_metric(
+            &mut payload,
+            ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+            "state",
+            &[("not_started", 2), ("started", 3), ("produced_output", 5)],
+        );
+
+        assert_eq!(
+            payload
+                .matches("# TYPE izwi_engine_executor_dispatch_state_rows_total counter")
+                .count(),
+            1
+        );
+        assert!(payload.contains(
+            "izwi_engine_executor_dispatch_state_rows_total{state=\"produced_output\"} 5"
+        ));
     }
 
     #[tokio::test]
