@@ -1885,6 +1885,23 @@ mod tests {
         }
     }
 
+    fn scheduled_decode(request_id: &str, sequence_id: u64) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id: sequence_id + 101,
+            request_id: request_id.to_string(),
+            sequence_id,
+            num_tokens: 1,
+            is_prefill: false,
+            block_ids: Vec::new(),
+            num_computed_tokens: 1,
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: crate::engine::SequencePhase::Decode,
+                input: crate::engine::InputRange { start: 1, end: 2 },
+                max_output_steps: 1,
+            },
+        }
+    }
+
     fn wrap_outputs(
         scheduled: &[ScheduledRequest],
         outputs: Vec<ExecutorOutput>,
@@ -2810,6 +2827,82 @@ mod tests {
         assert!(split
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
+    }
+
+    #[test]
+    fn one_token_continuous_budget_admits_multiple_rows() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor)
+            .expect("core");
+        for id in ["continuous-a", "continuous-b"] {
+            let mut request = EngineCoreRequest::tts("continuous batch fixture");
+            request.id = id.to_string();
+            core.add_request(request).unwrap();
+        }
+        let scheduled = ["continuous-a", "continuous-b"]
+            .into_iter()
+            .map(|id| {
+                let epoch = core.get_session_key(&id.to_string()).unwrap().epoch;
+                scheduled_decode(id, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.max_batch_size = 2;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(5),
+            "chat.decode.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        stage.max_work_units = 2;
+        let adapter_key = super::super::AdapterBindingKey {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: super::super::ModelInstanceId::new(2),
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: stage.id,
+        };
+        for item in &scheduled {
+            core.active_plans.insert(
+                item.plan_id,
+                ExecutionPlan {
+                    plan_id: item.plan_id,
+                    session: item.session_key(),
+                    work: item.work.clone(),
+                    batch_key: BatchKey {
+                        backend: BackendKind::Cpu,
+                        model_variant: None,
+                        task_type: TaskType::Chat,
+                        work_kind: "decode".to_string(),
+                        compute_dtype: "f32".to_string(),
+                        kv_dtype: "f32".to_string(),
+                        cache_namespace: "continuous".to_string(),
+                        adapter: Some(adapter_key.clone()),
+                    },
+                    batch_mode: NativeBatchMode::Continuous,
+                    max_batch_size: 2,
+                    estimate: ResourceVector::zero(),
+                    stage: Some(stage.clone()),
+                },
+            );
+        }
+        let requests = scheduled
+            .iter()
+            .map(|item| core.requests.get(&item.request_id).unwrap().clone())
+            .collect::<Vec<_>>();
+
+        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].physical_batch().mode,
+            NativeBatchMode::Continuous
+        );
+        assert_eq!(batches[0].physical_batch().rows.len(), 2);
+        assert_eq!(batches[0].physical_batch().budget.max_logical_units, 2);
     }
 
     #[tokio::test]

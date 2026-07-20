@@ -326,7 +326,13 @@ impl LoadedExecutionAdapter for ContinuousQwenChatExecutionAdapter {
             NativeBatchMode::Continuous,
         );
         decode.selector = StageWorkSelector::SequenceDecode;
-        decode.max_work_units = 1;
+        // `max_work_units` is the aggregate budget for the whole physical
+        // batch, not a per-row quantum. Continuous decode schedules exactly
+        // one token per row, so a width-N stage needs an N-unit budget or the
+        // second row can never join the batch.
+        decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
+            Error::Overloaded("continuous decode batch width exceeds work accounting".to_string())
+        })?;
         prefill.validate()?;
         decode.validate()?;
 
@@ -697,6 +703,6 @@ mod tests {
         );
         assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
         assert_eq!(contract.stages[1].max_batch_size, 8);
-        assert_eq!(contract.stages[1].max_work_units, 1);
+        assert_eq!(contract.stages[1].max_work_units, 8);
     }
 }
