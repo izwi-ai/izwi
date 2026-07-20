@@ -5,15 +5,19 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
+use super::metrics::record_engine_stream_backpressure;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
-use super::{ResourceAmount, ResourceVector, StageId, WorkCost};
+use super::{
+    BatchId, BatchLaneKey, OutputVisibility, PlanId, ResourceAmount, ResourceVector, SessionKey,
+    StageId, WorkCost,
+};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -236,37 +240,370 @@ pub(super) struct PreparedStageCost {
     cost: WorkCost,
 }
 
-/// Invisible host-side stream outbox used while one executor transaction is
-/// in flight. Clones intentionally share the same buffer because requests are
-/// wrapped in `Arc` before scheduling.
+pub(super) const STREAM_PROGRESS_QUEUE_CAPACITY: usize = 64;
+pub(super) const STREAM_PROGRESS_MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
+const STREAM_PROGRESS_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const STREAM_STAGED_MAX_EVENTS: usize = 4096;
+
+#[derive(Debug)]
+pub(super) struct StreamProgressBudget {
+    max_bytes: usize,
+    state: Mutex<usize>,
+    available: Condvar,
+}
+
+impl StreamProgressBudget {
+    pub(super) fn new(max_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_bytes: max_bytes.max(1),
+            state: Mutex::new(0),
+            available: Condvar::new(),
+        })
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        policy: EngineStreamPolicy,
+    ) -> Result<Option<StreamProgressPermit>> {
+        if bytes > STREAM_PROGRESS_MAX_EVENT_BYTES || bytes > self.max_bytes {
+            return Err(Error::Overloaded(format!(
+                "stream progress event requires {bytes} bytes, exceeding its bounded budget"
+            )));
+        }
+
+        let mut used = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("stream progress budget mutex poisoned".into()))?;
+        let admits = |used: usize| {
+            used.checked_add(bytes)
+                .is_some_and(|next| next <= self.max_bytes)
+        };
+
+        match policy {
+            EngineStreamPolicy::FailOnFull => {
+                if !admits(*used) {
+                    record_engine_stream_backpressure();
+                    return Err(Error::Overloaded(
+                        "stream progress byte budget is full".to_string(),
+                    ));
+                }
+            }
+            EngineStreamPolicy::DropNewest => {
+                if !admits(*used) {
+                    record_engine_stream_backpressure();
+                    return Ok(None);
+                }
+            }
+            EngineStreamPolicy::BlockWithDeadline { timeout_ms } => {
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+                while !admits(*used) {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        record_engine_stream_backpressure();
+                        return Err(Error::Overloaded(
+                            "stream progress byte-budget deadline elapsed".to_string(),
+                        ));
+                    }
+                    let wait = deadline.saturating_duration_since(now);
+                    let (next, result) = self.available.wait_timeout(used, wait).map_err(|_| {
+                        Error::InferenceError("stream progress budget mutex poisoned".into())
+                    })?;
+                    used = next;
+                    if result.timed_out() && !admits(*used) {
+                        record_engine_stream_backpressure();
+                        return Err(Error::Overloaded(
+                            "stream progress byte-budget deadline elapsed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        *used = used.checked_add(bytes).ok_or_else(|| {
+            Error::Overloaded("stream progress byte accounting overflowed".to_string())
+        })?;
+        Ok(Some(StreamProgressPermit {
+            budget: self.clone(),
+            bytes,
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct StreamProgressPermit {
+    budget: Arc<StreamProgressBudget>,
+    bytes: usize,
+}
+
+impl Drop for StreamProgressPermit {
+    fn drop(&mut self) {
+        let Ok(mut used) = self.budget.state.lock() else {
+            return;
+        };
+        *used = used.saturating_sub(self.bytes);
+        self.budget.available.notify_all();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct FencedStreamProgress {
+    pub(super) batch_id: BatchId,
+    pub(super) lane: BatchLaneKey,
+    pub(super) plan_id: PlanId,
+    pub(super) session: SessionKey,
+    pub(super) output: StreamingOutput,
+    pub(super) budget_permit: StreamProgressPermit,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalStreamBinding {
+    batch_id: BatchId,
+    lane: BatchLaneKey,
+    plan_id: PlanId,
+    session: SessionKey,
+    progress_tx: mpsc::Sender<FencedStreamProgress>,
+    budget: Arc<StreamProgressBudget>,
+}
+
+impl IncrementalStreamBinding {
+    fn send(
+        &self,
+        output: StreamingOutput,
+        policy: EngineStreamPolicy,
+    ) -> Result<StreamPushOutcome> {
+        let payload_bytes = stream_payload_bytes(&output)?;
+        let Some(budget_permit) = self.budget.reserve(payload_bytes, policy)? else {
+            return Ok(StreamPushOutcome::Dropped);
+        };
+        let mut progress = FencedStreamProgress {
+            batch_id: self.batch_id,
+            lane: self.lane.clone(),
+            plan_id: self.plan_id,
+            session: self.session.clone(),
+            output,
+            budget_permit,
+        };
+
+        match policy {
+            EngineStreamPolicy::FailOnFull => self
+                .progress_tx
+                .try_send(progress)
+                .map(|_| StreamPushOutcome::Accepted)
+                .map_err(stream_progress_send_error),
+            EngineStreamPolicy::DropNewest => match self.progress_tx.try_send(progress) {
+                Ok(()) => Ok(StreamPushOutcome::Accepted),
+                Err(mpsc::error::TrySendError::Closed(progress)) => Err(
+                    stream_progress_send_error(mpsc::error::TrySendError::Closed(progress)),
+                ),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    record_engine_stream_backpressure();
+                    Ok(StreamPushOutcome::Dropped)
+                }
+            },
+            EngineStreamPolicy::BlockWithDeadline { timeout_ms } => {
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+                loop {
+                    match self.progress_tx.try_send(progress) {
+                        Ok(()) => return Ok(StreamPushOutcome::Accepted),
+                        Err(mpsc::error::TrySendError::Closed(progress)) => {
+                            return Err(stream_progress_send_error(
+                                mpsc::error::TrySendError::Closed(progress),
+                            ));
+                        }
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            progress = returned;
+                            let now = Instant::now();
+                            if now >= deadline {
+                                record_engine_stream_backpressure();
+                                return Err(Error::Overloaded(
+                                    "stream progress queue deadline elapsed".to_string(),
+                                ));
+                            }
+                            std::thread::sleep(
+                                deadline
+                                    .saturating_duration_since(now)
+                                    .min(Duration::from_millis(1)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn stream_progress_send_error(err: mpsc::error::TrySendError<FencedStreamProgress>) -> Error {
+    match err {
+        mpsc::error::TrySendError::Closed(_) => {
+            Error::InferenceError("stream progress channel closed".to_string())
+        }
+        mpsc::error::TrySendError::Full(_) => {
+            record_engine_stream_backpressure();
+            Error::Overloaded("stream progress queue is full".to_string())
+        }
+    }
+}
+
+fn stream_payload_bytes(output: &StreamingOutput) -> Result<usize> {
+    let sample_bytes = output
+        .samples
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::Overloaded("stream sample byte size overflowed".to_string()))?;
+    output
+        .request_id
+        .len()
+        .checked_add(output.text.as_ref().map_or(0, String::len))
+        .and_then(|bytes| bytes.checked_add(sample_bytes))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| Error::Overloaded("stream payload byte size overflowed".to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamPushOutcome {
+    Accepted,
+    Dropped,
+}
+
+#[derive(Debug, Default)]
+struct StreamBufferState {
+    staged: Vec<StreamingOutput>,
+    staged_bytes: usize,
+    binding: Option<IncrementalStreamBinding>,
+}
+
+/// Bounded stream outbox and transaction-scoped progress binding. Clones
+/// intentionally share state because requests are wrapped in `Arc` before
+/// scheduling.
 #[derive(Debug, Clone, Default)]
 pub(super) struct StreamStagingBuffer {
-    events: Arc<Mutex<Vec<StreamingOutput>>>,
+    state: Arc<Mutex<StreamBufferState>>,
+}
+
+#[derive(Debug)]
+pub(super) struct StreamBindingGuard {
+    buffer: StreamStagingBuffer,
+    plan_id: PlanId,
+    session: SessionKey,
 }
 
 impl StreamStagingBuffer {
     pub(super) fn clear(&self) -> Result<()> {
-        self.events
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?
-            .clear();
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+        state.staged.clear();
+        state.staged_bytes = 0;
+        state.binding = None;
         Ok(())
     }
 
-    pub(super) fn push(&self, output: StreamingOutput) -> Result<()> {
-        self.events
+    pub(super) fn bind_quantum(
+        &self,
+        batch_id: BatchId,
+        lane: BatchLaneKey,
+        plan_id: PlanId,
+        session: SessionKey,
+        visibility: OutputVisibility,
+        progress_tx: mpsc::Sender<FencedStreamProgress>,
+        budget: Arc<StreamProgressBudget>,
+    ) -> Result<StreamBindingGuard> {
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?
-            .push(output);
-        Ok(())
+            .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+        if state.binding.is_some() {
+            return Err(Error::InferenceError(
+                "stream progress binding is already active".to_string(),
+            ));
+        }
+        state.staged.clear();
+        state.staged_bytes = 0;
+        if visibility == OutputVisibility::IncrementalCommitted {
+            state.binding = Some(IncrementalStreamBinding {
+                batch_id,
+                lane,
+                plan_id,
+                session: session.clone(),
+                progress_tx,
+                budget,
+            });
+        }
+        Ok(StreamBindingGuard {
+            buffer: self.clone(),
+            plan_id,
+            session,
+        })
+    }
+
+    pub(super) fn push_with_policy(
+        &self,
+        output: StreamingOutput,
+        policy: EngineStreamPolicy,
+    ) -> Result<StreamPushOutcome> {
+        let binding = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
+            if output.is_final || state.binding.is_none() {
+                let payload_bytes = stream_payload_bytes(&output)?;
+                let next_bytes =
+                    state
+                        .staged_bytes
+                        .checked_add(payload_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded("stream staging size overflowed".to_string())
+                        })?;
+                if state.staged.len() >= STREAM_STAGED_MAX_EVENTS
+                    || next_bytes > STREAM_PROGRESS_MAX_BUFFERED_BYTES
+                {
+                    record_engine_stream_backpressure();
+                    if policy == EngineStreamPolicy::DropNewest && !output.is_final {
+                        return Ok(StreamPushOutcome::Dropped);
+                    }
+                    return Err(Error::Overloaded(
+                        "stream staging outbox exceeded its bounded capacity".to_string(),
+                    ));
+                }
+                state.staged.push(output);
+                state.staged_bytes = next_bytes;
+                return Ok(StreamPushOutcome::Accepted);
+            }
+            state.binding.clone().expect("binding checked above")
+        };
+        binding.send(output, policy)
     }
 
     pub(super) fn take(&self) -> Result<Vec<StreamingOutput>> {
-        let mut events = self
-            .events
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| Error::InferenceError("stream staging mutex poisoned".to_string()))?;
-        Ok(std::mem::take(&mut *events))
+        state.staged_bytes = 0;
+        Ok(std::mem::take(&mut state.staged))
+    }
+
+    fn clear_binding(&self, plan_id: PlanId, session: &SessionKey) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.plan_id == plan_id && &binding.session == session)
+        {
+            state.binding = None;
+        }
+    }
+}
+
+impl Drop for StreamBindingGuard {
+    fn drop(&mut self) {
+        self.buffer.clear_binding(self.plan_id, &self.session);
     }
 }
 

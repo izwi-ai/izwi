@@ -5,7 +5,9 @@ use crate::error::{Error, Result};
 
 use super::super::metrics::record_engine_stream_backpressure;
 use super::super::output::{AsrProgress, StreamingOutput};
-use super::super::request::{EngineCoreRequest, EngineStreamPolicy, StreamStagingBuffer};
+use super::super::request::{
+    EngineCoreRequest, EngineStreamPolicy, StreamPushOutcome, StreamStagingBuffer,
+};
 use super::super::SessionKey;
 use super::NativeExecutor;
 
@@ -144,18 +146,22 @@ impl NativeExecutor {
         sequence: &mut usize,
         text: String,
     ) -> Result<()> {
-        let _ = policy;
-        tx.push(StreamingOutput {
-            request_id: request_id.to_string(),
-            sequence: *sequence,
-            samples: Vec::new(),
-            sample_rate: 0,
-            is_final: false,
-            text: Some(text),
-            stats: None,
-            asr_progress: None,
-        })?;
-        *sequence += 1;
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples: Vec::new(),
+                sample_rate: 0,
+                is_final: false,
+                text: Some(text),
+                stats: None,
+                asr_progress: None,
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
         Ok(())
     }
 
@@ -219,18 +225,22 @@ impl NativeExecutor {
         sample_rate: u32,
         is_final: bool,
     ) -> Result<()> {
-        let _ = policy;
-        tx.push(StreamingOutput {
-            request_id: request_id.to_string(),
-            sequence: *sequence,
-            samples,
-            sample_rate,
-            is_final,
-            text: None,
-            stats: None,
-            asr_progress: None,
-        })?;
-        *sequence += 1;
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples,
+                sample_rate,
+                is_final,
+                text: None,
+                stats: None,
+                asr_progress: None,
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
         Ok(())
     }
 
@@ -241,18 +251,22 @@ impl NativeExecutor {
         sequence: &mut usize,
         progress: AsrProgress,
     ) -> Result<()> {
-        let _ = policy;
-        tx.push(StreamingOutput {
-            request_id: request_id.to_string(),
-            sequence: *sequence,
-            samples: Vec::new(),
-            sample_rate: 0,
-            is_final: false,
-            text: None,
-            stats: None,
-            asr_progress: Some(progress),
-        })?;
-        *sequence += 1;
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples: Vec::new(),
+                sample_rate: 0,
+                is_final: false,
+                text: None,
+                stats: None,
+                asr_progress: Some(progress),
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
         Ok(())
     }
 
@@ -297,10 +311,16 @@ fn stream_send_error(err: mpsc::error::TrySendError<StreamingOutput>) -> Error {
 mod tests {
     use tokio::sync::mpsc;
 
+    use crate::backends::BackendKind;
     use crate::engine::executor::NativeExecutor;
     use crate::engine::output::StreamingOutput;
-    use crate::engine::request::StreamStagingBuffer;
-    use crate::engine::SessionKey;
+    use crate::engine::request::{
+        StreamProgressBudget, StreamStagingBuffer, STREAM_PROGRESS_MAX_BUFFERED_BYTES,
+    };
+    use crate::engine::{
+        AdapterAbiRevision, AdapterInstanceId, BatchId, BatchLaneKey, ExecutionGroupId,
+        ModelInstanceId, OutputVisibility, SessionKey, StageId,
+    };
 
     use super::{
         deliver_committed_streams, CommittedStreamDelivery, StreamBackpressurePolicy,
@@ -318,6 +338,75 @@ mod tests {
             stats: None,
             asr_progress: None,
         }
+    }
+
+    fn lane() -> BatchLaneKey {
+        BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(7),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "none".to_string(),
+            tensor_layout: "exact".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "none".to_string(),
+            kernel_mode: "compatibility".to_string(),
+            semantic_mode: "chat".to_string(),
+            shape_bucket: "exact.1".to_string(),
+        }
+    }
+
+    #[test]
+    fn incremental_binding_routes_nonterminal_output_and_stages_final() {
+        let staging = StreamStagingBuffer::default();
+        let (progress_tx, mut progress_rx) = mpsc::channel(4);
+        let session = SessionKey::new("req-1".to_string(), 7);
+        let guard = staging
+            .bind_quantum(
+                BatchId::new(9),
+                lane(),
+                11,
+                session.clone(),
+                OutputVisibility::IncrementalCommitted,
+                progress_tx,
+                StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES),
+            )
+            .expect("incremental binding");
+        let mut sequence = 0usize;
+
+        NativeExecutor::stream_text(&staging, "req-1", &mut sequence, "hello".to_string())
+            .expect("progress output");
+        NativeExecutor::stream_final_marker(&staging, "req-1", &mut sequence)
+            .expect("final marker");
+
+        let progress = progress_rx.try_recv().expect("incremental progress");
+        assert_eq!(progress.batch_id, BatchId::new(9));
+        assert_eq!(progress.plan_id, 11);
+        assert_eq!(progress.session, session);
+        assert_eq!(progress.output.sequence, 0);
+        assert_eq!(progress.output.text.as_deref(), Some("hello"));
+        assert!(!progress.output.is_final);
+        assert!(progress_rx.try_recv().is_err());
+
+        let staged = staging.take().expect("staged final");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].sequence, 1);
+        assert!(staged[0].is_final);
+
+        drop(guard);
+        NativeExecutor::stream_text(&staging, "req-1", &mut sequence, "later".to_string())
+            .expect("post-binding staged output");
+        assert_eq!(
+            staging.take().expect("post-binding staging")[0]
+                .text
+                .as_deref(),
+            Some("later")
+        );
     }
 
     #[tokio::test]
