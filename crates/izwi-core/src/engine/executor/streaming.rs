@@ -11,8 +11,8 @@ use super::super::metrics::{
 };
 use super::super::output::{AsrProgress, StreamingOutput};
 use super::super::request::{
-    EngineCoreRequest, EngineStreamPolicy, FencedStreamProgress, StreamProgressPermit,
-    StreamPushOutcome, StreamStagingBuffer,
+    checked_stream_backpressure_deadline, EngineCoreRequest, EngineStreamPolicy,
+    FencedStreamProgress, StreamProgressPermit, StreamPushOutcome, StreamStagingBuffer,
 };
 use super::super::SessionKey;
 use super::NativeExecutor;
@@ -136,9 +136,11 @@ pub(crate) async fn deliver_committed_streams(
 /// memory unbounded.
 pub(crate) struct IncrementalStreamDeliveryWorkers {
     senders: HashMap<SessionKey, mpsc::UnboundedSender<CommittedStreamDelivery>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: HashMap<SessionKey, tokio::task::JoinHandle<()>>,
     failure_tx: mpsc::UnboundedSender<StreamDeliveryFailure>,
 }
+
+const INCREMENTAL_COMMIT_FLUSH_GRACE: Duration = Duration::from_millis(10);
 
 impl IncrementalStreamDeliveryWorkers {
     pub(crate) fn new() -> (Self, mpsc::UnboundedReceiver<StreamDeliveryFailure>) {
@@ -146,7 +148,7 @@ impl IncrementalStreamDeliveryWorkers {
         (
             Self {
                 senders: HashMap::new(),
-                tasks: Vec::new(),
+                tasks: HashMap::new(),
                 failure_tx,
             },
             failure_rx,
@@ -162,7 +164,7 @@ impl IncrementalStreamDeliveryWorkers {
             let (tx, mut rx) = mpsc::unbounded_channel::<CommittedStreamDelivery>();
             let failure_tx = self.failure_tx.clone();
             let worker_session = session.clone();
-            self.tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 while let Some(delivery) = rx.recv().await {
                     if let Err(kind) = delivery.deliver().await {
                         let _ = failure_tx.send(StreamDeliveryFailure {
@@ -172,7 +174,8 @@ impl IncrementalStreamDeliveryWorkers {
                         break;
                     }
                 }
-            }));
+            });
+            self.tasks.insert(session.clone(), task);
             self.senders.insert(session.clone(), tx);
         }
         let sender = self
@@ -189,10 +192,42 @@ impl IncrementalStreamDeliveryWorkers {
         self.senders.remove(session);
     }
 
-    pub(crate) async fn finish(mut self) {
+    /// Close every ordered lane at the physical commit barrier. Deliveries
+    /// that are immediately writable get a short scheduler grace to finish;
+    /// a row still blocked after that point fails independently so its public
+    /// timeout cannot hold peer terminal markers or completions hostage.
+    pub(crate) async fn finish(mut self) -> Vec<StreamDeliveryFailure> {
         self.senders.clear();
         drop(self.failure_tx);
-        for task in self.tasks {
+        let deadline = tokio::time::Instant::now() + INCREMENTAL_COMMIT_FLUSH_GRACE;
+        loop {
+            let finished = self
+                .tasks
+                .iter()
+                .filter_map(|(session, task)| task.is_finished().then_some(session.clone()))
+                .collect::<Vec<_>>();
+            for session in finished {
+                let task = self
+                    .tasks
+                    .remove(&session)
+                    .expect("finished delivery task remained registered");
+                match task.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_panic() => {
+                        std::panic::resume_unwind(error.into_panic());
+                    }
+                    Err(_) => {}
+                }
+            }
+            if self.tasks.is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let mut failures = Vec::with_capacity(self.tasks.len());
+        for (session, task) in self.tasks {
+            task.abort();
             match task.await {
                 Ok(()) => {}
                 Err(error) if error.is_panic() => {
@@ -200,7 +235,14 @@ impl IncrementalStreamDeliveryWorkers {
                 }
                 Err(_) => {}
             }
+            record_engine_stream_backpressure();
+            record_engine_stream_delivery_failure();
+            failures.push(StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Deadline,
+            });
         }
+        failures
     }
 }
 
@@ -219,9 +261,9 @@ async fn send_committed_output(
             }
         },
         StreamBackpressurePolicy::BlockWithDeadline { timeout_ms } => {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), tx.send(output))
-                .await
-            {
+            let deadline = checked_stream_backpressure_deadline(timeout_ms)
+                .map_err(|_| StreamDeliveryFailureKind::Deadline)?;
+            match tokio::time::timeout_at(deadline.into(), tx.send(output)).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(_)) => Err(StreamDeliveryFailureKind::Delivery),
                 Err(_) => {
@@ -632,6 +674,7 @@ mod tests {
             .try_send(output("blocked", 0))
             .expect("prefill blocked queue");
         let (open_tx, mut open_rx) = mpsc::channel(2);
+        let terminal_tx = open_tx.clone();
         let (mut workers, mut failures) = IncrementalStreamDeliveryWorkers::new();
         workers
             .enqueue(CommittedStreamDelivery::new(
@@ -668,14 +711,40 @@ mod tests {
             .expect("open worker closed");
         assert_eq!((first.sequence, second.sequence), (0, 1));
 
-        workers.finish().await;
+        let started = std::time::Instant::now();
+        let barrier_failures = workers.finish().await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "blocked row held the physical commit barrier"
+        );
         assert_eq!(
-            failures.try_recv().expect("blocked row failure"),
-            StreamDeliveryFailure {
+            barrier_failures,
+            vec![StreamDeliveryFailure {
                 session: blocked,
                 kind: StreamDeliveryFailureKind::Deadline,
-            }
+            }]
         );
+        assert!(failures.try_recv().is_err());
+
+        let mut terminal = output("open", 2);
+        terminal.is_final = true;
+        let terminal_delivery = tokio::spawn(deliver_committed_streams(vec![
+            CommittedStreamDelivery::new(
+                SessionKey::new("open".to_string(), 2),
+                terminal_tx,
+                StreamBackpressurePolicy::FailOnFull,
+                vec![terminal],
+            ),
+        ]));
+        let terminal = tokio::time::timeout(std::time::Duration::from_millis(50), open_rx.recv())
+            .await
+            .expect("blocked row delayed the peer terminal marker")
+            .expect("peer stream closed before its terminal marker");
+        assert!(terminal.is_final);
+        assert!(terminal_delivery
+            .await
+            .expect("terminal delivery task")
+            .is_empty());
     }
 
     #[tokio::test]

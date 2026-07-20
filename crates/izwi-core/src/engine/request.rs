@@ -63,6 +63,20 @@ impl Default for EngineStreamPolicy {
     }
 }
 
+impl EngineStreamPolicy {
+    fn validate(self) -> Result<()> {
+        if let Self::BlockWithDeadline { timeout_ms } = self {
+            if timeout_ms > STREAM_BACKPRESSURE_MAX_TIMEOUT_MS {
+                return Err(Error::InvalidInput(format!(
+                    "stream backpressure timeout {timeout_ms}ms exceeds the {}ms limit",
+                    STREAM_BACKPRESSURE_MAX_TIMEOUT_MS
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Coarse workload class used by admission and latency-aware scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -243,6 +257,17 @@ pub(super) struct PreparedStageCost {
 pub(super) const STREAM_PROGRESS_QUEUE_CAPACITY: usize = 64;
 pub(super) const STREAM_PROGRESS_MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_PROGRESS_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const STREAM_BACKPRESSURE_MAX_TIMEOUT_MS: u64 = 60_000;
+
+pub(super) fn checked_stream_backpressure_deadline(timeout_ms: u64) -> Result<Instant> {
+    EngineStreamPolicy::BlockWithDeadline { timeout_ms }.validate()?;
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "stream backpressure timeout {timeout_ms}ms exceeds the supported deadline range"
+        ))
+    })
+}
 const STREAM_STAGED_MAX_EVENTS: usize = 4096;
 
 #[derive(Debug)]
@@ -297,7 +322,7 @@ impl StreamProgressBudget {
                 }
             }
             EngineStreamPolicy::BlockWithDeadline { timeout_ms } => {
-                let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+                let deadline = checked_stream_backpressure_deadline(timeout_ms)?;
                 while !admits(*used) {
                     let now = Instant::now();
                     if now >= deadline {
@@ -403,7 +428,7 @@ impl IncrementalStreamBinding {
                 }
             },
             EngineStreamPolicy::BlockWithDeadline { timeout_ms } => {
-                let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+                let deadline = checked_stream_backpressure_deadline(timeout_ms)?;
                 loop {
                     match self.progress_tx.try_send(progress) {
                         Ok(()) => return Ok(StreamPushOutcome::Accepted),
@@ -2646,6 +2671,8 @@ impl RequestProcessor {
             }
         }
 
+        request.stream_policy.validate()?;
+
         // Validate and clamp parameters
         self.validate_params(
             request.task_type,
@@ -2914,6 +2941,25 @@ mod tests {
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::ChatRole;
+
+    #[test]
+    fn maximal_stream_backpressure_timeout_fails_without_panicking() {
+        let error = checked_stream_backpressure_deadline(u64::MAX)
+            .expect_err("oversized public timeout must fail closed");
+        assert!(matches!(error, Error::InvalidInput(message) if message.contains("60000ms limit")));
+        assert!(checked_stream_backpressure_deadline(STREAM_BACKPRESSURE_MAX_TIMEOUT_MS).is_ok());
+
+        let mut request = EngineCoreRequest::tts("bounded policy").with_stream_policy(
+            EngineStreamPolicy::BlockWithDeadline {
+                timeout_ms: u64::MAX,
+            },
+        );
+        request.streaming = true;
+        assert!(matches!(
+            RequestProcessor::new(EngineCoreConfig::default()).process(request),
+            Err(Error::InvalidInput(message)) if message.contains("60000ms limit")
+        ));
+    }
 
     #[test]
     fn model_instance_binding_is_idempotent_and_fenced() {

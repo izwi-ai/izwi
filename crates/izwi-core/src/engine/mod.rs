@@ -420,8 +420,12 @@ impl OwnedStepContext {
             self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries)
                 .await;
         }
-        deliveries.finish().await;
+        let barrier_failures = deliveries.finish().await;
         while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
+        }
+        for failure in barrier_failures {
             self.cancel_failed_stream(&failure);
             failures.entry(failure.session.clone()).or_insert(failure);
         }
