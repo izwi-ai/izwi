@@ -120,6 +120,32 @@ impl ExecutedEngineStep {
                             DispatchState::ProducedOutput,
                         );
                     }
+                    StreamDeliveryFailureKind::Cancelled => {
+                        result.output =
+                            ExecutorOutput::cancelled(result.session.request_id.clone());
+                        result.disposition =
+                            ExecutionDisposition::Finished(FinishReason::Cancelled);
+                        result.provenance = OutcomeProvenance::produced_output();
+                    }
+                    StreamDeliveryFailureKind::RequestDeadline => {
+                        result.output = ExecutorOutput::terminal(result.session.request_id.clone());
+                        result.disposition = ExecutionDisposition::Finished(FinishReason::TimedOut);
+                        result.provenance = OutcomeProvenance::deadline(
+                            DeadlinePhase::ModelExecution,
+                            DispatchState::ProducedOutput,
+                        );
+                    }
+                    StreamDeliveryFailureKind::InvalidProgress => {
+                        let message = "executor emitted invalid incremental stream progress";
+                        result.output =
+                            ExecutorOutput::error(result.session.request_id.clone(), message);
+                        result.disposition =
+                            ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+                        result.provenance = OutcomeProvenance::failure(
+                            FailureOrigin::ExecutorValidation,
+                            DispatchState::ProducedOutput,
+                        );
+                    }
                 }
             }
             if changed {
@@ -867,6 +893,71 @@ mod tests {
             StreamProgressBudget::new(1024 * 1024),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn stream_progress_failures_keep_their_typed_terminal_outcomes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(CountingExecutor { calls }));
+        let mut request = EngineCoreRequest::tts("typed progress failure");
+        request.id = "typed-progress".to_string();
+        let scheduled = scheduled("typed-progress", 9, 0);
+        let session = scheduled.session_key();
+        let prepared = PreparedEngineStep::new(
+            executor,
+            Vec::new(),
+            vec![prepared_batch(9, request, scheduled)],
+        );
+        let mut executed = execute_prepared(prepared).await;
+
+        executed.apply_stream_delivery_failures(&[StreamDeliveryFailure {
+            session: session.clone(),
+            kind: StreamDeliveryFailureKind::Cancelled,
+        }]);
+        let result = &executed.batches[0].results[0];
+        assert_eq!(
+            result.disposition,
+            ExecutionDisposition::Finished(FinishReason::Cancelled)
+        );
+        assert_eq!(result.provenance, OutcomeProvenance::produced_output());
+
+        executed.apply_stream_delivery_failures(&[StreamDeliveryFailure {
+            session: session.clone(),
+            kind: StreamDeliveryFailureKind::RequestDeadline,
+        }]);
+        let result = &executed.batches[0].results[0];
+        assert_eq!(
+            result.disposition,
+            ExecutionDisposition::Finished(FinishReason::TimedOut)
+        );
+        assert_eq!(
+            result.provenance,
+            OutcomeProvenance::deadline(
+                DeadlinePhase::ModelExecution,
+                DispatchState::ProducedOutput,
+            )
+        );
+
+        executed.apply_stream_delivery_failures(&[StreamDeliveryFailure {
+            session,
+            kind: StreamDeliveryFailureKind::InvalidProgress,
+        }]);
+        let result = &executed.batches[0].results[0];
+        assert!(matches!(
+            result.disposition,
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::InvalidOutput,
+                retry: RetryDisposition::Never,
+                ..
+            })
+        ));
+        assert_eq!(
+            result.provenance,
+            OutcomeProvenance::failure(
+                FailureOrigin::ExecutorValidation,
+                DispatchState::ProducedOutput,
+            )
+        );
     }
 
     #[test]

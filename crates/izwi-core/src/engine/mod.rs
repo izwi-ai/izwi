@@ -321,7 +321,7 @@ impl OwnedStepContext {
                 );
                 Err(executor::StreamDeliveryFailure {
                     session,
-                    kind: executor::StreamDeliveryFailureKind::Delivery,
+                    kind: error.kind,
                 })
             }
         }
@@ -438,7 +438,7 @@ impl OwnedStepContext {
             Some(prepared) => Some(self.execute_prepared(prepared).await?),
             None => None,
         };
-        let (outputs, stream_deliveries) = {
+        let (mut outputs, stream_deliveries) = {
             let mut core = self.core.write().await;
             match executed {
                 Some(executed) => {
@@ -451,9 +451,8 @@ impl OwnedStepContext {
         let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
         if !failed_streams.is_empty() {
             let mut core = self.core.write().await;
-            for failure in failed_streams {
-                core.handle_stream_delivery_failure(failure).await;
-            }
+            core.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
+                .await;
         }
 
         // Keep every await before terminal dispatch. Once a completion sender

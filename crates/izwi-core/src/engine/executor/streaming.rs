@@ -21,6 +21,9 @@ pub(super) type StreamBackpressurePolicy = EngineStreamPolicy;
 pub(crate) enum StreamDeliveryFailureKind {
     Delivery,
     Deadline,
+    Cancelled,
+    RequestDeadline,
+    InvalidProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,14 +224,23 @@ async fn send_committed_output(
                 }
             }
         }
-        StreamBackpressurePolicy::DropNewest => match tx.try_send(output) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(StreamDeliveryFailureKind::Delivery),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                record_engine_stream_backpressure();
-                Ok(())
+        StreamBackpressurePolicy::DropNewest => {
+            let is_final = output.is_final;
+            match tx.try_send(output) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(StreamDeliveryFailureKind::Delivery)
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    record_engine_stream_backpressure();
+                    if is_final {
+                        Err(StreamDeliveryFailureKind::Delivery)
+                    } else {
+                        Ok(())
+                    }
+                }
             }
-        },
+        }
     }
 }
 
@@ -682,5 +694,36 @@ mod tests {
                 kind: StreamDeliveryFailureKind::Deadline,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn drop_newest_never_silently_drops_the_final_marker() {
+        let session = SessionKey::new("req-final".to_string(), 1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(output("req-final", 0))
+            .expect("prefill downstream queue");
+        let mut final_output = output("req-final", 1);
+        final_output.is_final = true;
+
+        let failed = deliver_committed_streams(vec![CommittedStreamDelivery::new(
+            session.clone(),
+            tx,
+            StreamBackpressurePolicy::DropNewest,
+            vec![final_output],
+        )])
+        .await;
+
+        assert_eq!(
+            failed,
+            vec![StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Delivery,
+            }]
+        );
+        assert_eq!(
+            rx.recv().await.expect("queued non-final output").sequence,
+            0
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

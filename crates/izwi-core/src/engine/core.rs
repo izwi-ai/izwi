@@ -26,7 +26,6 @@ use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
     PreparedExecutionBatch,
 };
-#[cfg(test)]
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
     deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
@@ -42,7 +41,9 @@ use super::request::{
     STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
 };
 use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
-use super::types::{AudioOutput, EngineOutput, LatencyBreakdown, RequestId};
+use super::types::{
+    AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
+};
 use super::{ResourceAmount, ResourceVector};
 use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
 use crate::error::{Error, Result};
@@ -140,6 +141,41 @@ struct CommittedExecutorOutput {
 pub(super) struct CommittedEngineStep {
     pub(super) outputs: Vec<EngineOutput>,
     pub(super) stream_deliveries: Vec<CommittedStreamDelivery>,
+}
+
+#[derive(Debug)]
+pub(super) struct StreamProgressRejection {
+    pub(super) kind: StreamDeliveryFailureKind,
+    message: String,
+}
+
+impl StreamProgressRejection {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            kind: StreamDeliveryFailureKind::InvalidProgress,
+            message: message.into(),
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            kind: StreamDeliveryFailureKind::Cancelled,
+            message: "stream progress request was cancelled".to_string(),
+        }
+    }
+
+    fn deadline() -> Self {
+        Self {
+            kind: StreamDeliveryFailureKind::RequestDeadline,
+            message: "stream progress request deadline elapsed".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamProgressRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 struct PhysicalBatchAssembly {
@@ -1502,20 +1538,20 @@ impl EngineCore {
     pub(super) fn commit_incremental_stream_progress(
         &mut self,
         progress: FencedStreamProgress,
-    ) -> Result<CommittedStreamDelivery> {
+    ) -> std::result::Result<CommittedStreamDelivery, StreamProgressRejection> {
         let plan = self.active_plans.get(&progress.plan_id).ok_or_else(|| {
-            Error::InferenceError("stream progress references an inactive plan".to_string())
+            StreamProgressRejection::invalid("stream progress references an inactive plan")
         })?;
         if plan.session != progress.session {
-            return Err(Error::InferenceError(
-                "stream progress session does not match its active plan".to_string(),
+            return Err(StreamProgressRejection::invalid(
+                "stream progress session does not match its active plan",
             ));
         }
         if plan.stage.as_ref().map(|stage| stage.output_visibility)
             != Some(OutputVisibility::IncrementalCommitted)
         {
-            return Err(Error::InferenceError(
-                "stream progress is not authorized by the active adapter stage".to_string(),
+            return Err(StreamProgressRejection::invalid(
+                "stream progress is not authorized by the active adapter stage",
             ));
         }
 
@@ -1523,16 +1559,16 @@ impl EngineCore {
             .active_stream_batches
             .get(&progress.batch_id)
             .ok_or_else(|| {
-                Error::InferenceError(
-                    "stream progress references an inactive physical batch".to_string(),
+                StreamProgressRejection::invalid(
+                    "stream progress references an inactive physical batch",
                 )
             })?;
         if batch.output_visibility != OutputVisibility::IncrementalCommitted
             || batch.lane != progress.lane
             || batch.rows.get(&progress.plan_id) != Some(&progress.session)
         {
-            return Err(Error::InferenceError(
-                "stream progress does not match its physical batch fence".to_string(),
+            return Err(StreamProgressRejection::invalid(
+                "stream progress does not match its physical batch fence",
             ));
         }
 
@@ -1540,25 +1576,25 @@ impl EngineCore {
             .execution_trackers
             .get(&progress.session.request_id)
             .ok_or_else(|| {
-                Error::InferenceError("stream progress has no execution tracker".to_string())
+                StreamProgressRejection::invalid("stream progress has no execution tracker")
             })?;
         if tracker.session() != &progress.session
             || tracker.active_plan_id() != Some(progress.plan_id)
         {
-            return Err(Error::InferenceError(
-                "stream progress does not match the active lifecycle transaction".to_string(),
+            return Err(StreamProgressRejection::invalid(
+                "stream progress does not match the active lifecycle transaction",
             ));
         }
         if self.scheduler.get_sequence_id(&progress.session.request_id)
             != Some(progress.session.epoch)
         {
-            return Err(Error::InferenceError(
-                "stream progress belongs to a stale scheduler session".to_string(),
+            return Err(StreamProgressRejection::invalid(
+                "stream progress belongs to a stale scheduler session",
             ));
         }
         if progress.output.request_id != progress.session.request_id || progress.output.is_final {
-            return Err(Error::InferenceError(
-                "incremental progress must be non-final output for its exact request".to_string(),
+            return Err(StreamProgressRejection::invalid(
+                "incremental progress must be non-final output for its exact request",
             ));
         }
 
@@ -1566,23 +1602,19 @@ impl EngineCore {
             .requests
             .get(&progress.session.request_id)
             .ok_or_else(|| {
-                Error::InferenceError("stream progress request is no longer active".to_string())
+                StreamProgressRejection::invalid("stream progress request is no longer active")
             })?;
         if request.is_cancelled() {
-            return Err(Error::InferenceError(
-                "stream progress request was cancelled".to_string(),
-            ));
+            return Err(StreamProgressRejection::cancelled());
         }
         if request
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(Error::InferenceError(
-                "stream progress request deadline elapsed".to_string(),
-            ));
+            return Err(StreamProgressRejection::deadline());
         }
         let tx = request.streaming_tx.clone().ok_or_else(|| {
-            Error::InferenceError("stream progress request has no delivery channel".to_string())
+            StreamProgressRejection::invalid("stream progress request has no delivery channel")
         })?;
         let policy = request.stream_policy;
 
@@ -1592,13 +1624,13 @@ impl EngineCore {
             .copied()
             .unwrap_or(0);
         if progress.output.sequence != expected {
-            return Err(Error::InferenceError(format!(
+            return Err(StreamProgressRejection::invalid(format!(
                 "stream progress sequence {} did not match expected {}",
                 progress.output.sequence, expected
             )));
         }
         let next = expected.checked_add(1).ok_or_else(|| {
-            Error::InferenceError("stream progress sequence space was exhausted".to_string())
+            StreamProgressRejection::invalid("stream progress sequence space was exhausted")
         })?;
         self.stream_sequence_cursors
             .insert(progress.session.clone(), next);
@@ -1683,11 +1715,11 @@ impl EngineCore {
         };
         let executed = self.execute_prepared_with_progress(prepared).await?;
         let committed = self.commit_step(executed).await?;
+        let mut outputs = committed.outputs;
         let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
-        for failure in failed_streams {
-            self.handle_stream_delivery_failure(failure).await;
-        }
-        Ok(committed.outputs)
+        self.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
+            .await;
+        Ok(outputs)
     }
 
     async fn execute_prepared_with_progress(
@@ -1775,7 +1807,7 @@ impl EngineCore {
                 );
                 Err(StreamDeliveryFailure {
                     session,
-                    kind: StreamDeliveryFailureKind::Delivery,
+                    kind: error.kind,
                 })
             }
         }
@@ -2387,9 +2419,105 @@ impl EngineCore {
                     DispatchState::ProducedOutput,
                 ),
             ),
+            StreamDeliveryFailureKind::Cancelled => (
+                ExecutorOutput::cancelled(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                OutcomeProvenance::produced_output(),
+            ),
+            StreamDeliveryFailureKind::RequestDeadline => (
+                ExecutorOutput::terminal(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::ModelExecution,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::InvalidProgress => {
+                let message = "executor emitted invalid incremental stream progress";
+                (
+                    ExecutorOutput::error(session.request_id.clone(), message),
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message)),
+                    OutcomeProvenance::failure(
+                        FailureOrigin::ExecutorValidation,
+                        DispatchState::ProducedOutput,
+                    ),
+                )
+            }
         };
         self.terminate_request_session(&session, output, disposition, provenance)
             .await
+    }
+
+    fn overlay_terminal_stream_delivery_failure(
+        output: &mut EngineOutput,
+        kind: StreamDeliveryFailureKind,
+    ) {
+        let (message, finish_reason, provenance) = match kind {
+            StreamDeliveryFailureKind::Delivery => (
+                "committed stream delivery failed",
+                OutputFinishReason::Error,
+                OutcomeProvenance::failure(
+                    FailureOrigin::StreamDelivery,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::Deadline => (
+                REQUEST_DEADLINE_EXCEEDED,
+                OutputFinishReason::Error,
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::StreamDelivery,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::Cancelled => (
+                "request cancelled",
+                OutputFinishReason::Aborted,
+                OutcomeProvenance::produced_output(),
+            ),
+            StreamDeliveryFailureKind::RequestDeadline => (
+                REQUEST_DEADLINE_EXCEEDED,
+                OutputFinishReason::Error,
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::ModelExecution,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+            StreamDeliveryFailureKind::InvalidProgress => (
+                "executor emitted invalid incremental stream progress",
+                OutputFinishReason::Error,
+                OutcomeProvenance::failure(
+                    FailureOrigin::ExecutorValidation,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+        };
+        output.is_finished = true;
+        output.finish_reason = Some(finish_reason);
+        output.error = Some(message.to_string());
+        output.provenance = provenance;
+    }
+
+    /// Reconcile failures from the committed stream outbox with the exact
+    /// public output for this step. A terminal result has already completed its
+    /// scheduler lifecycle, so replace that result in place instead of queuing
+    /// a second terminal event. Non-terminal rows still need normal exact-
+    /// session termination.
+    pub(crate) async fn reconcile_stream_delivery_failures(
+        &mut self,
+        outputs: &mut [EngineOutput],
+        failures: Vec<StreamDeliveryFailure>,
+    ) {
+        for failure in failures {
+            if let Some(output) = outputs.iter_mut().find(|output| {
+                output.is_finished
+                    && output.request_id == failure.session.request_id
+                    && output.sequence_id == failure.session.epoch
+            }) {
+                Self::overlay_terminal_stream_delivery_failure(output, failure.kind);
+            } else {
+                self.handle_stream_delivery_failure(failure).await;
+            }
+        }
     }
 
     /// Abort only if the caller still owns the exact request incarnation.
@@ -2535,6 +2663,7 @@ mod tests {
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn scheduled_prefill(request_id: &str, sequence_id: u64) -> ScheduledRequest {
@@ -3118,6 +3247,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_stream_delivery_failure_replaces_success_without_duplicate_terminal() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let session = super::super::SessionKey::new("terminal-stream".to_string(), 17);
+        let mut outputs = vec![core.output_processor.process_execution(
+            ExecutorOutput::terminal(session.request_id.clone()),
+            &ExecutionDisposition::Finished(ExecutionFinishReason::Completed),
+            session.epoch,
+            Duration::ZERO,
+        )];
+
+        core.reconcile_stream_delivery_failures(
+            &mut outputs,
+            vec![StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Delivery,
+            }],
+        )
+        .await;
+
+        assert!(outputs[0].is_finished);
+        assert_eq!(outputs[0].finish_reason, Some(OutputFinishReason::Error));
+        assert_eq!(
+            outputs[0].error.as_deref(),
+            Some("committed stream delivery failed")
+        );
+        assert_eq!(
+            outputs[0].provenance,
+            OutcomeProvenance::failure(
+                FailureOrigin::StreamDelivery,
+                DispatchState::ProducedOutput,
+            )
+        );
+        assert!(
+            core.pending_terminal_outputs.is_empty(),
+            "a completed scheduler session must not receive a second terminal event"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_execution_surfaces_aborted_terminal_output() {
         let executor = UnifiedExecutor::new_for_test(Box::new(CancelledExecutor));
         let mut core =
@@ -3471,6 +3643,8 @@ mod tests {
         request.id = request_id.clone();
         request.prompt_tokens = vec![1];
         request.streaming = true;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        request.cancellation = Some(cancellation.clone());
         let (delivery_tx, _delivery_rx) = mpsc::channel(8);
         request.streaming_tx = Some(delivery_tx);
         core.add_request(request).unwrap();
@@ -3527,7 +3701,7 @@ mod tests {
         let request = core.requests.get(&request_id).unwrap().clone();
         let staging = request.stream_staging_buffer();
         let (progress_tx, mut progress_rx) = mpsc::channel(8);
-        let _binding = request
+        let binding = request
             .bind_stream_quantum(
                 batch_id,
                 lane.clone(),
@@ -3596,6 +3770,47 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("did not match expected 1"));
+
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(
+            core.commit_incremental_stream_progress(next_progress(1))
+                .unwrap_err()
+                .kind,
+            StreamDeliveryFailureKind::Cancelled
+        );
+        cancellation.store(false, Ordering::Release);
+
+        drop(next_progress);
+        drop(binding);
+        drop(request);
+        Arc::get_mut(core.requests.get_mut(&request_id).expect("active request"))
+            .expect("core owns the last request reference")
+            .deadline = Some(Instant::now());
+        let request = core.requests.get(&request_id).unwrap().clone();
+        let staging = request.stream_staging_buffer();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let _binding = request
+            .bind_stream_quantum(
+                batch_id,
+                lane,
+                plan_id,
+                session,
+                OutputVisibility::IncrementalCommitted,
+                progress_tx,
+                StreamProgressBudget::new(STREAM_PROGRESS_MAX_BUFFERED_BYTES),
+            )
+            .unwrap();
+        staging
+            .push_with_policy(text_progress(&request_id, 1), request.stream_policy)
+            .unwrap();
+        assert_eq!(
+            core.commit_incremental_stream_progress(
+                progress_rx.try_recv().expect("deadline-fenced progress")
+            )
+            .unwrap_err()
+            .kind,
+            StreamDeliveryFailureKind::RequestDeadline
+        );
     }
 
     #[test]
@@ -4168,6 +4383,63 @@ mod tests {
         let retry = retry_schedule.prefill_requests.remove(0);
         assert_eq!(retry.session_key(), session);
         assert_ne!(retry.plan_id, scheduled.plan_id);
+    }
+
+    #[tokio::test]
+    async fn committed_stream_progress_disables_all_executor_retries() {
+        for (suffix, retry) in [
+            ("same-session", RetryDisposition::RetrySameSession),
+            ("recompute", RetryDisposition::Recompute),
+        ] {
+            let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+                Mutex::new(Vec::new()),
+            ))));
+            let mut core = EngineCore::new_with_unified_executor(
+                EngineCoreConfig {
+                    max_batch_size: 1,
+                    max_tokens_per_step: 8,
+                    ..Default::default()
+                },
+                executor,
+            )
+            .unwrap();
+            core.retry_policy.execution_backoff_base = Duration::ZERO;
+            core.retry_policy.execution_backoff_max = Duration::ZERO;
+            let mut request = EngineCoreRequest::tts("visible retry");
+            request.id = format!("visible-retry-{suffix}");
+            request.prompt_tokens = vec![1];
+            core.add_request(request).unwrap();
+            core.refresh_scheduler_execution_profiles().await;
+            let scheduled = core
+                .scheduler
+                .schedule(core.kv_cache.inner_mut())
+                .prefill_requests
+                .remove(0);
+            let session = scheduled.session_key();
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            core.incremental_stream_sessions.insert(session.clone());
+
+            let committed = core
+                .commit_executor_result(retryable_step_result(&scheduled, retry), 1.0)
+                .await
+                .expect("visible progress must turn a retry into a terminal failure");
+            assert_eq!(committed.session, session);
+            assert!(committed
+                .output
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("retry is unsafe")));
+            assert!(matches!(
+                committed.disposition,
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    retry: RetryDisposition::Never,
+                    ..
+                })
+            ));
+            let retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+            assert!(retry_schedule.prefill_requests.is_empty());
+            assert!(retry_schedule.decode_requests.is_empty());
+        }
     }
 
     #[tokio::test]
