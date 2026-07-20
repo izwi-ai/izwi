@@ -518,7 +518,12 @@ export class ChatApiClient {
 
         callbacks.onClose?.();
       } catch (error) {
-        if (!isAbortError(error)) {
+        if (
+          !isAbortError(error) &&
+          streamStatus === "open" &&
+          !abortController.signal.aborted
+        ) {
+          streamStatus = "failed";
           callbacks.onError?.(
             error instanceof Error
               ? error.message
@@ -612,6 +617,7 @@ export class ChatApiClient {
     const abortController = new AbortController();
 
     const startStream = async () => {
+      let streamStatus: "open" | "completed" | "failed" = "open";
       try {
         const response = await fetch(this.http.url("/chat/completions"), {
           method: "POST",
@@ -641,7 +647,6 @@ export class ChatApiClient {
         const streamStartedAt = performance.now();
         let completionTokens: number | null = null;
         let generationTimeMs: number | null = null;
-        let streamStatus: "open" | "completed" | "failed" = "open";
         let sawTerminalChunk = false;
 
         await consumeDataStream(response, (data) => {
@@ -709,7 +714,12 @@ export class ChatApiClient {
           callbacks.onError?.(CHAT_STREAM_TRUNCATED_ERROR);
         }
       } catch (error) {
-        if (!isAbortError(error)) {
+        if (
+          !isAbortError(error) &&
+          streamStatus === "open" &&
+          !abortController.signal.aborted
+        ) {
+          streamStatus = "failed";
           callbacks.onError?.(
             error instanceof Error ? error.message : "Chat stream error",
           );
@@ -833,7 +843,12 @@ export class ChatApiClient {
           callbacks.onError?.(RESPONSE_STREAM_TRUNCATED_ERROR);
         }
       } catch (error) {
-        if (!isAbortError(error)) {
+        if (
+          !isAbortError(error) &&
+          streamStatus === "open" &&
+          !abortController.signal.aborted
+        ) {
+          streamStatus = "failed";
           callbacks.onError?.(
             error instanceof Error ? error.message : "Responses stream error",
           );
