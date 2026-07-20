@@ -30,8 +30,8 @@ use super::execution_group::{
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
     deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
-    ExecutorStepResult, StreamDeliveryFailure, StreamDeliveryFailureKind, UnifiedExecutor,
-    WorkerConfig,
+    ExecutorStepResult, IncrementalStreamDeliveryWorkers, StreamDeliveryFailure,
+    StreamDeliveryFailureKind, UnifiedExecutor, WorkerConfig,
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
@@ -1701,8 +1701,10 @@ impl EngineCore {
             progress_tx,
             progress_budget,
         ));
+        let (mut deliveries, mut delivery_failures) = IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
         let mut progress_closed = false;
+        let mut delivery_failures_closed = false;
 
         let mut executed = loop {
             tokio::select! {
@@ -1722,42 +1724,48 @@ impl EngineCore {
                 progress = progress_rx.recv(), if !progress_closed => {
                     match progress {
                         Some(progress) => {
-                            if failures.contains_key(&progress.session) {
-                                continue;
-                            }
-                            if let Some(failure) = self.route_incremental_progress(progress).await {
-                                failures.insert(failure.session.clone(), failure);
-                            }
+                            self.enqueue_incremental_progress(
+                                progress,
+                                &mut failures,
+                                &mut deliveries,
+                            );
                         }
                         None => progress_closed = true,
+                    }
+                }
+                failure = delivery_failures.recv(), if !delivery_failures_closed => {
+                    match failure {
+                        Some(failure) => self.record_stream_failure(
+                            failure,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => delivery_failures_closed = true,
                     }
                 }
             }
         };
 
         while let Some(progress) = progress_rx.recv().await {
-            if failures.contains_key(&progress.session) {
-                continue;
-            }
-            if let Some(failure) = self.route_incremental_progress(progress).await {
-                failures.insert(failure.session.clone(), failure);
-            }
+            self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries);
+        }
+        deliveries.finish().await;
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
         }
         let failures = failures.into_values().collect::<Vec<_>>();
         executed.apply_stream_delivery_failures(&failures);
         Ok(executed)
     }
 
-    async fn route_incremental_progress(
+    fn commit_progress_delivery(
         &mut self,
         progress: FencedStreamProgress,
-    ) -> Option<StreamDeliveryFailure> {
+    ) -> std::result::Result<CommittedStreamDelivery, StreamDeliveryFailure> {
         let session = progress.session.clone();
-        let failure = match self.commit_incremental_stream_progress(progress) {
-            Ok(delivery) => deliver_committed_streams(vec![delivery])
-                .await
-                .into_iter()
-                .next(),
+        match self.commit_incremental_stream_progress(progress) {
+            Ok(delivery) => Ok(delivery),
             Err(error) => {
                 warn!(
                     request_id = %session.request_id,
@@ -1765,24 +1773,53 @@ impl EngineCore {
                     error = %error,
                     "Rejecting invalid incremental stream progress"
                 );
-                Some(StreamDeliveryFailure {
+                Err(StreamDeliveryFailure {
                     session,
                     kind: StreamDeliveryFailureKind::Delivery,
                 })
             }
-        };
-        if let Some(failure) = failure.as_ref() {
-            if let Some(request) = self.requests.get(&failure.session.request_id) {
-                if self.scheduler.get_sequence_id(&failure.session.request_id)
-                    == Some(failure.session.epoch)
-                {
-                    if let Some(cancellation) = request.cancellation.as_ref() {
-                        cancellation.store(true, std::sync::atomic::Ordering::Release);
-                    }
+        }
+    }
+
+    fn cancel_failed_stream(&self, failure: &StreamDeliveryFailure) {
+        if let Some(request) = self.requests.get(&failure.session.request_id) {
+            if self.scheduler.get_sequence_id(&failure.session.request_id)
+                == Some(failure.session.epoch)
+            {
+                if let Some(cancellation) = request.cancellation.as_ref() {
+                    cancellation.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         }
-        failure
+    }
+
+    fn record_stream_failure(
+        &self,
+        failure: StreamDeliveryFailure,
+        failures: &mut HashMap<super::SessionKey, StreamDeliveryFailure>,
+        deliveries: &mut IncrementalStreamDeliveryWorkers,
+    ) {
+        self.cancel_failed_stream(&failure);
+        deliveries.abandon_session(&failure.session);
+        failures.entry(failure.session.clone()).or_insert(failure);
+    }
+
+    fn enqueue_incremental_progress(
+        &mut self,
+        progress: FencedStreamProgress,
+        failures: &mut HashMap<super::SessionKey, StreamDeliveryFailure>,
+        deliveries: &mut IncrementalStreamDeliveryWorkers,
+    ) {
+        if failures.contains_key(&progress.session) {
+            return;
+        }
+        let result = match self.commit_progress_delivery(progress) {
+            Ok(delivery) => deliveries.enqueue(delivery),
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = result {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
     }
 
     /// Prepare an immutable execution transaction under the engine state lock.

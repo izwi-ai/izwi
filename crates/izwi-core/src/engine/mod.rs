@@ -301,20 +301,17 @@ impl OwnedStepContext {
         }
     }
 
-    async fn route_incremental_progress(
+    async fn commit_incremental_progress(
         &self,
         progress: request::FencedStreamProgress,
-    ) -> Option<executor::StreamDeliveryFailure> {
+    ) -> std::result::Result<executor::CommittedStreamDelivery, executor::StreamDeliveryFailure>
+    {
         let session = progress.session.clone();
-        let delivery = {
+        match {
             let mut core = self.core.write().await;
             core.commit_incremental_stream_progress(progress)
-        };
-        let failure = match delivery {
-            Ok(delivery) => executor::deliver_committed_streams(vec![delivery])
-                .await
-                .into_iter()
-                .next(),
+        } {
+            Ok(delivery) => Ok(delivery),
             Err(error) => {
                 warn!(
                     request_id = %session.request_id,
@@ -322,16 +319,41 @@ impl OwnedStepContext {
                     error = %error,
                     "Rejecting invalid incremental stream progress"
                 );
-                Some(executor::StreamDeliveryFailure {
+                Err(executor::StreamDeliveryFailure {
                     session,
                     kind: executor::StreamDeliveryFailureKind::Delivery,
                 })
             }
-        };
-        if let Some(failure) = failure.as_ref() {
-            self.cancel_failed_stream(failure);
         }
-        failure
+    }
+
+    fn record_stream_failure(
+        &self,
+        failure: executor::StreamDeliveryFailure,
+        failures: &mut HashMap<SessionKey, executor::StreamDeliveryFailure>,
+        deliveries: &mut executor::IncrementalStreamDeliveryWorkers,
+    ) {
+        self.cancel_failed_stream(&failure);
+        deliveries.abandon_session(&failure.session);
+        failures.entry(failure.session.clone()).or_insert(failure);
+    }
+
+    async fn enqueue_incremental_progress(
+        &self,
+        progress: request::FencedStreamProgress,
+        failures: &mut HashMap<SessionKey, executor::StreamDeliveryFailure>,
+        deliveries: &mut executor::IncrementalStreamDeliveryWorkers,
+    ) {
+        if failures.contains_key(&progress.session) {
+            return;
+        }
+        let result = match self.commit_incremental_progress(progress).await {
+            Ok(delivery) => deliveries.enqueue(delivery),
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = result {
+            self.record_stream_failure(failure, failures, deliveries);
+        }
     }
 
     async fn execute_prepared(
@@ -346,8 +368,11 @@ impl OwnedStepContext {
             progress_tx,
             progress_budget,
         ));
+        let (mut deliveries, mut delivery_failures) =
+            executor::IncrementalStreamDeliveryWorkers::new();
         let mut failures = HashMap::new();
         let mut progress_closed = false;
+        let mut delivery_failures_closed = false;
 
         let mut executed = loop {
             tokio::select! {
@@ -367,26 +392,36 @@ impl OwnedStepContext {
                 progress = progress_rx.recv(), if !progress_closed => {
                     match progress {
                         Some(progress) => {
-                            if failures.contains_key(&progress.session) {
-                                continue;
-                            }
-                            if let Some(failure) = self.route_incremental_progress(progress).await {
-                                failures.insert(failure.session.clone(), failure);
-                            }
+                            self.enqueue_incremental_progress(
+                                progress,
+                                &mut failures,
+                                &mut deliveries,
+                            ).await;
                         }
                         None => progress_closed = true,
+                    }
+                }
+                failure = delivery_failures.recv(), if !delivery_failures_closed => {
+                    match failure {
+                        Some(failure) => self.record_stream_failure(
+                            failure,
+                            &mut failures,
+                            &mut deliveries,
+                        ),
+                        None => delivery_failures_closed = true,
                     }
                 }
             }
         };
 
         while let Some(progress) = progress_rx.recv().await {
-            if failures.contains_key(&progress.session) {
-                continue;
-            }
-            if let Some(failure) = self.route_incremental_progress(progress).await {
-                failures.insert(failure.session.clone(), failure);
-            }
+            self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries)
+                .await;
+        }
+        deliveries.finish().await;
+        while let Ok(failure) = delivery_failures.try_recv() {
+            self.cancel_failed_stream(&failure);
+            failures.entry(failure.session.clone()).or_insert(failure);
         }
         let failures = failures.into_values().collect::<Vec<_>>();
         executed.apply_stream_delivery_failures(&failures);

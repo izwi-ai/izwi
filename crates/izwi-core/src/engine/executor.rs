@@ -26,8 +26,8 @@ mod state;
 mod streaming;
 
 pub(crate) use streaming::{
-    deliver_committed_streams, CommittedStreamDelivery, StreamDeliveryFailure,
-    StreamDeliveryFailureKind,
+    deliver_committed_streams, CommittedStreamDelivery, IncrementalStreamDeliveryWorkers,
+    StreamDeliveryFailure, StreamDeliveryFailureKind,
 };
 
 use super::config::EngineCoreConfig;
