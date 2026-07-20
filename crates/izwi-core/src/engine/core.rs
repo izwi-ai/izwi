@@ -559,6 +559,30 @@ impl EngineCore {
         Ok(())
     }
 
+    fn rollback_unexecuted_schedule(
+        &mut self,
+        scheduled: &[super::scheduler::ScheduledRequest],
+    ) {
+        for scheduled in scheduled {
+            let session = scheduled.session_key();
+            if let Some(plan) = self.active_plans.remove(&scheduled.plan_id) {
+                if plan.session != session {
+                    warn!(
+                        plan_id = scheduled.plan_id,
+                        request_id = %scheduled.request_id,
+                        "Unexecuted plan rollback found a mismatched session fence"
+                    );
+                }
+            }
+            if let Some(tracker) = self.execution_trackers.get_mut(&scheduled.request_id) {
+                if tracker.session() == &session {
+                    tracker.rollback_unexecuted_plan(scheduled.plan_id);
+                }
+            }
+            self.scheduler.release_execution_quantum_for_retry(&session);
+        }
+    }
+
     fn report_from_result(result: &ExecutorStepResult) -> ExecutionReport {
         let output = &result.output;
         ExecutionReport {
@@ -1403,8 +1427,16 @@ impl EngineCore {
 
         let prefill_scheduled = schedule_result.prefill_requests.clone();
         let decode_scheduled = schedule_result.decode_requests.clone();
-        for scheduled in decode_scheduled.iter().chain(prefill_scheduled.iter()) {
-            self.begin_execution_plan(scheduled).await?;
+        let all_scheduled = decode_scheduled
+            .iter()
+            .chain(prefill_scheduled.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for scheduled in &all_scheduled {
+            if let Err(error) = self.begin_execution_plan(scheduled).await {
+                self.rollback_unexecuted_schedule(&all_scheduled);
+                return Err(error);
+            }
         }
         let now = Instant::now();
 
@@ -1439,8 +1471,21 @@ impl EngineCore {
             return Ok(None);
         }
 
-        let decode_batches = self.form_physical_batches(&decode_requests, &decode_scheduled)?;
-        let prefill_batches = self.form_physical_batches(&prefill_requests, &prefill_scheduled)?;
+        let decode_batches = match self.form_physical_batches(&decode_requests, &decode_scheduled) {
+            Ok(batches) => batches,
+            Err(error) => {
+                self.rollback_unexecuted_schedule(&all_scheduled);
+                return Err(error);
+            }
+        };
+        let prefill_batches = match self.form_physical_batches(&prefill_requests, &prefill_scheduled)
+        {
+            Ok(batches) => batches,
+            Err(error) => {
+                self.rollback_unexecuted_schedule(&all_scheduled);
+                return Err(error);
+            }
+        };
 
         Ok(Some(PreparedEngineStep::new(
             self.executor.clone(),
@@ -2630,8 +2675,9 @@ mod tests {
 
         core.execution_trackers.remove(&plan_fault.id);
         assert!(core
-            .scheduler
-            .release_execution_quantum_for_retry(&plan_fault_session));
+            .active_plans
+            .values()
+            .all(|plan| plan.session != plan_fault_session));
         let retry_outputs = core.step().await.unwrap();
         let aborted_outputs: Vec<_> = retry_outputs
             .iter()

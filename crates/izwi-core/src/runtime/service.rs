@@ -1422,22 +1422,10 @@ impl RuntimeService {
                         }
                     }
                     Ok(Err(err)) => {
-                        let error_message = match err {
-                            Error::InferenceError(message) => message,
-                            other => other.to_string(),
-                        };
-                        let mut w = waiters.lock().await;
-                        let pending: Vec<_> = w.drain().collect();
-                        drop(w);
-                        let request_ids: Vec<_> =
-                            pending.iter().map(|(id, _)| id.as_str()).collect();
-                        telemetry.record_forced_failures(request_ids).await;
-                        let _ = engine.abort_all_requests().await;
-                        for (_, waiter) in pending {
-                            let _ = waiter
-                                .sender
-                                .send(Err(Error::InferenceError(error_message.clone())));
-                        }
+                        error!(
+                            error = %err,
+                            "Engine step failed before commit; scheduled quanta were rolled back"
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
                     }
                     Err(payload) => {

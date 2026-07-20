@@ -251,6 +251,108 @@ pub struct Engine {
     next_completion_registration: std::sync::atomic::AtomicU64,
 }
 
+/// Cloneable state for one owned engine transaction. The task holding this
+/// context is intentionally detached from the caller's future so cancellation
+/// cannot interrupt the prepare/execute/commit sequence.
+struct OwnedStepContext {
+    core: Arc<RwLock<EngineCore>>,
+    step_gate: Arc<Mutex<()>>,
+    metrics: Arc<RwLock<EngineMetrics>>,
+    request_controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
+    completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
+}
+
+impl OwnedStepContext {
+    fn take_completion_sender(
+        &self,
+        session: &SessionKey,
+    ) -> Option<oneshot::Sender<EngineOutput>> {
+        let mut mailboxes = self
+            .completion_mailboxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let owns_session = mailboxes
+            .get(&session.request_id)
+            .is_some_and(|mailbox| mailbox.session_epoch == Some(session.epoch));
+        owns_session
+            .then(|| mailboxes.remove(&session.request_id))
+            .flatten()
+            .map(|mailbox| mailbox.sender)
+    }
+
+    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
+        let _step = self.step_gate.lock().await;
+        let prepared = {
+            let mut core = self.core.write().await;
+            core.prepare_step().await?
+        };
+        let executed = match prepared {
+            Some(prepared) => Some(execution_group::ExecutionGroupRunner::execute(prepared).await),
+            None => None,
+        };
+        let (outputs, stream_deliveries) = {
+            let mut core = self.core.write().await;
+            match executed {
+                Some(executed) => {
+                    let committed = core.commit_step(executed).await?;
+                    (committed.outputs, committed.stream_deliveries)
+                }
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
+        if !failed_streams.is_empty() {
+            let mut core = self.core.write().await;
+            for session in failed_streams {
+                core.abort_request_session(&session).await;
+            }
+        }
+
+        // Keep every await before terminal dispatch. Once a completion sender
+        // is notified, routing and exact-session acknowledgement finish
+        // synchronously inside this owned transaction.
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.total_steps += 1;
+            metrics.requests_processed += outputs.len() as u64;
+        }
+
+        let mut core = self.core.write().await;
+        for output in outputs.iter().filter(|output| output.is_finished) {
+            let session = SessionKey::new(output.request_id.clone(), output.sequence_id);
+            let routed_to_mailbox = if let Some(sender) = self.take_completion_sender(&session) {
+                let _ = sender.send(output.clone());
+                true
+            } else {
+                false
+            };
+
+            if (routed_to_mailbox || !defer_unregistered_terminal_ack)
+                && !core.acknowledge_terminal_output(&session)
+            {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    "Terminal output had no matching delivery fence"
+                );
+            }
+
+            let mut controls = self
+                .request_controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if controls
+                .get(&output.request_id)
+                .is_some_and(|control| control.session_epoch == output.sequence_id)
+            {
+                controls.remove(&output.request_id);
+            }
+        }
+
+        Ok(outputs)
+    }
+}
+
 impl Engine {
     fn queue_capacity_from_env(key: &str) -> Option<usize> {
         std::env::var(key)
@@ -376,23 +478,6 @@ impl Engine {
             .filter(|mailbox| mailbox.registration_id == registration_id)
             .expect("completion registration must remain live while its request is admitted");
         mailbox.session_epoch = Some(session_epoch);
-    }
-
-    fn take_completion_sender(
-        &self,
-        session: &SessionKey,
-    ) -> Option<oneshot::Sender<EngineOutput>> {
-        let mut mailboxes = self
-            .completion_mailboxes
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let owns_session = mailboxes
-            .get(&session.request_id)
-            .is_some_and(|mailbox| mailbox.session_epoch == Some(session.epoch));
-        owns_session
-            .then(|| mailboxes.remove(&session.request_id))
-            .flatten()
-            .map(|mailbox| mailbox.sender)
     }
 
     fn resolve_generation_output(
@@ -870,87 +955,21 @@ impl Engine {
         &self,
         defer_unregistered_terminal_ack: bool,
     ) -> Result<Vec<EngineOutput>> {
-        let _step = self.step_gate.lock().await;
-        let prepared = {
-            let mut core = self.core.write().await;
-            core.prepare_step().await?
+        let context = OwnedStepContext {
+            core: self.core.clone(),
+            step_gate: self.step_gate.clone(),
+            metrics: self.metrics.clone(),
+            request_controls: self.request_controls.clone(),
+            completion_mailboxes: self.completion_mailboxes.clone(),
         };
-        let executed = match prepared {
-            Some(prepared) => Some(execution_group::ExecutionGroupRunner::execute(prepared).await),
-            None => None,
-        };
-        let (outputs, stream_deliveries) = {
-            let mut core = self.core.write().await;
-            match executed {
-                Some(executed) => {
-                    let committed = core.commit_step(executed).await?;
-                    (committed.outputs, committed.stream_deliveries)
-                }
-                None => (Vec::new(), Vec::new()),
-            }
-        };
-        let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
-        if !failed_streams.is_empty() {
-            let mut core = self.core.write().await;
-            for session in failed_streams {
-                core.abort_request_session(&session).await;
-            }
-        }
-
-        // Keep every await before terminal dispatch. Once a completion sender
-        // is notified, routing and exact-session acknowledgement must finish
-        // synchronously so cancelling a competing generate future cannot leave
-        // the delivery half-committed.
+        match tokio::spawn(async move { context.run(defer_unregistered_terminal_ack).await }).await
         {
-            let mut metrics = self.metrics.write().await;
-            metrics.total_steps += 1;
-            metrics.requests_processed += outputs.len() as u64;
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(Error::InferenceError(format!(
+                "owned engine step task was cancelled: {error}"
+            ))),
         }
-
-        let mut core = self.core.write().await;
-        if outputs.iter().any(|output| output.is_finished) {
-            for output in &outputs {
-                if output.is_finished {
-                    let session = SessionKey::new(output.request_id.clone(), output.sequence_id);
-                    let routed_to_mailbox =
-                        if let Some(sender) = self.take_completion_sender(&session) {
-                            // A dropped receiver is a completed routing attempt: no
-                            // live caller remains, so the public ID must not stay
-                            // fenced forever.
-                            let _ = sender.send(output.clone());
-                            true
-                        } else {
-                            false
-                        };
-
-                    // Acknowledge only after the exact-session mailbox has been
-                    // routed (or the output has been placed in this step's
-                    // return batch for callers without a mailbox).
-                    if (routed_to_mailbox || !defer_unregistered_terminal_ack)
-                        && !core.acknowledge_terminal_output(&session)
-                    {
-                        warn!(
-                            request_id = %session.request_id,
-                            session_epoch = session.epoch,
-                            "Terminal output had no matching delivery fence"
-                        );
-                    }
-
-                    let mut controls = self
-                        .request_controls
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    let owns_output = controls
-                        .get(&output.request_id)
-                        .is_some_and(|control| control.session_epoch == output.sequence_id);
-                    if owns_output {
-                        controls.remove(&output.request_id);
-                    }
-                }
-            }
-        }
-
-        Ok(outputs)
     }
 
     /// Confirm delivery after an outer dispatcher has attempted to route a
@@ -1557,6 +1576,46 @@ mod tests {
             .expect("engine step failed");
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].request_id, request_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_step_future_does_not_abandon_the_owned_transaction() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            BlockingForwardExecutor {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+            },
+        )));
+        let request_id = "cancelled-step-owner".to_string();
+        engine
+            .core
+            .write()
+            .await
+            .add_request(immediate_terminal_request(&request_id))
+            .unwrap();
+
+        let stepping_engine = engine.clone();
+        let caller = tokio::spawn(async move { stepping_engine.step().await });
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("executor did not enter the model forward")
+            .expect("executor entry signal was dropped");
+        caller.abort();
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.has_request(&request_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned step transaction did not finish after its caller was dropped");
+        assert!(engine.step().await.unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

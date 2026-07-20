@@ -1364,6 +1364,17 @@ impl ExecutionTracker {
         Ok(())
     }
 
+    /// Release a plan that never entered model execution. Committed progress
+    /// and the request's lifecycle state are unchanged; the next scheduler
+    /// cycle may prepare a fresh plan identity for the same safe point.
+    pub(crate) fn rollback_unexecuted_plan(&mut self, plan_id: PlanId) -> bool {
+        if self.active_plan != Some(plan_id) {
+            return false;
+        }
+        self.active_plan = None;
+        true
+    }
+
     pub fn commit(&mut self, plan: &ExecutionPlan, report: &ExecutionReport) -> Result<()> {
         report.validate_against(plan)?;
         if self.active_plan != Some(plan.plan_id) {
