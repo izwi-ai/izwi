@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
+use super::execution::OutcomeProvenance;
+
 /// Unique identifier for a request.
 pub type RequestId = String;
 
@@ -173,6 +175,8 @@ pub struct EngineOutput {
     pub asr_diagnostics: Option<serde_json::Value>,
     /// Backend execution error when generation failed.
     pub error: Option<String>,
+    /// Bounded provenance for dispatch, failure, and deadline observability.
+    pub provenance: OutcomeProvenance,
 }
 
 impl EngineOutput {

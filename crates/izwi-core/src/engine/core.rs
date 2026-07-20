@@ -14,11 +14,12 @@ use tracing::{debug, info, warn};
 use super::config::EngineCoreConfig;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
-    BatchLaneKey, CacheMode, ConcurrencyClass, ExecutionDisposition, ExecutionFailure,
-    ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport,
-    ExecutionState, ExecutionTracker, FinishReason as ExecutionFinishReason, ModelInstanceId,
-    NativeBatchMode, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
-    StageShapePolicy, WorkCost, WorkUnit,
+    BatchLaneKey, CacheMode, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
+    ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
+    ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
+    FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
+    PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId, StageShapePolicy,
+    WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, PreparedEngineStep, PreparedExecutionBatch,
@@ -27,7 +28,8 @@ use super::execution_group::{
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
     deliver_committed_streams, CacheReleaseReport, CommittedStreamDelivery, ExecutorOutput,
-    ExecutorStepResult, UnifiedExecutor, WorkerConfig,
+    ExecutorStepResult, StreamDeliveryFailure, StreamDeliveryFailureKind, UnifiedExecutor,
+    WorkerConfig,
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
@@ -126,6 +128,7 @@ struct CommittedExecutorOutput {
     session: super::SessionKey,
     output: ExecutorOutput,
     disposition: ExecutionDisposition,
+    provenance: OutcomeProvenance,
     staged_stream_outputs: Vec<super::output::StreamingOutput>,
 }
 
@@ -605,10 +608,7 @@ impl EngineCore {
         Ok(())
     }
 
-    fn rollback_unexecuted_schedule(
-        &mut self,
-        scheduled: &[super::scheduler::ScheduledRequest],
-    ) {
+    fn rollback_unexecuted_schedule(&mut self, scheduled: &[super::scheduler::ScheduledRequest]) {
         for scheduled in scheduled {
             let session = scheduled.session_key();
             if let Some(plan) = self.active_plans.remove(&scheduled.plan_id) {
@@ -638,12 +638,43 @@ impl EngineCore {
             output_produced: output.tokens_generated,
             observed_resources: result.observed_resources,
             dispatch: result.dispatch,
+            provenance: result.provenance,
             elapsed: std::time::Duration::ZERO,
             safe_point: result.safe_point,
             disposition: result.disposition.clone(),
             output_finished: output.finished,
             output_has_error: output.error.is_some(),
         }
+    }
+
+    fn canonical_failure_dispatch(
+        plan: &ExecutionPlan,
+        result: &ExecutorStepResult,
+    ) -> (BatchDispatch, DispatchState) {
+        let width = result.dispatch.width.clamp(1, plan.max_batch_size.max(1));
+        if result.dispatch.kind == super::BatchDispatchKind::NotDispatched {
+            return (
+                BatchDispatch::not_dispatched(width),
+                DispatchState::NotStarted,
+            );
+        }
+        let dispatch = match plan.batch_mode {
+            NativeBatchMode::Static => {
+                BatchDispatch::new(super::BatchDispatchKind::TensorStatic, width)
+            }
+            NativeBatchMode::Continuous => {
+                BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, width)
+            }
+            NativeBatchMode::None if width > 1 => {
+                BatchDispatch::new(super::BatchDispatchKind::RequestParallel, width)
+            }
+            NativeBatchMode::None => BatchDispatch::serial(),
+        };
+        let dispatch_state = match result.provenance.dispatch_state {
+            DispatchState::NotStarted | DispatchState::Started => DispatchState::Started,
+            DispatchState::ProducedOutput => DispatchState::ProducedOutput,
+        };
+        (dispatch, dispatch_state)
     }
 
     async fn commit_executor_result(
@@ -697,13 +728,19 @@ impl EngineCore {
             .and_then(|tracker| tracker.commit(&plan, &report));
 
         if let Err(err) = commit_result {
+            let (failure_dispatch, failure_dispatch_state) =
+                Self::canonical_failure_dispatch(&plan, &result);
             let failure_report = ExecutionReport {
                 plan_id: plan.plan_id,
                 session: plan.session.clone(),
                 input_consumed: 0,
                 output_produced: 0,
                 observed_resources: ResourceVector::zero(),
-                dispatch: BatchDispatch::serial(),
+                dispatch: failure_dispatch,
+                provenance: OutcomeProvenance::failure(
+                    FailureOrigin::StateCommit,
+                    failure_dispatch_state,
+                ),
                 elapsed: std::time::Duration::ZERO,
                 safe_point: true,
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
@@ -722,6 +759,10 @@ impl EngineCore {
                 disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                     message,
                 )),
+                provenance: OutcomeProvenance::failure(
+                    FailureOrigin::StateCommit,
+                    failure_dispatch_state,
+                ),
                 staged_stream_outputs: Vec::new(),
             });
         }
@@ -748,6 +789,10 @@ impl EngineCore {
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::StateCommit,
+                        result.provenance.dispatch_state,
+                    ),
                     staged_stream_outputs: Vec::new(),
                 });
             }
@@ -772,6 +817,10 @@ impl EngineCore {
                             output: ExecutorOutput::error(plan.session.request_id.clone(), message),
                             disposition: ExecutionDisposition::Failed(
                                 ExecutionFailure::invalid_output(message),
+                            ),
+                            provenance: OutcomeProvenance::failure(
+                                FailureOrigin::StateCommit,
+                                result.provenance.dispatch_state,
                             ),
                             staged_stream_outputs: Vec::new(),
                         });
@@ -799,6 +848,10 @@ impl EngineCore {
                     disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
                         message,
                     )),
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::Cleanup,
+                        result.provenance.dispatch_state,
+                    ),
                     staged_stream_outputs: Vec::new(),
                 });
             }
@@ -820,6 +873,7 @@ impl EngineCore {
             session: plan.session,
             output: result.output,
             disposition: result.disposition,
+            provenance: result.provenance,
             staged_stream_outputs: result.staged_stream_outputs,
         })
     }
@@ -1374,8 +1428,8 @@ impl EngineCore {
         let executed = ExecutionGroupRunner::execute(prepared).await;
         let committed = self.commit_step(executed).await?;
         let failed_streams = deliver_committed_streams(committed.stream_deliveries).await;
-        for session in failed_streams {
-            self.abort_request_session(&session).await;
+        for failure in failed_streams {
+            self.handle_stream_delivery_failure(failure).await;
         }
         Ok(committed.outputs)
     }
@@ -1433,6 +1487,10 @@ impl EngineCore {
                                 disposition: ExecutionDisposition::Failed(
                                     ExecutionFailure::invalid_output(message),
                                 ),
+                                provenance: OutcomeProvenance::failure(
+                                    FailureOrigin::Cleanup,
+                                    DispatchState::NotStarted,
+                                ),
                                 staged_stream_outputs: Vec::new(),
                             });
                     }
@@ -1449,6 +1507,10 @@ impl EngineCore {
                         disposition: ExecutionDisposition::Failed(
                             ExecutionFailure::invalid_output(message),
                         ),
+                        provenance: OutcomeProvenance::failure(
+                            FailureOrigin::Cleanup,
+                            DispatchState::NotStarted,
+                        ),
                         staged_stream_outputs: Vec::new(),
                     });
             }
@@ -1464,6 +1526,10 @@ impl EngineCore {
                     session: request.session_key(),
                     output: ExecutorOutput::terminal(request.request_id.clone()),
                     disposition: ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                    provenance: OutcomeProvenance::deadline(
+                        DeadlinePhase::SchedulerQueue,
+                        DispatchState::NotStarted,
+                    ),
                     staged_stream_outputs: Vec::new(),
                 });
         }
@@ -1531,14 +1597,14 @@ impl EngineCore {
                 return Err(error);
             }
         };
-        let prefill_batches = match self.form_physical_batches(&prefill_requests, &prefill_scheduled)
-        {
-            Ok(batches) => batches,
-            Err(error) => {
-                self.rollback_unexecuted_schedule(&all_scheduled);
-                return Err(error);
-            }
-        };
+        let prefill_batches =
+            match self.form_physical_batches(&prefill_requests, &prefill_scheduled) {
+                Ok(batches) => batches,
+                Err(error) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
+            };
 
         Ok(Some(PreparedEngineStep::new(
             self.executor.clone(),
@@ -1597,6 +1663,17 @@ impl EngineCore {
                     "Rejecting an invalid physical batch report before state commit"
                 );
                 let message = format!("invalid physical batch report: {error}");
+                let dispatch_state =
+                    if batch.report.dispatch.kind == super::BatchDispatchKind::NotDispatched {
+                        DispatchState::NotStarted
+                    } else {
+                        DispatchState::Started
+                    };
+                let failure_dispatch = if dispatch_state == DispatchState::NotStarted {
+                    BatchDispatch::not_dispatched(batch.physical_batch.rows.len().max(1))
+                } else {
+                    batch.physical_batch.expected_dispatch()
+                };
                 for result in &mut batch.results {
                     result.output =
                         ExecutorOutput::error(result.session.request_id.clone(), message.clone());
@@ -1604,7 +1681,9 @@ impl EngineCore {
                         ExecutionFailure::invalid_output(message.clone()),
                     );
                     result.safe_point = true;
-                    result.dispatch = BatchDispatch::serial();
+                    result.dispatch = failure_dispatch;
+                    result.provenance =
+                        OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state);
                     result.observed_resources = ResourceVector::zero();
                     result.staged_stream_outputs.clear();
                 }
@@ -1636,6 +1715,7 @@ impl EngineCore {
                 session,
                 output: exec_output,
                 disposition,
+                provenance,
                 staged_stream_outputs,
             } = committed;
             let request_id = exec_output.request_id.clone();
@@ -1710,6 +1790,7 @@ impl EngineCore {
                 sequence_id,
                 generation_time,
             );
+            engine_output.provenance = provenance;
             engine_output.token_stats.prompt_tokens = self
                 .requests
                 .get(&request_id)
@@ -1867,23 +1948,77 @@ impl EngineCore {
             .set_hard_deadline_for_test(request_id, deadline)
     }
 
-    /// Abort only if the caller still owns the exact request incarnation.
-    pub async fn abort_request_session(&mut self, session: &super::SessionKey) -> bool {
+    async fn terminate_request_session(
+        &mut self,
+        session: &super::SessionKey,
+        output: ExecutorOutput,
+        disposition: ExecutionDisposition,
+        provenance: OutcomeProvenance,
+    ) -> bool {
         if self.scheduler.get_sequence_id(&session.request_id) != Some(session.epoch) {
             return false;
         }
 
-        self.begin_terminal_release(session, TerminalReleaseCause::Cancelled)
-            .await;
+        let Some(cause) = Self::terminal_release_cause(&disposition) else {
+            return false;
+        };
+        self.begin_terminal_release(session, cause).await;
         self.requests.remove(&session.request_id);
         self.clear_exact_execution_state(session);
         self.pending_terminal_outputs
             .push_back(CommittedExecutorOutput {
                 session: session.clone(),
-                output: ExecutorOutput::terminal(session.request_id.clone()),
-                disposition: ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                output,
+                disposition,
+                provenance,
                 staged_stream_outputs: Vec::new(),
             });
+        true
+    }
+
+    pub(crate) async fn handle_stream_delivery_failure(
+        &mut self,
+        failure: StreamDeliveryFailure,
+    ) -> bool {
+        let session = failure.session;
+        let (output, disposition, provenance) = match failure.kind {
+            StreamDeliveryFailureKind::Delivery => {
+                let message = "committed stream delivery failed";
+                (
+                    ExecutorOutput::error(session.request_id.clone(), message),
+                    ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message)),
+                    OutcomeProvenance::failure(
+                        FailureOrigin::StreamDelivery,
+                        DispatchState::ProducedOutput,
+                    ),
+                )
+            }
+            StreamDeliveryFailureKind::Deadline => (
+                ExecutorOutput::terminal(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut),
+                OutcomeProvenance::deadline(
+                    DeadlinePhase::StreamDelivery,
+                    DispatchState::ProducedOutput,
+                ),
+            ),
+        };
+        self.terminate_request_session(&session, output, disposition, provenance)
+            .await
+    }
+
+    /// Abort only if the caller still owns the exact request incarnation.
+    pub async fn abort_request_session(&mut self, session: &super::SessionKey) -> bool {
+        let aborted = self
+            .terminate_request_session(
+                session,
+                ExecutorOutput::terminal(session.request_id.clone()),
+                ExecutionDisposition::Finished(ExecutionFinishReason::Cancelled),
+                OutcomeProvenance::not_started(),
+            )
+            .await;
+        if !aborted {
+            return false;
+        }
         debug!(
             request_id = %session.request_id,
             session_epoch = session.epoch,
@@ -2538,6 +2673,46 @@ mod tests {
         let calls = cleanup_calls.lock().unwrap().clone();
         assert!(calls.iter().any(|id| id == "req-a"));
         assert!(!calls.iter().any(|id| id == "req-b"));
+    }
+
+    #[tokio::test]
+    async fn stream_backpressure_deadline_preserves_delivery_provenance() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let mut request = EngineCoreRequest::tts("stream deadline");
+        request.id = "stream-deadline".to_string();
+        core.add_request(request).unwrap();
+        let session = core
+            .get_session_key(&"stream-deadline".to_string())
+            .expect("exact session");
+
+        assert!(
+            core.handle_stream_delivery_failure(StreamDeliveryFailure {
+                session: session.clone(),
+                kind: StreamDeliveryFailureKind::Deadline,
+            })
+            .await
+        );
+
+        let terminal = core
+            .pending_terminal_outputs
+            .back()
+            .expect("stream terminal output");
+        assert_eq!(terminal.session, session);
+        assert_eq!(
+            terminal.disposition,
+            ExecutionDisposition::Finished(ExecutionFinishReason::TimedOut)
+        );
+        assert_eq!(
+            terminal.provenance,
+            OutcomeProvenance::deadline(
+                DeadlinePhase::StreamDelivery,
+                DispatchState::ProducedOutput,
+            )
+        );
     }
 
     #[tokio::test]
@@ -3390,6 +3565,10 @@ mod tests {
                     message: "transient backend failure".to_string(),
                 }),
                 safe_point: true,
+                provenance: OutcomeProvenance::failure(
+                    FailureOrigin::Model,
+                    DispatchState::Started,
+                ),
                 staged_stream_outputs: Vec::new(),
             },
         )
@@ -3877,6 +4056,10 @@ mod tests {
         assert!(outputs[0].is_finished);
         assert_eq!(outputs[0].num_tokens, 0);
         assert_eq!(outputs[0].error.as_deref(), Some(REQUEST_DEADLINE_EXCEEDED));
+        assert_eq!(
+            outputs[0].provenance,
+            OutcomeProvenance::deadline(DeadlinePhase::SchedulerQueue, DispatchState::NotStarted,)
+        );
         assert!(!core.has_request(&"expired".to_string()));
         assert_eq!(
             cleanup_calls

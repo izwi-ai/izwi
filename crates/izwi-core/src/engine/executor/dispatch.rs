@@ -107,7 +107,9 @@ impl NativeExecutor {
         };
 
         if request.is_cancelled() {
-            return ModelSessionResult::cancelled(ExecutorOutput::cancelled(request.id.clone()));
+            return ModelSessionResult::cancelled_before_dispatch(ExecutorOutput::cancelled(
+                request.id.clone(),
+            ));
         }
 
         let Some(route) = Self::resolve_route(request.task_type, request.model_variant) else {
@@ -297,6 +299,15 @@ impl NativeExecutor {
                 scheduled.len()
             )));
         }
+        let dispatch = if !outputs.is_empty()
+            && outputs
+                .iter()
+                .all(|output| output.provenance.dispatch_state == super::DispatchState::NotStarted)
+        {
+            BatchDispatch::not_dispatched(scheduled.len().max(1))
+        } else {
+            dispatch
+        };
         Ok(scheduled
             .iter()
             .zip(outputs)

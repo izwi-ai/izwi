@@ -25,14 +25,18 @@ mod state;
 #[path = "executor/streaming.rs"]
 mod streaming;
 
-pub(crate) use streaming::{deliver_committed_streams, CommittedStreamDelivery};
+pub(crate) use streaming::{
+    deliver_committed_streams, CommittedStreamDelivery, StreamDeliveryFailure,
+    StreamDeliveryFailureKind,
+};
 
 use super::config::EngineCoreConfig;
 use super::execution::{
-    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, ExecutionCapabilities,
-    ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile, FailureKind,
-    FailureScope, FinishReason, HealthImpact, NativeBatchMode, PhysicalBatch, PlanId, PrefillMode,
-    RetryDisposition, SessionKey, YieldReason,
+    BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, DispatchState,
+    ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile,
+    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, NativeBatchMode,
+    OutcomeProvenance, PhysicalBatch, PlanId, PrefillMode, RetryDisposition, SessionKey,
+    YieldReason,
 };
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
@@ -335,6 +339,7 @@ pub struct ModelSessionResult {
     pub output: ExecutorOutput,
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
+    pub provenance: OutcomeProvenance,
     pub staged_stream_outputs: Vec<StreamingOutput>,
 }
 
@@ -357,10 +362,16 @@ impl ModelSessionResult {
         } else {
             ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
         };
+        let provenance = if matches!(disposition, ExecutionDisposition::Failed(_)) {
+            OutcomeProvenance::failure(FailureOrigin::Model, DispatchState::Started)
+        } else {
+            OutcomeProvenance::produced_output()
+        };
         Self {
             output,
             disposition,
             safe_point: true,
+            provenance,
             staged_stream_outputs: Vec::new(),
         }
     }
@@ -370,6 +381,7 @@ impl ModelSessionResult {
             output,
             disposition: ExecutionDisposition::Yielded(reason),
             safe_point: true,
+            provenance: OutcomeProvenance::produced_output(),
             staged_stream_outputs: Vec::new(),
         }
     }
@@ -380,6 +392,18 @@ impl ModelSessionResult {
             output,
             disposition: ExecutionDisposition::Finished(FinishReason::Cancelled),
             safe_point: true,
+            provenance: OutcomeProvenance::started(),
+            staged_stream_outputs: Vec::new(),
+        }
+    }
+
+    pub fn cancelled_before_dispatch(mut output: ExecutorOutput) -> Self {
+        output.finished = true;
+        Self {
+            output,
+            disposition: ExecutionDisposition::Finished(FinishReason::Cancelled),
+            safe_point: true,
+            provenance: OutcomeProvenance::not_started(),
             staged_stream_outputs: Vec::new(),
         }
     }
@@ -395,10 +419,16 @@ impl ModelSessionResult {
             output.finished = true;
             ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message))
         };
+        let provenance = if matches!(disposition, ExecutionDisposition::Failed(_)) {
+            OutcomeProvenance::failure(FailureOrigin::Model, DispatchState::Started)
+        } else {
+            OutcomeProvenance::produced_output()
+        };
         Self {
             output,
             disposition,
             safe_point: true,
+            provenance,
             staged_stream_outputs: Vec::new(),
         }
     }
@@ -417,6 +447,7 @@ pub struct ExecutorStepResult {
     pub disposition: ExecutionDisposition,
     pub safe_point: bool,
     pub dispatch: BatchDispatch,
+    pub provenance: OutcomeProvenance,
     /// Physical model-owned cache retained after this safe point. Unknown is
     /// reported explicitly when a backend/model cannot observe all storage.
     pub observed_resources: ResourceVector,
@@ -443,6 +474,7 @@ impl ExecutorStepResult {
             disposition: session_result.disposition,
             safe_point: session_result.safe_point,
             dispatch: BatchDispatch::serial(),
+            provenance: session_result.provenance,
             observed_resources: ResourceVector::zero(),
             output: session_result.output,
             staged_stream_outputs: session_result.staged_stream_outputs,
@@ -451,6 +483,11 @@ impl ExecutorStepResult {
 
     pub fn with_dispatch(mut self, dispatch: BatchDispatch) -> Self {
         self.dispatch = dispatch;
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: OutcomeProvenance) -> Self {
+        self.provenance = provenance;
         self
     }
 
@@ -467,7 +504,39 @@ pub struct PhysicalBatchExecution<'a> {
     pub scheduled: &'a [ScheduledRequest],
 }
 
+#[derive(Debug)]
+pub struct PhysicalDispatchError {
+    pub error: Error,
+    pub dispatch: BatchDispatch,
+    pub provenance: OutcomeProvenance,
+}
+
+impl PhysicalDispatchError {
+    pub(crate) fn not_started(error: Error, width: usize, origin: FailureOrigin) -> Self {
+        Self {
+            error,
+            dispatch: BatchDispatch::not_dispatched(width),
+            provenance: OutcomeProvenance::failure(origin, DispatchState::NotStarted),
+        }
+    }
+
+    pub(crate) fn started(error: Error, dispatch: BatchDispatch, origin: FailureOrigin) -> Self {
+        Self {
+            error,
+            dispatch,
+            provenance: OutcomeProvenance::failure(origin, DispatchState::Started),
+        }
+    }
+}
+
+pub type PhysicalDispatchResult =
+    std::result::Result<Vec<ExecutorStepResult>, PhysicalDispatchError>;
+
 impl PhysicalBatchExecution<'_> {
+    pub fn expected_dispatch(&self) -> BatchDispatch {
+        self.batch.expected_dispatch()
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.batch.validate()?;
         if self.batch.rows.len() != self.scheduled.len()
@@ -557,13 +626,34 @@ pub trait ModelExecutor: Send + Sync {
     fn execute_physical_batch(
         &self,
         execution: PhysicalBatchExecution<'_>,
-    ) -> Result<Vec<ExecutorStepResult>> {
-        execution.validate()?;
-        if execution.is_prefill() {
+    ) -> PhysicalDispatchResult {
+        let width = execution.scheduled.len().max(1);
+        execution.validate().map_err(|error| {
+            PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+        })?;
+        let dispatch = execution.expected_dispatch();
+        let result = if execution.is_prefill() {
             self.execute_prefill(execution.requests, execution.scheduled)
         } else {
             self.execute_decode(execution.requests, execution.scheduled)
-        }
+        };
+        result
+            .map(|mut outputs| {
+                let actual_dispatch = if !outputs.is_empty()
+                    && outputs
+                        .iter()
+                        .all(|output| output.provenance.dispatch_state == DispatchState::NotStarted)
+                {
+                    BatchDispatch::not_dispatched(width)
+                } else {
+                    dispatch
+                };
+                for output in &mut outputs {
+                    output.dispatch = actual_dispatch;
+                }
+                outputs
+            })
+            .map_err(|error| PhysicalDispatchError::started(error, dispatch, FailureOrigin::Model))
     }
 
     /// Execute prefill pass for newly admitted or in-progress prefill requests.
@@ -1228,13 +1318,23 @@ impl ModelExecutor for NativeExecutor {
     fn execute_physical_batch(
         &self,
         execution: PhysicalBatchExecution<'_>,
-    ) -> Result<Vec<ExecutorStepResult>> {
-        execution.validate()?;
+    ) -> PhysicalDispatchResult {
+        let width = execution.scheduled.len().max(1);
+        let expected_dispatch = execution.expected_dispatch();
+        execution.validate().map_err(|error| {
+            PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+        })?;
         if !self.initialized {
-            return Err(Error::InferenceError("Executor not initialized".into()));
+            return Err(PhysicalDispatchError::not_started(
+                Error::InferenceError("Executor not initialized".into()),
+                width,
+                FailureOrigin::ExecutorValidation,
+            ));
         }
         for request in execution.requests {
-            request.begin_stream_staging()?;
+            request.begin_stream_staging().map_err(|error| {
+                PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
+            })?;
         }
         if execution.batch.mode == NativeBatchMode::Static {
             if !execution.is_prefill()
@@ -1244,16 +1344,29 @@ impl ModelExecutor for NativeExecutor {
                     .iter()
                     .any(|request| request.task_type != super::types::TaskType::TTS)
             {
-                return Err(Error::InferenceError(
-                    "static tensor batch was routed to an incompatible native stage".to_string(),
+                return Err(PhysicalDispatchError::not_started(
+                    Error::InferenceError(
+                        "static tensor batch was routed to an incompatible native stage"
+                            .to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
                 ));
             }
             if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
-                return Err(Error::Overloaded(
-                    "static tensor batch exceeds the backend width cap".to_string(),
+                return Err(PhysicalDispatchError::not_started(
+                    Error::Overloaded(
+                        "static tensor batch exceeds the backend width cap".to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
                 ));
             }
-            return self.execute_static_tts_requests(execution.requests, execution.scheduled);
+            return self
+                .execute_static_tts_requests(execution.requests, execution.scheduled)
+                .map_err(|error| {
+                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+                });
         }
         if execution.batch.mode == NativeBatchMode::Continuous {
             if execution.is_prefill()
@@ -1263,23 +1376,38 @@ impl ModelExecutor for NativeExecutor {
                     .iter()
                     .any(|request| request.task_type != super::types::TaskType::Chat)
             {
-                return Err(Error::InferenceError(
-                    "continuous tensor batch was routed to an incompatible native stage"
-                        .to_string(),
+                return Err(PhysicalDispatchError::not_started(
+                    Error::InferenceError(
+                        "continuous tensor batch was routed to an incompatible native stage"
+                            .to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
                 ));
             }
             if execution.scheduled.len() > self.config.max_tensor_batch_size.max(1) {
-                return Err(Error::Overloaded(
-                    "continuous tensor batch exceeds the backend width cap".to_string(),
+                return Err(PhysicalDispatchError::not_started(
+                    Error::Overloaded(
+                        "continuous tensor batch exceeds the backend width cap".to_string(),
+                    ),
+                    width,
+                    FailureOrigin::ExecutorValidation,
                 ));
             }
-            return self.execute_continuous_chat_requests(execution.requests, execution.scheduled);
+            return self
+                .execute_continuous_chat_requests(execution.requests, execution.scheduled)
+                .map_err(|error| {
+                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+                });
         }
-        if execution.is_prefill() {
+        let result = if execution.is_prefill() {
             self.execute_prefill(execution.requests, execution.scheduled)
         } else {
             self.execute_decode(execution.requests, execution.scheduled)
-        }
+        };
+        result.map_err(|error| {
+            PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
+        })
     }
 
     fn execute_prefill(
@@ -1496,7 +1624,7 @@ impl UnifiedExecutor {
         batch: &PhysicalBatch,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
+    ) -> PhysicalDispatchResult {
         let executor = self.inner.read().await;
         executor.execute_physical_batch(PhysicalBatchExecution {
             batch,

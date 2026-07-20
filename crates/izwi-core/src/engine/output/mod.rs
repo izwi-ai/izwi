@@ -267,6 +267,7 @@ impl OutputProcessor {
             latency_breakdown: None,
             asr_diagnostics: executor_output.asr_diagnostics,
             error: executor_output.error,
+            provenance: super::OutcomeProvenance::produced_output(),
         }
     }
 

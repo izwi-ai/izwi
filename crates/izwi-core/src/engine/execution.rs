@@ -633,6 +633,95 @@ impl Default for BatchDispatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DeadlinePhase {
+    SchedulerQueue,
+    DispatchWait,
+    ModelExecution,
+    StreamDelivery,
+    TerminalDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchState {
+    NotStarted,
+    Started,
+    ProducedOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureOrigin {
+    AdapterPlanning,
+    DispatchCoordination,
+    WorkspaceAdmission,
+    ExecutorValidation,
+    Model,
+    StreamDelivery,
+    StateCommit,
+    Cleanup,
+    Panic,
+}
+
+/// Bounded execution provenance carried from physical dispatch through the
+/// terminal API result. Detailed error text remains separate and unlabelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeProvenance {
+    pub dispatch_state: DispatchState,
+    pub failure_origin: Option<FailureOrigin>,
+    pub deadline_phase: Option<DeadlinePhase>,
+}
+
+impl OutcomeProvenance {
+    pub const fn not_started() -> Self {
+        Self {
+            dispatch_state: DispatchState::NotStarted,
+            failure_origin: None,
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn produced_output() -> Self {
+        Self {
+            dispatch_state: DispatchState::ProducedOutput,
+            failure_origin: None,
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn started() -> Self {
+        Self {
+            dispatch_state: DispatchState::Started,
+            failure_origin: None,
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn failure(origin: FailureOrigin, dispatch_state: DispatchState) -> Self {
+        Self {
+            dispatch_state,
+            failure_origin: Some(origin),
+            deadline_phase: None,
+        }
+    }
+
+    pub const fn deadline(phase: DeadlinePhase, dispatch_state: DispatchState) -> Self {
+        Self {
+            dispatch_state,
+            failure_origin: None,
+            deadline_phase: Some(phase),
+        }
+    }
+}
+
+impl Default for OutcomeProvenance {
+    fn default() -> Self {
+        Self::produced_output()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheMode {
     None,
     OpaqueModelOwned,
@@ -818,6 +907,20 @@ pub struct PhysicalBatch {
 }
 
 impl PhysicalBatch {
+    pub fn expected_dispatch(&self) -> BatchDispatch {
+        let width = self.rows.len().max(1);
+        match self.mode {
+            NativeBatchMode::Static => BatchDispatch::new(BatchDispatchKind::TensorStatic, width),
+            NativeBatchMode::Continuous => {
+                BatchDispatch::new(BatchDispatchKind::TensorContinuous, width)
+            }
+            NativeBatchMode::None if width > 1 => {
+                BatchDispatch::new(BatchDispatchKind::RequestParallel, width)
+            }
+            NativeBatchMode::None => BatchDispatch::serial(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.budget.validate()?;
         if self.rows.is_empty() {
@@ -980,11 +1083,20 @@ impl PhysicalBatchReport {
         match self.dispatch.kind {
             BatchDispatchKind::NotDispatched
                 if self.rows.iter().any(|row| {
-                    !matches!(row.execution.disposition, ExecutionDisposition::Failed(_))
+                    !matches!(
+                        row.execution.disposition,
+                        ExecutionDisposition::Failed(_)
+                            | ExecutionDisposition::Finished(
+                                FinishReason::Cancelled
+                                    | FinishReason::TimedOut
+                                    | FinishReason::Rejected
+                            )
+                    )
                 }) =>
             {
                 return Err(Error::InferenceError(
-                    "a non-dispatched batch may only report failed rows".to_string(),
+                    "a non-dispatched batch may only fail or terminalize rows before model entry"
+                        .to_string(),
                 ));
             }
             BatchDispatchKind::Serial if batch.rows.len() != 1 => {
@@ -1225,6 +1337,7 @@ pub struct ExecutionReport {
     pub output_produced: usize,
     pub observed_resources: ResourceVector,
     pub dispatch: BatchDispatch,
+    pub provenance: OutcomeProvenance,
     pub elapsed: Duration,
     pub safe_point: bool,
     pub disposition: ExecutionDisposition,
@@ -1249,10 +1362,19 @@ impl ExecutionReport {
         }
         match self.dispatch.kind {
             BatchDispatchKind::NotDispatched
-                if !matches!(self.disposition, ExecutionDisposition::Failed(_)) =>
+                if !matches!(
+                    self.disposition,
+                    ExecutionDisposition::Failed(_)
+                        | ExecutionDisposition::Finished(
+                            FinishReason::Cancelled
+                                | FinishReason::TimedOut
+                                | FinishReason::Rejected
+                        )
+                ) =>
             {
                 return Err(Error::InferenceError(
-                    "non-dispatched execution must report failure".to_string(),
+                    "non-dispatched execution must fail or terminalize before model entry"
+                        .to_string(),
                 ));
             }
             BatchDispatchKind::Serial if self.dispatch.width != 1 => {
@@ -1281,6 +1403,45 @@ impl ExecutionReport {
                 ));
             }
             _ => {}
+        }
+        if self.dispatch.kind == BatchDispatchKind::NotDispatched
+            && self.provenance.dispatch_state != DispatchState::NotStarted
+        {
+            return Err(Error::InferenceError(
+                "non-dispatched execution cannot claim model entry".to_string(),
+            ));
+        }
+        if self.dispatch.kind != BatchDispatchKind::NotDispatched
+            && self.provenance.dispatch_state == DispatchState::NotStarted
+            && !(self.dispatch.kind == BatchDispatchKind::RequestParallel
+                && matches!(
+                    self.disposition,
+                    ExecutionDisposition::Finished(
+                        FinishReason::Cancelled | FinishReason::TimedOut | FinishReason::Rejected
+                    )
+                ))
+        {
+            return Err(Error::InferenceError(
+                "dispatched execution must record model entry unless an independent row terminated before entry"
+                    .to_string(),
+            ));
+        }
+        if self.provenance.deadline_phase.is_some()
+            != matches!(
+                self.disposition,
+                ExecutionDisposition::Finished(FinishReason::TimedOut)
+            )
+        {
+            return Err(Error::InferenceError(
+                "deadline provenance must match a timed-out disposition".to_string(),
+            ));
+        }
+        if self.provenance.failure_origin.is_some()
+            != matches!(self.disposition, ExecutionDisposition::Failed(_))
+        {
+            return Err(Error::InferenceError(
+                "failure provenance must match a failed disposition".to_string(),
+            ));
         }
         match plan.work {
             WorkUnit::SequenceStep {
@@ -1930,6 +2091,7 @@ mod tests {
             output_produced: 0,
             observed_resources: ResourceVector::default(),
             dispatch: BatchDispatch::serial(),
+            provenance: OutcomeProvenance::produced_output(),
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition: ExecutionDisposition::Progress,
@@ -2019,6 +2181,15 @@ mod tests {
                 (failure.retry == RetryDisposition::Never, true)
             }
         };
+        let provenance = match &disposition {
+            ExecutionDisposition::Failed(_) => {
+                OutcomeProvenance::failure(FailureOrigin::Model, DispatchState::Started)
+            }
+            ExecutionDisposition::Finished(FinishReason::TimedOut) => {
+                OutcomeProvenance::deadline(DeadlinePhase::ModelExecution, DispatchState::Started)
+            }
+            _ => OutcomeProvenance::produced_output(),
+        };
         ExecutionReport {
             plan_id: plan.plan_id,
             session: plan.session.clone(),
@@ -2026,6 +2197,7 @@ mod tests {
             output_produced: 0,
             observed_resources: ResourceVector::zero(),
             dispatch: BatchDispatch::serial(),
+            provenance,
             elapsed: Duration::ZERO,
             safe_point: true,
             disposition,
@@ -2209,6 +2381,47 @@ mod tests {
         let mut retryable = report_for(&plan, ExecutionDisposition::Failed(retry));
         retryable.output_finished = true;
         assert!(retryable.validate_against(&plan).is_err());
+    }
+
+    #[test]
+    fn provenance_must_match_dispatch_failure_and_deadline_outcomes() {
+        let plan = plan_for(
+            SessionKey::new("provenance".to_string(), 1),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 0, end: 0 },
+                max_output_steps: 1,
+            },
+        );
+        let mut failed = report_for(
+            &plan,
+            ExecutionDisposition::Failed(ExecutionFailure::invalid_output("failed")),
+        );
+        failed.dispatch = BatchDispatch::not_dispatched(1);
+        assert!(failed.validate_against(&plan).is_err());
+        failed.provenance = OutcomeProvenance::failure(
+            FailureOrigin::ExecutorValidation,
+            DispatchState::NotStarted,
+        );
+        assert!(failed.validate_against(&plan).is_ok());
+
+        let mut timed_out = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::TimedOut),
+        );
+        assert!(timed_out.validate_against(&plan).is_ok());
+        timed_out.provenance = OutcomeProvenance::started();
+        assert!(timed_out.validate_against(&plan).is_err());
+
+        let mut completed = report_for(
+            &plan,
+            ExecutionDisposition::Finished(FinishReason::Completed),
+        );
+        completed.provenance = OutcomeProvenance::deadline(
+            DeadlinePhase::ModelExecution,
+            DispatchState::ProducedOutput,
+        );
+        assert!(completed.validate_against(&plan).is_err());
     }
 
     #[test]

@@ -45,18 +45,20 @@ pub use core::EngineCore;
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
     BatchDispatchKind, BatchId, BatchKey, BatchLaneKey, CacheMode, CancellationGranularity,
-    ConcurrencyClass, ExecutionAdapterBinding, ExecutionCapabilities, ExecutionDisposition,
-    ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureKind, FailureScope,
-    FinishReason, HealthImpact, InputRange, MembershipSafePoint, ModelInstanceId, NativeBatchMode,
-    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId,
-    PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase, SessionEpoch, SessionKey,
-    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
-    StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionAdapterBinding, ExecutionCapabilities,
+    ExecutionDisposition, ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode,
+    ExecutionPlan, ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker,
+    FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, InputRange,
+    MembershipSafePoint, ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility,
+    PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, PrefillMode, ReadyQuantum,
+    RetryDisposition, SequencePhase, SessionEpoch, SessionKey, StageDescriptor, StageId,
+    StageProgressKind, StageShapePolicy, StageWorkSelector, StateDisposition, TerminalOutcome,
+    WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
-    PhysicalBatchExecution, WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
+    PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult, WorkerConfig,
+    REQUEST_DEADLINE_EXCEEDED,
 };
 pub use kv_cache::{
     BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
@@ -303,8 +305,8 @@ impl OwnedStepContext {
         let failed_streams = executor::deliver_committed_streams(stream_deliveries).await;
         if !failed_streams.is_empty() {
             let mut core = self.core.write().await;
-            for session in failed_streams {
-                core.abort_request_session(&session).await;
+            for failure in failed_streams {
+                core.handle_stream_delivery_failure(failure).await;
             }
         }
 

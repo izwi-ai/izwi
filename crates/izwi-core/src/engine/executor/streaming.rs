@@ -11,6 +11,18 @@ use super::NativeExecutor;
 
 pub(super) type StreamBackpressurePolicy = EngineStreamPolicy;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDeliveryFailureKind {
+    Delivery,
+    Deadline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamDeliveryFailure {
+    pub(crate) session: SessionKey,
+    pub(crate) kind: StreamDeliveryFailureKind,
+}
+
 /// Stream events whose producing model state has already committed. Delivery
 /// owns a clone of the exact request channel so terminal request cleanup cannot
 /// close the channel before the outbox is flushed.
@@ -37,12 +49,10 @@ impl CommittedStreamDelivery {
         }
     }
 
-    async fn deliver(self) -> Result<()> {
+    async fn deliver(self) -> std::result::Result<(), StreamDeliveryFailureKind> {
         for output in self.outputs {
             if output.request_id != self.session.request_id {
-                return Err(Error::InferenceError(
-                    "committed stream output does not match its exact session".to_string(),
-                ));
+                return Err(StreamDeliveryFailureKind::Delivery);
             }
             send_committed_output(&self.tx, self.policy, output).await?;
         }
@@ -55,12 +65,12 @@ impl CommittedStreamDelivery {
 /// flush their own outboxes.
 pub(crate) async fn deliver_committed_streams(
     deliveries: Vec<CommittedStreamDelivery>,
-) -> Vec<SessionKey> {
+) -> Vec<StreamDeliveryFailure> {
     let mut failed = Vec::new();
     for delivery in deliveries {
         let session = delivery.session.clone();
-        if delivery.deliver().await.is_err() {
-            failed.push(session);
+        if let Err(kind) = delivery.deliver().await {
+            failed.push(StreamDeliveryFailure { session, kind });
         }
     }
     failed
@@ -70,30 +80,31 @@ async fn send_committed_output(
     tx: &mpsc::Sender<StreamingOutput>,
     policy: StreamBackpressurePolicy,
     output: StreamingOutput,
-) -> Result<()> {
+) -> std::result::Result<(), StreamDeliveryFailureKind> {
     match policy {
-        StreamBackpressurePolicy::FailOnFull => tx.try_send(output).map_err(stream_send_error),
+        StreamBackpressurePolicy::FailOnFull => match tx.try_send(output) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StreamDeliveryFailureKind::Delivery),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                record_engine_stream_backpressure();
+                Err(StreamDeliveryFailureKind::Delivery)
+            }
+        },
         StreamBackpressurePolicy::BlockWithDeadline { timeout_ms } => {
             match tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), tx.send(output))
                 .await
             {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(_)) => Err(Error::InferenceError(
-                    "Streaming output channel closed".to_string(),
-                )),
+                Ok(Err(_)) => Err(StreamDeliveryFailureKind::Delivery),
                 Err(_) => {
                     record_engine_stream_backpressure();
-                    Err(Error::InferenceError(
-                        "Streaming output backpressure deadline elapsed".to_string(),
-                    ))
+                    Err(StreamDeliveryFailureKind::Deadline)
                 }
             }
         }
         StreamBackpressurePolicy::DropNewest => match tx.try_send(output) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(output)) => {
-                Err(stream_send_error(mpsc::error::TrySendError::Closed(output)))
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StreamDeliveryFailureKind::Delivery),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 record_engine_stream_backpressure();
                 Ok(())
@@ -291,7 +302,10 @@ mod tests {
     use crate::engine::request::StreamStagingBuffer;
     use crate::engine::SessionKey;
 
-    use super::{deliver_committed_streams, CommittedStreamDelivery, StreamBackpressurePolicy};
+    use super::{
+        deliver_committed_streams, CommittedStreamDelivery, StreamBackpressurePolicy,
+        StreamDeliveryFailure, StreamDeliveryFailureKind,
+    };
 
     fn output(request_id: &str, sequence: usize) -> StreamingOutput {
         StreamingOutput {
@@ -370,7 +384,13 @@ mod tests {
         ])
         .await;
 
-        assert_eq!(failed, vec![first]);
+        assert_eq!(
+            failed,
+            vec![StreamDeliveryFailure {
+                session: first,
+                kind: StreamDeliveryFailureKind::Delivery,
+            }]
+        );
         assert_eq!(open_rx.try_recv().expect("peer output").request_id, "open");
     }
 
@@ -389,6 +409,12 @@ mod tests {
         .await;
 
         assert!(started.elapsed() >= std::time::Duration::from_millis(5));
-        assert_eq!(failed, vec![session]);
+        assert_eq!(
+            failed,
+            vec![StreamDeliveryFailure {
+                session,
+                kind: StreamDeliveryFailureKind::Deadline,
+            }]
+        );
     }
 }
