@@ -10,6 +10,7 @@ use crate::engine::{
     NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
+use crate::kv::{CacheCapability, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::runtime::rollout::ExecutionRolloutMode;
 
@@ -110,6 +111,22 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn adapter_instance_id(&self) -> AdapterInstanceId;
     fn adapter_abi_revision(&self) -> AdapterAbiRevision;
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract>;
+
+    /// Exact loaded-adapter cache truth. Compatibility adapters remain opaque
+    /// until a model-specific implementation publishes a validated managed
+    /// contract and an execution backend can resolve it.
+    fn cache_capability(&self) -> Result<CacheCapability> {
+        Ok(CacheCapability::OpaqueModelOwned)
+    }
+}
+
+impl<T> KvCacheContractProvider for T
+where
+    T: LoadedExecutionAdapter + ?Sized,
+{
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        self.cache_capability()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -669,6 +686,7 @@ impl RuntimeAdapterRegistry {
                 metadata.model_variant, metadata.capability
             )));
         }
+        adapter.kv_cache_contract()?.validate()?;
         adapter.contract(StreamingRequirements::NONE)?;
         Ok(adapter)
     }
@@ -803,6 +821,15 @@ impl LoadedModelBundle {
         self.contract_for_streaming(capability, streaming)?
             .adapter_binding()
     }
+
+    pub(crate) fn kv_cache_capability(
+        &self,
+        capability: CapabilityKind,
+    ) -> Result<CacheCapability> {
+        let capability = self.require_adapter(capability)?.kv_cache_contract()?;
+        capability.validate()?;
+        Ok(capability)
+    }
 }
 
 #[cfg(test)]
@@ -866,6 +893,15 @@ mod tests {
             assert_eq!(bundle.adapter_count(), metadata.len(), "{variant}");
             assert_eq!(bundle.model_instance_id(), instance);
             for metadata in metadata {
+                assert_eq!(
+                    bundle
+                        .kv_cache_capability(metadata.capability)
+                        .unwrap_or_else(|error| {
+                            panic!("failed to resolve cache capability for {variant}: {error}")
+                        }),
+                    CacheCapability::OpaqueModelOwned,
+                    "compatibility behavior changed for {variant}"
+                );
                 let contract = bundle
                     .contract(metadata.capability, false)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));

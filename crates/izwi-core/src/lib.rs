@@ -33,6 +33,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod kernels;
+pub mod kv;
 pub mod model;
 mod models;
 pub mod residency;
