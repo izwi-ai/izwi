@@ -6,6 +6,7 @@
 //! bounds before lowering those references to backend slot indices.
 
 mod cpu;
+mod negotiate;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -13,10 +14,14 @@ use std::sync::Arc;
 use candle_core::{DType, Tensor};
 
 use crate::backends::BackendKind;
-use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding, KvSlotRef};
+use crate::kv::{
+    CacheBlockRef, KvArenaId, KvCacheContract, KvDecodeBatchMetadata, KvGroupId, KvLayerBinding,
+    KvSlotRef, ResolvedKvPlan,
+};
 use crate::Result;
 
 pub use cpu::{CpuKvArena, CpuKvBackendRuntime};
+pub use negotiate::{negotiate_kv_plan, KvBackendPlanRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvLayerConfig {
@@ -62,6 +67,14 @@ pub struct KvWriteArgs<'a> {
     pub slots: &'a dyn KvSlotMap,
 }
 
+/// One-token-per-row paged decode over authoritative arena storage.
+pub struct KvPagedDecodeArgs<'a> {
+    /// `[batch, query_heads, key_head_dim]`.
+    pub queries: &'a Tensor,
+    pub batch: &'a KvDecodeBatchMetadata,
+    pub softmax_scale: f32,
+}
+
 /// Completion token for an ordered backend mutation.
 pub trait KvDeviceFence: Send + Sync {
     fn is_complete(&self) -> bool;
@@ -83,10 +96,25 @@ pub trait KvArena: Send + Sync {
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence>;
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
     fn write_slots(&self, layer: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence>;
+    fn paged_decode(&self, layer: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor>;
 }
 
 /// Allocates backend-owned arenas from resolved physical configurations.
 pub trait KvBackendRuntime: Send + Sync {
     fn backend_kind(&self) -> BackendKind;
+    fn negotiate(
+        &self,
+        contract: &KvCacheContract,
+        request: &KvBackendPlanRequest,
+    ) -> Result<ResolvedKvPlan> {
+        if request.backend != self.backend_kind() {
+            return Err(crate::Error::InvalidInput(format!(
+                "KV negotiation request targets {:?}, but runtime is {:?}",
+                request.backend,
+                self.backend_kind()
+            )));
+        }
+        negotiate_kv_plan(contract, request)
+    }
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>>;
 }

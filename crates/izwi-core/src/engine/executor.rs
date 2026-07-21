@@ -453,6 +453,8 @@ pub struct ExecutorStepResult {
     pub observed_resources: ResourceVector,
     pub output: ExecutorOutput,
     pub staged_stream_outputs: Vec<StreamingOutput>,
+    /// Optional physical KV write acknowledgement for this exact row.
+    pub managed_cache: Option<super::ManagedCacheReceipt>,
 }
 
 impl ExecutorStepResult {
@@ -478,6 +480,7 @@ impl ExecutorStepResult {
             observed_resources: ResourceVector::zero(),
             output: session_result.output,
             staged_stream_outputs: session_result.staged_stream_outputs,
+            managed_cache: None,
         }
     }
 
@@ -493,6 +496,11 @@ impl ExecutorStepResult {
 
     pub fn with_observed_resources(mut self, resources: ResourceVector) -> Self {
         self.observed_resources = resources;
+        self
+    }
+
+    pub fn with_managed_cache_receipt(mut self, receipt: super::ManagedCacheReceipt) -> Self {
+        self.managed_cache = Some(receipt);
         self
     }
 }
@@ -1919,6 +1927,7 @@ mod tests {
                         kind: "test".to_string(),
                     },
                     cost: super::super::WorkCost::new(1, 1, 8),
+                    managed_cache: None,
                 }],
                 materialized_tensor_elements: 1,
                 workspace: expected_workspace,

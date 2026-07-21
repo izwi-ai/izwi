@@ -1110,6 +1110,7 @@ mod tests {
                 max_output_steps: 1,
             },
             cost: WorkCost::new(1, 10, 0),
+            managed_cache: None,
         };
         let batch = PhysicalBatch {
             batch_id: BatchId::new(5),

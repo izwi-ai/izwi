@@ -298,23 +298,13 @@ impl EngineCoreConfig {
         }
     }
 
-    /// Calculate memory required for KV cache
+    /// Legacy compatibility estimate for the scheduler-level logical cache.
+    ///
+    /// Physical KV bytes cannot be derived from engine-wide hints because the
+    /// loaded model owns the layer/head geometry and the backend negotiates its
+    /// layout. Managed arenas account exact bytes from `ResolvedKvPlan`; opaque
+    /// caches are authorized and observed by the loaded executor instead.
     pub fn kv_cache_memory_bytes(&self) -> usize {
-        // Approximate: 2 (K+V) * block_size * hidden_dim * num_layers * dtype_size
-        // Using typical values for audio models
-        let hidden_dim = 1024;
-        let num_layers = 24;
-        let requested_dtype_bytes = match self.kv_cache_dtype.trim().to_ascii_lowercase().as_str() {
-            "float32" | "f32" => 4,
-            "int8" | "i8" | "q8" | "q8_0" => 1,
-            _ => 2,
-        };
-        let dtype_bytes = if self.backend == BackendKind::Metal && requested_dtype_bytes != 1 {
-            4
-        } else {
-            requested_dtype_bytes
-        };
-
-        self.max_blocks * self.block_size * hidden_dim * num_layers * 2 * dtype_bytes
+        0
     }
 }

@@ -25,3 +25,16 @@ pub struct KvSlotRef {
     pub block: CacheBlockRef,
     pub offset: u32,
 }
+
+/// Logical page order and valid token count for one ragged decode row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSequenceBlockTable {
+    pub blocks: Vec<CacheBlockRef>,
+    pub context_len: u32,
+}
+
+/// Immutable block-table metadata for a ragged physical decode batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvDecodeBatchMetadata {
+    pub sequences: Vec<KvSequenceBlockTable>,
+}

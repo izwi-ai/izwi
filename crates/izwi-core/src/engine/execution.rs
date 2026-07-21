@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId};
 use crate::model::ModelVariant;
 
 use super::resources::{ResourceEstimate, ResourceVector};
@@ -903,6 +904,68 @@ pub struct ReadyQuantum {
     pub lane: BatchLaneKey,
     pub work: WorkUnit,
     pub cost: WorkCost,
+    /// Optional shadow/managed-cache transaction fenced to this exact row.
+    pub managed_cache: Option<ManagedCacheReservation>,
+}
+
+/// Backend-neutral identity of one row-level managed-cache reservation.
+///
+/// Physical tables and pins remain owned by the cache coordinator. Carrying
+/// this compact fence in the execution envelope lets report validation reject
+/// a receipt for another plan, request incarnation, arena generation, domain,
+/// or table version before engine state is committed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedCacheReservation {
+    pub txn_id: PlanId,
+    pub session: SessionKey,
+    pub arena: KvArenaId,
+    pub domain: CacheDomainId,
+    pub expected_version: u64,
+    pub expected_committed_tokens: u32,
+    pub target_committed_tokens: u32,
+}
+
+impl ManagedCacheReservation {
+    pub fn validate_for_row(&self, row: &ReadyQuantum) -> Result<()> {
+        if self.txn_id != row.plan_id || self.session != row.session {
+            return Err(Error::InvalidInput(
+                "managed-cache reservation does not match its physical row".to_string(),
+            ));
+        }
+        if self.target_committed_tokens < self.expected_committed_tokens {
+            return Err(Error::InvalidInput(
+                "managed-cache reservation moves committed tokens backwards".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Physical completion acknowledgement for one managed-cache row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheReceipt {
+    pub reservation: ManagedCacheReservation,
+    pub written_blocks: Vec<CacheBlockRef>,
+}
+
+impl ManagedCacheReceipt {
+    fn validate(&self) -> Result<()> {
+        let mut blocks = HashSet::with_capacity(self.written_blocks.len());
+        for block in &self.written_blocks {
+            if block.arena != self.reservation.arena {
+                return Err(Error::InferenceError(
+                    "managed-cache receipt contains a block from another arena generation"
+                        .to_string(),
+                ));
+            }
+            if !blocks.insert(*block) {
+                return Err(Error::InferenceError(
+                    "managed-cache receipt contains a duplicate written block".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1022,6 +1085,7 @@ pub enum StateDisposition {
 pub struct PhysicalBatchRowReport {
     pub execution: ExecutionReport,
     pub state: StateDisposition,
+    pub managed_cache: Option<ManagedCacheReceipt>,
 }
 
 impl PhysicalBatchRowReport {
@@ -1166,6 +1230,37 @@ impl PhysicalBatchReport {
             })?;
             row.execution.validate_against(plan)?;
             row.validate_state()?;
+            let expected_row = expected
+                .get(&key)
+                .expect("reported row was validated above");
+            match (&expected_row.managed_cache, &row.managed_cache) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    return Err(Error::InferenceError(
+                        "physical batch report contains an unplanned managed-cache receipt"
+                            .to_string(),
+                    ));
+                }
+                (Some(reservation), Some(receipt)) => {
+                    if &receipt.reservation != reservation {
+                        return Err(Error::InferenceError(
+                            "managed-cache receipt does not match its exact row reservation"
+                                .to_string(),
+                        ));
+                    }
+                    receipt.validate()?;
+                }
+                (Some(_), None) if row.state == StateDisposition::ValidNext => {
+                    return Err(Error::InferenceError(
+                        "continuing managed-cache row omitted its physical write receipt"
+                            .to_string(),
+                    ));
+                }
+                (Some(_), None) => {
+                    // Failed, rolled-back, poisoned, or terminal rows abort the
+                    // reservation instead of publishing cache state.
+                }
+            }
         }
         if reported.len() != expected.len() {
             return Err(Error::InferenceError(
@@ -1836,6 +1931,7 @@ mod tests {
                 kind: "test".to_string(),
             },
             cost: WorkCost::new(1, 10, 8),
+            managed_cache: None,
         };
         let mut batch = PhysicalBatch {
             batch_id: BatchId::new(1),
@@ -1903,6 +1999,7 @@ mod tests {
                     lane: lane.clone(),
                     work: first.work.clone(),
                     cost: WorkCost::new(1, 10, 8),
+                    managed_cache: None,
                 },
                 ReadyQuantum {
                     plan_id: second.plan_id,
@@ -1910,6 +2007,7 @@ mod tests {
                     lane: lane.clone(),
                     work: second.work.clone(),
                     cost: WorkCost::new(1, 10, 8),
+                    managed_cache: None,
                 },
             ],
             materialized_tensor_elements: 20,
@@ -1938,10 +2036,12 @@ mod tests {
                 PhysicalBatchRowReport {
                     execution: second_report.clone(),
                     state: StateDisposition::ValidNext,
+                    managed_cache: None,
                 },
                 PhysicalBatchRowReport {
                     execution: first_report.clone(),
                     state: StateDisposition::ValidNext,
+                    managed_cache: None,
                 },
             ],
         };
@@ -1952,6 +2052,7 @@ mod tests {
         report.rows[1] = PhysicalBatchRowReport {
             execution: first_report,
             state: StateDisposition::ValidNext,
+            managed_cache: None,
         };
         report.rows[1].execution.session = SessionKey::new("foreign".to_string(), 99);
         assert!(report.validate_against(&batch, &active).is_err());
@@ -1984,6 +2085,7 @@ mod tests {
                 lane: lane.clone(),
                 work: plan.work.clone(),
                 cost: WorkCost::new(1, 0, 0),
+                managed_cache: None,
             })
             .collect::<Vec<_>>();
         let batch = PhysicalBatch {
@@ -2020,6 +2122,7 @@ mod tests {
                     PhysicalBatchRowReport {
                         execution,
                         state: StateDisposition::Unchanged,
+                        managed_cache: None,
                     }
                 })
                 .collect(),
@@ -2053,6 +2156,7 @@ mod tests {
                 lane: lane.clone(),
                 work: plan.work.clone(),
                 cost: WorkCost::new(1, 1, 1),
+                managed_cache: None,
             }],
             materialized_tensor_elements: 1,
             workspace: ResourceVector::temporary_workspace(1),
@@ -2076,11 +2180,94 @@ mod tests {
             rows: vec![PhysicalBatchRowReport {
                 execution,
                 state: StateDisposition::ValidNext,
+                managed_cache: None,
             }],
         };
         assert!(report.validate_against(&batch, &active).is_err());
         report.rows[0].state = StateDisposition::RolledBack;
         assert!(report.validate_against(&batch, &active).is_ok());
+    }
+
+    #[test]
+    fn managed_cache_report_requires_the_exact_row_receipt() {
+        use crate::kv::KvGroupId;
+
+        let lane = lane();
+        let session = SessionKey::new("managed".to_string(), 7);
+        let plan = plan_for(
+            session.clone(),
+            WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: InputRange { start: 4, end: 5 },
+                max_output_steps: 1,
+            },
+        );
+        let arena = KvArenaId {
+            model_instance: lane.model_instance,
+            backend: lane.backend,
+            device_ordinal: lane.device_ordinal,
+            generation: 3,
+        };
+        let reservation = ManagedCacheReservation {
+            txn_id: plan.plan_id,
+            session: session.clone(),
+            arena,
+            domain: CacheDomainId::new(2),
+            expected_version: 11,
+            expected_committed_tokens: 4,
+            target_committed_tokens: 5,
+        };
+        let batch = PhysicalBatch {
+            batch_id: BatchId::new(99),
+            lane: lane.clone(),
+            mode: NativeBatchMode::None,
+            budget: BatchBudget::width_one(),
+            rows: vec![ReadyQuantum {
+                plan_id: plan.plan_id,
+                session: session.clone(),
+                lane: lane.clone(),
+                work: plan.work.clone(),
+                cost: WorkCost::new(1, 1, 0),
+                managed_cache: Some(reservation.clone()),
+            }],
+            materialized_tensor_elements: 1,
+            workspace: ResourceVector::zero(),
+        };
+        let mut execution = report_for(&plan, ExecutionDisposition::Progress);
+        execution.input_consumed = 1;
+        execution.dispatch = BatchDispatch::serial();
+        let mut report = PhysicalBatchReport {
+            batch_id: batch.batch_id,
+            lane,
+            dispatch: BatchDispatch::serial(),
+            observed_resources: ResourceVector::zero(),
+            elapsed: Duration::ZERO,
+            rows: vec![PhysicalBatchRowReport {
+                execution,
+                state: StateDisposition::ValidNext,
+                managed_cache: Some(ManagedCacheReceipt {
+                    reservation: reservation.clone(),
+                    written_blocks: vec![CacheBlockRef {
+                        arena,
+                        group: KvGroupId::new(0),
+                        index: 1,
+                        slot_generation: 8,
+                    }],
+                }),
+            }],
+        };
+        let active = HashMap::from([(plan.plan_id, plan)]);
+
+        assert!(report.validate_against(&batch, &active).is_ok());
+        report.rows[0].managed_cache = None;
+        assert!(report.validate_against(&batch, &active).is_err());
+        let mut foreign = reservation;
+        foreign.expected_version += 1;
+        report.rows[0].managed_cache = Some(ManagedCacheReceipt {
+            reservation: foreign,
+            written_blocks: Vec::new(),
+        });
+        assert!(report.validate_against(&batch, &active).is_err());
     }
 
     #[test]

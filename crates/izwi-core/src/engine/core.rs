@@ -48,7 +48,7 @@ use super::types::{
     AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
 };
 use super::{ResourceAmount, ResourceVector};
-use crate::backends::{kv_dtype_bytes, BackendKind, BackendRouter, BackendSelectionSource};
+use crate::backends::{BackendKind, BackendRouter, BackendSelectionSource};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
@@ -62,18 +62,12 @@ impl KvCacheBackend {
         let backend_context =
             BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
         let is_metal = backend_context.backend_kind == BackendKind::Metal;
-        // Keep Metal KV manager on its tuned F32 layout unless explicit int8 KV is requested.
-        let dtype_bytes = kv_dtype_bytes(&config.kv_cache_dtype, is_metal);
-        let kv_config = KVCacheConfig {
-            num_layers: 24,
-            num_heads: 16,
-            head_dim: 64,
-            block_size: config.block_size,
-            max_blocks: config.max_blocks,
-            dtype_bytes,
-        };
+        // Until a managed arena is selected, these are logical scheduler
+        // blocks only. Physical bytes come from the loaded-model contract and
+        // backend-resolved plan, never from global model geometry.
+        let kv_config = KVCacheConfig::logical_only(config.block_size, config.max_blocks);
 
-        if is_metal && kv_config.dtype_bytes == 4 {
+        if is_metal {
             let profile = backend_context.device.clone();
             if profile.kind.is_metal() {
                 let mut metal_config = MetalKVCacheConfig::default();
@@ -574,9 +568,7 @@ impl EngineCore {
             WorkUnit::AtomicJob { kind } => kind.clone(),
             WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
         };
-        let estimate = if profile.cache_mode == CacheMode::None {
-            ResourceVector::zero()
-        } else {
+        let estimate = if profile.cache_mode == CacheMode::ExternalPaged {
             let bytes_per_block =
                 self.config.kv_cache_memory_bytes() / self.config.max_blocks.max(1);
             let estimated_bytes = scheduled
@@ -589,6 +581,11 @@ impl EngineCore {
                 kv_bytes: ResourceAmount::Known(estimated_bytes),
                 ..ResourceVector::zero()
             }
+        } else {
+            // Opaque model caches are authorized and reconciled from their
+            // exact executor-owned tensors; logical scheduler blocks must not
+            // charge a second, fabricated physical-memory estimate.
+            ResourceVector::zero()
         };
         let bound_stage = request
             .execution_adapter_binding()
@@ -1164,6 +1161,7 @@ impl EngineCore {
                 lane: lane.clone(),
                 work: planned_work.clone(),
                 cost,
+                managed_cache: None,
             };
             let mut executable = scheduled.clone();
             executable.work = planned_work;
@@ -2094,6 +2092,7 @@ impl EngineCore {
                         OutcomeProvenance::failure(FailureOrigin::StateCommit, dispatch_state);
                     result.observed_resources = ResourceVector::zero();
                     result.staged_stream_outputs.clear();
+                    result.managed_cache = None;
                 }
             } else {
                 record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
@@ -3961,6 +3960,7 @@ mod tests {
                     ..ResourceVector::zero()
                 },
             ),
+            managed_cache: None,
         };
 
         assert_eq!(
@@ -4690,10 +4690,11 @@ mod tests {
             .prefill_requests
             .remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
-        assert!(matches!(
+        assert_eq!(
             core.active_plans[&scheduled.plan_id].estimate.kv_bytes,
-            ResourceAmount::Known(bytes) if bytes > 0
-        ));
+            ResourceAmount::Known(0),
+            "opaque executor caches must not inherit fabricated scheduler KV geometry"
+        );
 
         let observed = ResourceVector {
             kv_bytes: ResourceAmount::Known(123),

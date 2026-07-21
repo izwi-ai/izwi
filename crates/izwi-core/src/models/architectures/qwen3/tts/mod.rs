@@ -28,6 +28,13 @@ use tracing::{debug, info};
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kv::{
+    CacheCapability, CacheDomainId, CacheTokenAxis, KvCacheContract, KvCacheContractProvider,
+    KvDomainSpec, KvPrefixSemantics, PositionSemantics, CURRENT_KV_CONTRACT_ABI,
+};
+use crate::models::architectures::qwen3::core::{
+    qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
+};
 use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 
@@ -256,6 +263,50 @@ pub struct Qwen3TtsModel {
     kv_page_size: usize,
     /// KV cache quantization mode.
     kv_quantization: KvCacheQuantization,
+}
+
+impl KvCacheContractProvider for Qwen3TtsModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        let talker = &self.config.talker_config;
+        let predictor = &talker.code_predictor_config;
+        let talker_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain: CacheDomainId::new(0),
+            token_axis: CacheTokenAxis::Custom("qwen3_tts_talker_tokens".into()),
+            num_layers: talker.num_hidden_layers,
+            num_query_heads: talker.num_attention_heads,
+            num_kv_heads: talker.num_key_value_heads,
+            key_head_dim: talker.head_dim,
+            value_head_dim: talker.head_dim,
+            sliding_window: None,
+            storage_dtype: self.dtype,
+            preferred_page_tokens: self.kv_page_size,
+            prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+                positions: PositionSemantics::Absolute,
+            },
+        })?;
+        let predictor_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain: CacheDomainId::new(1),
+            token_axis: CacheTokenAxis::Custom("qwen3_tts_predictor_tokens".into()),
+            num_layers: predictor.num_hidden_layers,
+            num_query_heads: predictor.num_attention_heads,
+            num_kv_heads: predictor.num_key_value_heads,
+            key_head_dim: predictor.head_dim,
+            value_head_dim: predictor.head_dim,
+            sliding_window: None,
+            storage_dtype: self.code_predictor_dtype,
+            preferred_page_tokens: self.kv_page_size,
+            prefix_semantics: KvPrefixSemantics::Disabled,
+        })?;
+        let contract = KvCacheContract {
+            abi: CURRENT_KV_CONTRACT_ABI,
+            domains: vec![
+                KvDomainSpec::PagedAttention(talker_domain),
+                KvDomainSpec::PagedAttention(predictor_domain),
+            ],
+        };
+        contract.validate()?;
+        Ok(CacheCapability::Managed(contract))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{
-    backend::BackendStorage, CpuStorage, DType, Device, InplaceOp1, InplaceOp3, Layout, Tensor,
+    backend::BackendStorage, CpuStorage, DType, Device, InplaceOp1, InplaceOp3, Layout, Storage,
+    Tensor,
 };
 
 use crate::backends::BackendKind;
 use crate::error::Error;
-use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding, KvSlotRef};
+use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSlotRef};
 use crate::Result;
 
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvBackendRuntime, KvDeviceFence, KvPageCopy, KvSlotMap,
-    KvWriteArgs,
+    DeviceFence, KvArena, KvArenaConfig, KvBackendRuntime, KvDeviceFence, KvPageCopy,
+    KvPagedDecodeArgs, KvSlotMap, KvWriteArgs,
 };
 
 #[derive(Debug)]
@@ -308,6 +309,242 @@ impl KvArena for CpuKvArena {
             .inplace_op3(args.values, &slots.flat_slots, &SlotScatterOp)?;
         Ok(ready_fence())
     }
+
+    fn paged_decode(&self, binding: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor> {
+        let layer = self.layer(binding)?;
+        let query_dims = args.queries.dims();
+        if query_dims.len() != 3 {
+            return Err(Error::InferenceError(format!(
+                "CPU paged decode queries must have rank 3, got {query_dims:?}"
+            )));
+        }
+        let batch_size = query_dims[0];
+        let query_heads = query_dims[1];
+        if query_dims[2] != layer.key_head_dim {
+            return Err(Error::InferenceError(format!(
+                "CPU paged decode query head dimension {} does not match key head dimension {}",
+                query_dims[2], layer.key_head_dim
+            )));
+        }
+        if query_heads == 0 || query_heads % layer.num_kv_heads != 0 {
+            return Err(Error::InferenceError(format!(
+                "CPU paged decode query heads {query_heads} are not divisible by KV heads {}",
+                layer.num_kv_heads
+            )));
+        }
+        if args.batch.sequences.len() != batch_size {
+            return Err(Error::InferenceError(format!(
+                "CPU paged decode metadata has {} rows, expected {batch_size}",
+                args.batch.sequences.len()
+            )));
+        }
+        if !args.softmax_scale.is_finite() || args.softmax_scale <= 0.0 {
+            return Err(Error::InferenceError(
+                "CPU paged decode softmax scale must be finite and positive".into(),
+            ));
+        }
+        validate_decode_query(args.queries, self.config.dtype)?;
+        let tables = self.lower_decode_tables(args.batch)?;
+
+        // Serialize against paired K/V mutations. The storage read guards then
+        // provide stable direct slices for the complete online-softmax pass.
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let (key_storage, key_layout) = layer.keys.storage_and_layout();
+        let (value_storage, value_layout) = layer.values.storage_and_layout();
+        let (query_storage, query_layout) = args.queries.storage_and_layout();
+        let key_start = contiguous_range(key_layout, "kv-paged-decode-cpu")?.0;
+        let value_start = contiguous_range(value_layout, "kv-paged-decode-cpu")?.0;
+        let query_start = contiguous_range(query_layout, "kv-paged-decode-cpu")?.0;
+
+        macro_rules! decode_typed {
+            ($keys:expr, $values:expr, $queries:expr) => {
+                online_paged_decode(
+                    $keys,
+                    $values,
+                    $queries,
+                    key_start,
+                    value_start,
+                    query_start,
+                    &tables,
+                    self.config.page_tokens as usize,
+                    layer.num_kv_heads,
+                    layer.key_head_dim,
+                    layer.value_head_dim,
+                    query_heads,
+                    args.softmax_scale,
+                )
+            };
+        }
+
+        let output = match (&*key_storage, &*value_storage, &*query_storage) {
+            (
+                Storage::Cpu(CpuStorage::F32(keys)),
+                Storage::Cpu(CpuStorage::F32(values)),
+                Storage::Cpu(CpuStorage::F32(queries)),
+            ) => {
+                decode_typed!(keys, values, queries)
+            }
+            (
+                Storage::Cpu(CpuStorage::F16(keys)),
+                Storage::Cpu(CpuStorage::F16(values)),
+                Storage::Cpu(CpuStorage::F16(queries)),
+            ) => {
+                decode_typed!(keys, values, queries)
+            }
+            (
+                Storage::Cpu(CpuStorage::BF16(keys)),
+                Storage::Cpu(CpuStorage::BF16(values)),
+                Storage::Cpu(CpuStorage::BF16(queries)),
+            ) => {
+                decode_typed!(keys, values, queries)
+            }
+            _ => {
+                return Err(Error::InferenceError(
+                    "CPU paged decode storage dtype mismatch".into(),
+                ));
+            }
+        }?;
+
+        Ok(Tensor::from_vec(
+            output,
+            (batch_size, query_heads, layer.value_head_dim),
+            &Device::Cpu,
+        )?
+        .to_dtype(self.config.dtype)?)
+    }
+}
+
+impl CpuKvArena {
+    fn lower_decode_tables(&self, batch: &KvDecodeBatchMetadata) -> Result<Vec<LoweredDecodeRow>> {
+        batch
+            .sequences
+            .iter()
+            .enumerate()
+            .map(|(row, sequence)| {
+                if sequence.context_len == 0 {
+                    return Err(Error::InferenceError(format!(
+                        "CPU paged decode row {row} has an empty context"
+                    )));
+                }
+                let required_pages =
+                    (sequence.context_len as usize).div_ceil(self.config.page_tokens as usize);
+                if sequence.blocks.len() != required_pages {
+                    return Err(Error::InferenceError(format!(
+                        "CPU paged decode row {row} has {} pages, expected {required_pages}",
+                        sequence.blocks.len()
+                    )));
+                }
+                let pages = sequence
+                    .blocks
+                    .iter()
+                    .copied()
+                    .map(|block| self.validate_block(block))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(LoweredDecodeRow {
+                    pages,
+                    context_len: sequence.context_len as usize,
+                })
+            })
+            .collect()
+    }
+}
+
+struct LoweredDecodeRow {
+    pages: Vec<usize>,
+    context_len: usize,
+}
+
+fn validate_decode_query(query: &Tensor, dtype: DType) -> Result<()> {
+    if query.device().location() != Device::Cpu.location() {
+        return Err(Error::InferenceError(
+            "CPU paged decode queries must be on CPU".into(),
+        ));
+    }
+    if query.dtype() != dtype {
+        return Err(Error::InferenceError(format!(
+            "CPU paged decode query dtype {:?} does not match arena dtype {dtype:?}",
+            query.dtype()
+        )));
+    }
+    if !query.layout().is_contiguous() {
+        return Err(Error::InferenceError(
+            "CPU paged decode queries must be contiguous".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn online_paged_decode<T>(
+    keys: &[T],
+    values: &[T],
+    queries: &[T],
+    key_start: usize,
+    value_start: usize,
+    query_start: usize,
+    tables: &[LoweredDecodeRow],
+    page_tokens: usize,
+    kv_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    query_heads: usize,
+    softmax_scale: f32,
+) -> Result<Vec<f32>>
+where
+    T: Copy,
+    f32: From<T>,
+{
+    let batch_size = tables.len();
+    let mut output = vec![0.0f32; batch_size * query_heads * value_dim];
+    let queries_per_kv_head = query_heads / kv_heads;
+    let key_page_stride = page_tokens * kv_heads * key_dim;
+    let value_page_stride = page_tokens * kv_heads * value_dim;
+
+    for (row, table) in tables.iter().enumerate() {
+        for query_head in 0..query_heads {
+            let kv_head = query_head / queries_per_kv_head;
+            let query_offset = query_start + (row * query_heads + query_head) * key_dim;
+            let mut running_max = f32::NEG_INFINITY;
+            let mut running_sum = 0.0f32;
+            let mut accumulator = vec![0.0f32; value_dim];
+
+            for token in 0..table.context_len {
+                let page = table.pages[token / page_tokens];
+                let page_offset = token % page_tokens;
+                let key_offset = key_start
+                    + page * key_page_stride
+                    + (page_offset * kv_heads + kv_head) * key_dim;
+                let value_offset = value_start
+                    + page * value_page_stride
+                    + (page_offset * kv_heads + kv_head) * value_dim;
+                let mut score = 0.0f32;
+                for dim in 0..key_dim {
+                    score +=
+                        f32::from(queries[query_offset + dim]) * f32::from(keys[key_offset + dim]);
+                }
+                score *= softmax_scale;
+
+                let next_max = running_max.max(score);
+                let previous_weight = (running_max - next_max).exp();
+                let token_weight = (score - next_max).exp();
+                running_sum = running_sum * previous_weight + token_weight;
+                for dim in 0..value_dim {
+                    accumulator[dim] = accumulator[dim] * previous_weight
+                        + f32::from(values[value_offset + dim]) * token_weight;
+                }
+                running_max = next_max;
+            }
+
+            let output_offset = (row * query_heads + query_head) * value_dim;
+            for dim in 0..value_dim {
+                output[output_offset + dim] = accumulator[dim] / running_sum;
+            }
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Default)]
@@ -618,12 +855,12 @@ fn copy_storage_pages(
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{IndexOp, Storage};
+    use candle_core::IndexOp;
 
     use super::*;
     use crate::backends::kv::KvLayerConfig;
     use crate::engine::ModelInstanceId;
-    use crate::kv::{KvGroupId, KvSlotRef};
+    use crate::kv::{KvDecodeBatchMetadata, KvGroupId, KvSequenceBlockTable, KvSlotRef};
 
     const ARENA: KvArenaId = KvArenaId {
         model_instance: ModelInstanceId::new(41),
@@ -638,6 +875,10 @@ mod tests {
     };
 
     fn config(dtype: DType) -> KvArenaConfig {
+        config_with_heads(dtype, 2)
+    }
+
+    fn config_with_heads(dtype: DType, num_kv_heads: u32) -> KvArenaConfig {
         KvArenaConfig {
             id: ARENA,
             group: GROUP,
@@ -646,7 +887,7 @@ mod tests {
             dtype,
             layers: vec![KvLayerConfig {
                 binding: LAYER,
-                num_kv_heads: 2,
+                num_kv_heads,
                 key_head_dim: 2,
                 value_head_dim: 1,
             }],
@@ -670,6 +911,58 @@ mod tests {
             Storage::Cpu(CpuStorage::BF16(values)) => values.as_ptr() as usize,
             other => panic!("unexpected test storage: {:?}", other.dtype()),
         }
+    }
+
+    fn dense_reference(
+        queries: &[f32],
+        query_heads: usize,
+        keys: &[f32],
+        values: &[f32],
+        kv_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        logical_tokens: &[Vec<usize>],
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut output = Vec::new();
+        let queries_per_kv_head = query_heads / kv_heads;
+        for (row, tokens) in logical_tokens.iter().enumerate() {
+            for query_head in 0..query_heads {
+                let kv_head = query_head / queries_per_kv_head;
+                let query = &queries[(row * query_heads + query_head) * key_dim..][..key_dim];
+                let scores = tokens
+                    .iter()
+                    .map(|&token| {
+                        let key = &keys[(token * kv_heads + kv_head) * key_dim..][..key_dim];
+                        query
+                            .iter()
+                            .zip(key)
+                            .map(|(query, key)| query * key)
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect::<Vec<_>>();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores
+                    .iter()
+                    .map(|score| (score - max).exp())
+                    .collect::<Vec<_>>();
+                let sum = weights.iter().sum::<f32>();
+                for dim in 0..value_dim {
+                    output.push(
+                        tokens
+                            .iter()
+                            .zip(&weights)
+                            .map(|(&token, weight)| {
+                                values[(token * kv_heads + kv_head) * value_dim + dim] * weight
+                            })
+                            .sum::<f32>()
+                            / sum,
+                    );
+                }
+            }
+        }
+        output
     }
 
     #[test]
@@ -909,6 +1202,165 @@ mod tests {
                 destination: block(1),
             }])?;
             arena.zero_pages(&[block(0)])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn paged_decode_matches_dense_gqa_with_shuffled_ragged_tables() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let physical_slots = (0..3)
+            .flat_map(|page| {
+                (0..2).map(move |offset| KvSlotRef {
+                    block: block(page),
+                    offset,
+                })
+            })
+            .collect::<Vec<_>>();
+        let slot_map = arena.lower_slots(&physical_slots)?;
+        let keys = vec![
+            1., 0., 0., 1., // page 0, token 0
+            0., 1., 1., 0., // page 0, token 1
+            1., 1., 1., -1., // page 1, token 0
+            -1., 1., 2., 1., // page 1, token 1
+            2., 0., 0., 2., // page 2, token 0
+            0., 2., 2., 0., // page 2, token 1
+        ];
+        let values = vec![
+            1., 10., // page 0, token 0
+            2., 20., // page 0, token 1
+            3., 30., // page 1, token 0
+            4., 40., // page 1, token 1
+            5., 50., // page 2, token 0
+            6., 60., // page 2, token 1
+        ];
+        let key_tensor = Tensor::from_vec(keys.clone(), (6, 2, 2), &Device::Cpu)?;
+        let value_tensor = Tensor::from_vec(values.clone(), (6, 2, 1), &Device::Cpu)?;
+        arena.write_slots(
+            LAYER,
+            KvWriteArgs {
+                keys: &key_tensor,
+                values: &value_tensor,
+                slots: slot_map.as_ref(),
+            },
+        )?;
+
+        let query_values = vec![
+            1., 0., 0., 1., 1., 1., 1., -1., // row 0, four query heads
+            0.5, 1., 1., 0.5, -1., 1., 1., 1., // row 1
+        ];
+        let queries = Tensor::from_vec(query_values.clone(), (2, 4, 2), &Device::Cpu)?;
+        let batch = KvDecodeBatchMetadata {
+            sequences: vec![
+                KvSequenceBlockTable {
+                    blocks: vec![block(2), block(0)],
+                    context_len: 3,
+                },
+                KvSequenceBlockTable {
+                    blocks: vec![block(1)],
+                    context_len: 1,
+                },
+            ],
+        };
+        let scale = 1.0 / 2.0f32.sqrt();
+        let actual = arena
+            .paged_decode(
+                LAYER,
+                KvPagedDecodeArgs {
+                    queries: &queries,
+                    batch: &batch,
+                    softmax_scale: scale,
+                },
+            )?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        // Physical tokens 4, 5, 0 correspond to shuffled table [page 2, page 0]
+        // with a partial final page; row 1 contains only physical token 2.
+        let expected = dense_reference(
+            &query_values,
+            4,
+            &keys,
+            &values,
+            2,
+            2,
+            1,
+            &[vec![4, 5, 0], vec![2]],
+            scale,
+        );
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn paged_decode_supports_mha_and_mqa_head_mapping() -> Result<()> {
+        for (kv_heads, query_heads) in [(2, 2), (1, 4)] {
+            let arena = CpuKvArena::new(config_with_heads(DType::F32, kv_heads))?;
+            let slots = arena.lower_slots(&[
+                KvSlotRef {
+                    block: block(0),
+                    offset: 0,
+                },
+                KvSlotRef {
+                    block: block(0),
+                    offset: 1,
+                },
+            ])?;
+            let keys = (0..2 * kv_heads as usize * 2)
+                .map(|index| (index + 1) as f32 / 4.0)
+                .collect::<Vec<_>>();
+            let values = (0..2 * kv_heads as usize)
+                .map(|index| (index + 1) as f32)
+                .collect::<Vec<_>>();
+            let keys_tensor =
+                Tensor::from_vec(keys.clone(), (2, kv_heads as usize, 2), &Device::Cpu)?;
+            let values_tensor =
+                Tensor::from_vec(values.clone(), (2, kv_heads as usize, 1), &Device::Cpu)?;
+            arena.write_slots(
+                LAYER,
+                KvWriteArgs {
+                    keys: &keys_tensor,
+                    values: &values_tensor,
+                    slots: slots.as_ref(),
+                },
+            )?;
+            let query_values = (0..query_heads * 2)
+                .map(|index| (index + 1) as f32 / 3.0)
+                .collect::<Vec<_>>();
+            let queries =
+                Tensor::from_vec(query_values.clone(), (1, query_heads, 2), &Device::Cpu)?;
+            let batch = KvDecodeBatchMetadata {
+                sequences: vec![KvSequenceBlockTable {
+                    blocks: vec![block(0)],
+                    context_len: 2,
+                }],
+            };
+            let actual = arena
+                .paged_decode(
+                    LAYER,
+                    KvPagedDecodeArgs {
+                        queries: &queries,
+                        batch: &batch,
+                        softmax_scale: 0.5,
+                    },
+                )?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected = dense_reference(
+                &query_values,
+                query_heads,
+                &keys,
+                &values,
+                kv_heads as usize,
+                2,
+                1,
+                &[vec![0, 1]],
+                0.5,
+            );
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+            }
         }
         Ok(())
     }

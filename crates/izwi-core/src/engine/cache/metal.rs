@@ -30,11 +30,7 @@ pub struct MetalKVCacheConfig {
 
 impl Default for MetalKVCacheConfig {
     fn default() -> Self {
-        let base_config = KVCacheConfig {
-            // Metal performs better with F32, so adjust dtype_bytes
-            dtype_bytes: 4, // F32 instead of F16
-            ..Default::default()
-        };
+        let base_config = KVCacheConfig::default();
 
         Self {
             base_config,

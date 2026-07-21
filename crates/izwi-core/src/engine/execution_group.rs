@@ -36,6 +36,7 @@ pub(super) struct PreparedExecutionBatch {
     requests: Vec<Arc<EngineCoreRequest>>,
     scheduled: Vec<ScheduledRequest>,
     output_visibility: OutputVisibility,
+    managed_cache_reservations: Vec<super::ManagedCacheReservation>,
 }
 
 impl PreparedExecutionBatch {
@@ -50,7 +51,51 @@ impl PreparedExecutionBatch {
             requests,
             scheduled,
             output_visibility,
+            managed_cache_reservations: Vec::new(),
         }
+    }
+
+    pub(super) fn with_managed_cache_reservations(
+        mut self,
+        reservations: Vec<super::ManagedCacheReservation>,
+    ) -> crate::error::Result<Self> {
+        let rows = self
+            .physical_batch
+            .rows
+            .iter()
+            .map(|row| ((row.session.clone(), row.plan_id), row))
+            .collect::<HashMap<_, _>>();
+        let mut attached = HashSet::with_capacity(reservations.len());
+        for reservation in &reservations {
+            let key = (reservation.session.clone(), reservation.txn_id);
+            if !attached.insert(key.clone()) {
+                return Err(crate::error::Error::InvalidInput(
+                    "prepared batch contains a duplicate managed-cache reservation".to_string(),
+                ));
+            }
+            let row = rows.get(&key).ok_or_else(|| {
+                crate::error::Error::InvalidInput(
+                    "prepared batch contains a foreign managed-cache reservation".to_string(),
+                )
+            })?;
+            reservation.validate_for_row(row)?;
+            if row.managed_cache.as_ref() != Some(reservation) {
+                return Err(crate::error::Error::InvalidInput(
+                    "prepared managed-cache metadata differs from its row envelope".to_string(),
+                ));
+            }
+        }
+        if rows.values().any(|row| {
+            row.managed_cache.as_ref().is_some_and(|reservation| {
+                !attached.contains(&(reservation.session.clone(), reservation.txn_id))
+            })
+        }) {
+            return Err(crate::error::Error::InvalidInput(
+                "prepared batch omitted a row managed-cache reservation".to_string(),
+            ));
+        }
+        self.managed_cache_reservations = reservations;
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -100,6 +145,7 @@ impl ExecutedEngineStep {
                 changed = true;
                 result.safe_point = true;
                 result.staged_stream_outputs.clear();
+                result.managed_cache = None;
                 match kind {
                     StreamDeliveryFailureKind::Delivery => {
                         let message = "committed stream delivery failed";
@@ -155,6 +201,7 @@ impl ExecutedEngineStep {
                     .map(|result| PhysicalBatchRowReport {
                         execution: execution_report_from_result(result, batch.report.elapsed),
                         state: state_disposition(&result.disposition),
+                        managed_cache: result.managed_cache.clone(),
                     })
                     .collect();
             }
@@ -182,6 +229,8 @@ pub(super) struct ExecutedPhysicalBatch {
     pub(super) physical_batch: PhysicalBatch,
     pub(super) report: PhysicalBatchReport,
     pub(super) results: Vec<ExecutorStepResult>,
+    #[allow(dead_code)]
+    pub(super) managed_cache_reservations: Vec<super::ManagedCacheReservation>,
 }
 
 /// The sole owner of model-forward dispatch within one engine step.
@@ -467,6 +516,7 @@ fn apply_post_dispatch_deadlines(
         result.safe_point = true;
         result.provenance = OutcomeProvenance::deadline(phase, dispatch_state);
         result.staged_stream_outputs.clear();
+        result.managed_cache = None;
     }
 }
 
@@ -486,6 +536,7 @@ fn executed_batch(
         .map(|result| PhysicalBatchRowReport {
             execution: execution_report_from_result(result, elapsed),
             state: state_disposition(&result.disposition),
+            managed_cache: result.managed_cache.clone(),
         })
         .collect();
     let report = PhysicalBatchReport {
@@ -501,6 +552,7 @@ fn executed_batch(
         physical_batch: batch.physical_batch,
         report,
         results,
+        managed_cache_reservations: batch.managed_cache_reservations,
     }
 }
 
@@ -875,6 +927,7 @@ mod tests {
                     lane,
                     work: scheduled.work.clone(),
                     cost: WorkCost::new(1, 1, 0),
+                    managed_cache: None,
                 }],
                 materialized_tensor_elements: 1,
                 workspace: ResourceVector::zero(),
@@ -1064,6 +1117,7 @@ mod tests {
                 lane,
                 work: scheduled.work.clone(),
                 cost: WorkCost::new(1, 1, 1),
+                managed_cache: None,
             }],
             materialized_tensor_elements: 1,
             workspace: ResourceVector::temporary_workspace(1),
@@ -1174,6 +1228,7 @@ mod tests {
                     lane: lane.clone(),
                     work: scheduled.work.clone(),
                     cost: WorkCost::new(1, 1, 0),
+                    managed_cache: None,
                 })
                 .collect(),
             materialized_tensor_elements: 2,
@@ -1294,6 +1349,7 @@ mod tests {
                 lane,
                 work: scheduled.work.clone(),
                 cost: WorkCost::new(1, 1, 0),
+                managed_cache: None,
             }],
             materialized_tensor_elements: 1,
             workspace: ResourceVector::zero(),

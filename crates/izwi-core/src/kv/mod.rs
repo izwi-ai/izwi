@@ -9,7 +9,7 @@ mod batch;
 mod contract;
 mod resolved;
 
-pub use batch::{CacheBlockRef, KvSlotRef};
+pub use batch::{CacheBlockRef, KvDecodeBatchMetadata, KvSequenceBlockTable, KvSlotRef};
 pub use contract::{
     AttentionSemantics, CacheCapability, CacheDomainId, CacheTokenAxis, KeyEncoding,
     KvCacheContract, KvCacheContractProvider, KvContractAbi, KvDomainSpec, KvPrefixSemantics,
@@ -21,3 +21,6 @@ pub use resolved::{
     KvArenaId, KvGroupId, KvLayerBinding, KvPhysicalLayout, KvPlanFingerprint, KvPlanId,
     KvStorageFormat, PagedAttentionKernel, ResolvedKvGroup, ResolvedKvGroupKind, ResolvedKvPlan,
 };
+
+#[cfg(test)]
+pub(crate) use contract::test_contract;

@@ -22,6 +22,7 @@ use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
+use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     qwen3_runtime_profile_delta, qwen3_runtime_profile_snapshot, qwen3_runtime_profiling_enabled,
@@ -68,6 +69,18 @@ pub struct Qwen3AsrModel {
     text_model: Qwen3Model,
     mel: MelSpectrogram,
     preprocessor: PreprocessorConfig,
+}
+
+impl KvCacheContractProvider for Qwen3AsrModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        Ok(CacheCapability::Managed(
+            self.text_model.managed_kv_cache_contract(
+                CacheDomainId::new(0),
+                self.text_dtype,
+                default_kv_page_size(),
+            )?,
+        ))
+    }
 }
 
 pub struct AsrDecodeState {

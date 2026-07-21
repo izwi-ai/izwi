@@ -14,6 +14,11 @@ use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
+use crate::kv::{
+    AttentionSemantics, CacheDomainId, CacheTokenAxis, KeyEncoding, KvCacheContract, KvDomainSpec,
+    KvPrefixSemantics, KvStorageDType, KvStorageRequest, PageTokenConstraint,
+    PagedAttentionDomainSpec, PagedAttentionLayerSpec, CURRENT_KV_CONTRACT_ABI,
+};
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
@@ -87,6 +92,86 @@ impl Qwen3Config {
             .flatten()
             .filter(|window| *window > 0)
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Qwen3DecoderCacheGeometry {
+    pub domain: CacheDomainId,
+    pub token_axis: CacheTokenAxis,
+    pub num_layers: usize,
+    pub num_query_heads: usize,
+    pub num_kv_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub sliding_window: Option<usize>,
+    pub storage_dtype: DType,
+    pub preferred_page_tokens: usize,
+    pub prefix_semantics: KvPrefixSemantics,
+}
+
+pub(crate) fn qwen3_decoder_cache_domain(
+    geometry: Qwen3DecoderCacheGeometry,
+) -> Result<PagedAttentionDomainSpec> {
+    let num_layers = u32::try_from(geometry.num_layers)
+        .map_err(|_| Error::InvalidInput("Qwen3 layer count exceeds u32".into()))?;
+    let num_query_heads = u32::try_from(geometry.num_query_heads)
+        .map_err(|_| Error::InvalidInput("Qwen3 query head count exceeds u32".into()))?;
+    let num_kv_heads = u32::try_from(geometry.num_kv_heads)
+        .map_err(|_| Error::InvalidInput("Qwen3 KV head count exceeds u32".into()))?;
+    let key_head_dim = u32::try_from(geometry.key_head_dim)
+        .map_err(|_| Error::InvalidInput("Qwen3 key head dimension exceeds u32".into()))?;
+    let value_head_dim = u32::try_from(geometry.value_head_dim)
+        .map_err(|_| Error::InvalidInput("Qwen3 value head dimension exceeds u32".into()))?;
+    let preferred = u32::try_from(geometry.preferred_page_tokens.max(1))
+        .map_err(|_| Error::InvalidInput("Qwen3 page size exceeds u32".into()))?;
+    let max_page_tokens = preferred.max(256);
+    let attention = match geometry.sliding_window {
+        Some(window_tokens) => AttentionSemantics::SlidingWindow {
+            window_tokens: u32::try_from(window_tokens)
+                .map_err(|_| Error::InvalidInput("Qwen3 sliding window exceeds u32".into()))?,
+        },
+        None => AttentionSemantics::Full,
+    };
+    let storage_dtype = match geometry.storage_dtype {
+        DType::F32 => KvStorageDType::F32,
+        DType::F16 => KvStorageDType::F16,
+        DType::BF16 => KvStorageDType::Bf16,
+        dtype => {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed KV does not support {dtype:?} storage"
+            )))
+        }
+    };
+
+    let layers = (0..num_layers)
+        .map(|model_layer| PagedAttentionLayerSpec {
+            model_layer,
+            num_query_heads,
+            num_kv_heads,
+            key_head_dim,
+            value_head_dim,
+            attention,
+            key_encoding: KeyEncoding::Rotary {
+                rotary_dim: key_head_dim,
+            },
+        })
+        .collect();
+    Ok(PagedAttentionDomainSpec {
+        id: geometry.domain,
+        token_axis: geometry.token_axis,
+        layers,
+        page_tokens: PageTokenConstraint {
+            min: 1,
+            preferred,
+            max: max_page_tokens,
+            multiple_of: 1,
+        },
+        storage: KvStorageRequest {
+            dtypes: vec![storage_dtype],
+            allow_quantized: false,
+        },
+        prefix_semantics: geometry.prefix_semantics,
+    })
 }
 
 pub struct Qwen3Cache {
@@ -2063,6 +2148,35 @@ impl Default for Qwen3WeightLayout {
 }
 
 impl Qwen3Model {
+    pub(crate) fn managed_kv_cache_contract(
+        &self,
+        domain: CacheDomainId,
+        storage_dtype: DType,
+        preferred_page_tokens: usize,
+    ) -> Result<KvCacheContract> {
+        let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain,
+            token_axis: CacheTokenAxis::DecoderTokens,
+            num_layers: self.cfg.num_hidden_layers,
+            num_query_heads: self.cfg.num_attention_heads,
+            num_kv_heads: self.cfg.num_key_value_heads,
+            key_head_dim: self.cfg.head_dim(),
+            value_head_dim: self.cfg.head_dim(),
+            sliding_window: self.cfg.sliding_window(),
+            storage_dtype,
+            preferred_page_tokens,
+            prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+                positions: crate::kv::PositionSemantics::Absolute,
+            },
+        })?;
+        let contract = KvCacheContract {
+            abi: CURRENT_KV_CONTRACT_ABI,
+            domains: vec![KvDomainSpec::PagedAttention(cache_domain)],
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
     pub fn load(cfg: Qwen3Config, vb: VarBuilder) -> Result<Self> {
         Self::load_with_layout(cfg, vb, Qwen3WeightLayout::STANDARD)
     }
@@ -2681,6 +2795,31 @@ mod tests {
     use super::*;
     use candle_nn::rotary_emb;
     use std::collections::HashMap;
+
+    #[test]
+    fn cache_domain_is_derived_from_loaded_qwen3_geometry() {
+        let domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain: CacheDomainId::new(4),
+            token_axis: CacheTokenAxis::DecoderTokens,
+            num_layers: 3,
+            num_query_heads: 12,
+            num_kv_heads: 4,
+            key_head_dim: 80,
+            value_head_dim: 64,
+            sliding_window: Some(1024),
+            storage_dtype: DType::BF16,
+            preferred_page_tokens: 32,
+            prefix_semantics: KvPrefixSemantics::Disabled,
+        })
+        .unwrap();
+        assert_eq!(domain.layers.len(), 3);
+        assert_eq!(domain.layers[2].num_query_heads, 12);
+        assert_eq!(domain.layers[2].num_kv_heads, 4);
+        assert_eq!(domain.layers[2].key_head_dim, 80);
+        assert_eq!(domain.layers[2].value_head_dim, 64);
+        assert_eq!(domain.storage.dtypes, vec![KvStorageDType::Bf16]);
+        assert_eq!(domain.page_tokens.preferred, 32);
+    }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
         assert_eq!(lhs.dims(), rhs.dims());

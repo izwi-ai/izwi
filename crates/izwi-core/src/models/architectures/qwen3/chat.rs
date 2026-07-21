@@ -17,8 +17,10 @@ use crate::backends::DeviceProfile;
 use crate::backends::{open_gguf_reader, BackendKind};
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
+use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
@@ -156,6 +158,23 @@ pub struct Qwen3ChatModel {
     compute_dtype: Option<DType>,
     tokenizer: ChatTokenizer,
     backend: Qwen3ChatBackend,
+}
+
+impl KvCacheContractProvider for Qwen3ChatModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        match &self.backend {
+            Qwen3ChatBackend::Native { text_model } => Ok(CacheCapability::Managed(
+                text_model.managed_kv_cache_contract(
+                    CacheDomainId::new(0),
+                    self.compute_dtype.ok_or_else(|| {
+                        Error::InvalidInput("native Qwen3 chat KV dtype is unavailable".into())
+                    })?,
+                    default_kv_page_size(),
+                )?,
+            )),
+            Qwen3ChatBackend::Gguf { .. } => Ok(CacheCapability::OpaqueModelOwned),
+        }
+    }
 }
 
 impl Qwen3ChatModel {

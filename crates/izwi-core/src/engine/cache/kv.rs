@@ -33,7 +33,11 @@ pub struct PinnedBlockHandle {
     pub residency: CacheResidency,
 }
 
-/// Configuration for the KV cache.
+/// Configuration for the legacy scheduler's logical block metadata.
+///
+/// Geometry is populated only when an exact loaded-model contract is bound.
+/// Zero geometry means physical bytes are unknown; it must never be treated as
+/// a real tensor layout.
 #[derive(Debug, Clone)]
 pub struct KVCacheConfig {
     /// Number of transformer layers
@@ -53,21 +57,45 @@ pub struct KVCacheConfig {
 impl Default for KVCacheConfig {
     fn default() -> Self {
         Self {
-            num_layers: 24,
-            num_heads: 16,
-            head_dim: 64,
+            num_layers: 0,
+            num_heads: 0,
+            head_dim: 0,
             block_size: 16,
             max_blocks: 1024,
-            dtype_bytes: 2, // float16
+            dtype_bytes: 0,
         }
     }
 }
 
 impl KVCacheConfig {
+    pub fn logical_only(block_size: usize, max_blocks: usize) -> Self {
+        Self {
+            block_size: block_size.max(1),
+            max_blocks,
+            ..Self::default()
+        }
+    }
+
+    pub fn estimated_block_memory_bytes(&self) -> Option<usize> {
+        if self.num_layers == 0
+            || self.num_heads == 0
+            || self.head_dim == 0
+            || self.dtype_bytes == 0
+        {
+            return None;
+        }
+        2_usize
+            .checked_mul(self.block_size)?
+            .checked_mul(self.num_heads)?
+            .checked_mul(self.head_dim)?
+            .checked_mul(self.dtype_bytes)?
+            .checked_mul(self.num_layers)
+    }
+
     /// Calculate memory per block in bytes.
+    /// Returns zero when physical geometry is intentionally unknown.
     pub fn block_memory_bytes(&self) -> usize {
-        // 2 (K+V) * block_size * num_heads * head_dim * dtype_bytes * num_layers
-        2 * self.block_size * self.num_heads * self.head_dim * self.dtype_bytes * self.num_layers
+        self.estimated_block_memory_bytes().unwrap_or(0)
     }
 
     /// Calculate total memory for all blocks.
