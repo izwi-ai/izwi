@@ -22,11 +22,14 @@ use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
-use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
+use crate::kv::{
+    CacheCapability, CacheDomainId, KvCacheContractProvider, KvDomainSpec, KvPrefixSemantics,
+};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     qwen3_runtime_profile_delta, qwen3_runtime_profile_snapshot, qwen3_runtime_profiling_enabled,
-    Qwen3Cache, Qwen3Config, Qwen3Model, Qwen3RuntimeProfileSnapshot, RopeScalingConfig,
+    Qwen3Cache, Qwen3Config, Qwen3ManagedCache, Qwen3Model, Qwen3RuntimeProfileSnapshot,
+    RopeScalingConfig,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
@@ -72,19 +75,26 @@ pub struct Qwen3AsrModel {
 }
 
 pub(crate) const QWEN3_ASR_OPAQUE_KV_REASON: &str =
-    "qwen3_asr_decode_state_owns_qwen3_cache_and_has_no_managed_runtime_injection";
+    "qwen3_asr_engine_route_does_not_inject_managed_runtime";
 
 impl Qwen3AsrModel {
     /// Target semantic contract for the shared Qwen3 decoder.
     ///
     /// This is kept separate from the advertised loaded-model capability until
-    /// ASR decode accepts the engine's managed arena and writes receipts for it.
+    /// the ASR engine route supplies its transaction-owned reservation.
     pub(crate) fn managed_kv_cache_contract(&self) -> Result<crate::kv::KvCacheContract> {
-        self.text_model.managed_kv_cache_contract(
+        let mut contract = self.text_model.managed_kv_cache_contract(
             CacheDomainId::new(0),
             self.text_dtype,
             default_kv_page_size(),
-        )
+        )?;
+        for domain in &mut contract.domains {
+            if let KvDomainSpec::PagedAttention(domain) = domain {
+                domain.prefix_semantics = KvPrefixSemantics::Disabled;
+            }
+        }
+        contract.validate()?;
+        Ok(contract)
     }
 }
 
@@ -99,9 +109,13 @@ impl KvCacheContractProvider for Qwen3AsrModel {
 }
 
 pub struct AsrDecodeState {
-    cache: Qwen3Cache,
+    cache: AsrKvCache,
     embeds: Tensor,
     pos: usize,
+    /// Token emitted by the previous quantum but not yet appended to KV.
+    /// Deferring the write keeps physical progress aligned with the
+    /// scheduler's exact input range and transaction receipt.
+    pending_token: Option<u32>,
     language: Option<String>,
     generated_ids: Vec<u32>,
     visible_generated_ids: Vec<u32>,
@@ -115,13 +129,64 @@ pub struct AsrDecodeState {
     finished: bool,
 }
 
+enum AsrKvCache {
+    ModelOwned(Qwen3Cache),
+    Managed(Qwen3ManagedCache),
+}
+
+impl AsrKvCache {
+    fn page_size(&self) -> usize {
+        match self {
+            Self::ModelOwned(cache) => cache.page_size(),
+            Self::Managed(cache) => cache.arena().config().page_tokens as usize,
+        }
+    }
+
+    fn dense_decode_max_tokens(&self) -> usize {
+        match self {
+            Self::ModelOwned(cache) => cache.dense_decode_max_tokens(),
+            Self::Managed(_) => 0,
+        }
+    }
+}
+
 impl AsrDecodeState {
     /// All Candle backing allocations retained by this incremental session.
     pub fn session_cache_bytes(&self) -> Option<u64> {
         let mut accounting = TensorStorageAccounting::default();
-        self.cache.account_storage(&mut accounting)?;
+        if let AsrKvCache::ModelOwned(cache) = &self.cache {
+            cache.account_storage(&mut accounting)?;
+        }
         accounting.add_tensor(&self.embeds)?;
         Some(accounting.bytes())
+    }
+
+    pub(crate) fn uses_managed_kv(&self) -> bool {
+        matches!(self.cache, AsrKvCache::Managed(_))
+    }
+
+    pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
+        let AsrKvCache::Managed(current) = &self.cache else {
+            return Err(Error::InferenceError(
+                "a model-owned Qwen3 ASR session cannot switch to managed KV".to_string(),
+            ));
+        };
+        if current.arena().id() != cache.arena().id()
+            || current.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3 ASR session cannot switch managed KV authority".to_string(),
+            ));
+        }
+        if cache.context_len() != self.pos {
+            return Err(Error::InferenceError(format!(
+                "managed Qwen3 ASR reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.pos
+            )));
+        }
+        self.cache = AsrKvCache::Managed(cache);
+        Ok(())
     }
 }
 
@@ -593,7 +658,7 @@ impl Qwen3AsrModel {
         )
     }
 
-    fn execution_diagnostics(&self, cache: &Qwen3Cache) -> Qwen3AsrExecutionDiagnostics {
+    fn execution_diagnostics(&self, cache: &AsrKvCache) -> Qwen3AsrExecutionDiagnostics {
         let projection_diagnostics = self.text_model.projection_diagnostics();
         let text_projection_quantized = projection_diagnostics.quantized_projection_count > 0;
         let text_projection_backend = if text_projection_quantized {
@@ -797,6 +862,56 @@ impl Qwen3AsrModel {
         system_prompt: Option<&str>,
         max_new_tokens: usize,
     ) -> Result<AsrDecodeState> {
+        self.start_decode_with_prompt_and_cache(
+            audio,
+            sample_rate,
+            language,
+            system_prompt,
+            max_new_tokens,
+            None,
+        )
+    }
+
+    /// Start incremental ASR decode with scheduler-owned authoritative pages.
+    ///
+    /// The reservation must be a fresh ASR session covering the exact prompt
+    /// quantum. Later decode quanta replace its block-table view through
+    /// [`AsrDecodeState::install_managed_reservation`]. Prefix reuse is
+    /// deliberately rejected because audio-derived embeddings are not
+    /// represented by text token IDs.
+    pub(crate) fn start_decode_with_prompt_managed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: Qwen3ManagedCache,
+    ) -> Result<AsrDecodeState> {
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR managed cache must start with an empty multimodal context".to_string(),
+            ));
+        }
+        self.start_decode_with_prompt_and_cache(
+            audio,
+            sample_rate,
+            language,
+            system_prompt,
+            max_new_tokens,
+            Some(cache),
+        )
+    }
+
+    fn start_decode_with_prompt_and_cache(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        max_new_tokens: usize,
+        managed_cache: Option<Qwen3ManagedCache>,
+    ) -> Result<AsrDecodeState> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
                 "Qwen3-ForcedAligner models do not support transcription decode state.".to_string(),
@@ -854,7 +969,9 @@ impl Qwen3AsrModel {
         )?;
 
         let max_new_tokens = max_new_tokens.max(1);
-        let mut cache = self.build_decode_cache(prompt.ids.len(), max_new_tokens);
+        let mut cache = managed_cache.map(AsrKvCache::Managed).unwrap_or_else(|| {
+            AsrKvCache::ModelOwned(self.build_decode_cache(prompt.ids.len(), max_new_tokens))
+        });
         let execution = self.execution_diagnostics(&cache);
         let prefill_started = Instant::now();
         let embeds = self.forward_with_audio(
@@ -906,6 +1023,7 @@ impl Qwen3AsrModel {
             cache,
             embeds,
             pos,
+            pending_token: None,
             language: language.map(ToString::to_string),
             generated_ids: Vec::new(),
             visible_generated_ids: Vec::new(),
@@ -984,6 +1102,21 @@ impl Qwen3AsrModel {
             });
         }
 
+        if let Some(pending) = state.pending_token.take() {
+            let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
+            state.embeds = match &mut state.cache {
+                AsrKvCache::ModelOwned(cache) => {
+                    self.text_model
+                        .forward(&next_tensor, state.pos, Some(cache))?
+                }
+                AsrKvCache::Managed(cache) => {
+                    self.text_model
+                        .forward_managed(&next_tensor, state.pos, cache)?
+                }
+            };
+            state.pos += 1;
+        }
+
         let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
         let argmax_started = state
             .diagnostics
@@ -1008,6 +1141,7 @@ impl Qwen3AsrModel {
         }
 
         state.generated_ids.push(next);
+        state.pending_token = Some(next);
         if !is_special_generation_token(&self.specials, next) {
             state.visible_generated_ids.push(next);
         }
@@ -1016,12 +1150,6 @@ impl Qwen3AsrModel {
         } else {
             String::new()
         };
-
-        let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        state.embeds = self
-            .text_model
-            .forward(&next_tensor, state.pos, Some(&mut state.cache))?;
-        state.pos += 1;
 
         if state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
@@ -1099,7 +1227,8 @@ impl Qwen3AsrModel {
         )?;
 
         let max_tokens = 2048usize;
-        let mut cache = self.build_decode_cache(prompt.ids.len(), max_tokens);
+        let mut cache =
+            AsrKvCache::ModelOwned(self.build_decode_cache(prompt.ids.len(), max_tokens));
         let mut embeds = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
@@ -1122,9 +1251,10 @@ impl Qwen3AsrModel {
             generated.push(next);
 
             let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-            embeds = self
-                .text_model
-                .forward(&next_tensor, pos, Some(&mut cache))?;
+            let AsrKvCache::ModelOwned(cache) = &mut cache else {
+                unreachable!("forced alignment always uses a model-owned cache")
+            };
+            embeds = self.text_model.forward(&next_tensor, pos, Some(cache))?;
             pos += 1;
         }
 
@@ -1198,7 +1328,7 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let mut cache = self.build_decode_cache(prompt.ids.len(), 1);
+        let mut cache = AsrKvCache::ModelOwned(self.build_decode_cache(prompt.ids.len(), 1));
         let logits = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
@@ -1296,7 +1426,7 @@ impl Qwen3AsrModel {
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
-        cache: &mut Qwen3Cache,
+        cache: &mut AsrKvCache,
     ) -> Result<Tensor> {
         let embeds = self.text_model.embeddings(input_ids)?;
         let seq_len = embeds.dim(1)?;
@@ -1343,8 +1473,18 @@ impl Qwen3AsrModel {
         } else {
             None
         };
-        self.text_model
-            .forward_with_embeds(&embeds, 0, Some(cache), position_ids.as_ref())
+        match cache {
+            AsrKvCache::ModelOwned(cache) => {
+                self.text_model
+                    .forward_with_embeds(&embeds, 0, Some(cache), position_ids.as_ref())
+            }
+            AsrKvCache::Managed(cache) => self.text_model.forward_managed_with_embeds(
+                &embeds,
+                0,
+                cache,
+                position_ids.as_ref(),
+            ),
+        }
     }
 
     fn build_prompt(
@@ -2922,7 +3062,7 @@ mod tests {
     fn loaded_asr_capability_reason_is_stable_until_runtime_is_injected() {
         assert_eq!(
             QWEN3_ASR_OPAQUE_KV_REASON,
-            "qwen3_asr_decode_state_owns_qwen3_cache_and_has_no_managed_runtime_injection"
+            "qwen3_asr_engine_route_does_not_inject_managed_runtime"
         );
     }
 

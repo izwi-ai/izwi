@@ -568,6 +568,22 @@ impl NativeAsrDecodeState {
             Self::Nemotron(state) => state.session_cache_bytes(),
         }
     }
+
+    pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
+        matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
+    }
+
+    pub(crate) fn install_qwen3_managed_reservation(
+        &mut self,
+        cache: Qwen3ManagedCache,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.install_managed_reservation(cache),
+            Self::Nemotron(_) => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
+            )),
+        }
+    }
 }
 
 pub enum NativeAsrRealtimeState {
@@ -1266,6 +1282,35 @@ impl NativeAsrModel {
             )),
             Self::GraniteSpeech(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
+            )),
+        }
+    }
+
+    /// Start Qwen3 ASR with an exact scheduler-owned cache reservation.
+    /// Other ASR architectures fail closed until they provide their own
+    /// managed-cache adapter instead of being selected by family inference.
+    pub(crate) fn start_decode_state_with_prompt_managed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_new_tokens: usize,
+        cache: Qwen3ManagedCache,
+    ) -> Result<NativeAsrDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
+                model.start_decode_with_prompt_managed(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    max_new_tokens,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR model".to_string(),
             )),
         }
     }
