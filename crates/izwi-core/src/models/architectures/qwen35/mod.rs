@@ -1,5 +1,6 @@
 //! Qwen3.5 family implementations.
 
+mod cache;
 pub mod chat;
 mod text;
 mod vision;

@@ -14,6 +14,7 @@ use tracing::{debug, info};
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
+use crate::kv::{CacheCapability, KvCacheContract, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
@@ -21,6 +22,7 @@ use crate::models::shared::telemetry::record_prefill_token_mode_step;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
+use super::cache::{qwen35_composite_cache_contract, QWEN35_OPAQUE_KV_REASON};
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
@@ -422,6 +424,16 @@ pub struct Qwen35ChatModel {
     vision_model: Qwen35VisionModel,
 }
 
+impl KvCacheContractProvider for Qwen35ChatModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        Ok(CacheCapability::OpaqueModelOwned)
+    }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        Some(QWEN35_OPAQUE_KV_REASON)
+    }
+}
+
 impl Qwen35ChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let gguf_path = model_dir.join(qwen35_gguf_filename(variant)?);
@@ -491,6 +503,16 @@ impl Qwen35ChatModel {
 
     pub fn text_config(&self) -> &Qwen35TextConfig {
         &self.text_config
+    }
+
+    /// Target hybrid-state contract, exposed for backend negotiation tests and
+    /// future atomic adapter injection. It is not the advertised capability.
+    pub(crate) fn managed_composite_cache_contract(
+        &self,
+        attention_dtype: DType,
+        preferred_page_tokens: usize,
+    ) -> Result<KvCacheContract> {
+        qwen35_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
     }
 
     pub fn chat_template(&self) -> &str {

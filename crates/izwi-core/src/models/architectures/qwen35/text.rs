@@ -101,6 +101,50 @@ impl Qwen35TextRuntimeState {
         }
         Some(())
     }
+
+    /// Begin an isolated hybrid-state transition.
+    ///
+    /// Attention tails detach on write, while recurrent tensors and conv slots
+    /// are replaced by each transition. The live state is therefore unchanged
+    /// until the transaction is committed as one value replacement.
+    pub(crate) fn begin_composite_transaction(&self) -> Qwen35CompositeStateTransaction {
+        Qwen35CompositeStateTransaction {
+            expected_layers: self.layers.len(),
+            staged: self.clone(),
+        }
+    }
+}
+
+/// Provisional Qwen3.5 transition spanning full attention, recurrent state,
+/// and convolution history.
+///
+/// The current executor does not use this seam yet, so Qwen3.5 must continue to
+/// advertise `OpaqueModelOwned`. A future managed adapter can execute against
+/// `staged_mut`, publish backend receipts, then replace the live state only at
+/// the engine commit boundary.
+pub(crate) struct Qwen35CompositeStateTransaction {
+    expected_layers: usize,
+    staged: Qwen35TextRuntimeState,
+}
+
+impl Qwen35CompositeStateTransaction {
+    pub(crate) fn staged_mut(&mut self) -> &mut Qwen35TextRuntimeState {
+        &mut self.staged
+    }
+
+    pub(crate) fn commit(self, live: &mut Qwen35TextRuntimeState) -> Result<()> {
+        if live.layers.len() != self.expected_layers
+            || self.staged.layers.len() != self.expected_layers
+        {
+            return Err(Error::InferenceError(
+                "Qwen3.5 composite state changed shape during its transaction".to_string(),
+            ));
+        }
+        *live = self.staged;
+        Ok(())
+    }
+
+    pub(crate) fn abort(self) {}
 }
 
 /// Copy-on-write, geometrically growing head-major KV storage.
@@ -3233,5 +3277,56 @@ mod tests {
         assert_eq!(qwen35_page_count_for_tokens(64, 64).unwrap(), 1);
         assert_eq!(qwen35_page_count_for_tokens(65, 64).unwrap(), 2);
         assert!(qwen35_page_count_for_tokens(10, 0).is_err());
+    }
+
+    fn synthetic_composite_state() -> Qwen35TextRuntimeState {
+        Qwen35TextRuntimeState {
+            layers: vec![
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state: None,
+                    recurrent_state: None,
+                },
+                Qwen35LayerRuntimeState::Full {
+                    k_pages: Vec::new(),
+                    v_pages: Vec::new(),
+                    dense_k_cache_h: Qwen35DenseKvCache::default(),
+                    dense_v_cache_h: Qwen35DenseKvCache::default(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn composite_state_transaction_aborts_without_partial_publication() {
+        let live = synthetic_composite_state();
+        let mut transaction = live.begin_composite_transaction();
+        transaction.staged_mut().layers.swap(0, 1);
+        transaction.abort();
+
+        assert!(matches!(
+            live.layers[0],
+            Qwen35LayerRuntimeState::Linear { .. }
+        ));
+        assert!(matches!(
+            live.layers[1],
+            Qwen35LayerRuntimeState::Full { .. }
+        ));
+    }
+
+    #[test]
+    fn composite_state_transaction_commits_all_layer_kinds_together() {
+        let mut live = synthetic_composite_state();
+        let mut transaction = live.begin_composite_transaction();
+        transaction.staged_mut().layers.swap(0, 1);
+        transaction.commit(&mut live).unwrap();
+
+        assert!(matches!(
+            live.layers[0],
+            Qwen35LayerRuntimeState::Full { .. }
+        ));
+        assert!(matches!(
+            live.layers[1],
+            Qwen35LayerRuntimeState::Linear { .. }
+        ));
     }
 }

@@ -14,17 +14,15 @@ pub use batch::{CacheBlockRef, KvDecodeBatchMetadata, KvSequenceBlockTable, KvSl
 pub use contract::{
     AttentionSemantics, CacheCapability, CacheDomainId, CacheTokenAxis, KeyEncoding,
     KvCacheContract, KvCacheContractProvider, KvContractAbi, KvDomainSpec, KvPrefixSemantics,
-    KvStorageDType, KvStorageRequest, ModelStateDomainSpec, ModelStateKind, ModelStateLayerSpec,
-    PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PositionSemantics,
-    CURRENT_KV_CONTRACT_ABI,
+    KvStorageDType, KvStorageRequest, LoadedKvCacheCapability, ModelStateDomainSpec, ModelStateKind,
+    ModelStateLayerSpec, PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
+    PositionSemantics, CURRENT_KV_CONTRACT_ABI,
 };
 pub use resolved::{
     KvArenaId, KvGroupId, KvLayerBinding, KvPhysicalLayout, KvPlanFingerprint, KvPlanId,
     KvStorageFormat, PagedAttentionKernel, ResolvedKvGroup, ResolvedKvGroupKind, ResolvedKvPlan,
 };
-pub use residency::{
-    KvResidencyError, KvResidencyState, KvStorageTier, KvTransferId,
-};
+pub use residency::{KvResidencyError, KvResidencyState, KvStorageTier, KvTransferId};
 
 #[cfg(test)]
 pub(crate) use contract::test_contract;

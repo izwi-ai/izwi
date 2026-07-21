@@ -71,15 +71,30 @@ pub struct Qwen3AsrModel {
     preprocessor: PreprocessorConfig,
 }
 
+pub(crate) const QWEN3_ASR_OPAQUE_KV_REASON: &str =
+    "qwen3_asr_decode_state_owns_qwen3_cache_and_has_no_managed_runtime_injection";
+
+impl Qwen3AsrModel {
+    /// Target semantic contract for the shared Qwen3 decoder.
+    ///
+    /// This is kept separate from the advertised loaded-model capability until
+    /// ASR decode accepts the engine's managed arena and writes receipts for it.
+    pub(crate) fn managed_kv_cache_contract(&self) -> Result<crate::kv::KvCacheContract> {
+        self.text_model.managed_kv_cache_contract(
+            CacheDomainId::new(0),
+            self.text_dtype,
+            default_kv_page_size(),
+        )
+    }
+}
+
 impl KvCacheContractProvider for Qwen3AsrModel {
     fn kv_cache_contract(&self) -> Result<CacheCapability> {
-        Ok(CacheCapability::Managed(
-            self.text_model.managed_kv_cache_contract(
-                CacheDomainId::new(0),
-                self.text_dtype,
-                default_kv_page_size(),
-            )?,
-        ))
+        Ok(CacheCapability::OpaqueModelOwned)
+    }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        Some(QWEN3_ASR_OPAQUE_KV_REASON)
     }
 }
 
@@ -2901,6 +2916,14 @@ mod tests {
         assert!(qwen3_asr_gguf_qmatmul_text_policy(None));
         assert!(qwen3_asr_gguf_qmatmul_text_policy(Some(true)));
         assert!(!qwen3_asr_gguf_qmatmul_text_policy(Some(false)));
+    }
+
+    #[test]
+    fn loaded_asr_capability_reason_is_stable_until_runtime_is_injected() {
+        assert_eq!(
+            QWEN3_ASR_OPAQUE_KV_REASON,
+            "qwen3_asr_decode_state_owns_qwen3_cache_and_has_no_managed_runtime_injection"
+        );
     }
 
     #[test]

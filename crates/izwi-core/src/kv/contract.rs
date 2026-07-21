@@ -70,6 +70,54 @@ impl CacheCapability {
 /// Implemented by the loaded adapter/model boundary, never by catalog entries.
 pub trait KvCacheContractProvider {
     fn kv_cache_contract(&self) -> Result<CacheCapability>;
+
+    /// Stable, adapter-owned explanation for a deliberate opaque fallback.
+    ///
+    /// Engines may surface this in rollout diagnostics, but must never use the
+    /// text to infer cache geometry or select a model family path.
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn loaded_kv_cache_capability(&self) -> Result<LoadedKvCacheCapability> {
+        let capability = self.kv_cache_contract()?;
+        let fallback_reason = self.kv_cache_fallback_reason();
+        let loaded = LoadedKvCacheCapability {
+            capability,
+            fallback_reason,
+        };
+        loaded.validate()?;
+        Ok(loaded)
+    }
+}
+
+/// Cache capability resolved from one exact loaded adapter instance.
+///
+/// The reason is diagnostic only. Keeping it adjacent to the capability makes
+/// opaque fallback intentional and testable without teaching the engine about
+/// model families.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedKvCacheCapability {
+    pub capability: CacheCapability,
+    pub fallback_reason: Option<&'static str>,
+}
+
+impl LoadedKvCacheCapability {
+    pub fn validate(&self) -> Result<()> {
+        self.capability.validate()?;
+        match (&self.capability, self.fallback_reason) {
+            (CacheCapability::OpaqueModelOwned, Some(reason)) if !reason.trim().is_empty() => {
+                Ok(())
+            }
+            (CacheCapability::OpaqueModelOwned, _) => Err(invalid(
+                "opaque loaded-model KV capability requires a stable fallback reason",
+            )),
+            (_, None) => Ok(()),
+            (_, Some(_)) => Err(invalid(
+                "only opaque loaded-model KV capabilities may publish a fallback reason",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,5 +617,29 @@ mod tests {
         let capability = CacheCapability::OpaqueModelOwned;
         capability.validate().unwrap();
         assert!(capability.managed_contract().is_none());
+    }
+
+    #[test]
+    fn loaded_opaque_capability_requires_an_adapter_owned_reason() {
+        let missing = LoadedKvCacheCapability {
+            capability: CacheCapability::OpaqueModelOwned,
+            fallback_reason: None,
+        };
+        assert!(missing.validate().is_err());
+
+        let explicit = LoadedKvCacheCapability {
+            capability: CacheCapability::OpaqueModelOwned,
+            fallback_reason: Some("model_cache_has_no_runtime_injection"),
+        };
+        explicit.validate().unwrap();
+    }
+
+    #[test]
+    fn managed_capability_cannot_carry_an_opaque_fallback_reason() {
+        let invalid = LoadedKvCacheCapability {
+            capability: CacheCapability::Managed(test_contract()),
+            fallback_reason: Some("should_not_be_used"),
+        };
+        assert!(invalid.validate().is_err());
     }
 }

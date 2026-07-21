@@ -265,48 +265,79 @@ pub struct Qwen3TtsModel {
     kv_quantization: KvCacheQuantization,
 }
 
+pub(crate) const QWEN3_TTS_OPAQUE_KV_REASON: &str =
+    "qwen3_tts_decode_state_owns_talker_and_predictor_caches_without_managed_runtime_injection";
+
+impl Qwen3TtsModel {
+    /// Target two-domain contract for the talker and code predictor.
+    ///
+    /// The loaded adapter remains opaque until both cache owners consume one
+    /// engine transaction and return domain-complete write receipts.
+    pub(crate) fn managed_kv_cache_contract(&self) -> Result<KvCacheContract> {
+        qwen3_tts_managed_kv_cache_contract(
+            &self.config,
+            self.dtype,
+            self.code_predictor_dtype,
+            self.kv_page_size,
+        )
+    }
+}
+
 impl KvCacheContractProvider for Qwen3TtsModel {
     fn kv_cache_contract(&self) -> Result<CacheCapability> {
-        let talker = &self.config.talker_config;
-        let predictor = &talker.code_predictor_config;
-        let talker_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-            domain: CacheDomainId::new(0),
-            token_axis: CacheTokenAxis::Custom("qwen3_tts_talker_tokens".into()),
-            num_layers: talker.num_hidden_layers,
-            num_query_heads: talker.num_attention_heads,
-            num_kv_heads: talker.num_key_value_heads,
-            key_head_dim: talker.head_dim,
-            value_head_dim: talker.head_dim,
-            sliding_window: None,
-            storage_dtype: self.dtype,
-            preferred_page_tokens: self.kv_page_size,
-            prefix_semantics: KvPrefixSemantics::CommittedFullPages {
-                positions: PositionSemantics::Absolute,
-            },
-        })?;
-        let predictor_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-            domain: CacheDomainId::new(1),
-            token_axis: CacheTokenAxis::Custom("qwen3_tts_predictor_tokens".into()),
-            num_layers: predictor.num_hidden_layers,
-            num_query_heads: predictor.num_attention_heads,
-            num_kv_heads: predictor.num_key_value_heads,
-            key_head_dim: predictor.head_dim,
-            value_head_dim: predictor.head_dim,
-            sliding_window: None,
-            storage_dtype: self.code_predictor_dtype,
-            preferred_page_tokens: self.kv_page_size,
-            prefix_semantics: KvPrefixSemantics::Disabled,
-        })?;
-        let contract = KvCacheContract {
-            abi: CURRENT_KV_CONTRACT_ABI,
-            domains: vec![
-                KvDomainSpec::PagedAttention(talker_domain),
-                KvDomainSpec::PagedAttention(predictor_domain),
-            ],
-        };
-        contract.validate()?;
-        Ok(CacheCapability::Managed(contract))
+        Ok(CacheCapability::OpaqueModelOwned)
     }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        Some(QWEN3_TTS_OPAQUE_KV_REASON)
+    }
+}
+
+fn qwen3_tts_managed_kv_cache_contract(
+    config: &Qwen3TtsConfig,
+    talker_dtype: DType,
+    predictor_dtype: DType,
+    page_tokens: usize,
+) -> Result<KvCacheContract> {
+    let talker = &config.talker_config;
+    let predictor = &talker.code_predictor_config;
+    let talker_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+        domain: CacheDomainId::new(0),
+        token_axis: CacheTokenAxis::Custom("qwen3_tts_talker_tokens".into()),
+        num_layers: talker.num_hidden_layers,
+        num_query_heads: talker.num_attention_heads,
+        num_kv_heads: talker.num_key_value_heads,
+        key_head_dim: talker.head_dim,
+        value_head_dim: talker.head_dim,
+        sliding_window: None,
+        storage_dtype: talker_dtype,
+        preferred_page_tokens: page_tokens,
+        prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+            positions: PositionSemantics::Absolute,
+        },
+    })?;
+    let predictor_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+        domain: CacheDomainId::new(1),
+        token_axis: CacheTokenAxis::Custom("qwen3_tts_predictor_tokens".into()),
+        num_layers: predictor.num_hidden_layers,
+        num_query_heads: predictor.num_attention_heads,
+        num_kv_heads: predictor.num_key_value_heads,
+        key_head_dim: predictor.head_dim,
+        value_head_dim: predictor.head_dim,
+        sliding_window: None,
+        storage_dtype: predictor_dtype,
+        preferred_page_tokens: page_tokens,
+        prefix_semantics: KvPrefixSemantics::Disabled,
+    })?;
+    let contract = KvCacheContract {
+        abi: CURRENT_KV_CONTRACT_ABI,
+        domains: vec![
+            KvDomainSpec::PagedAttention(talker_domain),
+            KvDomainSpec::PagedAttention(predictor_domain),
+        ],
+    };
+    contract.validate()?;
+    Ok(contract)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3385,6 +3416,38 @@ mod tests {
                 codec_language_id: std::collections::HashMap::new(),
             },
         }
+    }
+
+    #[test]
+    fn target_managed_contract_keeps_talker_and_predictor_domains_distinct() {
+        let contract =
+            qwen3_tts_managed_kv_cache_contract(&cache_test_config(), DType::F16, DType::F32, 32)
+                .expect("target contract");
+        assert_eq!(contract.domains.len(), 2);
+
+        let KvDomainSpec::PagedAttention(talker) = &contract.domains[0] else {
+            panic!("talker domain must be paged attention");
+        };
+        let KvDomainSpec::PagedAttention(predictor) = &contract.domains[1] else {
+            panic!("predictor domain must be paged attention");
+        };
+        assert_eq!(talker.id, CacheDomainId::new(0));
+        assert_eq!(talker.layers.len(), 28);
+        assert_eq!(talker.storage.dtypes, vec![crate::kv::KvStorageDType::F16]);
+        assert_eq!(predictor.id, CacheDomainId::new(1));
+        assert_eq!(predictor.layers.len(), 5);
+        assert_eq!(
+            predictor.storage.dtypes,
+            vec![crate::kv::KvStorageDType::F32]
+        );
+    }
+
+    #[test]
+    fn loaded_tts_capability_reason_is_stable_until_runtime_is_injected() {
+        assert_eq!(
+            QWEN3_TTS_OPAQUE_KV_REASON,
+            "qwen3_tts_decode_state_owns_talker_and_predictor_caches_without_managed_runtime_injection"
+        );
     }
 
     #[test]
