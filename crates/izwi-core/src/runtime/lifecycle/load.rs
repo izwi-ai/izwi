@@ -11,7 +11,9 @@ use crate::engine::{
     ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
 };
 use crate::error::{Error, Result};
+use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
+use crate::runtime::adapters::{CapabilityKind, LoadedCacheActivation};
 use crate::runtime::lifecycle::controller::{
     ModelLifecycleController, SharedLoadFailure, SharedLoadOutcome,
 };
@@ -22,6 +24,19 @@ fn now_unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn managed_cache_activation_enabled(
+    backend: BackendKind,
+    rollout: crate::engine::KvRolloutState,
+) -> bool {
+    backend == BackendKind::Cpu
+        && matches!(
+            rollout,
+            crate::engine::KvRolloutState::ArenaOptIn
+                | crate::engine::KvRolloutState::Auto
+                | crate::engine::KvRolloutState::ArenaRequired
+        )
 }
 
 fn select_lru_eviction_candidate(
@@ -316,7 +331,35 @@ impl ModelLifecycleController {
             // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
             self.publish_loaded_model(instantiated).await?;
-            self.bind_loaded_model_bundle(variant, model_instance_id)?;
+            let cache_activation = if managed_cache_activation_enabled(
+                self.backend_router.context().backend_kind,
+                self.config.kv_rollout,
+            ) {
+                match self.model_registry.get_chat(variant).await {
+                    Some(loaded) => {
+                        let loaded_cache = loaded.loaded_kv_cache_capability()?;
+                        if matches!(
+                            loaded_cache.capability,
+                            crate::kv::CacheCapability::Managed(_)
+                        ) {
+                            Some(LoadedCacheActivation::new(
+                                CapabilityKind::Chat,
+                                loaded_cache,
+                            )?)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            self.bind_loaded_model_bundle_with_cache_capability(
+                variant,
+                model_instance_id,
+                cache_activation,
+            )?;
             // The physical allocation is now visible to the live provider.
             // Reconcile before Ready publication so it is no longer counted as
             // both pending ledger work and observed backend memory. CUDA drops
@@ -379,13 +422,11 @@ impl ModelLifecycleController {
                     return;
                 }
             };
-            let outcome = match AssertUnwindSafe(
-                controller.run_load_transaction_locked(
-                    variant,
-                    max_loaded_models,
-                    leader.generation,
-                ),
-            )
+            let outcome = match AssertUnwindSafe(controller.run_load_transaction_locked(
+                variant,
+                max_loaded_models,
+                leader.generation,
+            ))
             .catch_unwind()
             .await
             {

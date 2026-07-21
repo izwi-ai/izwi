@@ -10,7 +10,7 @@ use crate::engine::{
     NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
-use crate::kv::{CacheCapability, KvCacheContractProvider};
+use crate::kv::{CacheCapability, KvCacheContractProvider, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 use crate::runtime::rollout::ExecutionRolloutMode;
 
@@ -118,6 +118,10 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn cache_capability(&self) -> Result<CacheCapability> {
         Ok(CacheCapability::OpaqueModelOwned)
     }
+
+    fn cache_fallback_reason(&self) -> Option<&'static str> {
+        Some("loaded_adapter_uses_model_owned_cache")
+    }
 }
 
 impl<T> KvCacheContractProvider for T
@@ -126,6 +130,65 @@ where
 {
     fn kv_cache_contract(&self) -> Result<CacheCapability> {
         self.cache_capability()
+    }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        self.cache_fallback_reason()
+    }
+}
+
+#[derive(Debug)]
+struct CachePublishingExecutionAdapter {
+    inner: Arc<dyn LoadedExecutionAdapter>,
+    loaded_cache: LoadedKvCacheCapability,
+}
+
+impl LoadedExecutionAdapter for CachePublishingExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.inner.metadata()
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.inner.adapter_instance_id()
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        self.inner.adapter_abi_revision()
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        self.inner.contract(streaming)
+    }
+
+    fn cache_capability(&self) -> Result<CacheCapability> {
+        Ok(self.loaded_cache.capability.clone())
+    }
+
+    fn cache_fallback_reason(&self) -> Option<&'static str> {
+        self.loaded_cache.fallback_reason
+    }
+}
+
+/// Validated proof that one exact loaded model may activate cache semantics
+/// for its matching capability adapter. Backend/model rollout eligibility is
+/// decided by the concrete lifecycle/executor boundary before constructing
+/// this model-neutral value.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedCacheActivation {
+    capability: CapabilityKind,
+    loaded_cache: LoadedKvCacheCapability,
+}
+
+impl LoadedCacheActivation {
+    pub(crate) fn new(
+        capability: CapabilityKind,
+        loaded_cache: LoadedKvCacheCapability,
+    ) -> Result<Self> {
+        loaded_cache.validate()?;
+        Ok(Self {
+            capability,
+            loaded_cache,
+        })
     }
 }
 
@@ -721,6 +784,28 @@ impl LoadedModelBundle {
         model_variant: ModelVariant,
         backend_kind: BackendKind,
     ) -> Result<Self> {
+        Self::bind_with_cache_capability(
+            registry,
+            execution_group_id,
+            model_instance_id,
+            model_variant,
+            backend_kind,
+            None,
+        )
+    }
+
+    /// Bind adapter metadata to the exact loaded model's cache truth. The
+    /// override is accepted only for the matching capability after model
+    /// tensors have been published; catalog-only bundle construction remains
+    /// opaque.
+    pub(crate) fn bind_with_cache_capability(
+        registry: &RuntimeAdapterRegistry,
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+        cache_activation: Option<LoadedCacheActivation>,
+    ) -> Result<Self> {
         let metadata = registry.capabilities_for(model_variant);
         if metadata.is_empty() {
             return Err(Error::ModelLoadError(format!(
@@ -730,12 +815,20 @@ impl LoadedModelBundle {
 
         let mut adapters = HashMap::with_capacity(metadata.len());
         for metadata in metadata {
-            let adapter = registry.bind_loaded_adapter(
+            let mut adapter = registry.bind_loaded_adapter(
                 execution_group_id,
                 model_instance_id,
                 metadata,
                 backend_kind,
             )?;
+            if let Some(activation) = cache_activation.as_ref() {
+                if metadata.capability == activation.capability {
+                    adapter = Arc::new(CachePublishingExecutionAdapter {
+                        inner: adapter,
+                        loaded_cache: activation.loaded_cache.clone(),
+                    });
+                }
+            }
             if adapters.insert(metadata.capability, adapter).is_some() {
                 return Err(Error::ModelLoadError(format!(
                     "loaded model {model_variant} has duplicate {:?} adapters",
@@ -837,6 +930,48 @@ mod tests {
     use super::*;
     use crate::runtime::adapters::ExecutionTargetKind;
     use crate::runtime::rollout::ExecutionRolloutPolicy;
+
+    #[test]
+    fn exact_native_qwen3_cpu_bundle_publishes_managed_cache_only_with_runtime_proof() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let managed = CacheCapability::Managed(crate::kv::test_contract());
+        let activation = LoadedCacheActivation::new(
+            CapabilityKind::Chat,
+            LoadedKvCacheCapability {
+                capability: managed.clone(),
+                fallback_reason: None,
+            },
+        )
+        .unwrap();
+        let exact = LoadedModelBundle::bind_with_cache_capability(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(9),
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+            Some(activation),
+        )
+        .unwrap();
+        assert_eq!(
+            exact.kv_cache_capability(CapabilityKind::Chat).unwrap(),
+            managed
+        );
+
+        let catalog_only = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(10),
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_only
+                .kv_cache_capability(CapabilityKind::Chat)
+                .unwrap(),
+            CacheCapability::OpaqueModelOwned
+        );
+    }
 
     #[derive(Debug)]
     struct TestStaticTtsFactory {

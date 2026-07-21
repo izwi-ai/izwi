@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::{BackendPreference, BackendRouter};
+use crate::engine::KvRolloutState;
 
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +40,10 @@ pub struct EngineConfig {
     /// Number of threads for CPU operations
     #[serde(default = "default_num_threads")]
     pub num_threads: usize,
+
+    /// Physical KV-cache rollout policy. Defaults to legacy model-owned cache.
+    #[serde(default)]
+    pub kv_rollout: KvRolloutState,
 }
 
 impl Default for EngineConfig {
@@ -52,6 +57,7 @@ impl Default for EngineConfig {
             kv_page_size: default_kv_page_size(),
             backend: default_backend_preference(),
             num_threads: default_num_threads(),
+            kv_rollout: KvRolloutState::Legacy,
         }
     }
 }

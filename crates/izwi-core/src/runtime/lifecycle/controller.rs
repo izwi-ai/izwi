@@ -14,7 +14,7 @@ use crate::config::EngineConfig;
 use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
-use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+use crate::runtime::adapters::{LoadedCacheActivation, LoadedModelBundle, RuntimeAdapterRegistry};
 use crate::runtime::coordinator::InferenceCoordinator;
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -196,10 +196,7 @@ impl ModelLifecycleController {
         })
     }
 
-    pub(super) fn resident_instance_id(
-        &self,
-        variant: ModelVariant,
-    ) -> Option<ModelInstanceId> {
+    pub(super) fn resident_instance_id(&self, variant: ModelVariant) -> Option<ModelInstanceId> {
         self.state()
             .residents
             .get(&variant)
@@ -283,12 +280,22 @@ impl ModelLifecycleController {
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
     ) -> Result<Arc<LoadedModelBundle>> {
-        let bundle = Arc::new(LoadedModelBundle::bind(
+        self.bind_loaded_model_bundle_with_cache_capability(variant, model_instance_id, None)
+    }
+
+    pub(super) fn bind_loaded_model_bundle_with_cache_capability(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        cache_activation: Option<LoadedCacheActivation>,
+    ) -> Result<Arc<LoadedModelBundle>> {
+        let bundle = Arc::new(LoadedModelBundle::bind_with_cache_capability(
             &self.adapter_registry,
             self.coordinator.execution_group_id(),
             model_instance_id,
             variant,
             self.backend_router.context().backend_kind,
+            cache_activation,
         )?);
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {

@@ -12,6 +12,7 @@ use super::super::types::TaskType;
 use super::{
     ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult, NativeExecutor,
 };
+use crate::engine::ReadyQuantum;
 use crate::engine::{BatchDispatch, BatchDispatchKind};
 
 type RouteHandler =
@@ -98,6 +99,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled_req: &ScheduledRequest,
+        managed_cache: Option<&crate::engine::ManagedCacheReservation>,
     ) -> ModelSessionResult {
         let Some(request) = Self::find_request(requests, scheduled_req) else {
             return ModelSessionResult::atomic(ExecutorOutput::error(
@@ -122,9 +124,18 @@ impl NativeExecutor {
             ));
         };
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (route.handler)(self, request, scheduled_req)
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match managed_cache {
+                Some(reservation) if request.task_type == TaskType::Chat => {
+                    let cache =
+                        super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
+                    self.chat_request_with_managed_cache(request, scheduled_req, Some(cache))
+                }
+                Some(_) => Err(Error::InferenceError(
+                    "managed Qwen3 cache was routed to a non-chat executor".to_string(),
+                )),
+                None => (route.handler)(self, request, scheduled_req),
+            }));
 
         let result = match result {
             Ok(result) => result,
@@ -163,6 +174,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
     ) -> Result<Vec<ModelSessionResult>> {
         let worker_count = self.config.request_parallelism.min(scheduled.len()).max(1);
         let mut partitions: Vec<Vec<(usize, ScheduledRequest)>> = vec![Vec::new(); worker_count];
@@ -180,7 +192,13 @@ impl NativeExecutor {
                 scope.spawn(move || {
                     let mut local = Vec::with_capacity(chunk.len());
                     for (idx, scheduled_req) in chunk {
-                        let output = self.execute_single_request(requests, &scheduled_req);
+                        let managed_cache = rows.and_then(|rows| {
+                            rows.iter()
+                                .find(|row| row.plan_id == scheduled_req.plan_id)
+                                .and_then(|row| row.managed_cache.as_ref())
+                        });
+                        let output =
+                            self.execute_single_request(requests, &scheduled_req, managed_cache);
                         local.push((idx, output));
                     }
                     let _ = tx.send(local);
@@ -218,6 +236,15 @@ impl NativeExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ExecutorStepResult>> {
+        self.execute_requests_with_rows(requests, scheduled, None)
+    }
+
+    pub(super) fn execute_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
         // Reserve model-owned cache growth before any tensor state can be
         // allocated. The lease remains attached to the exact session until
         // finish, abort, failure cleanup, or recompute preemption.
@@ -225,19 +252,26 @@ impl NativeExecutor {
         self.prepare_scheduled_cache(scheduled)?;
         let (outputs, dispatch) = if self.can_parallelize_requests(scheduled.len()) {
             (
-                self.execute_requests_parallel(requests, scheduled)?,
+                self.execute_requests_parallel(requests, scheduled, rows)?,
                 BatchDispatch::new(BatchDispatchKind::RequestParallel, scheduled.len()),
             )
         } else {
             (
                 scheduled
                     .iter()
-                    .map(|scheduled_req| self.execute_single_request(requests, scheduled_req))
+                    .map(|scheduled_req| {
+                        let managed_cache = rows.and_then(|rows| {
+                            rows.iter()
+                                .find(|row| row.plan_id == scheduled_req.plan_id)
+                                .and_then(|row| row.managed_cache.as_ref())
+                        });
+                        self.execute_single_request(requests, scheduled_req, managed_cache)
+                    })
                     .collect(),
                 BatchDispatch::serial(),
             )
         };
-        self.finish_scheduled_execution(requests, scheduled, outputs, dispatch)
+        self.finish_scheduled_execution(requests, scheduled, outputs, dispatch, rows)
     }
 
     pub(super) fn execute_static_tts_requests(
@@ -266,6 +300,7 @@ impl NativeExecutor {
             scheduled,
             result.outputs,
             BatchDispatch::new(BatchDispatchKind::TensorStatic, result.tensor_width),
+            None,
         )
     }
 
@@ -274,14 +309,42 @@ impl NativeExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ExecutorStepResult>> {
+        self.execute_continuous_chat_requests_with_rows(requests, scheduled, None)
+    }
+
+    pub(super) fn execute_continuous_chat_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<ExecutorStepResult>> {
         self.reserve_scheduled_cache(requests, scheduled)?;
         self.prepare_scheduled_cache(scheduled)?;
-        let outputs = self.chat_decode_batch(requests, scheduled)?;
+        let managed_caches = scheduled
+            .iter()
+            .map(|scheduled| {
+                let reservation = rows
+                    .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                    .and_then(|row| row.managed_cache.as_ref());
+                let request = Self::find_request(requests, scheduled).ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous managed-cache row has no request snapshot".to_string(),
+                    )
+                })?;
+                reservation
+                    .map(|reservation| {
+                        super::qwen3_managed_cache_for_row(request, scheduled, reservation)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.chat_decode_batch_with_managed(requests, scheduled, managed_caches)?;
         self.finish_scheduled_execution(
             requests,
             scheduled,
             outputs,
             BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
+            rows,
         )
     }
 
@@ -291,6 +354,7 @@ impl NativeExecutor {
         scheduled: &[ScheduledRequest],
         outputs: Vec<ModelSessionResult>,
         dispatch: BatchDispatch,
+        rows: Option<&[ReadyQuantum]>,
     ) -> Result<Vec<ExecutorStepResult>> {
         if outputs.len() != scheduled.len() {
             return Err(Error::InferenceError(format!(
@@ -333,7 +397,7 @@ impl NativeExecutor {
                             .take_staged_stream_outputs()
                             .map(|staged| (observed, staged))
                     });
-                match reconciled {
+                let mut result = match reconciled {
                     Ok((observed, staged)) => ExecutorStepResult::from_session(
                         scheduled,
                         output.with_staged_stream_outputs(staged),
@@ -354,7 +418,18 @@ impl NativeExecutor {
                         .with_dispatch(dispatch)
                         .with_observed_resources(observed)
                     }
+                };
+                if result.output.error.is_none()
+                    && result.provenance.dispatch_state == super::DispatchState::ProducedOutput
+                {
+                    if let Some(reservation) = rows
+                        .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
+                        .and_then(|row| row.managed_cache.as_ref())
+                    {
+                        result.managed_cache = Some(reservation.completed_write_receipt());
+                    }
                 }
+                result
             })
             .collect())
     }
@@ -364,7 +439,13 @@ impl NativeExecutor {
 mod tests {
     use super::*;
     use crate::backends::BackendKind;
-    use crate::engine::{BatchDispatchKind, InputRange, SequencePhase, WorkUnit};
+    use crate::engine::cache::coordinator::GroupBlockTable;
+    use crate::engine::{
+        AdapterAbiRevision, AdapterInstanceId, BatchDispatchKind, BatchLaneKey, ExecutionGroupId,
+        InputRange, ManagedCacheDomainReservation, ManagedCacheReservation, ModelInstanceId,
+        SequencePhase, StageId, WorkCost, WorkUnit,
+    };
+    use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -407,7 +488,7 @@ mod tests {
             },
         };
 
-        let result = executor.execute_single_request(&[&request], &scheduled);
+        let result = executor.execute_single_request(&[&request], &scheduled, None);
         assert!(result.output.finished);
         assert!(result.output.error.is_none());
         assert_eq!(
@@ -450,5 +531,96 @@ mod tests {
                 .iter()
                 .all(|output| output.dispatch.width == expected_width));
         }
+    }
+
+    #[test]
+    fn successful_native_row_emits_receipt_for_its_exact_reserved_blocks() {
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        let mut request = EngineCoreRequest::tts("receipt");
+        request.id = "managed-receipt".to_string();
+        let scheduled = scheduled(&request.id, 7);
+        let arena = KvArenaId {
+            model_instance: ModelInstanceId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 2,
+        };
+        let block = CacheBlockRef {
+            arena,
+            group: KvGroupId::new(0),
+            index: 3,
+            slot_generation: 5,
+        };
+        let reservation = ManagedCacheReservation {
+            txn_id: scheduled.plan_id,
+            session: scheduled.session_key(),
+            domains: vec![ManagedCacheDomainReservation {
+                arena,
+                domain: CacheDomainId::new(0),
+                expected_version: 0,
+                expected_committed_tokens: 0,
+                target_committed_tokens: 1,
+                target_window_start: 0,
+                provisional_groups: vec![GroupBlockTable {
+                    group: KvGroupId::new(0),
+                    blocks: vec![block],
+                }],
+                writable_blocks: vec![block],
+            }],
+        };
+        let lane = BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(4),
+            adapter_instance: AdapterInstanceId::new(1),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(1),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "paged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "qwen3".to_string(),
+            kernel_mode: "reference".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "tokens.1".to_string(),
+        };
+        let rows = vec![ReadyQuantum {
+            plan_id: scheduled.plan_id,
+            session: scheduled.session_key(),
+            lane,
+            work: scheduled.work.clone(),
+            cost: WorkCost::new(1, 1, 0),
+            managed_cache: Some(reservation.clone()),
+        }];
+        let output = ModelSessionResult::atomic(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: None,
+            text: Some("done".to_string()),
+            input_transcription: None,
+            tokens_processed: 1,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        });
+
+        let result = executor
+            .finish_scheduled_execution(
+                &[&request],
+                std::slice::from_ref(&scheduled),
+                vec![output],
+                BatchDispatch::serial(),
+                Some(&rows),
+            )
+            .unwrap();
+        let receipt = result[0]
+            .managed_cache
+            .as_ref()
+            .expect("successful managed row must acknowledge writes");
+        assert_eq!(receipt.reservation, reservation);
+        assert_eq!(receipt.domains[0].written_blocks, vec![block]);
     }
 }

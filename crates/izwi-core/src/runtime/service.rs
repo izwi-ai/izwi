@@ -1093,6 +1093,7 @@ impl RuntimeService {
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
         core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
+        core_config.kv_rollout = config.kv_rollout;
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();

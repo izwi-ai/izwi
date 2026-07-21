@@ -22,6 +22,12 @@ pub enum KvRolloutState {
     ArenaRequired,
 }
 
+impl Default for KvRolloutState {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvSessionCacheMode {
     None,

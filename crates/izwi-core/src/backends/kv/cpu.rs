@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{
@@ -12,8 +13,8 @@ use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding,
 use crate::Result;
 
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvBackendRuntime, KvDeviceFence, KvPageCopy,
-    KvPagedDecodeArgs, KvSlotMap, KvWriteArgs,
+    DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvBackendRuntime, KvDeviceFence,
+    KvPageCopy, KvPagedDecodeArgs, KvSlotMap, KvWriteArgs,
 };
 
 #[derive(Debug)]
@@ -73,6 +74,10 @@ pub struct CpuKvArena {
     config: KvArenaConfig,
     layers: HashMap<KvLayerBinding, CpuLayerStorage>,
     mutation_lock: Mutex<()>,
+    slot_write_dispatches: AtomicU64,
+    paged_decode_dispatches: AtomicU64,
+    page_zero_dispatches: AtomicU64,
+    page_copy_dispatches: AtomicU64,
 }
 
 impl CpuKvArena {
@@ -112,6 +117,10 @@ impl CpuKvArena {
             config,
             layers,
             mutation_lock: Mutex::new(()),
+            slot_write_dispatches: AtomicU64::new(0),
+            paged_decode_dispatches: AtomicU64::new(0),
+            page_zero_dispatches: AtomicU64::new(0),
+            page_copy_dispatches: AtomicU64::new(0),
         })
     }
 
@@ -240,6 +249,7 @@ impl KvArena for CpuKvArena {
             layer.keys.inplace_op1(&op)?;
             layer.values.inplace_op1(&op)?;
         }
+        self.page_zero_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(ready_fence())
     }
 
@@ -274,6 +284,7 @@ impl KvArena for CpuKvArena {
             layer.keys.inplace_op1(&op)?;
             layer.values.inplace_op1(&op)?;
         }
+        self.page_copy_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(ready_fence())
     }
 
@@ -307,6 +318,7 @@ impl KvArena for CpuKvArena {
         layer
             .values
             .inplace_op3(args.values, &slots.flat_slots, &SlotScatterOp)?;
+        self.slot_write_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(ready_fence())
     }
 
@@ -408,12 +420,24 @@ impl KvArena for CpuKvArena {
             }
         }?;
 
-        Ok(Tensor::from_vec(
+        let output = Tensor::from_vec(
             output,
             (batch_size, query_heads, layer.value_head_dim),
             &Device::Cpu,
         )?
-        .to_dtype(self.config.dtype)?)
+        .to_dtype(self.config.dtype)?;
+        self.paged_decode_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(output)
+    }
+
+    fn operation_stats(&self) -> KvArenaOperationStats {
+        KvArenaOperationStats {
+            slot_write_dispatches: self.slot_write_dispatches.load(Ordering::Relaxed),
+            paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
+            page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
+            page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
+        }
     }
 
     fn drain(&self) -> Result<()> {

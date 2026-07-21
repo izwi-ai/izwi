@@ -83,6 +83,11 @@ impl Default for ManagedKvCacheManager {
 }
 
 impl ManagedKvCacheManager {
+    #[cfg(test)]
+    pub(crate) fn model_count(&self) -> usize {
+        self.models.len()
+    }
+
     pub(crate) fn new(resource_authority: Option<Arc<ResourceAuthority>>) -> Self {
         Self {
             models: HashMap::new(),

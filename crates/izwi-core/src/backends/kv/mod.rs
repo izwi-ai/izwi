@@ -56,6 +56,16 @@ pub struct KvPageCopy {
     pub destination: CacheBlockRef,
 }
 
+/// Monotonic physical-operation counters exposed without leaking arena
+/// tensors through the control-plane boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvArenaOperationStats {
+    pub slot_write_dispatches: u64,
+    pub paged_decode_dispatches: u64,
+    pub page_zero_dispatches: u64,
+    pub page_copy_dispatches: u64,
+}
+
 /// Backend-specific, immutable lowering of host slot references.
 ///
 /// Accelerator implementations can keep this mapping resident on device and
@@ -105,6 +115,10 @@ pub trait KvArena: Send + Sync {
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
     fn write_slots(&self, layer: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence>;
     fn paged_decode(&self, layer: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor>;
+
+    fn operation_stats(&self) -> KvArenaOperationStats {
+        KvArenaOperationStats::default()
+    }
 
     /// Wait until every operation that can still reference this arena's
     /// storage has completed. Model unload calls this before dropping the

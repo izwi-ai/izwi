@@ -38,6 +38,10 @@ pub struct ChatDecodeState {
     cache: ChatKvCache,
     embeds: Tensor,
     pos: usize,
+    /// Token already emitted to the caller but not yet appended to KV. The
+    /// next decode quantum consumes exactly this token, keeping physical KV
+    /// progress aligned with the scheduler's input range.
+    pending_token: Option<u32>,
     generated_ids: Vec<u32>,
     assembled: String,
     max_new_tokens: usize,
@@ -62,6 +66,30 @@ impl ChatDecodeState {
 
     pub fn uses_managed_kv(&self) -> bool {
         matches!(self.cache, ChatKvCache::Managed(_))
+    }
+
+    pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
+        let ChatKvCache::Managed(current) = &self.cache else {
+            return Err(Error::InferenceError(
+                "a model-owned Qwen3 session cannot switch to managed KV".to_string(),
+            ));
+        };
+        if current.arena().id() != cache.arena().id()
+            || current.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3 session cannot switch managed KV authority".to_string(),
+            ));
+        }
+        if cache.context_len() != self.pos {
+            return Err(Error::InferenceError(format!(
+                "managed Qwen3 reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.pos
+            )));
+        }
+        self.cache = ChatKvCache::Managed(cache);
+        Ok(())
     }
 }
 
@@ -186,6 +214,13 @@ impl KvCacheContractProvider for Qwen3ChatModel {
                 )?,
             )),
             Qwen3ChatBackend::Gguf { .. } => Ok(CacheCapability::OpaqueModelOwned),
+        }
+    }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        match &self.backend {
+            Qwen3ChatBackend::Native { .. } => None,
+            Qwen3ChatBackend::Gguf { .. } => Some("qwen3_gguf_cache_is_model_owned"),
         }
     }
 }
@@ -377,6 +412,7 @@ impl Qwen3ChatModel {
             cache: ChatKvCache::ModelOwned(cache),
             embeds,
             pos,
+            pending_token: None,
             generated_ids: Vec::new(),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
@@ -418,6 +454,7 @@ impl Qwen3ChatModel {
             cache: ChatKvCache::Managed(cache),
             embeds,
             pos,
+            pending_token: None,
             generated_ids: Vec::new(),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
@@ -446,6 +483,19 @@ impl Qwen3ChatModel {
             });
         }
 
+        if let Some(pending) = state.pending_token.take() {
+            let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
+            state.embeds = match &mut state.cache {
+                ChatKvCache::ModelOwned(cache) => {
+                    text_model.forward(&next_tensor, state.pos, Some(cache))?
+                }
+                ChatKvCache::Managed(cache) => {
+                    text_model.forward_managed(&next_tensor, state.pos, cache)?
+                }
+            };
+            state.pos += 1;
+        }
+
         let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
         let next = argmax(&logits)?;
 
@@ -463,20 +513,10 @@ impl Qwen3ChatModel {
         }
 
         state.generated_ids.push(next);
+        state.pending_token = Some(next);
         let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
         let delta = text_delta(&state.assembled, &decoded);
         state.assembled = decoded;
-
-        let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        state.embeds = match &mut state.cache {
-            ChatKvCache::ModelOwned(cache) => {
-                text_model.forward(&next_tensor, state.pos, Some(cache))?
-            }
-            ChatKvCache::Managed(cache) => {
-                text_model.forward_managed(&next_tensor, state.pos, cache)?
-            }
-        };
-        state.pos += 1;
 
         if state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
@@ -510,49 +550,18 @@ impl Qwen3ChatModel {
             return Ok(Vec::new());
         }
 
-        let mut next_tokens = Vec::with_capacity(states.len());
-        let mut steps = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
-            if state.finished || state.generated_ids.len() >= state.max_new_tokens {
-                return Err(Error::InvalidInput(
-                    "Continuous chat batch contains a terminal decode state".to_string(),
-                ));
-            }
-
-            let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
-            let next = argmax(&logits)?;
-            next_tokens.push(next);
-            if next == self.tokenizer.specials.im_end
-                || next == self.tokenizer.specials.eos
-                || self.tokenizer.specials.eos_alt == Some(next)
-            {
-                state.finished = true;
-                steps.push(ChatDecodeStep {
-                    delta: String::new(),
-                    text: state.assembled.trim().to_string(),
-                    tokens_generated: state.generated_ids.len(),
-                    finished: true,
-                });
-                continue;
-            }
-
-            state.generated_ids.push(next);
-            let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
-            let delta = text_delta(&state.assembled, &decoded);
-            state.assembled = decoded;
-            if state.generated_ids.len() >= state.max_new_tokens {
-                state.finished = true;
-            }
-            steps.push(ChatDecodeStep {
-                delta,
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: state.finished,
-            });
-        }
-
+        let pending_tokens = states
+            .iter_mut()
+            .map(|state| {
+                state.pending_token.take().ok_or_else(|| {
+                    Error::InferenceError(
+                        "continuous Qwen3 decode state has no scheduled input token".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let positions = states.iter().map(|state| state.pos).collect::<Vec<_>>();
-        let input_ids = Tensor::from_vec(next_tokens, (states.len(), 1), &self.device.device)?;
+        let input_ids = Tensor::from_vec(pending_tokens, (states.len(), 1), &self.device.device)?;
         let all_managed = states
             .iter()
             .all(|state| matches!(state.cache, ChatKvCache::Managed(_)));
@@ -582,15 +591,51 @@ impl Qwen3ChatModel {
                 "Qwen3 decode batch cannot mix model-owned and managed KV rows".to_string(),
             ));
         };
-
-        for (row_idx, state) in states.iter_mut().enumerate() {
-            // Stop rows participate in the tensor operation to preserve the
-            // physical batch width, but their terminal state is never reused.
-            if !steps[row_idx].finished || state.generated_ids.len() >= state.max_new_tokens {
-                state.embeds = next_logits.i(row_idx)?.unsqueeze(0)?;
-                state.pos = state.pos.saturating_add(1);
-            }
+        for (row, state) in states.iter_mut().enumerate() {
+            state.embeds = next_logits.i(row)?.unsqueeze(0)?;
+            state.pos = state.pos.saturating_add(1);
         }
+
+        let mut steps = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+                return Err(Error::InvalidInput(
+                    "Continuous chat batch contains a terminal decode state".to_string(),
+                ));
+            }
+
+            let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
+            let next = argmax(&logits)?;
+            if next == self.tokenizer.specials.im_end
+                || next == self.tokenizer.specials.eos
+                || self.tokenizer.specials.eos_alt == Some(next)
+            {
+                state.finished = true;
+                steps.push(ChatDecodeStep {
+                    delta: String::new(),
+                    text: state.assembled.trim().to_string(),
+                    tokens_generated: state.generated_ids.len(),
+                    finished: true,
+                });
+                continue;
+            }
+
+            state.generated_ids.push(next);
+            state.pending_token = Some(next);
+            let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
+            let delta = text_delta(&state.assembled, &decoded);
+            state.assembled = decoded;
+            if state.generated_ids.len() >= state.max_new_tokens {
+                state.finished = true;
+            }
+            steps.push(ChatDecodeStep {
+                delta,
+                text: state.assembled.trim().to_string(),
+                tokens_generated: state.generated_ids.len(),
+                finished: state.finished,
+            });
+        }
+
         Ok(steps)
     }
 

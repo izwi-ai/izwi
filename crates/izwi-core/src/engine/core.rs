@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::cache::managed::ManagedKvCacheManager;
+use super::cache::rollout::{
+    select_session_cache_authority, KvPlanCircuitBreaker, KvRolloutState, KvSessionCacheMode,
+};
 use super::config::EngineCoreConfig;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
@@ -342,6 +345,8 @@ pub struct EngineCore {
     kv_cache: KvCacheBackend,
     /// Physical managed-cache arenas and transactional block tables.
     managed_kv_cache: ManagedKvCacheManager,
+    /// Affects only authority selection for new sessions.
+    managed_kv_circuit_breaker: KvPlanCircuitBreaker,
     /// Model executor
     executor: UnifiedExecutor,
     /// Output processor
@@ -1501,6 +1506,7 @@ impl EngineCore {
             scheduler,
             kv_cache,
             managed_kv_cache: ManagedKvCacheManager::new(managed_resource_authority),
+            managed_kv_circuit_breaker: KvPlanCircuitBreaker::default(),
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -1564,24 +1570,49 @@ impl EngineCore {
         request.seal_execution_preparation()?;
         request.enforce_chat_context_window(self.config.max_seq_len)?;
 
-        if request.cache_capability().managed_contract().is_some() {
-            let model_instance = request.model_instance_id().ok_or_else(|| {
-                Error::InvalidInput(
-                    "managed KV request has no exact loaded-model instance".to_string(),
-                )
-            })?;
+        if let Some(model_instance) = request.model_instance_id() {
             let capability = request.cache_capability().clone();
-            let runtime = self
-                .managed_kv_cache
-                .bind_request(
+            let mut resolved_runtime = None;
+            let negotiated = if capability.managed_contract().is_some()
+                && matches!(
+                    self.config.kv_rollout,
+                    KvRolloutState::ArenaOptIn
+                        | KvRolloutState::Auto
+                        | KvRolloutState::ArenaRequired
+                ) {
+                match self.managed_kv_cache.bind_request(
                     model_instance,
                     self.config.backend,
                     self.config.max_blocks,
                     self.config.block_size,
                     &capability,
-                )?
-                .expect("managed capability resolves a runtime");
-            request.install_managed_cache_runtime(runtime)?;
+                ) {
+                    Ok(Some(runtime)) => {
+                        let fingerprint = runtime.plan().fingerprint();
+                        resolved_runtime = Some(runtime);
+                        Ok(fingerprint)
+                    }
+                    Ok(None) => Err("loaded adapter did not resolve a managed runtime".to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            } else {
+                Err("managed KV rollout is disabled for this session".to_string())
+            };
+            let authority = select_session_cache_authority(
+                model_instance,
+                self.config.kv_rollout,
+                &capability,
+                negotiated,
+                &self.managed_kv_circuit_breaker,
+            )
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            if matches!(authority.mode, KvSessionCacheMode::Managed { .. }) {
+                request.install_managed_cache_runtime(resolved_runtime.ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed KV authority was selected without a resolved runtime".to_string(),
+                    )
+                })?)?;
+            }
         }
 
         // Add to scheduler. A public ID remains unavailable while an expired
@@ -5340,6 +5371,7 @@ mod tests {
                 block_size: 16,
                 max_blocks: 4,
                 backend: BackendKind::Cpu,
+                kv_rollout: KvRolloutState::ArenaOptIn,
                 ..Default::default()
             },
             executor,
@@ -5380,6 +5412,77 @@ mod tests {
             .managed_kv_cache
             .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
             .is_none());
+    }
+
+    #[test]
+    fn legacy_and_shadow_rollout_do_not_allocate_or_switch_cache_authority() {
+        for rollout in [KvRolloutState::Legacy, KvRolloutState::ArenaShadow] {
+            let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+            let mut core = EngineCore::new_with_unified_executor(
+                EngineCoreConfig {
+                    backend: BackendKind::Cpu,
+                    kv_rollout: rollout,
+                    ..Default::default()
+                },
+                executor,
+            )
+            .unwrap();
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: "rollout".to_string(),
+            }])
+            .with_model_variant(ModelVariant::Qwen306B);
+            request.id = format!("rollout-{rollout:?}");
+            request
+                .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None)
+                .unwrap();
+            request
+                .bind_model_instance(ModelInstanceId::new(42))
+                .unwrap();
+            request
+                .bind_cache_capability(crate::kv::CacheCapability::Managed(
+                    crate::kv::test_contract(),
+                ))
+                .unwrap();
+
+            core.add_request(request).unwrap();
+            assert_eq!(core.managed_kv_cache.model_count(), 0);
+            assert!(core
+                .requests
+                .values()
+                .next()
+                .unwrap()
+                .managed_cache_runtime()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn required_rollout_rejects_an_opaque_loaded_adapter() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                kv_rollout: KvRolloutState::ArenaRequired,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "required".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1], None)
+            .unwrap();
+        request
+            .bind_model_instance(ModelInstanceId::new(43))
+            .unwrap();
+
+        let error = core.add_request(request).unwrap_err();
+        assert!(error.to_string().contains("managed KV cache is required"));
+        assert_eq!(core.managed_kv_cache.model_count(), 0);
     }
 
     #[test]

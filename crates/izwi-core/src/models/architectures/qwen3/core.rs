@@ -3580,19 +3580,23 @@ mod tests {
         let model = tiny_qwen3_model(&device);
         let mut owned = test_cache();
         let (arena, bindings) = test_managed_arena();
-        let mut managed = test_managed_cache(arena, bindings, 0);
+        let mut managed = test_managed_cache(arena.clone(), bindings, 0);
         let prompt = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
 
         let owned_prefill = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
         let managed_prefill = model.forward_managed(&prompt, 0, &mut managed).unwrap();
         assert_tensor_close(&owned_prefill, &managed_prefill);
         assert_eq!(managed.context_len(), 3);
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 0);
 
         let token = Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap();
         let owned_decode = model.forward(&token, 3, Some(&mut owned)).unwrap();
         let managed_decode = model.forward_managed(&token, 3, &mut managed).unwrap();
         assert_tensor_close(&owned_decode, &managed_decode);
         assert_eq!(managed.context_len(), 4);
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 2);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
     }
 
     #[test]
@@ -3603,7 +3607,7 @@ mod tests {
         let mut owned_b = test_cache();
         let (arena, bindings) = test_managed_arena();
         let mut managed_a = test_managed_cache(arena.clone(), bindings.clone(), 0);
-        let mut managed_b = test_managed_cache(arena, bindings, 4);
+        let mut managed_b = test_managed_cache(arena.clone(), bindings, 4);
         let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
         let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
         model.forward(&prompt_a, 0, Some(&mut owned_a)).unwrap();
@@ -3638,6 +3642,10 @@ mod tests {
         assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
         assert_eq!(managed_a.context_len(), 3);
         assert_eq!(managed_b.context_len(), 4);
+        // One batched slot write and one paged-attention call per layer, not
+        // one arena operation per ragged row.
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
     }
 
     #[test]

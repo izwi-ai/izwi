@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use super::cache::rollout::KvRolloutState;
 use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
 
@@ -129,6 +130,12 @@ pub struct EngineCoreConfig {
     /// Enable KV residency tiering hints during scheduling.
     #[serde(default = "default_enable_kv_tiering")]
     pub enable_kv_tiering: bool,
+
+    /// Pre-session authority policy for backend-owned physical KV arenas.
+    /// Legacy is the fail-closed default; a session never changes authority
+    /// after admission.
+    #[serde(default)]
+    pub kv_rollout: KvRolloutState,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -284,6 +291,7 @@ impl Default for EngineCoreConfig {
             enable_decode_quanta: default_enable_decode_quanta(),
             max_decode_tokens_per_request: default_max_decode_tokens_per_request(),
             enable_kv_tiering: default_enable_kv_tiering(),
+            kv_rollout: KvRolloutState::Legacy,
         }
     }
 }

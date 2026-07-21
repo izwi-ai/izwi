@@ -6,6 +6,7 @@ use tracing::debug;
 
 use crate::engine::resources::{ReservationClass, ReservationOwner, ResourceLease};
 use crate::error::{Error, Result};
+use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
 use crate::models::architectures::qwen35::chat::{Qwen35PrefixSnapshot, Qwen35PreparedPrompt};
 use crate::models::registry::NativeChatModel;
 use crate::models::shared::chat::ChatGenerationConfig;
@@ -96,6 +97,29 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
+        self.chat_request_with_managed_cache(request, scheduled, None)
+    }
+
+    pub(super) fn chat_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_cache: Option<Qwen3ManagedCache>,
+    ) -> Result<ModelSessionResult> {
+        if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+            return Err(Error::InferenceError(
+                "managed Qwen3 execution requires its exact row reservation".to_string(),
+            ));
+        }
+        if managed_cache.is_some()
+            && scheduled.is_prefill
+            && (scheduled.num_computed_tokens != 0
+                || scheduled.num_tokens != request.num_prompt_tokens())
+        {
+            return Err(Error::InvalidInput(
+                "managed Qwen3 chat requires one full-prompt prefill quantum".to_string(),
+            ));
+        }
         let prepared_qwen35_prompt = request.prepared_qwen35_prompt_for_executor()?;
         let variant = Self::resolve_variant(request)?;
         let messages = Self::chat_messages(request)?;
@@ -234,7 +258,16 @@ impl NativeExecutor {
             active_state = None;
         }
 
-        let mut active_state = if let Some(state) = active_state {
+        let mut active_state = if let Some(mut state) = active_state {
+            match managed_cache.take() {
+                Some(cache) => state.state.install_qwen3_managed_reservation(cache)?,
+                None if state.state.uses_managed_qwen3_kv() => {
+                    return Err(Error::InferenceError(
+                        "managed Qwen3 session lost its physical cache authority".to_string(),
+                    ))
+                }
+                None => {}
+            }
             state
         } else {
             if request.is_cancelled() {
@@ -267,16 +300,21 @@ impl NativeExecutor {
             let capture_prefix_max_bytes = pending_prefix_authorization
                 .as_ref()
                 .map(|authorization| authorization.max_bytes);
-            let mut decode_state = Self::run_blocking(|| {
-                model.start_decode_state_with_prefix(
-                    messages,
-                    max_new_tokens,
-                    &generation_config,
-                    prepared_qwen35_prompt,
-                    cached_prefix.as_ref().map(|cached| cached.snapshot()),
-                    capture_prefix_max_bytes,
-                )
-            })?;
+            let mut decode_state = match managed_cache.take() {
+                Some(cache) => Self::run_blocking(|| {
+                    model.start_qwen3_decode_state_managed(messages, max_new_tokens, cache)
+                })?,
+                None => Self::run_blocking(|| {
+                    model.start_decode_state_with_prefix(
+                        messages,
+                        max_new_tokens,
+                        &generation_config,
+                        prepared_qwen35_prompt,
+                        cached_prefix.as_ref().map(|cached| cached.snapshot()),
+                        capture_prefix_max_bytes,
+                    )
+                })?,
+            };
             let reused_prefix_tokens = decode_state.reused_qwen35_prefix_tokens();
             if reused_prefix_tokens > 0 {
                 debug!(
@@ -401,6 +439,19 @@ impl NativeExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> Result<Vec<ModelSessionResult>> {
+        self.chat_decode_batch_with_managed(
+            requests,
+            scheduled,
+            (0..scheduled.len()).map(|_| None).collect(),
+        )
+    }
+
+    pub(super) fn chat_decode_batch_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        managed_caches: Vec<Option<Qwen3ManagedCache>>,
+    ) -> Result<Vec<ModelSessionResult>> {
         if scheduled.is_empty()
             || scheduled
                 .iter()
@@ -408,6 +459,11 @@ impl NativeExecutor {
         {
             return Err(Error::InvalidInput(
                 "continuous chat execution requires one decode token per row".to_string(),
+            ));
+        }
+        if managed_caches.len() != scheduled.len() {
+            return Err(Error::InvalidInput(
+                "continuous chat managed-cache rows do not match batch width".to_string(),
             ));
         }
         let ordered_requests = scheduled
@@ -468,6 +524,29 @@ impl NativeExecutor {
                 })
                 .collect::<Vec<_>>()
         };
+
+        for ((request, active_state), managed_cache) in ordered_requests
+            .iter()
+            .zip(active_states.iter_mut())
+            .zip(managed_caches)
+        {
+            if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+                return Err(Error::InferenceError(
+                    "continuous managed Qwen3 row lost its reservation".to_string(),
+                ));
+            }
+            match managed_cache {
+                Some(cache) => active_state
+                    .state
+                    .install_qwen3_managed_reservation(cache)?,
+                None if active_state.state.uses_managed_qwen3_kv() => {
+                    return Err(Error::InferenceError(
+                        "continuous managed Qwen3 session changed cache authority".to_string(),
+                    ))
+                }
+                None => {}
+            }
+        }
 
         let mut state_refs = active_states
             .iter_mut()

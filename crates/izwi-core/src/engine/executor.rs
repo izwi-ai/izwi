@@ -52,12 +52,74 @@ use crate::backends::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
 use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
 use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::ModelRegistry;
 use prefix_cache::{configured_qwen35_prefix_cache_bytes, ExactPrefixCache};
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
+
+fn qwen3_managed_cache_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<Qwen3ManagedCache> {
+    if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
+        return Err(Error::InferenceError(
+            "managed Qwen3 reservation crossed its scheduled row fence".to_string(),
+        ));
+    }
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed Qwen3 row has no model runtime".to_string())
+    })?;
+    if reservation.domains.len() != 1 {
+        return Err(Error::InvalidInput(
+            "native Qwen3 chat requires exactly one managed KV domain".to_string(),
+        ));
+    }
+    let domain = &reservation.domains[0];
+    if runtime.plan().model_instance != domain.arena.model_instance
+        || runtime.plan().backend != BackendKind::Cpu
+    {
+        return Err(Error::InferenceError(
+            "managed Qwen3 reservation does not match its loaded CPU runtime".to_string(),
+        ));
+    }
+    let group = runtime
+        .plan()
+        .groups
+        .iter()
+        .find(|group| group.arena == domain.arena && group.domain == domain.domain)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "managed Qwen3 reservation references an unresolved arena domain".to_string(),
+            )
+        })?;
+    let crate::kv::ResolvedKvGroupKind::PagedAttention { layers } = &group.kind else {
+        return Err(Error::InvalidInput(
+            "native Qwen3 chat cannot consume a model-state KV group".to_string(),
+        ));
+    };
+    let table = domain
+        .provisional_groups
+        .iter()
+        .find(|table| table.group == group.id)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "managed Qwen3 reservation omitted its resolved block table".to_string(),
+            )
+        })?;
+    let arena = runtime.arena(group.arena).ok_or_else(|| {
+        Error::InferenceError("managed Qwen3 arena is no longer live".to_string())
+    })?;
+    Qwen3ManagedCache::new(
+        arena.clone(),
+        layers.clone(),
+        table.blocks.clone(),
+        domain.expected_committed_tokens as usize,
+    )
+}
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
@@ -1320,6 +1382,9 @@ impl ModelExecutor for NativeExecutor {
             };
             profile.max_batch_size = request_parallel_width;
         }
+        if request.managed_cache_runtime().is_some() {
+            profile.cache_mode = CacheMode::ExternalPaged;
+        }
         Some(profile)
     }
 
@@ -1398,15 +1463,27 @@ impl ModelExecutor for NativeExecutor {
                 ));
             }
             return self
-                .execute_continuous_chat_requests(execution.requests, execution.scheduled)
+                .execute_continuous_chat_requests_with_rows(
+                    execution.requests,
+                    execution.scheduled,
+                    Some(&execution.batch.rows),
+                )
                 .map_err(|error| {
                     PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
                 });
         }
         let result = if execution.is_prefill() {
-            self.execute_prefill(execution.requests, execution.scheduled)
+            self.execute_requests_with_rows(
+                execution.requests,
+                execution.scheduled,
+                Some(&execution.batch.rows),
+            )
         } else {
-            self.execute_decode(execution.requests, execution.scheduled)
+            self.execute_requests_with_rows(
+                execution.requests,
+                execution.scheduled,
+                Some(&execution.batch.rows),
+            )
         };
         result.map_err(|error| {
             PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)

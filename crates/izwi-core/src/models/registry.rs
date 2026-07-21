@@ -14,6 +14,7 @@ use tracing::info;
 use crate::backends::{DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
 use crate::error::{Error, Result};
+use crate::kv::{CacheCapability, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
@@ -1652,6 +1653,26 @@ pub enum NativeChatModel {
     Lfm2(Lfm2ChatModel),
 }
 
+impl KvCacheContractProvider for NativeChatModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        match self {
+            Self::Qwen3(model) => model.kv_cache_contract(),
+            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => {
+                Ok(CacheCapability::OpaqueModelOwned)
+            }
+        }
+    }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Qwen3(model) => model.kv_cache_fallback_reason(),
+            Self::Qwen35(_) => Some("qwen35_cache_has_no_managed_runtime_injection"),
+            Self::Gemma3(_) => Some("gemma3_cache_has_no_managed_runtime_injection"),
+            Self::Lfm2(_) => Some("lfm2_cache_has_no_managed_runtime_injection"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ModelUseState {
     active: AtomicUsize,
@@ -1834,6 +1855,22 @@ impl NativeChatDecodeState {
             Self::Qwen35(state) => state.reused_prefix_tokens(),
             Self::Qwen3(_) => 0,
         }
+    }
+
+    pub(crate) fn install_qwen3_managed_reservation(
+        &mut self,
+        cache: Qwen3ManagedCache,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen3(state) => state.install_managed_reservation(cache),
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was routed to Qwen3.5 state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
+        matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
     }
 }
 
@@ -2227,11 +2264,7 @@ impl LoadedModelActualRuntime {
         }
     }
 
-    fn from_diagnostics(
-        diagnostics: &Value,
-        device_pointer: &str,
-        dtype_pointer: &str,
-    ) -> Self {
+    fn from_diagnostics(diagnostics: &Value, device_pointer: &str, dtype_pointer: &str) -> Self {
         Self::from_values(
             diagnostics.pointer(device_pointer).and_then(Value::as_str),
             diagnostics.pointer(dtype_pointer).and_then(Value::as_str),
@@ -2340,11 +2373,8 @@ fn native_asr_runtime_diagnostics(
         }
         NativeAsrModel::GraniteSpeech(model) => {
             let diagnostics = model.diagnostics_summary();
-            let actual_runtime = LoadedModelActualRuntime::from_diagnostics(
-                &diagnostics,
-                "/device_kind",
-                "/dtype",
-            );
+            let actual_runtime =
+                LoadedModelActualRuntime::from_diagnostics(&diagnostics, "/device_kind", "/dtype");
             (actual_runtime, Some(diagnostics))
         }
         _ => (LoadedModelActualRuntime::default(), None),
