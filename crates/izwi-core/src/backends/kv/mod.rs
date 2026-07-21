@@ -105,6 +105,11 @@ pub trait KvArena: Send + Sync {
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
     fn write_slots(&self, layer: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence>;
     fn paged_decode(&self, layer: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor>;
+
+    /// Wait until every operation that can still reference this arena's
+    /// storage has completed. Model unload calls this before dropping the
+    /// arena generation and its physical resource lease.
+    fn drain(&self) -> Result<()>;
 }
 
 /// Allocates backend-owned arenas from resolved physical configurations.

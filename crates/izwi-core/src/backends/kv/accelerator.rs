@@ -495,6 +495,11 @@ impl KvArena for CandleAcceleratorKvArena {
             self.backend
         )))
     }
+
+    fn drain(&self) -> Result<()> {
+        self.device.synchronize()?;
+        Ok(())
+    }
 }
 
 /// Complete managed CUDA runtime, available only with Candle's paged

@@ -17,7 +17,8 @@ use crate::backends::kv::{
 use crate::backends::BackendKind;
 use crate::engine::{
     ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation, ModelInstanceId,
-    PlanId, SessionKey, WorkUnit,
+    PlanId, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
+    ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
 #[cfg(test)]
@@ -64,16 +65,32 @@ struct ManagedKvModelState {
     runtime: Arc<ManagedKvModelRuntime>,
     coordinators: HashMap<KvArenaId, KvCacheCoordinator>,
     registered_sessions: HashSet<SessionKey>,
+    resource_lease: Option<ResourceLease>,
 }
 
 /// Engine-owned managed-cache registry. Arena backing is allocated once per
 /// exact model instance; row transactions only change page ownership.
-#[derive(Default)]
 pub(crate) struct ManagedKvCacheManager {
     models: HashMap<ModelInstanceId, ManagedKvModelState>,
+    resource_authority: Option<Arc<ResourceAuthority>>,
+    next_arena_generation: u32,
+}
+
+impl Default for ManagedKvCacheManager {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl ManagedKvCacheManager {
+    pub(crate) fn new(resource_authority: Option<Arc<ResourceAuthority>>) -> Self {
+        Self {
+            models: HashMap::new(),
+            resource_authority,
+            next_arena_generation: 1,
+        }
+    }
+
     pub(crate) fn bind_request(
         &mut self,
         model_instance: ModelInstanceId,
@@ -113,6 +130,7 @@ impl ManagedKvCacheManager {
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".to_string()))?;
         let backend_runtime = CpuKvBackendRuntime;
+        let first_arena_generation = self.next_arena_generation;
         let plan = backend_runtime.negotiate(
             contract,
             &KvBackendPlanRequest {
@@ -122,13 +140,19 @@ impl ManagedKvCacheManager {
                 capacity_pages,
                 page_tokens_hint: Some(page_tokens_hint),
                 storage_dtype_hint: None,
-                first_arena_generation: 1,
+                first_arena_generation,
             },
         )?;
 
+        let physical_bytes = plan_physical_bytes(&plan)?;
+        let resources = managed_arena_resources(backend, physical_bytes);
+        let resource_lease = self
+            .resource_authority
+            .as_ref()
+            .map(|authority| reserve_managed_arena(authority, model_instance, backend, resources))
+            .transpose()?;
         let mut arenas = HashMap::with_capacity(plan.groups.len());
         let mut coordinators = HashMap::with_capacity(plan.groups.len());
-        let mut physical_bytes = 0_u64;
         for group in &plan.groups {
             let config = arena_config(contract, group)?;
             let arena = backend_runtime.allocate_arena(config)?;
@@ -141,16 +165,9 @@ impl ManagedKvCacheManager {
                 group.arena,
                 KvCacheCoordinator::new(group.arena, group.capacity_pages as usize),
             );
-            physical_bytes = physical_bytes
-                .checked_add(
-                    group
-                        .bytes_per_page
-                        .checked_mul(u64::from(group.capacity_pages))
-                        .ok_or_else(|| {
-                            Error::Overloaded("managed KV byte total overflow".into())
-                        })?,
-                )
-                .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))?;
+        }
+        if let Some(lease) = resource_lease.as_ref() {
+            lease.record_materialized_usage(resources)?;
         }
         let runtime = Arc::new(ManagedKvModelRuntime {
             plan: Arc::new(plan),
@@ -164,8 +181,14 @@ impl ManagedKvCacheManager {
                 runtime: runtime.clone(),
                 coordinators,
                 registered_sessions: HashSet::new(),
+                resource_lease,
             },
         );
+        self.next_arena_generation = first_arena_generation
+            .checked_add(u32::try_from(runtime.plan.groups.len()).map_err(|_| {
+                Error::InvalidInput("managed KV arena count exceeds u32".to_string())
+            })?)
+            .ok_or_else(|| Error::InvalidInput("managed KV arena generation overflow".into()))?;
         Ok(Some(runtime))
     }
 
@@ -384,6 +407,56 @@ impl ManagedKvCacheManager {
         Ok(())
     }
 
+    /// Drain and retire every arena belonging to one exact loaded-model
+    /// generation. The model-scoped physical lease is retained until no
+    /// session, row transaction, device fence, or external runtime handle can
+    /// still reference the backing storage.
+    pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
+        let Some(state) = self.models.get(&model_instance) else {
+            return Ok(false);
+        };
+        if !state.registered_sessions.is_empty() {
+            return Err(Error::InferenceError(format!(
+                "managed KV model {} still has registered sessions",
+                model_instance.get()
+            )));
+        }
+        if Arc::strong_count(&state.runtime) != 1 {
+            return Err(Error::InferenceError(format!(
+                "managed KV model {} still has live runtime handles",
+                model_instance.get()
+            )));
+        }
+        for coordinator in state.coordinators.values() {
+            let stats = coordinator.stats();
+            if stats.allocated_pages != 0
+                || stats.table_refs != 0
+                || stats.prefix_refs != 0
+                || stats.execution_pins != 0
+                || stats.transfer_pins != 0
+                || stats.reservations != 0
+                || stats.active_transactions != 0
+            {
+                return Err(Error::InferenceError(format!(
+                    "managed KV model {} still has live page ownership or transactions",
+                    model_instance.get()
+                )));
+            }
+        }
+        for arena in state.runtime.arenas.values() {
+            arena.drain()?;
+        }
+        if let Some(lease) = state.resource_lease.as_ref() {
+            lease.prepare_materialized_release(ResourceVector::zero())?;
+        }
+        let removed = self
+            .models
+            .remove(&model_instance)
+            .expect("managed KV state was validated under exclusive manager access");
+        drop(removed);
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(
         &self,
@@ -396,6 +469,44 @@ impl ManagedKvCacheManager {
             .coordinators
             .values()
             .find_map(|coordinator| coordinator.snapshot(session, domain).ok())
+    }
+}
+
+fn plan_physical_bytes(plan: &ResolvedKvPlan) -> Result<u64> {
+    plan.groups.iter().try_fold(0_u64, |total, group| {
+        let group_bytes = group
+            .bytes_per_page
+            .checked_mul(u64::from(group.capacity_pages))
+            .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))?;
+        total
+            .checked_add(group_bytes)
+            .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))
+    })
+}
+
+fn managed_arena_resources(backend: BackendKind, bytes: u64) -> ResourceVector {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
+    }
+    resources
+}
+
+fn reserve_managed_arena(
+    authority: &Arc<ResourceAuthority>,
+    model_instance: ModelInstanceId,
+    backend: BackendKind,
+    resources: ResourceVector,
+) -> Result<ResourceLease> {
+    let owner = ReservationOwner::new(
+        ReservationClass::Model,
+        format!("managed-kv:{}:{backend:?}", model_instance.get()),
+    );
+    match backend {
+        BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources),
+        BackendKind::Cuda => authority.reserve(owner, resources),
     }
 }
 
@@ -543,8 +654,38 @@ fn coordinator_error(error: impl fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{InputRange, SequencePhase};
-    use crate::kv::test_contract;
+    use crate::engine::{
+        CapacitySource, InputRange, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
+        SequencePhase,
+    };
+    use crate::kv::{test_contract, CacheBlockRef, KvSlotRef};
+
+    #[derive(Debug)]
+    struct TestCapacityProvider {
+        snapshot: PhysicalCapacitySnapshot,
+    }
+
+    impl PhysicalCapacityProvider for TestCapacityProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            self.snapshot
+        }
+    }
+
+    fn authority_with_capacity(bytes: u64) -> Arc<ResourceAuthority> {
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(bytes),
+            device_bytes: ResourceAmount::Known(bytes),
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        };
+        Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity,
+                available: capacity,
+                source: CapacitySource::Test,
+            },
+        })))
+    }
 
     fn sequence_work(start: usize, end: usize) -> WorkUnit {
         WorkUnit::SequenceStep {
@@ -665,5 +806,132 @@ mod tests {
             assert_eq!(snapshot.version, 1);
             assert_eq!(snapshot.committed_tokens, 8);
         }
+    }
+
+    #[test]
+    fn arena_accounting_is_once_per_model_and_survives_session_release() {
+        let model = ModelInstanceId::new(44);
+        let session = SessionKey::new("managed-accounting".to_string(), 1);
+        let authority = authority_with_capacity(u64::MAX);
+        let mut manager = ManagedKvCacheManager::new(Some(authority.clone()));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let physical_bytes = runtime.physical_bytes();
+        assert_eq!(authority.snapshot().reservations, 1);
+        assert_eq!(
+            authority.snapshot().reserved.host_bytes,
+            ResourceAmount::Known(physical_bytes)
+        );
+
+        let same = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("repeat bind")
+            .expect("same runtime");
+        assert_eq!(same.plan().id, runtime.plan().id);
+        assert_eq!(authority.snapshot().reservations, 1);
+
+        let reservation = manager
+            .prepare(&runtime, 10, &session, &sequence_work(0, 1))
+            .expect("prepare")
+            .expect("reservation");
+        manager.finalize(&reservation, None, false).expect("abort");
+        drop(same);
+        drop(runtime);
+        assert!(manager.unload_model(model).is_err());
+        manager.release_session(&session).expect("session release");
+        assert_eq!(authority.snapshot().reservations, 1);
+        assert_eq!(
+            authority.snapshot().reserved.host_bytes,
+            ResourceAmount::Known(physical_bytes)
+        );
+
+        assert!(manager.unload_model(model).expect("model unload"));
+        assert_eq!(authority.snapshot().reservations, 0);
+        assert_eq!(
+            authority.snapshot().reserved.host_bytes,
+            ResourceAmount::Known(0)
+        );
+    }
+
+    #[test]
+    fn replacement_arena_rejects_handles_from_the_unloaded_generation() {
+        let model = ModelInstanceId::new(45);
+        let mut manager = ManagedKvCacheManager::default();
+        let old_runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("old bind")
+            .expect("old runtime");
+        let old_group = old_runtime.plan().groups[0].clone();
+        assert!(manager.unload_model(model).is_err());
+        drop(old_runtime);
+        assert!(manager.unload_model(model).expect("old unload"));
+
+        let replacement = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("replacement bind")
+            .expect("replacement runtime");
+        let replacement_group = &replacement.plan().groups[0];
+        assert_ne!(old_group.arena, replacement_group.arena);
+        let stale = KvSlotRef {
+            block: CacheBlockRef {
+                arena: old_group.arena,
+                group: old_group.id,
+                index: 0,
+                slot_generation: 1,
+            },
+            offset: 0,
+        };
+        assert!(replacement
+            .arena(replacement_group.arena)
+            .expect("replacement arena")
+            .lower_slots(&[stale])
+            .is_err());
+    }
+
+    #[test]
+    fn cuda_arena_accounting_is_guarded_while_cpu_and_metal_are_advisory() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let authority = authority_with_capacity(1);
+            let resources = managed_arena_resources(backend, 2);
+            let lease =
+                reserve_managed_arena(&authority, ModelInstanceId::new(46), backend, resources)
+                    .expect("advisory arena accounting");
+            assert_eq!(lease.resources(), resources);
+        }
+
+        let authority = authority_with_capacity(1);
+        assert!(reserve_managed_arena(
+            &authority,
+            ModelInstanceId::new(47),
+            BackendKind::Cuda,
+            managed_arena_resources(BackendKind::Cuda, 2),
+        )
+        .is_err());
     }
 }

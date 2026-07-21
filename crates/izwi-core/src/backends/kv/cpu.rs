@@ -415,6 +415,10 @@ impl KvArena for CpuKvArena {
         )?
         .to_dtype(self.config.dtype)?)
     }
+
+    fn drain(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl CpuKvArena {

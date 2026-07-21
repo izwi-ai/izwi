@@ -40,6 +40,7 @@ mod scheduler;
 pub mod signal_frontend;
 mod types;
 
+pub use cache::rollout::KvRolloutState;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
@@ -1331,6 +1332,18 @@ impl Engine {
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
         let _step = self.step_gate.lock().await;
         self.core.write().await.purge_model_cache(variant).await
+    }
+
+    /// Retire the managed KV arenas for one exact loaded-model generation.
+    pub async fn unload_managed_model_cache(
+        &self,
+        model_instance: ModelInstanceId,
+    ) -> Result<bool> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .unload_managed_model_cache(model_instance)
     }
 
     /// Abort every request currently tracked by the engine.

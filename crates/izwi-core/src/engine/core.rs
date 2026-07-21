@@ -1471,11 +1471,20 @@ impl EngineCore {
     pub fn new_with_worker(config: EngineCoreConfig, worker_config: WorkerConfig) -> Result<Self> {
         info!("Creating engine core");
 
+        let managed_resource_authority = worker_config.resource_authority.clone();
         let executor = UnifiedExecutor::new_native(worker_config);
-        Self::new_with_executor(config, executor)
+        Self::new_with_executor_and_managed_authority(config, executor, managed_resource_authority)
     }
 
     fn new_with_executor(config: EngineCoreConfig, executor: UnifiedExecutor) -> Result<Self> {
+        Self::new_with_executor_and_managed_authority(config, executor, None)
+    }
+
+    fn new_with_executor_and_managed_authority(
+        config: EngineCoreConfig,
+        executor: UnifiedExecutor,
+        managed_resource_authority: Option<Arc<super::ResourceAuthority>>,
+    ) -> Result<Self> {
         // Create scheduler
         let scheduler_config = SchedulerConfig::from(&config);
         let scheduler = Scheduler::new(scheduler_config);
@@ -1491,7 +1500,7 @@ impl EngineCore {
             config,
             scheduler,
             kv_cache,
-            managed_kv_cache: ManagedKvCacheManager::default(),
+            managed_kv_cache: ManagedKvCacheManager::new(managed_resource_authority),
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -2750,6 +2759,16 @@ impl EngineCore {
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&mut self, variant: ModelVariant) -> CacheReleaseReport {
         self.executor.purge_model_cache(variant).await
+    }
+
+    /// Retire physical managed-KV state for one exact loaded-model instance.
+    /// Variant-only purge is insufficient because an unload/reload may publish
+    /// a different generation of the same variant.
+    pub fn unload_managed_model_cache(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+    ) -> Result<bool> {
+        self.managed_kv_cache.unload_model(model_instance)
     }
 
     /// Abort every request tracked by the core and release executor state.

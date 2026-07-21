@@ -96,8 +96,14 @@ impl ModelLifecycleController {
     }
 
     pub(super) async fn rollback_model_locked(&self, variant: ModelVariant) -> Result<()> {
+        let model_instance = self.resident_instance_id(variant);
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
         self.purge_executor_model_cache(variant).await?;
+        if let Some(model_instance) = model_instance {
+            self.core_engine
+                .unload_managed_model_cache(model_instance)
+                .await?;
+        }
         self.model_manager.unload_model(variant).await?;
         self.remove_registry_and_auxiliary_state(variant).await;
         self.remove_resident_slot(variant);
@@ -130,11 +136,22 @@ impl ModelLifecycleController {
     }
 
     pub(super) async fn unload_model_locked(&self, variant: ModelVariant) -> Result<()> {
+        let model_instance = self.resident_instance_id(variant);
         self.begin_unloading_slot(variant)?;
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
         if let Err(error) = self.purge_executor_model_cache(variant).await {
             self.restore_ready_slot_after_failed_unload(variant);
             return Err(error);
+        }
+        if let Some(model_instance) = model_instance {
+            if let Err(error) = self
+                .core_engine
+                .unload_managed_model_cache(model_instance)
+                .await
+            {
+                self.restore_ready_slot_after_failed_unload(variant);
+                return Err(error);
+            }
         }
 
         // Clear externally visible Ready state before removing the physical
