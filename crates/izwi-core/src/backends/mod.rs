@@ -3,6 +3,7 @@
 pub mod capabilities;
 pub mod cuda_runtime;
 pub mod device;
+pub mod kv;
 pub mod model_io;
 pub mod policy;
 pub mod router;

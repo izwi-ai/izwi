@@ -1,0 +1,915 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use candle_core::{
+    backend::BackendStorage, CpuStorage, DType, Device, InplaceOp1, InplaceOp3, Layout, Tensor,
+};
+
+use crate::backends::BackendKind;
+use crate::error::Error;
+use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding, KvSlotRef};
+use crate::Result;
+
+use super::{
+    DeviceFence, KvArena, KvArenaConfig, KvBackendRuntime, KvDeviceFence, KvPageCopy, KvSlotMap,
+    KvWriteArgs,
+};
+
+#[derive(Debug)]
+struct ReadyFence;
+
+impl KvDeviceFence for ReadyFence {
+    fn is_complete(&self) -> bool {
+        true
+    }
+
+    fn wait(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn ready_fence() -> DeviceFence {
+    Arc::new(ReadyFence)
+}
+
+#[derive(Debug)]
+struct CpuKvSlotMap {
+    arena: KvArenaId,
+    flat_slots: Tensor,
+    len: usize,
+}
+
+impl KvSlotMap for CpuKvSlotMap {
+    fn arena_id(&self) -> KvArenaId {
+        self.arena
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct CpuLayerStorage {
+    keys: Tensor,
+    values: Tensor,
+    num_kv_heads: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+}
+
+/// CPU reference implementation of a physical paged KV arena.
+///
+/// Each layer owns K and V tensors with shape
+/// `[capacity_pages, page_tokens, kv_heads, head_dim]`. All mutations preserve
+/// those allocations; no append, concatenation, or page materialization occurs.
+#[derive(Debug)]
+pub struct CpuKvArena {
+    config: KvArenaConfig,
+    layers: HashMap<KvLayerBinding, CpuLayerStorage>,
+    mutation_lock: Mutex<()>,
+}
+
+impl CpuKvArena {
+    pub fn new(config: KvArenaConfig) -> Result<Self> {
+        validate_config(&config)?;
+
+        let mut layers = HashMap::with_capacity(config.layers.len());
+        for layer in &config.layers {
+            let common = (
+                config.capacity_pages as usize,
+                config.page_tokens as usize,
+                layer.num_kv_heads as usize,
+            );
+            let keys = Tensor::zeros(
+                (common.0, common.1, common.2, layer.key_head_dim as usize),
+                config.dtype,
+                &Device::Cpu,
+            )?;
+            let values = Tensor::zeros(
+                (common.0, common.1, common.2, layer.value_head_dim as usize),
+                config.dtype,
+                &Device::Cpu,
+            )?;
+            layers.insert(
+                layer.binding,
+                CpuLayerStorage {
+                    keys,
+                    values,
+                    num_kv_heads: common.2,
+                    key_head_dim: layer.key_head_dim as usize,
+                    value_head_dim: layer.value_head_dim as usize,
+                },
+            );
+        }
+
+        Ok(Self {
+            config,
+            layers,
+            mutation_lock: Mutex::new(()),
+        })
+    }
+
+    /// Read-only handles to authoritative layer storage for CPU attention.
+    /// Cloning a Candle tensor shares its allocation.
+    pub fn layer_tensors(&self, layer: KvLayerBinding) -> Result<(Tensor, Tensor)> {
+        let layer = self.layer(layer)?;
+        Ok((layer.keys.clone(), layer.values.clone()))
+    }
+
+    fn layer(&self, binding: KvLayerBinding) -> Result<&CpuLayerStorage> {
+        self.layers.get(&binding).ok_or_else(|| {
+            Error::InferenceError(format!(
+                "KV layer binding {} is not present in arena {:?}",
+                binding.physical_layer, self.config.id
+            ))
+        })
+    }
+
+    fn validate_block(&self, block: CacheBlockRef) -> Result<usize> {
+        if block.arena != self.config.id {
+            return Err(Error::InferenceError(format!(
+                "KV block belongs to arena {:?}, expected {:?}",
+                block.arena, self.config.id
+            )));
+        }
+        if block.group != self.config.group {
+            return Err(Error::InferenceError(format!(
+                "KV block belongs to group {}, expected {}",
+                block.group.get(),
+                self.config.group.get()
+            )));
+        }
+        let page = block.index as usize;
+        if page >= self.config.capacity_pages as usize {
+            return Err(Error::InferenceError(format!(
+                "KV page {} is outside arena capacity {}",
+                page, self.config.capacity_pages
+            )));
+        }
+        Ok(page)
+    }
+
+    fn cpu_slots<'a>(&self, slots: &'a dyn KvSlotMap) -> Result<&'a CpuKvSlotMap> {
+        if slots.arena_id() != self.config.id {
+            return Err(Error::InferenceError(format!(
+                "KV slot map belongs to arena {:?}, expected {:?}",
+                slots.arena_id(),
+                self.config.id
+            )));
+        }
+        slots
+            .as_any()
+            .downcast_ref::<CpuKvSlotMap>()
+            .ok_or_else(|| Error::InferenceError("KV slot map backend mismatch".into()))
+    }
+}
+
+impl KvArena for CpuKvArena {
+    fn id(&self) -> KvArenaId {
+        self.config.id
+    }
+
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Cpu
+    }
+
+    fn config(&self) -> &KvArenaConfig {
+        &self.config
+    }
+
+    fn lower_slots(&self, slots: &[KvSlotRef]) -> Result<Arc<dyn KvSlotMap>> {
+        let mut flat_slots = Vec::with_capacity(slots.len());
+        let mut unique = HashSet::with_capacity(slots.len());
+        for slot in slots {
+            let page = self.validate_block(slot.block)?;
+            if slot.offset >= self.config.page_tokens {
+                return Err(Error::InferenceError(format!(
+                    "KV page offset {} is outside page size {}",
+                    slot.offset, self.config.page_tokens
+                )));
+            }
+            let flat = page
+                .checked_mul(self.config.page_tokens as usize)
+                .and_then(|base| base.checked_add(slot.offset as usize))
+                .ok_or_else(|| Error::InferenceError("KV slot index overflow".into()))?;
+            if !unique.insert(flat) {
+                return Err(Error::InferenceError(format!(
+                    "KV slot map contains duplicate physical slot {flat}"
+                )));
+            }
+            flat_slots.push(u32::try_from(flat).map_err(|_| {
+                Error::InferenceError(format!("KV slot index {flat} exceeds u32 range"))
+            })?);
+        }
+
+        let len = flat_slots.len();
+        let flat_slots = Tensor::from_vec(flat_slots, len, &Device::Cpu)?;
+        Ok(Arc::new(CpuKvSlotMap {
+            arena: self.config.id,
+            flat_slots,
+            len,
+        }))
+    }
+
+    fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence> {
+        if pages.is_empty() {
+            return Ok(ready_fence());
+        }
+        let page_indices = pages
+            .iter()
+            .copied()
+            .map(|page| self.validate_block(page))
+            .collect::<Result<Vec<_>>>()?;
+        reject_duplicate_pages(&page_indices, "zero")?;
+
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let op = PageZeroOp {
+            pages: page_indices,
+            page_tokens: self.config.page_tokens as usize,
+        };
+        for layer in self.layers.values() {
+            layer.keys.inplace_op1(&op)?;
+            layer.values.inplace_op1(&op)?;
+        }
+        Ok(ready_fence())
+    }
+
+    fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence> {
+        if copies.is_empty() {
+            return Ok(ready_fence());
+        }
+        let mut page_copies = Vec::with_capacity(copies.len());
+        let mut destinations = HashSet::with_capacity(copies.len());
+        for copy in copies {
+            let source = self.validate_block(copy.source)?;
+            let destination = self.validate_block(copy.destination)?;
+            if !destinations.insert(destination) {
+                return Err(Error::InferenceError(format!(
+                    "KV page copy has duplicate destination page {destination}"
+                )));
+            }
+            page_copies.push((source, destination));
+        }
+
+        // A single op snapshots all source pages before writing destinations, so
+        // chains and cycles have parallel-copy rather than sequential-copy semantics.
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let op = PageCopyOp {
+            copies: page_copies,
+            page_tokens: self.config.page_tokens as usize,
+        };
+        for layer in self.layers.values() {
+            layer.keys.inplace_op1(&op)?;
+            layer.values.inplace_op1(&op)?;
+        }
+        Ok(ready_fence())
+    }
+
+    fn write_slots(&self, binding: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence> {
+        let slots = self.cpu_slots(args.slots)?;
+        let layer = self.layer(binding)?;
+        validate_write_tensor(
+            args.keys,
+            slots.len,
+            layer.num_kv_heads,
+            layer.key_head_dim,
+            self.config.dtype,
+            "key",
+        )?;
+        validate_write_tensor(
+            args.values,
+            slots.len,
+            layer.num_kv_heads,
+            layer.value_head_dim,
+            self.config.dtype,
+            "value",
+        )?;
+
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        layer
+            .keys
+            .inplace_op3(args.keys, &slots.flat_slots, &SlotScatterOp)?;
+        layer
+            .values
+            .inplace_op3(args.values, &slots.flat_slots, &SlotScatterOp)?;
+        Ok(ready_fence())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CpuKvBackendRuntime;
+
+impl KvBackendRuntime for CpuKvBackendRuntime {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Cpu
+    }
+
+    fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        Ok(Arc::new(CpuKvArena::new(config)?))
+    }
+}
+
+fn validate_config(config: &KvArenaConfig) -> Result<()> {
+    if config.page_tokens == 0 || config.capacity_pages == 0 {
+        return Err(Error::InferenceError(
+            "CPU KV arena page size and capacity must be non-zero".into(),
+        ));
+    }
+    if !matches!(config.dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(Error::InferenceError(format!(
+            "CPU KV arena does not support {:?} storage",
+            config.dtype
+        )));
+    }
+    if config.layers.is_empty() {
+        return Err(Error::InferenceError(
+            "CPU KV arena must contain at least one layer".into(),
+        ));
+    }
+    let total_slots = (config.page_tokens as u64)
+        .checked_mul(config.capacity_pages as u64)
+        .ok_or_else(|| Error::InferenceError("CPU KV arena slot count overflow".into()))?;
+    if total_slots > u32::MAX as u64 {
+        return Err(Error::InferenceError(format!(
+            "CPU KV arena has {total_slots} slots, exceeding the u32 slot ABI"
+        )));
+    }
+    let mut bindings = HashSet::with_capacity(config.layers.len());
+    for layer in &config.layers {
+        if !bindings.insert(layer.binding) {
+            return Err(Error::InferenceError(format!(
+                "CPU KV arena contains duplicate layer binding {}",
+                layer.binding.physical_layer
+            )));
+        }
+        if layer.num_kv_heads == 0 || layer.key_head_dim == 0 || layer.value_head_dim == 0 {
+            return Err(Error::InferenceError(format!(
+                "CPU KV layer {} has zero-sized geometry",
+                layer.binding.physical_layer
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_write_tensor(
+    tensor: &Tensor,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    dtype: DType,
+    label: &str,
+) -> Result<()> {
+    if tensor.device().location() != Device::Cpu.location() {
+        return Err(Error::InferenceError(format!(
+            "CPU KV {label} source must be on CPU"
+        )));
+    }
+    if tensor.dtype() != dtype {
+        return Err(Error::InferenceError(format!(
+            "CPU KV {label} source dtype {:?} does not match arena dtype {:?}",
+            tensor.dtype(),
+            dtype
+        )));
+    }
+    let expected = [tokens, heads, head_dim];
+    if tensor.dims() != expected {
+        return Err(Error::InferenceError(format!(
+            "CPU KV {label} source shape {:?} does not match {:?}",
+            tensor.dims(),
+            expected
+        )));
+    }
+    if !tensor.layout().is_contiguous() {
+        return Err(Error::InferenceError(format!(
+            "CPU KV {label} source must be contiguous"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_pages(pages: &[usize], operation: &str) -> Result<()> {
+    let mut unique = HashSet::with_capacity(pages.len());
+    for &page in pages {
+        if !unique.insert(page) {
+            return Err(Error::InferenceError(format!(
+                "KV page {operation} contains duplicate page {page}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SlotScatterOp;
+
+impl InplaceOp3 for SlotScatterOp {
+    fn name(&self) -> &'static str {
+        "kv-slot-scatter-cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        destination: &mut CpuStorage,
+        destination_layout: &Layout,
+        source: &CpuStorage,
+        source_layout: &Layout,
+        slots: &CpuStorage,
+        slots_layout: &Layout,
+    ) -> candle_core::Result<()> {
+        let (destination_start, destination_end) =
+            contiguous_range(destination_layout, self.name())?;
+        let (source_start, source_end) = contiguous_range(source_layout, self.name())?;
+        let (slot_start, slot_end) = contiguous_range(slots_layout, self.name())?;
+        let slots = match slots {
+            CpuStorage::U32(values) => &values[slot_start..slot_end],
+            _ => candle_core::bail!("{} expects a u32 slot map", self.name()),
+        };
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let source_len = source_end - source_start;
+        if source_len % slots.len() != 0 {
+            candle_core::bail!(
+                "{} source element count {} is not divisible by slot count {}",
+                self.name(),
+                source_len,
+                slots.len()
+            )
+        }
+        let row_len = source_len / slots.len();
+        let destination_len = destination_end - destination_start;
+        scatter_storage(
+            destination,
+            destination_start,
+            destination_len,
+            source,
+            source_start,
+            slots,
+            row_len,
+            self.name(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct PageZeroOp {
+    pages: Vec<usize>,
+    page_tokens: usize,
+}
+
+impl InplaceOp1 for PageZeroOp {
+    fn name(&self) -> &'static str {
+        "kv-page-zero-cpu"
+    }
+
+    fn cpu_fwd(&self, storage: &mut CpuStorage, layout: &Layout) -> candle_core::Result<()> {
+        let (start, end) = contiguous_range(layout, self.name())?;
+        let capacity_pages = layout.dims()[0];
+        let page_len = (end - start) / capacity_pages;
+        debug_assert_eq!(layout.dims()[1], self.page_tokens);
+        zero_storage(storage, start, page_len, &self.pages, self.name())
+    }
+}
+
+#[derive(Debug)]
+struct PageCopyOp {
+    copies: Vec<(usize, usize)>,
+    page_tokens: usize,
+}
+
+impl InplaceOp1 for PageCopyOp {
+    fn name(&self) -> &'static str {
+        "kv-page-copy-cpu"
+    }
+
+    fn cpu_fwd(&self, storage: &mut CpuStorage, layout: &Layout) -> candle_core::Result<()> {
+        let (start, end) = contiguous_range(layout, self.name())?;
+        let capacity_pages = layout.dims()[0];
+        let page_len = (end - start) / capacity_pages;
+        debug_assert_eq!(layout.dims()[1], self.page_tokens);
+        copy_storage_pages(storage, start, page_len, &self.copies, self.name())
+    }
+}
+
+fn contiguous_range(layout: &Layout, op: &str) -> candle_core::Result<(usize, usize)> {
+    layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle_core::Error::Msg(format!("{op} requires contiguous storage")))
+}
+
+macro_rules! with_float_storage {
+    ($storage:expr, $values:ident, $body:expr, $op:expr) => {
+        match $storage {
+            CpuStorage::F32($values) => $body,
+            CpuStorage::F16($values) => $body,
+            CpuStorage::BF16($values) => $body,
+            other => candle_core::bail!("{} does not support {:?}", $op, other.dtype()),
+        }
+    };
+}
+
+fn scatter_storage(
+    destination: &mut CpuStorage,
+    destination_start: usize,
+    destination_len: usize,
+    source: &CpuStorage,
+    source_start: usize,
+    slots: &[u32],
+    row_len: usize,
+    op: &str,
+) -> candle_core::Result<()> {
+    macro_rules! scatter_typed {
+        ($destination:expr, $source:expr) => {{
+            for (source_row, &slot) in slots.iter().enumerate() {
+                let destination_offset = (slot as usize)
+                    .checked_mul(row_len)
+                    .ok_or_else(|| candle_core::Error::Msg(format!("{op} slot offset overflow")))?;
+                if destination_offset + row_len > destination_len {
+                    candle_core::bail!("{op} slot {slot} exceeds destination capacity")
+                }
+                let src = source_start + source_row * row_len;
+                let dst = destination_start + destination_offset;
+                $destination[dst..dst + row_len].copy_from_slice(&$source[src..src + row_len]);
+            }
+            Ok(())
+        }};
+    }
+
+    match (destination, source) {
+        (CpuStorage::F32(destination), CpuStorage::F32(source)) => {
+            scatter_typed!(destination, source)
+        }
+        (CpuStorage::F16(destination), CpuStorage::F16(source)) => {
+            scatter_typed!(destination, source)
+        }
+        (CpuStorage::BF16(destination), CpuStorage::BF16(source)) => {
+            scatter_typed!(destination, source)
+        }
+        (destination, source) => candle_core::bail!(
+            "{op} storage mismatch: destination {:?}, source {:?}",
+            destination.dtype(),
+            source.dtype()
+        ),
+    }
+}
+
+fn zero_storage(
+    storage: &mut CpuStorage,
+    start: usize,
+    page_len: usize,
+    pages: &[usize],
+    op: &str,
+) -> candle_core::Result<()> {
+    with_float_storage!(
+        storage,
+        values,
+        {
+            for &page in pages {
+                let offset = start + page * page_len;
+                values[offset..offset + page_len].fill(Default::default());
+            }
+            Ok(())
+        },
+        op
+    )
+}
+
+fn copy_storage_pages(
+    storage: &mut CpuStorage,
+    start: usize,
+    page_len: usize,
+    copies: &[(usize, usize)],
+    op: &str,
+) -> candle_core::Result<()> {
+    macro_rules! copy_typed {
+        ($values:expr) => {{
+            let snapshots = copies
+                .iter()
+                .map(|&(source, _)| {
+                    let source = start + source * page_len;
+                    $values[source..source + page_len].to_vec()
+                })
+                .collect::<Vec<_>>();
+            for ((_, destination), source) in copies.iter().zip(snapshots) {
+                let destination = start + destination * page_len;
+                $values[destination..destination + page_len].copy_from_slice(&source);
+            }
+            Ok(())
+        }};
+    }
+
+    with_float_storage!(storage, values, copy_typed!(values), op)
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{IndexOp, Storage};
+
+    use super::*;
+    use crate::backends::kv::KvLayerConfig;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{KvGroupId, KvSlotRef};
+
+    const ARENA: KvArenaId = KvArenaId {
+        model_instance: ModelInstanceId::new(41),
+        backend: BackendKind::Cpu,
+        device_ordinal: None,
+        generation: 3,
+    };
+    const GROUP: KvGroupId = KvGroupId::new(5);
+    const LAYER: KvLayerBinding = KvLayerBinding {
+        model_layer: 7,
+        physical_layer: 0,
+    };
+
+    fn config(dtype: DType) -> KvArenaConfig {
+        KvArenaConfig {
+            id: ARENA,
+            group: GROUP,
+            page_tokens: 2,
+            capacity_pages: 3,
+            dtype,
+            layers: vec![KvLayerConfig {
+                binding: LAYER,
+                num_kv_heads: 2,
+                key_head_dim: 2,
+                value_head_dim: 1,
+            }],
+        }
+    }
+
+    fn block(index: u32) -> CacheBlockRef {
+        CacheBlockRef {
+            arena: ARENA,
+            group: GROUP,
+            index,
+            slot_generation: 11,
+        }
+    }
+
+    fn cpu_storage_ptr(tensor: &Tensor) -> usize {
+        let (storage, _) = tensor.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(CpuStorage::F32(values)) => values.as_ptr() as usize,
+            Storage::Cpu(CpuStorage::F16(values)) => values.as_ptr() as usize,
+            Storage::Cpu(CpuStorage::BF16(values)) => values.as_ptr() as usize,
+            other => panic!("unexpected test storage: {:?}", other.dtype()),
+        }
+    }
+
+    #[test]
+    fn scatter_writes_flat_slots_without_reallocating_storage() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let (keys, values) = arena.layer_tensors(LAYER)?;
+        let key_ptr = cpu_storage_ptr(&keys);
+        let value_ptr = cpu_storage_ptr(&values);
+        let slots = arena.lower_slots(&[
+            KvSlotRef {
+                block: block(0),
+                offset: 1,
+            },
+            KvSlotRef {
+                block: block(2),
+                offset: 0,
+            },
+        ])?;
+        let source_keys = Tensor::from_vec(
+            vec![1f32, 2., 3., 4., 5., 6., 7., 8.],
+            (2, 2, 2),
+            &Device::Cpu,
+        )?;
+        let source_values = Tensor::from_vec(vec![9f32, 10., 11., 12.], (2, 2, 1), &Device::Cpu)?;
+
+        let fence = arena.write_slots(
+            LAYER,
+            KvWriteArgs {
+                keys: &source_keys,
+                values: &source_values,
+                slots: slots.as_ref(),
+            },
+        )?;
+        assert!(fence.is_complete());
+        fence.wait()?;
+
+        assert_eq!(cpu_storage_ptr(&keys), key_ptr);
+        assert_eq!(cpu_storage_ptr(&values), value_ptr);
+        assert_eq!(
+            keys.i((0, 1))?.to_vec2::<f32>()?,
+            vec![vec![1., 2.], vec![3., 4.]]
+        );
+        assert_eq!(
+            keys.i((2, 0))?.to_vec2::<f32>()?,
+            vec![vec![5., 6.], vec![7., 8.]]
+        );
+        assert_eq!(
+            values.i((0, 1))?.to_vec2::<f32>()?,
+            vec![vec![9.], vec![10.]]
+        );
+        assert_eq!(
+            values.i((2, 0))?.to_vec2::<f32>()?,
+            vec![vec![11.], vec![12.]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_and_zero_preserve_backing_allocations() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let (keys, values) = arena.layer_tensors(LAYER)?;
+        let key_ptr = cpu_storage_ptr(&keys);
+        let value_ptr = cpu_storage_ptr(&values);
+        let slots = arena.lower_slots(&[
+            KvSlotRef {
+                block: block(0),
+                offset: 0,
+            },
+            KvSlotRef {
+                block: block(0),
+                offset: 1,
+            },
+        ])?;
+        let source_keys = Tensor::from_vec(
+            (1..=8).map(|v| v as f32).collect::<Vec<_>>(),
+            (2, 2, 2),
+            &Device::Cpu,
+        )?;
+        let source_values = Tensor::from_vec(vec![9f32, 10., 11., 12.], (2, 2, 1), &Device::Cpu)?;
+        arena.write_slots(
+            LAYER,
+            KvWriteArgs {
+                keys: &source_keys,
+                values: &source_values,
+                slots: slots.as_ref(),
+            },
+        )?;
+
+        arena.copy_pages(&[KvPageCopy {
+            source: block(0),
+            destination: block(1),
+        }])?;
+        arena.zero_pages(&[block(0)])?;
+
+        assert_eq!(cpu_storage_ptr(&keys), key_ptr);
+        assert_eq!(cpu_storage_ptr(&values), value_ptr);
+        assert!(keys
+            .i(0)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|&value| value == 0.));
+        assert!(values
+            .i(0)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .all(|&value| value == 0.));
+        assert_eq!(
+            keys.i((1, 0))?.to_vec2::<f32>()?,
+            vec![vec![1., 2.], vec![3., 4.]]
+        );
+        assert_eq!(
+            keys.i((1, 1))?.to_vec2::<f32>()?,
+            vec![vec![5., 6.], vec![7., 8.]]
+        );
+        assert_eq!(
+            values.i((1, 0))?.to_vec2::<f32>()?,
+            vec![vec![9.], vec![10.]]
+        );
+        assert_eq!(
+            values.i((1, 1))?.to_vec2::<f32>()?,
+            vec![vec![11.], vec![12.]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_page_copy_uses_pre_write_sources() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let slots = arena.lower_slots(&[
+            KvSlotRef {
+                block: block(0),
+                offset: 0,
+            },
+            KvSlotRef {
+                block: block(1),
+                offset: 0,
+            },
+        ])?;
+        let source_keys = Tensor::from_vec(
+            vec![1f32, 2., 3., 4., 9., 8., 7., 6.],
+            (2, 2, 2),
+            &Device::Cpu,
+        )?;
+        let source_values = Tensor::from_vec(vec![5f32, 6., 4., 3.], (2, 2, 1), &Device::Cpu)?;
+        arena.write_slots(
+            LAYER,
+            KvWriteArgs {
+                keys: &source_keys,
+                values: &source_values,
+                slots: slots.as_ref(),
+            },
+        )?;
+
+        arena.copy_pages(&[
+            KvPageCopy {
+                source: block(0),
+                destination: block(1),
+            },
+            KvPageCopy {
+                source: block(1),
+                destination: block(0),
+            },
+        ])?;
+
+        let (keys, _) = arena.layer_tensors(LAYER)?;
+        assert_eq!(
+            keys.i((0, 0))?.to_vec2::<f32>()?,
+            vec![vec![9., 8.], vec![7., 6.]]
+        );
+        assert_eq!(
+            keys.i((1, 0))?.to_vec2::<f32>()?,
+            vec![vec![1., 2.], vec![3., 4.]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowering_rejects_wrong_arena_bounds_and_duplicate_slots() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let wrong_arena = KvSlotRef {
+            block: CacheBlockRef {
+                arena: KvArenaId {
+                    model_instance: ARENA.model_instance,
+                    backend: ARENA.backend,
+                    device_ordinal: ARENA.device_ordinal,
+                    generation: ARENA.generation + 1,
+                },
+                group: GROUP,
+                index: 0,
+                slot_generation: 1,
+            },
+            offset: 0,
+        };
+        assert!(arena.lower_slots(&[wrong_arena]).is_err());
+        assert!(arena
+            .lower_slots(&[KvSlotRef {
+                block: block(3),
+                offset: 0,
+            }])
+            .is_err());
+        assert!(arena
+            .lower_slots(&[KvSlotRef {
+                block: block(0),
+                offset: 2,
+            }])
+            .is_err());
+        let duplicate = KvSlotRef {
+            block: block(0),
+            offset: 1,
+        };
+        assert!(arena.lower_slots(&[duplicate, duplicate]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn f16_and_bf16_mutation_paths_are_supported() -> Result<()> {
+        for dtype in [DType::F16, DType::BF16] {
+            let arena = CpuKvArena::new(config(dtype))?;
+            let slots = arena.lower_slots(&[KvSlotRef {
+                block: block(0),
+                offset: 0,
+            }])?;
+            let keys = Tensor::ones((1, 2, 2), dtype, &Device::Cpu)?;
+            let values = Tensor::ones((1, 2, 1), dtype, &Device::Cpu)?;
+            arena.write_slots(
+                LAYER,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: slots.as_ref(),
+                },
+            )?;
+            arena.copy_pages(&[KvPageCopy {
+                source: block(0),
+                destination: block(1),
+            }])?;
+            arena.zero_pages(&[block(0)])?;
+        }
+        Ok(())
+    }
+}
