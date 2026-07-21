@@ -30,18 +30,57 @@ pub fn negotiate_kv_plan(
     request: &KvBackendPlanRequest,
 ) -> Result<ResolvedKvPlan> {
     contract.validate()?;
-    if request.backend != BackendKind::Cpu {
-        return Err(Error::InvalidInput(format!(
-            "managed KV negotiation is not implemented for {:?}",
-            request.backend
-        )));
-    }
     if request.capacity_pages == 0 || request.first_arena_generation == 0 {
         return Err(Error::InvalidInput(
             "KV capacity and first arena generation must be non-zero".into(),
         ));
     }
 
+    match request.backend {
+        BackendKind::Cpu => negotiate_dense_paged_plan(
+            contract,
+            request,
+            select_cpu_dtype,
+            |spec, hint| {
+                Ok(hint
+                    .filter(|value| spec.page_tokens.accepts(*value))
+                    .unwrap_or(spec.page_tokens.preferred))
+            },
+            PagedAttentionKernel::PortableReference,
+        ),
+        BackendKind::Cuda => {
+            #[cfg(feature = "flash-attn")]
+            {
+                negotiate_dense_paged_plan(
+                    contract,
+                    request,
+                    select_cuda_flash_dtype,
+                    select_cuda_flash_page_tokens,
+                    PagedAttentionKernel::CudaFlashAttention,
+                )
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                Err(Error::InvalidInput(
+                    "managed CUDA KV requires the flash-attn feature for direct paged attention"
+                        .into(),
+                ))
+            }
+        }
+        BackendKind::Metal => Err(Error::InvalidInput(
+            "managed Metal KV is unavailable because Candle 0.11 has no direct paged-attention kernel"
+                .into(),
+        )),
+    }
+}
+
+fn negotiate_dense_paged_plan(
+    contract: &KvCacheContract,
+    request: &KvBackendPlanRequest,
+    select_dtype: fn(&[KvStorageDType], Option<KvStorageDType>) -> Result<KvStorageDType>,
+    select_page_tokens: fn(&crate::kv::PagedAttentionDomainSpec, Option<u32>) -> Result<u32>,
+    kernel: PagedAttentionKernel,
+) -> Result<ResolvedKvPlan> {
     let mut groups = Vec::with_capacity(contract.domains.len());
     for (ordinal, domain) in contract.domains.iter().enumerate() {
         let ordinal = u32::try_from(ordinal)
@@ -59,17 +98,27 @@ pub fn negotiate_kv_plan(
 
         groups.push(match domain {
             KvDomainSpec::PagedAttention(spec) => {
-                let page_tokens = request
-                    .page_tokens_hint
-                    .filter(|value| spec.page_tokens.accepts(*value))
-                    .unwrap_or(spec.page_tokens.preferred);
-                let dtype = select_cpu_dtype(&spec.storage.dtypes, request.storage_dtype_hint)?;
+                let page_tokens = select_page_tokens(spec, request.page_tokens_hint)?;
+                let dtype = select_dtype(&spec.storage.dtypes, request.storage_dtype_hint)?;
                 let dtype_bytes = dtype.dense_bytes().ok_or_else(|| {
-                    Error::InvalidInput(format!("CPU cannot use dense {dtype:?} KV storage"))
+                    Error::InvalidInput(format!(
+                        "{:?} cannot use dense {dtype:?} KV storage",
+                        request.backend
+                    ))
                 })?;
                 let mut bytes_per_page = 0_u64;
                 let mut layers = Vec::with_capacity(spec.layers.len());
                 for (physical_layer, layer) in spec.layers.iter().enumerate() {
+                    if kernel == PagedAttentionKernel::CudaFlashAttention
+                        && (layer.key_head_dim != layer.value_head_dim
+                            || layer.key_head_dim > 512
+                            || layer.key_head_dim % 8 != 0)
+                    {
+                        return Err(Error::InvalidInput(format!(
+                            "CUDA paged flash attention requires equal K/V head dimensions that are multiples of 8 and at most 512; layer {} has K={} V={}",
+                            layer.model_layer, layer.key_head_dim, layer.value_head_dim
+                        )));
+                    }
                     let one_side = u64::from(page_tokens)
                         .checked_mul(u64::from(layer.num_kv_heads))
                         .ok_or_else(geometry_overflow)?;
@@ -104,14 +153,23 @@ pub fn negotiate_kv_plan(
                     bytes_per_page,
                     layout: KvPhysicalLayout::PageTokenHeadDim,
                     storage: KvStorageFormat::Dense { dtype },
-                    kernel: PagedAttentionKernel::PortableReference,
+                    kernel,
                     kind: ResolvedKvGroupKind::PagedAttention { layers },
                 }
             }
             KvDomainSpec::ModelState(spec) => {
-                let dtype = select_cpu_dtype(&spec.storage.dtypes, request.storage_dtype_hint)?;
+                if request.backend != BackendKind::Cpu {
+                    return Err(Error::InvalidInput(format!(
+                        "managed {:?} KV does not implement model-state domains",
+                        request.backend
+                    )));
+                }
+                let dtype = select_dtype(&spec.storage.dtypes, request.storage_dtype_hint)?;
                 let dtype_bytes = dtype.dense_bytes().ok_or_else(|| {
-                    Error::InvalidInput(format!("CPU cannot use dense {dtype:?} state storage"))
+                    Error::InvalidInput(format!(
+                        "{:?} cannot use dense {dtype:?} state storage",
+                        request.backend
+                    ))
                 })?;
                 let mut bytes_per_page = 0_u64;
                 let mut layers = Vec::with_capacity(spec.layers.len());
@@ -154,6 +212,67 @@ pub fn negotiate_kv_plan(
         contract,
         groups,
     )
+}
+
+#[cfg(feature = "flash-attn")]
+fn select_cuda_flash_dtype(
+    accepted: &[KvStorageDType],
+    hint: Option<KvStorageDType>,
+) -> Result<KvStorageDType> {
+    const SUPPORTED: [KvStorageDType; 2] = [KvStorageDType::F16, KvStorageDType::Bf16];
+    if let Some(dtype) = hint.filter(|dtype| accepted.contains(dtype) && SUPPORTED.contains(dtype))
+    {
+        return Ok(dtype);
+    }
+    accepted
+        .iter()
+        .copied()
+        .find(|dtype| SUPPORTED.contains(dtype))
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "CUDA paged flash attention found no compatible F16/BF16 KV dtype".into(),
+            )
+        })
+}
+
+#[cfg(feature = "flash-attn")]
+fn select_cuda_flash_page_tokens(
+    spec: &crate::kv::PagedAttentionDomainSpec,
+    hint: Option<u32>,
+) -> Result<u32> {
+    let accepts = |value: u32| spec.page_tokens.accepts(value) && value % 32 == 0;
+    if let Some(value) = hint.filter(|value| accepts(*value)) {
+        return Ok(value);
+    }
+    if accepts(spec.page_tokens.preferred) {
+        return Ok(spec.page_tokens.preferred);
+    }
+
+    let step = lcm(spec.page_tokens.multiple_of, 32).ok_or_else(geometry_overflow)?;
+    let first = spec
+        .page_tokens
+        .min
+        .div_ceil(step)
+        .checked_mul(step)
+        .ok_or_else(geometry_overflow)?;
+    if first <= spec.page_tokens.max {
+        Ok(first)
+    } else {
+        Err(Error::InvalidInput(
+            "CUDA paged flash attention requires a page size divisible by 32".into(),
+        ))
+    }
+}
+
+#[cfg(feature = "flash-attn")]
+fn lcm(left: u32, right: u32) -> Option<u32> {
+    fn gcd(mut left: u32, mut right: u32) -> u32 {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    }
+    left.checked_div(gcd(left, right))?.checked_mul(right)
 }
 
 fn select_cpu_dtype(
@@ -214,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn accelerator_negotiation_fails_closed_until_runtime_exists() {
+    fn metal_negotiation_fails_closed_without_direct_attention() {
         let error = negotiate_kv_plan(
             &test_contract(),
             &KvBackendPlanRequest {
@@ -228,6 +347,58 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not implemented"));
+        assert!(error
+            .to_string()
+            .contains("no direct paged-attention kernel"));
+    }
+
+    #[cfg(not(feature = "flash-attn"))]
+    #[test]
+    fn cuda_negotiation_fails_closed_without_paged_flash_attention() {
+        let error = negotiate_kv_plan(
+            &test_contract(),
+            &KvBackendPlanRequest {
+                model_instance: ModelInstanceId::new(9),
+                backend: BackendKind::Cuda,
+                device_ordinal: Some(0),
+                capacity_pages: 10,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+                first_arena_generation: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires the flash-attn feature"));
+    }
+
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn cuda_flash_negotiation_selects_only_supported_geometry() {
+        let plan = negotiate_kv_plan(
+            &test_contract(),
+            &KvBackendPlanRequest {
+                model_instance: ModelInstanceId::new(9),
+                backend: BackendKind::Cuda,
+                device_ordinal: Some(0),
+                capacity_pages: 10,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: Some(KvStorageDType::F16),
+                first_arena_generation: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.groups[0].page_tokens, 32);
+        assert_eq!(
+            plan.groups[0].kernel,
+            PagedAttentionKernel::CudaFlashAttention
+        );
+        assert_eq!(
+            plan.groups[0].storage,
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::F16
+            }
+        );
     }
 }

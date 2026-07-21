@@ -5,6 +5,8 @@
 //! generational block references; an arena validates its identity and physical
 //! bounds before lowering those references to backend slot indices.
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+mod accelerator;
 mod cpu;
 mod negotiate;
 
@@ -20,6 +22,12 @@ use crate::kv::{
 };
 use crate::Result;
 
+#[cfg(feature = "flash-attn")]
+pub use accelerator::CudaKvBackendRuntime;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use accelerator::{
+    candle_accelerator_kv_support, CandleAcceleratorKvArena, CandleAcceleratorKvSupport,
+};
 pub use cpu::{CpuKvArena, CpuKvBackendRuntime};
 pub use negotiate::{negotiate_kv_plan, KvBackendPlanRequest};
 
