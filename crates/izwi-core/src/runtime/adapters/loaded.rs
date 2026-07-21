@@ -12,7 +12,6 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::{CacheCapability, KvCacheContractProvider, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
-use crate::runtime::rollout::ExecutionRolloutMode;
 
 use super::{
     compatibility_execution_profile, AdapterMetadata, CapabilityKind, RuntimeAdapterRegistry,
@@ -170,9 +169,8 @@ impl LoadedExecutionAdapter for CachePublishingExecutionAdapter {
 }
 
 /// Validated proof that one exact loaded model may activate cache semantics
-/// for its matching capability adapter. Backend/model rollout eligibility is
-/// decided by the concrete lifecycle/executor boundary before constructing
-/// this model-neutral value.
+/// for its matching capability adapter. Backend support is decided by the
+/// concrete lifecycle/executor boundary before constructing this value.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedCacheActivation {
     capability: CapabilityKind,
@@ -203,7 +201,7 @@ pub(super) struct LoadedAdapterFactoryContext {
 
 pub(super) trait LoadedExecutionAdapterFactory: fmt::Debug + Send + Sync {
     fn id(&self) -> &'static str;
-    fn rollout_mode(&self) -> ExecutionRolloutMode;
+    fn batch_mode(&self) -> NativeBatchMode;
     fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool;
     fn create(
         &self,
@@ -220,8 +218,8 @@ impl LoadedExecutionAdapterFactory for StaticQwenTtsAdapterFactory {
         "builtin.qwen_tts.tensor_static"
     }
 
-    fn rollout_mode(&self) -> ExecutionRolloutMode {
-        ExecutionRolloutMode::Static
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Static
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -257,8 +255,8 @@ impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
         "builtin.qwen_chat.tensor_continuous"
     }
 
-    fn rollout_mode(&self) -> ExecutionRolloutMode {
-        ExecutionRolloutMode::Continuous
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::Continuous
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -654,24 +652,21 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
 }
 
 impl RuntimeAdapterRegistry {
-    fn loaded_adapter_factory(
+    pub(super) fn loaded_adapter_factory(
         &self,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
-        rollout_mode: ExecutionRolloutMode,
     ) -> Result<Option<&dyn LoadedExecutionAdapterFactory>> {
-        if rollout_mode == ExecutionRolloutMode::Off {
-            return Ok(None);
-        }
-        let mut matches = self.loaded_adapter_factories.iter().filter(|factory| {
-            factory.rollout_mode() == rollout_mode && factory.supports(metadata, backend_kind)
-        });
+        let mut matches = self
+            .loaded_adapter_factories
+            .iter()
+            .filter(|factory| factory.supports(metadata, backend_kind));
         let Some(selected) = matches.next() else {
             return Ok(None);
         };
         if let Some(ambiguous) = matches.next() {
             return Err(Error::ModelLoadError(format!(
-                "loaded model {} capability {:?} matches both `{}` and `{}` for {rollout_mode:?} rollout",
+                "loaded model {} capability {:?} matches both native factories `{}` and `{}`",
                 metadata.model_variant,
                 metadata.capability,
                 selected.id(),
@@ -681,39 +676,20 @@ impl RuntimeAdapterRegistry {
         Ok(Some(selected.as_ref()))
     }
 
-    pub(super) fn supports_loaded_rollout(
-        &self,
-        model_variant: ModelVariant,
-        backend_kind: BackendKind,
-        rollout_mode: ExecutionRolloutMode,
-    ) -> Result<bool> {
-        if rollout_mode == ExecutionRolloutMode::Off {
-            return Ok(true);
-        }
-        for metadata in self.capabilities_for(model_variant) {
-            if self
-                .loaded_adapter_factory(metadata, backend_kind, rollout_mode)?
-                .is_some()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    pub(super) fn loaded_rollout_variants(
+    pub(super) fn loaded_native_variants(
         &self,
         backend_kind: BackendKind,
-        rollout_mode: ExecutionRolloutMode,
+        batch_mode: NativeBatchMode,
     ) -> std::collections::HashSet<ModelVariant> {
         ModelVariant::all()
             .iter()
             .copied()
             .filter(|variant| {
-                self.execution_mode_for(*variant, backend_kind) == rollout_mode
-                    && self
-                        .supports_loaded_rollout(*variant, backend_kind, rollout_mode)
-                        .unwrap_or(false)
+                self.capabilities_for(*variant).into_iter().any(|metadata| {
+                    self.loaded_adapter_factory(metadata, backend_kind)
+                        .expect("factory ambiguity is rejected when the registry is built")
+                        .is_some_and(|factory| factory.batch_mode() == batch_mode)
+                })
             })
             .collect()
     }
@@ -725,7 +701,6 @@ impl RuntimeAdapterRegistry {
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        let rollout_mode = self.execution_mode_for(metadata.model_variant, backend_kind);
         let context = LoadedAdapterFactoryContext {
             execution_group_id,
             model_instance_id,
@@ -733,7 +708,7 @@ impl RuntimeAdapterRegistry {
             max_tensor_batch_size: self.max_tensor_batch_size(),
             request_parallelism: self.request_parallelism(),
         };
-        let adapter = match self.loaded_adapter_factory(metadata, backend_kind, rollout_mode)? {
+        let adapter = match self.loaded_adapter_factory(metadata, backend_kind)? {
             Some(factory) => factory.create(context, metadata)?,
             None => Arc::new(CompatibilityExecutionAdapter::new(
                 execution_group_id,
@@ -929,7 +904,6 @@ impl LoadedModelBundle {
 mod tests {
     use super::*;
     use crate::runtime::adapters::ExecutionTargetKind;
-    use crate::runtime::rollout::ExecutionRolloutPolicy;
 
     #[test]
     fn exact_native_qwen3_cpu_bundle_publishes_managed_cache_only_with_runtime_proof() {
@@ -984,8 +958,8 @@ mod tests {
             self.id
         }
 
-        fn rollout_mode(&self) -> ExecutionRolloutMode {
-            ExecutionRolloutMode::Static
+        fn batch_mode(&self) -> NativeBatchMode {
+            NativeBatchMode::Static
         }
 
         fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
@@ -1035,7 +1009,7 @@ mod tests {
                             panic!("failed to resolve cache capability for {variant}: {error}")
                         }),
                     CacheCapability::OpaqueModelOwned,
-                    "compatibility behavior changed for {variant}"
+                    "cache capability changed for {variant}"
                 );
                 let contract = bundle
                     .contract(metadata.capability, false)
@@ -1043,10 +1017,25 @@ mod tests {
                 assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
                 assert_eq!(contract.model_instance_id, instance);
                 assert_eq!(contract.metadata, metadata);
-                assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
-                assert_eq!(contract.stages.len(), 1);
-                assert_eq!(contract.stages[0].max_batch_size, 1);
-                assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+                let native_mode = registry
+                    .loaded_adapter_factory(metadata, BackendKind::Cpu)
+                    .unwrap()
+                    .map(|factory| factory.batch_mode());
+                match native_mode {
+                    Some(mode) => {
+                        assert_ne!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
+                        assert!(contract.stages.iter().any(|stage| stage.batch_mode == mode));
+                    }
+                    None => {
+                        assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
+                        assert_eq!(contract.stages.len(), 1);
+                        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+                    }
+                }
+                assert!(contract
+                    .stages
+                    .iter()
+                    .all(|stage| stage.max_batch_size == 1));
                 assert_eq!(contract.execution_profile.max_batch_size, 1);
                 assert!(contract.execution_profile.resolved_from_loaded_model);
                 let binding = bundle
@@ -1084,12 +1073,7 @@ mod tests {
 
     #[test]
     fn every_compatibility_adapter_uses_the_configured_independent_row_width() {
-        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(
-            ExecutionRolloutPolicy::default(),
-            1,
-            3,
-        )
-        .unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
             let bundle = LoadedModelBundle::bind(
@@ -1101,6 +1085,13 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("failed to bind {variant}: {error}"));
             for metadata in registry.capabilities_for(variant) {
+                if registry
+                    .loaded_adapter_factory(metadata, BackendKind::Cpu)
+                    .unwrap()
+                    .is_some()
+                {
+                    continue;
+                }
                 let contract = bundle
                     .contract(metadata.capability, false)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
@@ -1122,7 +1113,7 @@ mod tests {
             &registry,
             ExecutionGroupId::new(9),
             ModelInstanceId::new(999),
-            ModelVariant::Qwen306B,
+            ModelVariant::Gemma31BIt,
             BackendKind::Metal,
         )
         .unwrap();
@@ -1267,20 +1258,14 @@ mod tests {
     #[test]
     fn registering_a_factory_adds_an_optimized_model_without_bundle_branching() {
         let variant = ModelVariant::Kokoro82M;
-        let rollout = ExecutionRolloutPolicy::try_from_raw(
-            Some("off"),
-            Some(&format!("{variant}@cpu=static")),
-        )
-        .unwrap();
         let mut registry = RuntimeAdapterRegistry::built_in();
-        registry.execution_rollout = rollout;
         registry
             .loaded_adapter_factories
             .push(Arc::new(TestStaticTtsFactory {
                 id: "test.kokoro.tensor_static",
                 model_variant: variant,
             }));
-        registry.validate_execution_rollout().unwrap();
+        registry.validate_loaded_adapter_factories().unwrap();
 
         let bundle = LoadedModelBundle::bind(
             &registry,
@@ -1302,12 +1287,7 @@ mod tests {
     #[test]
     fn overlapping_loaded_factories_fail_closed() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let rollout = ExecutionRolloutPolicy::try_from_raw(
-            Some("off"),
-            Some(&format!("{variant}@cpu=static")),
-        )
-        .unwrap();
-        let mut registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 2).unwrap();
+        let mut registry = RuntimeAdapterRegistry::built_in_with_execution_limits(2, 1).unwrap();
         registry
             .loaded_adapter_factories
             .push(Arc::new(TestStaticTtsFactory {
@@ -1329,12 +1309,9 @@ mod tests {
     }
 
     #[test]
-    fn exact_qwen_tts_rollout_binds_static_generation_but_not_streaming() {
+    fn qwen_tts_native_factory_binds_static_generation_but_not_streaming() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let override_value = format!("{}@metal=static", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
         let bundle = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(1),
@@ -1382,12 +1359,9 @@ mod tests {
     }
 
     #[test]
-    fn static_rollout_does_not_cross_backend_boundaries() {
+    fn qwen_tts_native_factory_is_enabled_on_cpu_by_default() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let override_value = format!("{}@metal=static", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
         let bundle = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(1),
@@ -1398,18 +1372,15 @@ mod tests {
         .unwrap();
 
         let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
-        assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
-        assert_eq!(contract.execution_profile.max_batch_size, 1);
-        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
+        assert_eq!(contract.execution_profile.max_batch_size, 4);
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
     }
 
     #[test]
-    fn qwen_chat_continuous_rollout_publishes_scalar_prefill_and_ragged_decode() {
+    fn qwen_chat_native_factory_publishes_scalar_prefill_and_ragged_decode() {
         let variant = ModelVariant::Qwen306B;
-        let override_value = format!("{}@cuda=continuous", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 8).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
         let bundle = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(1),

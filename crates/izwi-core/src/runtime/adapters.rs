@@ -13,7 +13,6 @@ use crate::engine::{
     PrefillMode, TaskType,
 };
 use crate::error::{Error, Result};
-use crate::runtime::rollout::{ExecutionRolloutMode, ExecutionRolloutPolicy};
 
 mod loaded;
 
@@ -126,45 +125,23 @@ pub(crate) trait ModelCapabilityAdapter {
 #[derive(Debug)]
 pub(crate) struct RuntimeAdapterRegistry {
     adapters: HashMap<(CapabilityKind, ModelVariant), AdapterMetadata>,
-    execution_rollout: ExecutionRolloutPolicy,
     max_tensor_batch_size: usize,
     request_parallelism: usize,
     loaded_adapter_factories: Vec<Arc<dyn loaded::LoadedExecutionAdapterFactory>>,
 }
 
-impl Default for RuntimeAdapterRegistry {
-    fn default() -> Self {
-        Self {
-            adapters: HashMap::new(),
-            execution_rollout: ExecutionRolloutPolicy::default(),
-            max_tensor_batch_size: 1,
-            request_parallelism: 1,
-            loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
-        }
-    }
-}
-
 impl RuntimeAdapterRegistry {
     pub(crate) fn built_in() -> Self {
-        Self::built_in_with_rollout(ExecutionRolloutPolicy::default(), 1)
-            .expect("the fail-closed built-in adapter registry must be valid")
-    }
-
-    pub(crate) fn built_in_with_rollout(
-        execution_rollout: ExecutionRolloutPolicy,
-        max_tensor_batch_size: usize,
-    ) -> Result<Self> {
-        Self::built_in_with_execution_limits(execution_rollout, max_tensor_batch_size, 1)
+        Self::built_in_with_execution_limits(1, 1)
+            .expect("the built-in native adapter registry must be unambiguous")
     }
 
     pub(crate) fn built_in_with_execution_limits(
-        execution_rollout: ExecutionRolloutPolicy,
         max_tensor_batch_size: usize,
         request_parallelism: usize,
     ) -> Result<Self> {
         let mut registry = Self {
             adapters: HashMap::new(),
-            execution_rollout,
             max_tensor_batch_size: max_tensor_batch_size.max(1),
             request_parallelism: request_parallelism.max(1),
             loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
@@ -180,7 +157,7 @@ impl RuntimeAdapterRegistry {
         registry.register_adapter(DiarizationCapabilityAdapter);
         registry.register_adapter(ForcedAlignmentCapabilityAdapter);
         registry.register_adapter(TokenizerCapabilityAdapter);
-        registry.validate_execution_rollout()?;
+        registry.validate_loaded_adapter_factories()?;
         Ok(registry)
     }
 
@@ -208,14 +185,6 @@ impl RuntimeAdapterRegistry {
             })
     }
 
-    pub(crate) fn execution_mode_for(
-        &self,
-        model_variant: ModelVariant,
-        backend_kind: BackendKind,
-    ) -> ExecutionRolloutMode {
-        self.execution_rollout.mode_for(model_variant, backend_kind)
-    }
-
     pub(crate) fn max_tensor_batch_size(&self) -> usize {
         self.max_tensor_batch_size
     }
@@ -228,38 +197,31 @@ impl RuntimeAdapterRegistry {
         &self,
         backend_kind: BackendKind,
     ) -> HashSet<ModelVariant> {
-        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Static)
+        self.loaded_native_variants(backend_kind, NativeBatchMode::Static)
     }
 
     pub(crate) fn continuous_tensor_batch_variants(
         &self,
         backend_kind: BackendKind,
     ) -> HashSet<ModelVariant> {
-        self.loaded_rollout_variants(backend_kind, ExecutionRolloutMode::Continuous)
+        self.loaded_native_variants(backend_kind, NativeBatchMode::Continuous)
     }
 
-    fn validate_execution_rollout(&self) -> Result<()> {
+    fn validate_loaded_adapter_factories(&self) -> Result<()> {
         const BACKENDS: [BackendKind; 3] =
             [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
 
-        for model_variant in ModelVariant::all().iter().copied() {
+        for factory in &self.loaded_adapter_factories {
+            if factory.batch_mode() == NativeBatchMode::None {
+                return Err(Error::InvalidInput(format!(
+                    "native loaded adapter factory `{}` must declare static or continuous batching",
+                    factory.id()
+                )));
+            }
+        }
+        for metadata in self.adapters.values().copied() {
             for backend_kind in BACKENDS {
-                match self.execution_mode_for(model_variant, backend_kind) {
-                    ExecutionRolloutMode::Off => {}
-                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous)
-                        if self.supports_loaded_rollout(model_variant, backend_kind, mode)? => {}
-                    mode @ (ExecutionRolloutMode::Static | ExecutionRolloutMode::Continuous) => {
-                        let adapter_kind = match mode {
-                            ExecutionRolloutMode::Static => "static tensor",
-                            ExecutionRolloutMode::Continuous => "continuous tensor",
-                            ExecutionRolloutMode::Off => unreachable!("guarded rollout mode"),
-                        };
-                        return Err(Error::InvalidInput(format!(
-                            "Model {model_variant} has no {adapter_kind} adapter on {}",
-                            backend_kind.as_str()
-                        )));
-                    }
-                }
+                self.loaded_adapter_factory(metadata, backend_kind)?;
             }
         }
         Ok(())
@@ -705,62 +667,28 @@ mod tests {
     }
 
     #[test]
-    fn exact_static_rollout_only_publishes_proven_native_variants() {
+    fn native_static_factories_publish_supported_variants_on_every_backend() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let override_value = format!("{}@metal=static", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4).unwrap();
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
 
         assert_eq!(registry.max_tensor_batch_size(), 4);
-        assert_eq!(
-            registry.static_tensor_batch_variants(BackendKind::Metal),
-            HashSet::from([variant])
-        );
-        assert!(registry
-            .static_tensor_batch_variants(BackendKind::Cpu)
-            .is_empty());
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let variants = registry.static_tensor_batch_variants(backend);
+            assert!(variants.contains(&variant));
+            assert!(!variants.contains(&ModelVariant::Qwen306B));
+        }
     }
 
     #[test]
-    fn rollout_cannot_advertise_a_missing_static_adapter() {
+    fn native_continuous_factories_publish_supported_variants_on_every_backend() {
         let variant = ModelVariant::Qwen306B;
-        let override_value = format!("{}@metal=static", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
-            .expect_err("chat has no static tensor adapter");
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
 
-        assert!(error.to_string().contains("no static tensor adapter"));
-    }
-
-    #[test]
-    fn exact_continuous_rollout_only_publishes_proven_native_variants() {
-        let variant = ModelVariant::Qwen306B;
-        let override_value = format!("{}@cuda=continuous", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let registry = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 8).unwrap();
-
-        assert_eq!(
-            registry.continuous_tensor_batch_variants(BackendKind::Cuda),
-            HashSet::from([variant])
-        );
-        assert!(registry
-            .continuous_tensor_batch_variants(BackendKind::Metal)
-            .is_empty());
-    }
-
-    #[test]
-    fn rollout_cannot_advertise_a_missing_continuous_adapter() {
-        let variant = ModelVariant::Qwen3508BGguf;
-        let override_value = format!("{}@metal=continuous", variant);
-        let rollout =
-            ExecutionRolloutPolicy::try_from_raw(Some("off"), Some(&override_value)).unwrap();
-        let error = RuntimeAdapterRegistry::built_in_with_rollout(rollout, 4)
-            .expect_err("Qwen3.5 has no continuous tensor adapter");
-
-        assert!(error.to_string().contains("no continuous tensor adapter"));
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let variants = registry.continuous_tensor_batch_variants(backend);
+            assert!(variants.contains(&variant));
+            assert!(!variants.contains(&ModelVariant::Qwen3508BGguf));
+        }
     }
 
     #[test]

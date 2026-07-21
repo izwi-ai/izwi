@@ -84,69 +84,59 @@ struct EngineRuntimeTelemetrySnapshot {
     #[serde(default)]
     scheduler_running_requests: u64,
     #[serde(default)]
-    kv_cache_hits_total: u64,
-    #[serde(default)]
-    kv_cache_misses_total: u64,
-    #[serde(default)]
-    kv_cache_evictions_total: u64,
-    #[serde(default)]
-    kv_cache_allocated_blocks: u64,
-    #[serde(default)]
-    kv_cache_prefix_reuse_blocks_total: u64,
-    #[serde(default)]
     stream_backpressure_total: u64,
     #[serde(default)]
-    kv_cache: EngineKvCacheRuntimeSnapshot,
+    kv_cache: ManagedKvRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct EngineKvCacheRuntimeSnapshot {
-    #[serde(default)]
-    block_accounting: String,
+struct ManagedKvRuntimeSnapshot {
     #[serde(default)]
     memory_accounting: String,
     #[serde(default)]
-    total_blocks: u64,
+    totals: ManagedKvRuntimeTotalsSnapshot,
     #[serde(default)]
-    soft_max_blocks: u64,
+    counters: ManagedKvTelemetrySnapshot,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ManagedKvRuntimeTotalsSnapshot {
     #[serde(default)]
-    allocated_blocks: u64,
+    models: u64,
     #[serde(default)]
-    free_blocks: u64,
+    arenas: u64,
     #[serde(default)]
-    block_size: u64,
+    registered_sessions: u64,
     #[serde(default)]
-    dtype_bytes: u64,
+    physical_bytes: u64,
     #[serde(default)]
-    block_memory_bytes: u64,
+    coordinator: ManagedKvCoordinatorSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ManagedKvCoordinatorSnapshot {
     #[serde(default)]
-    memory_used_bytes: u64,
+    capacity_pages: u64,
     #[serde(default)]
-    memory_capacity_bytes: u64,
+    allocated_pages: u64,
     #[serde(default)]
-    utilization_ratio: f64,
+    free_pages: u64,
     #[serde(default)]
-    gpu_resident_blocks: u64,
+    execution_pins: u64,
     #[serde(default)]
-    pinned_blocks: u64,
+    transfer_pins: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct ManagedKvTelemetrySnapshot {
     #[serde(default)]
-    shared_prefixes: u64,
+    prefix_hits: u64,
     #[serde(default)]
-    total_allocations: u64,
+    prefix_misses: u64,
     #[serde(default)]
-    total_frees: u64,
+    prefix_evictions: u64,
     #[serde(default)]
-    shared_prefix_hits: u64,
-    #[serde(default)]
-    shared_prefix_misses: u64,
-    #[serde(default)]
-    shared_prefix_blocks_reused: u64,
-    #[serde(default)]
-    persistent_prefix_evictions: u64,
-    #[serde(default)]
-    copy_on_write_splits: u64,
-    #[serde(default)]
-    last_churn_ratio: f64,
+    reused_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -4785,20 +4775,27 @@ fn print_runtime_delta(
         "  End-to-end rolling(avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
         after.end_to_end_ms_avg, after.end_to_end_ms_p50, after.end_to_end_ms_p95
     );
-    if after.engine.kv_cache.total_blocks > 0 {
+    if after.engine.kv_cache.totals.coordinator.capacity_pages > 0 {
         let kv = &after.engine.kv_cache;
+        let coordinator = &kv.totals.coordinator;
+        let utilization = coordinator.allocated_pages as f64 / coordinator.capacity_pages as f64;
         println!(
-            "  KV cache logical blocks used/free/soft/total: {} / {} / {} / {} (util {:.1}%, churn {:.3})",
-            kv.allocated_blocks,
-            kv.free_blocks,
-            kv.soft_max_blocks,
-            kv.total_blocks,
-            kv.utilization_ratio * 100.0,
-            kv.last_churn_ratio
+            "  KV cache physical pages used/free/total: {} / {} / {} (util {:.1}%)",
+            coordinator.allocated_pages,
+            coordinator.free_pages,
+            coordinator.capacity_pages,
+            utilization * 100.0,
         );
         println!(
-            "  KV cache estimated memory used/capacity: {} / {} bytes ({})",
-            kv.memory_used_bytes, kv.memory_capacity_bytes, kv.memory_accounting
+            "  KV cache physical arena backing: {} bytes ({}, {} models, {} arenas)",
+            kv.totals.physical_bytes, kv.memory_accounting, kv.totals.models, kv.totals.arenas,
+        );
+        println!(
+            "  KV cache prefix hit/miss/eviction/reused tokens: {} / {} / {} / {}",
+            kv.counters.prefix_hits,
+            kv.counters.prefix_misses,
+            kv.counters.prefix_evictions,
+            kv.counters.reused_tokens,
         );
     }
     if !after.models.is_empty() {
@@ -5742,40 +5739,38 @@ mod tests {
         let engine: EngineRuntimeTelemetrySnapshot = serde_json::from_value(serde_json::json!({
             "scheduler_queue_depth": 1,
             "scheduler_running_requests": 2,
-            "kv_cache_hits_total": 3,
             "kv_cache": {
-                "block_accounting": "logical",
-                "memory_accounting": "estimated_from_config",
-                "total_blocks": 128,
-                "soft_max_blocks": 96,
-                "allocated_blocks": 48,
-                "free_blocks": 80,
-                "block_size": 16,
-                "dtype_bytes": 2,
-                "block_memory_bytes": 786432,
-                "utilization_ratio": 0.375,
-                "shared_prefixes": 4,
-                "shared_prefix_hits": 3,
-                "shared_prefix_misses": 2,
-                "shared_prefix_blocks_reused": 7,
-                "copy_on_write_splits": 5,
-                "last_churn_ratio": 1.25
+                "memory_accounting": "physical_arena_backing",
+                "totals": {
+                    "models": 2,
+                    "arenas": 4,
+                    "registered_sessions": 3,
+                    "physical_bytes": 100663296,
+                    "coordinator": {
+                        "capacity_pages": 128,
+                        "allocated_pages": 48,
+                        "free_pages": 80,
+                        "execution_pins": 2,
+                        "transfer_pins": 1
+                    }
+                },
+                "counters": {
+                    "prefix_hits": 3,
+                    "prefix_misses": 2,
+                    "prefix_evictions": 5,
+                    "reused_tokens": 112
+                }
             }
         }))
         .expect("engine telemetry should deserialize");
 
         assert_eq!(engine.scheduler_queue_depth, 1);
-        assert_eq!(engine.kv_cache.total_blocks, 128);
-        assert_eq!(engine.kv_cache.block_accounting, "logical");
-        assert_eq!(
-            engine.kv_cache.memory_accounting,
-            "estimated_from_config"
-        );
-        assert_eq!(engine.kv_cache.shared_prefix_misses, 2);
-        assert_eq!(engine.kv_cache.shared_prefix_blocks_reused, 7);
-        assert_eq!(engine.kv_cache.soft_max_blocks, 96);
-        assert_eq!(engine.kv_cache.copy_on_write_splits, 5);
-        assert_eq!(engine.kv_cache.last_churn_ratio, 1.25);
+        assert_eq!(engine.kv_cache.memory_accounting, "physical_arena_backing");
+        assert_eq!(engine.kv_cache.totals.coordinator.capacity_pages, 128);
+        assert_eq!(engine.kv_cache.totals.coordinator.allocated_pages, 48);
+        assert_eq!(engine.kv_cache.totals.physical_bytes, 100663296);
+        assert_eq!(engine.kv_cache.counters.prefix_misses, 2);
+        assert_eq!(engine.kv_cache.counters.reused_tokens, 112);
     }
 
     #[test]

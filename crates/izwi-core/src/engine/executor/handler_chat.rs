@@ -736,7 +736,6 @@ mod tests {
             sequence_id: 1,
             num_tokens: 3,
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: WorkUnit::SequenceStep {
                 phase: SequencePhase::Prefill,

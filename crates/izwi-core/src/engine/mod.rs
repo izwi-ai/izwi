@@ -30,7 +30,6 @@ mod core;
 pub mod execution;
 mod execution_group;
 mod executor;
-mod kv_cache;
 pub mod metrics;
 mod output;
 mod request;
@@ -65,10 +64,6 @@ pub use executor::{
     PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult, WorkerConfig,
     REQUEST_DEADLINE_EXCEEDED,
 };
-pub use kv_cache::{
-    BlockAllocator, CacheResidency, KVCacheConfig as KVConfig, KVCacheManager, KVCacheStats,
-    PinnedBlockHandle,
-};
 pub use metrics::{
     engine_batch_metrics_snapshot, engine_metric_catalog, engine_request_parallel_batches_total,
     engine_stream_backpressure_total, engine_stream_metrics_snapshot,
@@ -87,15 +82,12 @@ pub use metrics::{
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
-    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
-    ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
-    ENGINE_SCHEDULER_PREEMPTIONS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
-    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
+    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
+    ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
     ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
     ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
@@ -1399,16 +1391,8 @@ impl Engine {
         core.running_request_count()
     }
 
-    /// Get KV cache statistics.
-    pub async fn kv_cache_stats(&self) -> KVCacheStats {
-        let core = self.core.read().await;
-        core.kv_cache_stats()
-    }
-
-    /// Snapshot exact managed arena backing and coordinator ownership. This is
-    /// intentionally separate from `kv_cache_stats`, whose blocks are a
-    /// legacy logical scheduling projection.
-    pub async fn managed_kv_runtime_snapshot(&self) -> ManagedKvRuntimeSnapshot {
+    /// Snapshot exact physical arena backing, page ownership, and counters.
+    pub async fn kv_cache_snapshot(&self) -> ManagedKvRuntimeSnapshot {
         self.core.read().await.managed_kv_runtime_snapshot()
     }
 

@@ -33,17 +33,13 @@ use crate::engine::{
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_CHURN_RATIO,
-    ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL, ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-    ENGINE_KV_CACHE_FREE_BLOCKS, ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
+    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_PINNED_BLOCKS,
-    ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL, ENGINE_KV_CACHE_SHARED_PREFIXES,
-    ENGINE_KV_CACHE_SOFT_MAX_BLOCKS, ENGINE_KV_CACHE_UTILIZATION_RATIO,
-    ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
-    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
-    REQUEST_DEADLINE_EXCEEDED,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL, ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -62,11 +58,10 @@ use crate::runtime::coordinator::{
 };
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
-use crate::runtime::rollout::ExecutionRolloutPolicy;
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    push_engine_labeled_metric, push_engine_metric, push_engine_metric_f64,
-    EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
+    push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
+    push_engine_metric_f64, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
     RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
     RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
 };
@@ -245,10 +240,28 @@ async fn route_terminal_output(
     telemetry.record_request_finished(&output).await;
 }
 
-fn reported_gpu_resident_blocks(_backend_kind: BackendKind, _logical_blocks: u64) -> u64 {
-    // Scheduler blocks are logical quotas until an ExternalPaged executor binds
-    // them to tensor pages and reports measured residency.
-    0
+fn managed_kv_used_bytes(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -> u64 {
+    snapshot
+        .models
+        .iter()
+        .flat_map(|model| &model.arenas)
+        .map(|arena| {
+            arena
+                .coordinator
+                .allocated_pages
+                .saturating_mul(arena.bytes_per_page)
+        })
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn managed_kv_device_pages(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -> u64 {
+    snapshot
+        .models
+        .iter()
+        .filter(|model| model.backend != BackendKind::Cpu)
+        .flat_map(|model| &model.arenas)
+        .map(|arena| arena.coordinator.allocated_pages)
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
@@ -1103,9 +1116,7 @@ impl RuntimeService {
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
-        let execution_rollout = ExecutionRolloutPolicy::from_env()?;
         let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_execution_limits(
-            execution_rollout,
             worker_config.max_tensor_batch_size,
             worker_config.request_parallelism,
         )?);
@@ -2522,50 +2533,13 @@ impl RuntimeService {
     async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {
         let queue_depth = self.core_engine.pending_requests().await as u64;
         let running_requests = self.core_engine.running_requests().await as u64;
-        let kv_cache = self.core_engine.kv_cache_stats().await;
-        let managed_kv_cache = self.core_engine.managed_kv_runtime_snapshot().await;
+        let kv_cache = self.core_engine.kv_cache_snapshot().await;
         let stream = engine_stream_metrics_snapshot();
-        let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
-        let kv_cache_misses_total = kv_cache.telemetry.shared_prefix_misses;
-        let backend_kind = self.backend_context().backend_kind;
-        let kv_cache_snapshot = EngineKvCacheRuntimeSnapshot {
-            block_accounting: "logical",
-            memory_accounting: "estimated_from_config",
-            total_blocks: kv_cache.total_blocks as u64,
-            soft_max_blocks: kv_cache.soft_max_blocks as u64,
-            allocated_blocks: kv_cache.allocated_blocks as u64,
-            free_blocks: kv_cache.free_blocks as u64,
-            block_size: kv_cache.block_size as u64,
-            dtype_bytes: kv_cache.dtype_bytes as u64,
-            block_memory_bytes: kv_cache.block_memory_bytes as u64,
-            memory_used_bytes: kv_cache.memory_used_bytes as u64,
-            memory_capacity_bytes: kv_cache.memory_capacity_bytes as u64,
-            utilization_ratio: kv_cache.utilization(),
-            gpu_resident_blocks: reported_gpu_resident_blocks(
-                backend_kind,
-                kv_cache.gpu_resident_blocks as u64,
-            ),
-            pinned_blocks: kv_cache.pinned_blocks as u64,
-            shared_prefixes: kv_cache.shared_prefixes as u64,
-            total_allocations: kv_cache.telemetry.total_allocations,
-            total_frees: kv_cache.telemetry.total_frees,
-            shared_prefix_hits: kv_cache.telemetry.shared_prefix_hits,
-            shared_prefix_misses: kv_cache.telemetry.shared_prefix_misses,
-            shared_prefix_blocks_reused: kv_cache.telemetry.shared_prefix_blocks_reused,
-            persistent_prefix_evictions: kv_cache.telemetry.persistent_prefix_evictions,
-            copy_on_write_splits: kv_cache.telemetry.copy_on_write_splits,
-            last_churn_ratio: kv_cache.telemetry.last_churn_ratio,
-        };
 
         let batch = engine_batch_metrics_snapshot();
         EngineRuntimeTelemetrySnapshot {
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
-            kv_cache_hits_total,
-            kv_cache_misses_total,
-            kv_cache_evictions_total: kv_cache.telemetry.persistent_prefix_evictions,
-            kv_cache_allocated_blocks: kv_cache.allocated_blocks as u64,
-            kv_cache_prefix_reuse_blocks_total: kv_cache.telemetry.shared_prefix_blocks_reused,
             stream_backpressure_total: stream.backpressure_total,
             stream_checkpoints_committed_total: stream.checkpoints_committed_total,
             stream_checkpoint_rejections_total: stream.checkpoint_rejections_total,
@@ -2588,8 +2562,7 @@ impl RuntimeService {
             workspace_domains: batch.workspace_domains,
             tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
             tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
-            kv_cache: kv_cache_snapshot,
-            managed_kv_cache,
+            kv_cache,
         }
     }
 
@@ -2608,77 +2581,76 @@ impl RuntimeService {
         push_engine_metric(
             payload,
             ENGINE_KV_CACHE_HITS_TOTAL,
-            snapshot.kv_cache_hits_total,
+            snapshot.kv_cache.counters.prefix_hits,
         );
         push_engine_metric(
             payload,
             ENGINE_KV_CACHE_MISSES_TOTAL,
-            snapshot.kv_cache_misses_total,
+            snapshot.kv_cache.counters.prefix_misses,
         );
         push_engine_metric(
             payload,
             ENGINE_KV_CACHE_EVICTIONS_TOTAL,
-            snapshot.kv_cache_evictions_total,
+            snapshot.kv_cache.counters.prefix_evictions,
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-            snapshot.kv_cache_allocated_blocks,
+            "accounting",
+            &[(
+                "physical_pages",
+                snapshot.kv_cache.totals.coordinator.allocated_pages,
+            )],
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_FREE_BLOCKS,
-            snapshot.kv_cache.free_blocks,
+            "accounting",
+            &[(
+                "physical_pages",
+                snapshot.kv_cache.totals.coordinator.free_pages,
+            )],
         );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_SOFT_MAX_BLOCKS,
-            snapshot.kv_cache.soft_max_blocks,
-        );
-        push_engine_metric_f64(
+        push_engine_labeled_metric_f64(
             payload,
             ENGINE_KV_CACHE_UTILIZATION_RATIO,
-            snapshot.kv_cache.utilization_ratio,
+            "accounting",
+            &[(
+                "physical_pages",
+                if snapshot.kv_cache.totals.coordinator.capacity_pages == 0 {
+                    0.0
+                } else {
+                    snapshot.kv_cache.totals.coordinator.allocated_pages as f64
+                        / snapshot.kv_cache.totals.coordinator.capacity_pages as f64
+                },
+            )],
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-            snapshot.kv_cache.memory_used_bytes,
+            "accounting",
+            &[(
+                "physical_managed_pages",
+                managed_kv_used_bytes(&snapshot.kv_cache),
+            )],
         );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
-            snapshot.kv_cache.memory_capacity_bytes,
+            "accounting",
+            &[(
+                "physical_arena_backing",
+                snapshot.kv_cache.totals.physical_bytes,
+            )],
         );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_SHARED_PREFIXES,
-            snapshot.kv_cache.shared_prefixes,
-        );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
-            snapshot.kv_cache_prefix_reuse_blocks_total,
-        );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-            snapshot.kv_cache.copy_on_write_splits,
-        );
-        push_engine_metric_f64(
-            payload,
-            ENGINE_KV_CACHE_CHURN_RATIO,
-            snapshot.kv_cache.last_churn_ratio,
-        );
-        push_engine_metric(
+        push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
-            snapshot.kv_cache.gpu_resident_blocks,
-        );
-        push_engine_metric(
-            payload,
-            ENGINE_KV_CACHE_PINNED_BLOCKS,
-            snapshot.kv_cache.pinned_blocks,
+            "accounting",
+            &[(
+                "physical_device_pages",
+                managed_kv_device_pages(&snapshot.kv_cache),
+            )],
         );
         push_engine_metric(
             payload,
@@ -4278,12 +4250,17 @@ mod tests {
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
-        assert!(payload.contains("izwi_engine_kv_cache_allocated_blocks"));
-        assert!(payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
-        assert!(payload.contains("izwi_engine_kv_cache_utilization_ratio"));
-        assert!(payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
-        assert!(payload.contains("allocated logical KV-cache blocks"));
-        assert!(payload.contains("Estimated KV-cache bytes"));
+        assert!(payload
+            .contains("izwi_engine_kv_cache_allocated_blocks{accounting=\"physical_pages\"}"));
+        assert!(payload
+            .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}"));
+        assert!(payload.contains(
+            "izwi_engine_kv_cache_memory_capacity_bytes{accounting=\"physical_arena_backing\"}"
+        ));
+        assert!(payload.contains("allocated physical KV-cache pages"));
+        assert!(payload.contains("Exact physical backing bytes"));
+        assert!(!payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
+        assert!(!payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
         assert!(payload.contains("izwi_engine_stream_checkpoints_committed_total"));
         assert!(payload.contains("izwi_engine_stream_checkpoint_rejections_total"));
@@ -4316,12 +4293,14 @@ mod tests {
 
         let snapshot = runtime.telemetry_snapshot().await;
         assert_eq!(snapshot.coordinator, runtime.coordinator_snapshot());
-        assert!(snapshot.engine.kv_cache.total_blocks > 0);
-        assert!(snapshot.engine.kv_cache.block_size > 0);
-        assert_eq!(snapshot.engine.kv_cache.block_accounting, "logical");
         assert_eq!(
             snapshot.engine.kv_cache.memory_accounting,
-            "estimated_from_config"
+            "physical_arena_backing"
+        );
+        assert_eq!(snapshot.engine.kv_cache.totals.models, 0);
+        assert_eq!(
+            snapshot.engine.kv_cache.totals.coordinator.capacity_pages,
+            0
         );
     }
 
@@ -4343,10 +4322,46 @@ mod tests {
     }
 
     #[test]
-    fn logical_blocks_are_never_reported_as_measured_gpu_residency() {
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cpu, 17), 0);
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Metal, 17), 0);
-        assert_eq!(reported_gpu_resident_blocks(BackendKind::Cuda, 17), 0);
+    fn managed_kv_prometheus_projections_use_physical_arenas() {
+        use crate::engine::{
+            ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot,
+            ManagedKvModelRuntimeSnapshot, ManagedKvOperationSnapshot, ModelInstanceId,
+        };
+
+        let arena = |allocated_pages| ManagedKvArenaRuntimeSnapshot {
+            generation: 0,
+            group_id: 1,
+            domain_id: 1,
+            device_ordinal: Some(0),
+            page_tokens: 16,
+            bytes_per_page: 128,
+            physical_bytes: 1_280,
+            coordinator: ManagedKvCoordinatorSnapshot {
+                capacity_pages: 10,
+                allocated_pages,
+                free_pages: 10 - allocated_pages,
+                ..ManagedKvCoordinatorSnapshot::default()
+            },
+            operations: ManagedKvOperationSnapshot::default(),
+        };
+        let model = |model_instance, backend, allocated_pages| ManagedKvModelRuntimeSnapshot {
+            model_instance: ModelInstanceId::new(model_instance),
+            plan_fingerprint: format!("plan-{model_instance}"),
+            backend,
+            device_ordinal: Some(0),
+            physical_bytes: 1_280,
+            registered_sessions: 1,
+            arenas: vec![arena(allocated_pages)],
+        };
+        let mut snapshot = crate::engine::ManagedKvRuntimeSnapshot::default();
+        snapshot.models = vec![
+            model(1, BackendKind::Cpu, 3),
+            model(2, BackendKind::Metal, 4),
+            model(3, BackendKind::Cuda, 5),
+        ];
+
+        assert_eq!(managed_kv_used_bytes(&snapshot), 12 * 128);
+        assert_eq!(managed_kv_device_pages(&snapshot), 9);
     }
 
     #[tokio::test]

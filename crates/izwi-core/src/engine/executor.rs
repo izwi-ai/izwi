@@ -160,10 +160,6 @@ pub struct WorkerConfig {
     pub model_registry: Option<Arc<ModelRegistry>>,
     /// Shared physical resource authority used for model-owned cache lifetime.
     pub resource_authority: Option<Arc<ResourceAuthority>>,
-    /// Bytes represented by one scheduler logical KV block for logical
-    /// scheduling metrics only. Model-owned physical cache authorization must
-    /// come from the loaded model adapter.
-    pub logical_kv_block_bytes: u64,
     /// Maximum width of a model-native tensor batch on this backend.
     pub max_tensor_batch_size: usize,
     /// Exact model variants enabled for static tensor execution on this worker.
@@ -189,7 +185,6 @@ impl std::fmt::Debug for WorkerConfig {
                 "resource_authority",
                 &self.resource_authority.as_ref().map(|_| "<shared>"),
             )
-            .field("logical_kv_block_bytes", &self.logical_kv_block_bytes)
             .field("max_tensor_batch_size", &self.max_tensor_batch_size)
             .field(
                 "static_tensor_batch_variants",
@@ -221,7 +216,6 @@ impl Default for WorkerConfig {
             kv_page_size: 64,
             model_registry: None,
             resource_authority: None,
-            logical_kv_block_bytes: 0,
             max_tensor_batch_size: 1,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
         }
@@ -245,8 +239,6 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             kv_page_size: config.block_size.max(1),
             model_registry: None,
             resource_authority: None,
-            logical_kv_block_bytes: (config.kv_cache_memory_bytes() / config.max_blocks.max(1))
-                as u64,
             max_tensor_batch_size: config
                 .max_batch_size
                 .min(Self::tensor_batch_cap(backend_kind))
@@ -800,7 +792,6 @@ impl CacheReleaseReport {
 #[derive(Debug, Default)]
 struct CacheResourceReservation {
     reserved_bytes: u64,
-    observed_blocks: usize,
     lease: Option<ResourceLease>,
 }
 
@@ -990,7 +981,6 @@ impl NativeExecutor {
             session.clone(),
             CacheResourceReservation {
                 reserved_bytes: authorized_bytes,
-                observed_blocks: 0,
                 lease: Some(lease),
             },
         );
@@ -1156,7 +1146,6 @@ impl NativeExecutor {
                     observed_bytes,
                 ))?;
         }
-        reservation.observed_blocks = scheduled.block_ids.len();
         Ok(observation)
     }
 }
@@ -1205,7 +1194,7 @@ fn unknown_cache_observation() -> ResourceVector {
 fn static_qwen_tts_batch_eligible(
     request: &EngineCoreRequest,
     loaded_has_speakers: bool,
-    rollout_enabled: bool,
+    native_variant_enabled: bool,
 ) -> bool {
     matches!(request.task_type, super::types::TaskType::TTS)
         && !request.streaming
@@ -1215,7 +1204,7 @@ fn static_qwen_tts_batch_eligible(
             .and_then(|variant| variant.speech_capabilities())
             .is_some_and(|capabilities| capabilities.supports_builtin_voices)
         && loaded_has_speakers
-        && rollout_enabled
+        && native_variant_enabled
         && request.execution_adapter_binding().is_some_and(|binding| {
             binding.stages.iter().any(|stage| {
                 stage.batch_mode == NativeBatchMode::Static
@@ -1868,7 +1857,6 @@ mod tests {
             session,
             CacheResourceReservation {
                 reserved_bytes: 100,
-                observed_blocks: 1,
                 lease: Some(lease),
             },
         );
@@ -1880,7 +1868,6 @@ mod tests {
             sequence_id: 7,
             num_tokens: 1,
             is_prefill: false,
-            block_ids: vec![1],
             num_computed_tokens: 1,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Decode,
@@ -2099,7 +2086,6 @@ mod tests {
                     session.clone(),
                     CacheResourceReservation {
                         reserved_bytes: 1024,
-                        observed_blocks: 1,
                         lease: Some(lease),
                     },
                 );
@@ -2308,7 +2294,6 @@ mod tests {
             sequence_id: 42,
             num_tokens: 1,
             is_prefill: false,
-            block_ids: Vec::new(),
             num_computed_tokens: 1,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Decode,

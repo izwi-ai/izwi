@@ -45,18 +45,18 @@ pub mod tokenizer;
 // Re-export main types from the new engine module
 pub use engine::{
     AdapterAbiRevision, AdapterInstanceId, AsrEngineInput, AsrProgress, AsrProgressPhase,
-    AudioChatEngineInput, BatchBudget, BatchId, BatchKey, BatchLaneKey, CacheResidency,
-    ChatEngineInput, Engine, EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest,
+    AudioChatEngineInput, BatchBudget, BatchId, BatchKey, BatchLaneKey, ChatEngineInput, Engine,
+    EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest,
     EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities, ExecutionDisposition,
     ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
     ExecutionProfile, ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind,
-    FailureScope, FinishReason, GenerationParams, HealthImpact, KVCacheManager,
+    FailureScope, FinishReason, GenerationParams, HealthImpact,
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
     ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
     ManagedKvTelemetrySnapshot, MembershipSafePoint, ModelExecutor, ModelInstanceId,
     ModelSessionResult, OutputProcessor, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
-    PhysicalBatchRowReport, PinnedBlockHandle, PlanId, Priority, ReadyQuantum, RequestProcessor,
-    RequestStatus, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
+    PhysicalBatchRowReport, PlanId, Priority, ReadyQuantum, RequestProcessor, RequestStatus,
+    ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
     ResourceVector, RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch,
     SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
     StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass,
@@ -85,8 +85,7 @@ pub use runtime::{
     GenerationRequest, GenerationResult,
 };
 pub use runtime::{
-    AudioChunk, CoordinatorSnapshot, EngineKvCacheRuntimeSnapshot, EngineRuntimeTelemetrySnapshot,
-    GenerationConfig,
+    AudioChunk, CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
     ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeLatencyStats,
     RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,

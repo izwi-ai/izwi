@@ -456,7 +456,6 @@ mod tests {
             sequence_id: plan_id,
             num_tokens: 1,
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: WorkUnit::SequenceStep {
                 phase: SequencePhase::Prefill,
@@ -479,7 +478,6 @@ mod tests {
             sequence_id: 1,
             num_tokens: 1,
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Prefill,

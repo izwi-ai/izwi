@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn request_envelope_carries_capability_model_and_rollout_controls() {
+    fn request_envelope_carries_capability_model_and_routing_controls() {
         let deadline = Instant::now();
         let envelope = RequestEnvelope::new(CapabilityKind::Chat, ModelVariant::Qwen38BGguf)
             .with_request_id("req-1")

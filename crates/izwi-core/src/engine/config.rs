@@ -78,7 +78,7 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_num_threads")]
     pub num_threads: usize,
 
-    /// Enable request preemption when KV cache is full
+    /// Defer lower-priority decode while higher-priority work is waiting.
     #[serde(default = "default_enable_preemption")]
     pub enable_preemption: bool,
 
@@ -131,9 +131,6 @@ pub struct EngineCoreConfig {
     /// Maximum decode tokens per request in one scheduler step.
     #[serde(default = "default_max_decode_tokens_per_request")]
     pub max_decode_tokens_per_request: usize,
-    /// Enable KV residency tiering hints during scheduling.
-    #[serde(default = "default_enable_kv_tiering")]
-    pub enable_kv_tiering: bool,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -249,9 +246,6 @@ fn default_enable_decode_quanta() -> bool {
 fn default_max_decode_tokens_per_request() -> usize {
     2
 }
-fn default_enable_kv_tiering() -> bool {
-    false
-}
 fn default_enable_prefix_caching() -> bool {
     true
 }
@@ -299,7 +293,6 @@ impl Default for EngineCoreConfig {
             power_save_mode: default_power_save_mode(),
             enable_decode_quanta: default_enable_decode_quanta(),
             max_decode_tokens_per_request: default_max_decode_tokens_per_request(),
-            enable_kv_tiering: default_enable_kv_tiering(),
         }
     }
 }
@@ -312,16 +305,6 @@ impl EngineCoreConfig {
             num_codebooks: 8,
             ..Default::default()
         }
-    }
-
-    /// Legacy compatibility estimate for the scheduler-level logical cache.
-    ///
-    /// Physical KV bytes cannot be derived from engine-wide hints because the
-    /// loaded model owns the layer/head geometry and the backend negotiates its
-    /// layout. Managed arenas account exact bytes from `ResolvedKvPlan`; opaque
-    /// caches are authorized and observed by the loaded executor instead.
-    pub fn kv_cache_memory_bytes(&self) -> usize {
-        0
     }
 }
 

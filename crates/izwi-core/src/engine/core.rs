@@ -36,7 +36,6 @@ use super::executor::{
     ExecutorStepResult, IncrementalStreamDeliveryWorkers, StreamDeliveryFailure,
     StreamDeliveryFailureKind, UnifiedExecutor, WorkerConfig,
 };
-use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
 use super::metrics::{
     record_engine_execution_outcome, record_engine_physical_batch,
     record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
@@ -54,31 +53,6 @@ use super::{ResourceAmount, ResourceVector};
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-
-struct KvCacheBackend(KVCacheManager);
-
-impl KvCacheBackend {
-    fn new(config: &EngineCoreConfig) -> Self {
-        // Until a managed arena is selected, these are logical scheduler
-        // blocks only for unprofiled compatibility callers. Every loaded
-        // execution profile bypasses them: physical bytes come from the model
-        // contract/arena or from explicit opaque-cache resource accounting.
-        let kv_config = KVCacheConfig::logical_only(config.block_size, config.max_blocks);
-        Self(KVCacheManager::new(kv_config))
-    }
-
-    fn inner(&self) -> &KVCacheManager {
-        &self.0
-    }
-
-    fn inner_mut(&mut self) -> &mut KVCacheManager {
-        &mut self.0
-    }
-
-    fn stats(&self) -> KVCacheStats {
-        self.inner().stats()
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 struct RequestPhaseTiming {
@@ -307,8 +281,6 @@ pub struct EngineCore {
     config: EngineCoreConfig,
     /// Request scheduler
     scheduler: Scheduler,
-    /// KV cache manager
-    kv_cache: KvCacheBackend,
     /// Physical managed-cache arenas and transactional block tables.
     managed_kv_cache: ManagedKvCacheManager,
     /// Model executor
@@ -951,10 +923,7 @@ impl EngineCore {
                 if release.confirmed {
                     self.request_managed_session_release(&plan.session);
                 }
-                if release.confirmed
-                    && self
-                        .scheduler
-                        .restart_request_for_recompute(&plan.session, self.kv_cache.inner_mut())
+                if release.confirmed && self.scheduler.restart_request_for_recompute(&plan.session)
                 {
                     let attempt = retry_attempt.unwrap_or(1);
                     let retry_at = Instant::now() + self.retry_policy.execution_delay(attempt);
@@ -1013,7 +982,6 @@ impl EngineCore {
                     &plan.session.request_id,
                     result.output.tokens_processed,
                     result.output.tokens_generated,
-                    Vec::new(),
                     step_time_ms,
                 );
             }
@@ -1469,9 +1437,6 @@ impl EngineCore {
         let scheduler_config = SchedulerConfig::from(&config);
         let scheduler = Scheduler::new(scheduler_config);
 
-        // Create KV cache manager
-        let kv_cache = KvCacheBackend::new(&config);
-
         // Create output processor
         let output_processor =
             OutputProcessor::new(config.sample_rate).with_chunk_size(config.streaming_chunk_size);
@@ -1497,7 +1462,6 @@ impl EngineCore {
         Ok(Self {
             config,
             scheduler,
-            kv_cache,
             managed_kv_cache,
             executor,
             output_processor,
@@ -1585,8 +1549,7 @@ impl EngineCore {
         }
 
         // Add to scheduler. A public ID remains unavailable while an expired
-        // incarnation has logical cache quarantined behind unconfirmed
-        // executor cleanup.
+        // incarnation awaits capability-authoritative executor cleanup.
         if !self.scheduler.add_request(&request) {
             return Err(Error::InvalidInput(format!(
                 "Request {} already exists or is awaiting cache cleanup",
@@ -1850,8 +1813,7 @@ impl EngineCore {
         };
         let release = self.executor.cleanup_session(session).await;
         if release.confirmed || !confirmation_required {
-            self.scheduler
-                .confirm_session_release(session, self.kv_cache.inner_mut());
+            self.scheduler.confirm_session_release(session);
         } else {
             self.record_unconfirmed_cleanup(session);
         }
@@ -2046,76 +2008,13 @@ impl EngineCore {
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
         self.reconcile_due_cleanup().await;
-        let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
+        let schedule_result = self.scheduler.schedule();
 
-        // Deadline expiry removes a request from runnable scheduler state but
-        // deliberately retains its logical cache allocation. Reconcile the
-        // exact executor session before any newly scheduled work can execute;
-        // only a confirmed physical cleanup permits logical block reuse.
+        // Reconcile capability-authoritative state for expired sessions before
+        // newly scheduled work executes.
         for expired in &schedule_result.expired_requests {
             let session = expired.session_key();
             self.attempt_pending_release_cleanup(&session).await;
-        }
-
-        for session in &schedule_result.preempted_requests {
-            let release = self.executor.cleanup_session(session).await;
-            if release.confirmed {
-                if !self
-                    .scheduler
-                    .confirm_preemption(session, self.kv_cache.inner_mut())
-                {
-                    let quarantined = self.scheduler.quarantine_rejected_confirmed_preemption(
-                        session,
-                        self.kv_cache.inner_mut(),
-                    );
-                    warn!(
-                        request_id = %session.request_id,
-                        session_epoch = session.epoch,
-                        quarantined,
-                        "Scheduler rejected confirmed preemption"
-                    );
-                    if quarantined {
-                        self.requests.remove(&session.request_id);
-                        let message = "scheduler could not commit an executor-confirmed preemption";
-                        self.pending_terminal_outputs
-                            .push_back(CommittedExecutorOutput {
-                                session: session.clone(),
-                                output: ExecutorOutput::error(session.request_id.clone(), message),
-                                disposition: ExecutionDisposition::Failed(
-                                    ExecutionFailure::invalid_output(message),
-                                ),
-                                provenance: OutcomeProvenance::failure(
-                                    FailureOrigin::Cleanup,
-                                    DispatchState::NotStarted,
-                                ),
-                                staged_stream_outputs: Vec::new(),
-                            });
-                    }
-                }
-            } else {
-                self.scheduler.quarantine_failed_preemption(session);
-                self.record_unconfirmed_cleanup(session);
-                self.requests.remove(&session.request_id);
-                let message = "executor could not confirm physical cache release during preemption";
-                self.pending_terminal_outputs
-                    .push_back(CommittedExecutorOutput {
-                        session: session.clone(),
-                        output: ExecutorOutput::error(session.request_id.clone(), message),
-                        disposition: ExecutionDisposition::Failed(
-                            ExecutionFailure::invalid_output(message),
-                        ),
-                        provenance: OutcomeProvenance::failure(
-                            FailureOrigin::Cleanup,
-                            DispatchState::NotStarted,
-                        ),
-                        staged_stream_outputs: Vec::new(),
-                    });
-            }
-            self.request_managed_session_release(session);
-            self.clear_exact_execution_state(session);
-            self.request_phase_timings
-                .entry(session.request_id.clone())
-                .and_modify(|timing| *timing = RequestPhaseTiming::default());
         }
 
         for request in &schedule_result.expired_requests {
@@ -2798,13 +2697,7 @@ impl EngineCore {
         self.scheduler.running_count()
     }
 
-    /// Get KV cache statistics.
-    pub fn kv_cache_stats(&self) -> super::kv_cache::KVCacheStats {
-        self.kv_cache.stats()
-    }
-
-    /// Exact physical managed-arena state, kept distinct from the legacy
-    /// logical KV block projection returned by `kv_cache_stats`.
+    /// Exact physical managed-arena state.
     pub fn managed_kv_runtime_snapshot(&self) -> super::ManagedKvRuntimeSnapshot {
         self.managed_kv_cache.runtime_snapshot()
     }
@@ -2827,10 +2720,8 @@ impl EngineCore {
         // Shutdown executor
         self.executor.shutdown().await?;
 
-        // A successful executor shutdown is the final physical-release fence:
-        // no backend session can still reference the quarantined logical cache.
-        self.scheduler
-            .force_release_all_after_executor_shutdown(self.kv_cache.inner_mut());
+        // A successful executor shutdown is the final physical-release fence.
+        self.scheduler.force_release_all_after_executor_shutdown();
         self.requests.clear();
         self.request_start_times.clear();
         self.request_phase_timings.clear();
@@ -2864,7 +2755,7 @@ mod tests {
         ExecutorOutput, ExecutorPhaseTiming, ExecutorStepResult, ModelExecutor,
     };
     use super::super::scheduler::ScheduledRequest;
-    use super::super::types::{AudioOutput, Priority, TaskType};
+    use super::super::types::{AudioOutput, TaskType};
     use super::*;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -2878,7 +2769,6 @@ mod tests {
             sequence_id,
             num_tokens: 1,
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Prefill,
@@ -2895,7 +2785,6 @@ mod tests {
             sequence_id,
             num_tokens: 1,
             is_prefill: false,
-            block_ids: Vec::new(),
             num_computed_tokens: 1,
             work: crate::engine::WorkUnit::SequenceStep {
                 phase: crate::engine::SequencePhase::Decode,
@@ -3147,10 +3036,9 @@ mod tests {
                 ExecutionMode::Sequence,
             );
             profile.prefill = PrefillMode::Full;
-            // This fixture exercises executor-owned cache cleanup and logical
-            // quarantine. ExternalPaged is reserved for requests carrying an
-            // installed managed arena runtime and must not allocate shadow
-            // legacy blocks.
+            // This fixture exercises executor-owned cache cleanup and exact
+            // session quarantine. ExternalPaged is reserved for requests
+            // carrying an installed managed arena runtime.
             profile.cache_mode = super::super::execution::CacheMode::OpaqueModelOwned;
             profile.cache_release_safe = true;
             profile.prefix_reuse_safe = true;
@@ -3421,60 +3309,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_recompute_preemption_cleanup_clears_executor_state() {
-        let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
-        let executor =
-            UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
-
-        let config = EngineCoreConfig {
-            max_batch_size: 2,
-            max_tokens_per_step: 8,
-            min_tokens_per_step: 1,
-            block_size: 1,
-            max_blocks: 1,
-            scheduling_policy: super::super::scheduler::SchedulingPolicy::Priority,
-            enable_chunked_prefill: false,
-            enable_preemption: true,
-            enable_adaptive_batching: false,
-            backend: BackendKind::Cpu,
-            ..Default::default()
-        };
-        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
-
-        let mut low = EngineCoreRequest::tts("low-priority");
-        low.id = "low-priority".to_string();
-        low.prompt_tokens = vec![1];
-        low.priority = Priority::Low;
-        core.add_request(low).unwrap();
-        let _ = core.step().await.unwrap();
-
-        let low_id = "low-priority".to_string();
-        let session = core
-            .scheduler
-            .prepare_preemption_for_test(&low_id)
-            .expect("running low-priority session");
-        let release = core.executor.cleanup_session(&session).await;
-        assert!(release.confirmed);
-        assert!(core
-            .scheduler
-            .confirm_preemption(&session, core.kv_cache.inner_mut()));
-        core.request_managed_session_release(&session);
-        core.clear_exact_execution_state(&session);
-
-        let calls = cleanup_calls.lock().unwrap().clone();
-        assert!(
-            calls.iter().any(|id| id == "low-priority"),
-            "recompute preemption must clear stale executor decode state"
-        );
-        assert_eq!(
-            core.get_request_status(&low_id),
-            Some(RequestStatus::Running)
-        );
-        assert_eq!(core.scheduler.get_running_info(&low_id), Some((0, 0)));
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
-    }
-
-    #[tokio::test]
     async fn test_abort_requests_for_variant_only_aborts_matching_requests() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
@@ -3711,7 +3545,6 @@ mod tests {
             .filter(|event| event.starts_with("cleanup:cleanup-fence:"))
             .count();
         assert!(cleanup_attempts >= 2, "cleanup was not retried");
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(core.add_request(request).is_err());
     }
 
@@ -3741,11 +3574,9 @@ mod tests {
         aborted.prompt_tokens = vec![1];
         core.add_request(aborted.clone()).unwrap();
         core.step().await.unwrap();
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
 
         let aborted_session = core.get_session_key(&aborted.id).unwrap();
         assert!(core.abort_request_session(&aborted_session).await);
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(core.has_pending_terminal_output(&aborted.id));
         assert!(core.add_request(aborted.clone()).is_err());
 
@@ -4553,11 +4384,7 @@ mod tests {
         request.id = "transaction".to_string();
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
 
         let mut invalid = ExecutorStepResult::new(
@@ -4651,11 +4478,7 @@ mod tests {
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         let session = scheduled.session_key();
         core.begin_execution_plan(&scheduled).await.unwrap();
 
@@ -4674,7 +4497,7 @@ mod tests {
             Some((0, 0))
         );
 
-        let mut retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+        let mut retry_schedule = core.scheduler.schedule();
         assert_eq!(
             retry_schedule.prefill_requests.len(),
             1,
@@ -4710,11 +4533,7 @@ mod tests {
             request.prompt_tokens = vec![1];
             core.add_request(request).unwrap();
             core.refresh_scheduler_execution_profiles().await;
-            let scheduled = core
-                .scheduler
-                .schedule(core.kv_cache.inner_mut())
-                .prefill_requests
-                .remove(0);
+            let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
             let session = scheduled.session_key();
             core.begin_execution_plan(&scheduled).await.unwrap();
             core.incremental_stream_sessions.insert(session.clone());
@@ -4736,7 +4555,7 @@ mod tests {
                     ..
                 })
             ));
-            let retry_schedule = core.scheduler.schedule(core.kv_cache.inner_mut());
+            let retry_schedule = core.scheduler.schedule();
             assert!(retry_schedule.prefill_requests.is_empty());
             assert!(retry_schedule.decode_requests.is_empty());
         }
@@ -4765,11 +4584,7 @@ mod tests {
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
 
-        let mut scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let mut scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         let session = scheduled.session_key();
         for attempt in 1..=3 {
             core.begin_execution_plan(&scheduled).await.unwrap();
@@ -4781,11 +4596,7 @@ mod tests {
                 .await;
             if attempt <= 2 {
                 assert!(committed.is_none());
-                scheduled = core
-                    .scheduler
-                    .schedule(core.kv_cache.inner_mut())
-                    .prefill_requests
-                    .remove(0);
+                scheduled = core.scheduler.schedule().prefill_requests.remove(0);
                 assert_eq!(scheduled.session_key(), session);
             } else {
                 let committed = committed.expect("retry budget must terminalize");
@@ -4807,7 +4618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recompute_retry_releases_physical_and_logical_session_state() {
+    async fn recompute_retry_releases_capability_authoritative_session_state() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
@@ -4828,11 +4639,7 @@ mod tests {
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
 
-        let prefill = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let prefill = core.scheduler.schedule().prefill_requests.remove(0);
         let session = prefill.session_key();
         core.begin_execution_plan(&prefill).await.unwrap();
         core.commit_executor_result(
@@ -4845,11 +4652,7 @@ mod tests {
         .await
         .expect("prefill progress must be emitted");
 
-        let decode = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .decode_requests
-            .remove(0);
+        let decode = core.scheduler.schedule().decode_requests.remove(0);
         core.begin_execution_plan(&decode).await.unwrap();
         let emitted = core
             .commit_executor_result(
@@ -4872,11 +4675,7 @@ mod tests {
         );
         assert!(!core.execution_trackers.contains_key(&decode.request_id));
 
-        let retry = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let retry = core.scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(retry.session_key(), session);
         assert_ne!(retry.plan_id, decode.plan_id);
     }
@@ -4900,15 +4699,9 @@ mod tests {
         request.prompt_tokens = (0..16).collect();
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(scheduled.num_computed_tokens, 0);
         assert_eq!(scheduled.num_tokens, 16);
-        assert!(scheduled.block_ids.is_empty());
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         let mut partial = scheduled.clone();
         partial.num_tokens = 4;
         assert!(core.begin_execution_plan(&partial).await.is_err());
@@ -4971,11 +4764,7 @@ mod tests {
         request.prompt_tokens = vec![1, 2];
         core.add_request(request).unwrap();
         core.refresh_scheduler_execution_profiles().await;
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
         assert_eq!(
             core.active_plans[&scheduled.plan_id].estimate.kv_bytes,
@@ -5024,11 +4813,7 @@ mod tests {
         request.id = "valid-transaction".to_string();
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
         let result = ExecutorStepResult::new(
             &scheduled,
@@ -5069,11 +4854,7 @@ mod tests {
         request.id = "atomic".to_string();
         request.prompt_tokens = vec![1];
         core.add_request(request).unwrap();
-        let scheduled = core
-            .scheduler
-            .schedule(core.kv_cache.inner_mut())
-            .prefill_requests
-            .remove(0);
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
         core.begin_execution_plan(&scheduled).await.unwrap();
         assert!(matches!(
             core.active_plans
@@ -5286,7 +5067,6 @@ mod tests {
         expired.prompt_tokens = vec![1];
         core.add_request(expired).unwrap();
         core.step().await.unwrap();
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(core.scheduler.set_hard_deadline_for_test(
             &"expired-running".to_string(),
             Instant::now() - std::time::Duration::from_millis(1),
@@ -5302,7 +5082,6 @@ mod tests {
             output.request_id == "expired-running"
                 && output.error.as_deref() == Some(REQUEST_DEADLINE_EXCEEDED)
         }));
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(events
             .lock()
             .unwrap()
@@ -5447,8 +5226,7 @@ mod tests {
         let owner_session = core
             .get_session_key(&"capacity-owner".to_string())
             .expect("owner session");
-        core.scheduler
-            .finish_request(&"capacity-owner".to_string(), core.kv_cache.inner_mut());
+        core.scheduler.finish_request(&"capacity-owner".to_string());
 
         core.add_request(managed_request("capacity-waiter", vec![5, 6, 7, 8]))
             .expect("add waiter");
@@ -5459,7 +5237,6 @@ mod tests {
             .is_none());
         assert!(core.active_plans.is_empty());
         assert!(core.active_managed_cache.is_empty());
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
 
         core.managed_kv_cache
             .release_session(&owner_session)

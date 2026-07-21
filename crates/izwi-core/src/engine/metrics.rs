@@ -28,25 +28,16 @@ pub struct EngineMetricDescriptor {
 
 pub const ENGINE_SCHEDULER_QUEUE_DEPTH: &str = "engine.scheduler.queue_depth";
 pub const ENGINE_SCHEDULER_RUNNING_REQUESTS: &str = "engine.scheduler.running_requests";
-pub const ENGINE_SCHEDULER_PREEMPTIONS_TOTAL: &str = "engine.scheduler.preemptions_total";
 pub const ENGINE_SCHEDULER_STEP_TOKENS_TOTAL: &str = "engine.scheduler.step_tokens_total";
 pub const ENGINE_KV_CACHE_HITS_TOTAL: &str = "engine.kv_cache.hits_total";
 pub const ENGINE_KV_CACHE_MISSES_TOTAL: &str = "engine.kv_cache.misses_total";
 pub const ENGINE_KV_CACHE_EVICTIONS_TOTAL: &str = "engine.kv_cache.evictions_total";
 pub const ENGINE_KV_CACHE_ALLOCATED_BLOCKS: &str = "engine.kv_cache.allocated_blocks";
 pub const ENGINE_KV_CACHE_FREE_BLOCKS: &str = "engine.kv_cache.free_blocks";
-pub const ENGINE_KV_CACHE_SOFT_MAX_BLOCKS: &str = "engine.kv_cache.soft_max_blocks";
 pub const ENGINE_KV_CACHE_UTILIZATION_RATIO: &str = "engine.kv_cache.utilization_ratio";
 pub const ENGINE_KV_CACHE_MEMORY_USED_BYTES: &str = "engine.kv_cache.memory_used_bytes";
 pub const ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES: &str = "engine.kv_cache.memory_capacity_bytes";
-pub const ENGINE_KV_CACHE_SHARED_PREFIXES: &str = "engine.kv_cache.shared_prefixes";
-pub const ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL: &str =
-    "engine.kv_cache.prefix_reuse_blocks_total";
-pub const ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL: &str =
-    "engine.kv_cache.copy_on_write_splits_total";
-pub const ENGINE_KV_CACHE_CHURN_RATIO: &str = "engine.kv_cache.churn_ratio";
 pub const ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS: &str = "engine.kv_cache.gpu_resident_blocks";
-pub const ENGINE_KV_CACHE_PINNED_BLOCKS: &str = "engine.kv_cache.pinned_blocks";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
 pub const ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL: &str =
     "engine.stream.checkpoints_committed_total";
@@ -94,20 +85,16 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         description: "Requests currently running in the scheduler.",
     },
     EngineMetricDescriptor {
-        name: ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
-        description: "Scheduler preemptions caused by priority or KV pressure.",
-    },
-    EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
         description: "Tokens admitted into scheduler execution steps.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_HITS_TOTAL,
-        description: "Request-level prefix-cache lookups that reused at least one logical block.",
+        description: "Managed prefix-cache lookups that reused at least one physical KV page.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MISSES_TOTAL,
-        description: "Request-level prefix-cache lookups that reused no logical blocks.",
+        description: "Managed prefix-cache lookups that reused no physical KV pages.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_EVICTIONS_TOTAL,
@@ -115,51 +102,28 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
-        description: "Currently allocated logical KV-cache blocks.",
+        description: "Currently allocated physical KV-cache pages (legacy metric name retained).",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_FREE_BLOCKS,
-        description: "Currently free logical KV-cache blocks.",
-    },
-    EngineMetricDescriptor {
-        name: ENGINE_KV_CACHE_SOFT_MAX_BLOCKS,
-        description: "Current adaptive soft cap for logical KV-cache blocks.",
+        description: "Currently free physical KV-cache pages (legacy metric name retained).",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_UTILIZATION_RATIO,
-        description: "Logical KV-cache block utilization ratio.",
+        description: "Physical KV-cache page utilization ratio.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-        description: "Estimated KV-cache bytes implied by allocated logical blocks; not measured residency.",
+        description: "Physical bytes owned by currently allocated managed KV pages.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
-        description: "Estimated KV-cache bytes implied by logical block capacity; not measured residency.",
-    },
-    EngineMetricDescriptor {
-        name: ENGINE_KV_CACHE_SHARED_PREFIXES,
-        description: "Active and persistent shared-prefix entries in the KV cache.",
-    },
-    EngineMetricDescriptor {
-        name: ENGINE_KV_CACHE_PREFIX_REUSE_BLOCKS_TOTAL,
-        description: "Logical prompt blocks reused from prefix cache.",
-    },
-    EngineMetricDescriptor {
-        name: ENGINE_KV_CACHE_COPY_ON_WRITE_SPLITS_TOTAL,
-        description: "Copy-on-write logical KV-block splits.",
-    },
-    EngineMetricDescriptor {
-        name: ENGINE_KV_CACHE_CHURN_RATIO,
-        description: "Last sampled logical KV-block churn ratio used by soft-cap tuning.",
+        description: "Exact physical backing bytes allocated for managed KV arenas.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
-        description: "Logical KV blocks marked device-resident by scheduler tiering; not measured GPU memory.",
-    },
-    EngineMetricDescriptor {
-        name: ENGINE_KV_CACHE_PINNED_BLOCKS,
-        description: "Logical KV blocks pinned for backend execution.",
+        description:
+            "Allocated physical KV pages in Metal or CUDA arenas (legacy metric name retained).",
     },
     EngineMetricDescriptor {
         name: ENGINE_STREAM_BACKPRESSURE_TOTAL,
@@ -978,7 +942,6 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
 
         assert!(names.contains(ENGINE_SCHEDULER_QUEUE_DEPTH));
-        assert!(names.contains(ENGINE_SCHEDULER_PREEMPTIONS_TOTAL));
         assert!(names.contains(ENGINE_KV_CACHE_HITS_TOTAL));
         assert!(names.contains(ENGINE_KV_CACHE_EVICTIONS_TOTAL));
         assert!(names.contains(ENGINE_STREAM_BACKPRESSURE_TOTAL));

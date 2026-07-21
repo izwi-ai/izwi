@@ -55,11 +55,6 @@ pub struct InferenceBrokerRuntimeTelemetrySnapshot {
 pub struct EngineRuntimeTelemetrySnapshot {
     pub scheduler_queue_depth: u64,
     pub scheduler_running_requests: u64,
-    pub kv_cache_hits_total: u64,
-    pub kv_cache_misses_total: u64,
-    pub kv_cache_evictions_total: u64,
-    pub kv_cache_allocated_blocks: u64,
-    pub kv_cache_prefix_reuse_blocks_total: u64,
     pub stream_backpressure_total: u64,
     pub stream_checkpoints_committed_total: u64,
     pub stream_checkpoint_rejections_total: u64,
@@ -81,37 +76,8 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
-    /// Legacy scheduler block projection; memory values are config estimates.
-    pub kv_cache: EngineKvCacheRuntimeSnapshot,
-    /// Exact backend-owned managed arenas and transaction/page ownership.
-    pub managed_kv_cache: ManagedKvRuntimeSnapshot,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct EngineKvCacheRuntimeSnapshot {
-    pub block_accounting: &'static str,
-    pub memory_accounting: &'static str,
-    pub total_blocks: u64,
-    pub soft_max_blocks: u64,
-    pub allocated_blocks: u64,
-    pub free_blocks: u64,
-    pub block_size: u64,
-    pub dtype_bytes: u64,
-    pub block_memory_bytes: u64,
-    pub memory_used_bytes: u64,
-    pub memory_capacity_bytes: u64,
-    pub utilization_ratio: f64,
-    pub gpu_resident_blocks: u64,
-    pub pinned_blocks: u64,
-    pub shared_prefixes: u64,
-    pub total_allocations: u64,
-    pub total_frees: u64,
-    pub shared_prefix_hits: u64,
-    pub shared_prefix_misses: u64,
-    pub shared_prefix_blocks_reused: u64,
-    pub persistent_prefix_evictions: u64,
-    pub copy_on_write_splits: u64,
-    pub last_churn_ratio: f64,
+    /// Exact backend-owned managed arenas, page ownership, and counters.
+    pub kv_cache: ManagedKvRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1117,6 +1083,23 @@ pub(crate) fn push_engine_labeled_metric(
     }
 }
 
+pub(crate) fn push_engine_labeled_metric_f64(
+    payload: &mut String,
+    name: &str,
+    label_name: &str,
+    values: &[(&str, f64)],
+) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
+    payload.push_str(&format!("# TYPE {prometheus_name} {metric_type}\n"));
+    for (label_value, value) in values {
+        payload.push_str(&format!(
+            "{prometheus_name}{{{label_name}=\"{label_value}\"}} {value:.6}\n"
+        ));
+    }
+}
+
 fn push_engine_metric_help(payload: &mut String, name: &str, prometheus_name: &str) {
     if let Some(descriptor) = engine_metric_catalog()
         .iter()
@@ -1188,25 +1171,20 @@ mod tests {
     }
 
     #[test]
-    fn engine_snapshot_serializes_legacy_and_managed_kv_as_distinct_domains() {
+    fn engine_snapshot_serializes_managed_kv_as_the_only_cache_domain() {
         let snapshot = EngineRuntimeTelemetrySnapshot {
-            kv_cache: EngineKvCacheRuntimeSnapshot {
-                block_accounting: "logical",
-                memory_accounting: "estimated_from_config",
-                ..EngineKvCacheRuntimeSnapshot::default()
-            },
-            managed_kv_cache: ManagedKvRuntimeSnapshot::default(),
+            kv_cache: ManagedKvRuntimeSnapshot::default(),
             ..EngineRuntimeTelemetrySnapshot::default()
         };
 
         let value = serde_json::to_value(snapshot).expect("serialize engine telemetry");
-        assert_eq!(value["kv_cache"]["block_accounting"], "logical");
         assert_eq!(
-            value["managed_kv_cache"]["memory_accounting"],
+            value["kv_cache"]["memory_accounting"],
             "physical_arena_backing"
         );
-        assert!(value["managed_kv_cache"].get("totals").is_some());
-        assert!(value["kv_cache"].get("models").is_none());
+        assert!(value["kv_cache"].get("totals").is_some());
+        assert!(value.get("managed_kv_cache").is_none());
+        assert!(value.get("kv_cache_allocated_blocks").is_none());
     }
 
     #[tokio::test]

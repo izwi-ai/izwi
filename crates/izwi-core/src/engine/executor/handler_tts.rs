@@ -65,8 +65,8 @@ impl NativeExecutor {
                 },
             )
         }) {
-            // The atomic tensor API is valid only when the exact model/backend
-            // rollout produced a static execution plan. In particular, an
+            // The atomic tensor API is valid only when native adapter selection
+            // produced a static execution plan. In particular, an
             // ordinary singleton Qwen request must stay on its incremental
             // sequence adapter instead of generating a full utterance against
             // a one-step sequence plan.
@@ -499,7 +499,6 @@ mod tests {
             sequence_id: 1,
             num_tokens: request.num_prompt_tokens().max(1),
             is_prefill: true,
-            block_ids: Vec::new(),
             num_computed_tokens: 0,
             work: WorkUnit::SequenceStep {
                 phase: SequencePhase::Prefill,
