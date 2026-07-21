@@ -12,12 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use crate::backends::kv::{KvArena, KvPagedDecodeArgs, KvWriteArgs};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::{
-    AttentionSemantics, CacheDomainId, CacheTokenAxis, KeyEncoding, KvCacheContract, KvDomainSpec,
-    KvPrefixSemantics, KvStorageDType, KvStorageRequest, PageTokenConstraint,
-    PagedAttentionDomainSpec, PagedAttentionLayerSpec, CURRENT_KV_CONTRACT_ABI,
+    AttentionSemantics, CacheBlockRef, CacheDomainId, CacheTokenAxis, KeyEncoding, KvCacheContract,
+    KvDecodeBatchMetadata, KvDomainSpec, KvLayerBinding, KvPrefixSemantics, KvSequenceBlockTable,
+    KvSlotRef, KvStorageDType, KvStorageRequest, PageTokenConstraint, PagedAttentionDomainSpec,
+    PagedAttentionLayerSpec, CURRENT_KV_CONTRACT_ABI,
 };
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
@@ -172,6 +174,184 @@ pub(crate) fn qwen3_decoder_cache_domain(
         },
         prefix_semantics: geometry.prefix_semantics,
     })
+}
+
+/// Session-local view of backend-owned, authoritative Qwen3 KV pages.
+///
+/// The arena owns all K/V tensors. This object retains only the physical block
+/// table and the logical context length, so promoting a native Qwen3 session to
+/// managed paging never leaves a second model-owned copy of its history.
+pub struct Qwen3ManagedCache {
+    arena: Arc<dyn KvArena>,
+    layer_bindings: Vec<KvLayerBinding>,
+    blocks: Vec<CacheBlockRef>,
+    context_len: usize,
+}
+
+impl Qwen3ManagedCache {
+    pub fn new(
+        arena: Arc<dyn KvArena>,
+        layer_bindings: Vec<KvLayerBinding>,
+        blocks: Vec<CacheBlockRef>,
+        context_len: usize,
+    ) -> Result<Self> {
+        if layer_bindings.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed cache has no layer bindings".to_string(),
+            ));
+        }
+        if blocks.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed cache has no physical blocks".to_string(),
+            ));
+        }
+        let arena_id = arena.id();
+        let group = arena.config().group;
+        let mut unique_blocks = std::collections::HashSet::with_capacity(blocks.len());
+        for block in &blocks {
+            if block.arena != arena_id || block.group != group {
+                return Err(Error::InvalidInput(
+                    "Qwen3 managed cache block belongs to another arena or group".to_string(),
+                ));
+            }
+            if block.index >= arena.config().capacity_pages {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 managed cache block {} exceeds arena capacity {}",
+                    block.index,
+                    arena.config().capacity_pages
+                )));
+            }
+            if !unique_blocks.insert(*block) {
+                return Err(Error::InvalidInput(
+                    "Qwen3 managed cache block table contains a duplicate block".to_string(),
+                ));
+            }
+        }
+        let capacity_tokens = blocks
+            .len()
+            .checked_mul(arena.config().page_tokens as usize)
+            .ok_or_else(|| Error::InvalidInput("Qwen3 managed cache capacity overflow".into()))?;
+        if context_len > capacity_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed cache context {context_len} exceeds capacity {capacity_tokens}"
+            )));
+        }
+        for (expected, binding) in layer_bindings.iter().enumerate() {
+            if binding.model_layer as usize != expected {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 managed layer binding {} maps model layer {}, expected {}",
+                    binding.physical_layer, binding.model_layer, expected
+                )));
+            }
+        }
+        Ok(Self {
+            arena,
+            layer_bindings,
+            blocks,
+            context_len,
+        })
+    }
+
+    pub fn context_len(&self) -> usize {
+        self.context_len
+    }
+
+    pub fn capacity_tokens(&self) -> usize {
+        self.blocks.len() * self.arena.config().page_tokens as usize
+    }
+
+    pub fn arena(&self) -> &Arc<dyn KvArena> {
+        &self.arena
+    }
+
+    fn validate_model(
+        &self,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if self.layer_bindings.len() != num_layers || self.arena.config().layers.len() != num_layers
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed cache has {} layers for a {num_layers}-layer model",
+                self.layer_bindings.len()
+            )));
+        }
+        for (binding, layer) in self
+            .layer_bindings
+            .iter()
+            .zip(self.arena.config().layers.iter())
+        {
+            if layer.binding != *binding
+                || layer.num_kv_heads as usize != num_kv_heads
+                || layer.key_head_dim as usize != head_dim
+                || layer.value_head_dim as usize != head_dim
+            {
+                return Err(Error::InvalidInput(
+                    "Qwen3 managed cache geometry does not match the loaded model".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn slots_for_append(&self, start_pos: usize, token_count: usize) -> Result<Vec<KvSlotRef>> {
+        if start_pos != self.context_len {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed append starts at {start_pos}, expected {}",
+                self.context_len
+            )));
+        }
+        let end = start_pos
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("Qwen3 managed context overflow".into()))?;
+        if end > self.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed append ends at {end}, beyond capacity {}",
+                self.capacity_tokens()
+            )));
+        }
+        let page_tokens = self.arena.config().page_tokens as usize;
+        (start_pos..end)
+            .map(|position| {
+                Ok(KvSlotRef {
+                    block: self.blocks[position / page_tokens],
+                    offset: u32::try_from(position % page_tokens).map_err(|_| {
+                        Error::InvalidInput("Qwen3 managed page offset exceeds u32".into())
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    fn sequence_table(&self, context_len: usize) -> Result<KvSequenceBlockTable> {
+        if context_len == 0 || context_len > self.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed decode context {context_len} is outside cache capacity"
+            )));
+        }
+        let required_pages = context_len.div_ceil(self.arena.config().page_tokens as usize);
+        Ok(KvSequenceBlockTable {
+            blocks: self.blocks[..required_pages].to_vec(),
+            context_len: u32::try_from(context_len).map_err(|_| {
+                Error::InvalidInput("Qwen3 managed context length exceeds u32".into())
+            })?,
+        })
+    }
+
+    fn layer_binding(&self, layer_idx: usize) -> Result<KvLayerBinding> {
+        self.layer_bindings.get(layer_idx).copied().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Qwen3 managed cache has no binding for layer {layer_idx}"
+            ))
+        })
+    }
+
+    fn commit_append(&mut self, start_pos: usize, token_count: usize) -> Result<()> {
+        self.slots_for_append(start_pos, token_count)?;
+        self.context_len += token_count;
+        Ok(())
+    }
 }
 
 pub struct Qwen3Cache {
@@ -1868,6 +2048,188 @@ impl Qwen3Attention {
         Ok(out)
     }
 
+    fn forward_managed(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: &Qwen3ManagedCache,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        let seq_len = x.dim(1)?;
+        if bsz != 1 {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed prefill expects one sequence per call".to_string(),
+            ));
+        }
+        if seq_len > 1 && start_pos != 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed chunked prefill is not implemented".to_string(),
+            ));
+        }
+
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
+        let (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, None)?;
+
+        let slots = cache.slots_for_append(start_pos, seq_len)?;
+        let lowered = cache.arena.lower_slots(&slots)?;
+        let keys = k
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        cache
+            .arena
+            .write_slots(
+                cache.layer_binding(layer_idx)?,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: lowered.as_ref(),
+                },
+            )?
+            .wait()?;
+
+        if seq_len == 1 {
+            let queries = q
+                .reshape((1, self.num_heads, self.head_dim))?
+                .contiguous()?;
+            let metadata = KvDecodeBatchMetadata {
+                sequences: vec![cache.sequence_table(start_pos + 1)?],
+            };
+            let out = cache.arena.paged_decode(
+                cache.layer_binding(layer_idx)?,
+                KvPagedDecodeArgs {
+                    queries: &queries,
+                    batch: &metadata,
+                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                },
+            )?;
+            let out = out.reshape((1, 1, self.num_heads * self.head_dim))?;
+            return self.o_proj.forward(&out).map_err(Error::from);
+        }
+
+        // Initial prefill writes the authoritative pages and computes causal
+        // attention from the already projected tensors. No model-owned cache
+        // is created, and subsequent decode starts directly from the arena.
+        let q = q.transpose(1, 2)?;
+        let k_kv = k.transpose(1, 2)?;
+        let v_kv = v.transpose(1, 2)?;
+        if let Some(fused_out) =
+            try_fused_self_attention(&q, &k_kv, &v_kv, None, self.head_dim, true)?
+        {
+            let out = fused_out.transpose(1, 2)?.reshape((
+                bsz,
+                seq_len,
+                self.num_heads * self.head_dim,
+            ))?;
+            return self.o_proj.forward(&out).map_err(Error::from);
+        }
+
+        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
+        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
+        let q = q.reshape((self.num_heads, seq_len, self.head_dim))?;
+        let k = k.reshape((self.num_heads, seq_len, self.head_dim))?;
+        let v = v.reshape((self.num_heads, seq_len, self.head_dim))?;
+        let mut att = q.matmul(&k.transpose(1, 2)?)?;
+        let scale = Tensor::from_vec(vec![(self.head_dim as f32).sqrt()], (1,), att.device())?
+            .to_dtype(att.dtype())?;
+        att = att.broadcast_div(&scale)?;
+        let mask = causal_mask(seq_len, seq_len, 0, att.device(), att.dtype())?;
+        let att = ops::softmax(&att.broadcast_add(&mask)?, D::Minus1)?;
+        let out = att
+            .matmul(&v)?
+            .reshape((1, self.num_heads, seq_len, self.head_dim))?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((1, seq_len, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&Qwen3ManagedCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let bsz = x.dim(0)?;
+        if x.dim(1)? != 1 || bsz == 0 || start_positions.len() != bsz || caches.len() != bsz {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed decode batch dimensions do not match".to_string(),
+            ));
+        }
+        let first = caches[0];
+        if caches.iter().any(|cache| {
+            !Arc::ptr_eq(&cache.arena, &first.arena)
+                || cache.layer_binding(layer_idx).ok() != first.layer_binding(layer_idx).ok()
+        }) {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed decode rows must share one arena and layer binding".to_string(),
+            ));
+        }
+
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((bsz, 1, self.num_heads, self.head_dim))?;
+        let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
+        let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
+
+        let mut query_rows = Vec::with_capacity(bsz);
+        let mut key_rows = Vec::with_capacity(bsz);
+        let mut value_rows = Vec::with_capacity(bsz);
+        let mut slots = Vec::with_capacity(bsz);
+        let mut sequences = Vec::with_capacity(bsz);
+        for row in 0..bsz {
+            let q_row = q.i(row)?.unsqueeze(0)?;
+            let k_row = k.i(row)?.unsqueeze(0)?;
+            let (q_row, k_row) =
+                self.apply_rope_pair(q_row, k_row, start_positions[row], None, None)?;
+            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
+            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
+            slots.push(caches[row].slots_for_append(start_positions[row], 1)?[0]);
+            sequences.push(caches[row].sequence_table(start_positions[row] + 1)?);
+        }
+
+        let query_rows = query_rows.iter().collect::<Vec<_>>();
+        let key_rows = key_rows.iter().collect::<Vec<_>>();
+        let value_rows = value_rows.iter().collect::<Vec<_>>();
+        let queries = Tensor::stack(&query_rows, 0)?.contiguous()?;
+        let keys = Tensor::stack(&key_rows, 0)?.contiguous()?;
+        let values = Tensor::stack(&value_rows, 0)?.contiguous()?;
+        let lowered = first.arena.lower_slots(&slots)?;
+        let binding = first.layer_binding(layer_idx)?;
+        first
+            .arena
+            .write_slots(
+                binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: lowered.as_ref(),
+                },
+            )?
+            .wait()?;
+        let metadata = KvDecodeBatchMetadata { sequences };
+        let out = first.arena.paged_decode(
+            binding,
+            KvPagedDecodeArgs {
+                queries: &queries,
+                batch: &metadata,
+                softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+            },
+        )?;
+        let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
     fn forward_decode_batch(
         &self,
         x: &Tensor,
@@ -2107,6 +2469,44 @@ impl Qwen3Layer {
                 .forward_decode_batch(&normed, start_positions, caches, layer_idx)?;
         let x = x.broadcast_add(&attn_out)?;
 
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_managed(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: &Qwen3ManagedCache,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out =
+            self.self_attn
+                .forward_managed(&normed, start_pos, position_ids, cache, layer_idx)?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_managed_decode_batch(
+        &self,
+        x: &Tensor,
+        start_positions: &[usize],
+        caches: &[&Qwen3ManagedCache],
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_managed_decode_batch(
+            &normed,
+            start_positions,
+            caches,
+            layer_idx,
+        )?;
+        let x = x.broadcast_add(&attn_out)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
@@ -2387,6 +2787,97 @@ impl Qwen3Model {
         }
         let hidden = self.norm.forward(&x)?;
         self.logits_from_hidden(&hidden)
+    }
+
+    /// Execute native Qwen3 against backend-owned authoritative KV pages.
+    ///
+    /// Initial prefill writes each layer directly into the supplied arena and
+    /// advances the logical context only after every layer succeeds. Decode
+    /// consumes those same pages without constructing a `Qwen3Cache`.
+    pub fn forward_managed(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: &mut Qwen3ManagedCache,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len) = input_ids.dims2()?;
+        if batch_size != 1 || sequence_len == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed forward expects [1,sequence], got {:?}",
+                input_ids.dims()
+            )));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        cache.slots_for_append(start_pos, sequence_len)?;
+
+        let mut x = self.embeddings(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_managed(&x, start_pos, None, cache, layer_idx)?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        let logits = self.logits_from_hidden(&hidden)?;
+        cache.commit_append(start_pos, sequence_len)?;
+        Ok(logits)
+    }
+
+    /// One direct paged-attention call per layer for a ragged batch of native
+    /// Qwen3 decode rows sharing the same physical arena.
+    pub fn forward_managed_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        start_positions: &[usize],
+        caches: &mut [&mut Qwen3ManagedCache],
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len) = input_ids.dims2()?;
+        if sequence_len != 1
+            || batch_size == 0
+            || start_positions.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed decode expects matching [batch,1] rows, got {:?}",
+                input_ids.dims()
+            )));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        for (row, cache) in caches.iter().enumerate() {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                self.cfg.head_dim(),
+            )?;
+            cache.slots_for_append(start_positions[row], 1)?;
+        }
+
+        let mut x = self.embeddings(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let cache_refs = caches
+                .iter()
+                .map(|cache| &**cache)
+                .collect::<Vec<&Qwen3ManagedCache>>();
+            x = layer.forward_managed_decode_batch(&x, start_positions, &cache_refs, layer_idx)?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        let logits = self.logits_from_hidden(&hidden)?;
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_append(start_positions[row], 1)?;
+        }
+        Ok(logits)
     }
 
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -2793,6 +3284,10 @@ fn qwen3_rope_kernel_enabled(device: &Device) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{KvArenaId, KvGroupId};
     use candle_nn::rotary_emb;
     use std::collections::HashMap;
 
@@ -2938,6 +3433,49 @@ mod tests {
         Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None)
     }
 
+    fn test_managed_arena() -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = CpuKvArena::new(KvArenaConfig {
+            id: KvArenaId {
+                model_instance: ModelInstanceId::new(93),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                generation: 1,
+            },
+            group: KvGroupId::new(0),
+            page_tokens: 2,
+            capacity_pages: 8,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        })
+        .unwrap();
+        (Arc::new(arena), vec![binding])
+    }
+
+    fn test_managed_cache(
+        arena: Arc<dyn KvArena>,
+        bindings: Vec<KvLayerBinding>,
+        first_page: u32,
+    ) -> Qwen3ManagedCache {
+        let blocks = (first_page..first_page + 4)
+            .map(|index| CacheBlockRef {
+                arena: arena.id(),
+                group: arena.config().group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        Qwen3ManagedCache::new(arena, bindings, blocks, 0).unwrap()
+    }
+
     #[test]
     fn session_cache_bound_is_architecture_derived_and_monotonic() {
         let cfg = Qwen3Config {
@@ -3034,6 +3572,72 @@ mod tests {
 
         assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
         assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
+    }
+
+    #[test]
+    fn managed_qwen3_prefill_and_decode_match_model_owned_cache() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let mut owned = test_cache();
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
+
+        let owned_prefill = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+        let managed_prefill = model.forward_managed(&prompt, 0, &mut managed).unwrap();
+        assert_tensor_close(&owned_prefill, &managed_prefill);
+        assert_eq!(managed.context_len(), 3);
+
+        let token = Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap();
+        let owned_decode = model.forward(&token, 3, Some(&mut owned)).unwrap();
+        let managed_decode = model.forward_managed(&token, 3, &mut managed).unwrap();
+        assert_tensor_close(&owned_decode, &managed_decode);
+        assert_eq!(managed.context_len(), 4);
+    }
+
+    #[test]
+    fn managed_qwen3_decode_batches_ragged_rows_in_one_arena() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let mut owned_a = test_cache();
+        let mut owned_b = test_cache();
+        let (arena, bindings) = test_managed_arena();
+        let mut managed_a = test_managed_cache(arena.clone(), bindings.clone(), 0);
+        let mut managed_b = test_managed_cache(arena, bindings, 4);
+        let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        model.forward(&prompt_a, 0, Some(&mut owned_a)).unwrap();
+        model.forward(&prompt_b, 0, Some(&mut owned_b)).unwrap();
+        model.forward_managed(&prompt_a, 0, &mut managed_a).unwrap();
+        model.forward_managed(&prompt_b, 0, &mut managed_b).unwrap();
+
+        let scalar_a = model
+            .forward(
+                &Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap(),
+                2,
+                Some(&mut owned_a),
+            )
+            .unwrap();
+        let scalar_b = model
+            .forward(
+                &Tensor::from_vec(vec![6u32], (1, 1), &device).unwrap(),
+                3,
+                Some(&mut owned_b),
+            )
+            .unwrap();
+        let mut caches = [&mut managed_a, &mut managed_b];
+        let batched = model
+            .forward_managed_decode_batch(
+                &Tensor::from_vec(vec![5u32, 6], (2, 1), &device).unwrap(),
+                &[2, 3],
+                &mut caches,
+            )
+            .unwrap();
+
+        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
+        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
+        assert_eq!(managed_a.context_len(), 3);
+        assert_eq!(managed_b.context_len(), 4);
     }
 
     #[test]

@@ -19,7 +19,9 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Config, Qwen3Model};
+use crate::models::architectures::qwen3::core::{
+    Qwen3Cache, Qwen3Config, Qwen3ManagedCache, Qwen3Model,
+};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
@@ -33,7 +35,7 @@ pub struct ChatGenerationOutput {
 }
 
 pub struct ChatDecodeState {
-    cache: Qwen3Cache,
+    cache: ChatKvCache,
     embeds: Tensor,
     pos: usize,
     generated_ids: Vec<u32>,
@@ -42,13 +44,24 @@ pub struct ChatDecodeState {
     finished: bool,
 }
 
+enum ChatKvCache {
+    ModelOwned(Qwen3Cache),
+    Managed(Qwen3ManagedCache),
+}
+
 impl ChatDecodeState {
     /// All Candle backing allocations retained by this incremental session.
     pub fn session_cache_bytes(&self) -> Option<u64> {
         let mut accounting = TensorStorageAccounting::default();
-        self.cache.account_storage(&mut accounting)?;
+        if let ChatKvCache::ModelOwned(cache) = &self.cache {
+            cache.account_storage(&mut accounting)?;
+        }
         accounting.add_tensor(&self.embeds)?;
         Some(accounting.bytes())
+    }
+
+    pub fn uses_managed_kv(&self) -> bool {
+        matches!(self.cache, ChatKvCache::Managed(_))
     }
 }
 
@@ -361,7 +374,48 @@ impl Qwen3ChatModel {
         let pos = embeds.dim(1)?;
 
         Ok(ChatDecodeState {
-            cache,
+            cache: ChatKvCache::ModelOwned(cache),
+            embeds,
+            pos,
+            generated_ids: Vec::new(),
+            assembled: String::new(),
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
+        })
+    }
+
+    /// Start a native safetensors session directly in authoritative physical
+    /// KV pages supplied by the engine. The prompt is written into the arena
+    /// during prefill; no model-owned prompt history survives this boundary.
+    pub fn start_decode_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        mut cache: Qwen3ManagedCache,
+    ) -> Result<ChatDecodeState> {
+        let text_model = match &self.backend {
+            Qwen3ChatBackend::Native { text_model } => text_model,
+            Qwen3ChatBackend::Gguf { .. } => {
+                return Err(Error::InvalidInput(
+                    "Managed KV is unavailable for GGUF Qwen3 chat".to_string(),
+                ))
+            }
+        };
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed chat prefill requires an empty cache".to_string(),
+            ));
+        }
+        let prompt_ids = self.build_prompt(messages)?;
+        let input_ids = Tensor::from_vec(
+            prompt_ids.clone(),
+            (1, prompt_ids.len()),
+            &self.device.device,
+        )?;
+        let embeds = text_model.forward_managed(&input_ids, 0, &mut cache)?;
+        let pos = embeds.dim(1)?;
+        Ok(ChatDecodeState {
+            cache: ChatKvCache::Managed(cache),
             embeds,
             pos,
             generated_ids: Vec::new(),
@@ -414,7 +468,14 @@ impl Qwen3ChatModel {
         state.assembled = decoded;
 
         let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-        state.embeds = text_model.forward(&next_tensor, state.pos, Some(&mut state.cache))?;
+        state.embeds = match &mut state.cache {
+            ChatKvCache::ModelOwned(cache) => {
+                text_model.forward(&next_tensor, state.pos, Some(cache))?
+            }
+            ChatKvCache::Managed(cache) => {
+                text_model.forward_managed(&next_tensor, state.pos, cache)?
+            }
+        };
         state.pos += 1;
 
         if state.generated_ids.len() >= state.max_new_tokens {
@@ -492,12 +553,35 @@ impl Qwen3ChatModel {
 
         let positions = states.iter().map(|state| state.pos).collect::<Vec<_>>();
         let input_ids = Tensor::from_vec(next_tokens, (states.len(), 1), &self.device.device)?;
-        let mut caches = states
-            .iter_mut()
-            .map(|state| &mut state.cache)
-            .collect::<Vec<_>>();
-        let next_logits = text_model.forward_decode_batch(&input_ids, &positions, &mut caches)?;
-        drop(caches);
+        let all_managed = states
+            .iter()
+            .all(|state| matches!(state.cache, ChatKvCache::Managed(_)));
+        let all_model_owned = states
+            .iter()
+            .all(|state| matches!(state.cache, ChatKvCache::ModelOwned(_)));
+        let next_logits = if all_managed {
+            let mut caches = states
+                .iter_mut()
+                .map(|state| match &mut state.cache {
+                    ChatKvCache::Managed(cache) => cache,
+                    ChatKvCache::ModelOwned(_) => unreachable!("cache mode checked above"),
+                })
+                .collect::<Vec<_>>();
+            text_model.forward_managed_decode_batch(&input_ids, &positions, &mut caches)?
+        } else if all_model_owned {
+            let mut caches = states
+                .iter_mut()
+                .map(|state| match &mut state.cache {
+                    ChatKvCache::ModelOwned(cache) => cache,
+                    ChatKvCache::Managed(_) => unreachable!("cache mode checked above"),
+                })
+                .collect::<Vec<_>>();
+            text_model.forward_decode_batch(&input_ids, &positions, &mut caches)?
+        } else {
+            return Err(Error::InvalidInput(
+                "Qwen3 decode batch cannot mix model-owned and managed KV rows".to_string(),
+            ));
+        };
 
         for (row_idx, state) in states.iter_mut().enumerate() {
             // Stop rows participate in the tensor operation to preserve the

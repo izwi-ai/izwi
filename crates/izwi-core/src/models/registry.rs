@@ -40,6 +40,7 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
+use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PrefixSnapshot,
@@ -2017,6 +2018,27 @@ impl NativeChatModel {
     ) -> Result<NativeChatDecodeState> {
         let config = ChatGenerationConfig::default();
         self.start_decode_state_with_config(messages, max_new_tokens, &config)
+    }
+
+    /// Native Qwen3 entry point used once the engine has reserved a physical
+    /// block table. Other families remain on their existing compatibility
+    /// cache until they publish an equivalent managed adapter.
+    pub fn start_qwen3_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        cache: Qwen3ManagedCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(model.start_decode_managed(
+                messages,
+                max_new_tokens,
+                cache,
+            )?)),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3 KV cache was routed to another model family".to_string(),
+            )),
+        }
     }
 
     pub fn start_decode_state_with_config(
