@@ -14,7 +14,7 @@ concurrency:
 
 env:
   CUDA_COMPUTE_CAP: "80"
-  IZWI_CUDA_FEATURES: "cuda,cudnn,flash-attn"
+  IZWI_CUDA_FEATURES: "cuda,cudnn"
 
 jobs:
   cargo-cuda-flash-attn:

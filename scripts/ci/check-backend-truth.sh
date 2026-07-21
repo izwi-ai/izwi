@@ -232,7 +232,8 @@ audit_cuda_docker_server() {
             fi
         '
 
-    if cuda_features_include "${cuda_features}" "cudnn"; then
+    if cuda_features_include "${cuda_features}" "cudnn" \
+        || cuda_features_include "${cuda_features}" "cudnn-base"; then
         docker run --rm \
             --entrypoint /bin/sh \
             "${image}" \

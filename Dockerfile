@@ -46,7 +46,7 @@ RUN cargo build --release --locked --bin izwi-server
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS rust-builder-cuda
 ARG CUDA_COMPUTE_CAP=80
-ARG IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn
+ARG IZWI_CUDA_FEATURES=cuda,cudnn
 
 ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:${PATH}
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}

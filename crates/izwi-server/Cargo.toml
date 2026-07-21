@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["izwi-core/cuda"]
+cuda-base = ["izwi-core/cuda"]
+cudnn-base = ["cuda-base", "izwi-core/cudnn"]
+cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
-flash-attn = ["cuda", "izwi-core/flash-attn"]
+flash-attn = ["cuda"]
 db-mysql = ["sea-orm/sqlx-mysql"]
 db-postgres = ["sea-orm/sqlx-postgres"]
 

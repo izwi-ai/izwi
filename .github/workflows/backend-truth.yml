@@ -74,7 +74,10 @@ jobs:
     timeout-minutes: 60
     env:
       CUDA_COMPUTE_CAP: "80"
-      IZWI_CUDA_FEATURES: "cuda,cudnn"
+      # Keep the required PR build on Candle's base CUDA path; the normal
+      # product `cuda` feature includes paged FlashAttention and is exercised
+      # by the longer CUDA workflow.
+      IZWI_CUDA_FEATURES: "cuda-base,cudnn-base"
     container:
       image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -145,7 +148,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: "1"
       CUDA_COMPUTE_CAP: "80"
-      IZWI_CUDA_FEATURES: "cuda,cudnn"
+      IZWI_CUDA_FEATURES: "cuda-base,cudnn-base"
 
     steps:
       - name: Checkout
