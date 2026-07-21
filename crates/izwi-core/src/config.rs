@@ -44,6 +44,15 @@ pub struct EngineConfig {
     /// Physical KV-cache rollout policy. Defaults to legacy model-owned cache.
     #[serde(default)]
     pub kv_rollout: KvRolloutState,
+
+    /// Enable committed managed-prefix reuse. An explicit salt is also
+    /// required, so enabling this flag alone cannot share pages.
+    #[serde(default)]
+    pub enable_prefix_caching: bool,
+
+    /// Deployment/tenant namespace salt for managed physical prefix pages.
+    #[serde(default)]
+    pub managed_prefix_cache_salt: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -58,6 +67,8 @@ impl Default for EngineConfig {
             backend: default_backend_preference(),
             num_threads: default_num_threads(),
             kv_rollout: KvRolloutState::Legacy,
+            enable_prefix_caching: false,
+            managed_prefix_cache_salt: None,
         }
     }
 }

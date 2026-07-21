@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, DeviceLocation, Tensor};
@@ -12,8 +12,8 @@ use crate::Result;
 #[cfg(feature = "flash-attn")]
 use super::KvBackendRuntime;
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvDeviceFence, KvPageCopy, KvPagedDecodeArgs, KvSlotMap,
-    KvWriteArgs,
+    DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvDeviceFence, KvPageCopy,
+    KvPagedDecodeArgs, KvSlotMap, KvWriteArgs,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -36,10 +36,9 @@ impl CandleAcceleratorKvSupport {
 
 /// Report managed-KV support compiled into this binary.
 ///
-/// Metal intentionally reports an incomplete implementation: Candle provides
-/// device-resident mutation primitives, but no kernel that consumes the page
-/// table directly. CUDA becomes complete only with `flash-attn`, whose Candle
-/// 0.11 binding includes variable-length paged attention.
+/// CUDA becomes complete only with `flash-attn`, whose Candle 0.11 binding
+/// includes variable-length paged attention. Metal uses izwi's native MSL
+/// block-table kernel when the feature is compiled.
 pub const fn candle_accelerator_kv_support(backend: BackendKind) -> CandleAcceleratorKvSupport {
     match backend {
         BackendKind::Cpu => CandleAcceleratorKvSupport {
@@ -52,7 +51,7 @@ pub const fn candle_accelerator_kv_support(backend: BackendKind) -> CandleAccele
             in_place_zero: cfg!(feature = "metal"),
             device_page_copy: cfg!(feature = "metal"),
             in_place_slot_write: cfg!(feature = "metal"),
-            direct_paged_attention: false,
+            direct_paged_attention: cfg!(feature = "metal"),
         },
         BackendKind::Cuda => CandleAcceleratorKvSupport {
             in_place_zero: cfg!(feature = "cuda"),
@@ -90,6 +89,17 @@ fn device_fence(device: &Device) -> DeviceFence {
     })
 }
 
+fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
+    // Candle does not expose the current Metal command buffer as a clonable
+    // completion token. Complete this mutation before publishing its fence so
+    // coordinator commit/reuse never races queued private-buffer work.
+    device.synchronize()?;
+    Ok(Arc::new(AcceleratorFence {
+        device: device.clone(),
+        complete: AtomicBool::new(true),
+    }))
+}
+
 #[derive(Debug)]
 struct AcceleratorSlotMap {
     arena: KvArenaId,
@@ -123,8 +133,8 @@ struct AcceleratorLayerStorage {
 ///
 /// `new_mutation_only` is deliberately explicit: it exposes the independently
 /// useful write/copy/zero slice without claiming that a backend has direct
-/// paged attention. Production allocation uses `CudaKvBackendRuntime`, which
-/// is available only when the complete CUDA path is compiled.
+/// paged attention. Production allocation uses the feature-gated CUDA or Metal
+/// runtime only when that backend's complete direct-attention path is compiled.
 #[derive(Debug)]
 pub struct CandleAcceleratorKvArena {
     config: KvArenaConfig,
@@ -132,6 +142,11 @@ pub struct CandleAcceleratorKvArena {
     device: Device,
     layers: HashMap<KvLayerBinding, AcceleratorLayerStorage>,
     mutation_lock: Mutex<()>,
+    slot_write_dispatches: AtomicU64,
+    paged_decode_dispatches: AtomicU64,
+    page_zero_dispatches: AtomicU64,
+    page_copy_dispatches: AtomicU64,
+    host_synchronizations: AtomicU64,
 }
 
 impl CandleAcceleratorKvArena {
@@ -180,6 +195,11 @@ impl CandleAcceleratorKvArena {
             device,
             layers,
             mutation_lock: Mutex::new(()),
+            slot_write_dispatches: AtomicU64::new(0),
+            paged_decode_dispatches: AtomicU64::new(0),
+            page_zero_dispatches: AtomicU64::new(0),
+            page_copy_dispatches: AtomicU64::new(0),
+            host_synchronizations: AtomicU64::new(0),
         })
     }
 
@@ -226,6 +246,16 @@ impl CandleAcceleratorKvArena {
         Ok(page)
     }
 
+    fn mutation_fence(&self) -> Result<DeviceFence> {
+        if self.backend == BackendKind::Metal {
+            let fence = completed_device_fence(&self.device)?;
+            self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+            Ok(fence)
+        } else {
+            Ok(device_fence(&self.device))
+        }
+    }
+
     fn accelerator_slots<'a>(&self, slots: &'a dyn KvSlotMap) -> Result<&'a AcceleratorSlotMap> {
         let slots = slots
             .as_any()
@@ -245,7 +275,7 @@ impl CandleAcceleratorKvArena {
     fn lower_decode_tables(
         &self,
         batch: &KvDecodeBatchMetadata,
-    ) -> Result<(Vec<u32>, Vec<u32>, usize, usize)> {
+    ) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, usize, usize)> {
         let batch_size = batch.sequences.len();
         let max_blocks = batch
             .sequences
@@ -255,26 +285,41 @@ impl CandleAcceleratorKvArena {
             .unwrap_or(0);
         if batch_size == 0 || max_blocks == 0 {
             return Err(Error::InferenceError(
-                "CUDA paged decode requires a non-empty batch and block table".into(),
+                "accelerator paged decode requires a non-empty batch and block table".into(),
             ));
         }
 
         let mut table = vec![0_u32; batch_size * max_blocks];
         let mut cumulative = Vec::with_capacity(batch_size + 1);
+        let mut first_page_offsets = Vec::with_capacity(batch_size);
         cumulative.push(0_u32);
         let mut total = 0_u32;
         let mut max_context = 0_usize;
         for (row, sequence) in batch.sequences.iter().enumerate() {
             if sequence.context_len == 0 {
                 return Err(Error::InferenceError(format!(
-                    "CUDA paged decode row {row} has an empty context"
+                    "accelerator paged decode row {row} has an empty context"
                 )));
             }
+            if sequence.first_page_offset >= self.config.page_tokens {
+                return Err(Error::InferenceError(format!(
+                    "accelerator paged decode row {row} first-page offset {} exceeds page size {}",
+                    sequence.first_page_offset, self.config.page_tokens
+                )));
+            }
+            let physical_tokens = sequence
+                .context_len
+                .checked_add(sequence.first_page_offset)
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "accelerator paged decode physical token range exceeds u32".into(),
+                    )
+                })?;
             let required_pages =
-                (sequence.context_len as usize).div_ceil(self.config.page_tokens as usize);
+                (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
             if sequence.blocks.len() != required_pages {
                 return Err(Error::InferenceError(format!(
-                    "CUDA paged decode row {row} has {} pages, expected {required_pages}",
+                    "accelerator paged decode row {row} has {} pages, expected {required_pages}",
                     sequence.blocks.len()
                 )));
             }
@@ -284,12 +329,19 @@ impl CandleAcceleratorKvArena {
                     .map_err(|_| Error::InferenceError("KV page index exceeds u32".into()))?;
             }
             total = total.checked_add(sequence.context_len).ok_or_else(|| {
-                Error::InferenceError("CUDA cumulative context length exceeds u32".into())
+                Error::InferenceError("cumulative accelerator context length exceeds u32".into())
             })?;
             cumulative.push(total);
+            first_page_offsets.push(sequence.first_page_offset);
             max_context = max_context.max(sequence.context_len as usize);
         }
-        Ok((table, cumulative, max_blocks, max_context))
+        Ok((
+            table,
+            cumulative,
+            first_page_offsets,
+            max_blocks,
+            max_context,
+        ))
     }
 
     #[cfg(feature = "flash-attn")]
@@ -299,7 +351,13 @@ impl CandleAcceleratorKvArena {
         args: KvPagedDecodeArgs<'_>,
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
-        let (table, seqlens_k, max_blocks, max_context) = self.lower_decode_tables(args.batch)?;
+        let (table, seqlens_k, first_page_offsets, max_blocks, max_context) =
+            self.lower_decode_tables(args.batch)?;
+        if first_page_offsets.iter().any(|offset| *offset != 0) {
+            return Err(Error::InferenceError(
+                "CUDA paged attention cannot consume a non-zero first-page offset".into(),
+            ));
+        }
         let mut seqlens_q = Vec::with_capacity(batch_size + 1);
         for value in 0..=batch_size {
             seqlens_q.push(u32::try_from(value).map_err(|_| {
@@ -327,6 +385,41 @@ impl CandleAcceleratorKvArena {
             None,
         )?)
     }
+
+    #[cfg(feature = "metal")]
+    fn metal_paged_decode(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: KvPagedDecodeArgs<'_>,
+    ) -> Result<Tensor> {
+        let batch_size = args.batch.sequences.len();
+        let num_heads = args.queries.dims()[1];
+        let (table, cumulative, first_page_offsets, max_blocks, _) =
+            self.lower_decode_tables(args.batch)?;
+        let context_lens = cumulative
+            .windows(2)
+            .map(|window| window[1] - window[0])
+            .collect::<Vec<_>>();
+        let mut metadata =
+            Vec::with_capacity(context_lens.len() + first_page_offsets.len() + table.len());
+        metadata.extend(context_lens);
+        metadata.extend(first_page_offsets);
+        metadata.extend(table);
+        Ok(crate::kernels::metal::paged_decode_attention(
+            args.queries,
+            &layer.keys,
+            &layer.values,
+            metadata,
+            batch_size,
+            num_heads,
+            layer.num_kv_heads,
+            self.config.page_tokens as usize,
+            max_blocks,
+            layer.key_head_dim,
+            layer.value_head_dim,
+            args.softmax_scale,
+        )?)
+    }
 }
 
 impl KvArena for CandleAcceleratorKvArena {
@@ -336,6 +429,10 @@ impl KvArena for CandleAcceleratorKvArena {
 
     fn backend_kind(&self) -> BackendKind {
         self.backend
+    }
+
+    fn device_location(&self) -> DeviceLocation {
+        self.device.location()
     }
 
     fn config(&self) -> &KvArenaConfig {
@@ -386,7 +483,8 @@ impl KvArena for CandleAcceleratorKvArena {
                 layer.values.narrow(0, page, 1)?.zero_set()?;
             }
         }
-        Ok(device_fence(&self.device))
+        self.page_zero_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.mutation_fence()
     }
 
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence> {
@@ -426,7 +524,8 @@ impl KvArena for CandleAcceleratorKvArena {
                 layer.values.slice_set(values, 0, *destination)?;
             }
         }
-        Ok(device_fence(&self.device))
+        self.page_copy_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.mutation_fence()
     }
 
     fn write_slots(&self, binding: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence> {
@@ -469,7 +568,8 @@ impl KvArena for CandleAcceleratorKvArena {
             flat_keys.slice_set(&args.keys.narrow(0, token, 1)?, 0, slot)?;
             flat_values.slice_set(&args.values.narrow(0, token, 1)?, 0, slot)?;
         }
-        Ok(device_fence(&self.device))
+        self.slot_write_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.mutation_fence()
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor> {
@@ -487,7 +587,16 @@ impl KvArena for CandleAcceleratorKvArena {
 
         #[cfg(feature = "flash-attn")]
         if self.backend == BackendKind::Cuda {
-            return self.cuda_paged_decode(layer, args);
+            let output = self.cuda_paged_decode(layer, args)?;
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
+        }
+
+        #[cfg(feature = "metal")]
+        if self.backend == BackendKind::Metal {
+            let output = self.metal_paged_decode(layer, args)?;
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
         }
 
         Err(Error::InferenceError(format!(
@@ -496,8 +605,19 @@ impl KvArena for CandleAcceleratorKvArena {
         )))
     }
 
+    fn operation_stats(&self) -> KvArenaOperationStats {
+        KvArenaOperationStats {
+            slot_write_dispatches: self.slot_write_dispatches.load(Ordering::Relaxed),
+            paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
+            page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
+            page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
+            host_synchronizations: self.host_synchronizations.load(Ordering::Relaxed),
+        }
+    }
+
     fn drain(&self) -> Result<()> {
         self.device.synchronize()?;
+        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -508,6 +628,39 @@ impl KvArena for CandleAcceleratorKvArena {
 #[derive(Debug, Clone)]
 pub struct CudaKvBackendRuntime {
     device: Device,
+}
+
+/// Complete managed Metal runtime backed by native block-table MSL attention.
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+pub struct MetalKvBackendRuntime {
+    device: Device,
+}
+
+#[cfg(feature = "metal")]
+impl MetalKvBackendRuntime {
+    pub fn new(device: Device) -> Result<Self> {
+        if !device.is_metal() {
+            return Err(Error::InvalidInput(
+                "Metal KV runtime requires a Metal device".into(),
+            ));
+        }
+        Ok(Self { device })
+    }
+}
+
+#[cfg(feature = "metal")]
+impl super::KvBackendRuntime for MetalKvBackendRuntime {
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Metal
+    }
+
+    fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        Ok(Arc::new(CandleAcceleratorKvArena::new_mutation_only(
+            config,
+            self.device.clone(),
+        )?))
+    }
 }
 
 #[cfg(feature = "flash-attn")]
@@ -587,6 +740,8 @@ fn validate_config(config: &KvArenaConfig, backend: BackendKind, device: &Device
     }
     let direct_cuda = backend == BackendKind::Cuda
         && candle_accelerator_kv_support(backend).direct_paged_attention;
+    let direct_metal = backend == BackendKind::Metal
+        && candle_accelerator_kv_support(backend).direct_paged_attention;
     if direct_cuda {
         if !matches!(config.dtype, DType::F16 | DType::BF16) {
             return Err(Error::InferenceError(
@@ -634,6 +789,19 @@ fn validate_config(config: &KvArenaConfig, backend: BackendKind, device: &Device
             return Err(Error::InferenceError(format!(
                 "CUDA paged flash attention cannot execute layer {} with K={} V={}",
                 layer.binding.physical_layer, layer.key_head_dim, layer.value_head_dim
+            )));
+        }
+        if direct_metal
+            && (!matches!(config.dtype, DType::F16 | DType::F32)
+                || layer.key_head_dim > 512
+                || layer.value_head_dim > 512)
+        {
+            return Err(Error::InferenceError(format!(
+                "Metal paged attention requires F16/F32 storage and head dimensions at most 512; layer {} has dtype {:?}, K={} V={}",
+                layer.binding.physical_layer,
+                config.dtype,
+                layer.key_head_dim,
+                layer.value_head_dim
             )));
         }
     }
@@ -712,7 +880,7 @@ fn validate_decode_query(
             dims[1], layer.num_kv_heads
         )));
     }
-    if layer.key_head_dim != layer.value_head_dim {
+    if backend == BackendKind::Cuda && layer.key_head_dim != layer.value_head_dim {
         return Err(Error::InferenceError(format!(
             "{backend:?} direct paged attention requires equal K/V head dimensions"
         )));
@@ -744,10 +912,10 @@ mod tests {
     use crate::kv::KvGroupId;
 
     #[test]
-    fn support_matrix_never_claims_metal_paged_attention() {
+    fn support_matrix_matches_compiled_direct_attention() {
         let metal = candle_accelerator_kv_support(BackendKind::Metal);
-        assert!(!metal.direct_paged_attention);
-        assert!(!metal.is_complete());
+        assert_eq!(metal.direct_paged_attention, cfg!(feature = "metal"));
+        assert_eq!(metal.is_complete(), cfg!(feature = "metal"));
 
         let cuda = candle_accelerator_kv_support(BackendKind::Cuda);
         assert_eq!(cuda.direct_paged_attention, cfg!(feature = "flash-attn"));
@@ -756,100 +924,186 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
-    fn metal_mutations_are_device_resident_and_decode_fails_closed() -> Result<()> {
+    fn metal_paged_decode_matches_cpu_for_ragged_shuffled_mha_gqa_mqa() -> Result<()> {
         // Candle 0.11 panics inside Device::new_metal when Metal reports an
         // empty device list, so feature-only CI must guard both failure modes.
         let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
             return Ok(());
         };
-        let binding = KvLayerBinding {
-            model_layer: 0,
-            physical_layer: 0,
-        };
-        let arena_id = KvArenaId {
-            model_instance: ModelInstanceId::new(1),
-            backend: BackendKind::Metal,
-            device_ordinal: Some(0),
-            generation: 1,
-        };
-        let group = KvGroupId::new(0);
-        let config = KvArenaConfig {
-            id: arena_id,
-            group,
-            page_tokens: 2,
-            capacity_pages: 3,
-            dtype: DType::F32,
-            layers: vec![super::super::KvLayerConfig {
-                binding,
-                num_kv_heads: 1,
-                key_head_dim: 2,
-                value_head_dim: 2,
-            }],
-        };
-        let arena = CandleAcceleratorKvArena::new_mutation_only(config, device.clone())?;
-        let block = |index| CacheBlockRef {
-            arena: arena_id,
-            group,
-            index,
-            slot_generation: 1,
-        };
-        let slots = arena.lower_slots(&[
-            KvSlotRef {
-                block: block(0),
-                offset: 0,
-            },
-            KvSlotRef {
-                block: block(1),
-                offset: 1,
-            },
-        ])?;
-        let keys = Tensor::from_vec(vec![1_f32, 2., 3., 4.], (2, 1, 2), &device)?;
-        let values = Tensor::from_vec(vec![5_f32, 6., 7., 8.], (2, 1, 2), &device)?;
-        arena
-            .write_slots(
-                binding,
-                KvWriteArgs {
-                    keys: &keys,
-                    values: &values,
-                    slots: slots.as_ref(),
-                },
-            )?
-            .wait()?;
-        arena
-            .copy_pages(&[KvPageCopy {
-                source: block(1),
-                destination: block(2),
-            }])?
-            .wait()?;
-        arena.zero_pages(&[block(0)])?.wait()?;
+        for dtype in [DType::F32, DType::F16] {
+            for (num_kv_heads, num_query_heads) in [(1_usize, 2_usize), (2, 2), (2, 4)] {
+                let binding = KvLayerBinding {
+                    model_layer: 0,
+                    physical_layer: 0,
+                };
+                let metal_arena_id = KvArenaId {
+                    model_instance: ModelInstanceId::new(1),
+                    backend: BackendKind::Metal,
+                    device_ordinal: Some(0),
+                    generation: 1,
+                };
+                let cpu_arena_id = KvArenaId {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    ..metal_arena_id
+                };
+                let group = KvGroupId::new(0);
+                let layer_config = super::super::KvLayerConfig {
+                    binding,
+                    num_kv_heads: num_kv_heads as u32,
+                    key_head_dim: 2,
+                    value_head_dim: 3,
+                };
+                let metal_config = KvArenaConfig {
+                    id: metal_arena_id,
+                    group,
+                    page_tokens: 2,
+                    capacity_pages: 4,
+                    dtype,
+                    layers: vec![layer_config],
+                };
+                let cpu_config = KvArenaConfig {
+                    id: cpu_arena_id,
+                    ..metal_config.clone()
+                };
+                let metal_arena =
+                    CandleAcceleratorKvArena::new_mutation_only(metal_config, device.clone())?;
+                let cpu_arena = super::super::CpuKvArena::new(cpu_config)?;
+                let metal_block = |index| CacheBlockRef {
+                    arena: metal_arena_id,
+                    group,
+                    index,
+                    slot_generation: 1,
+                };
+                let cpu_block = |index| CacheBlockRef {
+                    arena: cpu_arena_id,
+                    group,
+                    index,
+                    slot_generation: 1,
+                };
+                let metal_slot_refs = (0..4)
+                    .flat_map(|page| {
+                        (0..2).map(move |offset| KvSlotRef {
+                            block: metal_block(page),
+                            offset,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let cpu_slot_refs = (0..4)
+                    .flat_map(|page| {
+                        (0..2).map(move |offset| KvSlotRef {
+                            block: cpu_block(page),
+                            offset,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let metal_slots = metal_arena.lower_slots(&metal_slot_refs)?;
+                let cpu_slots = cpu_arena.lower_slots(&cpu_slot_refs)?;
+                let key_data = (0..(8 * num_kv_heads * 2))
+                    .map(|index| (index as f32 - 7.0) / 5.0)
+                    .collect::<Vec<_>>();
+                let value_data = (0..(8 * num_kv_heads * 3))
+                    .map(|index| (index as f32 + 1.0) / 7.0)
+                    .collect::<Vec<_>>();
+                let metal_keys = Tensor::from_vec(key_data.clone(), (8, num_kv_heads, 2), &device)?
+                    .to_dtype(dtype)?;
+                let metal_values =
+                    Tensor::from_vec(value_data.clone(), (8, num_kv_heads, 3), &device)?
+                        .to_dtype(dtype)?;
+                let cpu_keys = Tensor::from_vec(key_data, (8, num_kv_heads, 2), &Device::Cpu)?
+                    .to_dtype(dtype)?;
+                let cpu_values = Tensor::from_vec(value_data, (8, num_kv_heads, 3), &Device::Cpu)?
+                    .to_dtype(dtype)?;
+                let fence = metal_arena.write_slots(
+                    binding,
+                    KvWriteArgs {
+                        keys: &metal_keys,
+                        values: &metal_values,
+                        slots: metal_slots.as_ref(),
+                    },
+                )?;
+                assert!(fence.is_complete());
+                cpu_arena.write_slots(
+                    binding,
+                    KvWriteArgs {
+                        keys: &cpu_keys,
+                        values: &cpu_values,
+                        slots: cpu_slots.as_ref(),
+                    },
+                )?;
 
-        let (stored_keys, _) = arena.layer_tensors(binding)?;
-        let stored = stored_keys
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        assert_eq!(&stored[0..4], &[0., 0., 0., 0.]);
-        assert_eq!(&stored[4..8], &[0., 0., 3., 4.]);
-        assert_eq!(&stored[8..12], &[0., 0., 3., 4.]);
-
-        let query = Tensor::zeros((1, 1, 2), DType::F32, &device)?;
-        let batch = KvDecodeBatchMetadata {
-            sequences: vec![crate::kv::KvSequenceBlockTable {
-                blocks: vec![block(2)],
-                context_len: 1,
-            }],
-        };
-        let error = arena
-            .paged_decode(
-                binding,
-                KvPagedDecodeArgs {
-                    queries: &query,
-                    batch: &batch,
-                    softmax_scale: 1.0,
-                },
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("not compiled"));
+                let metal_batch = KvDecodeBatchMetadata {
+                    sequences: vec![
+                        crate::kv::KvSequenceBlockTable {
+                            blocks: vec![metal_block(2), metal_block(0)],
+                            first_page_offset: 1,
+                            context_len: 3,
+                        },
+                        crate::kv::KvSequenceBlockTable {
+                            blocks: vec![metal_block(3)],
+                            first_page_offset: 0,
+                            context_len: 2,
+                        },
+                    ],
+                };
+                let cpu_batch = KvDecodeBatchMetadata {
+                    sequences: vec![
+                        crate::kv::KvSequenceBlockTable {
+                            blocks: vec![cpu_block(2), cpu_block(0)],
+                            first_page_offset: 1,
+                            context_len: 3,
+                        },
+                        crate::kv::KvSequenceBlockTable {
+                            blocks: vec![cpu_block(3)],
+                            first_page_offset: 0,
+                            context_len: 2,
+                        },
+                    ],
+                };
+                let query_data = (0..(2 * num_query_heads * 2))
+                    .map(|index| (index as f32 - 3.0) / 4.0)
+                    .collect::<Vec<_>>();
+                let metal_query =
+                    Tensor::from_vec(query_data.clone(), (2, num_query_heads, 2), &device)?
+                        .to_dtype(dtype)?;
+                let cpu_query =
+                    Tensor::from_vec(query_data, (2, num_query_heads, 2), &Device::Cpu)?
+                        .to_dtype(dtype)?;
+                let metal_output = metal_arena.paged_decode(
+                    binding,
+                    KvPagedDecodeArgs {
+                        queries: &metal_query,
+                        batch: &metal_batch,
+                        softmax_scale: 0.5,
+                    },
+                )?;
+                let cpu_output = cpu_arena.paged_decode(
+                    binding,
+                    KvPagedDecodeArgs {
+                        queries: &cpu_query,
+                        batch: &cpu_batch,
+                        softmax_scale: 0.5,
+                    },
+                )?;
+                let metal_values = metal_output
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let cpu_values = cpu_output
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert_eq!(metal_values.len(), cpu_values.len());
+                let tolerance = if dtype == DType::F16 { 3e-3 } else { 1e-5 };
+                for (actual, expected) in metal_values.iter().zip(cpu_values.iter()) {
+                    assert!(
+                        (actual - expected).abs() < tolerance,
+                        "{dtype:?} {num_query_heads}Q/{num_kv_heads}KV: {actual} != {expected}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

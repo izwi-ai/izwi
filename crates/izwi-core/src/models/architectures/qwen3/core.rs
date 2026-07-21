@@ -185,6 +185,7 @@ pub struct Qwen3ManagedCache {
     arena: Arc<dyn KvArena>,
     layer_bindings: Vec<KvLayerBinding>,
     blocks: Vec<CacheBlockRef>,
+    window_start: usize,
     context_len: usize,
 }
 
@@ -193,6 +194,16 @@ impl Qwen3ManagedCache {
         arena: Arc<dyn KvArena>,
         layer_bindings: Vec<KvLayerBinding>,
         blocks: Vec<CacheBlockRef>,
+        context_len: usize,
+    ) -> Result<Self> {
+        Self::new_windowed(arena, layer_bindings, blocks, 0, context_len)
+    }
+
+    pub fn new_windowed(
+        arena: Arc<dyn KvArena>,
+        layer_bindings: Vec<KvLayerBinding>,
+        blocks: Vec<CacheBlockRef>,
+        window_start: usize,
         context_len: usize,
     ) -> Result<Self> {
         if layer_bindings.is_empty() {
@@ -227,13 +238,23 @@ impl Qwen3ManagedCache {
                 ));
             }
         }
-        let capacity_tokens = blocks
+        if window_start > context_len {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed cache window starts after its context".to_string(),
+            ));
+        }
+        let page_tokens = arena.config().page_tokens as usize;
+        let first_page_start = (window_start / page_tokens)
+            .checked_mul(page_tokens)
+            .ok_or_else(|| Error::InvalidInput("Qwen3 managed page start overflow".into()))?;
+        let capacity_end = blocks
             .len()
-            .checked_mul(arena.config().page_tokens as usize)
+            .checked_mul(page_tokens)
+            .and_then(|capacity| first_page_start.checked_add(capacity))
             .ok_or_else(|| Error::InvalidInput("Qwen3 managed cache capacity overflow".into()))?;
-        if context_len > capacity_tokens {
+        if context_len > capacity_end {
             return Err(Error::InvalidInput(format!(
-                "Qwen3 managed cache context {context_len} exceeds capacity {capacity_tokens}"
+                "Qwen3 managed cache context {context_len} exceeds capacity end {capacity_end}"
             )));
         }
         for (expected, binding) in layer_bindings.iter().enumerate() {
@@ -248,6 +269,7 @@ impl Qwen3ManagedCache {
             arena,
             layer_bindings,
             blocks,
+            window_start,
             context_len,
         })
     }
@@ -257,7 +279,12 @@ impl Qwen3ManagedCache {
     }
 
     pub fn capacity_tokens(&self) -> usize {
-        self.blocks.len() * self.arena.config().page_tokens as usize
+        let page_tokens = self.arena.config().page_tokens as usize;
+        (self.window_start / page_tokens) * page_tokens + self.blocks.len() * page_tokens
+    }
+
+    pub fn window_start(&self) -> usize {
+        self.window_start
     }
 
     pub fn arena(&self) -> &Arc<dyn KvArena> {
@@ -312,10 +339,22 @@ impl Qwen3ManagedCache {
             )));
         }
         let page_tokens = self.arena.config().page_tokens as usize;
+        let first_logical_page = self.window_start / page_tokens;
         (start_pos..end)
             .map(|position| {
+                let logical_page = position / page_tokens;
+                let table_index =
+                    logical_page
+                        .checked_sub(first_logical_page)
+                        .ok_or_else(|| {
+                            Error::InvalidInput(
+                                "Qwen3 managed append precedes its cache window".into(),
+                            )
+                        })?;
                 Ok(KvSlotRef {
-                    block: self.blocks[position / page_tokens],
+                    block: *self.blocks.get(table_index).ok_or_else(|| {
+                        Error::InvalidInput("Qwen3 managed append exceeds its block table".into())
+                    })?,
                     offset: u32::try_from(position % page_tokens).map_err(|_| {
                         Error::InvalidInput("Qwen3 managed page offset exceeds u32".into())
                     })?,
@@ -325,15 +364,21 @@ impl Qwen3ManagedCache {
     }
 
     fn sequence_table(&self, context_len: usize) -> Result<KvSequenceBlockTable> {
-        if context_len == 0 || context_len > self.capacity_tokens() {
+        if context_len <= self.window_start || context_len > self.capacity_tokens() {
             return Err(Error::InvalidInput(format!(
                 "Qwen3 managed decode context {context_len} is outside cache capacity"
             )));
         }
-        let required_pages = context_len.div_ceil(self.arena.config().page_tokens as usize);
+        let page_tokens = self.arena.config().page_tokens as usize;
+        let first_page_offset = self.window_start % page_tokens;
+        let visible_tokens = context_len - self.window_start;
+        let required_pages = (first_page_offset + visible_tokens).div_ceil(page_tokens);
         Ok(KvSequenceBlockTable {
             blocks: self.blocks[..required_pages].to_vec(),
-            context_len: u32::try_from(context_len).map_err(|_| {
+            first_page_offset: u32::try_from(first_page_offset).map_err(|_| {
+                Error::InvalidInput("Qwen3 managed first-page offset exceeds u32".into())
+            })?,
+            context_len: u32::try_from(visible_tokens).map_err(|_| {
                 Error::InvalidInput("Qwen3 managed context length exceeds u32".into())
             })?,
         })
@@ -2548,6 +2593,10 @@ impl Default for Qwen3WeightLayout {
 }
 
 impl Qwen3Model {
+    pub(crate) fn supports_managed_kv_execution(&self) -> bool {
+        self.cfg.sliding_window().is_none()
+    }
+
     pub(crate) fn managed_kv_cache_contract(
         &self,
         domain: CacheDomainId,
@@ -2807,6 +2856,31 @@ impl Qwen3Model {
                 input_ids.dims()
             )));
         }
+        let embeds = self.embeddings(input_ids)?;
+        self.forward_managed_with_embeds(&embeds, start_pos, cache, None)
+    }
+
+    /// Execute caller-provided embeddings against authoritative KV pages.
+    ///
+    /// Multimodal adapters use this entry point after replacing placeholder
+    /// token embeddings with modality features. The cache behavior is exactly
+    /// the same as [`Self::forward_managed`]: every layer writes the supplied
+    /// arena and the logical context advances only after the full pass succeeds.
+    pub fn forward_managed_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut Qwen3ManagedCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 managed embeddings expect [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
         if self.cfg.sliding_window().is_some() {
             return Err(Error::InvalidInput(
                 "Qwen3 managed execution does not yet support sliding-window block tables"
@@ -2820,9 +2894,9 @@ impl Qwen3Model {
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
 
-        let mut x = self.embeddings(input_ids)?;
+        let mut x = embeds.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_managed(&x, start_pos, None, cache, layer_idx)?;
+            x = layer.forward_managed(&x, start_pos, position_ids, cache, layer_idx)?;
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.logits_from_hidden(&hidden)?;
@@ -3600,6 +3674,27 @@ mod tests {
     }
 
     #[test]
+    fn managed_qwen3_caller_embeddings_match_token_prefill() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let (token_arena, token_bindings) = test_managed_arena();
+        let (embed_arena, embed_bindings) = test_managed_arena();
+        let mut token_cache = test_managed_cache(token_arena, token_bindings, 0);
+        let mut embed_cache = test_managed_cache(embed_arena, embed_bindings, 0);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
+        let embeds = model.embeddings(&prompt).unwrap();
+
+        let token_logits = model.forward_managed(&prompt, 0, &mut token_cache).unwrap();
+        let embed_logits = model
+            .forward_managed_with_embeds(&embeds, 0, &mut embed_cache, None)
+            .unwrap();
+
+        assert_tensor_close(&token_logits, &embed_logits);
+        assert_eq!(token_cache.context_len(), 3);
+        assert_eq!(embed_cache.context_len(), 3);
+    }
+
+    #[test]
     fn managed_qwen3_decode_batches_ragged_rows_in_one_arena() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);
@@ -3646,6 +3741,33 @@ mod tests {
         // one arena operation per ragged row.
         assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
         assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+    }
+
+    #[test]
+    fn managed_full_page_prefix_reuse_matches_full_prefill_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
+        let mut owned = test_cache();
+        let full_logits = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+
+        let (arena, bindings) = test_managed_arena();
+        let mut publisher = test_managed_cache(arena.clone(), bindings.clone(), 0);
+        let prefix = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &device).unwrap();
+        model.forward_managed(&prefix, 0, &mut publisher).unwrap();
+        assert_eq!(publisher.context_len(), 4);
+
+        let mut reused = Qwen3ManagedCache::new(
+            arena,
+            bindings,
+            publisher.blocks.clone(),
+            publisher.context_len(),
+        )
+        .unwrap();
+        let suffix = Tensor::from_vec(vec![4u32], (1, 1), &device).unwrap();
+        let reused_logits = model.forward_managed(&suffix, 4, &mut reused).unwrap();
+        let expected_last = full_logits.i((.., 4..5, ..)).unwrap();
+        assert_tensor_close(&expected_last, &reused_logits);
     }
 
     #[test]

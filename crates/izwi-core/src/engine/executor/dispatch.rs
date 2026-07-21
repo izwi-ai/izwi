@@ -559,8 +559,10 @@ mod tests {
                 domain: CacheDomainId::new(0),
                 expected_version: 0,
                 expected_committed_tokens: 0,
+                execution_start_tokens: 0,
                 target_committed_tokens: 1,
                 target_window_start: 0,
+                first_page_offset: 0,
                 provisional_groups: vec![GroupBlockTable {
                     group: KvGroupId::new(0),
                     blocks: vec![block],

@@ -46,6 +46,13 @@ pub struct EngineCoreConfig {
     #[serde(default)]
     pub enable_prefix_caching: bool,
 
+    /// Explicit namespace salt for managed physical-prefix reuse. Managed
+    /// prefix reuse remains disabled unless both this value and
+    /// `enable_prefix_caching` are set, preventing accidental cross-tenant
+    /// sharing in automatic arena rollout.
+    #[serde(default)]
+    pub managed_prefix_cache_salt: Option<String>,
+
     /// Enable chunked prefill for long prompts
     #[serde(default = "default_chunked_prefill")]
     pub enable_chunked_prefill: bool,
@@ -267,6 +274,7 @@ impl Default for EngineCoreConfig {
             max_blocks: default_max_blocks(),
             scheduling_policy: SchedulingPolicy::default(),
             enable_prefix_caching: false,
+            managed_prefix_cache_salt: None,
             enable_chunked_prefill: default_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),

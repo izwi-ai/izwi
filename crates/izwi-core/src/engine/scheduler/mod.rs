@@ -578,6 +578,16 @@ impl Scheduler {
         session: &SessionKey,
         profile: &ExecutionProfile,
     ) -> bool {
+        if profile.cache_mode == CacheMode::ExternalPaged
+            && self
+                .running
+                .get(&session.request_id)
+                .is_some_and(|running| !running.block_ids.is_empty())
+        {
+            // Cache authority is selected before first execution. Refuse a
+            // mid-session promotion that would strand legacy logical blocks.
+            return false;
+        }
         let Some(metadata) = self.requests.get_mut(&session.request_id) else {
             return false;
         };
@@ -689,6 +699,7 @@ impl Scheduler {
                     metadata.workload_class,
                     overdue_ms,
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
+                    metadata.cache_policy.has_external_physical_cache(),
                 ))
             })
             .collect();
@@ -764,6 +775,7 @@ impl Scheduler {
             workload_class,
             overdue_ms,
             continuous_decode,
+            external_physical_cache,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -796,6 +808,41 @@ impl Scheduler {
                 num_tokens = num_tokens.min(1);
             }
             if num_tokens == 0 {
+                continue;
+            }
+
+            if external_physical_cache {
+                // This is a tentative scheduling decision. The managed
+                // coordinator reserves the exact generational page table
+                // during physical batch formation, so legacy BlockIds must
+                // remain empty and cannot become a second cache authority.
+                debug_assert!(block_ids.is_empty());
+                if let Some(running) = self.running.get_mut(&request_id) {
+                    running.paused = false;
+                }
+                let plan_id = self.next_plan_id;
+                self.next_plan_id = self.next_plan_id.saturating_add(1);
+                result.decode_requests.push(ScheduledRequest {
+                    plan_id,
+                    request_id: request_id.clone(),
+                    sequence_id,
+                    num_tokens,
+                    is_prefill: false,
+                    block_ids,
+                    num_computed_tokens: num_computed,
+                    work: WorkUnit::SequenceStep {
+                        phase: SequencePhase::Decode,
+                        input: InputRange {
+                            start: num_computed,
+                            end: num_computed.saturating_add(num_tokens),
+                        },
+                        max_output_steps: num_tokens,
+                    },
+                });
+                remaining_decode_budget = remaining_decode_budget.saturating_sub(num_tokens);
+                remaining_batch -= 1;
+                result.total_tokens += num_tokens;
+                self.record_class_service(workload_class, num_tokens);
                 continue;
             }
 
@@ -998,7 +1045,12 @@ impl Scheduler {
             let mut selected_blocks = None;
             let mut fresh_allocated_blocks = 0usize;
 
-            while num_tokens > 0 {
+            if metadata.cache_policy.has_external_physical_cache() {
+                debug_assert_eq!(existing_blocks, 0);
+                selected_blocks = Some(Vec::new());
+            }
+
+            while num_tokens > 0 && selected_blocks.is_none() {
                 let total_tokens_after = num_computed.saturating_add(num_tokens);
                 let plan = self.prefill_allocation_plan(
                     kv_cache,
@@ -1180,7 +1232,11 @@ impl Scheduler {
             let mut selected = None;
             let mut fresh_allocated_blocks = 0usize;
 
-            while num_tokens > 0 {
+            if metadata.cache_policy.has_external_physical_cache() {
+                selected = Some(Vec::new());
+            }
+
+            while num_tokens > 0 && selected.is_none() {
                 let plan = self.prefill_allocation_plan(
                     kv_cache,
                     &metadata.prompt_prefix_tokens,
@@ -3502,7 +3558,43 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_reuse_allows_prefill_when_free_blocks_are_zero() {
+    fn external_paged_decode_never_allocates_legacy_blocks() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+            max_blocks: 1,
+            block_size: 1,
+            ..Default::default()
+        });
+        let request = build_request(TaskType::Chat, "managed-decode", Priority::Normal);
+        let request_id = request.id.clone();
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+        let session = SessionKey::new(request_id.clone(), epoch);
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.cache_mode = CacheMode::ExternalPaged;
+        assert!(scheduler.update_execution_profile(&session, &profile));
+
+        let prefill = scheduler.schedule(&mut kv_cache);
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        assert!(prefill.prefill_requests[0].block_ids.is_empty());
+        scheduler.update_after_step(&request_id, 1, 0, Vec::new(), 1.0);
+
+        let decode = scheduler.schedule(&mut kv_cache);
+        assert_eq!(decode.decode_requests.len(), 1);
+        assert!(decode.decode_requests[0].block_ids.is_empty());
+        assert_eq!(decode.blocks_allocated, 0);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
+        assert!(kv_cache.get_block_table(&request_id).is_none());
+    }
+
+    #[test]
+    fn external_paged_prefill_does_not_consume_legacy_prefix_blocks() {
         let config = SchedulerConfig {
             max_batch_size: 2,
             max_tokens_per_step: 32,
@@ -3530,6 +3622,9 @@ mod tests {
 
         let first = scheduler.schedule(&mut kv_cache);
         assert_eq!(first.prefill_requests.len(), 1);
+        assert!(first.prefill_requests[0].block_ids.is_empty());
+        assert_eq!(first.blocks_allocated, 0);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
         scheduler.update_after_step(&req1_id, 4, 0, Vec::new(), 1.0);
 
         let req2_id = "prefix-reuser".to_string();
@@ -3545,12 +3640,20 @@ mod tests {
                 .prefill_requests
                 .iter()
                 .any(|entry| entry.request_id == req2_id),
-            "Second request should be admitted via shared-prefix block reuse"
+            "managed prefill admission must not depend on legacy KV capacity"
         );
+        assert!(second
+            .prefill_requests
+            .iter()
+            .find(|entry| entry.request_id == req2_id)
+            .expect("external prefill")
+            .block_ids
+            .is_empty());
         assert_eq!(
             second.blocks_allocated, 0,
-            "Prefix-reused prefill should avoid fresh KV block allocation"
+            "managed prefix policy must not allocate legacy KV blocks"
         );
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
     }
 
     #[test]
@@ -3766,9 +3869,11 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_release_safe = true;
         assert!(scheduler.update_execution_profile(&session, &profile));
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        let scheduled = scheduler.schedule(&mut kv_cache);
+        assert_eq!(scheduled.prefill_requests.len(), 1);
+        assert!(scheduled.prefill_requests[0].block_ids.is_empty());
         let allocated = kv_cache.stats().allocated_blocks;
-        assert!(allocated > 0);
+        assert_eq!(allocated, 0);
 
         assert_eq!(
             scheduler.begin_terminal_release(&session, TerminalReleaseCause::Completed),
@@ -3780,10 +3885,10 @@ mod tests {
         let stale = SessionKey::new(request.id.clone(), session.epoch + 1);
         assert!(!scheduler.confirm_session_release(&stale, &mut kv_cache));
         assert!(!scheduler.mark_terminal_delivered(&stale));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
 
         assert!(scheduler.mark_terminal_delivered(&session));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
         assert!(!scheduler.add_request(&request));
         assert!(scheduler.confirm_session_release(&session, &mut kv_cache));
         assert_eq!(kv_cache.stats().allocated_blocks, 0);

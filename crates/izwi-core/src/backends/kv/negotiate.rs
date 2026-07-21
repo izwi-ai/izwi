@@ -67,11 +67,48 @@ pub fn negotiate_kv_plan(
                 ))
             }
         }
-        BackendKind::Metal => Err(Error::InvalidInput(
-            "managed Metal KV is unavailable because Candle 0.11 has no direct paged-attention kernel"
-                .into(),
-        )),
+        BackendKind::Metal => {
+            #[cfg(feature = "metal")]
+            {
+                negotiate_dense_paged_plan(
+                    contract,
+                    request,
+                    select_metal_dtype,
+                    |spec, hint| {
+                        Ok(hint
+                            .filter(|value| spec.page_tokens.accepts(*value))
+                            .unwrap_or(spec.page_tokens.preferred))
+                    },
+                    PagedAttentionKernel::MetalPaged,
+                )
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Err(Error::InvalidInput(
+                    "managed Metal KV requires the metal feature for direct paged attention".into(),
+                ))
+            }
+        }
     }
+}
+
+#[cfg(feature = "metal")]
+fn select_metal_dtype(
+    accepted: &[KvStorageDType],
+    hint: Option<KvStorageDType>,
+) -> Result<KvStorageDType> {
+    const SUPPORTED: [KvStorageDType; 2] = [KvStorageDType::F16, KvStorageDType::F32];
+    if let Some(dtype) = hint.filter(|dtype| accepted.contains(dtype) && SUPPORTED.contains(dtype))
+    {
+        return Ok(dtype);
+    }
+    accepted
+        .iter()
+        .copied()
+        .find(|dtype| SUPPORTED.contains(dtype))
+        .ok_or_else(|| {
+            Error::InvalidInput("Metal paged attention found no compatible F16/F32 KV dtype".into())
+        })
 }
 
 fn negotiate_dense_paged_plan(
@@ -157,50 +194,11 @@ fn negotiate_dense_paged_plan(
                     kind: ResolvedKvGroupKind::PagedAttention { layers },
                 }
             }
-            KvDomainSpec::ModelState(spec) => {
-                if request.backend != BackendKind::Cpu {
-                    return Err(Error::InvalidInput(format!(
-                        "managed {:?} KV does not implement model-state domains",
-                        request.backend
-                    )));
-                }
-                let dtype = select_dtype(&spec.storage.dtypes, request.storage_dtype_hint)?;
-                let dtype_bytes = dtype.dense_bytes().ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "{:?} cannot use dense {dtype:?} state storage",
-                        request.backend
-                    ))
-                })?;
-                let mut bytes_per_page = 0_u64;
-                let mut layers = Vec::with_capacity(spec.layers.len());
-                for (physical_layer, layer) in spec.layers.iter().enumerate() {
-                    bytes_per_page = bytes_per_page
-                        .checked_add(
-                            layer
-                                .elements_per_sequence
-                                .checked_mul(dtype_bytes)
-                                .ok_or_else(geometry_overflow)?,
-                        )
-                        .ok_or_else(geometry_overflow)?;
-                    layers.push(KvLayerBinding {
-                        model_layer: layer.model_layer,
-                        physical_layer: u32::try_from(physical_layer).map_err(|_| {
-                            Error::InvalidInput("KV state layer count exceeds u32".into())
-                        })?,
-                    });
-                }
-                ResolvedKvGroup {
-                    id,
-                    arena,
-                    domain: spec.id,
-                    page_tokens: 1,
-                    capacity_pages: request.capacity_pages,
-                    bytes_per_page,
-                    layout: KvPhysicalLayout::PageTokenHeadDim,
-                    storage: KvStorageFormat::Dense { dtype },
-                    kernel: PagedAttentionKernel::PortableReference,
-                    kind: ResolvedKvGroupKind::ModelState { layers },
-                }
+            KvDomainSpec::ModelState(_) => {
+                return Err(Error::InvalidInput(format!(
+                    "managed {:?} KV does not implement physical model-state arenas",
+                    request.backend
+                )));
             }
         });
     }
@@ -302,7 +300,10 @@ fn geometry_overflow() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv::test_contract;
+    use crate::kv::{
+        test_contract, CacheDomainId, CacheTokenAxis, KvPrefixSemantics, KvStorageRequest,
+        ModelStateDomainSpec, ModelStateKind, ModelStateLayerSpec,
+    };
 
     #[test]
     fn cpu_negotiation_uses_loaded_geometry_and_hints() {
@@ -333,6 +334,44 @@ mod tests {
     }
 
     #[test]
+    fn negotiation_fails_closed_for_unimplemented_model_state_arenas() {
+        let mut contract = test_contract();
+        contract.domains[0] = KvDomainSpec::ModelState(ModelStateDomainSpec {
+            id: CacheDomainId::new(1),
+            token_axis: CacheTokenAxis::DecoderTokens,
+            layers: vec![ModelStateLayerSpec {
+                model_layer: 0,
+                kind: ModelStateKind::Recurrent,
+                elements_per_sequence: 128,
+            }],
+            storage: KvStorageRequest {
+                dtypes: vec![KvStorageDType::F32],
+                allow_quantized: false,
+            },
+            prefix_semantics: KvPrefixSemantics::Disabled,
+        });
+
+        let error = negotiate_kv_plan(
+            &contract,
+            &KvBackendPlanRequest {
+                model_instance: ModelInstanceId::new(9),
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                capacity_pages: 10,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+                first_arena_generation: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not implement physical model-state arenas"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "metal"))]
     fn metal_negotiation_fails_closed_without_direct_attention() {
         let error = negotiate_kv_plan(
             &test_contract(),
@@ -347,9 +386,33 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("no direct paged-attention kernel"));
+        assert!(error.to_string().contains("requires the metal feature"));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_negotiation_selects_native_paged_attention() {
+        let plan = negotiate_kv_plan(
+            &test_contract(),
+            &KvBackendPlanRequest {
+                model_instance: ModelInstanceId::new(9),
+                backend: BackendKind::Metal,
+                device_ordinal: Some(0),
+                capacity_pages: 10,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: Some(KvStorageDType::F16),
+                first_arena_generation: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.groups[0].page_tokens, 16);
+        assert_eq!(plan.groups[0].kernel, PagedAttentionKernel::MetalPaged);
+        assert_eq!(
+            plan.groups[0].storage,
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::F16
+            }
+        );
     }
 
     #[cfg(not(feature = "flash-attn"))]

@@ -929,8 +929,14 @@ pub struct ManagedCacheDomainReservation {
     pub domain: CacheDomainId,
     pub expected_version: u64,
     pub expected_committed_tokens: u32,
+    /// Logical context already present in the provisional table when model
+    /// execution starts. This may exceed the committed request-table length
+    /// when admission attached immutable pages from the prefix index.
+    pub execution_start_tokens: u32,
     pub target_committed_tokens: u32,
     pub target_window_start: u32,
+    /// Hidden-token offset in the first provisional physical page.
+    pub first_page_offset: u32,
     pub provisional_groups: Vec<GroupBlockTable>,
     pub writable_blocks: Vec<CacheBlockRef>,
 }
@@ -949,8 +955,10 @@ impl ManagedCacheReservation {
         }
         let mut identities = HashSet::with_capacity(self.domains.len());
         for domain in &self.domains {
-            if domain.target_committed_tokens < domain.expected_committed_tokens
+            if domain.execution_start_tokens < domain.expected_committed_tokens
+                || domain.target_committed_tokens < domain.execution_start_tokens
                 || domain.target_window_start > domain.target_committed_tokens
+                || domain.first_page_offset > domain.target_committed_tokens
             {
                 return Err(Error::InvalidInput(
                     "managed-cache reservation has an invalid token range".to_string(),
@@ -2303,8 +2311,10 @@ mod tests {
                 domain: CacheDomainId::new(2),
                 expected_version: 11,
                 expected_committed_tokens: 4,
+                execution_start_tokens: 4,
                 target_committed_tokens: 5,
                 target_window_start: 0,
+                first_page_offset: 0,
                 provisional_groups: vec![GroupBlockTable {
                     group: KvGroupId::new(0),
                     blocks: vec![written_block],

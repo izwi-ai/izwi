@@ -415,6 +415,38 @@ impl CoordinatedPrefixIndex {
         }
         Ok(blocks)
     }
+
+    /// Evict the least-recently-used chain that does not contain any block in
+    /// `protected`. Admission uses this after a prefix hit so reclaiming old
+    /// prefixes cannot invalidate the exact shared pages it is about to
+    /// reserve.
+    pub fn evict_lru_excluding(
+        &mut self,
+        coordinator: &mut KvCacheCoordinator,
+        protected: &std::collections::HashSet<CacheBlockRef>,
+    ) -> Result<Vec<CacheBlockRef>, KvPrefixIndexError> {
+        let mut candidates = self
+            .index
+            .entries
+            .iter()
+            .map(|(digest, entry)| (*digest, entry.last_access))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, last_access)| *last_access);
+        for (digest, _) in candidates {
+            let mut staged = self.index.clone();
+            let blocks = staged.remove_chain_from(digest);
+            if blocks.is_empty() || blocks.iter().any(|block| protected.contains(block)) {
+                continue;
+            }
+            coordinator.release_prefixes(&blocks)?;
+            self.index = staged;
+            for _ in &blocks {
+                self.telemetry.record_prefix_eviction();
+            }
+            return Ok(blocks);
+        }
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

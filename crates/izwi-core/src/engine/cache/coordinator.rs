@@ -12,6 +12,8 @@ use crate::backends::kv::KvPageCopy;
 use crate::engine::execution::{PlanId, SessionKey};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId};
 
+use super::window::{plan_window_step, KvWindowError};
+
 /// Committed block table for one compatible physical group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupBlockTable {
@@ -62,6 +64,20 @@ pub struct KvReserveRequest {
     pub target_committed_tokens: u32,
     pub target_window_start: u32,
     pub groups: Vec<KvGroupReservation>,
+}
+
+/// Model-neutral append plus logical-window rotation request.
+///
+/// Unlike `KvReserveRequest`, callers do not supply a replacement block table.
+/// The coordinator derives it from the exact snapshot and page geometry, which
+/// prevents early dereference or accidental retention of hidden leading pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvWindowReserveRequest {
+    pub txn_id: PlanId,
+    pub expected: KvSnapshot,
+    pub target_committed_tokens: u32,
+    pub target_window_start: u32,
+    pub page_tokens: u32,
 }
 
 /// Immutable execution metadata produced by `prepare`.
@@ -152,6 +168,10 @@ pub enum KvCoordinatorError {
     Capacity,
     #[error("committed token or window positions are invalid")]
     InvalidTokenRange,
+    #[error("a sliding-window reservation requires an established physical group table")]
+    MissingWindowGroups,
+    #[error(transparent)]
+    Window(#[from] KvWindowError),
     #[error("write receipt does not cover the transaction's exact writable set")]
     InvalidWriteReceipt,
     #[error("cache block has no matching reference or pin to release")]
@@ -306,6 +326,85 @@ impl KvCacheCoordinator {
         self.terminal_transactions.get(&txn_id).copied()
     }
 
+    /// Reserve an exact versioned append/window transition.
+    ///
+    /// The old table remains intact until commit, so abort is lossless. Pages
+    /// before the retained suffix are dereferenced only by commit. Extending a
+    /// partial tail uses in-place mutation only when it is exclusively owned;
+    /// otherwise a transaction-private copy is reserved.
+    pub fn reserve_window(&mut self, request: KvWindowReserveRequest) -> KvCoordinatorResult<()> {
+        if request.expected.arena != self.arena {
+            return Err(KvCoordinatorError::WrongArena);
+        }
+        let key = TableKey::new(request.expected.session.clone(), request.expected.domain);
+        let current = self
+            .tables
+            .get(&key)
+            .ok_or(KvCoordinatorError::MissingTable)?;
+        if current != &request.expected {
+            return Err(KvCoordinatorError::VersionConflict);
+        }
+        if request.expected.groups.is_empty() {
+            return Err(KvCoordinatorError::MissingWindowGroups);
+        }
+        let page_plan = plan_window_step(
+            request.expected.window_start,
+            request.expected.committed_tokens,
+            request.target_window_start,
+            request.target_committed_tokens,
+            request.page_tokens,
+        )?;
+        let expected_pages = page_plan.released_pages + page_plan.retained_pages;
+        let mut groups = Vec::with_capacity(request.expected.groups.len());
+        for expected_group in &request.expected.groups {
+            if expected_group.blocks.len() != expected_pages {
+                return Err(KvCoordinatorError::Window(KvWindowError::InvalidTable {
+                    expected: expected_pages,
+                    actual: expected_group.blocks.len(),
+                }));
+            }
+            let retained = &expected_group.blocks[page_plan.released_pages..];
+            let mut blocks = Vec::with_capacity(
+                page_plan
+                    .retained_pages
+                    .saturating_add(page_plan.fresh_pages),
+            );
+            for (index, block) in retained.iter().copied().enumerate() {
+                let intent = if page_plan.writable_retained_page == Some(index) {
+                    self.validate_block(block, Some(expected_group.group))?;
+                    let slot = &self.slots[block.index as usize];
+                    if slot.writer.is_none()
+                        && slot.table_refs == 1
+                        && slot.prefix_refs == 0
+                        && slot.execution_pins == 0
+                        && slot.transfer_pins == 0
+                        && slot.reservations == 0
+                    {
+                        KvBlockIntent::Writable(block)
+                    } else {
+                        KvBlockIntent::CopyOnWrite(block)
+                    }
+                } else {
+                    KvBlockIntent::Existing(block)
+                };
+                blocks.push(intent);
+            }
+            blocks.extend(std::iter::repeat(KvBlockIntent::Fresh).take(page_plan.fresh_pages));
+            groups.push(KvGroupReservation {
+                group: expected_group.group,
+                blocks,
+            });
+        }
+
+        self.reserve(KvReserveRequest {
+            txn_id: request.txn_id,
+            expected: request.expected,
+            target_committed_tokens: request.target_committed_tokens,
+            target_window_start: request.target_window_start,
+            groups,
+        })
+    }
+
     /// Atomically reserve shared/fresh pages and exclusive writable tails.
     pub fn reserve(&mut self, request: KvReserveRequest) -> KvCoordinatorResult<()> {
         if self.transactions.contains_key(&request.txn_id)
@@ -336,6 +435,7 @@ impl KvCacheCoordinator {
         let mut blocks_seen = HashSet::new();
         let mut fresh_count = 0usize;
         let mut has_writable = false;
+        let mut has_provisional_blocks = false;
 
         for group_request in &request.groups {
             if !groups_seen.insert(group_request.group) {
@@ -347,6 +447,7 @@ impl KvCacheCoordinator {
                 .iter()
                 .find(|group| group.group == group_request.group);
             for intent in &group_request.blocks {
+                has_provisional_blocks = true;
                 match *intent {
                     KvBlockIntent::Fresh => {
                         fresh_count += 1;
@@ -415,7 +516,11 @@ impl KvCacheCoordinator {
         if fresh_count > reusable_pages {
             return Err(KvCoordinatorError::Capacity);
         }
-        if request.target_committed_tokens > request.expected.committed_tokens && !has_writable {
+        if request.target_committed_tokens > request.expected.committed_tokens
+            && (request.target_window_start < request.target_committed_tokens
+                || has_provisional_blocks)
+            && !has_writable
+        {
             return Err(KvCoordinatorError::InvalidTokenRange);
         }
 
@@ -1445,20 +1550,12 @@ mod tests {
         let committed = coordinator.commit(110, &[]).unwrap();
         let advanced = advance_window(&initial_pages, 0, 5, 10, 4).unwrap();
         coordinator
-            .reserve(KvReserveRequest {
+            .reserve_window(KvWindowReserveRequest {
                 txn_id: 111,
                 expected: committed,
                 target_committed_tokens: 10,
                 target_window_start: advanced.window_start,
-                groups: vec![KvGroupReservation {
-                    group: KvGroupId::new(0),
-                    blocks: advanced
-                        .visible_blocks
-                        .iter()
-                        .copied()
-                        .map(KvBlockIntent::Existing)
-                        .collect(),
-                }],
+                page_tokens: 4,
             })
             .unwrap();
         let prepared = coordinator.prepare(111).unwrap();
@@ -1480,5 +1577,172 @@ mod tests {
             Err(KvCoordinatorError::StaleBlock)
         );
         coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn window_abort_preserves_the_versioned_table_and_all_old_pages() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 5);
+        let session = session("window-abort", 1);
+        let initial = coordinator
+            .register_table(session.clone(), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 120, initial, 3, 10);
+        prepare_and_complete(&mut coordinator, 120);
+        let committed = coordinator.commit(120, &[]).unwrap();
+        let committed_pages = committed.groups[0].blocks.clone();
+
+        coordinator
+            .reserve_window(KvWindowReserveRequest {
+                txn_id: 121,
+                expected: committed.clone(),
+                target_committed_tokens: 13,
+                target_window_start: 5,
+                page_tokens: 4,
+            })
+            .unwrap();
+        let prepared = coordinator.prepare(121).unwrap();
+        assert_eq!(prepared.provisional_groups[0].blocks.len(), 3);
+        assert_eq!(prepared.writable_blocks.len(), 2);
+        assert_eq!(coordinator.stats().allocated_pages, 4);
+        coordinator
+            .complete_write(KvWriteReceipt {
+                txn_id: 121,
+                committed_tokens: 13,
+                written_blocks: prepared.writable_blocks,
+            })
+            .unwrap();
+        assert!(coordinator.abort(121).unwrap());
+
+        assert_eq!(
+            coordinator
+                .snapshot(&session, CacheDomainId::new(0))
+                .unwrap(),
+            committed
+        );
+        assert_eq!(coordinator.stats().allocated_pages, 3);
+        coordinator.pin_transfer(&committed_pages).unwrap();
+        coordinator.unpin_transfer(&committed_pages).unwrap();
+        coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn stale_window_snapshot_cannot_rotate_a_new_generation() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 4);
+        let session = session("window-version", 1);
+        let initial = coordinator
+            .register_table(session, CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 130, initial, 2, 8);
+        prepare_and_complete(&mut coordinator, 130);
+        let stale = coordinator.commit(130, &[]).unwrap();
+
+        coordinator
+            .reserve_window(KvWindowReserveRequest {
+                txn_id: 131,
+                expected: stale.clone(),
+                target_committed_tokens: 9,
+                target_window_start: 4,
+                page_tokens: 4,
+            })
+            .unwrap();
+        prepare_and_complete(&mut coordinator, 131);
+        coordinator.commit(131, &[]).unwrap();
+
+        assert_eq!(
+            coordinator.reserve_window(KvWindowReserveRequest {
+                txn_id: 132,
+                expected: stale,
+                target_committed_tokens: 10,
+                target_window_start: 5,
+                page_tokens: 4,
+            }),
+            Err(KvCoordinatorError::VersionConflict)
+        );
+        assert_eq!(coordinator.stats().active_transactions, 0);
+        coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn randomized_window_rotation_plateaus_physical_pages_and_survives_aborts() {
+        const PAGE_TOKENS: u32 = 16;
+        const WINDOW_TOKENS: u32 = 64;
+        const COMMITTED_PAGE_BOUND: usize = 5;
+        const TRANSACTION_PAGE_BOUND: usize = 6;
+
+        let mut coordinator = KvCacheCoordinator::new(arena(1), TRANSACTION_PAGE_BOUND);
+        let session = session("window-random", 1);
+        let initial = coordinator
+            .register_table(session.clone(), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 140, initial, 1, 1);
+        prepare_and_complete(&mut coordinator, 140);
+        let mut committed = coordinator.commit(140, &[]).unwrap();
+        let mut txn_id = 141;
+        let mut random = 0x9e37_79b9_u32;
+
+        while committed.committed_tokens < 10_000 {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let step = 1 + random % 7;
+            let target = committed.committed_tokens.saturating_add(step).min(10_000);
+            let window_start = target.saturating_sub(WINDOW_TOKENS);
+            let before = committed.clone();
+
+            coordinator
+                .reserve_window(KvWindowReserveRequest {
+                    txn_id,
+                    expected: before.clone(),
+                    target_committed_tokens: target,
+                    target_window_start: window_start,
+                    page_tokens: PAGE_TOKENS,
+                })
+                .unwrap();
+            assert!(coordinator.stats().allocated_pages <= TRANSACTION_PAGE_BOUND);
+            let prepared = coordinator.prepare(txn_id).unwrap();
+
+            if random & 0x1f == 0 {
+                if random & 0x20 != 0 {
+                    coordinator
+                        .complete_write(KvWriteReceipt {
+                            txn_id,
+                            committed_tokens: target,
+                            written_blocks: prepared.writable_blocks,
+                        })
+                        .unwrap();
+                }
+                assert!(coordinator.abort(txn_id).unwrap());
+                assert_eq!(
+                    coordinator
+                        .snapshot(&session, CacheDomainId::new(0))
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(
+                    coordinator.stats().allocated_pages,
+                    before.groups[0].blocks.len()
+                );
+                txn_id += 1;
+                continue;
+            }
+
+            coordinator
+                .complete_write(KvWriteReceipt {
+                    txn_id,
+                    committed_tokens: target,
+                    written_blocks: prepared.writable_blocks,
+                })
+                .unwrap();
+            committed = coordinator.commit(txn_id, &[]).unwrap();
+            let expected_pages = crate::engine::cache::window::pages_for_logical_range(
+                window_start,
+                target,
+                PAGE_TOKENS,
+            )
+            .unwrap();
+            assert_eq!(committed.groups[0].blocks.len(), expected_pages);
+            assert!(coordinator.stats().allocated_pages <= COMMITTED_PAGE_BOUND);
+            assert_eq!(coordinator.stats().allocated_pages, expected_pages);
+            coordinator.check_invariants().unwrap();
+            txn_id += 1;
+        }
     }
 }

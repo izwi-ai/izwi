@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::FutureExt;
 use tracing::info;
 
+use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::engine::{
     ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
@@ -30,13 +31,19 @@ fn managed_cache_activation_enabled(
     backend: BackendKind,
     rollout: crate::engine::KvRolloutState,
 ) -> bool {
-    backend == BackendKind::Cpu
-        && matches!(
-            rollout,
-            crate::engine::KvRolloutState::ArenaOptIn
-                | crate::engine::KvRolloutState::Auto
-                | crate::engine::KvRolloutState::ArenaRequired
-        )
+    if !managed_kv_backend_compiled(backend) {
+        return false;
+    }
+    match rollout {
+        crate::engine::KvRolloutState::ArenaOptIn
+        | crate::engine::KvRolloutState::ArenaRequired => true,
+        // CPU has completed the production parity gates. Accelerator kernels
+        // remain explicit opt-ins until their hardware performance/fencing
+        // gates pass; merely compiling a direct kernel must not promote Auto.
+        crate::engine::KvRolloutState::Auto => backend == BackendKind::Cpu,
+        crate::engine::KvRolloutState::Legacy
+        | crate::engine::KvRolloutState::ArenaShadow => false,
+    }
 }
 
 fn select_lru_eviction_candidate(
@@ -494,8 +501,9 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        model_load_capacity_is_guarded, model_memory_estimate, model_resource_plan,
-        residency_budget_has_capacity, select_lru_eviction_candidate, ModelMemoryEstimate,
+        managed_cache_activation_enabled, model_load_capacity_is_guarded, model_memory_estimate,
+        model_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
+        ModelMemoryEstimate,
     };
     use crate::backends::{BackendKind, BackendPreference};
     use crate::config::EngineConfig;
@@ -515,6 +523,38 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::{oneshot, Barrier};
     use uuid::Uuid;
+
+    #[test]
+    fn managed_cache_activation_tracks_compiled_direct_kernels() {
+        use crate::engine::KvRolloutState;
+
+        assert!(managed_cache_activation_enabled(
+            BackendKind::Cpu,
+            KvRolloutState::Auto
+        ));
+        assert_eq!(
+            managed_cache_activation_enabled(BackendKind::Metal, KvRolloutState::Auto),
+            false
+        );
+        assert_eq!(
+            managed_cache_activation_enabled(BackendKind::Cuda, KvRolloutState::Auto),
+            false
+        );
+        assert_eq!(
+            managed_cache_activation_enabled(BackendKind::Metal, KvRolloutState::ArenaOptIn),
+            cfg!(feature = "metal")
+        );
+        assert_eq!(
+            managed_cache_activation_enabled(BackendKind::Cuda, KvRolloutState::ArenaRequired),
+            cfg!(feature = "flash-attn")
+        );
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert!(!managed_cache_activation_enabled(
+                backend,
+                KvRolloutState::ArenaShadow
+            ));
+        }
+    }
 
     fn one_byte_host_reservation() -> ResourceVector {
         ResourceVector {

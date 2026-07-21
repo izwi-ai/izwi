@@ -6,6 +6,7 @@
 //! - KV cache management
 //! - Output processing
 
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,13 +20,15 @@ use super::cache::rollout::{
 use super::config::EngineCoreConfig;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
-    BatchLaneKey, CacheMode, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
+    BatchLaneKey, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
     ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
     ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
     OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
     StageShapePolicy, WorkCost, WorkUnit,
 };
+#[cfg(test)]
+use super::execution::CacheMode;
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
     PreparedExecutionBatch,
@@ -580,25 +583,10 @@ impl EngineCore {
             WorkUnit::AtomicJob { kind } => kind.clone(),
             WorkUnit::PipelineStage { name, ordinal } => format!("{name}:{ordinal}"),
         };
-        let estimate = if profile.cache_mode == CacheMode::ExternalPaged {
-            let bytes_per_block =
-                self.config.kv_cache_memory_bytes() / self.config.max_blocks.max(1);
-            let estimated_bytes = scheduled
-                .block_ids
-                .len()
-                .checked_mul(bytes_per_block)
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .ok_or_else(|| Error::Overloaded("cache plan estimate overflow".to_string()))?;
-            ResourceVector {
-                kv_bytes: ResourceAmount::Known(estimated_bytes),
-                ..ResourceVector::zero()
-            }
-        } else {
-            // Opaque model caches are authorized and reconciled from their
-            // exact executor-owned tensors; logical scheduler blocks must not
-            // charge a second, fabricated physical-memory estimate.
-            ResourceVector::zero()
-        };
+        // Managed arenas are registered once at model scope, while opaque
+        // caches are authorized and reconciled from executor-owned tensors.
+        // A row therefore never reserves either physical allocation again.
+        let estimate = ResourceVector::zero();
         let bound_stage = request
             .execution_adapter_binding()
             .map(|binding| binding.stage_for_work(&work).cloned())
@@ -716,6 +704,24 @@ impl EngineCore {
             }
             self.scheduler.release_execution_quantum_for_retry(&session);
             self.release_managed_session_if_ready(&session);
+        }
+    }
+
+    fn defer_unexecuted_schedule_for_capacity(
+        &mut self,
+        scheduled: &[super::scheduler::ScheduledRequest],
+    ) {
+        self.rollback_unexecuted_schedule(scheduled);
+        let retry_at = Instant::now() + self.retry_policy.execution_delay(1);
+        for scheduled in scheduled {
+            let session = scheduled.session_key();
+            if !self.scheduler.defer_execution_retry(&session, retry_at) {
+                warn!(
+                    request_id = %session.request_id,
+                    session_epoch = session.epoch,
+                    "Scheduler rejected managed KV capacity backpressure"
+                );
+            }
         }
     }
 
@@ -1244,6 +1250,7 @@ impl EngineCore {
                         plan.plan_id,
                         &plan.session,
                         &planned_work,
+                        Some(&request),
                     )
                 })
                 .transpose()?
@@ -1477,18 +1484,26 @@ impl EngineCore {
         info!("Creating engine core");
 
         let managed_resource_authority = worker_config.resource_authority.clone();
+        let managed_worker_backend = worker_config.backend_context.backend_kind;
+        let managed_worker_device = worker_config.backend_context.device.device.clone();
         let executor = UnifiedExecutor::new_native(worker_config);
-        Self::new_with_executor_and_managed_authority(config, executor, managed_resource_authority)
+        Self::new_with_executor_and_managed_authority(
+            config,
+            executor,
+            managed_resource_authority,
+            Some((managed_worker_backend, managed_worker_device)),
+        )
     }
 
     fn new_with_executor(config: EngineCoreConfig, executor: UnifiedExecutor) -> Result<Self> {
-        Self::new_with_executor_and_managed_authority(config, executor, None)
+        Self::new_with_executor_and_managed_authority(config, executor, None, None)
     }
 
     fn new_with_executor_and_managed_authority(
         config: EngineCoreConfig,
         executor: UnifiedExecutor,
         managed_resource_authority: Option<Arc<super::ResourceAuthority>>,
+        managed_worker: Option<(BackendKind, candle_core::Device)>,
     ) -> Result<Self> {
         // Create scheduler
         let scheduler_config = SchedulerConfig::from(&config);
@@ -1500,12 +1515,30 @@ impl EngineCore {
         // Create output processor
         let output_processor =
             OutputProcessor::new(config.sample_rate).with_chunk_size(config.streaming_chunk_size);
+        let managed_prefix_salt = config
+            .enable_prefix_caching
+            .then(|| config.managed_prefix_cache_salt.as_deref())
+            .flatten()
+            .map(|salt| Sha256::digest(salt.as_bytes()).into());
+
+        let managed_kv_cache = match managed_worker {
+            Some((backend, device)) => ManagedKvCacheManager::for_worker_with_prefix_cache_salt(
+                managed_resource_authority,
+                managed_prefix_salt,
+                backend,
+                device,
+            ),
+            None => ManagedKvCacheManager::with_prefix_cache_salt(
+                managed_resource_authority,
+                managed_prefix_salt,
+            ),
+        };
 
         Ok(Self {
             config,
             scheduler,
             kv_cache,
-            managed_kv_cache: ManagedKvCacheManager::new(managed_resource_authority),
+            managed_kv_cache,
             managed_kv_circuit_breaker: KvPlanCircuitBreaker::default(),
             executor,
             output_processor,
@@ -1580,9 +1613,10 @@ impl EngineCore {
                         | KvRolloutState::Auto
                         | KvRolloutState::ArenaRequired
                 ) {
+                let managed_backend = self.managed_kv_cache.worker_backend();
                 match self.managed_kv_cache.bind_request(
                     model_instance,
-                    self.config.backend,
+                    managed_backend,
                     self.config.max_blocks,
                     self.config.block_size,
                     &capability,
@@ -2226,6 +2260,11 @@ impl EngineCore {
 
         let decode_batches = match self.form_physical_batches(&decode_requests, &decode_scheduled) {
             Ok(batches) => batches,
+            Err(Error::Backpressure(reason)) => {
+                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                return Ok(None);
+            }
             Err(error) => {
                 self.rollback_unexecuted_schedule(&all_scheduled);
                 return Err(error);
@@ -2234,6 +2273,11 @@ impl EngineCore {
         let prefill_batches =
             match self.form_physical_batches(&prefill_requests, &prefill_scheduled) {
                 Ok(batches) => batches,
+                Err(Error::Backpressure(reason)) => {
+                    self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                    debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                    return Ok(None);
+                }
                 Err(error) => {
                     self.rollback_unexecuted_schedule(&all_scheduled);
                     return Err(error);
@@ -2829,6 +2873,12 @@ impl EngineCore {
         self.kv_cache.stats()
     }
 
+    /// Exact physical managed-arena state, kept distinct from the legacy
+    /// logical KV block projection returned by `kv_cache_stats`.
+    pub fn managed_kv_runtime_snapshot(&self) -> super::ManagedKvRuntimeSnapshot {
+        self.managed_kv_cache.runtime_snapshot()
+    }
+
     /// Get configuration.
     pub fn config(&self) -> &EngineCoreConfig {
         &self.config
@@ -3167,7 +3217,11 @@ mod tests {
                 ExecutionMode::Sequence,
             );
             profile.prefill = PrefillMode::Full;
-            profile.cache_mode = super::super::execution::CacheMode::ExternalPaged;
+            // This fixture exercises executor-owned cache cleanup and logical
+            // quarantine. ExternalPaged is reserved for requests carrying an
+            // installed managed arena runtime and must not allocate shadow
+            // legacy blocks.
+            profile.cache_mode = super::super::execution::CacheMode::OpaqueModelOwned;
             profile.cache_release_safe = true;
             profile.prefix_reuse_safe = true;
             profile.resolved_from_loaded_model = true;
@@ -5412,6 +5466,87 @@ mod tests {
             .managed_kv_cache
             .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_kv_capacity_defers_without_failing_or_sticking_prefill() {
+        let model_instance = ModelInstanceId::new(92);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 1,
+                backend: BackendKind::Cpu,
+                kv_rollout: KvRolloutState::ArenaOptIn,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let managed_request = |id: &str, tokens: Vec<u32>| {
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: id.to_string(),
+            }])
+            .with_model_variant(ModelVariant::Qwen306B);
+            request.id = id.to_string();
+            request.params.max_tokens = 1;
+            request
+                .install_chat_execution_preparation(ModelVariant::Qwen306B, tokens, None)
+                .expect("prepare prompt");
+            request
+                .bind_model_instance(model_instance)
+                .expect("model instance");
+            request
+                .bind_cache_capability(crate::kv::CacheCapability::Managed(
+                    crate::kv::test_contract(),
+                ))
+                .expect("cache contract");
+            request
+        };
+
+        core.add_request(managed_request("capacity-owner", vec![1, 2, 3, 4]))
+            .expect("add owner");
+        core.step().await.expect("commit owner prefill");
+        let owner_session = core
+            .get_session_key(&"capacity-owner".to_string())
+            .expect("owner session");
+        core.scheduler
+            .finish_request(&"capacity-owner".to_string(), core.kv_cache.inner_mut());
+
+        core.add_request(managed_request("capacity-waiter", vec![5, 6, 7, 8]))
+            .expect("add waiter");
+        assert!(core
+            .prepare_step()
+            .await
+            .expect("capacity is scheduler backpressure")
+            .is_none());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_managed_cache.is_empty());
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
+
+        core.managed_kv_cache
+            .release_session(&owner_session)
+            .expect("release owner capacity");
+        core.step()
+            .await
+            .expect("waiter retries after capacity release");
+        let waiter_session = core
+            .get_session_key(&"capacity-waiter".to_string())
+            .expect("waiter session");
+        let snapshot = core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &waiter_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .expect("waiter committed table");
+        assert_eq!(snapshot.committed_tokens, 4);
     }
 
     #[test]

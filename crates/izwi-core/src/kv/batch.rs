@@ -30,6 +30,10 @@ pub struct KvSlotRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvSequenceBlockTable {
     pub blocks: Vec<CacheBlockRef>,
+    /// Number of hidden tokens before the first visible token in `blocks[0]`.
+    /// This is always less than the arena page size.
+    pub first_page_offset: u32,
+    /// Number of visible tokens, excluding `first_page_offset`.
     pub context_len: u32,
 }
 

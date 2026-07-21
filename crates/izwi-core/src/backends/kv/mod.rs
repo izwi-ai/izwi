@@ -13,7 +13,7 @@ mod negotiate;
 use std::any::Any;
 use std::sync::Arc;
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, DeviceLocation, Tensor};
 
 use crate::backends::BackendKind;
 use crate::kv::{
@@ -24,12 +24,25 @@ use crate::Result;
 
 #[cfg(feature = "flash-attn")]
 pub use accelerator::CudaKvBackendRuntime;
+#[cfg(feature = "metal")]
+pub use accelerator::MetalKvBackendRuntime;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use accelerator::{
     candle_accelerator_kv_support, CandleAcceleratorKvArena, CandleAcceleratorKvSupport,
 };
 pub use cpu::{CpuKvArena, CpuKvBackendRuntime};
 pub use negotiate::{negotiate_kv_plan, KvBackendPlanRequest};
+
+/// Whether this binary contains a complete managed-KV runtime for a backend.
+/// Capability publication and live worker binding share this gate so a loaded
+/// adapter cannot advertise managed paging without a direct attention kernel.
+pub const fn managed_kv_backend_compiled(backend: BackendKind) -> bool {
+    match backend {
+        BackendKind::Cpu => true,
+        BackendKind::Metal => cfg!(feature = "metal"),
+        BackendKind::Cuda => cfg!(feature = "flash-attn"),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvLayerConfig {
@@ -64,6 +77,8 @@ pub struct KvArenaOperationStats {
     pub paged_decode_dispatches: u64,
     pub page_zero_dispatches: u64,
     pub page_copy_dispatches: u64,
+    /// Explicit device synchronization that blocks the calling host thread.
+    pub host_synchronizations: u64,
 }
 
 /// Backend-specific, immutable lowering of host slot references.
@@ -105,6 +120,7 @@ pub type DeviceFence = Arc<dyn KvDeviceFence>;
 pub trait KvArena: Send + Sync {
     fn id(&self) -> KvArenaId;
     fn backend_kind(&self) -> BackendKind;
+    fn device_location(&self) -> DeviceLocation;
     fn config(&self) -> &KvArenaConfig;
 
     /// Validate arena identity and bounds, then lower to backend slot indices.

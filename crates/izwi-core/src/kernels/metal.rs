@@ -458,6 +458,196 @@ kernel void izwi_decode_gqa_attention_f16(
     }
 }
 
+kernel void izwi_paged_decode_attention_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const uint* metadata [[buffer(4)]],
+    constant uint& batch_size [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& page_tokens [[buffer(8)]],
+    constant uint& max_blocks [[buffer(9)]],
+    constant uint& key_head_dim [[buffer(10)]],
+    constant uint& value_head_dim [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint row = group.y;
+    if (row >= batch_size || head >= num_heads) {
+        return;
+    }
+
+    const uint context_len = metadata[row];
+    const uint first_page_offset = metadata[batch_size + row];
+    const uint kv_group = num_heads / num_kv_heads;
+    const uint kv_head = head / kv_group;
+    const uint q_base = (row * num_heads + head) * key_head_dim;
+    const uint table_base = 2 * batch_size + row * max_blocks;
+
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = 0; pos < context_len; pos++) {
+        const uint physical_pos = first_page_offset + pos;
+        const uint logical_page = physical_pos / page_tokens;
+        const uint page_offset = physical_pos - logical_page * page_tokens;
+        const uint physical_page = metadata[table_base + logical_page];
+        const uint slot = physical_page * page_tokens + page_offset;
+        const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+
+        float local_dot = 0.0f;
+        for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+            local_dot += q[q_base + dim] * k[k_base + dim];
+        }
+        dot_scratch[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                dot_scratch[tid] += dot_scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            const float score = dot_scratch[0] * scale;
+            const float next_max = max(online_state[0], score);
+            const float alpha = online_state[1] == 0.0f
+                ? 0.0f
+                : exp(online_state[0] - next_max);
+            const float beta = exp(score - next_max);
+            online_state[0] = next_max;
+            online_state[1] = online_state[1] * alpha + beta;
+            online_state[2] = alpha;
+            online_state[3] = beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+        for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+            accumulator[dim] = accumulator[dim] * online_state[2]
+                + v[v_base + dim] * online_state[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const float inv_sum = 1.0f / online_state[1];
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        output[out_base + dim] = accumulator[dim] * inv_sum;
+    }
+}
+
+kernel void izwi_paged_decode_attention_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    device const uint* metadata [[buffer(4)]],
+    constant uint& batch_size [[buffer(5)]],
+    constant uint& num_heads [[buffer(6)]],
+    constant uint& num_kv_heads [[buffer(7)]],
+    constant uint& page_tokens [[buffer(8)]],
+    constant uint& max_blocks [[buffer(9)]],
+    constant uint& key_head_dim [[buffer(10)]],
+    constant uint& value_head_dim [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint2 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint row = group.y;
+    if (row >= batch_size || head >= num_heads) {
+        return;
+    }
+
+    const uint context_len = metadata[row];
+    const uint first_page_offset = metadata[batch_size + row];
+    const uint kv_group = num_heads / num_kv_heads;
+    const uint kv_head = head / kv_group;
+    const uint q_base = (row * num_heads + head) * key_head_dim;
+    const uint table_base = 2 * batch_size + row * max_blocks;
+
+    const uint threads_per_threadgroup = threads_per_group.x;
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint pos = 0; pos < context_len; pos++) {
+        const uint physical_pos = first_page_offset + pos;
+        const uint logical_page = physical_pos / page_tokens;
+        const uint page_offset = physical_pos - logical_page * page_tokens;
+        const uint physical_page = metadata[table_base + logical_page];
+        const uint slot = physical_page * page_tokens + page_offset;
+        const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+
+        float local_dot = 0.0f;
+        for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+            local_dot += float(q[q_base + dim]) * float(k[k_base + dim]);
+        }
+        dot_scratch[tid] = local_dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                dot_scratch[tid] += dot_scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            const float score = dot_scratch[0] * scale;
+            const float next_max = max(online_state[0], score);
+            const float alpha = online_state[1] == 0.0f
+                ? 0.0f
+                : exp(online_state[0] - next_max);
+            const float beta = exp(score - next_max);
+            online_state[0] = next_max;
+            online_state[1] = online_state[1] * alpha + beta;
+            online_state[2] = alpha;
+            online_state[3] = beta;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+        for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+            accumulator[dim] = accumulator[dim] * online_state[2]
+                + float(v[v_base + dim]) * online_state[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_base = (row * num_heads + head) * value_head_dim;
+    const float inv_sum = 1.0f / online_state[1];
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        output[out_base + dim] = half(accumulator[dim] * inv_sum);
+    }
+}
+
 kernel void izwi_qwen35_causal_conv_sequence_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -1294,6 +1484,20 @@ struct DecodeGqaAttentionOp {
 }
 
 #[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct PagedDecodeAttentionOp {
+    metadata: Vec<u32>,
+    batch_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    scale: f32,
+}
+
+#[cfg(feature = "metal")]
 #[derive(Debug, Clone, Copy)]
 struct LfmShortConvDecode3Op {
     batch_size: usize,
@@ -1480,6 +1684,202 @@ fn decode_gqa_attention_pipeline(
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?
         .insert(key, pipeline.clone());
 
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for PagedDecodeAttentionOp {
+    fn name(&self) -> &'static str {
+        "izwi-paged-decode-attention-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-paged-decode-attention-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        q_storage: &MetalStorage,
+        q_layout: &Layout,
+        k_storage: &MetalStorage,
+        k_layout: &Layout,
+        v_storage: &MetalStorage,
+        v_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        let dtype = q_storage.dtype();
+        if k_storage.dtype() != dtype || v_storage.dtype() != dtype {
+            bail!("izwi-paged-decode-attention-metal requires matching dtypes")
+        }
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            bail!("izwi-paged-decode-attention-metal only supports F32 and F16 tensors")
+        }
+        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !v_layout.is_contiguous() {
+            bail!("izwi-paged-decode-attention-metal requires contiguous tensors")
+        }
+        if self.batch_size == 0
+            || self.num_heads == 0
+            || self.num_kv_heads == 0
+            || self.num_heads % self.num_kv_heads != 0
+            || self.page_tokens == 0
+            || self.max_blocks == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+            || self.key_head_dim > 512
+            || self.value_head_dim > 512
+            || self.metadata.len()
+                != self
+                    .batch_size
+                    .saturating_mul(2)
+                    .saturating_add(self.batch_size.saturating_mul(self.max_blocks))
+        {
+            bail!("izwi-paged-decode-attention-metal unsupported shape")
+        }
+        let q_elems = self
+            .batch_size
+            .saturating_mul(self.num_heads)
+            .saturating_mul(self.key_head_dim);
+        if q_layout.shape().elem_count() != q_elems {
+            bail!("izwi-paged-decode-attention-metal query shape mismatch")
+        }
+        let k_dims = k_layout.shape().dims();
+        let v_dims = v_layout.shape().dims();
+        if k_dims.len() != 4
+            || v_dims.len() != 4
+            || k_dims[0] != v_dims[0]
+            || k_dims[1] != self.page_tokens
+            || v_dims[1] != self.page_tokens
+            || k_dims[2] != self.num_kv_heads
+            || v_dims[2] != self.num_kv_heads
+            || k_dims[3] != self.key_head_dim
+            || v_dims[3] != self.value_head_dim
+        {
+            bail!("izwi-paged-decode-attention-metal page-major K/V shape mismatch")
+        }
+        let values = [
+            self.batch_size,
+            self.num_heads,
+            self.num_kv_heads,
+            self.page_tokens,
+            self.max_blocks,
+            self.key_head_dim,
+            self.value_head_dim,
+        ];
+        if values.iter().any(|&value| value > u32::MAX as usize) {
+            bail!("izwi-paged-decode-attention-metal tensor is too large")
+        }
+
+        let elem_count = self
+            .batch_size
+            .saturating_mul(self.num_heads)
+            .saturating_mul(self.value_head_dim);
+        let device = q_storage.device().clone();
+        let output = device.new_buffer(elem_count, dtype, "izwi-paged-decode-attention")?;
+        // One compact host-authored control buffer per physical batch. It holds
+        // context lengths, first-page offsets, and physical page ids; K/V
+        // remains in the arena.
+        let metadata = device.new_buffer_with_data(&self.metadata)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-paged-decode-attention");
+        let pipeline = paged_decode_attention_pipeline(device.metal_device(), dtype)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(
+            0,
+            Some(q_storage.buffer()),
+            q_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            1,
+            Some(k_storage.buffer()),
+            k_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(v_storage.buffer()),
+            v_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.set_input_buffer(4, Some(&metadata), 0);
+        encoder.set_bytes(5, &(self.batch_size as u32));
+        encoder.set_bytes(6, &(self.num_heads as u32));
+        encoder.set_bytes(7, &(self.num_kv_heads as u32));
+        encoder.set_bytes(8, &(self.page_tokens as u32));
+        encoder.set_bytes(9, &(self.max_blocks as u32));
+        encoder.set_bytes(10, &(self.key_head_dim as u32));
+        encoder.set_bytes(11, &(self.value_head_dim as u32));
+        encoder.set_bytes(12, &self.scale);
+
+        let reduction_width = self
+            .key_head_dim
+            .max(self.value_head_dim)
+            .next_power_of_two()
+            .min(pipeline.max_total_threads_per_threadgroup())
+            .min(256)
+            .max(1);
+        encoder.dispatch_thread_groups(
+            objc2_metal::MTLSize {
+                width: self.num_heads,
+                height: self.batch_size,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: reduction_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, dtype),
+            Shape::from((self.batch_size, self.num_heads, self.value_head_dim)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn paged_decode_attention_pipeline(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+
+    let function_name = match dtype {
+        DType::F32 => "izwi_paged_decode_attention_f32",
+        DType::F16 => "izwi_paged_decode_attention_f16",
+        _ => bail!("izwi-paged-decode-attention-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
     Ok(pipeline)
 }
 
@@ -2739,6 +3139,45 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
 
     #[allow(unreachable_code)]
     None
+}
+
+/// Dispatch one decode token per row directly against page-major arena K/V.
+///
+/// `metadata` is `[context_lens..., first_page_offsets...,
+/// padded_block_table...]`. The Metal kernel
+/// resolves each logical token to a physical page while applying online
+/// softmax, so this path never gathers pages or expands grouped-query heads.
+#[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paged_decode_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    metadata: Vec<u32>,
+    batch_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    scale: f32,
+) -> CandleResult<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &PagedDecodeAttentionOp {
+            metadata,
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            page_tokens,
+            max_blocks,
+            key_head_dim,
+            value_head_dim,
+            scale,
+        },
+    )
 }
 
 pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> Option<Tensor> {

@@ -80,10 +80,10 @@ fn qwen3_managed_cache_for_row(
     }
     let domain = &reservation.domains[0];
     if runtime.plan().model_instance != domain.arena.model_instance
-        || runtime.plan().backend != BackendKind::Cpu
+        || runtime.plan().backend != domain.arena.backend
     {
         return Err(Error::InferenceError(
-            "managed Qwen3 reservation does not match its loaded CPU runtime".to_string(),
+            "managed Qwen3 reservation does not match its loaded worker runtime".to_string(),
         ));
     }
     let group = runtime
@@ -101,6 +101,11 @@ fn qwen3_managed_cache_for_row(
             "native Qwen3 chat cannot consume a model-state KV group".to_string(),
         ));
     };
+    if domain.first_page_offset != domain.target_window_start % group.page_tokens {
+        return Err(Error::InvalidInput(
+            "managed Qwen3 first-page offset does not match its logical window".to_string(),
+        ));
+    }
     let table = domain
         .provisional_groups
         .iter()
@@ -113,11 +118,12 @@ fn qwen3_managed_cache_for_row(
     let arena = runtime.arena(group.arena).ok_or_else(|| {
         Error::InferenceError("managed Qwen3 arena is no longer live".to_string())
     })?;
-    Qwen3ManagedCache::new(
+    Qwen3ManagedCache::new_windowed(
         arena.clone(),
         layers.clone(),
         table.blocks.clone(),
-        domain.expected_committed_tokens as usize,
+        domain.target_window_start as usize,
+        domain.execution_start_tokens as usize,
     )
 }
 

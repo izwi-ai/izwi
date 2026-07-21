@@ -204,21 +204,31 @@ pub struct Qwen3ChatModel {
 impl KvCacheContractProvider for Qwen3ChatModel {
     fn kv_cache_contract(&self) -> Result<CacheCapability> {
         match &self.backend {
-            Qwen3ChatBackend::Native { text_model } => Ok(CacheCapability::Managed(
-                text_model.managed_kv_cache_contract(
-                    CacheDomainId::new(0),
-                    self.compute_dtype.ok_or_else(|| {
-                        Error::InvalidInput("native Qwen3 chat KV dtype is unavailable".into())
-                    })?,
-                    default_kv_page_size(),
-                )?,
-            )),
+            Qwen3ChatBackend::Native { text_model }
+                if text_model.supports_managed_kv_execution() =>
+            {
+                Ok(CacheCapability::Managed(
+                    text_model.managed_kv_cache_contract(
+                        CacheDomainId::new(0),
+                        self.compute_dtype.ok_or_else(|| {
+                            Error::InvalidInput("native Qwen3 chat KV dtype is unavailable".into())
+                        })?,
+                        default_kv_page_size(),
+                    )?,
+                ))
+            }
+            Qwen3ChatBackend::Native { .. } => Ok(CacheCapability::OpaqueModelOwned),
             Qwen3ChatBackend::Gguf { .. } => Ok(CacheCapability::OpaqueModelOwned),
         }
     }
 
     fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
         match &self.backend {
+            Qwen3ChatBackend::Native { text_model }
+                if !text_model.supports_managed_kv_execution() =>
+            {
+                Some("qwen3_sliding_window_managed_parity_is_unproven")
+            }
             Qwen3ChatBackend::Native { .. } => None,
             Qwen3ChatBackend::Gguf { .. } => Some("qwen3_gguf_cache_is_model_owned"),
         }
@@ -437,19 +447,22 @@ impl Qwen3ChatModel {
                 ))
             }
         };
-        if cache.context_len() != 0 {
+        let prompt_ids = self.build_prompt(messages)?;
+        let reused_prefix_tokens = cache.context_len();
+        if reused_prefix_tokens >= prompt_ids.len() {
             return Err(Error::InvalidInput(
-                "Qwen3 managed chat prefill requires an empty cache".to_string(),
+                "Qwen3 managed chat prefill must retain at least one private prompt token"
+                    .to_string(),
             ));
         }
-        let prompt_ids = self.build_prompt(messages)?;
+        let suffix = prompt_ids[reused_prefix_tokens..].to_vec();
         let input_ids = Tensor::from_vec(
-            prompt_ids.clone(),
-            (1, prompt_ids.len()),
+            suffix,
+            (1, prompt_ids.len() - reused_prefix_tokens),
             &self.device.device,
         )?;
-        let embeds = text_model.forward_managed(&input_ids, 0, &mut cache)?;
-        let pos = embeds.dim(1)?;
+        let embeds = text_model.forward_managed(&input_ids, reused_prefix_tokens, &mut cache)?;
+        let pos = prompt_ids.len();
         Ok(ChatDecodeState {
             cache: ChatKvCache::Managed(cache),
             embeds,

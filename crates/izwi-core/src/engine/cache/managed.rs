@@ -4,29 +4,134 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use candle_core::DType;
+use candle_core::{DType, Device, DeviceLocation};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::coordinator::{
     KvBlockIntent, KvCacheCoordinator, KvCoordinatorError, KvGroupReservation, KvReserveRequest,
-    KvSnapshot, KvWriteReceipt,
+    KvSnapshot, KvWindowReserveRequest, KvWriteReceipt,
 };
+use super::prefix::{
+    CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
+};
+use super::telemetry::{ManagedKvTelemetry, ManagedKvTelemetrySnapshot};
+#[cfg(feature = "flash-attn")]
+use crate::backends::kv::CudaKvBackendRuntime;
+#[cfg(feature = "metal")]
+use crate::backends::kv::MetalKvBackendRuntime;
 use crate::backends::kv::{
     CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendPlanRequest, KvBackendRuntime,
     KvLayerConfig,
 };
 use crate::backends::BackendKind;
 use crate::engine::{
-    ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation, ModelInstanceId,
-    PlanId, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease,
-    ResourceVector, SessionKey, WorkUnit,
+    EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
+    ModelInstanceId, PlanId, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
+    ResourceLease, ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::kv::CacheDomainId;
 use crate::kv::{
-    CacheCapability, KvArenaId, KvCacheContract, KvDomainSpec, KvGroupId, KvStorageDType,
-    ResolvedKvGroupKind, ResolvedKvPlan,
+    AttentionSemantics, CacheCapability, KvArenaId, KvCacheContract, KvDomainSpec, KvGroupId,
+    KvPrefixSemantics, KvStorageDType, ResolvedKvGroupKind, ResolvedKvPlan,
 };
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ManagedKvOperationSnapshot {
+    pub slot_write_dispatches: u64,
+    pub paged_decode_dispatches: u64,
+    pub page_zero_dispatches: u64,
+    pub page_copy_dispatches: u64,
+    pub host_synchronizations: u64,
+}
+
+impl ManagedKvOperationSnapshot {
+    fn add_assign(&mut self, other: Self) {
+        self.slot_write_dispatches = self
+            .slot_write_dispatches
+            .saturating_add(other.slot_write_dispatches);
+        self.paged_decode_dispatches = self
+            .paged_decode_dispatches
+            .saturating_add(other.paged_decode_dispatches);
+        self.page_zero_dispatches = self
+            .page_zero_dispatches
+            .saturating_add(other.page_zero_dispatches);
+        self.page_copy_dispatches = self
+            .page_copy_dispatches
+            .saturating_add(other.page_copy_dispatches);
+        self.host_synchronizations = self
+            .host_synchronizations
+            .saturating_add(other.host_synchronizations);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ManagedKvCoordinatorSnapshot {
+    pub capacity_pages: u64,
+    pub allocated_pages: u64,
+    pub free_pages: u64,
+    pub table_refs: u64,
+    pub prefix_refs: u64,
+    pub execution_pins: u64,
+    pub transfer_pins: u64,
+    pub reservations: u64,
+    pub active_transactions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedKvArenaRuntimeSnapshot {
+    pub generation: u32,
+    pub group_id: u32,
+    pub domain_id: u32,
+    pub device_ordinal: Option<u32>,
+    pub page_tokens: u32,
+    pub bytes_per_page: u64,
+    pub physical_bytes: u64,
+    pub coordinator: ManagedKvCoordinatorSnapshot,
+    pub operations: ManagedKvOperationSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedKvModelRuntimeSnapshot {
+    pub model_instance: ModelInstanceId,
+    pub plan_fingerprint: String,
+    pub backend: BackendKind,
+    pub device_ordinal: Option<u32>,
+    pub physical_bytes: u64,
+    pub registered_sessions: u64,
+    pub arenas: Vec<ManagedKvArenaRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ManagedKvRuntimeTotalsSnapshot {
+    pub models: u64,
+    pub arenas: u64,
+    pub registered_sessions: u64,
+    pub physical_bytes: u64,
+    pub coordinator: ManagedKvCoordinatorSnapshot,
+    pub operations: ManagedKvOperationSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedKvRuntimeSnapshot {
+    pub memory_accounting: &'static str,
+    pub totals: ManagedKvRuntimeTotalsSnapshot,
+    pub counters: ManagedKvTelemetrySnapshot,
+    pub models: Vec<ManagedKvModelRuntimeSnapshot>,
+}
+
+impl Default for ManagedKvRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            memory_accounting: "physical_arena_backing",
+            totals: ManagedKvRuntimeTotalsSnapshot::default(),
+            counters: ManagedKvTelemetrySnapshot::default(),
+            models: Vec::new(),
+        }
+    }
+}
 
 /// Immutable model-level plan and physical arenas shared by all its sessions.
 pub(crate) struct ManagedKvModelRuntime {
@@ -64,8 +169,16 @@ struct ManagedKvModelState {
     contract: KvCacheContract,
     runtime: Arc<ManagedKvModelRuntime>,
     coordinators: HashMap<KvArenaId, KvCacheCoordinator>,
+    prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
+    pending_prefixes: HashMap<PlanId, Vec<PendingPrefixCommit>>,
     registered_sessions: HashSet<SessionKey>,
     resource_lease: Option<ResourceLease>,
+}
+
+struct PendingPrefixCommit {
+    arena: KvArenaId,
+    page_tokens: u32,
+    publications: Vec<KvPrefixPublication>,
 }
 
 /// Engine-owned managed-cache registry. Arena backing is allocated once per
@@ -74,6 +187,13 @@ pub(crate) struct ManagedKvCacheManager {
     models: HashMap<ModelInstanceId, ManagedKvModelState>,
     resource_authority: Option<Arc<ResourceAuthority>>,
     next_arena_generation: u32,
+    telemetry: Arc<ManagedKvTelemetry>,
+    prefix_cache_salt: Option<[u8; 32]>,
+    worker_backend: BackendKind,
+    worker_device_location: DeviceLocation,
+    worker_device_ordinal: Option<u32>,
+    backend_runtime: Option<Arc<dyn KvBackendRuntime>>,
+    backend_unavailable: Option<String>,
 }
 
 impl Default for ManagedKvCacheManager {
@@ -89,11 +209,144 @@ impl ManagedKvCacheManager {
     }
 
     pub(crate) fn new(resource_authority: Option<Arc<ResourceAuthority>>) -> Self {
+        Self::for_worker(resource_authority, BackendKind::Cpu, Device::Cpu)
+    }
+
+    pub(crate) fn for_worker(
+        resource_authority: Option<Arc<ResourceAuthority>>,
+        backend: BackendKind,
+        device: Device,
+    ) -> Self {
+        let (backend_runtime, backend_unavailable) = managed_backend_runtime(backend, &device);
         Self {
             models: HashMap::new(),
             resource_authority,
             next_arena_generation: 1,
+            telemetry: Arc::new(ManagedKvTelemetry::default()),
+            prefix_cache_salt: None,
+            worker_backend: backend,
+            worker_device_location: device.location(),
+            worker_device_ordinal: managed_device_ordinal(&device),
+            backend_runtime,
+            backend_unavailable,
         }
+    }
+
+    pub(crate) fn with_prefix_cache_salt(
+        resource_authority: Option<Arc<ResourceAuthority>>,
+        salt: Option<[u8; 32]>,
+    ) -> Self {
+        let mut manager = Self::new(resource_authority);
+        manager.prefix_cache_salt = salt;
+        manager
+    }
+
+    pub(crate) fn for_worker_with_prefix_cache_salt(
+        resource_authority: Option<Arc<ResourceAuthority>>,
+        salt: Option<[u8; 32]>,
+        backend: BackendKind,
+        device: Device,
+    ) -> Self {
+        let mut manager = Self::for_worker(resource_authority, backend, device);
+        manager.prefix_cache_salt = salt;
+        manager
+    }
+
+    pub(crate) fn telemetry_snapshot(&self) -> ManagedKvTelemetrySnapshot {
+        self.telemetry.snapshot()
+    }
+
+    pub(crate) fn runtime_snapshot(&self) -> ManagedKvRuntimeSnapshot {
+        let mut totals = ManagedKvRuntimeTotalsSnapshot {
+            models: usize_to_u64(self.models.len()),
+            ..ManagedKvRuntimeTotalsSnapshot::default()
+        };
+        let mut models = self
+            .models
+            .iter()
+            .map(|(model_instance, state)| {
+                totals.registered_sessions = totals
+                    .registered_sessions
+                    .saturating_add(usize_to_u64(state.registered_sessions.len()));
+                totals.physical_bytes = totals
+                    .physical_bytes
+                    .saturating_add(state.runtime.physical_bytes);
+                let mut arenas = state
+                    .runtime
+                    .plan
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        let coordinator = state
+                            .coordinators
+                            .get(&group.arena)
+                            .expect("resolved managed arena has a coordinator")
+                            .stats();
+                        let coordinator = ManagedKvCoordinatorSnapshot {
+                            capacity_pages: usize_to_u64(coordinator.capacity_pages),
+                            allocated_pages: usize_to_u64(coordinator.allocated_pages),
+                            free_pages: usize_to_u64(coordinator.free_pages),
+                            table_refs: usize_to_u64(coordinator.table_refs),
+                            prefix_refs: usize_to_u64(coordinator.prefix_refs),
+                            execution_pins: usize_to_u64(coordinator.execution_pins),
+                            transfer_pins: usize_to_u64(coordinator.transfer_pins),
+                            reservations: usize_to_u64(coordinator.reservations),
+                            active_transactions: usize_to_u64(coordinator.active_transactions),
+                        };
+                        let arena = state
+                            .runtime
+                            .arenas
+                            .get(&group.arena)
+                            .expect("resolved managed arena has physical storage");
+                        let operation_stats = arena.operation_stats();
+                        let operations = ManagedKvOperationSnapshot {
+                            slot_write_dispatches: operation_stats.slot_write_dispatches,
+                            paged_decode_dispatches: operation_stats.paged_decode_dispatches,
+                            page_zero_dispatches: operation_stats.page_zero_dispatches,
+                            page_copy_dispatches: operation_stats.page_copy_dispatches,
+                            host_synchronizations: operation_stats.host_synchronizations,
+                        };
+                        add_coordinator_stats(&mut totals.coordinator, &coordinator);
+                        totals.operations.add_assign(operations.clone());
+                        totals.arenas = totals.arenas.saturating_add(1);
+                        ManagedKvArenaRuntimeSnapshot {
+                            generation: group.arena.generation,
+                            group_id: group.id.get(),
+                            domain_id: group.domain.get(),
+                            device_ordinal: group.arena.device_ordinal,
+                            page_tokens: group.page_tokens,
+                            bytes_per_page: group.bytes_per_page,
+                            physical_bytes: group
+                                .bytes_per_page
+                                .saturating_mul(u64::from(group.capacity_pages)),
+                            coordinator,
+                            operations,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                arenas.sort_by_key(|arena| (arena.generation, arena.group_id));
+                ManagedKvModelRuntimeSnapshot {
+                    model_instance: *model_instance,
+                    plan_fingerprint: state.runtime.plan.fingerprint().to_string(),
+                    backend: state.runtime.plan.backend,
+                    device_ordinal: state.runtime.plan.device_ordinal,
+                    physical_bytes: state.runtime.physical_bytes,
+                    registered_sessions: usize_to_u64(state.registered_sessions.len()),
+                    arenas,
+                }
+            })
+            .collect::<Vec<_>>();
+        models.sort_by_key(|model| model.model_instance);
+        ManagedKvRuntimeSnapshot {
+            memory_accounting: "physical_arena_backing",
+            totals,
+            counters: self.telemetry.snapshot(),
+            models,
+        }
+    }
+
+    pub(crate) fn worker_backend(&self) -> BackendKind {
+        self.worker_backend
     }
 
     pub(crate) fn bind_request(
@@ -107,6 +360,7 @@ impl ManagedKvCacheManager {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
         };
+        validate_sliding_contract(contract, backend)?;
         if let Some(state) = self.models.get(&model_instance) {
             if &state.contract != contract || state.runtime.plan.backend != backend {
                 return Err(Error::InvalidInput(
@@ -116,32 +370,30 @@ impl ManagedKvCacheManager {
             }
             return Ok(Some(state.runtime.clone()));
         }
-        if backend != BackendKind::Cpu {
+        if backend != self.worker_backend {
             return Err(Error::InvalidInput(format!(
-                "managed KV arenas are not implemented for {backend:?}"
+                "managed KV request targets {backend:?}, but its worker is bound to {:?}",
+                self.worker_backend
             )));
         }
-        if contract
-            .domains
-            .iter()
-            .any(|domain| matches!(domain, KvDomainSpec::ModelState(_)))
-        {
-            return Err(Error::InvalidInput(
-                "managed model-state arenas are not implemented by the CPU KV runtime".to_string(),
-            ));
-        }
+        let backend_runtime = self.backend_runtime.as_ref().ok_or_else(|| {
+            Error::InvalidInput(
+                self.backend_unavailable
+                    .clone()
+                    .unwrap_or_else(|| format!("managed KV is unavailable for {backend:?}")),
+            )
+        })?;
         let capacity_pages = u32::try_from(capacity_pages)
             .map_err(|_| Error::InvalidInput("managed KV page capacity exceeds u32".to_string()))?;
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".to_string()))?;
-        let backend_runtime = CpuKvBackendRuntime;
         let first_arena_generation = self.next_arena_generation;
         let plan = backend_runtime.negotiate(
             contract,
             &KvBackendPlanRequest {
                 model_instance,
                 backend,
-                device_ordinal: None,
+                device_ordinal: self.worker_device_ordinal,
                 capacity_pages,
                 page_tokens_hint: Some(page_tokens_hint),
                 storage_dtype_hint: None,
@@ -158,17 +410,40 @@ impl ManagedKvCacheManager {
             .transpose()?;
         let mut arenas = HashMap::with_capacity(plan.groups.len());
         let mut coordinators = HashMap::with_capacity(plan.groups.len());
+        let mut prefix_indexes = HashMap::with_capacity(plan.groups.len());
         for group in &plan.groups {
             let config = arena_config(contract, group)?;
             let arena = backend_runtime.allocate_arena(config)?;
+            if arena.backend_kind() != self.worker_backend {
+                return Err(Error::InferenceError(format!(
+                    "managed KV runtime allocated a {:?} arena for a {:?} worker",
+                    arena.backend_kind(),
+                    self.worker_backend
+                )));
+            }
+            if arena.device_location() != self.worker_device_location {
+                return Err(Error::InferenceError(format!(
+                    "managed KV runtime allocated arena device {:?} for exact worker device {:?}",
+                    arena.device_location(),
+                    self.worker_device_location
+                )));
+            }
             if arenas.insert(group.arena, arena).is_some() {
                 return Err(Error::InferenceError(
                     "resolved KV plan reused one arena identity".to_string(),
                 ));
             }
+            self.telemetry.record_backing_allocation();
             coordinators.insert(
                 group.arena,
                 KvCacheCoordinator::new(group.arena, group.capacity_pages as usize),
+            );
+            prefix_indexes.insert(
+                group.arena,
+                CoordinatedPrefixIndex::with_telemetry(
+                    group.capacity_pages as usize,
+                    self.telemetry.clone(),
+                ),
             );
         }
         if let Some(lease) = resource_lease.as_ref() {
@@ -185,6 +460,8 @@ impl ManagedKvCacheManager {
                 contract: contract.clone(),
                 runtime: runtime.clone(),
                 coordinators,
+                prefix_indexes,
+                pending_prefixes: HashMap::new(),
                 registered_sessions: HashSet::new(),
                 resource_lease,
             },
@@ -203,6 +480,7 @@ impl ManagedKvCacheManager {
         txn_id: PlanId,
         session: &SessionKey,
         work: &WorkUnit,
+        request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
         let WorkUnit::SequenceStep { input, .. } = work else {
             return Ok(None);
@@ -210,6 +488,7 @@ impl ManagedKvCacheManager {
         let target_committed_tokens = u32::try_from(input.end).map_err(|_| {
             Error::InvalidInput("managed KV token position exceeds u32".to_string())
         })?;
+        let namespace = managed_prefix_namespace(request, runtime, self.prefix_cache_salt)?;
         let state = self
             .models
             .get_mut(&runtime.plan.model_instance)
@@ -222,6 +501,7 @@ impl ManagedKvCacheManager {
         ensure_session_tables(state, session)?;
 
         let mut domains = Vec::with_capacity(runtime.plan.groups.len());
+        let mut pending_prefixes = Vec::new();
         for group in &runtime.plan.groups {
             let coordinator = state
                 .coordinators
@@ -236,33 +516,111 @@ impl ManagedKvCacheManager {
                     "scheduled KV target regressed behind the committed cache table".to_string(),
                 ));
             }
-            let reservation = reservation_for_group(
-                group.id,
-                group.page_tokens,
-                &snapshot,
-                target_committed_tokens,
-            )?;
-            let request = KvReserveRequest {
-                txn_id,
-                expected: snapshot.clone(),
-                target_committed_tokens,
-                target_window_start: 0,
-                groups: vec![reservation],
-            };
-            let reserved = match coordinator.reserve(request.clone()) {
-                Err(KvCoordinatorError::WriteConflict) => {
-                    let mut copy_on_write = request;
-                    for intent in &mut copy_on_write.groups[0].blocks {
-                        if let KvBlockIntent::Writable(source) = *intent {
-                            *intent = KvBlockIntent::CopyOnWrite(source);
-                        }
-                    }
-                    coordinator.reserve(copy_on_write)
+            let prefix_eligible = snapshot.committed_tokens == 0
+                && input.start == 0
+                && request.is_some_and(|request| input.end == request.prompt_tokens.len())
+                && target_committed_tokens > 1
+                && prefix_enabled_for_domain(&state.contract, group.domain);
+            let prefix_match = if prefix_eligible {
+                if let Some(namespace) = namespace.as_ref() {
+                    let reusable_tokens =
+                        usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
+                    state
+                        .prefix_indexes
+                        .get_mut(&group.arena)
+                        .expect("resolved arena has a prefix index")
+                        .lookup_longest(
+                            namespace,
+                            &request
+                                .expect("prefix namespace requires a request")
+                                .prompt_tokens[..reusable_tokens],
+                            group.page_tokens,
+                        )
+                        .map_err(prefix_error)?
+                } else {
+                    Default::default()
                 }
-                result => result,
+            } else {
+                Default::default()
             };
+            let execution_start_tokens = snapshot.committed_tokens.max(prefix_match.reused_tokens);
+            let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
+            let target_window_start = sliding_window
+                .map(|window| {
+                    target_committed_tokens
+                        .saturating_sub(window)
+                        .min(u32::try_from(input.start).unwrap_or(u32::MAX))
+                })
+                .unwrap_or(0);
+            let established_window_table = sliding_window.is_some()
+                && snapshot.groups.iter().any(|table| table.group == group.id);
+            let reserve_request = if established_window_table {
+                None
+            } else {
+                let reservation = reservation_for_group(
+                    group.id,
+                    group.page_tokens,
+                    &snapshot,
+                    target_committed_tokens,
+                    &prefix_match.blocks,
+                )?;
+                Some(KvReserveRequest {
+                    txn_id,
+                    expected: snapshot.clone(),
+                    target_committed_tokens,
+                    target_window_start: 0,
+                    groups: vec![reservation],
+                })
+            };
+            let reserve_once = |coordinator: &mut KvCacheCoordinator| {
+                if established_window_table {
+                    coordinator.reserve_window(KvWindowReserveRequest {
+                        txn_id,
+                        expected: snapshot.clone(),
+                        target_committed_tokens,
+                        target_window_start,
+                        page_tokens: group.page_tokens,
+                    })
+                } else {
+                    let request = reserve_request
+                        .as_ref()
+                        .expect("non-window reservation exists")
+                        .clone();
+                    match coordinator.reserve(request.clone()) {
+                        Err(KvCoordinatorError::WriteConflict) => {
+                            let mut copy_on_write = request;
+                            for intent in &mut copy_on_write.groups[0].blocks {
+                                if let KvBlockIntent::Writable(source) = *intent {
+                                    *intent = KvBlockIntent::CopyOnWrite(source);
+                                }
+                            }
+                            coordinator.reserve(copy_on_write)
+                        }
+                        result => result,
+                    }
+                }
+            };
+            let mut reserved = reserve_once(coordinator);
+            while matches!(reserved, Err(KvCoordinatorError::Capacity)) {
+                let protected = prefix_match.blocks.iter().copied().collect::<HashSet<_>>();
+                let evicted = state
+                    .prefix_indexes
+                    .get_mut(&group.arena)
+                    .expect("resolved arena has a prefix index")
+                    .evict_lru_excluding(coordinator, &protected)
+                    .map_err(prefix_error)?;
+                if evicted.is_empty() {
+                    break;
+                }
+                reserved = reserve_once(coordinator);
+            }
             if let Err(error) = reserved {
                 abort_domains(state, txn_id, &domains);
+                if matches!(error, KvCoordinatorError::Capacity) {
+                    return Err(Error::Backpressure(
+                        "managed KV arena has no reservable pages".to_string(),
+                    ));
+                }
                 return Err(coordinator_error(error));
             }
             let prepared = match coordinator.prepare(txn_id) {
@@ -280,9 +638,9 @@ impl ManagedKvCacheManager {
                 .flat_map(|group| group.blocks.iter().copied())
                 .collect::<HashSet<_>>();
             let fresh = prepared
-                .provisional_groups
+                .writable_blocks
                 .iter()
-                .flat_map(|group| group.blocks.iter().copied())
+                .copied()
                 .filter(|block| !old.contains(block))
                 .collect::<Vec<_>>();
             if !fresh.is_empty() {
@@ -294,6 +652,7 @@ impl ManagedKvCacheManager {
                     abort_domains(state, txn_id, &domains);
                     return Err(error);
                 }
+                self.telemetry.record_zero(fresh.len());
             }
             if !prepared.page_copies.is_empty() {
                 let arena = runtime
@@ -307,17 +666,56 @@ impl ManagedKvCacheManager {
                     abort_domains(state, txn_id, &domains);
                     return Err(error);
                 }
+                self.telemetry.record_copy(prepared.page_copies.len());
             }
             domains.push(ManagedCacheDomainReservation {
                 arena: group.arena,
                 domain: group.domain,
                 expected_version: prepared.expected.version,
                 expected_committed_tokens: prepared.expected.committed_tokens,
+                execution_start_tokens,
                 target_committed_tokens: prepared.target_committed_tokens,
                 target_window_start: prepared.target_window_start,
+                first_page_offset: prepared.target_window_start % group.page_tokens,
                 provisional_groups: prepared.provisional_groups,
                 writable_blocks: prepared.writable_blocks,
             });
+            if prefix_eligible {
+                let Some(namespace) = namespace.as_ref() else {
+                    continue;
+                };
+                let publications = prefix_publications(
+                    namespace,
+                    &request
+                        .expect("prefix namespace requires a request")
+                        .prompt_tokens,
+                    group.page_tokens,
+                    execution_start_tokens,
+                    target_committed_tokens,
+                    domains
+                        .last()
+                        .expect("domain reservation was just appended"),
+                    group.id,
+                )?;
+                if !publications.is_empty() {
+                    pending_prefixes.push(PendingPrefixCommit {
+                        arena: group.arena,
+                        page_tokens: group.page_tokens,
+                        publications,
+                    });
+                }
+            }
+        }
+        if !pending_prefixes.is_empty()
+            && state
+                .pending_prefixes
+                .insert(txn_id, pending_prefixes)
+                .is_some()
+        {
+            abort_domains(state, txn_id, &domains);
+            return Err(Error::InferenceError(
+                "managed KV transaction duplicated pending prefix publication".into(),
+            ));
         }
         Ok(Some(ManagedCacheReservation {
             txn_id,
@@ -343,6 +741,7 @@ impl ManagedKvCacheManager {
             .ok_or_else(|| Error::InferenceError("managed KV model state is missing".into()))?;
         if !commit {
             abort_reservation(state, reservation);
+            self.telemetry.record_abort();
             return Ok(());
         }
         let receipt = receipt.ok_or_else(|| {
@@ -384,14 +783,38 @@ impl ManagedKvCacheManager {
         // The engine serializes this loop under its state lock. Every domain
         // has already passed version/write validation, so no competing table
         // update can interleave between these publications.
+        let mut pending = state
+            .pending_prefixes
+            .remove(&reservation.txn_id)
+            .unwrap_or_default();
         for domain in &reservation.domains {
-            state
+            let coordinator = state
                 .coordinators
                 .get_mut(&domain.arena)
-                .expect("reservation arena has a coordinator")
-                .commit(reservation.txn_id, &[])
-                .map_err(coordinator_error)?;
+                .expect("reservation arena has a coordinator");
+            if let Some(index) = pending
+                .iter()
+                .position(|publication| publication.arena == domain.arena)
+            {
+                let publication = pending.swap_remove(index);
+                state
+                    .prefix_indexes
+                    .get_mut(&domain.arena)
+                    .expect("reservation arena has a prefix index")
+                    .commit_transaction(
+                        coordinator,
+                        reservation.txn_id,
+                        publication.page_tokens,
+                        &publication.publications,
+                    )
+                    .map_err(prefix_error)?;
+            } else {
+                coordinator
+                    .commit(reservation.txn_id, &[])
+                    .map_err(coordinator_error)?;
+            }
         }
+        self.telemetry.record_commit();
         Ok(())
     }
 
@@ -417,7 +840,7 @@ impl ManagedKvCacheManager {
     /// session, row transaction, device fence, or external runtime handle can
     /// still reference the backing storage.
     pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
-        let Some(state) = self.models.get(&model_instance) else {
+        let Some(state) = self.models.get_mut(&model_instance) else {
             return Ok(false);
         };
         if !state.registered_sessions.is_empty() {
@@ -431,6 +854,24 @@ impl ManagedKvCacheManager {
                 "managed KV model {} still has live runtime handles",
                 model_instance.get()
             )));
+        }
+        for group in &state.runtime.plan.groups {
+            loop {
+                let evicted = state
+                    .prefix_indexes
+                    .get_mut(&group.arena)
+                    .expect("resolved arena has a prefix index")
+                    .evict_lru(
+                        state
+                            .coordinators
+                            .get_mut(&group.arena)
+                            .expect("resolved arena has a coordinator"),
+                    )
+                    .map_err(prefix_error)?;
+                if evicted.is_empty() {
+                    break;
+                }
+            }
         }
         for coordinator in state.coordinators.values() {
             let stats = coordinator.stats();
@@ -474,6 +915,108 @@ impl ManagedKvCacheManager {
             .coordinators
             .values()
             .find_map(|coordinator| coordinator.snapshot(session, domain).ok())
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn add_coordinator_stats(
+    totals: &mut ManagedKvCoordinatorSnapshot,
+    arena: &ManagedKvCoordinatorSnapshot,
+) {
+    totals.capacity_pages = totals.capacity_pages.saturating_add(arena.capacity_pages);
+    totals.allocated_pages = totals.allocated_pages.saturating_add(arena.allocated_pages);
+    totals.free_pages = totals.free_pages.saturating_add(arena.free_pages);
+    totals.table_refs = totals.table_refs.saturating_add(arena.table_refs);
+    totals.prefix_refs = totals.prefix_refs.saturating_add(arena.prefix_refs);
+    totals.execution_pins = totals.execution_pins.saturating_add(arena.execution_pins);
+    totals.transfer_pins = totals.transfer_pins.saturating_add(arena.transfer_pins);
+    totals.reservations = totals.reservations.saturating_add(arena.reservations);
+    totals.active_transactions = totals
+        .active_transactions
+        .saturating_add(arena.active_transactions);
+}
+
+fn managed_backend_runtime(
+    backend: BackendKind,
+    device: &Device,
+) -> (Option<Arc<dyn KvBackendRuntime>>, Option<String>) {
+    let wrong_device = || {
+        (
+            None,
+            Some(format!(
+                "managed {backend:?} KV cannot bind worker device {:?}",
+                device.location()
+            )),
+        )
+    };
+    match backend {
+        BackendKind::Cpu => {
+            if !device.is_cpu() {
+                return wrong_device();
+            }
+            (Some(Arc::new(CpuKvBackendRuntime)), None)
+        }
+        BackendKind::Metal => {
+            if !device.is_metal() {
+                return wrong_device();
+            }
+            #[cfg(feature = "metal")]
+            {
+                match MetalKvBackendRuntime::new(device.clone()) {
+                    Ok(runtime) => (Some(Arc::new(runtime)), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                (
+                    None,
+                    Some(
+                        "managed Metal KV requires the metal feature and direct paged attention"
+                            .to_string(),
+                    ),
+                )
+            }
+        }
+        BackendKind::Cuda => {
+            if !device.is_cuda() {
+                return wrong_device();
+            }
+            #[cfg(feature = "flash-attn")]
+            {
+                match CudaKvBackendRuntime::new(device.clone()) {
+                    Ok(runtime) => (Some(Arc::new(runtime)), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                (
+                    None,
+                    Some(
+                        "managed CUDA KV requires the flash-attn feature and direct paged attention"
+                            .to_string(),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+fn managed_device_ordinal(device: &Device) -> Option<u32> {
+    match device.location() {
+        DeviceLocation::Cpu => None,
+        DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
+        // Candle reports Metal's registry id rather than the selector ordinal.
+        // Fold the exact device identity into the plan's compact device tag;
+        // the runtime itself retains the exact Candle device handle.
+        DeviceLocation::Metal { gpu_id } => {
+            let id = gpu_id as u64;
+            Some((id ^ (id >> 32)) as u32)
+        }
     }
 }
 
@@ -541,11 +1084,201 @@ fn ensure_session_tables(state: &mut ManagedKvModelState, session: &SessionKey) 
     Ok(())
 }
 
+fn managed_prefix_namespace(
+    request: Option<&EngineCoreRequest>,
+    runtime: &ManagedKvModelRuntime,
+    cache_salt: Option<[u8; 32]>,
+) -> Result<Option<KvPrefixNamespace>> {
+    let (Some(request), Some(cache_salt)) = (request, cache_salt) else {
+        return Ok(None);
+    };
+    let Some(binding) = request.execution_adapter_binding() else {
+        return Ok(None);
+    };
+    if request.task_type != crate::engine::TaskType::Chat
+        || request.model_instance_id() != Some(runtime.plan.model_instance)
+        || binding.model_instance_id != runtime.plan.model_instance
+    {
+        return Ok(None);
+    }
+
+    // The current managed producer is text-only Qwen3. Each digest is derived
+    // from exact lifecycle/adapter facts already sealed onto this request. The
+    // model-generation fence deliberately prevents reuse across reloads until
+    // artifact revisions and tokenizer ABIs become first-class lifecycle data.
+    let model_revision = digest_parts(
+        b"izwi.kv.loaded-model-generation.v1\0",
+        &[&runtime.plan.model_instance.get().to_le_bytes()],
+    );
+    let adapter_abi = digest_parts(
+        b"izwi.kv.loaded-adapter-abi.v1\0",
+        &[
+            &binding.adapter_instance_id.get().to_le_bytes(),
+            &binding.adapter_abi_revision.get().to_le_bytes(),
+            binding.capability_id.as_bytes(),
+        ],
+    );
+    let tokenizer_or_input_encoding = digest_parts(
+        b"izwi.kv.loaded-input-encoding.v1\0",
+        &[
+            &runtime.plan.model_instance.get().to_le_bytes(),
+            &binding.adapter_instance_id.get().to_le_bytes(),
+            binding.capability_id.as_bytes(),
+        ],
+    );
+    let position_semantics = digest_parts(
+        b"izwi.kv.position-semantics.v1\0",
+        &[&runtime.plan.contract_fingerprint],
+    );
+    Ok(Some(KvPrefixNamespace {
+        model_instance: runtime.plan.model_instance,
+        model_revision,
+        adapter_abi,
+        tokenizer_or_input_encoding,
+        position_semantics,
+        plan: runtime.plan.fingerprint(),
+        multimodal_artifact: None,
+        cache_salt,
+    }))
+}
+
+fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn prefix_enabled_for_domain(
+    contract: &KvCacheContract,
+    domain_id: crate::kv::CacheDomainId,
+) -> bool {
+    contract.domains.iter().any(|domain| {
+        if domain.id() != domain_id {
+            return false;
+        }
+        match domain {
+            KvDomainSpec::PagedAttention(spec) => {
+                spec.layers
+                    .iter()
+                    .all(|layer| matches!(layer.attention, AttentionSemantics::Full))
+                    && matches!(
+                        spec.prefix_semantics,
+                        KvPrefixSemantics::CommittedFullPages { .. }
+                    )
+            }
+            KvDomainSpec::ModelState(spec) => matches!(
+                spec.prefix_semantics,
+                KvPrefixSemantics::CommittedFullPages { .. }
+            ),
+        }
+    })
+}
+
+fn sliding_window_for_domain(
+    contract: &KvCacheContract,
+    domain_id: crate::kv::CacheDomainId,
+) -> Result<Option<u32>> {
+    let Some(domain) = contract
+        .domains
+        .iter()
+        .find(|domain| domain.id() == domain_id)
+    else {
+        return Err(Error::InferenceError(
+            "managed KV plan references a missing semantic domain".into(),
+        ));
+    };
+    let KvDomainSpec::PagedAttention(spec) = domain else {
+        return Ok(None);
+    };
+    let first = spec.layers.first().ok_or_else(|| {
+        Error::InvalidInput("managed paged-attention domain has no layers".into())
+    })?;
+    if spec
+        .layers
+        .iter()
+        .any(|layer| layer.attention != first.attention)
+    {
+        return Err(Error::InvalidInput(format!(
+            "managed KV domain {} mixes full and sliding attention semantics",
+            domain_id.get()
+        )));
+    }
+    Ok(match first.attention {
+        AttentionSemantics::Full => None,
+        AttentionSemantics::SlidingWindow { window_tokens } => Some(window_tokens),
+    })
+}
+
+fn validate_sliding_contract(contract: &KvCacheContract, backend: BackendKind) -> Result<()> {
+    for domain in &contract.domains {
+        if let Some(window_tokens) = sliding_window_for_domain(contract, domain.id())? {
+            if backend == BackendKind::Cuda {
+                return Err(Error::InvalidInput(format!(
+                    "managed CUDA KV cannot safely consume sliding window {window_tokens}: its paged kernel ABI has no first-page offset"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prefix_publications(
+    namespace: &KvPrefixNamespace,
+    tokens: &[u32],
+    page_tokens: u32,
+    execution_start_tokens: u32,
+    target_tokens: u32,
+    reservation: &ManagedCacheDomainReservation,
+    group: KvGroupId,
+) -> Result<Vec<KvPrefixPublication>> {
+    let page_tokens_usize = usize::try_from(page_tokens)
+        .map_err(|_| Error::InvalidInput("managed prefix page size exceeds usize".into()))?;
+    let target = usize::try_from(target_tokens)
+        .map_err(|_| Error::InvalidInput("managed prefix target exceeds usize".into()))?;
+    if target > tokens.len() || page_tokens_usize == 0 {
+        return Ok(Vec::new());
+    }
+    let table = reservation
+        .provisional_groups
+        .iter()
+        .find(|table| table.group == group)
+        .ok_or_else(|| Error::InferenceError("managed prefix group table is missing".into()))?;
+    let first_new_page = usize::try_from(execution_start_tokens / page_tokens)
+        .map_err(|_| Error::InvalidInput("managed prefix start exceeds usize".into()))?;
+    let complete_pages = target / page_tokens_usize;
+    let mut previous = None;
+    let mut publications = Vec::new();
+    for page_index in 0..complete_pages {
+        let start = page_index * page_tokens_usize;
+        let key = KvPrefixPageKey::new(
+            namespace,
+            previous,
+            start as u64,
+            tokens[start..start + page_tokens_usize].to_vec(),
+        )
+        .map_err(prefix_error)?;
+        previous = Some(key.digest());
+        if page_index < first_new_page {
+            continue;
+        }
+        let block = table.blocks.get(page_index).copied().ok_or_else(|| {
+            Error::InferenceError("managed prefix publication exceeds its block table".into())
+        })?;
+        publications.push(KvPrefixPublication { key, block });
+    }
+    Ok(publications)
+}
+
 fn reservation_for_group(
     group: KvGroupId,
     page_tokens: u32,
     snapshot: &KvSnapshot,
     target_tokens: u32,
+    shared_prefix: &[crate::kv::CacheBlockRef],
 ) -> Result<KvGroupReservation> {
     let required_pages = target_tokens
         .checked_add(page_tokens - 1)
@@ -560,6 +1293,13 @@ fn reservation_for_group(
         .map(|table| table.blocks.as_slice())
         .unwrap_or_default();
     let mut blocks = Vec::with_capacity(required_pages);
+    if snapshot.committed_tokens == 0 {
+        blocks.extend(shared_prefix.iter().copied().map(KvBlockIntent::Shared));
+    } else if !shared_prefix.is_empty() {
+        return Err(Error::InferenceError(
+            "managed KV prefix pages cannot replace a committed request table".into(),
+        ));
+    }
     for (index, block) in existing.iter().take(required_pages).copied().enumerate() {
         let is_partial_tail = snapshot.committed_tokens % page_tokens != 0
             && index + 1 == existing.len()
@@ -591,6 +1331,7 @@ fn abort_domains(
 }
 
 fn abort_reservation(state: &mut ManagedKvModelState, reservation: &ManagedCacheReservation) {
+    state.pending_prefixes.remove(&reservation.txn_id);
     abort_domains(state, reservation.txn_id, &reservation.domains);
 }
 
@@ -611,7 +1352,7 @@ fn arena_config(
         }
         _ => {
             return Err(Error::InvalidInput(
-                "CPU KV arena requires a paged-attention domain".to_string(),
+                "dense paged KV arena requires a paged-attention domain".to_string(),
             ));
         }
     };
@@ -645,7 +1386,7 @@ fn candle_dtype(dtype: KvStorageDType) -> Result<DType> {
         KvStorageDType::F16 => Ok(DType::F16),
         KvStorageDType::Bf16 => Ok(DType::BF16),
         KvStorageDType::I8 | KvStorageDType::Q4 => Err(Error::InvalidInput(
-            "CPU KV arena cannot allocate quantized storage".to_string(),
+            "dense KV arena cannot allocate quantized storage".to_string(),
         )),
     }
 }
@@ -656,14 +1397,24 @@ fn coordinator_error(error: impl fmt::Display) -> Error {
     ))
 }
 
+fn prefix_error(error: impl fmt::Display) -> Error {
+    Error::InferenceError(format!(
+        "managed KV prefix index rejected operation: {error}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::{
-        CapacitySource, InputRange, PhysicalCapacityProvider, PhysicalCapacitySnapshot,
-        SequencePhase,
+        AdapterAbiRevision, AdapterInstanceId, CapacitySource, ExecutionAdapterBinding,
+        ExecutionGroupId, ExecutionMode, ExecutionProfile, InputRange, NativeBatchMode,
+        PhysicalCapacityProvider, PhysicalCapacitySnapshot, SequencePhase, StageDescriptor,
+        StageId,
     };
     use crate::kv::{test_contract, CacheBlockRef, KvSlotRef};
+    use crate::model::ModelVariant;
+    use crate::models::shared::chat::{ChatMessage, ChatRole};
 
     #[derive(Debug)]
     struct TestCapacityProvider {
@@ -692,12 +1443,101 @@ mod tests {
         })))
     }
 
+    #[test]
+    fn managed_runtime_rejects_a_backend_device_mismatch() {
+        let mut manager = ManagedKvCacheManager::for_worker(None, BackendKind::Metal, Device::Cpu);
+        let error = manager
+            .bind_request(
+                ModelInstanceId::new(700),
+                BackendKind::Metal,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot bind worker device"));
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn managed_metal_runtime_allocates_on_the_exact_worker_device() -> Result<()> {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return Ok(());
+        };
+        let expected_location = device.location();
+        let mut manager =
+            ManagedKvCacheManager::for_worker(None, BackendKind::Metal, device.clone());
+        let runtime = manager
+            .bind_request(
+                ModelInstanceId::new(701),
+                BackendKind::Metal,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )?
+            .expect("managed contract should activate on compiled Metal");
+        assert_eq!(runtime.plan().backend, BackendKind::Metal);
+        assert_eq!(
+            runtime.plan().device_ordinal,
+            managed_device_ordinal(&device)
+        );
+        for group in &runtime.plan().groups {
+            let arena = runtime.arena(group.arena).expect("resolved arena");
+            assert_eq!(arena.backend_kind(), BackendKind::Metal);
+            assert_eq!(arena.device_location(), expected_location);
+        }
+        Ok(())
+    }
+
     fn sequence_work(start: usize, end: usize) -> WorkUnit {
         WorkUnit::SequenceStep {
             phase: SequencePhase::Prefill,
             input: InputRange { start, end },
             max_output_steps: end.saturating_sub(start).max(1),
         }
+    }
+
+    fn sliding_contract(window_tokens: u32) -> KvCacheContract {
+        let mut contract = test_contract();
+        let KvDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        for layer in &mut domain.layers {
+            layer.attention = AttentionSemantics::SlidingWindow { window_tokens };
+        }
+        domain.prefix_semantics = KvPrefixSemantics::Disabled;
+        contract
+    }
+
+    fn prefix_request(model: ModelInstanceId, tokens: Vec<u32>) -> EngineCoreRequest {
+        let variant = ModelVariant::Qwen306B;
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "qwen3.managed",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "prefix".into(),
+        }])
+        .with_model_variant(variant);
+        request.prompt_tokens = tokens;
+        request
+            .bind_execution_adapter(ExecutionAdapterBinding {
+                execution_group_id: ExecutionGroupId::new(1),
+                model_instance_id: model,
+                adapter_instance_id: AdapterInstanceId::new(2),
+                adapter_abi_revision: AdapterAbiRevision::new(9),
+                model_variant: variant,
+                capability_id: "chat".into(),
+                stages: Arc::from([stage]),
+            })
+            .expect("adapter binding");
+        request
     }
 
     #[test]
@@ -719,7 +1559,7 @@ mod tests {
         assert!(runtime.physical_bytes() > 0);
 
         let first = manager
-            .prepare(&runtime, 1, &session, &sequence_work(0, 5))
+            .prepare(&runtime, 1, &session, &sequence_work(0, 5), None)
             .expect("prepare")
             .expect("reservation");
         assert_eq!(first.domains.len(), 1);
@@ -732,7 +1572,7 @@ mod tests {
         assert_eq!(snapshot.committed_tokens, 5);
 
         let second = manager
-            .prepare(&runtime, 2, &session, &sequence_work(5, 17))
+            .prepare(&runtime, 2, &session, &sequence_work(5, 17), None)
             .expect("prepare")
             .expect("reservation");
         assert_eq!(second.domains[0].writable_blocks.len(), 2);
@@ -743,6 +1583,244 @@ mod tests {
 
         manager.release_session(&session).expect("release");
         assert!(manager.snapshot(model, &session, domain).is_none());
+    }
+
+    #[test]
+    fn runtime_snapshot_reports_exact_physical_state_and_serializes() {
+        let model = ModelInstanceId::new(44);
+        let session = SessionKey::new("managed-telemetry".to_string(), 3);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("managed runtime");
+        let reservation = manager
+            .prepare(&runtime, 11, &session, &sequence_work(0, 1), None)
+            .expect("prepare")
+            .expect("reservation");
+
+        let prepared = manager.runtime_snapshot();
+        assert_eq!(prepared.memory_accounting, "physical_arena_backing");
+        assert_eq!(prepared.totals.models, 1);
+        assert_eq!(prepared.totals.arenas, 1);
+        assert_eq!(prepared.totals.physical_bytes, runtime.physical_bytes());
+        assert_eq!(prepared.totals.coordinator.capacity_pages, 2);
+        assert_eq!(prepared.totals.coordinator.allocated_pages, 1);
+        assert_eq!(prepared.totals.coordinator.active_transactions, 1);
+        assert_eq!(prepared.totals.operations.page_zero_dispatches, 1);
+        assert_eq!(prepared.counters.pages_zeroed, 1);
+        assert_eq!(prepared.counters.backing_allocations, 1);
+        assert_eq!(prepared.models[0].model_instance, model);
+        assert_eq!(
+            prepared.models[0].arenas[0].physical_bytes,
+            runtime.physical_bytes()
+        );
+
+        let encoded = serde_json::to_value(&prepared).expect("serialize managed KV telemetry");
+        assert_eq!(encoded["memory_accounting"], "physical_arena_backing");
+        assert_eq!(encoded["totals"]["coordinator"]["allocated_pages"], 1);
+        assert_eq!(encoded["models"][0]["backend"], "cpu");
+
+        manager.finalize(&reservation, None, false).expect("abort");
+        let aborted = manager.runtime_snapshot();
+        assert_eq!(aborted.counters.transaction_aborts, 1);
+        assert_eq!(aborted.totals.coordinator.allocated_pages, 0);
+        assert_eq!(aborted.totals.coordinator.active_transactions, 0);
+    }
+
+    #[test]
+    fn live_sliding_window_table_stays_bounded_and_carries_first_page_offset() {
+        let model = ModelInstanceId::new(48);
+        let session = SessionKey::new("managed-window".into(), 1);
+        let domain = CacheDomainId::new(1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(sliding_contract(32)),
+            )
+            .expect("bind")
+            .expect("managed runtime");
+
+        let mut observed_nonzero_offset = false;
+        for target in 1..=256_usize {
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    target as u64,
+                    &session,
+                    &sequence_work(target - 1, target),
+                    None,
+                )
+                .expect("prepare")
+                .expect("reservation");
+            let row = &reservation.domains[0];
+            assert_eq!(
+                row.target_window_start,
+                u32::try_from(target.saturating_sub(32)).unwrap()
+            );
+            assert_eq!(row.first_page_offset, row.target_window_start % 16);
+            observed_nonzero_offset |= row.first_page_offset != 0;
+            assert!(row.provisional_groups[0].blocks.len() <= 3);
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt()),
+                    true,
+                )
+                .expect("commit");
+        }
+
+        assert!(observed_nonzero_offset);
+        let snapshot = manager.snapshot(model, &session, domain).expect("snapshot");
+        assert_eq!(snapshot.committed_tokens, 256);
+        assert_eq!(snapshot.window_start, 224);
+        assert!(snapshot.groups[0].blocks.len() <= 3);
+    }
+
+    #[test]
+    fn salted_prefix_reuse_attaches_shared_pages_and_skips_their_prefill() {
+        let model = ModelInstanceId::new(45);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([9; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let first_request = prefix_request(model, tokens.clone());
+        let first_session = SessionKey::new("prefix-first".into(), 1);
+        let first = manager
+            .prepare(
+                &runtime,
+                21,
+                &first_session,
+                &sequence_work(0, tokens.len()),
+                Some(&first_request),
+            )
+            .expect("first prepare")
+            .expect("first reservation");
+        assert_eq!(first.domains[0].execution_start_tokens, 0);
+        manager
+            .finalize(&first, Some(&first.completed_write_receipt()), true)
+            .expect("first commit");
+        manager
+            .release_session(&first_session)
+            .expect("first release");
+
+        let mut second_tokens = tokens;
+        *second_tokens.last_mut().unwrap() = 999;
+        let second_request = prefix_request(model, second_tokens.clone());
+        let second_session = SessionKey::new("prefix-second".into(), 1);
+        let second = manager
+            .prepare(
+                &runtime,
+                22,
+                &second_session,
+                &sequence_work(0, second_tokens.len()),
+                Some(&second_request),
+            )
+            .expect("second prepare")
+            .expect("second reservation");
+        assert_eq!(second.domains[0].execution_start_tokens, 64);
+        assert_eq!(second.domains[0].writable_blocks.len(), 1);
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.prefix_hits, 1);
+        assert_eq!(telemetry.reused_tokens, 64);
+        assert_eq!(telemetry.avoided_prefill_tokens, 64);
+        manager.finalize(&second, None, false).expect("abort");
+        assert_eq!(manager.telemetry_snapshot().transaction_aborts, 1);
+    }
+
+    #[test]
+    fn managed_prefix_reuse_is_disabled_without_an_explicit_salt() {
+        let model = ModelInstanceId::new(46);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let request = prefix_request(model, (0..33).collect());
+        let session = SessionKey::new("prefix-disabled".into(), 1);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                23,
+                &session,
+                &sequence_work(0, 33),
+                Some(&request),
+            )
+            .expect("prepare")
+            .expect("reservation");
+        assert_eq!(reservation.domains[0].execution_start_tokens, 0);
+        assert_eq!(manager.telemetry_snapshot().prefix_hits, 0);
+        assert_eq!(manager.telemetry_snapshot().prefix_misses, 0);
+    }
+
+    #[test]
+    fn aborted_managed_prefill_never_publishes_prefix_pages() {
+        let model = ModelInstanceId::new(47);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([7; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                3,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let request = prefix_request(model, (100..133).collect());
+        let first_session = SessionKey::new("aborted-prefix".into(), 1);
+        let first = manager
+            .prepare(
+                &runtime,
+                24,
+                &first_session,
+                &sequence_work(0, 33),
+                Some(&request),
+            )
+            .expect("prepare")
+            .expect("reservation");
+        manager.finalize(&first, None, false).expect("abort");
+        manager.release_session(&first_session).expect("release");
+
+        let second_session = SessionKey::new("after-abort".into(), 1);
+        let second = manager
+            .prepare(
+                &runtime,
+                25,
+                &second_session,
+                &sequence_work(0, 33),
+                Some(&request),
+            )
+            .expect("prepare after abort")
+            .expect("reservation");
+        assert_eq!(second.domains[0].execution_start_tokens, 0);
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.prefix_hits, 0);
+        assert_eq!(telemetry.prefix_misses, 2);
     }
 
     #[test]
@@ -795,7 +1873,7 @@ mod tests {
             .expect("bind")
             .expect("runtime");
         let reservation = manager
-            .prepare(&runtime, 8, &session, &sequence_work(0, 8))
+            .prepare(&runtime, 8, &session, &sequence_work(0, 8), None)
             .expect("prepare")
             .expect("reservation");
         assert_eq!(reservation.domains.len(), 2);
@@ -850,7 +1928,7 @@ mod tests {
         assert_eq!(authority.snapshot().reservations, 1);
 
         let reservation = manager
-            .prepare(&runtime, 10, &session, &sequence_work(0, 1))
+            .prepare(&runtime, 10, &session, &sequence_work(0, 1), None)
             .expect("prepare")
             .expect("reservation");
         manager.finalize(&reservation, None, false).expect("abort");

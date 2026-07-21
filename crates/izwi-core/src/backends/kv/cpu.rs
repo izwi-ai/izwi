@@ -188,6 +188,10 @@ impl KvArena for CpuKvArena {
         BackendKind::Cpu
     }
 
+    fn device_location(&self) -> candle_core::DeviceLocation {
+        candle_core::DeviceLocation::Cpu
+    }
+
     fn config(&self) -> &KvArenaConfig {
         &self.config
     }
@@ -426,8 +430,7 @@ impl KvArena for CpuKvArena {
             &Device::Cpu,
         )?
         .to_dtype(self.config.dtype)?;
-        self.paged_decode_dispatches
-            .fetch_add(1, Ordering::Relaxed);
+        self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(output)
     }
 
@@ -437,6 +440,7 @@ impl KvArena for CpuKvArena {
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
             page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
+            host_synchronizations: 0,
         }
     }
 
@@ -457,8 +461,22 @@ impl CpuKvArena {
                         "CPU paged decode row {row} has an empty context"
                     )));
                 }
+                if sequence.first_page_offset >= self.config.page_tokens {
+                    return Err(Error::InferenceError(format!(
+                        "CPU paged decode row {row} first-page offset {} exceeds page size {}",
+                        sequence.first_page_offset, self.config.page_tokens
+                    )));
+                }
+                let physical_tokens = sequence
+                    .context_len
+                    .checked_add(sequence.first_page_offset)
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "CPU paged decode physical token range exceeds u32".into(),
+                        )
+                    })?;
                 let required_pages =
-                    (sequence.context_len as usize).div_ceil(self.config.page_tokens as usize);
+                    (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
                 if sequence.blocks.len() != required_pages {
                     return Err(Error::InferenceError(format!(
                         "CPU paged decode row {row} has {} pages, expected {required_pages}",
@@ -473,6 +491,7 @@ impl CpuKvArena {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(LoweredDecodeRow {
                     pages,
+                    first_page_offset: sequence.first_page_offset as usize,
                     context_len: sequence.context_len as usize,
                 })
             })
@@ -482,6 +501,7 @@ impl CpuKvArena {
 
 struct LoweredDecodeRow {
     pages: Vec<usize>,
+    first_page_offset: usize,
     context_len: usize,
 }
 
@@ -540,8 +560,9 @@ where
             let mut accumulator = vec![0.0f32; value_dim];
 
             for token in 0..table.context_len {
-                let page = table.pages[token / page_tokens];
-                let page_offset = token % page_tokens;
+                let physical_token = table.first_page_offset + token;
+                let page = table.pages[physical_token / page_tokens];
+                let page_offset = physical_token % page_tokens;
                 let key_offset = key_start
                     + page * key_page_stride
                     + (page_offset * kv_heads + kv_head) * key_dim;
@@ -1282,10 +1303,12 @@ mod tests {
             sequences: vec![
                 KvSequenceBlockTable {
                     blocks: vec![block(2), block(0)],
+                    first_page_offset: 1,
                     context_len: 3,
                 },
                 KvSequenceBlockTable {
                     blocks: vec![block(1)],
+                    first_page_offset: 0,
                     context_len: 1,
                 },
             ],
@@ -1302,8 +1325,8 @@ mod tests {
             )?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        // Physical tokens 4, 5, 0 correspond to shuffled table [page 2, page 0]
-        // with a partial final page; row 1 contains only physical token 2.
+        // Physical tokens 5, 0, 1 correspond to shuffled table [page 2, page 0]
+        // after hiding its first slot; row 1 contains only physical token 2.
         let expected = dense_reference(
             &query_values,
             4,
@@ -1312,7 +1335,7 @@ mod tests {
             2,
             2,
             1,
-            &[vec![4, 5, 0], vec![2]],
+            &[vec![5, 0, 1], vec![2]],
             scale,
         );
         for (actual, expected) in actual.iter().zip(expected) {
@@ -1361,6 +1384,7 @@ mod tests {
             let batch = KvDecodeBatchMetadata {
                 sequences: vec![KvSequenceBlockTable {
                     blocks: vec![block(0)],
+                    first_page_offset: 0,
                     context_len: 2,
                 }],
             };

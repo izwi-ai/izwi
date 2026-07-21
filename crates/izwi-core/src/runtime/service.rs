@@ -1094,6 +1094,8 @@ impl RuntimeService {
         core_config.block_size = config.kv_page_size.max(1);
         core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
         core_config.kv_rollout = config.kv_rollout;
+        core_config.enable_prefix_caching = config.enable_prefix_caching;
+        core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
@@ -3797,7 +3799,11 @@ mod tests {
         let (spec, observation) = runtime
             .coordinator_job_for_request(&request)
             .expect("job shape");
-        let isolated_coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 1));
+        let isolated_coordinator = Arc::new(InferenceCoordinator::new(
+            runtime.backend_context().backend_kind,
+            1,
+            1,
+        ));
         let job = isolated_coordinator
             .admit_observed(spec, observation)
             .await
