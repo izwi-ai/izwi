@@ -41,6 +41,11 @@ pub mod signal_frontend;
 mod types;
 
 pub use cache::rollout::KvRolloutState;
+pub use cache::managed::{
+    ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
+    ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
+};
+pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
@@ -1400,6 +1405,13 @@ impl Engine {
     pub async fn kv_cache_stats(&self) -> KVCacheStats {
         let core = self.core.read().await;
         core.kv_cache_stats()
+    }
+
+    /// Snapshot exact managed arena backing and coordinator ownership. This is
+    /// intentionally separate from `kv_cache_stats`, whose blocks are a
+    /// legacy logical scheduling projection.
+    pub async fn managed_kv_runtime_snapshot(&self) -> ManagedKvRuntimeSnapshot {
+        self.core.read().await.managed_kv_runtime_snapshot()
     }
 
     /// Check if scheduler currently has runnable or queued work.

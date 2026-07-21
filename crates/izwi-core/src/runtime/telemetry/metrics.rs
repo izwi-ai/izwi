@@ -12,7 +12,7 @@ use crate::engine::{
     engine_metric_catalog, prometheus_engine_metric_name, prometheus_engine_metric_type,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
     EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineOutput,
-    EngineWorkspaceDomainMetricsSnapshot,
+    EngineWorkspaceDomainMetricsSnapshot, ManagedKvRuntimeSnapshot,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
@@ -81,7 +81,10 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
+    /// Legacy scheduler block projection; memory values are config estimates.
     pub kv_cache: EngineKvCacheRuntimeSnapshot,
+    /// Exact backend-owned managed arenas and transaction/page ownership.
+    pub managed_kv_cache: ManagedKvRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1182,6 +1185,28 @@ mod tests {
             None => ExecutorOutput::terminal(request_id.to_string()),
         };
         OutputProcessor::new(24_000).process(output, 1, Duration::ZERO)
+    }
+
+    #[test]
+    fn engine_snapshot_serializes_legacy_and_managed_kv_as_distinct_domains() {
+        let snapshot = EngineRuntimeTelemetrySnapshot {
+            kv_cache: EngineKvCacheRuntimeSnapshot {
+                block_accounting: "logical",
+                memory_accounting: "estimated_from_config",
+                ..EngineKvCacheRuntimeSnapshot::default()
+            },
+            managed_kv_cache: ManagedKvRuntimeSnapshot::default(),
+            ..EngineRuntimeTelemetrySnapshot::default()
+        };
+
+        let value = serde_json::to_value(snapshot).expect("serialize engine telemetry");
+        assert_eq!(value["kv_cache"]["block_accounting"], "logical");
+        assert_eq!(
+            value["managed_kv_cache"]["memory_accounting"],
+            "physical_arena_backing"
+        );
+        assert!(value["managed_kv_cache"].get("totals").is_some());
+        assert!(value["kv_cache"].get("models").is_none());
     }
 
     #[tokio::test]

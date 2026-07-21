@@ -2524,6 +2524,7 @@ impl RuntimeService {
         let queue_depth = self.core_engine.pending_requests().await as u64;
         let running_requests = self.core_engine.running_requests().await as u64;
         let kv_cache = self.core_engine.kv_cache_stats().await;
+        let managed_kv_cache = self.core_engine.managed_kv_runtime_snapshot().await;
         let stream = engine_stream_metrics_snapshot();
         let kv_cache_hits_total = kv_cache.telemetry.shared_prefix_hits;
         let kv_cache_misses_total = kv_cache.telemetry.shared_prefix_misses;
@@ -2589,6 +2590,7 @@ impl RuntimeService {
             tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
             tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
             kv_cache: kv_cache_snapshot,
+            managed_kv_cache,
         }
     }
 

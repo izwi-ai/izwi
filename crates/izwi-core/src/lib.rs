@@ -51,13 +51,16 @@ pub use engine::{
     ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
     ExecutionProfile, ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind,
     FailureScope, FinishReason, GenerationParams, HealthImpact, KVCacheManager,
-    MembershipSafePoint, ModelExecutor, ModelInstanceId, ModelSessionResult, OutputProcessor,
-    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PinnedBlockHandle,
-    PlanId, Priority, ReadyQuantum, RequestProcessor, RequestStatus, ResourceAmount,
-    ResourceEstimate, ResourceLedger, ResourceReservation, ResourceVector, RetryDisposition,
-    Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, StageDescriptor,
-    StageId, StageProgressKind, StageShapePolicy, StateDisposition, StreamingOutput,
-    TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass, YieldReason,
+    ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
+    ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
+    ManagedKvTelemetrySnapshot, MembershipSafePoint, ModelExecutor, ModelInstanceId,
+    ModelSessionResult, OutputProcessor, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
+    PhysicalBatchRowReport, PinnedBlockHandle, PlanId, Priority, ReadyQuantum, RequestProcessor,
+    RequestStatus, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
+    ResourceVector, RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch,
+    SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
+    StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass,
+    YieldReason,
 };
 
 // Legacy re-exports for backward compatibility

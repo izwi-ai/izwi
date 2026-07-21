@@ -2,7 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ManagedKvTelemetrySnapshot {
     pub transaction_commits: u64,
     pub transaction_aborts: u64,
