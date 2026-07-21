@@ -1093,7 +1093,6 @@ impl RuntimeService {
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
         core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
-        core_config.kv_rollout = config.kv_rollout;
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
 

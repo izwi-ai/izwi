@@ -14,10 +14,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::cache::managed::ManagedKvCacheManager;
-use super::cache::rollout::{
-    select_session_cache_authority, KvPlanCircuitBreaker, KvRolloutState, KvSessionCacheMode,
-};
 use super::config::EngineCoreConfig;
+#[cfg(test)]
+use super::execution::CacheMode;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
     BatchLaneKey, ConcurrencyClass, DeadlinePhase, DispatchState, ExecutionDisposition,
@@ -27,8 +26,6 @@ use super::execution::{
     OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
     StageShapePolicy, WorkCost, WorkUnit,
 };
-#[cfg(test)]
-use super::execution::CacheMode;
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
     PreparedExecutionBatch,
@@ -40,7 +37,6 @@ use super::executor::{
     StreamDeliveryFailureKind, UnifiedExecutor, WorkerConfig,
 };
 use super::kv_cache::{KVCacheConfig, KVCacheManager, KVCacheStats};
-use super::metal_kv_cache::{MetalKVCacheConfig, MetalKVCacheManager};
 use super::metrics::{
     record_engine_execution_outcome, record_engine_physical_batch,
     record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
@@ -55,61 +51,28 @@ use super::types::{
     AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
 };
 use super::{ResourceAmount, ResourceVector};
-use crate::backends::{BackendKind, BackendRouter, BackendSelectionSource};
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
-enum KvCacheBackend {
-    Standard(KVCacheManager),
-    Metal(MetalKVCacheManager),
-}
+struct KvCacheBackend(KVCacheManager);
 
 impl KvCacheBackend {
-    fn new(config: &EngineCoreConfig) -> Result<Self> {
-        let backend_context =
-            BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
-        let is_metal = backend_context.backend_kind == BackendKind::Metal;
+    fn new(config: &EngineCoreConfig) -> Self {
         // Until a managed arena is selected, these are logical scheduler
-        // blocks only. Physical bytes come from the loaded-model contract and
-        // backend-resolved plan, never from global model geometry.
+        // blocks only for unprofiled compatibility callers. Every loaded
+        // execution profile bypasses them: physical bytes come from the model
+        // contract/arena or from explicit opaque-cache resource accounting.
         let kv_config = KVCacheConfig::logical_only(config.block_size, config.max_blocks);
-
-        if is_metal {
-            let profile = backend_context.device.clone();
-            if profile.kind.is_metal() {
-                let mut metal_config = MetalKVCacheConfig::default();
-                metal_config.base_config = kv_config.clone();
-                let manager = MetalKVCacheManager::new(metal_config, profile)?;
-                return Ok(Self::Metal(manager));
-            }
-        }
-
-        Ok(Self::Standard(KVCacheManager::new(kv_config)))
+        Self(KVCacheManager::new(kv_config))
     }
 
     fn inner(&self) -> &KVCacheManager {
-        match self {
-            Self::Standard(manager) => manager,
-            Self::Metal(manager) => &manager.inner,
-        }
+        &self.0
     }
 
     fn inner_mut(&mut self) -> &mut KVCacheManager {
-        match self {
-            Self::Standard(manager) => manager,
-            Self::Metal(manager) => &mut manager.inner,
-        }
-    }
-
-    fn maintenance(&mut self) -> Result<()> {
-        if let Self::Metal(manager) = self {
-            manager.maintenance()?;
-        }
-        Ok(())
-    }
-
-    fn compact_shared_prefixes(&mut self) {
-        self.inner_mut().compact_shared_prefixes();
+        &mut self.0
     }
 
     fn stats(&self) -> KVCacheStats {
@@ -348,8 +311,6 @@ pub struct EngineCore {
     kv_cache: KvCacheBackend,
     /// Physical managed-cache arenas and transactional block tables.
     managed_kv_cache: ManagedKvCacheManager,
-    /// Affects only authority selection for new sessions.
-    managed_kv_circuit_breaker: KvPlanCircuitBreaker,
     /// Model executor
     executor: UnifiedExecutor,
     /// Output processor
@@ -384,7 +345,6 @@ pub struct EngineCore {
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
-    maintenance_steps: u64,
     /// Monotonic identity for physical dispatch envelopes.
     next_batch_id: u64,
 }
@@ -1510,7 +1470,7 @@ impl EngineCore {
         let scheduler = Scheduler::new(scheduler_config);
 
         // Create KV cache manager
-        let kv_cache = KvCacheBackend::new(&config)?;
+        let kv_cache = KvCacheBackend::new(&config);
 
         // Create output processor
         let output_processor =
@@ -1539,7 +1499,6 @@ impl EngineCore {
             scheduler,
             kv_cache,
             managed_kv_cache,
-            managed_kv_circuit_breaker: KvPlanCircuitBreaker::default(),
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -1556,7 +1515,6 @@ impl EngineCore {
             execution_retry_attempts: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
             initialized: false,
-            maintenance_steps: 0,
             next_batch_id: 1,
         })
     }
@@ -1605,47 +1563,24 @@ impl EngineCore {
 
         if let Some(model_instance) = request.model_instance_id() {
             let capability = request.cache_capability().clone();
-            let mut resolved_runtime = None;
-            let negotiated = if capability.managed_contract().is_some()
-                && matches!(
-                    self.config.kv_rollout,
-                    KvRolloutState::ArenaOptIn
-                        | KvRolloutState::Auto
-                        | KvRolloutState::ArenaRequired
-                ) {
+            if capability.managed_contract().is_some() {
                 let managed_backend = self.managed_kv_cache.worker_backend();
-                match self.managed_kv_cache.bind_request(
-                    model_instance,
-                    managed_backend,
-                    self.config.max_blocks,
-                    self.config.block_size,
-                    &capability,
-                ) {
-                    Ok(Some(runtime)) => {
-                        let fingerprint = runtime.plan().fingerprint();
-                        resolved_runtime = Some(runtime);
-                        Ok(fingerprint)
-                    }
-                    Ok(None) => Err("loaded adapter did not resolve a managed runtime".to_string()),
-                    Err(error) => Err(error.to_string()),
-                }
-            } else {
-                Err("managed KV rollout is disabled for this session".to_string())
-            };
-            let authority = select_session_cache_authority(
-                model_instance,
-                self.config.kv_rollout,
-                &capability,
-                negotiated,
-                &self.managed_kv_circuit_breaker,
-            )
-            .map_err(|error| Error::InvalidInput(error.to_string()))?;
-            if matches!(authority.mode, KvSessionCacheMode::Managed { .. }) {
-                request.install_managed_cache_runtime(resolved_runtime.ok_or_else(|| {
-                    Error::InferenceError(
-                        "managed KV authority was selected without a resolved runtime".to_string(),
-                    )
-                })?)?;
+                let runtime = self
+                    .managed_kv_cache
+                    .bind_request(
+                        model_instance,
+                        managed_backend,
+                        self.config.max_blocks,
+                        self.config.block_size,
+                        &capability,
+                    )?
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "loaded adapter published managed KV without a resolved runtime"
+                                .to_string(),
+                        )
+                    })?;
+                request.install_managed_cache_runtime(runtime)?;
             }
         }
 
@@ -2110,11 +2045,6 @@ impl EngineCore {
 
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
-        self.kv_cache.maintenance()?;
-        self.maintenance_steps = self.maintenance_steps.saturating_add(1);
-        if self.maintenance_steps % 64 == 0 {
-            self.kv_cache.compact_shared_prefixes();
-        }
         self.reconcile_due_cleanup().await;
         let schedule_result = self.scheduler.schedule(self.kv_cache.inner_mut());
 
@@ -3491,7 +3421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_step_clears_executor_state_for_recompute_preemption() {
+    async fn exact_recompute_preemption_cleanup_clears_executor_state() {
         let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
         let executor =
             UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(cleanup_calls.clone())));
@@ -3518,12 +3448,18 @@ mod tests {
         core.add_request(low).unwrap();
         let _ = core.step().await.unwrap();
 
-        let mut high = EngineCoreRequest::tts("high-priority");
-        high.id = "high-priority".to_string();
-        high.prompt_tokens = vec![1];
-        high.priority = Priority::High;
-        core.add_request(high).unwrap();
-        let _ = core.step().await.unwrap();
+        let low_id = "low-priority".to_string();
+        let session = core
+            .scheduler
+            .prepare_preemption_for_test(&low_id)
+            .expect("running low-priority session");
+        let release = core.executor.cleanup_session(&session).await;
+        assert!(release.confirmed);
+        assert!(core
+            .scheduler
+            .confirm_preemption(&session, core.kv_cache.inner_mut()));
+        core.request_managed_session_release(&session);
+        core.clear_exact_execution_state(&session);
 
         let calls = cleanup_calls.lock().unwrap().clone();
         assert!(
@@ -3531,9 +3467,11 @@ mod tests {
             "recompute preemption must clear stale executor decode state"
         );
         assert_eq!(
-            core.get_request_status(&"low-priority".to_string()),
+            core.get_request_status(&low_id),
             Some(RequestStatus::Running)
         );
+        assert_eq!(core.scheduler.get_running_info(&low_id), Some((0, 0)));
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
     }
 
     #[tokio::test]
@@ -3773,7 +3711,7 @@ mod tests {
             .filter(|event| event.starts_with("cleanup:cleanup-fence:"))
             .count();
         assert!(cleanup_attempts >= 2, "cleanup was not retried");
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(core.add_request(request).is_err());
     }
 
@@ -3803,7 +3741,7 @@ mod tests {
         aborted.prompt_tokens = vec![1];
         core.add_request(aborted.clone()).unwrap();
         core.step().await.unwrap();
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
 
         let aborted_session = core.get_session_key(&aborted.id).unwrap();
         assert!(core.abort_request_session(&aborted_session).await);
@@ -4969,10 +4907,8 @@ mod tests {
             .remove(0);
         assert_eq!(scheduled.num_computed_tokens, 0);
         assert_eq!(scheduled.num_tokens, 16);
-        assert_eq!(
-            scheduled.block_ids.len(),
-            core.kv_cache.inner().blocks_for_tokens(16)
-        );
+        assert!(scheduled.block_ids.is_empty());
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         let mut partial = scheduled.clone();
         partial.num_tokens = 4;
         assert!(core.begin_execution_plan(&partial).await.is_err());
@@ -5322,7 +5258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconfirmed_deadline_cleanup_quarantines_scarce_logical_block() {
+    async fn unconfirmed_deadline_cleanup_fences_id_without_blocking_unrelated_work() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let executor = UnifiedExecutor::new_for_test(Box::new(DeadlineCleanupExecutor::new(
             events.clone(),
@@ -5345,18 +5281,18 @@ mod tests {
         )
         .unwrap();
 
-        let mut expired = EngineCoreRequest::tts("owns the only block");
+        let mut expired = EngineCoreRequest::tts("expires with model-owned state");
         expired.id = "expired-running".to_string();
         expired.prompt_tokens = vec![1];
         core.add_request(expired).unwrap();
         core.step().await.unwrap();
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(core.scheduler.set_hard_deadline_for_test(
             &"expired-running".to_string(),
             Instant::now() - std::time::Duration::from_millis(1),
         ));
 
-        let mut waiting = EngineCoreRequest::tts("waits for capacity");
+        let mut waiting = EngineCoreRequest::tts("independent work");
         waiting.id = "waiting".to_string();
         waiting.prompt_tokens = vec![1];
         core.add_request(waiting).unwrap();
@@ -5366,14 +5302,12 @@ mod tests {
             output.request_id == "expired-running"
                 && output.error.as_deref() == Some(REQUEST_DEADLINE_EXCEEDED)
         }));
-        assert_eq!(core.kv_cache_stats().allocated_blocks, 1);
-        assert_eq!(core.pending_request_count(), 1);
-        assert!(core.step().await.unwrap().is_empty());
+        assert_eq!(core.kv_cache_stats().allocated_blocks, 0);
         assert!(events
             .lock()
             .unwrap()
             .iter()
-            .all(|event| event != "execute-prefill:waiting"));
+            .any(|event| event == "execute-prefill:waiting"));
 
         let mut reused = EngineCoreRequest::tts("must remain fenced");
         reused.id = "expired-running".to_string();
@@ -5425,7 +5359,6 @@ mod tests {
                 block_size: 16,
                 max_blocks: 4,
                 backend: BackendKind::Cpu,
-                kv_rollout: KvRolloutState::ArenaOptIn,
                 ..Default::default()
             },
             executor,
@@ -5479,7 +5412,6 @@ mod tests {
                 max_blocks: 1,
                 max_batch_size: 1,
                 backend: BackendKind::Cpu,
-                kv_rollout: KvRolloutState::ArenaOptIn,
                 ..Default::default()
             },
             executor,
@@ -5550,62 +5482,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_shadow_rollout_do_not_allocate_or_switch_cache_authority() {
-        for rollout in [KvRolloutState::Legacy, KvRolloutState::ArenaShadow] {
-            let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
-            let mut core = EngineCore::new_with_unified_executor(
-                EngineCoreConfig {
-                    backend: BackendKind::Cpu,
-                    kv_rollout: rollout,
-                    ..Default::default()
-                },
-                executor,
-            )
-            .unwrap();
-            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
-                role: ChatRole::User,
-                content: "rollout".to_string(),
-            }])
-            .with_model_variant(ModelVariant::Qwen306B);
-            request.id = format!("rollout-{rollout:?}");
-            request
-                .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None)
-                .unwrap();
-            request
-                .bind_model_instance(ModelInstanceId::new(42))
-                .unwrap();
-            request
-                .bind_cache_capability(crate::kv::CacheCapability::Managed(
-                    crate::kv::test_contract(),
-                ))
-                .unwrap();
-
-            core.add_request(request).unwrap();
-            assert_eq!(core.managed_kv_cache.model_count(), 0);
-            assert!(core
-                .requests
-                .values()
-                .next()
-                .unwrap()
-                .managed_cache_runtime()
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn required_rollout_rejects_an_opaque_loaded_adapter() {
+    fn opaque_loaded_adapter_does_not_allocate_managed_cache() {
         let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
-        let mut core = EngineCore::new_with_unified_executor(
-            EngineCoreConfig {
-                kv_rollout: KvRolloutState::ArenaRequired,
-                ..Default::default()
-            },
-            executor,
-        )
-        .unwrap();
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
         let mut request = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
-            content: "required".to_string(),
+            content: "opaque".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
         request
@@ -5615,8 +5498,48 @@ mod tests {
             .bind_model_instance(ModelInstanceId::new(43))
             .unwrap();
 
+        core.add_request(request).unwrap();
+        assert_eq!(core.managed_kv_cache.model_count(), 0);
+        assert!(core
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .managed_cache_runtime()
+            .is_none());
+    }
+
+    #[test]
+    fn managed_loaded_adapter_cannot_fall_back_after_failed_negotiation() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_blocks: 0,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "managed".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1], None)
+            .unwrap();
+        request
+            .bind_model_instance(ModelInstanceId::new(44))
+            .unwrap();
+        request
+            .bind_cache_capability(crate::kv::CacheCapability::Managed(
+                crate::kv::test_contract(),
+            ))
+            .unwrap();
+
         let error = core.add_request(request).unwrap_err();
-        assert!(error.to_string().contains("managed KV cache is required"));
+        assert!(error.to_string().contains("capacity"));
+        assert!(core.requests.is_empty());
         assert_eq!(core.managed_kv_cache.model_count(), 0);
     }
 

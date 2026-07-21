@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::{BackendPreference, BackendRouter};
-use crate::engine::KvRolloutState;
 
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,17 +40,13 @@ pub struct EngineConfig {
     #[serde(default = "default_num_threads")]
     pub num_threads: usize,
 
-    /// Physical KV-cache rollout policy. Defaults to legacy model-owned cache.
-    #[serde(default)]
-    pub kv_rollout: KvRolloutState,
-
-    /// Enable committed managed-prefix reuse. An explicit salt is also
-    /// required, so enabling this flag alone cannot share pages.
-    #[serde(default)]
+    /// Enable committed managed-prefix reuse.
+    #[serde(default = "default_enable_prefix_caching")]
     pub enable_prefix_caching: bool,
 
     /// Deployment/tenant namespace salt for managed physical prefix pages.
-    #[serde(default)]
+    /// A process-local default namespace is used when no override is supplied.
+    #[serde(default = "default_managed_prefix_cache_salt")]
     pub managed_prefix_cache_salt: Option<String>,
 }
 
@@ -66,11 +61,22 @@ impl Default for EngineConfig {
             kv_page_size: default_kv_page_size(),
             backend: default_backend_preference(),
             num_threads: default_num_threads(),
-            kv_rollout: KvRolloutState::Legacy,
-            enable_prefix_caching: false,
-            managed_prefix_cache_salt: None,
+            enable_prefix_caching: default_enable_prefix_caching(),
+            managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
         }
     }
+}
+
+fn default_enable_prefix_caching() -> bool {
+    true
+}
+
+fn default_managed_prefix_cache_salt() -> Option<String> {
+    let configured = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Some(configured.unwrap_or_else(|| "izwi-managed-prefix-v1".to_string()))
 }
 
 fn default_models_dir() -> PathBuf {
@@ -282,4 +288,19 @@ fn get_num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4)
+}
+
+#[cfg(test)]
+mod managed_kv_default_tests {
+    use super::EngineConfig;
+
+    #[test]
+    fn managed_prefix_reuse_is_enabled_for_normal_runtime_config() {
+        let config = EngineConfig::default();
+        assert!(config.enable_prefix_caching);
+        assert!(config
+            .managed_prefix_cache_salt
+            .as_deref()
+            .is_some_and(|salt| !salt.is_empty()));
+    }
 }

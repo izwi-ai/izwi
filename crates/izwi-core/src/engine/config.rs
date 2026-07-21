@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use super::cache::rollout::KvRolloutState;
 use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
 
@@ -43,14 +42,12 @@ pub struct EngineCoreConfig {
     pub scheduling_policy: SchedulingPolicy,
 
     /// Enable prefix reuse only for executor-backed physical cache snapshots.
-    #[serde(default)]
+    #[serde(default = "default_enable_prefix_caching")]
     pub enable_prefix_caching: bool,
 
-    /// Explicit namespace salt for managed physical-prefix reuse. Managed
-    /// prefix reuse remains disabled unless both this value and
-    /// `enable_prefix_caching` are set, preventing accidental cross-tenant
-    /// sharing in automatic arena rollout.
-    #[serde(default)]
+    /// Namespace salt for managed physical-prefix reuse. The default enables
+    /// process-local reuse; deployments can override it to isolate namespaces.
+    #[serde(default = "default_managed_prefix_cache_salt")]
     pub managed_prefix_cache_salt: Option<String>,
 
     /// Enable chunked prefill for long prompts
@@ -137,12 +134,6 @@ pub struct EngineCoreConfig {
     /// Enable KV residency tiering hints during scheduling.
     #[serde(default = "default_enable_kv_tiering")]
     pub enable_kv_tiering: bool,
-
-    /// Pre-session authority policy for backend-owned physical KV arenas.
-    /// Legacy is the fail-closed default; a session never changes authority
-    /// after admission.
-    #[serde(default)]
-    pub kv_rollout: KvRolloutState,
 }
 
 fn default_models_dir() -> PathBuf {
@@ -261,6 +252,16 @@ fn default_max_decode_tokens_per_request() -> usize {
 fn default_enable_kv_tiering() -> bool {
     false
 }
+fn default_enable_prefix_caching() -> bool {
+    true
+}
+fn default_managed_prefix_cache_salt() -> Option<String> {
+    let configured = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Some(configured.unwrap_or_else(|| "izwi-managed-prefix-v1".to_string()))
+}
 
 impl Default for EngineCoreConfig {
     fn default() -> Self {
@@ -273,8 +274,8 @@ impl Default for EngineCoreConfig {
             kv_cache_dtype: default_kv_cache_dtype(),
             max_blocks: default_max_blocks(),
             scheduling_policy: SchedulingPolicy::default(),
-            enable_prefix_caching: false,
-            managed_prefix_cache_salt: None,
+            enable_prefix_caching: default_enable_prefix_caching(),
+            managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             enable_chunked_prefill: default_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
@@ -299,7 +300,6 @@ impl Default for EngineCoreConfig {
             enable_decode_quanta: default_enable_decode_quanta(),
             max_decode_tokens_per_request: default_max_decode_tokens_per_request(),
             enable_kv_tiering: default_enable_kv_tiering(),
-            kv_rollout: KvRolloutState::Legacy,
         }
     }
 }
@@ -322,5 +322,20 @@ impl EngineCoreConfig {
     /// caches are authorized and observed by the loaded executor instead.
     pub fn kv_cache_memory_bytes(&self) -> usize {
         0
+    }
+}
+
+#[cfg(test)]
+mod managed_kv_default_tests {
+    use super::EngineCoreConfig;
+
+    #[test]
+    fn managed_prefix_reuse_is_enabled_by_default() {
+        let config = EngineCoreConfig::default();
+        assert!(config.enable_prefix_caching);
+        assert!(config
+            .managed_prefix_cache_salt
+            .as_deref()
+            .is_some_and(|salt| !salt.is_empty()));
     }
 }

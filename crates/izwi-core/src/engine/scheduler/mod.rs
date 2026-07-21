@@ -117,7 +117,7 @@ impl Default for SchedulerConfig {
             max_tokens_per_step: 384,
             policy: SchedulingPolicy::FCFS,
             enable_chunked_prefill: false,
-            enable_prefix_caching: false,
+            enable_prefix_caching: true,
             chunked_prefill_threshold: 192,
             enable_preemption: false,
             enable_vad_preemption: true,
@@ -455,6 +455,18 @@ impl RequestCachePolicy {
     fn has_external_physical_cache(&self) -> bool {
         self.mode == Some(CacheMode::ExternalPaged)
     }
+
+    /// Whether the loaded execution profile has established a real cache
+    /// authority outside the scheduler's legacy logical block projection.
+    ///
+    /// Managed rows use backend arenas, opaque rows retain model-owned tensors,
+    /// and cacheless rows retain no KV state. None of those modes may allocate
+    /// fake scheduler BlockIds. `None` is kept as the legacy/unprofiled state so
+    /// old isolated scheduler callers remain fail-compatible until the profile
+    /// refresh performed by EngineCore.
+    fn bypasses_legacy_logical_cache(&self) -> bool {
+        self.mode.is_some()
+    }
 }
 
 /// State for a running request.
@@ -699,7 +711,7 @@ impl Scheduler {
                     metadata.workload_class,
                     overdue_ms,
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
-                    metadata.cache_policy.has_external_physical_cache(),
+                    metadata.cache_policy.bypasses_legacy_logical_cache(),
                 ))
             })
             .collect();
@@ -775,7 +787,7 @@ impl Scheduler {
             workload_class,
             overdue_ms,
             continuous_decode,
-            external_physical_cache,
+            bypasses_legacy_logical_cache,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -811,11 +823,11 @@ impl Scheduler {
                 continue;
             }
 
-            if external_physical_cache {
-                // This is a tentative scheduling decision. The managed
-                // coordinator reserves the exact generational page table
-                // during physical batch formation, so legacy BlockIds must
-                // remain empty and cannot become a second cache authority.
+            if bypasses_legacy_logical_cache {
+                // Cache ownership belongs to the selected execution profile:
+                // managed coordinators reserve physical pages later, opaque
+                // adapters retain their own tensors, and cacheless rows retain
+                // nothing. Legacy BlockIds cannot become a second authority.
                 debug_assert!(block_ids.is_empty());
                 if let Some(running) = self.running.get_mut(&request_id) {
                     running.paused = false;
@@ -1045,7 +1057,7 @@ impl Scheduler {
             let mut selected_blocks = None;
             let mut fresh_allocated_blocks = 0usize;
 
-            if metadata.cache_policy.has_external_physical_cache() {
+            if metadata.cache_policy.bypasses_legacy_logical_cache() {
                 debug_assert_eq!(existing_blocks, 0);
                 selected_blocks = Some(Vec::new());
             }
@@ -1232,7 +1244,7 @@ impl Scheduler {
             let mut selected = None;
             let mut fresh_allocated_blocks = 0usize;
 
-            if metadata.cache_policy.has_external_physical_cache() {
+            if metadata.cache_policy.bypasses_legacy_logical_cache() {
                 selected = Some(Vec::new());
             }
 
@@ -1796,6 +1808,18 @@ impl Scheduler {
         };
         metadata.hard_deadline = Some(deadline);
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_preemption_for_test(
+        &mut self,
+        request_id: &RequestId,
+    ) -> Option<SessionKey> {
+        let running = self.running.get_mut(request_id)?;
+        running.prefill_in_flight = false;
+        running.paused = true;
+        running.preemption_pending = true;
+        Some(SessionKey::new(request_id.clone(), running.sequence_id))
     }
 
     // Helper methods
@@ -2451,8 +2475,11 @@ impl Scheduler {
             return false;
         }
 
-        let freed = kv_cache.free_for_preemption(&session.request_id);
-        debug_assert!(freed > 0, "confirmed preemption reclaimed no blocks");
+        // Profiled requests have no scheduler BlockIds: managed pages or
+        // model-owned tensors were already released by the executor before
+        // this metadata commit. Unprofiled compatibility callers may still
+        // contribute legacy blocks here.
+        kv_cache.free_for_preemption(&session.request_id);
         running.block_ids.clear();
         running.num_tokens_processed = 0;
         running.num_tokens_generated = 0;
@@ -2583,6 +2610,12 @@ mod tests {
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
     }
 
+    fn prepare_exact_session_preemption(scheduler: &mut Scheduler, request_id: &str) -> SessionKey {
+        scheduler
+            .prepare_preemption_for_test(&request_id.to_string())
+            .expect("running preemption fixture")
+    }
+
     fn allow_external_prefix_reuse(scheduler: &mut Scheduler, request_id: &str) {
         let epoch = scheduler
             .get_sequence_id(&request_id.to_string())
@@ -2662,9 +2695,10 @@ mod tests {
 
         let scheduled = scheduler.schedule(&mut kv_cache);
         let session = scheduled.prefill_requests[0].session_key();
+        assert!(scheduled.prefill_requests[0].block_ids.is_empty());
         scheduler.update_after_step(&request_id, 4, 2, Vec::new(), 1.0);
         let metadata_before = scheduler.requests[&request_id].clone();
-        assert!(kv_cache.get_block_table(&request_id).is_some());
+        assert!(kv_cache.get_block_table(&request_id).is_none());
 
         assert!(scheduler.restart_request_for_recompute(&session, &mut kv_cache));
 
@@ -2714,6 +2748,7 @@ mod tests {
         assert_eq!(restarted.prefill_requests.len(), 1);
         assert_eq!(restarted.prefill_requests[0].session_key(), session);
         assert_eq!(restarted.prefill_requests[0].num_computed_tokens, 0);
+        assert!(restarted.prefill_requests[0].block_ids.is_empty());
     }
 
     #[test]
@@ -3021,42 +3056,36 @@ mod tests {
                 "expected initial prefill for {task_type:?}"
             );
             assert_eq!(first.prefill_requests[0].request_id, low_id);
+            assert!(first.prefill_requests[0].block_ids.is_empty());
             scheduler.update_after_step(&low_id, 1, 0, Vec::new(), 1.0);
 
             let high = build_request(task_type, &high_id, Priority::High);
             scheduler.add_request(&high);
-
-            let second = scheduler.schedule(&mut kv_cache);
-            assert!(
-                second
-                    .preempted_requests
-                    .iter()
-                    .any(|session| session.request_id == low_id),
-                "expected low-priority {task_type:?} request to be preempted"
-            );
+            allow_recompute(&mut scheduler, &high_id);
+            let preempted = prepare_exact_session_preemption(&mut scheduler, &low_id);
             assert_eq!(
                 scheduler.get_status(&low_id),
                 Some(RequestStatus::Running),
                 "preempted {task_type:?} request should remain tracked for resume"
             );
+
+            // With no fake logical capacity dependency, the higher-priority
+            // request can be admitted while physical cleanup is confirmed.
+            let second = scheduler.schedule(&mut kv_cache);
             assert_eq!(
-                scheduler.get_status(&high_id),
-                Some(RequestStatus::Waiting),
-                "high-priority {task_type:?} request must wait for physical cleanup"
+                second.prefill_requests.len(),
+                1,
+                "high-priority {task_type:?} request should not wait on fake blocks"
             );
-
-            let preempted = second
-                .preempted_requests
-                .iter()
-                .find(|session| session.request_id == low_id)
-                .unwrap();
-            assert!(scheduler.confirm_preemption(preempted, &mut kv_cache));
-
-            let third = scheduler.schedule(&mut kv_cache);
-            assert_eq!(third.prefill_requests.len(), 1);
-            assert_eq!(third.prefill_requests[0].request_id, high_id);
+            assert_eq!(second.prefill_requests[0].request_id, high_id);
+            assert!(second.prefill_requests[0].block_ids.is_empty());
+            assert!(scheduler.confirm_preemption(&preempted, &mut kv_cache));
+            scheduler.update_after_step(&high_id, 1, 0, Vec::new(), 1.0);
             scheduler.finish_request(&high_id, &mut kv_cache);
 
+            // The confirmation installs a one-cycle resume fence so the work
+            // that caused preemption retains its committed scheduling turn.
+            assert!(!scheduler.schedule(&mut kv_cache).has_execution_work());
             let fourth = scheduler.schedule(&mut kv_cache);
             assert_eq!(
                 fourth.prefill_requests.len(),
@@ -3070,34 +3099,29 @@ mod tests {
     }
 
     #[test]
-    fn preemption_does_not_reuse_blocks_before_exact_cleanup_confirmation() {
+    fn preemption_requires_exact_cleanup_confirmation_without_logical_blocks() {
         let (mut scheduler, mut kv_cache) = tiny_preemption_scheduler();
         let low = build_request(TaskType::Chat, "preempt-low", Priority::Low);
         assert!(scheduler.add_request(&low));
         allow_recompute(&mut scheduler, &low.id);
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        let initial = scheduler.schedule(&mut kv_cache);
+        assert_eq!(initial.prefill_requests.len(), 1);
+        assert!(initial.prefill_requests[0].block_ids.is_empty());
         scheduler.update_after_step(&low.id, 1, 0, Vec::new(), 1.0);
-        let allocated_before = kv_cache.stats().allocated_blocks;
+        let victim = prepare_exact_session_preemption(&mut scheduler, &low.id);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
 
-        let high = build_request(TaskType::Chat, "preempt-high", Priority::High);
-        assert!(scheduler.add_request(&high));
-        let prepared = scheduler.schedule(&mut kv_cache);
-        let victim = prepared.preempted_requests[0].clone();
-        assert_eq!(scheduler.get_status(&high.id), Some(RequestStatus::Waiting));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
-
-        let still_blocked = scheduler.schedule(&mut kv_cache);
-        assert!(!still_blocked.has_execution_work());
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
         let stale = SessionKey::new(victim.request_id.clone(), victim.epoch + 1);
         assert!(!scheduler.confirm_preemption(&stale, &mut kv_cache));
-        assert_eq!(kv_cache.stats().allocated_blocks, allocated_before);
+        assert!(scheduler.running[&low.id].preemption_pending);
+        assert_eq!(scheduler.running[&low.id].num_tokens_processed, 1);
 
         assert!(scheduler.confirm_preemption(&victim, &mut kv_cache));
         assert_eq!(kv_cache.stats().allocated_blocks, 0);
-        let admitted = scheduler.schedule(&mut kv_cache);
-        assert_eq!(admitted.prefill_requests.len(), 1);
-        assert_eq!(admitted.prefill_requests[0].request_id, high.id);
+        let running = &scheduler.running[&low.id];
+        assert!(!running.preemption_pending);
+        assert_eq!(running.num_tokens_processed, 0);
+        assert!(running.block_ids.is_empty());
     }
 
     #[test]
@@ -3106,13 +3130,11 @@ mod tests {
         let low = build_request(TaskType::Chat, "rejected-preempt", Priority::Low);
         assert!(scheduler.add_request(&low));
         allow_recompute(&mut scheduler, &low.id);
-        assert_eq!(scheduler.schedule(&mut kv_cache).prefill_requests.len(), 1);
+        let initial = scheduler.schedule(&mut kv_cache);
+        assert_eq!(initial.prefill_requests.len(), 1);
+        assert!(initial.prefill_requests[0].block_ids.is_empty());
         scheduler.update_after_step(&low.id, 1, 0, Vec::new(), 1.0);
-
-        let high = build_request(TaskType::Chat, "preemptor", Priority::High);
-        assert!(scheduler.add_request(&high));
-        let prepared = scheduler.schedule(&mut kv_cache);
-        let victim = prepared.preempted_requests[0].clone();
+        let victim = prepare_exact_session_preemption(&mut scheduler, &low.id);
         assert!(scheduler
             .running
             .get(&victim.request_id)
@@ -3415,7 +3437,7 @@ mod tests {
     }
 
     #[test]
-    fn full_prefill_profile_schedules_the_entire_prompt_and_logical_cache() {
+    fn full_prefill_profile_schedules_the_entire_prompt_without_logical_cache() {
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 4,
@@ -3454,8 +3476,9 @@ mod tests {
         assert_eq!(scheduled.prefill_requests.len(), 1);
         assert_eq!(scheduled.prefill_requests[0].session_key(), session);
         assert_eq!(scheduled.prefill_requests[0].num_tokens, 8);
-        assert_eq!(scheduled.prefill_requests[0].block_ids.len(), 2);
-        assert_eq!(scheduled.blocks_allocated, 2);
+        assert!(scheduled.prefill_requests[0].block_ids.is_empty());
+        assert_eq!(scheduled.blocks_allocated, 0);
+        assert_eq!(kv_cache.stats().allocated_blocks, 0);
         assert_eq!(scheduled.total_tokens, 8);
         assert_eq!(
             scheduled.prefill_requests[0].work,
@@ -3591,6 +3614,46 @@ mod tests {
         assert_eq!(decode.blocks_allocated, 0);
         assert_eq!(kv_cache.stats().allocated_blocks, 0);
         assert!(kv_cache.get_block_table(&request_id).is_none());
+    }
+
+    #[test]
+    fn opaque_and_cacheless_sequences_never_allocate_legacy_blocks() {
+        for (suffix, cache_mode) in [
+            ("opaque", CacheMode::OpaqueModelOwned),
+            ("cacheless", CacheMode::None),
+        ] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            });
+            let mut kv_cache = KVCacheManager::new(super::super::kv_cache::KVCacheConfig {
+                max_blocks: 1,
+                block_size: 1,
+                ..Default::default()
+            });
+            let request_id = format!("{suffix}-no-logical-kv");
+            let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+            assert!(scheduler.add_request(&request));
+            let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+            let session = SessionKey::new(request_id.clone(), epoch);
+            let mut profile =
+                ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+            profile.cache_mode = cache_mode;
+            assert!(scheduler.update_execution_profile(&session, &profile));
+
+            let prefill = scheduler.schedule(&mut kv_cache);
+            assert_eq!(prefill.prefill_requests.len(), 1);
+            assert!(prefill.prefill_requests[0].block_ids.is_empty());
+            scheduler.update_after_step(&request_id, 1, 0, Vec::new(), 1.0);
+
+            let decode = scheduler.schedule(&mut kv_cache);
+            assert_eq!(decode.decode_requests.len(), 1);
+            assert!(decode.decode_requests[0].block_ids.is_empty());
+            assert_eq!(kv_cache.stats().allocated_blocks, 0);
+            assert!(kv_cache.get_block_table(&request_id).is_none());
+        }
     }
 
     #[test]

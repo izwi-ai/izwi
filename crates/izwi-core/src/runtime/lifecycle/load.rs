@@ -27,25 +27,6 @@ fn now_unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn managed_cache_activation_enabled(
-    backend: BackendKind,
-    rollout: crate::engine::KvRolloutState,
-) -> bool {
-    if !managed_kv_backend_compiled(backend) {
-        return false;
-    }
-    match rollout {
-        crate::engine::KvRolloutState::ArenaOptIn
-        | crate::engine::KvRolloutState::ArenaRequired => true,
-        // CPU has completed the production parity gates. Accelerator kernels
-        // remain explicit opt-ins until their hardware performance/fencing
-        // gates pass; merely compiling a direct kernel must not promote Auto.
-        crate::engine::KvRolloutState::Auto => backend == BackendKind::Cpu,
-        crate::engine::KvRolloutState::Legacy
-        | crate::engine::KvRolloutState::ArenaShadow => false,
-    }
-}
-
 fn select_lru_eviction_candidate(
     resident_variants: &[ModelVariant],
     requested_variant: ModelVariant,
@@ -338,29 +319,25 @@ impl ModelLifecycleController {
             // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
             self.publish_loaded_model(instantiated).await?;
-            let cache_activation = if managed_cache_activation_enabled(
-                self.backend_router.context().backend_kind,
-                self.config.kv_rollout,
-            ) {
-                match self.model_registry.get_chat(variant).await {
-                    Some(loaded) => {
-                        let loaded_cache = loaded.loaded_kv_cache_capability()?;
-                        if matches!(
-                            loaded_cache.capability,
-                            crate::kv::CacheCapability::Managed(_)
-                        ) {
-                            Some(LoadedCacheActivation::new(
-                                CapabilityKind::Chat,
-                                loaded_cache,
-                            )?)
-                        } else {
-                            None
-                        }
+            let backend = self.backend_router.context().backend_kind;
+            let cache_activation = match self.model_registry.get_chat(variant).await {
+                Some(loaded) => {
+                    let loaded_cache = loaded.loaded_kv_cache_capability()?;
+                    if matches!(
+                        &loaded_cache.capability,
+                        crate::kv::CacheCapability::Managed(_)
+                    ) && !managed_kv_backend_compiled(backend)
+                    {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
+                        )));
                     }
-                    None => None,
+                    Some(LoadedCacheActivation::new(
+                        CapabilityKind::Chat,
+                        loaded_cache,
+                    )?)
                 }
-            } else {
-                None
+                None => None,
             };
             self.bind_loaded_model_bundle_with_cache_capability(
                 variant,
@@ -501,10 +478,10 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        managed_cache_activation_enabled, model_load_capacity_is_guarded, model_memory_estimate,
-        model_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
-        ModelMemoryEstimate,
+        model_load_capacity_is_guarded, model_memory_estimate, model_resource_plan,
+        residency_budget_has_capacity, select_lru_eviction_candidate, ModelMemoryEstimate,
     };
+    use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
     use crate::config::EngineConfig;
     use crate::engine::{
@@ -526,34 +503,15 @@ mod tests {
 
     #[test]
     fn managed_cache_activation_tracks_compiled_direct_kernels() {
-        use crate::engine::KvRolloutState;
-
-        assert!(managed_cache_activation_enabled(
-            BackendKind::Cpu,
-            KvRolloutState::Auto
-        ));
+        assert!(managed_kv_backend_compiled(BackendKind::Cpu));
         assert_eq!(
-            managed_cache_activation_enabled(BackendKind::Metal, KvRolloutState::Auto),
-            false
-        );
-        assert_eq!(
-            managed_cache_activation_enabled(BackendKind::Cuda, KvRolloutState::Auto),
-            false
-        );
-        assert_eq!(
-            managed_cache_activation_enabled(BackendKind::Metal, KvRolloutState::ArenaOptIn),
+            managed_kv_backend_compiled(BackendKind::Metal),
             cfg!(feature = "metal")
         );
         assert_eq!(
-            managed_cache_activation_enabled(BackendKind::Cuda, KvRolloutState::ArenaRequired),
+            managed_kv_backend_compiled(BackendKind::Cuda),
             cfg!(feature = "flash-attn")
         );
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            assert!(!managed_cache_activation_enabled(
-                backend,
-                KvRolloutState::ArenaShadow
-            ));
-        }
     }
 
     fn one_byte_host_reservation() -> ResourceVector {

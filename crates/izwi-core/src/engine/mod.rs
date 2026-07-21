@@ -31,7 +31,6 @@ pub mod execution;
 mod execution_group;
 mod executor;
 mod kv_cache;
-mod metal_kv_cache;
 pub mod metrics;
 mod output;
 mod request;
@@ -40,7 +39,6 @@ mod scheduler;
 pub mod signal_frontend;
 mod types;
 
-pub use cache::rollout::KvRolloutState;
 pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
     ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
