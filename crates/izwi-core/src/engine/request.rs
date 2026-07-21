@@ -772,6 +772,11 @@ pub struct EngineCoreRequest {
     /// Exact loaded capability adapter selected by the runtime. Direct engine
     /// callers without a lifecycle bundle remain on compatibility dispatch.
     pub(super) execution_adapter_binding: Option<super::ExecutionAdapterBinding>,
+    /// Cache truth published by the exact loaded adapter. The core resolves a
+    /// managed contract into backend-owned arenas before scheduler execution.
+    pub(super) cache_capability: crate::kv::CacheCapability,
+    /// Immutable model-level physical KV runtime installed by the engine.
+    pub(super) managed_cache_runtime: Option<Arc<super::cache::managed::ManagedKvModelRuntime>>,
     /// Request-specific shape/workspace facts produced by the exact loaded
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
@@ -2054,6 +2059,8 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
@@ -2101,6 +2108,8 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
             text: None,
@@ -2148,6 +2157,8 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
             text: None,
@@ -2192,6 +2203,8 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
             text: None,
@@ -2237,6 +2250,8 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
             text: None,
@@ -2282,6 +2297,8 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
+            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
             text: None,
@@ -2372,6 +2389,54 @@ impl EngineCoreRequest {
 
     pub(crate) fn execution_adapter_binding(&self) -> Option<&super::ExecutionAdapterBinding> {
         self.execution_adapter_binding.as_ref()
+    }
+
+    pub(crate) fn bind_cache_capability(
+        &mut self,
+        capability: crate::kv::CacheCapability,
+    ) -> Result<()> {
+        capability.validate()?;
+        if self.cache_capability != crate::kv::CacheCapability::OpaqueModelOwned
+            && self.cache_capability != capability
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different cache contract".to_string(),
+            ));
+        }
+        self.cache_capability = capability;
+        Ok(())
+    }
+
+    pub(crate) fn cache_capability(&self) -> &crate::kv::CacheCapability {
+        &self.cache_capability
+    }
+
+    pub(crate) fn install_managed_cache_runtime(
+        &mut self,
+        runtime: Arc<super::cache::managed::ManagedKvModelRuntime>,
+    ) -> Result<()> {
+        if self.model_instance_id != Some(runtime.plan().model_instance) {
+            return Err(Error::InvalidInput(
+                "managed-cache runtime does not match the request model instance".to_string(),
+            ));
+        }
+        if self
+            .managed_cache_runtime
+            .as_ref()
+            .is_some_and(|current| current.plan().id != runtime.plan().id)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different managed-cache plan".to_string(),
+            ));
+        }
+        self.managed_cache_runtime = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn managed_cache_runtime(
+        &self,
+    ) -> Option<&Arc<super::cache::managed::ManagedKvModelRuntime>> {
+        self.managed_cache_runtime.as_ref()
     }
 
     fn validate_prepared_stage_costs(&self) -> Result<()> {
@@ -2969,7 +3034,9 @@ mod tests {
 
         assert_eq!(request.model_instance_id(), None);
         request.bind_model_instance(first).expect("initial binding");
-        request.bind_model_instance(first).expect("idempotent binding");
+        request
+            .bind_model_instance(first)
+            .expect("idempotent binding");
         assert_eq!(request.model_instance_id(), Some(first));
         assert!(request.bind_model_instance(second).is_err());
         assert_eq!(request.model_instance_id(), Some(first));

@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use thiserror::Error;
 
+use crate::backends::kv::KvPageCopy;
 use crate::engine::execution::{PlanId, SessionKey};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId};
 
@@ -41,6 +42,9 @@ pub enum KvBlockIntent {
     Shared(CacheBlockRef),
     /// Allocate a new transaction-private page.
     Fresh,
+    /// Allocate a private destination and copy an immutable committed source
+    /// into it before any model writes are allowed.
+    CopyOnWrite(CacheBlockRef),
 }
 
 /// Provisional table description for one physical group.
@@ -67,6 +71,7 @@ pub struct KvPreparedReservation {
     pub expected: KvSnapshot,
     pub provisional_groups: Vec<GroupBlockTable>,
     pub writable_blocks: Vec<CacheBlockRef>,
+    pub page_copies: Vec<KvPageCopy>,
     pub target_committed_tokens: u32,
     pub target_window_start: u32,
 }
@@ -225,6 +230,7 @@ struct Transaction {
     expected: KvSnapshot,
     provisional_groups: Vec<GroupBlockTable>,
     writable_blocks: Vec<CacheBlockRef>,
+    page_copies: Vec<KvPageCopy>,
     holds: Vec<TransactionHold>,
     target_committed_tokens: u32,
     target_window_start: u32,
@@ -346,6 +352,21 @@ impl KvCacheCoordinator {
                         fresh_count += 1;
                         has_writable = true;
                     }
+                    KvBlockIntent::CopyOnWrite(block) => {
+                        self.validate_block(block, Some(group_request.group))?;
+                        if !blocks_seen.insert(block) {
+                            return Err(KvCoordinatorError::DuplicateBlock);
+                        }
+                        if !expected_group.is_some_and(|group| group.blocks.contains(&block)) {
+                            return Err(KvCoordinatorError::BlockNotInSnapshot);
+                        }
+                        let slot = &self.slots[block.index as usize];
+                        if slot.writer.is_some() {
+                            return Err(KvCoordinatorError::WriteConflict);
+                        }
+                        fresh_count += 1;
+                        has_writable = true;
+                    }
                     KvBlockIntent::Existing(block)
                     | KvBlockIntent::Writable(block)
                     | KvBlockIntent::Shared(block) => {
@@ -367,7 +388,7 @@ impl KvCacheCoordinator {
                                     return Err(KvCoordinatorError::UnpublishedPrefix);
                                 }
                             }
-                            KvBlockIntent::Fresh => unreachable!(),
+                            KvBlockIntent::Fresh | KvBlockIntent::CopyOnWrite(_) => unreachable!(),
                         }
                         if matches!(intent, KvBlockIntent::Writable(_)) {
                             let slot = &self.slots[block.index as usize];
@@ -400,6 +421,7 @@ impl KvCacheCoordinator {
 
         let mut provisional_groups = Vec::with_capacity(request.groups.len());
         let mut writable_blocks = Vec::new();
+        let mut page_copies = Vec::new();
         let mut holds = Vec::new();
 
         for group_request in request.groups {
@@ -435,6 +457,19 @@ impl KvCacheCoordinator {
                         writable_blocks.push(block);
                         blocks.push(block);
                     }
+                    KvBlockIntent::CopyOnWrite(source) => {
+                        let destination = self.allocate_block(group_request.group, request.txn_id);
+                        holds.push(TransactionHold {
+                            block: destination,
+                            writer: true,
+                        });
+                        writable_blocks.push(destination);
+                        page_copies.push(KvPageCopy {
+                            source,
+                            destination,
+                        });
+                        blocks.push(destination);
+                    }
                 }
             }
             provisional_groups.push(GroupBlockTable {
@@ -451,6 +486,7 @@ impl KvCacheCoordinator {
                 expected: request.expected,
                 provisional_groups,
                 writable_blocks,
+                page_copies,
                 holds,
                 target_committed_tokens: request.target_committed_tokens,
                 target_window_start: request.target_window_start,
@@ -473,7 +509,7 @@ impl KvCacheCoordinator {
                 actual: txn.state,
             });
         }
-        let pages = unique_table_blocks(&txn.provisional_groups);
+        let pages = transaction_execution_blocks(txn);
         let writable: HashSet<_> = txn.writable_blocks.iter().copied().collect();
         for block in &pages {
             self.validate_block(*block, None)?;
@@ -497,6 +533,7 @@ impl KvCacheCoordinator {
             expected: txn.expected.clone(),
             provisional_groups: txn.provisional_groups.clone(),
             writable_blocks: txn.writable_blocks.clone(),
+            page_copies: txn.page_copies.clone(),
             target_committed_tokens: txn.target_committed_tokens,
             target_window_start: txn.target_window_start,
         })
@@ -533,6 +570,18 @@ impl KvCacheCoordinator {
         txn_id: PlanId,
         publish_prefix: &[CacheBlockRef],
     ) -> KvCoordinatorResult<KvSnapshot> {
+        self.commit_with_prefix_updates(txn_id, publish_prefix, &[])
+    }
+
+    /// CAS the table and apply prefix-index ownership changes as one metadata
+    /// transaction. Callers stage their index mutation first and make it
+    /// visible only after this method succeeds.
+    pub fn commit_with_prefix_updates(
+        &mut self,
+        txn_id: PlanId,
+        retain_prefix: &[CacheBlockRef],
+        release_prefix: &[CacheBlockRef],
+    ) -> KvCoordinatorResult<KvSnapshot> {
         let txn = self
             .transactions
             .get(&txn_id)
@@ -556,10 +605,18 @@ impl KvCacheCoordinator {
 
         let writable: HashSet<_> = txn.writable_blocks.iter().copied().collect();
         let mut published = HashSet::new();
-        for block in publish_prefix {
+        for block in retain_prefix {
             self.validate_block(*block, None)?;
             if !writable.contains(block) || !published.insert(*block) {
                 return Err(KvCoordinatorError::InvalidWriteReceipt);
+            }
+        }
+        let released = unique_blocks(release_prefix)?;
+        for block in &released {
+            self.validate_block(*block, None)?;
+            let retained_here = usize::from(published.contains(block));
+            if self.slots[block.index as usize].prefix_refs + retained_here == 0 {
+                return Err(KvCoordinatorError::ReferenceUnderflow);
             }
         }
 
@@ -585,8 +642,11 @@ impl KvCacheCoordinator {
         for block in new_blocks.difference(&old_blocks) {
             self.slots[block.index as usize].table_refs += 1;
         }
-        for block in publish_prefix {
+        for block in retain_prefix {
             self.slots[block.index as usize].prefix_refs += 1;
+        }
+        for block in &released {
+            self.slots[block.index as usize].prefix_refs -= 1;
         }
 
         self.release_transaction_pins(&txn);
@@ -594,6 +654,9 @@ impl KvCacheCoordinator {
         for block in old_blocks.difference(&new_blocks) {
             let slot = &mut self.slots[block.index as usize];
             slot.table_refs -= 1;
+            self.recycle_if_unowned(block.index);
+        }
+        for block in released {
             self.recycle_if_unowned(block.index);
         }
 
@@ -672,13 +735,22 @@ impl KvCacheCoordinator {
     }
 
     pub fn release_prefix(&mut self, block: CacheBlockRef) -> KvCoordinatorResult<()> {
-        self.validate_block(block, None)?;
-        let slot = &mut self.slots[block.index as usize];
-        if slot.prefix_refs == 0 {
-            return Err(KvCoordinatorError::ReferenceUnderflow);
+        self.release_prefixes(&[block])
+    }
+
+    /// Atomically release a set of durable prefix-index references.
+    pub fn release_prefixes(&mut self, blocks: &[CacheBlockRef]) -> KvCoordinatorResult<()> {
+        let blocks = unique_blocks(blocks)?;
+        for block in &blocks {
+            self.validate_block(*block, None)?;
+            if self.slots[block.index as usize].prefix_refs == 0 {
+                return Err(KvCoordinatorError::ReferenceUnderflow);
+            }
         }
-        slot.prefix_refs -= 1;
-        self.recycle_if_unowned(block.index);
+        for block in blocks {
+            self.slots[block.index as usize].prefix_refs -= 1;
+            self.recycle_if_unowned(block.index);
+        }
         Ok(())
     }
 
@@ -764,7 +836,7 @@ impl KvCacheCoordinator {
                 txn.state,
                 KvTransactionState::Prepared | KvTransactionState::Written
             ) {
-                for block in unique_table_blocks(&txn.provisional_groups) {
+                for block in transaction_execution_blocks(txn) {
                     execution_pins[block.index as usize] += 1;
                 }
             }
@@ -867,7 +939,7 @@ impl KvCacheCoordinator {
         ) {
             return;
         }
-        for block in unique_table_blocks(&txn.provisional_groups) {
+        for block in transaction_execution_blocks(txn) {
             let slot = &mut self.slots[block.index as usize];
             slot.execution_pins = slot
                 .execution_pins
@@ -915,6 +987,18 @@ fn unique_table_blocks(groups: &[GroupBlockTable]) -> Vec<CacheBlockRef> {
         .collect()
 }
 
+fn transaction_execution_blocks(txn: &Transaction) -> Vec<CacheBlockRef> {
+    let mut blocks = unique_table_blocks(&txn.provisional_groups);
+    let mut seen = blocks.iter().copied().collect::<HashSet<_>>();
+    blocks.extend(
+        txn.page_copies
+            .iter()
+            .map(|copy| copy.source)
+            .filter(|block| seen.insert(*block)),
+    );
+    blocks
+}
+
 fn unique_blocks(blocks: &[CacheBlockRef]) -> KvCoordinatorResult<Vec<CacheBlockRef>> {
     let unique: HashSet<_> = blocks.iter().copied().collect();
     if unique.len() != blocks.len() {
@@ -926,8 +1010,13 @@ fn unique_blocks(blocks: &[CacheBlockRef]) -> KvCoordinatorResult<Vec<CacheBlock
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::{DType, Device, IndexOp, Tensor};
+
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig, KvWriteArgs};
     use crate::backends::BackendKind;
+    use crate::engine::cache::window::advance_window;
     use crate::engine::ModelInstanceId;
+    use crate::kv::{KvLayerBinding, KvSlotRef};
 
     fn arena(generation: u32) -> KvArenaId {
         KvArenaId {
@@ -1241,5 +1330,155 @@ mod tests {
             Err(KvCoordinatorError::WrongArena)
         );
         old.abort(90).unwrap();
+    }
+
+    #[test]
+    fn physical_tail_cow_pins_the_source_and_copies_before_commit() -> crate::Result<()> {
+        const LAYER: KvLayerBinding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena_id = arena(1);
+        let physical = CpuKvArena::new(KvArenaConfig {
+            id: arena_id,
+            group: KvGroupId::new(0),
+            page_tokens: 2,
+            capacity_pages: 2,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding: LAYER,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        })?;
+        let mut coordinator = KvCacheCoordinator::new(arena_id, 2);
+        let session = session("cow", 1);
+        let initial = coordinator
+            .register_table(session.clone(), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 100, initial, 1, 1);
+        let source = prepare_and_complete(&mut coordinator, 100).writable_blocks[0];
+        let committed = coordinator.commit(100, &[]).unwrap();
+
+        let slots = physical.lower_slots(&[
+            KvSlotRef {
+                block: source,
+                offset: 0,
+            },
+            KvSlotRef {
+                block: source,
+                offset: 1,
+            },
+        ])?;
+        let keys = Tensor::from_vec(vec![1f32, 2., 3., 4.], (2, 1, 2), &Device::Cpu)?;
+        let values = Tensor::from_vec(vec![5f32, 6., 7., 8.], (2, 1, 2), &Device::Cpu)?;
+        physical
+            .write_slots(
+                LAYER,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: slots.as_ref(),
+                },
+            )?
+            .wait()?;
+
+        coordinator
+            .reserve(KvReserveRequest {
+                txn_id: 101,
+                expected: committed,
+                target_committed_tokens: 2,
+                target_window_start: 0,
+                groups: vec![KvGroupReservation {
+                    group: KvGroupId::new(0),
+                    blocks: vec![KvBlockIntent::CopyOnWrite(source)],
+                }],
+            })
+            .unwrap();
+        let prepared = coordinator.prepare(101).unwrap();
+        assert_eq!(prepared.page_copies.len(), 1);
+        assert_eq!(prepared.page_copies[0].source, source);
+        assert_eq!(coordinator.stats().execution_pins, 2);
+        physical.copy_pages(&prepared.page_copies)?.wait()?;
+        let destination = prepared.page_copies[0].destination;
+        let (stored_keys, stored_values) = physical.layer_tensors(LAYER)?;
+        assert_eq!(
+            stored_keys
+                .i(destination.index as usize)?
+                .to_vec3::<f32>()?,
+            vec![vec![vec![1., 2.]], vec![vec![3., 4.]]]
+        );
+        assert_eq!(
+            stored_values
+                .i(destination.index as usize)?
+                .to_vec3::<f32>()?,
+            vec![vec![vec![5., 6.]], vec![vec![7., 8.]]]
+        );
+        coordinator
+            .complete_write(KvWriteReceipt {
+                txn_id: 101,
+                committed_tokens: 2,
+                written_blocks: prepared.writable_blocks,
+            })
+            .unwrap();
+        let forked = coordinator.commit(101, &[]).unwrap();
+        assert_eq!(forked.groups[0].blocks, vec![destination]);
+        assert_eq!(coordinator.stats().execution_pins, 0);
+        assert_eq!(
+            coordinator.pin_transfer(&[source]),
+            Err(KvCoordinatorError::StaleBlock)
+        );
+        coordinator.check_invariants().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_window_commit_releases_only_wholly_hidden_pages() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 4);
+        let session = session("window", 1);
+        let initial = coordinator
+            .register_table(session.clone(), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 110, initial, 3, 10);
+        let initial_pages = prepare_and_complete(&mut coordinator, 110).writable_blocks;
+        let committed = coordinator.commit(110, &[]).unwrap();
+        let advanced = advance_window(&initial_pages, 0, 5, 10, 4).unwrap();
+        coordinator
+            .reserve(KvReserveRequest {
+                txn_id: 111,
+                expected: committed,
+                target_committed_tokens: 10,
+                target_window_start: advanced.window_start,
+                groups: vec![KvGroupReservation {
+                    group: KvGroupId::new(0),
+                    blocks: advanced
+                        .visible_blocks
+                        .iter()
+                        .copied()
+                        .map(KvBlockIntent::Existing)
+                        .collect(),
+                }],
+            })
+            .unwrap();
+        let prepared = coordinator.prepare(111).unwrap();
+        assert!(prepared.writable_blocks.is_empty());
+        coordinator
+            .complete_write(KvWriteReceipt {
+                txn_id: 111,
+                committed_tokens: 10,
+                written_blocks: Vec::new(),
+            })
+            .unwrap();
+        let trimmed = coordinator.commit(111, &[]).unwrap();
+        assert_eq!(trimmed.window_start, 5);
+        assert_eq!(trimmed.groups[0].blocks, advanced.visible_blocks);
+        assert_eq!(coordinator.stats().allocated_pages, 2);
+        assert_eq!(coordinator.stats().table_refs, 2);
+        assert_eq!(
+            coordinator.pin_transfer(&[advanced.released_blocks[0]]),
+            Err(KvCoordinatorError::StaleBlock)
+        );
+        coordinator.check_invariants().unwrap();
     }
 }

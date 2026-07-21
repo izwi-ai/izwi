@@ -8,6 +8,7 @@
 mod batch;
 mod contract;
 mod resolved;
+mod residency;
 
 pub use batch::{CacheBlockRef, KvDecodeBatchMetadata, KvSequenceBlockTable, KvSlotRef};
 pub use contract::{
@@ -20,6 +21,9 @@ pub use contract::{
 pub use resolved::{
     KvArenaId, KvGroupId, KvLayerBinding, KvPhysicalLayout, KvPlanFingerprint, KvPlanId,
     KvStorageFormat, PagedAttentionKernel, ResolvedKvGroup, ResolvedKvGroupKind, ResolvedKvPlan,
+};
+pub use residency::{
+    KvResidencyError, KvResidencyState, KvStorageTier, KvTransferId,
 };
 
 #[cfg(test)]

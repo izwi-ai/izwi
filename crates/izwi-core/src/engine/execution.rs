@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::backends::BackendKind;
+use crate::engine::cache::coordinator::GroupBlockTable;
 use crate::error::{Error, Result};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId};
 use crate::model::ModelVariant;
@@ -914,15 +915,24 @@ pub struct ReadyQuantum {
 /// this compact fence in the execution envelope lets report validation reject
 /// a receipt for another plan, request incarnation, arena generation, domain,
 /// or table version before engine state is committed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedCacheReservation {
     pub txn_id: PlanId,
     pub session: SessionKey,
+    pub domains: Vec<ManagedCacheDomainReservation>,
+}
+
+/// One physical cache-domain transaction within a row reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheDomainReservation {
     pub arena: KvArenaId,
     pub domain: CacheDomainId,
     pub expected_version: u64,
     pub expected_committed_tokens: u32,
     pub target_committed_tokens: u32,
+    pub target_window_start: u32,
+    pub provisional_groups: Vec<GroupBlockTable>,
+    pub writable_blocks: Vec<CacheBlockRef>,
 }
 
 impl ManagedCacheReservation {
@@ -932,12 +942,44 @@ impl ManagedCacheReservation {
                 "managed-cache reservation does not match its physical row".to_string(),
             ));
         }
-        if self.target_committed_tokens < self.expected_committed_tokens {
+        if self.domains.is_empty() {
             return Err(Error::InvalidInput(
-                "managed-cache reservation moves committed tokens backwards".to_string(),
+                "managed-cache reservation has no cache domains".to_string(),
             ));
         }
+        let mut identities = HashSet::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            if domain.target_committed_tokens < domain.expected_committed_tokens
+                || domain.target_window_start > domain.target_committed_tokens
+            {
+                return Err(Error::InvalidInput(
+                    "managed-cache reservation has an invalid token range".to_string(),
+                ));
+            }
+            if !identities.insert((domain.arena, domain.domain)) {
+                return Err(Error::InvalidInput(
+                    "managed-cache reservation repeats a cache domain".to_string(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Build the exact acknowledgement after the backend has completed and
+    /// fenced every write in this reservation.
+    pub fn completed_write_receipt(&self) -> ManagedCacheReceipt {
+        ManagedCacheReceipt {
+            reservation: self.clone(),
+            domains: self
+                .domains
+                .iter()
+                .map(|domain| ManagedCacheDomainReceipt {
+                    arena: domain.arena,
+                    domain: domain.domain,
+                    written_blocks: domain.writable_blocks.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -945,22 +987,61 @@ impl ManagedCacheReservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedCacheReceipt {
     pub reservation: ManagedCacheReservation,
+    pub domains: Vec<ManagedCacheDomainReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCacheDomainReceipt {
+    pub arena: KvArenaId,
+    pub domain: CacheDomainId,
     pub written_blocks: Vec<CacheBlockRef>,
 }
 
 impl ManagedCacheReceipt {
     fn validate(&self) -> Result<()> {
-        let mut blocks = HashSet::with_capacity(self.written_blocks.len());
-        for block in &self.written_blocks {
-            if block.arena != self.reservation.arena {
+        if self.domains.len() != self.reservation.domains.len() {
+            return Err(Error::InferenceError(
+                "managed-cache receipt does not cover every reserved domain".to_string(),
+            ));
+        }
+        let mut identities = HashSet::with_capacity(self.domains.len());
+        for receipt in &self.domains {
+            let reservation = self
+                .reservation
+                .domains
+                .iter()
+                .find(|reserved| {
+                    reserved.arena == receipt.arena && reserved.domain == receipt.domain
+                })
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache receipt contains a foreign cache domain".to_string(),
+                    )
+                })?;
+            if !identities.insert((receipt.arena, receipt.domain)) {
                 return Err(Error::InferenceError(
-                    "managed-cache receipt contains a block from another arena generation"
-                        .to_string(),
+                    "managed-cache receipt repeats a cache domain".to_string(),
                 ));
             }
-            if !blocks.insert(*block) {
+            let blocks = receipt
+                .written_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if blocks.len() != receipt.written_blocks.len()
+                || blocks
+                    != reservation
+                        .writable_blocks
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>()
+                || receipt
+                    .written_blocks
+                    .iter()
+                    .any(|block| block.arena != receipt.arena)
+            {
                 return Err(Error::InferenceError(
-                    "managed-cache receipt contains a duplicate written block".to_string(),
+                    "managed-cache receipt does not match the domain writable set".to_string(),
                 ));
             }
         }
@@ -2208,14 +2289,28 @@ mod tests {
             device_ordinal: lane.device_ordinal,
             generation: 3,
         };
+        let written_block = CacheBlockRef {
+            arena,
+            group: KvGroupId::new(0),
+            index: 1,
+            slot_generation: 8,
+        };
         let reservation = ManagedCacheReservation {
             txn_id: plan.plan_id,
             session: session.clone(),
-            arena,
-            domain: CacheDomainId::new(2),
-            expected_version: 11,
-            expected_committed_tokens: 4,
-            target_committed_tokens: 5,
+            domains: vec![ManagedCacheDomainReservation {
+                arena,
+                domain: CacheDomainId::new(2),
+                expected_version: 11,
+                expected_committed_tokens: 4,
+                target_committed_tokens: 5,
+                target_window_start: 0,
+                provisional_groups: vec![GroupBlockTable {
+                    group: KvGroupId::new(0),
+                    blocks: vec![written_block],
+                }],
+                writable_blocks: vec![written_block],
+            }],
         };
         let batch = PhysicalBatch {
             batch_id: BatchId::new(99),
@@ -2247,11 +2342,10 @@ mod tests {
                 state: StateDisposition::ValidNext,
                 managed_cache: Some(ManagedCacheReceipt {
                     reservation: reservation.clone(),
-                    written_blocks: vec![CacheBlockRef {
+                    domains: vec![ManagedCacheDomainReceipt {
                         arena,
-                        group: KvGroupId::new(0),
-                        index: 1,
-                        slot_generation: 8,
+                        domain: CacheDomainId::new(2),
+                        written_blocks: vec![written_block],
                     }],
                 }),
             }],
@@ -2262,10 +2356,10 @@ mod tests {
         report.rows[0].managed_cache = None;
         assert!(report.validate_against(&batch, &active).is_err());
         let mut foreign = reservation;
-        foreign.expected_version += 1;
+        foreign.domains[0].expected_version += 1;
         report.rows[0].managed_cache = Some(ManagedCacheReceipt {
             reservation: foreign,
-            written_blocks: Vec::new(),
+            domains: Vec::new(),
         });
         assert!(report.validate_against(&batch, &active).is_err());
     }

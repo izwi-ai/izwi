@@ -796,7 +796,10 @@ fn bind_request_to_residency(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
     )?;
+    let cache_capability =
+        bundle.kv_cache_capability(CapabilityKind::for_engine_task(request.task_type))?;
     request.bind_execution_adapter(binding)?;
+    request.bind_cache_capability(cache_capability)?;
     Ok(())
 }
 

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::cache::managed::ManagedKvCacheManager;
 use super::config::EngineCoreConfig;
 use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
@@ -339,6 +340,8 @@ pub struct EngineCore {
     scheduler: Scheduler,
     /// KV cache manager
     kv_cache: KvCacheBackend,
+    /// Physical managed-cache arenas and transactional block tables.
+    managed_kv_cache: ManagedKvCacheManager,
     /// Model executor
     executor: UnifiedExecutor,
     /// Output processor
@@ -353,6 +356,10 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
+    /// Prepared physical KV transactions keyed by their exact execution plan.
+    active_managed_cache: HashMap<u64, super::ManagedCacheReservation>,
+    /// Terminal sessions whose table release waits for an in-flight row.
+    pending_managed_releases: HashSet<super::SessionKey>,
     /// Exact physical envelopes allowed to publish pre-quantum progress.
     active_stream_batches: HashMap<BatchId, ActiveStreamBatch>,
     /// Next sequence number accepted for each exact streaming session.
@@ -679,6 +686,15 @@ impl EngineCore {
         });
         for scheduled in scheduled {
             let session = scheduled.session_key();
+            if let Some(reservation) = self.active_managed_cache.remove(&scheduled.plan_id) {
+                if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
+                    warn!(
+                        plan_id = scheduled.plan_id,
+                        error = %error,
+                        "Failed to abort an unexecuted managed KV transaction"
+                    );
+                }
+            }
             if let Some(plan) = self.active_plans.remove(&scheduled.plan_id) {
                 if plan.session != session {
                     warn!(
@@ -694,6 +710,7 @@ impl EngineCore {
                 }
             }
             self.scheduler.release_execution_quantum_for_retry(&session);
+            self.release_managed_session_if_ready(&session);
         }
     }
 
@@ -751,6 +768,10 @@ impl EngineCore {
         step_time_ms: f64,
     ) -> Option<CommittedExecutorOutput> {
         let Some(plan) = self.active_plans.remove(&result.plan_id) else {
+            if let Some(reservation) = self.active_managed_cache.remove(&result.plan_id) {
+                let _ = self.managed_kv_cache.finalize(&reservation, None, false);
+                self.release_managed_session_if_ready(&reservation.session);
+            }
             warn!(
                 plan_id = result.plan_id,
                 request_id = %result.session.request_id,
@@ -822,54 +843,106 @@ impl EngineCore {
                 None
             }
         };
+        let managed_reservation = self.active_managed_cache.remove(&plan.plan_id);
         let report = Self::report_from_result(&result);
-        let commit_result = self
+        // Validate the execution transition on a clone before publishing the
+        // physical cache table. This keeps invalid/duplicate reports from
+        // advancing KV state, while the serialized core lock guarantees that
+        // installing the validated tracker cannot race another row commit.
+        let prospective_tracker = self
             .execution_trackers
-            .get_mut(&plan.session.request_id)
+            .get(&plan.session.request_id)
+            .cloned()
             .ok_or_else(|| {
                 Error::InferenceError("execution tracker is missing for active plan".to_string())
             })
-            .and_then(|tracker| tracker.commit(&plan, &report));
+            .and_then(|mut tracker| {
+                tracker.commit(&plan, &report)?;
+                Ok(tracker)
+            });
 
-        if let Err(err) = commit_result {
-            let (failure_dispatch, failure_dispatch_state) =
-                Self::canonical_failure_dispatch(&plan, &result);
-            let failure_report = ExecutionReport {
-                plan_id: plan.plan_id,
-                session: plan.session.clone(),
-                input_consumed: 0,
-                output_produced: 0,
-                observed_resources: ResourceVector::zero(),
-                dispatch: failure_dispatch,
-                provenance: OutcomeProvenance::failure(
-                    FailureOrigin::StateCommit,
-                    failure_dispatch_state,
-                ),
-                elapsed: std::time::Duration::ZERO,
-                safe_point: true,
-                disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
-                    err.to_string(),
-                )),
-                output_finished: true,
-                output_has_error: true,
-            };
+        let prospective_tracker = match prospective_tracker {
+            Ok(tracker) => tracker,
+            Err(err) => {
+                if let Some(reservation) = managed_reservation.as_ref() {
+                    let _ = self.managed_kv_cache.finalize(reservation, None, false);
+                }
+                self.release_managed_session_if_ready(&plan.session);
+                let (failure_dispatch, failure_dispatch_state) =
+                    Self::canonical_failure_dispatch(&plan, &result);
+                let failure_report = ExecutionReport {
+                    plan_id: plan.plan_id,
+                    session: plan.session.clone(),
+                    input_consumed: 0,
+                    output_produced: 0,
+                    observed_resources: ResourceVector::zero(),
+                    dispatch: failure_dispatch,
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::StateCommit,
+                        failure_dispatch_state,
+                    ),
+                    elapsed: std::time::Duration::ZERO,
+                    safe_point: true,
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        err.to_string(),
+                    )),
+                    output_finished: true,
+                    output_has_error: true,
+                };
+                if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
+                    let _ = tracker.commit(&plan, &failure_report);
+                }
+                let message = format!("invalid executor result: {err}");
+                return Some(CommittedExecutorOutput {
+                    session: plan.session.clone(),
+                    output: ExecutorOutput::error(plan.session.request_id, message.clone()),
+                    disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
+                        message,
+                    )),
+                    provenance: OutcomeProvenance::failure(
+                        FailureOrigin::StateCommit,
+                        failure_dispatch_state,
+                    ),
+                    staged_stream_outputs: Vec::new(),
+                });
+            }
+        };
+
+        let managed_commit = matches!(
+            result.disposition,
+            ExecutionDisposition::Progress | ExecutionDisposition::Yielded(_)
+        );
+        let managed_result = match managed_reservation.as_ref() {
+            Some(reservation) => self.managed_kv_cache.finalize(
+                reservation,
+                result.managed_cache.as_ref(),
+                managed_commit,
+            ),
+            None if result.managed_cache.is_some() => Err(Error::InferenceError(
+                "executor returned an unplanned managed KV receipt".to_string(),
+            )),
+            None => Ok(()),
+        };
+        if let Err(error) = managed_result {
+            let message = format!("managed KV commit failed: {error}");
+            result.output = ExecutorOutput::error(plan.session.request_id.clone(), message.clone());
+            result.disposition =
+                ExecutionDisposition::Failed(ExecutionFailure::invalid_output(message));
+            result.safe_point = true;
+            result.provenance = OutcomeProvenance::failure(
+                FailureOrigin::StateCommit,
+                result.provenance.dispatch_state,
+            );
+            result.staged_stream_outputs.clear();
+            let failure_report = Self::report_from_result(&result);
             if let Some(tracker) = self.execution_trackers.get_mut(&plan.session.request_id) {
                 let _ = tracker.commit(&plan, &failure_report);
             }
-            let message = format!("invalid executor result: {err}");
-            return Some(CommittedExecutorOutput {
-                session: plan.session.clone(),
-                output: ExecutorOutput::error(plan.session.request_id, message.clone()),
-                disposition: ExecutionDisposition::Failed(ExecutionFailure::invalid_output(
-                    message,
-                )),
-                provenance: OutcomeProvenance::failure(
-                    FailureOrigin::StateCommit,
-                    failure_dispatch_state,
-                ),
-                staged_stream_outputs: Vec::new(),
-            });
+        } else {
+            self.execution_trackers
+                .insert(plan.session.request_id.clone(), prospective_tracker);
         }
+        self.release_managed_session_if_ready(&plan.session);
 
         match &result.disposition {
             ExecutionDisposition::Failed(failure)
@@ -904,6 +977,9 @@ impl EngineCore {
                 if failure.retry == RetryDisposition::Recompute =>
             {
                 let release = self.executor.cleanup_session(&plan.session).await;
+                if release.confirmed {
+                    self.request_managed_session_release(&plan.session);
+                }
                 if release.confirmed
                     && self
                         .scheduler
@@ -1155,13 +1231,37 @@ impl EngineCore {
                     stage.output_visibility
                 });
             let planned_work = plan.work.clone();
+            let managed_cache = request
+                .managed_cache_runtime()
+                .map(|runtime| {
+                    self.managed_kv_cache.prepare(
+                        runtime,
+                        plan.plan_id,
+                        &plan.session,
+                        &planned_work,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            if let Some(reservation) = managed_cache.as_ref() {
+                if self
+                    .active_managed_cache
+                    .insert(plan.plan_id, reservation.clone())
+                    .is_some()
+                {
+                    let _ = self.managed_kv_cache.finalize(reservation, None, false);
+                    return Err(Error::InferenceError(
+                        "managed KV transaction was prepared twice".to_string(),
+                    ));
+                }
+            }
             let row = ReadyQuantum {
                 plan_id: plan.plan_id,
                 session: plan.session.clone(),
                 lane: lane.clone(),
                 work: planned_work.clone(),
                 cost,
-                managed_cache: None,
+                managed_cache,
             };
             let mut executable = scheduled.clone();
             executable.work = planned_work;
@@ -1247,12 +1347,21 @@ impl EngineCore {
                     ));
                 }
             }
-            prepared.push(PreparedExecutionBatch::new(
-                assembly.physical_batch,
-                assembly.requests,
-                assembly.scheduled,
-                assembly.output_visibility,
-            ));
+            let reservations = assembly
+                .physical_batch
+                .rows
+                .iter()
+                .filter_map(|row| row.managed_cache.clone())
+                .collect();
+            prepared.push(
+                PreparedExecutionBatch::new(
+                    assembly.physical_batch,
+                    assembly.requests,
+                    assembly.scheduled,
+                    assembly.output_visibility,
+                )
+                .with_managed_cache_reservations(reservations)?,
+            );
         }
         Ok(prepared)
     }
@@ -1382,6 +1491,7 @@ impl EngineCore {
             config,
             scheduler,
             kv_cache,
+            managed_kv_cache: ManagedKvCacheManager::default(),
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -1389,6 +1499,8 @@ impl EngineCore {
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
+            active_managed_cache: HashMap::new(),
+            pending_managed_releases: HashSet::new(),
             active_stream_batches: HashMap::new(),
             stream_sequence_cursors: HashMap::new(),
             incremental_stream_sessions: HashSet::new(),
@@ -1442,6 +1554,26 @@ impl EngineCore {
         // exact model preparation, never from the public mutable request fields.
         request.seal_execution_preparation()?;
         request.enforce_chat_context_window(self.config.max_seq_len)?;
+
+        if request.cache_capability().managed_contract().is_some() {
+            let model_instance = request.model_instance_id().ok_or_else(|| {
+                Error::InvalidInput(
+                    "managed KV request has no exact loaded-model instance".to_string(),
+                )
+            })?;
+            let capability = request.cache_capability().clone();
+            let runtime = self
+                .managed_kv_cache
+                .bind_request(
+                    model_instance,
+                    self.config.backend,
+                    self.config.max_blocks,
+                    self.config.block_size,
+                    &capability,
+                )?
+                .expect("managed capability resolves a runtime");
+            request.install_managed_cache_runtime(runtime)?;
+        }
 
         // Add to scheduler. A public ID remains unavailable while an expired
         // incarnation has logical cache quarantined behind unconfirmed
@@ -1503,6 +1635,37 @@ impl EngineCore {
         self.execution_retry_attempts.remove(session);
         self.stream_sequence_cursors.remove(session);
         self.incremental_stream_sessions.remove(session);
+    }
+
+    fn request_managed_session_release(&mut self, session: &super::SessionKey) {
+        if self
+            .active_managed_cache
+            .values()
+            .any(|reservation| &reservation.session == session)
+        {
+            self.pending_managed_releases.insert(session.clone());
+            return;
+        }
+        if let Err(error) = self.managed_kv_cache.release_session(session) {
+            warn!(
+                request_id = %session.request_id,
+                session_epoch = session.epoch,
+                error = %error,
+                "Failed to release a managed KV session table"
+            );
+        }
+        self.pending_managed_releases.remove(session);
+    }
+
+    fn release_managed_session_if_ready(&mut self, session: &super::SessionKey) {
+        if self.pending_managed_releases.contains(session)
+            && !self
+                .active_managed_cache
+                .values()
+                .any(|reservation| &reservation.session == session)
+        {
+            self.request_managed_session_release(session);
+        }
     }
 
     fn validate_staged_stream_outputs(
@@ -1696,6 +1859,7 @@ impl EngineCore {
         ) {
             self.attempt_pending_release_cleanup(session).await;
         }
+        self.request_managed_session_release(session);
         self.clear_exact_execution_state(session);
     }
 
@@ -1943,6 +2107,7 @@ impl EngineCore {
                         staged_stream_outputs: Vec::new(),
                     });
             }
+            self.request_managed_session_release(session);
             self.clear_exact_execution_state(session);
             self.request_phase_timings
                 .entry(session.request_id.clone())
@@ -2815,6 +2980,88 @@ mod tests {
                 calls.push(request_id.to_string());
             }
             super::super::executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
+    struct ManagedReceiptExecutor;
+
+    impl ModelExecutor for ManagedReceiptExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                ExecutionMode::Sequence,
+            );
+            profile.prefill = PrefillMode::Full;
+            profile.cache_mode = CacheMode::ExternalPaged;
+            profile.cache_release_safe = true;
+            Some(profile)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: super::super::executor::PhysicalBatchExecution<'_>,
+        ) -> super::super::executor::PhysicalDispatchResult {
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .zip(&execution.batch.rows)
+                .map(|(scheduled, row)| {
+                    let mut result = ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput {
+                            request_id: scheduled.request_id.clone(),
+                            audio: None,
+                            text: None,
+                            input_transcription: None,
+                            tokens_processed: scheduled.num_tokens,
+                            tokens_generated: 0,
+                            finished: false,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                        },
+                    );
+                    result.dispatch = dispatch;
+                    if let Some(reservation) = &row.managed_cache {
+                        result.managed_cache = Some(reservation.completed_write_receipt());
+                    }
+                    result
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> CacheReleaseReport {
+            CacheReleaseReport::confirmed(0)
         }
     }
 
@@ -5062,6 +5309,58 @@ mod tests {
             .expect("latency breakdown");
         assert!(latency.ttft_ms.is_some());
         assert!(latency.ttft_ms.unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn managed_kv_transaction_follows_live_prepare_commit_and_cancel_lifecycle() {
+        let model_instance = ModelInstanceId::new(91);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 4,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "managed".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.id = "managed-core".to_string();
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 12, 13, 14], None)
+            .expect("prepare prompt");
+        request
+            .bind_model_instance(model_instance)
+            .expect("model instance");
+        request
+            .bind_cache_capability(crate::kv::CacheCapability::Managed(
+                crate::kv::test_contract(),
+            ))
+            .expect("cache contract");
+        core.add_request(request).expect("add request");
+        let session = core
+            .get_session_key(&"managed-core".to_string())
+            .expect("session");
+
+        core.step().await.expect("managed step");
+        let snapshot = core
+            .managed_kv_cache
+            .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
+            .expect("committed table");
+        assert_eq!(snapshot.committed_tokens, 4);
+        assert_eq!(snapshot.version, 1);
+
+        assert!(core.abort_request_session(&session).await);
+        assert!(core
+            .managed_kv_cache
+            .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
+            .is_none());
     }
 
     #[test]
