@@ -1234,6 +1234,24 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn incremental_prompt_token_count(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<usize> {
+        match self {
+            Self::Qwen3(model) => {
+                model.incremental_prompt_token_count(audio, sample_rate, language, prompt)
+            }
+            _ => Err(Error::InvalidInput(
+                "Loaded ASR model does not expose multimodal sequence shape preparation"
+                    .to_string(),
+            )),
+        }
+    }
+
     pub fn start_decode_state(
         &self,
         audio: &[f32],

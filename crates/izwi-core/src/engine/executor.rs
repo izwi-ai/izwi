@@ -30,6 +30,12 @@ pub(crate) use streaming::{
     StreamDeliveryFailure, StreamDeliveryFailureKind,
 };
 
+pub(super) fn decode_request_audio_with_rate(
+    request: &EngineCoreRequest,
+) -> Result<(Vec<f32>, u32)> {
+    audio::decode_request_audio_with_rate(request)
+}
+
 use super::config::EngineCoreConfig;
 use super::execution::{
     BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, DispatchState,

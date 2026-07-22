@@ -895,6 +895,48 @@ impl Engine {
                 let model = registry.get_asr_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
                 })?;
+                let managed_incremental = request.streaming
+                    && request
+                        .v2_state_runtime()
+                        .and_then(|runtime| runtime.managed_kv_runtime())
+                        .is_some();
+                if managed_incremental {
+                    let model_for_shape = model.model_arc();
+                    let language = request.asr_language_for_execution().map(str::to_string);
+                    let prompt = request.asr_prompt_for_execution().map(str::to_string);
+                    let request_id = request.id.clone();
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        let (samples, sample_rate) =
+                            executor::decode_request_audio_with_rate(&request)?;
+                        if model_for_shape.max_audio_seconds_hint().is_some_and(|limit| {
+                            sample_rate > 0
+                                && samples.len() as f32 / sample_rate as f32 > limit
+                        }) {
+                            return Err(Error::InvalidInput(
+                                "managed incremental ASR requires one bounded model input; long-form audio must select the chunked graph"
+                                    .to_string(),
+                            ));
+                        }
+                        let input_tokens = model_for_shape.incremental_prompt_token_count(
+                            &samples,
+                            sample_rate,
+                            language.as_deref(),
+                            prompt.as_deref(),
+                        )?;
+                        Ok::<_, Error>((request, input_tokens))
+                    })
+                    .await
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "ASR request {request_id} sequence-shape worker failed: {error}"
+                        ))
+                    })??;
+                    request = prepared.0;
+                    request.install_prepared_sequence_input_tokens(
+                        prepared.1,
+                        self.config.max_seq_len,
+                    )?;
+                }
                 request.install_asr_execution_model(variant, model)?;
             }
             TaskType::TTS if variant.family() == crate::catalog::ModelFamily::Qwen3Tts => {

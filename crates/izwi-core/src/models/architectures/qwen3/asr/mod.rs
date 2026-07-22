@@ -39,7 +39,7 @@ use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
-use audio::AudioTower;
+use audio::{get_cnn_output_lengths, AudioTower};
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};
 
@@ -737,6 +737,49 @@ impl Qwen3AsrModel {
             return Some(self.preprocessor.n_samples as f32 / sample_rate);
         }
         None
+    }
+
+    /// Resolve the exact text-decoder input span before scheduler admission.
+    /// The physical KV allocator must see the CNN-downsampled audio-token
+    /// count, not a text-length estimate, or its block table and receipts will
+    /// disagree with the prefill that the model actually executes.
+    pub(crate) fn incremental_prompt_token_count(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+    ) -> Result<usize> {
+        if self.is_forced_aligner {
+            return Err(Error::InvalidInput(
+                "Qwen3-ForcedAligner models do not support transcription decode state.".to_string(),
+            ));
+        }
+        let audio = if sample_rate != 16_000 {
+            resample(audio, sample_rate, 16_000)?
+        } else {
+            audio.to_vec()
+        };
+        let (_, mut frames) = self.mel.compute_flat(&audio)?;
+        if qwen_asr_drop_last_mel_frame() && frames > 0 {
+            frames -= 1;
+        }
+        if self.preprocessor.nb_max_frames > 0 {
+            frames = frames.min(self.preprocessor.nb_max_frames);
+        }
+        if frames == 0 {
+            return Err(Error::InvalidInput("Empty audio input".to_string()));
+        }
+        let audio_tokens = get_cnn_output_lengths(&[frames])[0];
+        if audio_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3 ASR audio produced no decoder input tokens".to_string(),
+            ));
+        }
+        Ok(self
+            .build_prompt(audio_tokens, language, system_prompt)?
+            .ids
+            .len())
     }
 
     /// Model-derived authorization for the largest incremental ASR session

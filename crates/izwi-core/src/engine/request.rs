@@ -790,6 +790,11 @@ pub struct EngineCoreRequest {
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
     pub(super) prepared_stage_costs: Vec<PreparedStageCost>,
+    /// Exact logical input span produced by model-specific multimodal
+    /// preprocessing before scheduler admission. Text models derive this from
+    /// `prompt_tokens`; speech and future multimodal adapters publish it here
+    /// instead of manufacturing placeholder token IDs.
+    pub(super) prepared_sequence_input_tokens: Option<usize>,
     /// Executor-produced stream events remain invisible until their exact
     /// execution report has committed.
     pub(super) stream_staging: StreamStagingBuffer,
@@ -1877,6 +1882,41 @@ impl EngineCoreRequest {
         Ok(())
     }
 
+    pub(crate) fn install_prepared_sequence_input_tokens(
+        &mut self,
+        input_tokens: usize,
+        max_sequence_tokens: usize,
+    ) -> Result<()> {
+        if self.task_type != TaskType::ASR {
+            return Err(Error::InvalidInput(format!(
+                "Request {} cannot install multimodal sequence shape for {:?}",
+                self.id, self.task_type
+            )));
+        }
+        if input_tokens == 0 || input_tokens >= max_sequence_tokens {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} exact prefill has {input_tokens} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
+                self.id
+            )));
+        }
+        if self
+            .prepared_sequence_input_tokens
+            .is_some_and(|current| current != input_tokens)
+        {
+            return Err(Error::InvalidInput(format!(
+                "ASR request {} changed its prepared multimodal sequence shape",
+                self.id
+            )));
+        }
+        self.params.max_tokens = self
+            .params
+            .max_tokens
+            .max(1)
+            .min(max_sequence_tokens - input_tokens);
+        self.prepared_sequence_input_tokens = Some(input_tokens);
+        Ok(())
+    }
+
     pub(crate) fn install_qwen_tts_execution_model(
         &mut self,
         model_variant: ModelVariant,
@@ -1956,6 +1996,12 @@ impl EngineCoreRequest {
 
     fn validate_incremental_model_execution_preparation(&self) -> Result<()> {
         let Some(ready) = self.incremental_model_execution_ready.as_ref() else {
+            if self.prepared_sequence_input_tokens.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "Request {} carries a multimodal sequence shape without an exact loaded model",
+                    self.id
+                )));
+            }
             return Ok(());
         };
         if self.model_variant != Some(ready.model_variant) {
@@ -1967,7 +2013,8 @@ impl EngineCoreRequest {
         match (&ready.model, self.task_type) {
             (PreparedIncrementalModel::Asr(_), TaskType::ASR) => Ok(()),
             (PreparedIncrementalModel::QwenTts(_), TaskType::TTS)
-                if ready.model_variant.family() == ModelFamily::Qwen3Tts =>
+                if ready.model_variant.family() == ModelFamily::Qwen3Tts
+                    && self.prepared_sequence_input_tokens.is_none() =>
             {
                 Ok(())
             }
@@ -2074,6 +2121,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
             stream_staging: StreamStagingBuffer::default(),
             text: Some(text),
             chat_messages: None,
@@ -2126,6 +2174,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2178,6 +2227,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2227,6 +2277,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: Some(messages),
@@ -2277,6 +2328,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2327,6 +2379,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
+            prepared_sequence_input_tokens: None,
             stream_staging: StreamStagingBuffer::default(),
             text: None,
             chat_messages: None,
@@ -2775,7 +2828,9 @@ impl EngineCoreRequest {
 
     /// Get number of prompt tokens.
     pub fn num_prompt_tokens(&self) -> usize {
-        if !self.prompt_tokens.is_empty() {
+        if let Some(input_tokens) = self.prepared_sequence_input_tokens {
+            input_tokens
+        } else if !self.prompt_tokens.is_empty() {
             self.prompt_tokens.len()
         } else if let Some(prompt) = self.asr_prompt_for_execution() {
             (prompt.len() / 4).max(1)
@@ -3859,6 +3914,24 @@ mod tests {
             },
             other => panic!("unexpected task payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn prepared_multimodal_shape_is_the_scheduler_prompt_span() {
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.params.max_tokens = 32;
+        request
+            .install_prepared_sequence_input_tokens(40, 64)
+            .expect("exact ASR shape");
+
+        assert_eq!(request.num_prompt_tokens(), 40);
+        assert_eq!(request.params.max_tokens, 24);
+        assert!(request
+            .install_prepared_sequence_input_tokens(41, 64)
+            .is_err());
+        assert!(EngineCoreRequest::asr_bytes(vec![1])
+            .install_prepared_sequence_input_tokens(64, 64)
+            .is_err());
     }
 
     #[test]
