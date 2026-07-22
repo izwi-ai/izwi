@@ -4,8 +4,9 @@
 //! physical choices a backend is prepared to implement and attests only
 //! operation sets that are complete today. KV arenas expose in-place writes,
 //! ragged causal prefill/extend, and paged decode without materializing K/V or
-//! expanding grouped-query heads. Resource negotiation remains fail-closed
-//! until the selected allocator can attest exact envelopes.
+//! expanding grouped-query heads. Fixed logical backing and unpinned workspace
+//! envelopes are exact; unsupported growth, pinned memory, domains, and builds
+//! remain fail-closed.
 
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
@@ -213,9 +214,18 @@ impl StateResourceRegistry for StateBackendRegistry {
             ));
         }
 
-        Err(invalid(
-            "v2 physical state allocator cannot yet issue an exact resource envelope",
-        ))
+        // The fixed arena allocates one immutable logical backing whose Candle
+        // tensor extents exactly equal `blocks * bytes_per_page`. Driver
+        // residency is reported separately by AllocationReceipt and is never
+        // guessed here.
+        Ok(ResolvedGroupResourceEnvelope {
+            allocator_alignment_bytes: 1,
+            allocator_overhead_per_allocation: 0,
+            max_backing_allocations: 1,
+            reservation_metadata_bytes: 0,
+            metadata_bytes_per_block: 0,
+            pinned_bytes_per_block: 0,
+        })
     }
 
     fn resolve_workspace_resources(
@@ -234,9 +244,11 @@ impl StateResourceRegistry for StateBackendRegistry {
                 "pinned invocation workspace has no v2 backend allocator",
             ));
         }
-        Err(invalid(
-            "v2 workspace allocator cannot yet issue an exact resource envelope",
-        ))
+        Ok(ResolvedWorkspaceResourceEnvelope {
+            allocator_alignment_bytes: 1,
+            allocator_overhead_per_slot: 0,
+            max_concurrency_slots: query.workspace.concurrency_slots,
+        })
     }
 }
 
@@ -529,9 +541,11 @@ impl PagedPolicyValidation for PagedAttentionDomainSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ModelInstanceId;
     use crate::kv::v2::{
-        test_contract, GroupResourceQuery, ResolvedCapacityDomain, StateResourceRegistry,
-        WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement, WorkspaceResourceQuery,
+        test_contract, GroupCapacityRequest, GroupResourceQuery, ResolvedCapacityDomain,
+        StateResourceRegistry, StateResourceVector, StateRuntimeAllocationPlan, WorkspaceContract,
+        WorkspaceDimensionBound, WorkspacePlacement, WorkspaceResourceQuery,
     };
 
     fn request(backend: BackendKind) -> StateBackendPlanRequest {
@@ -644,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_registry_rejects_guesses_without_an_exact_allocator_envelope() {
+    fn resource_registry_attests_fixed_logical_backing_without_guessing_residency() {
         let contract = test_contract();
         let group = resolved_group(&contract, BackendKind::Cpu);
         let registry = StateBackendRegistry::new(BackendKind::Cpu, None).unwrap();
@@ -655,10 +669,10 @@ mod tests {
                 resolved: ResolvedCapacityDomain::Paged(&group),
                 strategy: CapacityStrategy::Fixed { blocks: 8 },
             })
-            .unwrap_err();
-        assert!(fixed
-            .to_string()
-            .contains("cannot yet issue an exact resource envelope"));
+            .unwrap();
+        assert_eq!(fixed.allocator_alignment_bytes, 1);
+        assert_eq!(fixed.allocator_overhead_per_allocation, 0);
+        assert_eq!(fixed.max_backing_allocations, 1);
 
         assert!(registry
             .resolve_group_resources(&GroupResourceQuery {
@@ -674,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_resources_reject_missing_allocator_pinned_and_wrong_identity() {
+    fn workspace_resources_attest_exact_logical_slots_and_reject_pinned_or_wrong_identity() {
         let registry = StateBackendRegistry::new(BackendKind::Cpu, None).unwrap();
         let workspace = WorkspaceContract {
             fixed_bytes: 64,
@@ -692,10 +706,10 @@ mod tests {
                 device_ordinal: None,
                 workspace: &workspace,
             })
-            .unwrap_err();
-        assert!(envelope
-            .to_string()
-            .contains("cannot yet issue an exact resource envelope"));
+            .unwrap();
+        assert_eq!(envelope.allocator_alignment_bytes, 1);
+        assert_eq!(envelope.allocator_overhead_per_slot, 0);
+        assert_eq!(envelope.max_concurrency_slots, 2);
         assert!(registry
             .resolve_workspace_resources(&WorkspaceResourceQuery {
                 backend: BackendKind::Cpu,
@@ -713,5 +727,38 @@ mod tests {
                 workspace: &pinned,
             })
             .is_err());
+    }
+
+    #[test]
+    fn cpu_fixed_capacity_builds_a_hard_admission_plan() {
+        let contract = test_contract();
+        let state_plan = negotiate_state_plan(&contract, &request(BackendKind::Cpu)).unwrap();
+        let group = &state_plan.paged_attention[0];
+        let blocks = 8_u32;
+        let hard_limit = StateResourceVector {
+            host_bytes: u64::from(blocks) * group.bytes_per_page,
+            ..StateResourceVector::default()
+        };
+        let allocation = StateRuntimeAllocationPlan::build(
+            &state_plan,
+            ModelInstanceId::new(9),
+            vec![GroupCapacityRequest {
+                group: group.group,
+                domain: group.domain,
+                strategy: CapacityStrategy::Fixed { blocks },
+            }],
+            WorkspaceContract {
+                fixed_bytes: 0,
+                dimensions: vec![],
+                terms: vec![],
+                placement: WorkspacePlacement::Host,
+                concurrency_slots: 1,
+            },
+            hard_limit,
+            &StateBackendRegistry::new(BackendKind::Cpu, None).unwrap(),
+        )
+        .unwrap();
+        allocation.validate_against(&state_plan).unwrap();
+        assert_eq!(allocation.hard_limit, hard_limit);
     }
 }
