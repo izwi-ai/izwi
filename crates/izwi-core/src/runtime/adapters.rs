@@ -374,10 +374,10 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: match model_variant.family() {
-                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::KokoroTts => InferenceStateRequirement::Stateless,
-                _ => InferenceStateRequirement::Invocation,
+            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
+                InferenceStateRequirement::RetainedAndInvocation
+            } else {
+                InferenceStateRequirement::Stateless
             },
         })
     }
@@ -400,10 +400,10 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: match model_variant.family() {
-                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::KokoroTts => InferenceStateRequirement::Stateless,
-                _ => InferenceStateRequirement::Invocation,
+            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
+                InferenceStateRequirement::RetainedAndInvocation
+            } else {
+                InferenceStateRequirement::Stateless
             },
         })
     }
@@ -436,7 +436,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 state_requirement: if model_variant.family() == ModelFamily::Qwen3Asr {
                     InferenceStateRequirement::Retained
                 } else {
-                    InferenceStateRequirement::Invocation
+                    InferenceStateRequirement::Stateless
                 },
             })
     }
@@ -456,7 +456,7 @@ impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Invocation,
+                state_requirement: InferenceStateRequirement::Stateless,
             })
     }
 }
@@ -490,7 +490,13 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: chat_sequence_execution(model_variant),
-            state_requirement: InferenceStateRequirement::Retained,
+            state_requirement: if chat_sequence_execution(model_variant)
+                == SequenceExecutionMode::Always
+            {
+                InferenceStateRequirement::Retained
+            } else {
+                InferenceStateRequirement::Stateless
+            },
         })
     }
 }
@@ -507,7 +513,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Invocation,
+            state_requirement: InferenceStateRequirement::Stateless,
         })
     }
 }
@@ -524,7 +530,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Invocation,
+            state_requirement: InferenceStateRequirement::Stateless,
         })
     }
 }
@@ -543,7 +549,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Invocation,
+                state_requirement: InferenceStateRequirement::Stateless,
             })
     }
 }
