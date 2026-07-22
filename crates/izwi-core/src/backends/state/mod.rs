@@ -2,11 +2,10 @@
 //!
 //! This module deliberately contains no tensor allocation. It resolves the
 //! physical choices a backend is prepared to implement and attests only
-//! operation sets that are complete today. In particular, the current KV
-//! arenas expose in-place writes and one-query paged decode, but no backend
-//! paged-prefill operation. Consequently paged plan negotiation currently
-//! fails closed instead of assigning a name to an operation that does not
-//! exist.
+//! operation sets that are complete today. KV arenas expose in-place writes,
+//! ragged causal prefill/extend, and paged decode without materializing K/V or
+//! expanding grouped-query heads. Resource negotiation remains fail-closed
+//! until the selected allocator can attest exact envelopes.
 
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
@@ -103,18 +102,17 @@ impl StateBackendRegistry {
         match self.backend {
             BackendKind::Cpu => PagedOperationAvailability {
                 write: true,
-                // The CPU arena currently implements one-query decode only.
-                prefill: false,
+                prefill: true,
                 decode: true,
             },
             BackendKind::Metal => PagedOperationAvailability {
                 write: cfg!(feature = "metal"),
-                prefill: false,
+                prefill: cfg!(feature = "metal"),
                 decode: cfg!(feature = "metal"),
             },
             BackendKind::Cuda => PagedOperationAvailability {
                 write: cfg!(feature = "cuda"),
-                prefill: false,
+                prefill: cfg!(feature = "flash-attn"),
                 decode: cfg!(feature = "flash-attn"),
             },
         }
@@ -244,8 +242,9 @@ impl StateResourceRegistry for StateBackendRegistry {
 
 /// Resolve a complete semantic retained-state contract for one backend.
 ///
-/// Today this returns a precise missing-operation error for paged contracts,
-/// because no backend implements the required multi-query paged-prefill ABI.
+/// Complete paged contracts resolve only when the selected build contains all
+/// three physical operations. Unsupported domains and unavailable accelerator
+/// kernels continue to fail closed.
 pub(crate) fn negotiate_state_plan(
     contract: &InferenceStateContract,
     request: &StateBackendPlanRequest,
@@ -579,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_policy_is_real_but_complete_operation_attestation_is_closed() {
+    fn cpu_policy_attests_the_complete_direct_paged_operation_set() {
         let contract = test_contract();
         let spec = paged_spec(&contract);
         let policy = resolve_paged_policy(spec, &request(BackendKind::Cpu)).unwrap();
@@ -591,12 +590,13 @@ mod tests {
             registry.paged_operation_availability(),
             PagedOperationAvailability {
                 write: true,
-                prefill: false,
+                prefill: true,
                 decode: true,
             }
         );
-        let error = negotiate_state_plan(&contract, &request(BackendKind::Cpu)).unwrap_err();
-        assert!(error.to_string().contains("missing paged_prefill"));
+        let plan = negotiate_state_plan(&contract, &request(BackendKind::Cpu)).unwrap();
+        assert_eq!(plan.backend, BackendKind::Cpu);
+        assert_eq!(plan.paged_attention.len(), 1);
     }
 
     #[test]
@@ -627,20 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn accelerator_operation_registry_never_invents_paged_prefill() {
+    fn accelerator_operation_registry_tracks_compiled_direct_paged_support() {
         let metal = StateBackendRegistry::new(BackendKind::Metal, Some(0)).unwrap();
         let metal_operations = metal.paged_operation_availability();
         assert_eq!(metal_operations.write, cfg!(feature = "metal"));
         assert_eq!(metal_operations.decode, cfg!(feature = "metal"));
-        assert!(!metal_operations.prefill);
-        assert!(!metal_operations.complete());
+        assert_eq!(metal_operations.prefill, cfg!(feature = "metal"));
+        assert_eq!(metal_operations.complete(), cfg!(feature = "metal"));
 
         let cuda = StateBackendRegistry::new(BackendKind::Cuda, Some(0)).unwrap();
         let cuda_operations = cuda.paged_operation_availability();
         assert_eq!(cuda_operations.write, cfg!(feature = "cuda"));
         assert_eq!(cuda_operations.decode, cfg!(feature = "flash-attn"));
-        assert!(!cuda_operations.prefill);
-        assert!(!cuda_operations.complete());
+        assert_eq!(cuda_operations.prefill, cfg!(feature = "flash-attn"));
+        assert_eq!(cuda_operations.complete(), cfg!(feature = "flash-attn"));
     }
 
     #[test]

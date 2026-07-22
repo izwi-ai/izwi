@@ -108,6 +108,28 @@ pub struct KvPagedDecodeArgs<'a> {
     pub softmax_scale: f32,
 }
 
+/// One ragged row in a multi-query paged prefill/extend operation.
+///
+/// `context_len` is the visible context after the final query token has been
+/// written. Earlier query tokens observe the causal prefix ending at their own
+/// position, so no dense causal mask or repeated KV heads are materialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvPagedPrefillRow {
+    pub blocks: Vec<CacheBlockRef>,
+    pub first_page_offset: u32,
+    pub query_start: u32,
+    pub query_len: u32,
+    pub context_len: u32,
+}
+
+/// Ragged multi-query attention over authoritative paged arena storage.
+pub struct KvPagedPrefillArgs<'a> {
+    /// `[total_queries, query_heads, key_head_dim]`, flattened row-major.
+    pub queries: &'a Tensor,
+    pub rows: &'a [KvPagedPrefillRow],
+    pub softmax_scale: f32,
+}
+
 /// Completion token for an ordered backend mutation.
 pub trait KvDeviceFence: Send + Sync {
     fn is_complete(&self) -> bool;
@@ -130,6 +152,84 @@ pub trait KvArena: Send + Sync {
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence>;
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
     fn write_slots(&self, layer: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence>;
+    /// Direct paged prefill/extend. Backends may fuse this operation; the
+    /// portable default remains page-native by issuing the already-attested
+    /// direct decode operation for each causal query position.
+    fn paged_prefill(&self, layer: KvLayerBinding, args: KvPagedPrefillArgs<'_>) -> Result<Tensor> {
+        let query_dims = args.queries.dims();
+        if query_dims.len() != 3 {
+            return Err(crate::Error::InferenceError(format!(
+                "paged prefill queries must have rank 3, got {query_dims:?}"
+            )));
+        }
+        if args.rows.is_empty() || !args.softmax_scale.is_finite() || args.softmax_scale <= 0.0 {
+            return Err(crate::Error::InferenceError(
+                "paged prefill requires rows and a finite positive scale".into(),
+            ));
+        }
+
+        let mut next_query = 0_u32;
+        let mut outputs = Vec::with_capacity(query_dims[0]);
+        for row in args.rows {
+            if row.query_start != next_query
+                || row.query_len == 0
+                || row.query_len > row.context_len
+                || row.first_page_offset >= self.config().page_tokens
+            {
+                return Err(crate::Error::InferenceError(
+                    "paged prefill rows are not canonical valid causal ranges".into(),
+                ));
+            }
+            let prefix_len = row.context_len - row.query_len;
+            for local_query in 0..row.query_len {
+                let visible = prefix_len
+                    .checked_add(local_query)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| {
+                        crate::Error::InferenceError("paged prefill context overflow".into())
+                    })?;
+                let physical_tokens =
+                    visible.checked_add(row.first_page_offset).ok_or_else(|| {
+                        crate::Error::InferenceError("paged prefill physical range overflow".into())
+                    })?;
+                let required_pages = physical_tokens.div_ceil(self.config().page_tokens) as usize;
+                if required_pages == 0 || required_pages > row.blocks.len() {
+                    return Err(crate::Error::InferenceError(
+                        "paged prefill block table does not cover its causal context".into(),
+                    ));
+                }
+                let query_index = row.query_start.checked_add(local_query).ok_or_else(|| {
+                    crate::Error::InferenceError("paged prefill query index overflow".into())
+                })?;
+                let query = args.queries.narrow(0, query_index as usize, 1)?;
+                let batch = KvDecodeBatchMetadata {
+                    sequences: vec![crate::kv::KvSequenceBlockTable {
+                        blocks: row.blocks[..required_pages].to_vec(),
+                        first_page_offset: row.first_page_offset,
+                        context_len: visible,
+                    }],
+                };
+                outputs.push(self.paged_decode(
+                    layer,
+                    KvPagedDecodeArgs {
+                        queries: &query,
+                        batch: &batch,
+                        softmax_scale: args.softmax_scale,
+                    },
+                )?);
+            }
+            next_query = next_query.checked_add(row.query_len).ok_or_else(|| {
+                crate::Error::InferenceError("paged prefill query range overflow".into())
+            })?;
+        }
+        if next_query as usize != query_dims[0] {
+            return Err(crate::Error::InferenceError(
+                "paged prefill rows do not cover every query exactly once".into(),
+            ));
+        }
+        let outputs = outputs.iter().collect::<Vec<_>>();
+        Tensor::cat(&outputs, 0).map_err(crate::Error::from)
+    }
     fn paged_decode(&self, layer: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor>;
 
     fn operation_stats(&self) -> KvArenaOperationStats {

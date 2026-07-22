@@ -14,7 +14,7 @@ use crate::Result;
 
 use super::{
     DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvBackendRuntime, KvDeviceFence,
-    KvPageCopy, KvPagedDecodeArgs, KvSlotMap, KvWriteArgs,
+    KvPageCopy, KvPagedDecodeArgs, KvPagedPrefillArgs, KvSlotMap, KvWriteArgs,
 };
 
 #[derive(Debug)]
@@ -432,6 +432,146 @@ impl KvArena for CpuKvArena {
         .to_dtype(self.config.dtype)?;
         self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(output)
+    }
+
+    fn paged_prefill(
+        &self,
+        binding: KvLayerBinding,
+        args: KvPagedPrefillArgs<'_>,
+    ) -> Result<Tensor> {
+        let layer = self.layer(binding)?;
+        let query_dims = args.queries.dims();
+        if query_dims.len() != 3 || query_dims[2] != layer.key_head_dim {
+            return Err(Error::InferenceError(format!(
+                "CPU paged prefill query shape {query_dims:?} does not match key head dimension {}",
+                layer.key_head_dim
+            )));
+        }
+        let query_heads = query_dims[1];
+        if query_heads == 0 || query_heads % layer.num_kv_heads != 0 {
+            return Err(Error::InferenceError(
+                "CPU paged prefill query heads are incompatible with KV heads".into(),
+            ));
+        }
+        if !args.softmax_scale.is_finite() || args.softmax_scale <= 0.0 {
+            return Err(Error::InferenceError(
+                "CPU paged prefill softmax scale must be finite and positive".into(),
+            ));
+        }
+        validate_decode_query(args.queries, self.config.dtype)?;
+
+        let mut tables = Vec::with_capacity(query_dims[0]);
+        let mut next_query = 0_u32;
+        for (row_index, row) in args.rows.iter().enumerate() {
+            if row.query_start != next_query
+                || row.query_len == 0
+                || row.query_len > row.context_len
+                || row.first_page_offset >= self.config.page_tokens
+            {
+                return Err(Error::InferenceError(format!(
+                    "CPU paged prefill row {row_index} is not a canonical causal range"
+                )));
+            }
+            let pages = row
+                .blocks
+                .iter()
+                .copied()
+                .map(|block| self.validate_block(block))
+                .collect::<Result<Vec<_>>>()?;
+            let prefix_len = row.context_len - row.query_len;
+            for local_query in 0..row.query_len {
+                let context_len = prefix_len
+                    .checked_add(local_query)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| Error::InferenceError("prefill context overflow".into()))?;
+                let physical_tokens =
+                    context_len
+                        .checked_add(row.first_page_offset)
+                        .ok_or_else(|| {
+                            Error::InferenceError("prefill physical range overflow".into())
+                        })?;
+                let required_pages =
+                    (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
+                if required_pages == 0 || required_pages > pages.len() {
+                    return Err(Error::InferenceError(format!(
+                        "CPU paged prefill row {row_index} has an incomplete block table"
+                    )));
+                }
+                tables.push(LoweredDecodeRow {
+                    pages: pages[..required_pages].to_vec(),
+                    first_page_offset: row.first_page_offset as usize,
+                    context_len: context_len as usize,
+                });
+            }
+            next_query = next_query
+                .checked_add(row.query_len)
+                .ok_or_else(|| Error::InferenceError("prefill query range overflow".into()))?;
+        }
+        if next_query as usize != query_dims[0] || tables.is_empty() {
+            return Err(Error::InferenceError(
+                "CPU paged prefill rows do not cover every query exactly once".into(),
+            ));
+        }
+
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let (key_storage, key_layout) = layer.keys.storage_and_layout();
+        let (value_storage, value_layout) = layer.values.storage_and_layout();
+        let (query_storage, query_layout) = args.queries.storage_and_layout();
+        let key_start = contiguous_range(key_layout, "kv-paged-prefill-cpu")?.0;
+        let value_start = contiguous_range(value_layout, "kv-paged-prefill-cpu")?.0;
+        let query_start = contiguous_range(query_layout, "kv-paged-prefill-cpu")?.0;
+
+        macro_rules! prefill_typed {
+            ($keys:expr, $values:expr, $queries:expr) => {
+                online_paged_decode(
+                    $keys,
+                    $values,
+                    $queries,
+                    key_start,
+                    value_start,
+                    query_start,
+                    &tables,
+                    self.config.page_tokens as usize,
+                    layer.num_kv_heads,
+                    layer.key_head_dim,
+                    layer.value_head_dim,
+                    query_heads,
+                    args.softmax_scale,
+                )
+            };
+        }
+        let output = match (&*key_storage, &*value_storage, &*query_storage) {
+            (
+                Storage::Cpu(CpuStorage::F32(k)),
+                Storage::Cpu(CpuStorage::F32(v)),
+                Storage::Cpu(CpuStorage::F32(q)),
+            ) => prefill_typed!(k, v, q),
+            (
+                Storage::Cpu(CpuStorage::F16(k)),
+                Storage::Cpu(CpuStorage::F16(v)),
+                Storage::Cpu(CpuStorage::F16(q)),
+            ) => prefill_typed!(k, v, q),
+            (
+                Storage::Cpu(CpuStorage::BF16(k)),
+                Storage::Cpu(CpuStorage::BF16(v)),
+                Storage::Cpu(CpuStorage::BF16(q)),
+            ) => prefill_typed!(k, v, q),
+            _ => {
+                return Err(Error::InferenceError(
+                    "CPU paged prefill storage dtype mismatch".into(),
+                ))
+            }
+        }?;
+        Tensor::from_vec(
+            output,
+            (query_dims[0], query_heads, layer.value_head_dim),
+            &Device::Cpu,
+        )?
+        .to_dtype(self.config.dtype)
+        .map_err(Error::from)
     }
 
     fn operation_stats(&self) -> KvArenaOperationStats {
@@ -907,7 +1047,7 @@ mod tests {
     use candle_core::IndexOp;
 
     use super::*;
-    use crate::backends::kv::KvLayerConfig;
+    use crate::backends::kv::{KvLayerConfig, KvPagedPrefillRow};
     use crate::engine::ModelInstanceId;
     use crate::kv::{KvDecodeBatchMetadata, KvGroupId, KvSequenceBlockTable, KvSlotRef};
 
@@ -1413,6 +1553,85 @@ mod tests {
             for (actual, expected) in actual.iter().zip(expected) {
                 assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn paged_prefill_matches_ragged_causal_dense_attention() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let physical_slots = (0..3)
+            .flat_map(|page| {
+                (0..2).map(move |offset| KvSlotRef {
+                    block: block(page),
+                    offset,
+                })
+            })
+            .collect::<Vec<_>>();
+        let slot_map = arena.lower_slots(&physical_slots)?;
+        let keys = vec![
+            1., 0., 0., 1., 0., 1., 1., 0., 1., 1., 1., -1., -1., 1., 2., 1., 2., 0., 0., 2., 0.,
+            2., 2., 0.,
+        ];
+        let values = vec![1., 10., 2., 20., 3., 30., 4., 40., 5., 50., 6., 60.];
+        let key_tensor = Tensor::from_vec(keys.clone(), (6, 2, 2), &Device::Cpu)?;
+        let value_tensor = Tensor::from_vec(values.clone(), (6, 2, 1), &Device::Cpu)?;
+        arena.write_slots(
+            LAYER,
+            KvWriteArgs {
+                keys: &key_tensor,
+                values: &value_tensor,
+                slots: slot_map.as_ref(),
+            },
+        )?;
+
+        let query_values = vec![
+            1., 0., 0., 1., 1., 1., 1., -1., // row 0 query 0
+            0.5, 1., 1., 0.5, -1., 1., 1., 1., // row 0 query 1
+            1., 0.5, 0.5, 1., 1., -0.5, -0.5, 1., // row 1 query 0
+        ];
+        let queries = Tensor::from_vec(query_values.clone(), (3, 4, 2), &Device::Cpu)?;
+        let rows = vec![
+            KvPagedPrefillRow {
+                blocks: vec![block(2), block(0)],
+                first_page_offset: 1,
+                query_start: 0,
+                query_len: 2,
+                context_len: 3,
+            },
+            KvPagedPrefillRow {
+                blocks: vec![block(1)],
+                first_page_offset: 0,
+                query_start: 2,
+                query_len: 1,
+                context_len: 1,
+            },
+        ];
+        let scale = 1.0 / 2.0f32.sqrt();
+        let actual = arena
+            .paged_prefill(
+                LAYER,
+                KvPagedPrefillArgs {
+                    queries: &queries,
+                    rows: &rows,
+                    softmax_scale: scale,
+                },
+            )?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = dense_reference(
+            &query_values,
+            4,
+            &keys,
+            &values,
+            2,
+            2,
+            1,
+            &[vec![5, 0], vec![5, 0, 1], vec![2]],
+            scale,
+        );
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
         Ok(())
     }
