@@ -101,7 +101,7 @@ pub struct KvWriteArgs<'a> {
 }
 
 /// One-token-per-row paged decode over authoritative arena storage.
-pub struct KvPagedDecodeArgs<'a> {
+pub struct PagedKvDecodeArgs<'a> {
     /// `[batch, query_heads, key_head_dim]`.
     pub queries: &'a Tensor,
     pub batch: &'a KvDecodeBatchMetadata,
@@ -114,7 +114,7 @@ pub struct KvPagedDecodeArgs<'a> {
 /// written. Earlier query tokens observe the causal prefix ending at their own
 /// position, so no dense causal mask or repeated KV heads are materialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvPagedPrefillRow {
+pub struct PagedKvPrefillRow {
     pub blocks: Vec<CacheBlockRef>,
     pub first_page_offset: u32,
     pub query_start: u32,
@@ -123,10 +123,10 @@ pub struct KvPagedPrefillRow {
 }
 
 /// Ragged multi-query attention over authoritative paged arena storage.
-pub struct KvPagedPrefillArgs<'a> {
+pub struct PagedKvPrefillArgs<'a> {
     /// `[total_queries, query_heads, key_head_dim]`, flattened row-major.
     pub queries: &'a Tensor,
-    pub rows: &'a [KvPagedPrefillRow],
+    pub rows: &'a [PagedKvPrefillRow],
     pub softmax_scale: f32,
 }
 
@@ -155,7 +155,7 @@ pub trait KvArena: Send + Sync {
     /// Direct paged prefill/extend. Backends may fuse this operation; the
     /// portable default remains page-native by issuing the already-attested
     /// direct decode operation for each causal query position.
-    fn paged_prefill(&self, layer: KvLayerBinding, args: KvPagedPrefillArgs<'_>) -> Result<Tensor> {
+    fn paged_prefill(&self, layer: KvLayerBinding, args: PagedKvPrefillArgs<'_>) -> Result<Tensor> {
         let query_dims = args.queries.dims();
         if query_dims.len() != 3 {
             return Err(crate::Error::InferenceError(format!(
@@ -211,7 +211,7 @@ pub trait KvArena: Send + Sync {
                 };
                 outputs.push(self.paged_decode(
                     layer,
-                    KvPagedDecodeArgs {
+                    PagedKvDecodeArgs {
                         queries: &query,
                         batch: &batch,
                         softmax_scale: args.softmax_scale,
@@ -230,7 +230,7 @@ pub trait KvArena: Send + Sync {
         let outputs = outputs.iter().collect::<Vec<_>>();
         Tensor::cat(&outputs, 0).map_err(crate::Error::from)
     }
-    fn paged_decode(&self, layer: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor>;
+    fn paged_decode(&self, layer: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor>;
 
     fn operation_stats(&self) -> KvArenaOperationStats {
         KvArenaOperationStats::default()

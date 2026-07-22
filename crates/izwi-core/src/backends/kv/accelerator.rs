@@ -13,7 +13,7 @@ use crate::Result;
 use super::KvBackendRuntime;
 use super::{
     DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvDeviceFence, KvPageCopy,
-    KvPagedDecodeArgs, KvSlotMap, KvWriteArgs,
+    KvSlotMap, KvWriteArgs, PagedKvDecodeArgs,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -348,7 +348,7 @@ impl CandleAcceleratorKvArena {
     fn cuda_paged_decode(
         &self,
         layer: &AcceleratorLayerStorage,
-        args: KvPagedDecodeArgs<'_>,
+        args: PagedKvDecodeArgs<'_>,
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
         let (table, seqlens_k, first_page_offsets, max_blocks, max_context) =
@@ -390,7 +390,7 @@ impl CandleAcceleratorKvArena {
     fn metal_paged_decode(
         &self,
         layer: &AcceleratorLayerStorage,
-        args: KvPagedDecodeArgs<'_>,
+        args: PagedKvDecodeArgs<'_>,
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
         let num_heads = args.queries.dims()[1];
@@ -572,7 +572,7 @@ impl KvArena for CandleAcceleratorKvArena {
         self.mutation_fence()
     }
 
-    fn paged_decode(&self, binding: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor> {
+    fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
         if !candle_accelerator_kv_support(self.backend).direct_paged_attention {
             return Err(Error::InferenceError(format!(
                 "direct paged attention is not compiled for {:?}",
@@ -845,7 +845,7 @@ fn validate_write_tensor(
 
 fn validate_decode_query(
     layer: &AcceleratorLayerStorage,
-    args: &KvPagedDecodeArgs<'_>,
+    args: &PagedKvDecodeArgs<'_>,
     dtype: DType,
     device: &Device,
     backend: BackendKind,
@@ -1071,7 +1071,7 @@ mod tests {
                         .to_dtype(dtype)?;
                 let metal_output = metal_arena.paged_decode(
                     binding,
-                    KvPagedDecodeArgs {
+                    PagedKvDecodeArgs {
                         queries: &metal_query,
                         batch: &metal_batch,
                         softmax_scale: 0.5,
@@ -1079,7 +1079,7 @@ mod tests {
                 )?;
                 let cpu_output = cpu_arena.paged_decode(
                     binding,
-                    KvPagedDecodeArgs {
+                    PagedKvDecodeArgs {
                         queries: &cpu_query,
                         batch: &cpu_batch,
                         softmax_scale: 0.5,

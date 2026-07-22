@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use crate::backends::kv::{KvArena, KvPagedDecodeArgs, KvWriteArgs};
+use crate::backends::kv::{KvArena, KvWriteArgs, PagedKvDecodeArgs};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::{
@@ -2150,7 +2150,7 @@ impl Qwen3Attention {
             };
             let out = cache.arena.paged_decode(
                 cache.layer_binding(layer_idx)?,
-                KvPagedDecodeArgs {
+                PagedKvDecodeArgs {
                     queries: &queries,
                     batch: &metadata,
                     softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
@@ -2265,7 +2265,7 @@ impl Qwen3Attention {
         let metadata = KvDecodeBatchMetadata { sequences };
         let out = first.arena.paged_decode(
             binding,
-            KvPagedDecodeArgs {
+            PagedKvDecodeArgs {
                 queries: &queries,
                 batch: &metadata,
                 softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),

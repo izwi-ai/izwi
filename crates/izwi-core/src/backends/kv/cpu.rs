@@ -14,7 +14,7 @@ use crate::Result;
 
 use super::{
     DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvBackendRuntime, KvDeviceFence,
-    KvPageCopy, KvPagedDecodeArgs, KvPagedPrefillArgs, KvSlotMap, KvWriteArgs,
+    KvPageCopy, KvSlotMap, KvWriteArgs, PagedKvDecodeArgs, PagedKvPrefillArgs,
 };
 
 #[derive(Debug)]
@@ -326,7 +326,7 @@ impl KvArena for CpuKvArena {
         Ok(ready_fence())
     }
 
-    fn paged_decode(&self, binding: KvLayerBinding, args: KvPagedDecodeArgs<'_>) -> Result<Tensor> {
+    fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
         let layer = self.layer(binding)?;
         let query_dims = args.queries.dims();
         if query_dims.len() != 3 {
@@ -437,7 +437,7 @@ impl KvArena for CpuKvArena {
     fn paged_prefill(
         &self,
         binding: KvLayerBinding,
-        args: KvPagedPrefillArgs<'_>,
+        args: PagedKvPrefillArgs<'_>,
     ) -> Result<Tensor> {
         let layer = self.layer(binding)?;
         let query_dims = args.queries.dims();
@@ -1047,7 +1047,7 @@ mod tests {
     use candle_core::IndexOp;
 
     use super::*;
-    use crate::backends::kv::{KvLayerConfig, KvPagedPrefillRow};
+    use crate::backends::kv::{KvLayerConfig, PagedKvPrefillRow};
     use crate::engine::ModelInstanceId;
     use crate::kv::{KvDecodeBatchMetadata, KvGroupId, KvSequenceBlockTable, KvSlotRef};
 
@@ -1457,7 +1457,7 @@ mod tests {
         let actual = arena
             .paged_decode(
                 LAYER,
-                KvPagedDecodeArgs {
+                PagedKvDecodeArgs {
                     queries: &queries,
                     batch: &batch,
                     softmax_scale: scale,
@@ -1531,7 +1531,7 @@ mod tests {
             let actual = arena
                 .paged_decode(
                     LAYER,
-                    KvPagedDecodeArgs {
+                    PagedKvDecodeArgs {
                         queries: &queries,
                         batch: &batch,
                         softmax_scale: 0.5,
@@ -1592,14 +1592,14 @@ mod tests {
         ];
         let queries = Tensor::from_vec(query_values.clone(), (3, 4, 2), &Device::Cpu)?;
         let rows = vec![
-            KvPagedPrefillRow {
+            PagedKvPrefillRow {
                 blocks: vec![block(2), block(0)],
                 first_page_offset: 1,
                 query_start: 0,
                 query_len: 2,
                 context_len: 3,
             },
-            KvPagedPrefillRow {
+            PagedKvPrefillRow {
                 blocks: vec![block(1)],
                 first_page_offset: 0,
                 query_start: 2,
@@ -1611,7 +1611,7 @@ mod tests {
         let actual = arena
             .paged_prefill(
                 LAYER,
-                KvPagedPrefillArgs {
+                PagedKvPrefillArgs {
                     queries: &queries,
                     rows: &rows,
                     softmax_scale: scale,

@@ -7,8 +7,8 @@
 use crate::error::{Error, Result};
 use crate::kv::{
     AttentionSemantics as V1Attention, CacheTokenAxis, KeyEncoding as V1KeyEncoding,
-    KvCacheContract, KvDomainSpec, KvPrefixSemantics, KvStorageDType, ModelStateKind,
-    PositionSemantics as V1Position,
+    KvCacheContract, KvDomainSpec as LegacyDomain, KvPrefixSemantics, KvStorageDType,
+    ModelStateKind, PositionSemantics as V1Position,
 };
 
 use super::{
@@ -33,7 +33,7 @@ pub(crate) fn upgrade_kv_contract_v1(contract: &KvCacheContract) -> Result<Infer
                 .ok_or_else(|| invalid("v1 cache domain id cannot be represented in v2"))?,
         );
         let (domain, prefix_shareable) = match source {
-            KvDomainSpec::PagedAttention(spec) => {
+            LegacyDomain::PagedAttention(spec) => {
                 let prefix = paged_prefix(&spec.prefix_semantics);
                 let prefix_shareable = !matches!(prefix, PrefixPolicy::Disabled);
                 let layers = spec
@@ -88,7 +88,7 @@ pub(crate) fn upgrade_kv_contract_v1(contract: &KvCacheContract) -> Result<Infer
                     prefix_shareable,
                 )
             }
-            KvDomainSpec::ModelState(spec) => {
+            LegacyDomain::ModelState(spec) => {
                 let prefix_shareable = matches!(
                     spec.prefix_semantics,
                     KvPrefixSemantics::CommittedFullPages { .. }
