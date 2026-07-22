@@ -13,6 +13,7 @@ mod descriptor;
 mod intent;
 mod resolved;
 mod resolved_domains;
+mod runtime;
 
 #[allow(unused_imports)]
 pub(crate) use batch::{
@@ -65,6 +66,8 @@ pub(crate) use resolved_domains::{
     ResolvedTensorStatePlan, RingStateOperationSet, StaticAttentionOperationSet,
     StaticTensorOperationSet, TensorPhysicalLayout, TensorStateOperationSet,
 };
+#[allow(unused_imports)]
+pub(crate) use runtime::StatelessCapabilityRuntimeV2;
 
 #[cfg(test)]
 pub(crate) use contract::test_contract;

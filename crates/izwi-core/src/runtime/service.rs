@@ -823,13 +823,14 @@ fn bind_request_to_residency(
             }
             request.bind_cache_capability(cache)?
         }
-        CapabilityStateBinding::V2(descriptor) => request.bind_v2_state_descriptor(
-            descriptor,
+        CapabilityStateBinding::V2(runtime) => request.bind_v2_state_runtime(
+            runtime,
             state_fingerprint.ok_or_else(|| {
                 Error::InferenceError(
                     "v2 capability is missing its sealed state fingerprint".to_string(),
                 )
             })?,
+            bundle.backend_kind(),
         )?,
     }
     Ok(())
@@ -887,11 +888,8 @@ fn loaded_contract_for_residency(
         capability,
         StreamingRequirements::native(streaming_required),
     )?;
-    if matches!(state_binding.state, CapabilityStateBinding::V2(_)) {
-        return Err(Error::InferenceError(
-            "direct capability execution requires a resolved v2 physical state/workspace runtime"
-                .to_string(),
-        ));
+    if let CapabilityStateBinding::V2(runtime) = state_binding.state {
+        runtime.validate_against(backend_kind, &state_binding.execution)?;
     }
     Ok(contract)
 }
@@ -3119,9 +3117,8 @@ mod tests {
     fn residency_binding_preserves_v2_state_without_opaque_fallback() {
         let residency = crate::model::ModelResidency::default();
         let instance = crate::engine::ModelInstanceId::new(20);
-        let variant = ModelVariant::Qwen306B;
+        let variant = ModelVariant::Kokoro82M;
         let lease = residency.acquire_instance_lease(variant, instance);
-        let contract = crate::kv::v2::test_contract();
         let registry = RuntimeAdapterRegistry::built_in();
         let compatibility = LoadedModelBundle::bind(
             &registry,
@@ -3131,12 +3128,35 @@ mod tests {
             BackendKind::Cpu,
         )
         .expect("compatibility bundle");
-        let stages = compatibility
-            .contract(CapabilityKind::Chat, false)
-            .expect("chat contract")
+        let offline = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .expect("offline TTS contract")
+            .stages;
+        let transport = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::transport_only())
+            .expect("transport TTS contract")
+            .stages;
+        let native = compatibility
+            .contract_for_streaming(
+                CapabilityKind::Tts,
+                StreamingRequirements {
+                    transport_output: false,
+                    model_native: true,
+                },
+            )
+            .expect("native TTS contract")
+            .stages;
+        let native_transport = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::native(true))
+            .expect("native transport TTS contract")
             .stages;
         let descriptor =
-            crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(contract, &stages);
+            crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stage_graphs_test(&[
+                &offline,
+                &transport,
+                &native,
+                &native_transport,
+            ]);
         let bundle = LoadedModelBundle::bind_with_state_publications(
             &registry,
             crate::engine::ExecutionGroupId::new(3),
@@ -3144,12 +3164,12 @@ mod tests {
             variant,
             BackendKind::Cpu,
             HashMap::from([(
-                CapabilityKind::Chat,
+                CapabilityKind::Tts,
                 crate::runtime::adapters::LoadedStatePublication::V2(descriptor.clone()),
             )]),
         )
         .expect("v2 loaded bundle");
-        let mut request = EngineCoreRequest::chat(Vec::new()).with_model_variant(variant);
+        let mut request = EngineCoreRequest::tts("stateless").with_model_variant(variant);
 
         bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
             .expect("matching v2 loaded capability descriptor");
@@ -3157,25 +3177,27 @@ mod tests {
         assert_eq!(request.v2_state_descriptor(), Some(&descriptor));
         assert_eq!(
             request.v2_state_fingerprint(),
-            Some(descriptor.fingerprint(&stages).unwrap())
+            Some(descriptor.fingerprint(&offline).unwrap())
         );
+        assert!(request.v2_stateless_runtime().is_some());
         assert_eq!(
             request.cache_capability(),
-            &crate::kv::CacheCapability::OpaqueModelOwned
+            &crate::kv::CacheCapability::None
         );
-        let direct_error = loaded_contract_for_residency(
+        assert!(request
+            .bind_cache_capability(crate::kv::CacheCapability::OpaqueModelOwned)
+            .is_err());
+        let direct = loaded_contract_for_residency(
             &lease,
             Some(&bundle),
-            CapabilityKind::Chat,
+            CapabilityKind::Tts,
             false,
             crate::engine::ExecutionGroupId::new(3),
             BackendKind::Cpu,
             None,
         )
-        .expect_err("direct runners must not discard a v2 physical state descriptor");
-        assert!(direct_error
-            .to_string()
-            .contains("resolved v2 physical state/workspace runtime"));
+        .expect("direct runners may use a load-sealed stateless v2 runtime");
+        assert_eq!(direct.model_instance_id, instance);
     }
 
     #[test]

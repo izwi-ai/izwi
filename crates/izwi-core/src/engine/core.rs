@@ -1527,10 +1527,18 @@ impl EngineCore {
 
         if let Some(model_instance) = request.model_instance_id() {
             if request.v2_state_descriptor().is_some() {
-                return Err(Error::InferenceError(format!(
-                    "model instance {} published state ABI v2 before a resolved v2 runtime was installed",
-                    model_instance.get()
-                )));
+                let runtime = request.v2_stateless_runtime().ok_or_else(|| {
+                    Error::InferenceError(format!(
+                        "model instance {} published state ABI v2 before a resolved v2 runtime was installed",
+                        model_instance.get()
+                    ))
+                })?;
+                let execution = request.execution_adapter_binding().ok_or_else(|| {
+                    Error::InferenceError(
+                        "state ABI v2 runtime has no bound execution adapter".to_string(),
+                    )
+                })?;
+                runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
             }
             let capability = request.cache_capability().clone();
             if capability.managed_contract().is_some() {
@@ -3333,6 +3341,72 @@ mod tests {
             .expect_err("v2 must never fall back to model-owned execution");
         assert!(error.to_string().contains("resolved v2 runtime"));
         assert_eq!(core.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn load_sealed_stateless_v2_runtime_enters_the_engine() {
+        let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let instance = ModelInstanceId::new(102);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(0),
+            "tts.compatibility",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let execution = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(
+            &execution.stages,
+        );
+        let runtime = Arc::new(
+            crate::kv::v2::StatelessCapabilityRuntimeV2::seal(
+                BackendKind::Cpu,
+                &execution,
+                descriptor,
+            )
+            .unwrap(),
+        );
+        let mut request = EngineCoreRequest::tts("v2 stateless").with_model_variant(variant);
+        request.bind_execution_adapter(execution.clone()).unwrap();
+        request
+            .bind_v2_state_runtime(runtime.clone(), runtime.state_fingerprint, BackendKind::Cpu)
+            .unwrap();
+
+        core.add_request(request).unwrap();
+        assert_eq!(core.pending_request_count(), 1);
+
+        let cuda_descriptor = crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(
+            &execution.stages,
+        );
+        let cuda_runtime = Arc::new(
+            crate::kv::v2::StatelessCapabilityRuntimeV2::seal(
+                BackendKind::Cuda,
+                &execution,
+                cuda_descriptor,
+            )
+            .unwrap(),
+        );
+        let mut mismatched = EngineCoreRequest::tts("wrong backend").with_model_variant(variant);
+        mismatched.bind_execution_adapter(execution).unwrap();
+        mismatched
+            .bind_v2_state_runtime(
+                cuda_runtime.clone(),
+                cuda_runtime.state_fingerprint,
+                BackendKind::Cuda,
+            )
+            .unwrap();
+        assert!(core.add_request(mismatched).is_err());
+        assert_eq!(core.pending_request_count(), 1);
     }
 
     #[tokio::test]

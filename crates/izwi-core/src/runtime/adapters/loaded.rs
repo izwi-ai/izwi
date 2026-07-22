@@ -10,7 +10,9 @@ use crate::engine::{
     NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
-use crate::kv::v2::CapabilityStateDescriptorV2;
+use crate::kv::v2::{
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, StatelessCapabilityRuntimeV2,
+};
 use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 
@@ -138,10 +140,12 @@ impl LoadedStatePublication {
         }
     }
 
-    fn binding(&self) -> CapabilityStateBinding {
+    fn legacy_binding(&self) -> Result<CapabilityStateBinding> {
         match self {
-            Self::LegacyV1(cache) => CapabilityStateBinding::LegacyV1(cache.capability.clone()),
-            Self::V2(descriptor) => CapabilityStateBinding::V2(descriptor.clone()),
+            Self::LegacyV1(cache) => Ok(CapabilityStateBinding::LegacyV1(cache.capability.clone())),
+            Self::V2(_) => Err(Error::ModelLoadError(
+                "state ABI v2 requires an immutable load-sealed runtime binding".to_string(),
+            )),
         }
     }
 
@@ -162,16 +166,82 @@ impl LoadedStatePublication {
 pub(crate) struct LoadedCapabilityDescriptor {
     execution: Arc<dyn LoadedExecutionAdapter>,
     state: LoadedStatePublication,
+    stateless_v2_runtimes: HashMap<[u8; 32], Arc<StatelessCapabilityRuntimeV2>>,
 }
 
 impl LoadedCapabilityDescriptor {
     fn new(
         execution: Arc<dyn LoadedExecutionAdapter>,
         state: LoadedStatePublication,
+        backend_kind: BackendKind,
     ) -> Result<Self> {
         let execution_contract = execution.contract(StreamingRequirements::NONE)?;
         state.validate(&execution_contract.stages)?;
-        Ok(Self { execution, state })
+        let mut stateless_v2_runtimes = HashMap::new();
+        if let LoadedStatePublication::V2(descriptor) = &state {
+            if !descriptor.is_stateless()
+                || !descriptor.has_zero_invocation_workspace_for(&execution_contract.stages)?
+            {
+                return Err(Error::ModelLoadError(
+                    "managed or workspace-bearing state ABI v2 requires a physical backend runtime before Ready publication".to_string(),
+                ));
+            }
+
+            let metadata = execution.metadata();
+            let mut requirements = vec![
+                StreamingRequirements::NONE,
+                StreamingRequirements::transport_only(),
+            ];
+            if metadata.streaming_mode != StreamingMode::None {
+                requirements.push(StreamingRequirements {
+                    transport_output: false,
+                    model_native: true,
+                });
+                requirements.push(StreamingRequirements::native(true));
+            }
+            for requirements in requirements {
+                let contract = execution.contract(requirements)?;
+                if contract.execution_profile.backend != backend_kind {
+                    return Err(Error::ModelLoadError(
+                        "state ABI v2 execution contract does not match the authoritative loaded backend"
+                            .to_string(),
+                    ));
+                }
+                if contract.execution_profile.cache_mode != CacheMode::None
+                    || contract.execution_profile.cache_namespace.is_some()
+                    || contract.execution_profile.kv_dtype != "none"
+                {
+                    return Err(Error::ModelLoadError(
+                        "stateless state ABI v2 contradicts execution that declares retained cache state"
+                            .to_string(),
+                    ));
+                }
+                let binding = contract.adapter_binding()?;
+                let runtime = Arc::new(StatelessCapabilityRuntimeV2::seal(
+                    backend_kind,
+                    &binding,
+                    descriptor.clone(),
+                )?);
+                match stateless_v2_runtimes.entry(runtime.stage_graph_fingerprint) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(runtime);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        if entry.get().as_ref() != runtime.as_ref() {
+                            return Err(Error::ModelLoadError(
+                                "one state ABI v2 stage graph resolved to inconsistent runtime identities"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            execution,
+            state,
+            stateless_v2_runtimes,
+        })
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
@@ -181,10 +251,31 @@ impl LoadedCapabilityDescriptor {
     fn binding(&self, streaming: StreamingRequirements) -> Result<LoadedCapabilityBinding> {
         let contract = self.contract(streaming)?;
         self.state.validate(&contract.stages)?;
+        let execution = contract.adapter_binding()?;
+        let (state, state_fingerprint) = match &self.state {
+            LoadedStatePublication::LegacyV1(_) => (
+                self.state.legacy_binding()?,
+                self.state.fingerprint(&contract.stages)?,
+            ),
+            LoadedStatePublication::V2(_) => {
+                let graph = stage_graph_fingerprint(&contract.stages)?;
+                let runtime = self.stateless_v2_runtimes.get(&graph).ok_or_else(|| {
+                    Error::InferenceError(
+                        "selected execution graph has no load-sealed state ABI v2 runtime"
+                            .to_string(),
+                    )
+                })?;
+                runtime.validate_against(contract.execution_profile.backend, &execution)?;
+                (
+                    CapabilityStateBinding::V2(runtime.clone()),
+                    Some(runtime.state_fingerprint),
+                )
+            }
+        };
         Ok(LoadedCapabilityBinding {
-            execution: contract.adapter_binding()?,
-            state: self.state.binding(),
-            state_fingerprint: self.state.fingerprint(&contract.stages)?,
+            execution,
+            state,
+            state_fingerprint,
         })
     }
 }
@@ -200,7 +291,7 @@ pub(crate) struct LoadedCapabilityBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CapabilityStateBinding {
     LegacyV1(CacheCapability),
-    V2(CapabilityStateDescriptorV2),
+    V2(Arc<StatelessCapabilityRuntimeV2>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -738,7 +829,7 @@ impl RuntimeAdapterRegistry {
                 metadata.model_variant, metadata.capability
             )));
         }
-        LoadedCapabilityDescriptor::new(adapter, state)
+        LoadedCapabilityDescriptor::new(adapter, state, backend_kind)
     }
 }
 
@@ -967,12 +1058,106 @@ mod tests {
 
     #[test]
     fn v2_state_publication_is_preserved_without_legacy_fallback() {
-        let contract = crate::kv::v2::test_contract();
         let registry = RuntimeAdapterRegistry::built_in();
         let compatibility = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(10),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let offline = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .unwrap()
+            .stages;
+        let transport = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::transport_only())
+            .unwrap()
+            .stages;
+        let native = compatibility
+            .contract_for_streaming(
+                CapabilityKind::Tts,
+                StreamingRequirements {
+                    transport_output: false,
+                    model_native: true,
+                },
+            )
+            .unwrap()
+            .stages;
+        let native_transport = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::native(true))
+            .unwrap()
+            .stages;
+        let descriptor =
+            crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stage_graphs_test(&[
+                &offline,
+                &transport,
+                &native,
+                &native_transport,
+            ]);
+        let bundle = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(10),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+            HashMap::from([(
+                CapabilityKind::Tts,
+                LoadedStatePublication::V2(descriptor.clone()),
+            )]),
+        )
+        .unwrap();
+
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .unwrap();
+        let CapabilityStateBinding::V2(runtime) = binding.state else {
+            panic!("expected stateless v2 runtime");
+        };
+        assert_eq!(runtime.descriptor, descriptor);
+        runtime
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .unwrap();
+    }
+
+    #[test]
+    fn v2_runtime_preseals_every_selectable_stage_graph() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::Kokoro82M;
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(11),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let offline = compatibility
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .unwrap();
+        let incomplete =
+            crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(&offline.stages);
+
+        let error = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(11),
+            variant,
+            BackendKind::Cpu,
+            HashMap::from([(CapabilityKind::Tts, LoadedStatePublication::V2(incomplete))]),
+        )
+        .expect_err("missing transport/native stage graphs must fail during loading");
+        assert!(error.to_string().contains("selected stage graph"));
+    }
+
+    #[test]
+    fn managed_v2_publication_requires_a_physical_runtime_before_ready() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(12),
             ModelVariant::Qwen306B,
             BackendKind::Cpu,
         )
@@ -981,30 +1166,53 @@ mod tests {
             .contract(CapabilityKind::Chat, false)
             .unwrap()
             .stages;
-        let descriptor =
-            crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(contract, &stages);
-        let bundle = LoadedModelBundle::bind_with_state_publications(
+        let descriptor = CapabilityStateDescriptorV2::managed_for_stages_test(
+            crate::kv::v2::test_contract(),
+            &stages,
+        );
+
+        let error = LoadedModelBundle::bind_with_state_publications(
             &registry,
             ExecutionGroupId::new(3),
-            ModelInstanceId::new(10),
+            ModelInstanceId::new(12),
             ModelVariant::Qwen306B,
             BackendKind::Cpu,
-            HashMap::from([(
-                CapabilityKind::Chat,
-                LoadedStatePublication::V2(descriptor.clone()),
-            )]),
+            HashMap::from([(CapabilityKind::Chat, LoadedStatePublication::V2(descriptor))]),
+        )
+        .expect_err("managed v2 metadata alone must not publish Ready");
+        assert!(error.to_string().contains("physical backend runtime"));
+    }
+
+    #[test]
+    fn stateless_v2_rejects_execution_that_declares_model_owned_cache() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::Qwen3508BGguf;
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(13),
+            variant,
+            BackendKind::Cpu,
         )
         .unwrap();
+        let stages = compatibility
+            .contract_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
+            .unwrap()
+            .stages;
+        let descriptor = CapabilityStateDescriptorV2::stateless_for_stages_test(&stages);
 
-        assert_eq!(
-            bundle
-                .capability_binding_for_streaming(
-                    CapabilityKind::Chat,
-                    StreamingRequirements::NONE,
-                )
-                .unwrap()
-                .state,
-            CapabilityStateBinding::V2(descriptor)
+        let error = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(13),
+            variant,
+            BackendKind::Cpu,
+            HashMap::from([(CapabilityKind::Chat, LoadedStatePublication::V2(descriptor))]),
+        )
+        .expect_err("stateless v2 must not relabel an opaque sequence cache");
+        assert!(
+            error.to_string().contains("retained cache state"),
+            "unexpected error: {error}"
         );
     }
 

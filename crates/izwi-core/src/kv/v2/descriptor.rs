@@ -118,6 +118,17 @@ impl CapabilityStateDescriptorV2 {
         matches!(self.retained, RetainedStateCapability::Stateless)
     }
 
+    pub(crate) fn has_zero_invocation_workspace_for(
+        &self,
+        stages: &[StageDescriptor],
+    ) -> Result<bool> {
+        self.validate_against_stages(stages)?;
+        Ok(matches!(
+            self.invocation,
+            InvocationWorkspaceSet::None { .. }
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn managed_for_stages_test(
         contract: InferenceStateContract,
@@ -199,6 +210,28 @@ impl CapabilityStateDescriptorV2 {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::None {
                 stage_graph_fingerprints: vec![],
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stateless_for_stages_test(stages: &[StageDescriptor]) -> Self {
+        Self::stateless_for_stage_graphs_test(&[stages])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stateless_for_stage_graphs_test(stage_graphs: &[&[StageDescriptor]]) -> Self {
+        let mut stage_graph_fingerprints = stage_graphs
+            .iter()
+            .map(|stages| stage_graph_fingerprint(stages).expect("test stages must serialize"))
+            .collect::<Vec<_>>();
+        stage_graph_fingerprints.sort_unstable();
+        stage_graph_fingerprints.dedup();
+        Self {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::None {
+                stage_graph_fingerprints,
             },
         }
     }
