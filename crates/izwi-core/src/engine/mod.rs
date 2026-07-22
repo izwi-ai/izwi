@@ -38,6 +38,12 @@ mod scheduler;
 pub mod signal_frontend;
 mod types;
 
+#[allow(unused_imports)]
+pub(crate) use cache::invocation::{
+    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPool,
+    InvocationPagedKvPoolId, InvocationPagedKvSlotRef,
+};
+
 pub(crate) use cache::managed::ManagedKvModelRuntime;
 pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
