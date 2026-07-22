@@ -6,7 +6,7 @@
 //! at a time. Every range is zeroed and fenced before a model can observe it.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::DType;
 use serde::Serialize;
@@ -44,9 +44,18 @@ pub(crate) struct InvocationPagedKvSlotRef {
 /// arena. Constructing this type does not allocate device memory; the v2
 /// lifecycle allocator must supply a dedicated arena that is never registered
 /// with the retained-state coordinator.
-#[derive(Debug, Clone)]
-pub(crate) struct InvocationPagedKvPool {
+#[derive(Debug)]
+pub(crate) struct InvocationPagedKvPoolOwner {
     inner: Arc<InvocationPagedKvPoolInner>,
+}
+
+/// A request-facing generation handle that cannot keep the load-owned arena
+/// alive after its physical owner has retired.
+#[derive(Debug, Clone)]
+pub(crate) struct InvocationPagedKvPoolHandle {
+    id: InvocationPagedKvPoolId,
+    workspace_domain: InvocationWorkspaceDomain,
+    inner: Weak<InvocationPagedKvPoolInner>,
 }
 
 struct InvocationPagedKvPoolInner {
@@ -56,7 +65,7 @@ struct InvocationPagedKvPoolInner {
     layer_bindings: Vec<KvLayerBinding>,
     first_page: u32,
     pages_per_slot: u32,
-    slots: Mutex<Vec<InvocationPagedKvSlotState>>,
+    state: Mutex<InvocationPagedKvPoolState>,
 }
 
 impl std::fmt::Debug for InvocationPagedKvPoolInner {
@@ -66,9 +75,27 @@ impl std::fmt::Debug for InvocationPagedKvPoolInner {
             .field("id", &self.id)
             .field("first_page", &self.first_page)
             .field("pages_per_slot", &self.pages_per_slot)
-            .field("slot_count", &self.slots.lock().map(|slots| slots.len()))
+            .field(
+                "slot_count",
+                &self.state.lock().map(|state| state.slots.len()),
+            )
             .finish()
     }
+}
+
+#[derive(Debug)]
+struct InvocationPagedKvPoolState {
+    lifecycle: InvocationPagedKvPoolLifecycle,
+    owner_alive: bool,
+    slots: Vec<InvocationPagedKvSlotState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationPagedKvPoolLifecycle {
+    Accepting,
+    Draining,
+    DrainInFlight,
+    Drained,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +115,7 @@ impl InvocationPagedKvSlotState {
     }
 }
 
-impl InvocationPagedKvPool {
+impl InvocationPagedKvPoolOwner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         plan: &ResolvedStatePlan,
@@ -213,10 +240,11 @@ impl InvocationPagedKvPool {
                     .collect(),
                 first_page,
                 pages_per_slot,
-                slots: Mutex::new(vec![
-                    InvocationPagedKvSlotState::Vacant { generation: 0 };
-                    slot_count
-                ]),
+                state: Mutex::new(InvocationPagedKvPoolState {
+                    lifecycle: InvocationPagedKvPoolLifecycle::Accepting,
+                    owner_alive: true,
+                    slots: vec![InvocationPagedKvSlotState::Vacant { generation: 0 }; slot_count],
+                }),
             }),
         })
     }
@@ -229,6 +257,14 @@ impl InvocationPagedKvPool {
         &self.inner.workspace_domain
     }
 
+    pub(crate) fn handle(&self) -> InvocationPagedKvPoolHandle {
+        InvocationPagedKvPoolHandle {
+            id: self.inner.id,
+            workspace_domain: self.inner.workspace_domain.clone(),
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub(crate) fn maximum_tokens_per_lease(&self) -> Result<u64> {
         u64::from(self.inner.pages_per_slot)
             .checked_mul(u64::from(self.inner.arena.config().page_tokens))
@@ -239,104 +275,178 @@ impl InvocationPagedKvPool {
     /// model-facing physical cache. A failed zero/fence returns the exact slot
     /// generation to the pool without exposing partially scrubbed storage.
     pub(crate) fn lease(&self) -> Result<InvocationPagedKvLease> {
-        let slot = self.begin_lease()?;
-        let blocks = blocks_for_slot(self.inner.as_ref(), slot)?;
-        let prepared = self
-            .inner
-            .arena
-            .zero_pages(&blocks)
-            .and_then(|fence| fence.wait())
-            .and_then(|()| {
-                PhysicalPagedKvCache::new(
-                    self.inner.arena.clone(),
-                    self.inner.layer_bindings.clone(),
-                    blocks.clone(),
-                    0,
-                )
-            });
-        let cache = match prepared {
-            Ok(cache) => cache,
-            Err(error) => {
-                release_slot(
-                    self.inner.as_ref(),
-                    slot,
-                    InvocationPagedKvSlotKind::Preparing,
-                );
-                return Err(error);
-            }
-        };
-        if !transition_to_leased(self.inner.as_ref(), slot) {
-            release_slot(
-                self.inner.as_ref(),
-                slot,
-                InvocationPagedKvSlotKind::Preparing,
-            );
-            return Err(Error::InferenceError(
-                "invocation paged workspace lost its preparing generation".to_string(),
-            ));
-        }
-        Ok(InvocationPagedKvLease {
-            inner: self.inner.clone(),
-            slot,
-            cache: Some(cache),
-            released: false,
-        })
+        lease_from_inner(self.inner.clone())
+    }
+
+    /// Close the pool against new work, then fence its physical arena exactly
+    /// once. Active leases make the close retryable without reopening it.
+    pub(crate) fn close_and_drain(&self) -> Result<()> {
+        close_and_drain(self.inner.as_ref())
     }
 
     pub(crate) fn contains_active_lease(&self, slot: InvocationPagedKvSlotRef) -> bool {
-        if slot.pool != self.inner.id
-            || slot.slot_generation == 0
-            || slot.first_page
-                != self
-                    .inner
-                    .first_page
-                    .saturating_add(slot.slot.saturating_mul(self.inner.pages_per_slot))
-            || slot.page_count != self.inner.pages_per_slot
-        {
-            return false;
-        }
-        self.inner
-            .slots
-            .lock()
-            .ok()
-            .and_then(|slots| slots.get(slot.slot as usize).copied())
-            == Some(InvocationPagedKvSlotState::Leased {
-                generation: slot.slot_generation,
-            })
+        contains_active_lease(self.inner.as_ref(), slot)
     }
 
-    fn begin_lease(&self) -> Result<InvocationPagedKvSlotRef> {
-        let mut slots = self
-            .inner
-            .slots
+    #[cfg(test)]
+    fn is_drained(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.lifecycle == InvocationPagedKvPoolLifecycle::Drained)
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for InvocationPagedKvPoolOwner {
+    fn drop(&mut self) {
+        let should_drain = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return;
+            };
+            state.owner_alive = false;
+            if state.lifecycle == InvocationPagedKvPoolLifecycle::Accepting {
+                state.lifecycle = InvocationPagedKvPoolLifecycle::Draining;
+            }
+            begin_drain_if_idle(&mut state)
+        };
+        if should_drain {
+            finish_drain(self.inner.as_ref());
+        }
+    }
+}
+
+impl InvocationPagedKvPoolHandle {
+    pub(crate) const fn id(&self) -> InvocationPagedKvPoolId {
+        self.id
+    }
+
+    pub(crate) fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
+        &self.workspace_domain
+    }
+
+    pub(crate) fn validate_live(&self) -> Result<()> {
+        let inner = self.inner.upgrade().ok_or_else(|| {
+            invalid("invocation paged workspace refers to a retired physical generation")
+        })?;
+        let state = inner
+            .state
             .lock()
             .map_err(|_| invalid("invocation paged workspace slot state is poisoned"))?;
-        let (slot_index, state) = slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, state)| matches!(state, InvocationPagedKvSlotState::Vacant { .. }))
-            .ok_or_else(|| {
-                Error::Backpressure("invocation paged workspace has no free slot".to_string())
-            })?;
-        let generation = state
-            .generation()
-            .checked_add(1)
-            .ok_or_else(|| invalid("invocation paged workspace slot generation exhausted"))?;
-        *state = InvocationPagedKvSlotState::Preparing { generation };
-        let slot = u32::try_from(slot_index)
-            .map_err(|_| invalid("invocation paged workspace slot index exceeds u32"))?;
-        let first_page = slot
-            .checked_mul(self.inner.pages_per_slot)
-            .and_then(|offset| self.inner.first_page.checked_add(offset))
-            .ok_or_else(|| invalid("invocation paged workspace slot range overflow"))?;
-        Ok(InvocationPagedKvSlotRef {
-            pool: self.inner.id,
-            slot,
-            slot_generation: generation,
-            first_page,
-            page_count: self.inner.pages_per_slot,
-        })
+        if !state.owner_alive || state.lifecycle != InvocationPagedKvPoolLifecycle::Accepting {
+            return Err(invalid(
+                "invocation paged workspace physical generation is not accepting leases",
+            ));
+        }
+        Ok(())
     }
+
+    pub(crate) fn lease(&self) -> Result<InvocationPagedKvLease> {
+        self.validate_live()?;
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| invalid("invocation paged workspace owner retired during admission"))?;
+        lease_from_inner(inner)
+    }
+}
+
+fn lease_from_inner(inner: Arc<InvocationPagedKvPoolInner>) -> Result<InvocationPagedKvLease> {
+    let slot = begin_lease(inner.as_ref())?;
+    let blocks = blocks_for_slot(inner.as_ref(), slot)?;
+    let prepared = inner
+        .arena
+        .zero_pages(&blocks)
+        .and_then(|fence| fence.wait())
+        .and_then(|()| {
+            PhysicalPagedKvCache::new(
+                inner.arena.clone(),
+                inner.layer_bindings.clone(),
+                blocks.clone(),
+                0,
+            )
+        });
+    let cache = match prepared {
+        Ok(cache) => cache,
+        Err(error) => {
+            release_slot(inner.as_ref(), slot, InvocationPagedKvSlotKind::Preparing);
+            return Err(error);
+        }
+    };
+    if !transition_to_leased(inner.as_ref(), slot) {
+        release_slot(inner.as_ref(), slot, InvocationPagedKvSlotKind::Preparing);
+        return Err(Error::InferenceError(
+            "invocation paged workspace lost its preparing generation".to_string(),
+        ));
+    }
+    Ok(InvocationPagedKvLease {
+        inner,
+        slot,
+        cache: Some(cache),
+        released: false,
+    })
+}
+
+fn contains_active_lease(
+    inner: &InvocationPagedKvPoolInner,
+    slot: InvocationPagedKvSlotRef,
+) -> bool {
+    if slot.pool != inner.id
+        || slot.slot_generation == 0
+        || slot.first_page
+            != inner
+                .first_page
+                .saturating_add(slot.slot.saturating_mul(inner.pages_per_slot))
+        || slot.page_count != inner.pages_per_slot
+    {
+        return false;
+    }
+    inner
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.slots.get(slot.slot as usize).copied())
+        == Some(InvocationPagedKvSlotState::Leased {
+            generation: slot.slot_generation,
+        })
+}
+
+fn begin_lease(inner: &InvocationPagedKvPoolInner) -> Result<InvocationPagedKvSlotRef> {
+    let mut state = inner
+        .state
+        .lock()
+        .map_err(|_| invalid("invocation paged workspace slot state is poisoned"))?;
+    if !state.owner_alive || state.lifecycle != InvocationPagedKvPoolLifecycle::Accepting {
+        return Err(invalid(
+            "invocation paged workspace pool is closed for new leases",
+        ));
+    }
+    let (slot_index, slot_state) = state
+        .slots
+        .iter_mut()
+        .enumerate()
+        .find(|(_, state)| matches!(state, InvocationPagedKvSlotState::Vacant { .. }))
+        .ok_or_else(|| {
+            Error::Backpressure("invocation paged workspace has no free slot".to_string())
+        })?;
+    let generation = slot_state
+        .generation()
+        .checked_add(1)
+        .ok_or_else(|| invalid("invocation paged workspace slot generation exhausted"))?;
+    *slot_state = InvocationPagedKvSlotState::Preparing { generation };
+    let slot = u32::try_from(slot_index)
+        .map_err(|_| invalid("invocation paged workspace slot index exceeds u32"))?;
+    let first_page = slot
+        .checked_mul(inner.pages_per_slot)
+        .and_then(|offset| inner.first_page.checked_add(offset))
+        .ok_or_else(|| invalid("invocation paged workspace slot range overflow"))?;
+    Ok(InvocationPagedKvSlotRef {
+        pool: inner.id,
+        slot,
+        slot_generation: generation,
+        first_page,
+        page_count: inner.pages_per_slot,
+    })
 }
 
 /// Unique generation pin over one zeroed invocation page range. The physical
@@ -429,6 +539,70 @@ enum InvocationPagedKvSlotKind {
     Leased,
 }
 
+fn begin_drain_if_idle(state: &mut InvocationPagedKvPoolState) -> bool {
+    if state.lifecycle == InvocationPagedKvPoolLifecycle::Draining
+        && state
+            .slots
+            .iter()
+            .all(|slot| matches!(slot, InvocationPagedKvSlotState::Vacant { .. }))
+    {
+        state.lifecycle = InvocationPagedKvPoolLifecycle::DrainInFlight;
+        true
+    } else {
+        false
+    }
+}
+
+fn finish_drain(inner: &InvocationPagedKvPoolInner) {
+    let result = inner.arena.drain();
+    if let Ok(mut state) = inner.state.lock() {
+        state.lifecycle = if result.is_ok() {
+            InvocationPagedKvPoolLifecycle::Drained
+        } else {
+            InvocationPagedKvPoolLifecycle::Draining
+        };
+    }
+}
+
+fn close_and_drain(inner: &InvocationPagedKvPoolInner) -> Result<()> {
+    let should_drain = {
+        let mut state = inner
+            .state
+            .lock()
+            .map_err(|_| invalid("invocation paged workspace slot state is poisoned"))?;
+        match state.lifecycle {
+            InvocationPagedKvPoolLifecycle::Drained => return Ok(()),
+            InvocationPagedKvPoolLifecycle::DrainInFlight => {
+                return Err(Error::Backpressure(
+                    "invocation paged workspace drain is already in flight".to_string(),
+                ));
+            }
+            InvocationPagedKvPoolLifecycle::Accepting => {
+                state.lifecycle = InvocationPagedKvPoolLifecycle::Draining;
+            }
+            InvocationPagedKvPoolLifecycle::Draining => {}
+        }
+        if !begin_drain_if_idle(&mut state) {
+            return Err(Error::Backpressure(
+                "invocation paged workspace still has active leases".to_string(),
+            ));
+        }
+        true
+    };
+    debug_assert!(should_drain);
+    let result = inner.arena.drain();
+    let mut state = inner
+        .state
+        .lock()
+        .map_err(|_| invalid("invocation paged workspace slot state is poisoned"))?;
+    state.lifecycle = if result.is_ok() {
+        InvocationPagedKvPoolLifecycle::Drained
+    } else {
+        InvocationPagedKvPoolLifecycle::Draining
+    };
+    result
+}
+
 fn transition_to_leased(
     inner: &InvocationPagedKvPoolInner,
     slot: InvocationPagedKvSlotRef,
@@ -436,10 +610,10 @@ fn transition_to_leased(
     if slot.pool != inner.id {
         return false;
     }
-    let Ok(mut slots) = inner.slots.lock() else {
+    let Ok(mut pool) = inner.state.lock() else {
         return false;
     };
-    let Some(state) = slots.get_mut(slot.slot as usize) else {
+    let Some(state) = pool.slots.get_mut(slot.slot as usize) else {
         return false;
     };
     if *state
@@ -463,24 +637,30 @@ fn release_slot(
     if slot.pool != inner.id {
         return;
     }
-    let Ok(mut slots) = inner.slots.lock() else {
-        return;
-    };
-    let Some(state) = slots.get_mut(slot.slot as usize) else {
-        return;
-    };
-    let expected = match kind {
-        InvocationPagedKvSlotKind::Preparing => InvocationPagedKvSlotState::Preparing {
-            generation: slot.slot_generation,
-        },
-        InvocationPagedKvSlotKind::Leased => InvocationPagedKvSlotState::Leased {
-            generation: slot.slot_generation,
-        },
-    };
-    if *state == expected {
-        *state = InvocationPagedKvSlotState::Vacant {
-            generation: slot.slot_generation,
+    let should_drain = {
+        let Ok(mut pool) = inner.state.lock() else {
+            return;
         };
+        let Some(state) = pool.slots.get_mut(slot.slot as usize) else {
+            return;
+        };
+        let expected = match kind {
+            InvocationPagedKvSlotKind::Preparing => InvocationPagedKvSlotState::Preparing {
+                generation: slot.slot_generation,
+            },
+            InvocationPagedKvSlotKind::Leased => InvocationPagedKvSlotState::Leased {
+                generation: slot.slot_generation,
+            },
+        };
+        if *state == expected {
+            *state = InvocationPagedKvSlotState::Vacant {
+                generation: slot.slot_generation,
+            };
+        }
+        !pool.owner_alive && begin_drain_if_idle(&mut pool)
+    };
+    if should_drain {
+        finish_drain(inner);
     }
 }
 
@@ -493,7 +673,12 @@ fn blocks_for_slot(
         .checked_mul(inner.pages_per_slot)
         .and_then(|offset| inner.first_page.checked_add(offset));
     if slot.pool != inner.id
-        || slot.slot as usize >= inner.slots.lock().map(|slots| slots.len()).unwrap_or(0)
+        || slot.slot as usize
+            >= inner
+                .state
+                .lock()
+                .map(|state| state.slots.len())
+                .unwrap_or(0)
         || slot.slot_generation == 0
         || slot.page_count != inner.pages_per_slot
         || Some(slot.first_page) != expected_first_page
@@ -680,9 +865,16 @@ mod tests {
     fn lease_zeroes_before_exposure_and_reuses_with_a_new_generation() {
         let (plan, workspace_domain) = plan();
         let base_arena = arena(&plan, 1);
-        let pool =
-            InvocationPagedKvPool::new(&plan, &workspace_domain, base_arena.clone(), 0, 1, 1, 4)
-                .unwrap();
+        let pool = InvocationPagedKvPoolOwner::new(
+            &plan,
+            &workspace_domain,
+            base_arena.clone(),
+            0,
+            1,
+            1,
+            4,
+        )
+        .unwrap();
         assert_eq!(pool.maximum_tokens_per_lease().unwrap(), 16);
         let first = pool.lease().unwrap();
         let first_slot = first.slot();
@@ -702,7 +894,8 @@ mod tests {
     fn explicit_release_returns_only_authenticated_backend_completions() {
         let (plan, workspace_domain) = plan();
         let arena = arena(&plan, 1);
-        let pool = InvocationPagedKvPool::new(&plan, &workspace_domain, arena, 0, 1, 1, 5).unwrap();
+        let pool =
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, arena, 0, 1, 1, 5).unwrap();
         let mut lease = pool.lease().unwrap();
         let mut prepared = lease.cache().prepare_append(0, 1).unwrap();
         let queries = Tensor::from_vec(vec![1_f32; 8], (1, 2, 4), &Device::Cpu).unwrap();
@@ -734,17 +927,59 @@ mod tests {
             unreachable!()
         };
         domain.header.id = StateDomainId::new(99);
-        assert!(
-            InvocationPagedKvPool::new(&plan, &wrong_domain, base_arena.clone(), 0, 1, 1, 1,)
-                .is_err()
-        );
+        assert!(InvocationPagedKvPoolOwner::new(
+            &plan,
+            &wrong_domain,
+            base_arena.clone(),
+            0,
+            1,
+            1,
+            1,
+        )
+        .is_err());
         let oversized_range = arena(&plan, 2);
+        assert!(InvocationPagedKvPoolOwner::new(
+            &plan,
+            &workspace_domain,
+            oversized_range,
+            0,
+            2,
+            1,
+            1,
+        )
+        .is_err());
         assert!(
-            InvocationPagedKvPool::new(&plan, &workspace_domain, oversized_range, 0, 2, 1, 1,)
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, base_arena, 0, 1, 2, 1,)
                 .is_err()
         );
-        assert!(
-            InvocationPagedKvPool::new(&plan, &workspace_domain, base_arena, 0, 1, 2, 1,).is_err()
-        );
+    }
+
+    #[test]
+    fn weak_pool_handle_does_not_own_the_arena_generation() {
+        let (plan, workspace_domain) = plan();
+        let owner =
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, arena(&plan, 1), 0, 1, 1, 31)
+                .unwrap();
+        let handle = owner.handle();
+        assert_eq!(handle.id(), owner.id());
+        drop(owner);
+        assert!(handle.lease().is_err());
+    }
+
+    #[test]
+    fn close_is_retryable_after_active_lease_and_drains_once() {
+        let (plan, workspace_domain) = plan();
+        let owner =
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, arena(&plan, 1), 0, 1, 1, 32)
+                .unwrap();
+        let handle = owner.handle();
+        let lease = handle.lease().unwrap();
+        assert!(owner.close_and_drain().is_err());
+        assert!(handle.lease().is_err());
+        drop(lease);
+        owner.close_and_drain().unwrap();
+        assert!(owner.is_drained());
+        owner.close_and_drain().unwrap();
+        assert!(handle.lease().is_err());
     }
 }

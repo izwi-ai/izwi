@@ -40,8 +40,8 @@ mod types;
 
 #[allow(unused_imports)]
 pub(crate) use cache::invocation::{
-    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPool,
-    InvocationPagedKvPoolId, InvocationPagedKvSlotRef,
+    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
+    InvocationPagedKvPoolId, InvocationPagedKvPoolOwner, InvocationPagedKvSlotRef,
 };
 
 pub(crate) use cache::managed::ManagedKvModelRuntime;

@@ -9,7 +9,7 @@ use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, ExecutionAdapterBinding, ExecutionGroupId,
     ModelInstanceId,
 };
-use crate::engine::{InvocationPagedKvLease, InvocationPagedKvPool, InvocationPagedKvPoolId};
+use crate::engine::{InvocationPagedKvLease, InvocationPagedKvPoolHandle, InvocationPagedKvPoolId};
 use crate::engine::{ManagedKvModelRuntime, StageId};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
@@ -42,14 +42,14 @@ pub(crate) struct InvocationPagedWorkspaceKeyV2 {
 #[derive(Debug, Clone)]
 pub(crate) struct InvocationPagedWorkspaceBindingV2 {
     pub(crate) key: InvocationPagedWorkspaceKeyV2,
-    pub(crate) pool: InvocationPagedKvPool,
+    pub(crate) pool: InvocationPagedKvPoolHandle,
 }
 
 /// Load-sealed physical invocation page pools. Reusing one pool across exact
 /// graph/stage keys is explicit because each key must be published here.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InvocationPagedWorkspaceRuntimeV2 {
-    pools: HashMap<InvocationPagedWorkspaceKeyV2, InvocationPagedKvPool>,
+    pools: HashMap<InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolHandle>,
 }
 
 impl InvocationPagedWorkspaceRuntimeV2 {
@@ -120,6 +120,7 @@ impl InvocationPagedWorkspaceRuntimeV2 {
             let pool = self.pools.get(&key).ok_or_else(|| {
                 invalid("invocation paged workspace is missing a graph/stage/domain pool")
             })?;
+            pool.validate_live()?;
             if pool.workspace_domain() != domain {
                 return Err(invalid(
                     "invocation paged workspace pool does not match its authored domain",
@@ -563,8 +564,8 @@ mod tests {
     use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::engine::{
-        EngineCore, EngineCoreConfig, ExecutionMode, ExecutionProfile, NativeBatchMode,
-        StageDescriptor, StageId,
+        EngineCore, EngineCoreConfig, ExecutionMode, ExecutionProfile, InvocationPagedKvPoolOwner,
+        NativeBatchMode, StageDescriptor, StageId,
     };
     use crate::kv::v2::{test_contract, upgrade_kv_contract_v1};
     use crate::kv::v2::{
@@ -597,7 +598,7 @@ mod tests {
 
     fn invocation_pool(
         model_instance: ModelInstanceId,
-    ) -> (InvocationPagedKvPool, InvocationWorkspaceDomain) {
+    ) -> (InvocationPagedKvPoolOwner, InvocationWorkspaceDomain) {
         let mut contract = test_contract();
         let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
             unreachable!()
@@ -662,7 +663,7 @@ mod tests {
             .unwrap(),
         );
         (
-            InvocationPagedKvPool::new(&plan, &workspace_domain, arena, 0, 1, 1, 23).unwrap(),
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, arena, 0, 1, 1, 23).unwrap(),
             workspace_domain,
         )
     }
@@ -671,7 +672,7 @@ mod tests {
         ExecutionAdapterBinding,
         CapabilityStateDescriptorV2,
         Arc<ManagedKvModelRuntime>,
-        InvocationPagedKvPool,
+        InvocationPagedKvPoolOwner,
     ) {
         let model_instance = ModelInstanceId::new(37);
         let mut execution = binding();
@@ -788,6 +789,7 @@ mod tests {
     #[test]
     fn invocation_runtime_rejects_duplicate_or_mismatched_bindings() {
         let (execution, _, _, pool) = managed_invocation_fixture();
+        let handle = pool.handle();
         let key = InvocationPagedWorkspaceKeyV2 {
             stage_graph: stage_graph_fingerprint(&execution.stages).unwrap(),
             stage: execution.stages[0].id,
@@ -796,11 +798,11 @@ mod tests {
         assert!(InvocationPagedWorkspaceRuntimeV2::new(vec![
             InvocationPagedWorkspaceBindingV2 {
                 key,
-                pool: pool.clone(),
+                pool: handle.clone(),
             },
             InvocationPagedWorkspaceBindingV2 {
                 key,
-                pool: pool.clone(),
+                pool: handle.clone(),
             },
         ])
         .is_err());
@@ -811,7 +813,7 @@ mod tests {
         assert!(
             InvocationPagedWorkspaceRuntimeV2::new(vec![InvocationPagedWorkspaceBindingV2 {
                 key: wrong_key,
-                pool,
+                pool: handle,
             },])
             .is_err()
         );
@@ -839,7 +841,7 @@ mod tests {
                     stage,
                     domain,
                 },
-                pool,
+                pool: pool.handle(),
             }])
             .unwrap();
         let runtime = CapabilityStateRuntimeV2::managed(
@@ -856,5 +858,10 @@ mod tests {
         let lease = runtime.lease_invocation_paged(stage, domain).unwrap();
         assert_eq!(lease.cache().context_len(), 0);
         lease.release().unwrap();
+        drop(pool);
+        assert!(runtime.lease_invocation_paged(stage, domain).is_err());
+        assert!(runtime
+            .validate_against(BackendKind::Cpu, &execution)
+            .is_err());
     }
 }
