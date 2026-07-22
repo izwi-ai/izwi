@@ -272,6 +272,14 @@ impl InvocationWorkspaceSet {
                         "bounded invocation workspace has no stage profiles",
                     ));
                 }
+                if profiles
+                    .windows(2)
+                    .any(|pair| pair[0].stage_graph_fingerprint >= pair[1].stage_graph_fingerprint)
+                {
+                    return Err(invalid(
+                        "bounded invocation workspace profiles require canonical unique stage-graph order",
+                    ));
+                }
                 let fingerprint = stage_graph_fingerprint(execution_stages)?;
                 let matching = profiles
                     .iter()
@@ -606,27 +614,38 @@ mod tests {
             dimensions: vec![],
             terms: vec![],
         };
-        let descriptor = CapabilityStateDescriptorV2 {
+        let mut profiles = vec![
+            InvocationWorkspaceProfile {
+                stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                stages: vec![InvocationStageWorkspace {
+                    stage: StageId::new(1),
+                    domains: vec![workspace_domain()],
+                }],
+            },
+            InvocationWorkspaceProfile {
+                stage_graph_fingerprint: stage_graph_fingerprint(&[stage(64)]).unwrap(),
+                stages: vec![InvocationStageWorkspace {
+                    stage: StageId::new(1),
+                    domains: vec![second_domain],
+                }],
+            },
+        ];
+        profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+        let mut noncanonical = profiles.clone();
+        noncanonical.reverse();
+        let noncanonical = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
-                profiles: vec![
-                    InvocationWorkspaceProfile {
-                        stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
-                        stages: vec![InvocationStageWorkspace {
-                            stage: StageId::new(1),
-                            domains: vec![workspace_domain()],
-                        }],
-                    },
-                    InvocationWorkspaceProfile {
-                        stage_graph_fingerprint: stage_graph_fingerprint(&[stage(64)]).unwrap(),
-                        stages: vec![InvocationStageWorkspace {
-                            stage: StageId::new(1),
-                            domains: vec![second_domain],
-                        }],
-                    },
-                ],
+                profiles: noncanonical,
             },
+        };
+        assert!(noncanonical.validate_against_stages(&[stage(192)]).is_err());
+
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::Bounded { profiles },
         };
         descriptor.validate_against_stages(&[stage(192)]).unwrap();
         descriptor.validate_against_stages(&[stage(64)]).unwrap();
