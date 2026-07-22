@@ -13,9 +13,9 @@ use super::contract::{
 };
 #[cfg(test)]
 use super::contract::{AttentionMask, KeyEncoding, PrefixPolicy, StateClock};
-use super::resolved_domains::{
-    NonPagedStateOperationQuery, NonPagedStateOperationRegistry, ResolvedNonPagedDomainPlan,
-};
+#[cfg(test)]
+use super::resolved_domains::NonPagedStateOperationQuery;
+use super::resolved_domains::{NonPagedStateOperationRegistry, ResolvedNonPagedDomainPlan};
 
 const PLAN_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.resolved-plan.v2\0";
 
