@@ -22,6 +22,11 @@ use super::{
 
 pub(crate) fn upgrade_kv_contract_v1(contract: &KvCacheContract) -> Result<InferenceStateContract> {
     contract.validate()?;
+    let has_composite_model_state = contract.domains.len() > 1
+        && contract
+            .domains
+            .iter()
+            .any(|domain| matches!(domain, LegacyDomain::ModelState(_)));
     let mut domains = Vec::with_capacity(contract.domains.len());
     let mut groups = Vec::with_capacity(contract.domains.len());
     for source in &contract.domains {
@@ -154,7 +159,23 @@ pub(crate) fn upgrade_kv_contract_v1(contract: &KvCacheContract) -> Result<Infer
         });
     }
     domains.sort_unstable_by_key(StateDomainSpec::id);
-    groups.sort_unstable_by_key(|group| group.id);
+    if has_composite_model_state {
+        groups = vec![StateGroupSpec {
+            id: StateGroupId::new(
+                domains
+                    .first()
+                    .expect("validated v1 contract has a domain")
+                    .id()
+                    .get(),
+            ),
+            domains: domains.iter().map(StateDomainSpec::id).collect(),
+            // A legacy composite contract has no proof that every retained
+            // domain can publish the same immutable prefix boundary.
+            prefix_shareable: false,
+        }];
+    } else {
+        groups.sort_unstable_by_key(|group| group.id);
+    }
     let upgraded = InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains,

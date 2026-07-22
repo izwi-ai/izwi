@@ -5,12 +5,16 @@ use candle_nn::{ops, rotary_emb, Embedding};
 use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
+use crate::backends::state::{
+    PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
+};
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
     use_block_fusion_for_device,
 };
+use crate::kv::v2::{StateComponentId, StateDomainId};
 use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_preserve_dtype,
@@ -19,6 +23,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
 };
@@ -28,6 +33,7 @@ use crate::models::shared::telemetry::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
+use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
 
 pub struct Qwen35TextModel {
@@ -113,6 +119,141 @@ impl Qwen35TextRuntimeState {
             staged: self.clone(),
         }
     }
+
+    pub(crate) fn restore_tensor_domains(
+        &mut self,
+        arena: &TensorStateArena,
+        sequence: PhysicalStateSequenceId,
+    ) -> Result<()> {
+        let recurrent = arena.read(sequence, recurrent_domain_v2())?;
+        let convolution = arena.read(sequence, convolution_domain_v2())?;
+        if recurrent.is_none() && convolution.is_none() {
+            return Ok(());
+        }
+        let recurrent = recurrent.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 recurrent state is missing its convolution peer".into())
+        })?;
+        let convolution = convolution.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 convolution state is missing its recurrent peer".into())
+        })?;
+        let mut recurrent_components = recurrent.components.iter();
+        let mut convolution_components = convolution.components.iter();
+        for layer in &mut self.layers {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            else {
+                continue;
+            };
+            let recurrent = recurrent_components.next().ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 recurrent component coverage is incomplete".into())
+            })?;
+            let convolution = convolution_components.next().ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 convolution component coverage is incomplete".into())
+            })?;
+            *recurrent_state = Some(recurrent.tensor.clone());
+            let history_len = convolution.tensor.dim(0)?;
+            let slots = (0..history_len)
+                .map(|index| convolution.tensor.i(index).map_err(Error::from))
+                .collect::<Result<Vec<_>>>()?;
+            *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+        }
+        if recurrent_components.next().is_some() || convolution_components.next().is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3.5 tensor state has components for unknown layers".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_tensor_domains(
+        &mut self,
+        arena: &TensorStateArena,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        let recurrent_cursor = arena
+            .read_transaction_base(transaction, recurrent_domain_v2())?
+            .map(|snapshot| snapshot.cursor)
+            .unwrap_or(0);
+        let convolution_cursor = arena
+            .read_transaction_base(transaction, convolution_domain_v2())?
+            .map(|snapshot| snapshot.cursor)
+            .unwrap_or(0);
+        let mut recurrent = Vec::new();
+        let mut convolution = Vec::new();
+        for layer in &self.layers {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            else {
+                continue;
+            };
+            let recurrent_tensor = recurrent_state.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 recurrent state was not initialized".into())
+            })?;
+            let ring = conv_state.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 convolution state was not initialized".into())
+            })?;
+            if ring.slots.is_empty() || ring.next_idx >= ring.slots.len() {
+                return Err(Error::InferenceError(
+                    "Qwen3.5 convolution ring is invalid at the physical boundary".into(),
+                ));
+            }
+            let ordered = (0..ring.slots.len())
+                .map(|offset| &ring.slots[(ring.next_idx + offset) % ring.slots.len()])
+                .collect::<Vec<_>>();
+            let ring_tensor = Tensor::stack(&ordered, 0)?;
+            let component = u32::try_from(recurrent.len() + 1)
+                .map_err(|_| Error::InvalidInput("Qwen3.5 state component overflow".into()))?;
+            recurrent.push(StateComponentValue {
+                component: StateComponentId::new(component),
+                tensor: recurrent_tensor.clone(),
+            });
+            convolution.push(StateComponentValue {
+                component: StateComponentId::new(component),
+                tensor: ring_tensor,
+            });
+        }
+        arena.stage_replace(
+            transaction,
+            recurrent_domain_v2(),
+            recurrent_cursor,
+            target_cursor,
+            recurrent,
+        )?;
+        arena.stage_replace(
+            transaction,
+            convolution_domain_v2(),
+            convolution_cursor,
+            target_cursor,
+            convolution,
+        )?;
+        // The arena now owns the only retained handles. Keep the decode state
+        // as control metadata between quanta so engine abort cannot expose a
+        // partially drained model state.
+        for layer in &mut self.layers {
+            if let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            {
+                *conv_state = None;
+                *recurrent_state = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn recurrent_domain_v2() -> StateDomainId {
+    StateDomainId::new(RECURRENT_STATE_DOMAIN.get() + 1)
+}
+
+fn convolution_domain_v2() -> StateDomainId {
+    StateDomainId::new(CONVOLUTION_STATE_DOMAIN.get() + 1)
 }
 
 /// Provisional Qwen3.5 transition spanning full attention, recurrent state,
@@ -568,6 +709,136 @@ impl Qwen35TextModel {
         Ok(hidden)
     }
 
+    pub(crate) fn forward_token_id_at_physical(
+        &self,
+        token_id: u32,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
+        let hidden = self.token_embeddings.forward(&input)?;
+        let hidden = self.forward_hidden_physical(&hidden, &[position_ids], state, cache)?;
+        self.forward_hidden_to_logits(&hidden)
+    }
+
+    pub(crate) fn prefill_token_ids_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        compute_logits: bool,
+    ) -> Result<Option<Tensor>> {
+        if token_ids.is_empty() {
+            return Ok(None);
+        }
+        if token_ids.len() != position_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 physical prefill span mismatch: {} token ids for {} position ids",
+                token_ids.len(),
+                position_ids.len()
+            )));
+        }
+        record_prefill_sequence_span(token_ids.len());
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        let hidden = self.token_embeddings.forward(&input)?;
+        let hidden = self.forward_hidden_physical(&hidden, position_ids, state, cache)?;
+        if !compute_logits {
+            return Ok(None);
+        }
+        let last = hidden.narrow(1, token_ids.len() - 1, 1)?;
+        self.forward_hidden_to_logits(&last).map(Some)
+    }
+
+    pub(crate) fn forward_input_embedding_at_physical(
+        &self,
+        input_embedding: &Tensor,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let hidden =
+            self.forward_hidden_physical(input_embedding, &[position_ids], state, cache)?;
+        self.forward_hidden_to_logits(&hidden)
+    }
+
+    fn forward_hidden_physical(
+        &self,
+        input: &Tensor,
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        self.validate_runtime_state(state)?;
+        let (_, sequence_len, hidden_size) = input.dims3()?;
+        if sequence_len == 0
+            || sequence_len != position_ids.len()
+            || hidden_size != self.hidden_size()
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 physical hidden span does not match its positions or model width".into(),
+            ));
+        }
+        let sparse_layers = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| {
+                matches!(layer.mixer, Qwen35Mixer::Full(_)).then_some(index as u32)
+            })
+            .collect::<Vec<_>>();
+        let first_full = self.layers.iter().find_map(|layer| match &layer.mixer {
+            Qwen35Mixer::Full(attention) => Some(attention),
+            Qwen35Mixer::Linear(_) => None,
+        });
+        let first_full = first_full.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 model has no full-attention layer".into())
+        })?;
+        cache.validate_sparse_model(
+            &sparse_layers,
+            first_full.num_kv_heads,
+            first_full.head_dim,
+            first_full.head_dim,
+        )?;
+        let start_pos = cache.context_len();
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+            layer.ensure_state_initialized(layer_state, &self.device)?;
+        }
+        let mut hidden = input.clone();
+        let mut physical_layer = 0usize;
+        for (layer_index, (layer, layer_state)) in
+            self.layers.iter().zip(state.layers.iter_mut()).enumerate()
+        {
+            hidden = layer.forward_physical(
+                &hidden,
+                layer_state,
+                position_ids,
+                cache,
+                &mut prepared,
+                &mut physical_layer,
+            )?;
+            validate_qwen35_finite_tensor(
+                &hidden,
+                layer_index,
+                if sequence_len == 1 {
+                    layer.decode_diagnostic_path()
+                } else {
+                    layer.prefill_diagnostic_path()
+                },
+                self.finite_diagnostics_enabled,
+            )?;
+        }
+        if physical_layer != sparse_layers.len() {
+            return Err(Error::InferenceError(
+                "Qwen3.5 physical attention did not cover every sparse layer".into(),
+            ));
+        }
+        cache.commit_prepared(prepared)?;
+        Ok(hidden)
+    }
+
     pub fn prefill_token_ids(
         &self,
         token_ids: &[u32],
@@ -796,6 +1067,46 @@ impl Qwen35Layer {
         };
         let hidden_states = (&residual + &hidden_states)?;
 
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        (&residual + &hidden_states).map_err(Error::from)
+    }
+
+    fn forward_physical(
+        &self,
+        hidden_states: &Tensor,
+        state: &mut Qwen35LayerRuntimeState,
+        position_ids: &[[usize; 3]],
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        physical_layer: &mut usize,
+    ) -> Result<Tensor> {
+        let residual = hidden_states.clone();
+        let normalized = self.attn_norm.forward(hidden_states)?;
+        let mixed = match &self.mixer {
+            Qwen35Mixer::Linear(mixer) => {
+                if normalized.dim(1)? == 1 {
+                    mixer.forward(&normalized, state)?
+                } else {
+                    mixer.forward_sequence(&normalized, state)?
+                }
+            }
+            Qwen35Mixer::Full(mixer) => {
+                let output = mixer.forward_physical(
+                    &normalized,
+                    position_ids,
+                    cache,
+                    prepared,
+                    *physical_layer,
+                )?;
+                *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
+                    Error::InvalidInput("Qwen3.5 physical layer ordinal overflow".into())
+                })?;
+                output
+            }
+        };
+        let hidden_states = (&residual + &mixed)?;
         let residual = hidden_states.clone();
         let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
         let hidden_states = self.mlp.forward(&hidden_states)?;
@@ -1190,6 +1501,83 @@ impl Qwen35FullAttention {
         )?;
 
         Ok(output)
+    }
+
+    fn forward_physical(
+        &self,
+        hidden_states: &Tensor,
+        position_ids: &[[usize; 3]],
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
+        if seq_len == 0 || seq_len != position_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 physical attention received {} tokens and {} positions",
+                seq_len,
+                position_ids.len()
+            )));
+        }
+        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
+            1,
+            seq_len,
+            self.num_heads,
+            self.head_dim * 2,
+        ))?;
+        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
+            1,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
+        let key_states = self.k_proj.forward(hidden_states)?.reshape((
+            1,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let value_states = self.v_proj.forward(hidden_states)?.reshape((
+            1,
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
+        let (query_states, key_states) = if seq_len == 1 {
+            self.apply_rope(&query_states, &key_states, position_ids[0])?
+        } else {
+            self.apply_rope_sequence(&query_states, &key_states, position_ids)?
+        };
+        let queries = query_states
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = key_states
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = value_states
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let storage_dtype = cache.arena().config().dtype;
+        let output_dtype = queries.dtype();
+        let queries = queries.to_dtype(storage_dtype)?;
+        let keys = keys.to_dtype(storage_dtype)?;
+        let values = values.to_dtype(storage_dtype)?;
+        let output = cache.write_and_attend(
+            physical_layer,
+            prepared,
+            &queries,
+            &keys,
+            &values,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+        let output =
+            output
+                .to_dtype(output_dtype)?
+                .reshape((1, seq_len, self.num_heads * self.head_dim))?;
+        let output = (&output * &ops::sigmoid(&gate)?)?;
+        self.o_proj.forward(&output).map_err(Error::from)
     }
 
     fn apply_rope(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, Tensor};
@@ -18,6 +18,10 @@ impl PhysicalStateSequenceId {
             .then_some(Self(value))
             .ok_or_else(|| invalid("physical state sequence id must be non-zero"))
     }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,6 +32,10 @@ impl PhysicalStateTransactionId {
         (value != 0)
             .then_some(Self(value))
             .ok_or_else(|| invalid("physical state transaction id must be non-zero"))
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -51,6 +59,7 @@ struct SequenceState {
 struct StagedTransaction {
     sequence: PhysicalStateSequenceId,
     state: SequenceState,
+    touched: HashSet<StateDomainId>,
 }
 
 #[derive(Default)]
@@ -139,6 +148,7 @@ impl TensorStateArena {
             StagedTransaction {
                 sequence,
                 state: live,
+                touched: HashSet::new(),
             },
         );
         Ok(())
@@ -184,6 +194,7 @@ impl TensorStateArena {
                 components: components.into(),
             },
         );
+        staged.touched.insert(domain);
         Ok(())
     }
 
@@ -202,12 +213,54 @@ impl TensorStateArena {
             .cloned())
     }
 
-    pub(crate) fn commit(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
+    pub(crate) fn read_transaction_base(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        Ok(self
+            .lock()?
+            .transactions
+            .get(&transaction)
+            .ok_or_else(|| invalid("physical state transaction is not active"))?
+            .state
+            .domains
+            .get(&domain)
+            .cloned())
+    }
+
+    pub(crate) fn commit(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        expected_cursor: u64,
+    ) -> Result<()> {
+        let required_domains = self
+            .plan
+            .non_paged
+            .iter()
+            .map(ResolvedNonPagedDomainPlan::domain)
+            .collect::<Vec<_>>();
         let mut state = self.lock()?;
         let staged = state
             .transactions
-            .remove(&transaction)
+            .get(&transaction)
             .ok_or_else(|| invalid("physical state transaction is not active"))?;
+        if required_domains.iter().any(|domain| {
+            !staged.touched.contains(domain)
+                || staged
+                    .state
+                    .domains
+                    .get(domain)
+                    .map_or(true, |snapshot| snapshot.cursor != expected_cursor)
+        }) {
+            return Err(invalid(
+                "physical state transaction did not stage every domain at the target cursor",
+            ));
+        }
+        let staged = state
+            .transactions
+            .remove(&transaction)
+            .expect("validated physical state transaction remains active");
         let live = state
             .sequences
             .get_mut(&staged.sequence)
@@ -428,7 +481,7 @@ mod tests {
             .read(sequence, StateDomainId::new(1))
             .unwrap()
             .is_none());
-        arena.commit(first).unwrap();
+        arena.commit(first, 1).unwrap();
         let committed = arena
             .read(sequence, StateDomainId::new(1))
             .unwrap()
@@ -450,7 +503,7 @@ mod tests {
         arena
             .stage_replace(committed, StateDomainId::new(1), 0, 1, vec![value(&[3.0])])
             .unwrap();
-        arena.commit(committed).unwrap();
+        arena.commit(committed, 1).unwrap();
 
         let aborted = PhysicalStateTransactionId::new(2).unwrap();
         arena.begin(aborted, sequence).unwrap();
@@ -469,5 +522,20 @@ mod tests {
                 .unwrap(),
             vec![3.0]
         );
+    }
+
+    #[test]
+    fn commit_rejects_an_unstaged_domain_and_remains_abortable() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        arena.begin(transaction, sequence).unwrap();
+        assert!(arena.commit(transaction, 1).is_err());
+        arena.abort(transaction).unwrap();
+        assert!(arena
+            .read(sequence, StateDomainId::new(1))
+            .unwrap()
+            .is_none());
     }
 }

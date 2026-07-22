@@ -25,12 +25,15 @@ use crate::backends::kv::{
     CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendPlanRequest, KvBackendRuntime,
     KvLayerConfig,
 };
-use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest, TensorStateArena};
+use crate::backends::state::{
+    negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+    StateBackendPlanRequest, TensorStateArena,
+};
 use crate::backends::BackendKind;
 use crate::engine::{
     EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
-    ModelInstanceId, PlanId, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
-    ResourceLease, ResourceVector, SessionKey, WorkUnit,
+    ManagedTensorStateReservation, ModelInstanceId, PlanId, ReservationClass, ReservationOwner,
+    ResourceAmount, ResourceAuthority, ResourceLease, ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{upgrade_kv_contract_v1, ResolvedStatePlan};
@@ -187,6 +190,7 @@ struct ManagedKvModelState {
     prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
     pending_prefixes: HashMap<PlanId, Vec<PendingPrefixCommit>>,
     registered_sessions: HashSet<SessionKey>,
+    tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
     resource_lease: Option<ResourceLease>,
 }
 
@@ -203,6 +207,7 @@ pub(crate) struct ManagedKvCacheManager {
     models: HashMap<ModelInstanceId, ManagedKvModelState>,
     resource_authority: Option<Arc<ResourceAuthority>>,
     next_arena_generation: u32,
+    next_tensor_sequence: u64,
     telemetry: Arc<ManagedKvTelemetry>,
     prefix_cache_salt: Option<[u8; 32]>,
     worker_backend: BackendKind,
@@ -239,6 +244,7 @@ impl ManagedKvCacheManager {
             models: HashMap::new(),
             resource_authority,
             next_arena_generation: 1,
+            next_tensor_sequence: 1,
             telemetry: Arc::new(ManagedKvTelemetry::default()),
             prefix_cache_salt: None,
             worker_backend: backend,
@@ -508,6 +514,7 @@ impl ManagedKvCacheManager {
                 prefix_indexes,
                 pending_prefixes: HashMap::new(),
                 registered_sessions: HashSet::new(),
+                tensor_sequences: HashMap::new(),
                 resource_lease,
             },
         );
@@ -562,6 +569,16 @@ impl ManagedKvCacheManager {
             Error::InvalidInput("managed KV token position exceeds u32".to_string())
         })?;
         let namespace = managed_prefix_namespace(request, runtime, self.prefix_cache_salt)?;
+        let tensor_sequence_candidate = if runtime.tensor_state().is_some() {
+            let candidate = PhysicalStateSequenceId::new(self.next_tensor_sequence)?;
+            self.next_tensor_sequence = self
+                .next_tensor_sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::InferenceError("tensor-state sequence id overflow".into()))?;
+            Some(candidate)
+        } else {
+            None
+        };
         let state = self
             .models
             .get_mut(&runtime.plan.model_instance)
@@ -790,10 +807,36 @@ impl ManagedKvCacheManager {
                 "managed KV transaction duplicated pending prefix publication".into(),
             ));
         }
+        let tensor_state = if let Some(arena) = runtime.tensor_state() {
+            let sequence = if let Some(sequence) = state.tensor_sequences.get(session).copied() {
+                sequence
+            } else {
+                let sequence = tensor_sequence_candidate.expect("tensor arena has a candidate");
+                if let Err(error) = arena.register(sequence) {
+                    abort_domains(state, txn_id, &domains);
+                    state.pending_prefixes.remove(&txn_id);
+                    return Err(error);
+                }
+                state.tensor_sequences.insert(session.clone(), sequence);
+                sequence
+            };
+            let transaction = PhysicalStateTransactionId::new(txn_id)?;
+            if let Err(error) = arena.begin(transaction, sequence) {
+                abort_domains(state, txn_id, &domains);
+                state.pending_prefixes.remove(&txn_id);
+                return Err(error);
+            }
+            Some(ManagedTensorStateReservation {
+                sequence: sequence.get(),
+            })
+        } else {
+            None
+        };
         Ok(Some(ManagedCacheReservation {
             txn_id,
             session: session.clone(),
             domains,
+            tensor_state,
         }))
     }
 
@@ -817,9 +860,15 @@ impl ManagedKvCacheManager {
             self.telemetry.record_abort();
             return Ok(());
         }
-        let receipt = receipt.ok_or_else(|| {
-            Error::InferenceError("committing managed KV row omitted its write receipt".into())
-        })?;
+        let receipt = match receipt {
+            Some(receipt) => receipt,
+            None => {
+                abort_reservation(state, reservation);
+                return Err(Error::InferenceError(
+                    "committing managed KV row omitted its write receipt".into(),
+                ));
+            }
+        };
         if &receipt.reservation != reservation {
             abort_reservation(state, reservation);
             return Err(Error::InferenceError(
@@ -914,6 +963,33 @@ impl ManagedKvCacheManager {
                 "managed KV transaction contains a prefix publication for an unknown domain".into(),
             ));
         }
+        if reservation.tensor_state.is_some() {
+            let arena = state.runtime.tensor_state().ok_or_else(|| {
+                Error::InferenceError("tensor-state reservation lost its physical arena".into())
+            })?;
+            let target_cursor = reservation
+                .domains
+                .first()
+                .map(|domain| u64::from(domain.target_committed_tokens))
+                .ok_or_else(|| Error::InferenceError("managed KV reservation is empty".into()))?;
+            if reservation
+                .domains
+                .iter()
+                .any(|domain| u64::from(domain.target_committed_tokens) != target_cursor)
+            {
+                abort_reservation(state, reservation);
+                return Err(Error::InferenceError(
+                    "one managed state transaction resolved divergent domain cursors".into(),
+                ));
+            }
+            if let Err(error) = arena.commit(
+                PhysicalStateTransactionId::new(reservation.txn_id)?,
+                target_cursor,
+            ) {
+                abort_reservation(state, reservation);
+                return Err(error);
+            }
+        }
         // Every fallible operation has succeeded. Applying these plans cannot
         // fail, and the engine state lock prevents an interleaving mutation.
         for (arena, commit, prefix) in staged {
@@ -947,6 +1023,17 @@ impl ManagedKvCacheManager {
                     .expect("resolved arena has a coordinator")
                     .release_table(session, group.domain)
                     .map_err(coordinator_error)?;
+            }
+            if let Some(sequence) = state.tensor_sequences.remove(session) {
+                state
+                    .runtime
+                    .tensor_state()
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "registered tensor-state sequence lost its arena".into(),
+                        )
+                    })?
+                    .release(sequence)?;
             }
         }
         Ok(())
@@ -1506,6 +1593,14 @@ fn abort_domains(
 fn abort_reservation(state: &mut ManagedKvModelState, reservation: &ManagedCacheReservation) {
     state.pending_prefixes.remove(&reservation.txn_id);
     abort_domains(state, reservation.txn_id, &reservation.domains);
+    if reservation.tensor_state.is_some() {
+        if let (Some(arena), Ok(transaction)) = (
+            state.runtime.tensor_state(),
+            PhysicalStateTransactionId::new(reservation.txn_id),
+        ) {
+            let _ = arena.abort(transaction);
+        }
+    }
 }
 
 fn arena_config(
@@ -1579,6 +1674,9 @@ fn prefix_error(error: impl fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::state::{
+        PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue,
+    };
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, CapacitySource, ExecutionAdapterBinding,
         ExecutionGroupId, ExecutionMode, ExecutionProfile, InputRange, NativeBatchMode,
@@ -1586,8 +1684,13 @@ mod tests {
         StageId,
     };
     use crate::kv::{test_contract, CacheBlockRef, KvSlotRef};
+    use crate::kv::{
+        CacheTokenAxis, KvDomainSpec as LegacyDomainSpec, KvStorageRequest, ModelStateDomainSpec,
+        ModelStateKind, ModelStateLayerSpec,
+    };
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+    use candle_core::Tensor;
 
     #[derive(Debug)]
     struct TestCapacityProvider {
@@ -1680,6 +1783,28 @@ mod tests {
             layer.attention = AttentionSemantics::SlidingWindow { window_tokens };
         }
         domain.prefix_semantics = KvPrefixSemantics::Disabled;
+        contract
+    }
+
+    fn composite_tensor_contract() -> KvCacheContract {
+        let mut contract = test_contract();
+        contract
+            .domains
+            .push(LegacyDomainSpec::ModelState(ModelStateDomainSpec {
+                id: CacheDomainId::new(2),
+                token_axis: CacheTokenAxis::DecoderTokens,
+                layers: vec![ModelStateLayerSpec {
+                    model_layer: 0,
+                    kind: ModelStateKind::Recurrent,
+                    elements_per_sequence: 4,
+                }],
+                storage: KvStorageRequest {
+                    dtypes: vec![KvStorageDType::F32],
+                    allow_quantized: false,
+                },
+                prefix_semantics: KvPrefixSemantics::Disabled,
+            }));
+        contract.validate().unwrap();
         contract
     }
 
@@ -2122,6 +2247,96 @@ mod tests {
             .iter()
             .flat_map(|model| &model.arenas)
             .all(|arena| arena.coordinator.active_transactions == 0));
+    }
+
+    #[test]
+    fn paged_and_tensor_state_commit_or_abort_under_one_row_fence() {
+        let model = ModelInstanceId::new(52);
+        let session = SessionKey::new("managed-tensor-composite".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(composite_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let tensor_domain = crate::kv::v2::StateDomainId::new(3);
+
+        let aborted = manager
+            .prepare(&runtime, 31, &session, &sequence_work(0, 1), None)
+            .unwrap()
+            .unwrap();
+        let sequence =
+            PhysicalStateSequenceId::new(aborted.tensor_state.unwrap().sequence).unwrap();
+        let transaction = PhysicalStateTransactionId::new(aborted.txn_id).unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                tensor_domain,
+                0,
+                1,
+                vec![StateComponentValue {
+                    component: crate::kv::v2::StateComponentId::new(1),
+                    tensor: Tensor::from_slice(&[1.0_f32], 1, &Device::Cpu).unwrap(),
+                }],
+            )
+            .unwrap();
+        manager.finalize(&aborted, None, false).unwrap();
+        assert!(arena.read(sequence, tensor_domain).unwrap().is_none());
+        assert_eq!(
+            manager
+                .snapshot(model, &session, CacheDomainId::new(1))
+                .unwrap()
+                .committed_tokens,
+            0
+        );
+
+        let committed = manager
+            .prepare(&runtime, 32, &session, &sequence_work(0, 1), None)
+            .unwrap()
+            .unwrap();
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(committed.txn_id).unwrap(),
+                tensor_domain,
+                0,
+                1,
+                vec![StateComponentValue {
+                    component: crate::kv::v2::StateComponentId::new(1),
+                    tensor: Tensor::from_slice(&[2.0_f32], 1, &Device::Cpu).unwrap(),
+                }],
+            )
+            .unwrap();
+        manager
+            .finalize(
+                &committed,
+                Some(&committed.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            arena
+                .read(sequence, tensor_domain)
+                .unwrap()
+                .unwrap()
+                .components[0]
+                .tensor
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![2.0]
+        );
+        assert_eq!(
+            manager
+                .snapshot(model, &session, CacheDomainId::new(1))
+                .unwrap()
+                .committed_tokens,
+            1
+        );
     }
 
     #[test]

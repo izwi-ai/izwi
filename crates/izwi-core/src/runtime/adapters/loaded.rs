@@ -1809,9 +1809,9 @@ mod tests {
     }
 
     #[test]
-    fn invocation_capability_cannot_publish_ready_without_physical_workspace() {
+    fn stateful_capability_cannot_publish_ready_without_physical_backing() {
         let registry = RuntimeAdapterRegistry::built_in();
-        let variant = ModelVariant::Kokoro82M;
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
         let compatibility = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(3),
@@ -1821,13 +1821,16 @@ mod tests {
         )
         .unwrap();
         let binding = compatibility
-            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .capability_binding_for_streaming(
+                CapabilityKind::RealtimeAsr,
+                StreamingRequirements::NONE,
+            )
             .unwrap();
         assert!(matches!(binding.state, CapabilityStateBinding::LegacyV1(_)));
 
         let graphs = loaded_execution_contracts(
             compatibility
-                .require_capability(CapabilityKind::Tts)
+                .require_capability(CapabilityKind::RealtimeAsr)
                 .unwrap()
                 .execution
                 .as_ref(),
@@ -1844,10 +1847,13 @@ mod tests {
             ModelInstanceId::new(14),
             variant,
             BackendKind::Cpu,
-            HashMap::from([(CapabilityKind::Tts, LoadedStatePublication::V2(zero))]),
+            HashMap::from([(
+                CapabilityKind::RealtimeAsr,
+                LoadedStatePublication::V2(zero),
+            )]),
         )
-        .expect_err("invocation-state metadata without a physical pool must fail before Ready");
-        assert!(error.to_string().contains("invocation state"));
+        .expect_err("retained-state metadata without physical backing must fail before Ready");
+        assert!(error.to_string().contains("retained inference state"));
     }
 
     #[test]

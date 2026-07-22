@@ -1754,16 +1754,15 @@ impl KvCacheContractProvider for NativeChatModel {
     fn kv_cache_contract(&self) -> Result<CacheCapability> {
         match self {
             Self::Qwen3(model) => model.kv_cache_contract(),
-            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => {
-                Ok(CacheCapability::OpaqueModelOwned)
-            }
+            Self::Qwen35(model) => model.kv_cache_contract(),
+            Self::Gemma3(_) | Self::Lfm2(_) => Ok(CacheCapability::OpaqueModelOwned),
         }
     }
 
     fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
         match self {
             Self::Qwen3(model) => model.kv_cache_fallback_reason(),
-            Self::Qwen35(_) => Some("qwen35_cache_has_no_managed_runtime_injection"),
+            Self::Qwen35(model) => model.kv_cache_fallback_reason(),
             Self::Gemma3(_) => Some("gemma3_cache_has_no_managed_runtime_injection"),
             Self::Lfm2(_) => Some("lfm2_cache_has_no_managed_runtime_injection"),
         }
@@ -1954,20 +1953,18 @@ impl NativeChatDecodeState {
         }
     }
 
-    pub(crate) fn install_qwen3_managed_reservation(
-        &mut self,
-        cache: Qwen3ManagedCache,
-    ) -> Result<()> {
+    pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
-            Self::Qwen35(_) => Err(Error::InvalidInput(
-                "managed Qwen3 KV cache was routed to Qwen3.5 state".to_string(),
-            )),
+            Self::Qwen35(state) => state.install_physical_reservation(cache),
         }
     }
 
-    pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
-        matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
+    pub(crate) fn uses_managed_kv(&self) -> bool {
+        match self {
+            Self::Qwen3(state) => state.uses_managed_kv(),
+            Self::Qwen35(state) => state.uses_physical_kv(),
+        }
     }
 
     pub(crate) fn take_managed_write_completions(
@@ -1975,7 +1972,41 @@ impl NativeChatDecodeState {
     ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
         match self {
             Self::Qwen3(state) => state.take_managed_write_completions(),
-            Self::Qwen35(_) => Vec::new(),
+            Self::Qwen35(state) => state.take_physical_write_completions(),
+        }
+    }
+
+    pub(crate) fn bind_qwen35_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        match self {
+            Self::Qwen35(state) => state.bind_tensor_sequence(sequence),
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "tensor-state reservation was routed to a dense Qwen3 model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn restore_qwen35_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(state) => state.restore_tensor_state(arena),
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a dense Qwen3 model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn stage_qwen35_tensor_state(
+        &mut self,
+        arena: &crate::backends::state::TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(state) => state.stage_tensor_state(arena, transaction),
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a dense Qwen3 model".into(),
+            )),
         }
     }
 }
@@ -2180,6 +2211,30 @@ impl NativeChatModel {
             )?)),
             _ => Err(Error::InvalidInput(
                 "managed Qwen3 KV cache was routed to another model family".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_qwen35_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        cache: Qwen3ManagedCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(
+                model.start_decode_state_physical(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    prepared,
+                    cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.5 state was routed to another model family".into(),
             )),
         }
     }

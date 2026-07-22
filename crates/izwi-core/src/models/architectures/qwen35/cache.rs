@@ -1,9 +1,7 @@
 //! Semantic cache domains for Qwen3.5's hybrid decoder.
 //!
-//! This contract is intentionally not advertised as managed yet. The current
-//! executor mutates one model-owned runtime state; promotion requires one
-//! transaction that commits full-attention pages, recurrent state, and
-//! convolution history together.
+//! Full-attention pages, recurrent state, and convolution history advance in
+//! one consistency group and are committed by the managed runtime transaction.
 
 use candle_core::DType;
 
@@ -16,9 +14,6 @@ use crate::kv::{
 };
 
 use super::chat::Qwen35TextConfig;
-
-pub(crate) const QWEN35_OPAQUE_KV_REASON: &str =
-    "qwen35_hybrid_state_is_not_injected_as_one_atomic_managed_transaction";
 
 pub(crate) const FULL_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(0);
 pub(crate) const RECURRENT_STATE_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -245,20 +240,23 @@ mod tests {
     }
 
     #[test]
-    fn opaque_reason_is_stable_until_composite_execution_is_atomic() {
-        assert_eq!(
-            QWEN35_OPAQUE_KV_REASON,
-            "qwen35_hybrid_state_is_not_injected_as_one_atomic_managed_transaction"
-        );
-    }
-
-    #[test]
     fn composite_contract_allocates_paged_and_transactional_tensor_arenas() {
         use crate::backends::BackendKind;
         use crate::engine::{ManagedKvCacheManager, ModelInstanceId};
         use crate::kv::CacheCapability;
 
         let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
+        let upgraded = crate::kv::v2::upgrade_kv_contract_v1(&contract).unwrap();
+        assert_eq!(upgraded.groups.len(), 1);
+        assert_eq!(
+            upgraded.groups[0].domains,
+            vec![
+                crate::kv::v2::StateDomainId::new(1),
+                crate::kv::v2::StateDomainId::new(2),
+                crate::kv::v2::StateDomainId::new(3),
+            ]
+        );
+        assert!(!upgraded.groups[0].prefix_shareable);
         let mut manager = ManagedKvCacheManager::default();
         let runtime = manager
             .bind_request(

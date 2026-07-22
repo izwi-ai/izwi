@@ -97,7 +97,7 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
-        self.chat_request_with_managed_cache(request, scheduled, None)
+        self.chat_request_with_managed_cache(request, scheduled, None, None)
     }
 
     pub(super) fn chat_request_with_managed_cache(
@@ -105,6 +105,7 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
         mut managed_cache: Option<Qwen3ManagedCache>,
+        tensor_reservation: Option<crate::engine::ManagedTensorStateReservation>,
     ) -> Result<ModelSessionResult> {
         if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
             return Err(Error::InferenceError(
@@ -118,6 +119,14 @@ impl NativeExecutor {
         {
             return Err(Error::InvalidInput(
                 "managed Qwen3 chat requires one full-prompt prefill quantum".to_string(),
+            ));
+        }
+        let tensor_arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state().cloned());
+        if tensor_arena.is_some() != tensor_reservation.is_some() {
+            return Err(Error::InferenceError(
+                "managed chat tensor state requires its exact row reservation".into(),
             ));
         }
         let prepared_qwen35_prompt = request.prepared_qwen35_prompt_for_executor()?;
@@ -135,8 +144,8 @@ impl NativeExecutor {
             activation_dtype: self.config.dtype.clone(),
             kv_cache_dtype: self.config.kv_cache_dtype.clone(),
         };
-        let prefix_cache_enabled =
-            self.qwen35_prefix_cache_enabled(prepared_qwen35_prompt, model.as_ref());
+        let prefix_cache_enabled = managed_cache.is_none()
+            && self.qwen35_prefix_cache_enabled(prepared_qwen35_prompt, model.as_ref());
 
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
@@ -260,13 +269,19 @@ impl NativeExecutor {
 
         let mut active_state = if let Some(mut state) = active_state {
             match managed_cache.take() {
-                Some(cache) => state.state.install_qwen3_managed_reservation(cache)?,
-                None if state.state.uses_managed_qwen3_kv() => {
+                Some(cache) => state.state.install_managed_reservation(cache)?,
+                None if state.state.uses_managed_kv() => {
                     return Err(Error::InferenceError(
-                        "managed Qwen3 session lost its physical cache authority".to_string(),
+                        "managed chat session lost its physical cache authority".to_string(),
                     ))
                 }
                 None => {}
+            }
+            if let (Some(arena), Some(reservation)) = (tensor_arena.as_ref(), tensor_reservation) {
+                state
+                    .state
+                    .bind_qwen35_tensor_sequence(reservation.sequence)?;
+                state.state.restore_qwen35_tensor_state(arena)?;
             }
             state
         } else {
@@ -301,6 +316,17 @@ impl NativeExecutor {
                 .as_ref()
                 .map(|authorization| authorization.max_bytes);
             let mut decode_state = match managed_cache.take() {
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_qwen35_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_qwen35_prompt,
+                            cache,
+                        )
+                    })?
+                }
                 Some(cache) => Self::run_blocking(|| {
                     model.start_qwen3_decode_state_managed(messages, max_new_tokens, cache)
                 })?,
@@ -315,6 +341,9 @@ impl NativeExecutor {
                     )
                 })?,
             };
+            if let Some(reservation) = tensor_reservation {
+                decode_state.bind_qwen35_tensor_sequence(reservation.sequence)?;
+            }
             let reused_prefix_tokens = decode_state.reused_qwen35_prefix_tokens();
             if reused_prefix_tokens > 0 {
                 debug!(
@@ -413,6 +442,11 @@ impl NativeExecutor {
         } else {
             decode_steps_ran.max(1)
         };
+        if let Some(arena) = tensor_arena.as_ref() {
+            active_state
+                .state
+                .stage_qwen35_tensor_state(arena, scheduled.plan_id)?;
+        }
         let managed_cache_completions = active_state.state.take_managed_write_completions();
         if !finished {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {
@@ -538,10 +572,8 @@ impl NativeExecutor {
                 ));
             }
             match managed_cache {
-                Some(cache) => active_state
-                    .state
-                    .install_qwen3_managed_reservation(cache)?,
-                None if active_state.state.uses_managed_qwen3_kv() => {
+                Some(cache) => active_state.state.install_managed_reservation(cache)?,
+                None if active_state.state.uses_managed_kv() => {
                     return Err(Error::InferenceError(
                         "continuous managed Qwen3 session changed cache authority".to_string(),
                     ))

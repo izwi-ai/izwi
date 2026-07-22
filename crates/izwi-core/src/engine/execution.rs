@@ -921,6 +921,12 @@ pub struct ManagedCacheReservation {
     pub txn_id: PlanId,
     pub session: SessionKey,
     pub domains: Vec<ManagedCacheDomainReservation>,
+    pub tensor_state: Option<ManagedTensorStateReservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedTensorStateReservation {
+    pub sequence: u64,
 }
 
 /// One physical cache-domain transaction within a row reservation.
@@ -952,6 +958,14 @@ impl ManagedCacheReservation {
         if self.domains.is_empty() {
             return Err(Error::InvalidInput(
                 "managed-cache reservation has no cache domains".to_string(),
+            ));
+        }
+        if self
+            .tensor_state
+            .is_some_and(|reservation| reservation.sequence == 0)
+        {
+            return Err(Error::InvalidInput(
+                "managed tensor-state reservation has a zero sequence id".into(),
             ));
         }
         let mut identities = HashSet::with_capacity(self.domains.len());
@@ -2447,6 +2461,7 @@ mod tests {
                 }],
                 writable_blocks: vec![written_block],
             }],
+            tensor_state: None,
         };
         let batch = PhysicalBatch {
             batch_id: BatchId::new(99),

@@ -129,7 +129,12 @@ impl NativeExecutor {
                 Some(reservation) if request.task_type == TaskType::Chat => {
                     let cache =
                         super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
-                    self.chat_request_with_managed_cache(request, scheduled_req, Some(cache))
+                    self.chat_request_with_managed_cache(
+                        request,
+                        scheduled_req,
+                        Some(cache),
+                        reservation.tensor_state,
+                    )
                 }
                 Some(reservation) if request.task_type == TaskType::ASR => {
                     let cache =
@@ -590,6 +595,7 @@ mod tests {
                 }],
                 writable_blocks: vec![block],
             }],
+            tensor_state: None,
         };
         let lane = BatchLaneKey {
             execution_group: ExecutionGroupId::new(1),
@@ -795,6 +801,7 @@ mod tests {
                     }],
                     writable_blocks: vec![block],
                 }],
+                tensor_state: None,
             };
             let receipt = reservation
                 .completed_write_receipt(std::slice::from_ref(&completion))

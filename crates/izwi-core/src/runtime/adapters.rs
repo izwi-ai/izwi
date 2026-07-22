@@ -279,7 +279,7 @@ pub(crate) fn compatibility_execution_profile(
     if sequence {
         profile.prefill = PrefillMode::Full;
         profile.incremental_decode = true;
-        profile.cache_mode = CacheMode::OpaqueModelOwned;
+        profile.cache_mode = CacheMode::ExternalPaged;
     }
     if metadata.capability == CapabilityKind::Asr {
         profile.cancellation = CancellationGranularity::OperationBoundary;
@@ -289,12 +289,12 @@ pub(crate) fn compatibility_execution_profile(
     profile.max_batch_size = 1;
     profile.compute_dtype = "loaded_model_default".to_string();
     profile.kv_dtype = if sequence {
-        "loaded_model_default".to_string()
+        "state_v2_resolved".to_string()
     } else {
         "none".to_string()
     };
     profile.cache_namespace =
-        sequence.then(|| format!("{}:{}:opaque", variant, backend_kind.as_str()));
+        sequence.then(|| format!("{}:{}:state-v2", variant, backend_kind.as_str()));
     profile
 }
 

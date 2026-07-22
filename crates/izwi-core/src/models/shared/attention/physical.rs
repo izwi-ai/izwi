@@ -106,13 +106,17 @@ impl PhysicalPagedKvCache {
                 "physical paged cache context {context_len} exceeds capacity end {capacity_end}"
             )));
         }
-        for (expected, binding) in layer_bindings.iter().enumerate() {
-            if binding.model_layer as usize != expected {
+        let mut previous_model_layer = None;
+        for (expected_physical, binding) in layer_bindings.iter().enumerate() {
+            if previous_model_layer.is_some_and(|previous| binding.model_layer <= previous)
+                || binding.physical_layer as usize != expected_physical
+            {
                 return Err(Error::InvalidInput(format!(
-                    "physical layer binding {} maps model layer {}, expected {}",
-                    binding.physical_layer, binding.model_layer, expected
+                    "physical layer bindings must have increasing model layers and dense physical ordinals; got {}:{} at ordinal {}",
+                    binding.model_layer, binding.physical_layer, expected_physical
                 )));
             }
+            previous_model_layer = Some(binding.model_layer);
         }
         Ok(Self {
             arena,
@@ -166,6 +170,41 @@ impl PhysicalPagedKvCache {
             {
                 return Err(Error::InvalidInput(
                     "physical paged cache geometry does not match the loaded model".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_sparse_model(
+        &self,
+        model_layers: &[u32],
+        num_kv_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> Result<()> {
+        if self.layer_bindings.len() != model_layers.len()
+            || self.arena.config().layers.len() != model_layers.len()
+        {
+            return Err(Error::InvalidInput(
+                "physical paged cache does not cover every sparse attention layer".into(),
+            ));
+        }
+        for ((binding, layer), model_layer) in self
+            .layer_bindings
+            .iter()
+            .zip(self.arena.config().layers.iter())
+            .zip(model_layers)
+        {
+            if layer.binding != *binding
+                || binding.model_layer != *model_layer
+                || layer.num_kv_heads as usize != num_kv_heads
+                || layer.key_head_dim as usize != key_head_dim
+                || layer.value_head_dim as usize != value_head_dim
+            {
+                return Err(Error::InvalidInput(
+                    "physical paged cache geometry does not match the sparse attention model"
+                        .into(),
                 ));
             }
         }
@@ -395,5 +434,72 @@ impl PhysicalPagedKvCache {
 
     pub(crate) fn take_completed_writes(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
         std::mem::take(&mut self.completed_writes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::DType;
+
+    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{KvGroupId, KvLayerBinding};
+
+    #[test]
+    fn sparse_model_layers_bind_to_dense_physical_ordinals() {
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(9),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let bindings = vec![
+            KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            },
+            KvLayerBinding {
+                model_layer: 7,
+                physical_layer: 1,
+            },
+        ];
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 1,
+                dtype: DType::F32,
+                layers: bindings
+                    .iter()
+                    .copied()
+                    .map(|binding| KvLayerConfig {
+                        binding,
+                        num_kv_heads: 2,
+                        key_head_dim: 4,
+                        value_head_dim: 4,
+                    })
+                    .collect(),
+            })
+            .unwrap(),
+        );
+        let cache = PhysicalPagedKvCache::new(
+            arena,
+            bindings,
+            vec![CacheBlockRef {
+                arena: arena_id,
+                group,
+                index: 0,
+                slot_generation: 1,
+            }],
+            0,
+        )
+        .unwrap();
+
+        cache.validate_sparse_model(&[3, 7], 2, 4, 4).unwrap();
+        assert!(cache.validate_sparse_model(&[3, 6], 2, 4, 4).is_err());
     }
 }
