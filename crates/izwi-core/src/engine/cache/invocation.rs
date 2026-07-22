@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use candle_core::DType;
+use serde::Serialize;
 
 use crate::backends::kv::{KvArena, KvWriteBatchCompletion};
 use crate::error::{Error, Result};
@@ -19,7 +20,7 @@ use crate::kv::v2::{
 use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct InvocationPagedKvPoolId {
     pub(crate) plan: StatePlanId,
     pub(crate) domain: StateDomainId,
@@ -50,6 +51,7 @@ pub(crate) struct InvocationPagedKvPool {
 
 struct InvocationPagedKvPoolInner {
     id: InvocationPagedKvPoolId,
+    workspace_domain: InvocationWorkspaceDomain,
     arena: Arc<dyn KvArena>,
     layer_bindings: Vec<KvLayerBinding>,
     first_page: u32,
@@ -199,6 +201,7 @@ impl InvocationPagedKvPool {
         Ok(Self {
             inner: Arc::new(InvocationPagedKvPoolInner {
                 id,
+                workspace_domain: workspace_domain.clone(),
                 arena,
                 layer_bindings: resolved
                     .layers
@@ -220,6 +223,10 @@ impl InvocationPagedKvPool {
 
     pub(crate) fn id(&self) -> InvocationPagedKvPoolId {
         self.inner.id
+    }
+
+    pub(crate) fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
+        &self.inner.workspace_domain
     }
 
     pub(crate) fn maximum_tokens_per_lease(&self) -> Result<u64> {

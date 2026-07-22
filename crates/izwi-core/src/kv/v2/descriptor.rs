@@ -428,7 +428,7 @@ impl InvocationStageWorkspace {
 }
 
 impl InvocationWorkspaceDomain {
-    fn id(&self) -> StateDomainId {
+    pub(crate) fn id(&self) -> StateDomainId {
         match self {
             Self::Scratch { id, .. } => *id,
             Self::State { state, .. } => state.id(),

@@ -13,8 +13,8 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CapabilityStateRuntimeV2,
-    InferenceStateContract, ManagedCapabilityRuntimeV2, RetainedStateUseV2,
-    StatelessCapabilityRuntimeV2,
+    InferenceStateContract, InvocationPagedWorkspaceRuntimeV2, ManagedCapabilityRuntimeV2,
+    RetainedStateCapability, RetainedStateUseV2, StatelessCapabilityRuntimeV2,
 };
 use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
@@ -137,6 +137,13 @@ pub(crate) enum LoadedStatePublication {
         contract: InferenceStateContract,
         physical: Arc<ManagedKvModelRuntime>,
     },
+    /// Fully authored retained + typed invocation state with all physical
+    /// backing allocated before capability sealing.
+    PhysicalV2 {
+        descriptor: CapabilityStateDescriptorV2,
+        retained: Arc<ManagedKvModelRuntime>,
+        invocation_paged: InvocationPagedWorkspaceRuntimeV2,
+    },
 }
 
 impl LoadedStatePublication {
@@ -153,15 +160,35 @@ impl LoadedStatePublication {
                 }
                 Ok(())
             }
+            Self::PhysicalV2 {
+                descriptor,
+                retained,
+                ..
+            } => {
+                descriptor.validate_against_stages(stages)?;
+                let RetainedStateCapability::Managed { contract } = &descriptor.retained else {
+                    return Err(Error::ModelLoadError(
+                        "physical state publication is missing its retained contract".into(),
+                    ));
+                };
+                if contract.fingerprint()? != retained.state_plan_v2().contract_fingerprint {
+                    return Err(Error::ModelLoadError(
+                        "physical state publication does not match its retained plan".into(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
     fn legacy_binding(&self) -> Result<CapabilityStateBinding> {
         match self {
             Self::LegacyV1(cache) => Ok(CapabilityStateBinding::LegacyV1(cache.capability.clone())),
-            Self::V2(_) | Self::ManagedV2 { .. } => Err(Error::ModelLoadError(
-                "state ABI v2 requires an immutable load-sealed runtime binding".to_string(),
-            )),
+            Self::V2(_) | Self::ManagedV2 { .. } | Self::PhysicalV2 { .. } => {
+                Err(Error::ModelLoadError(
+                    "state ABI v2 requires an immutable load-sealed runtime binding".to_string(),
+                ))
+            }
         }
     }
 
@@ -169,7 +196,7 @@ impl LoadedStatePublication {
         match self {
             Self::LegacyV1(_) => Ok(None),
             Self::V2(descriptor) => Ok(Some(descriptor.fingerprint(stages)?)),
-            Self::ManagedV2 { .. } => Err(Error::ModelLoadError(
+            Self::ManagedV2 { .. } | Self::PhysicalV2 { .. } => Err(Error::ModelLoadError(
                 "managed v2 publication must be normalized into a sealed descriptor".to_string(),
             )),
         }
@@ -373,6 +400,75 @@ impl LoadedCapabilityDescriptor {
                 }
                 LoadedStatePublication::V2(descriptor)
             }
+            LoadedStatePublication::PhysicalV2 {
+                descriptor,
+                retained,
+                invocation_paged,
+            } => {
+                if !execution.metadata().state_requirement.requires_retained() {
+                    return Err(Error::ModelLoadError(
+                        "capability declared without retained state published a retained physical runtime"
+                            .to_string(),
+                    ));
+                }
+                for contract in &contracts {
+                    let has_invocation =
+                        !descriptor.has_zero_invocation_workspace_for(&contract.stages)?;
+                    if execution.metadata().state_requirement.requires_invocation()
+                        != has_invocation
+                    {
+                        return Err(Error::ModelLoadError(
+                            "physical invocation workspace does not match the capability lifetime declaration"
+                                .to_string(),
+                        ));
+                    }
+                    let retained_state_use = match contract.execution_profile.cache_mode {
+                        CacheMode::ExternalPaged
+                            if contract.execution_profile.cache_namespace.is_some()
+                                && contract.execution_profile.kv_dtype != "none" =>
+                        {
+                            RetainedStateUseV2::ExternalPaged
+                        }
+                        CacheMode::None
+                            if contract.execution_profile.cache_namespace.is_none()
+                                && contract.execution_profile.kv_dtype == "none" =>
+                        {
+                            RetainedStateUseV2::Inactive
+                        }
+                        _ => {
+                            return Err(Error::ModelLoadError(
+                                "physical state ABI v2 requires each graph to declare either external paged state or no retained state"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    let binding = contract.adapter_binding()?;
+                    let managed = ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
+                        backend_kind,
+                        &binding,
+                        descriptor.clone(),
+                        retained.clone(),
+                        retained_state_use,
+                        invocation_paged.clone(),
+                    )?;
+                    let graph = managed.stage_graph_fingerprint;
+                    let runtime = Arc::new(CapabilityStateRuntimeV2::managed(managed));
+                    match v2_runtimes.entry(graph) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(runtime);
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            if entry.get().as_ref() != runtime.as_ref() {
+                                return Err(Error::ModelLoadError(
+                                    "one physical state ABI v2 graph resolved inconsistent runtime identities"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                LoadedStatePublication::V2(descriptor)
+            }
         };
         Ok(Self {
             execution,
@@ -408,7 +504,8 @@ impl LoadedCapabilityDescriptor {
                     Some(runtime.state_fingerprint),
                 )
             }
-            LoadedStatePublication::ManagedV2 { .. } => {
+            LoadedStatePublication::ManagedV2 { .. }
+            | LoadedStatePublication::PhysicalV2 { .. } => {
                 return Err(Error::InferenceError(
                     "managed state publication was not load-sealed".to_string(),
                 ));

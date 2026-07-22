@@ -1,20 +1,22 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::backends::state::StateBackendRegistry;
 use crate::backends::BackendKind;
-use crate::engine::ManagedKvModelRuntime;
 use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, ExecutionAdapterBinding, ExecutionGroupId,
     ModelInstanceId,
 };
+use crate::engine::{InvocationPagedKvLease, InvocationPagedKvPool, InvocationPagedKvPoolId};
+use crate::engine::{ManagedKvModelRuntime, StageId};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
 use super::{
-    stage_graph_fingerprint, CapabilityStateDescriptorV2, ResolvedStatePlan,
-    RetainedStateCapability,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, InvocationWorkspaceDomain,
+    InvocationWorkspaceSet, ResolvedStatePlan, RetainedStateCapability, StateDomainId,
 };
 
 const STATELESS_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.stateless-runtime.v2\0";
@@ -28,6 +30,134 @@ const MANAGED_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.managed
 pub(crate) enum RetainedStateUseV2 {
     Inactive,
     ExternalPaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub(crate) struct InvocationPagedWorkspaceKeyV2 {
+    pub(crate) stage_graph: [u8; 32],
+    pub(crate) stage: StageId,
+    pub(crate) domain: StateDomainId,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InvocationPagedWorkspaceBindingV2 {
+    pub(crate) key: InvocationPagedWorkspaceKeyV2,
+    pub(crate) pool: InvocationPagedKvPool,
+}
+
+/// Load-sealed physical invocation page pools. Reusing one pool across exact
+/// graph/stage keys is explicit because each key must be published here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InvocationPagedWorkspaceRuntimeV2 {
+    pools: HashMap<InvocationPagedWorkspaceKeyV2, InvocationPagedKvPool>,
+}
+
+impl InvocationPagedWorkspaceRuntimeV2 {
+    pub(crate) fn new(bindings: Vec<InvocationPagedWorkspaceBindingV2>) -> Result<Self> {
+        let mut pools = HashMap::with_capacity(bindings.len());
+        for binding in bindings {
+            if binding.key.stage_graph.iter().all(|byte| *byte == 0)
+                || binding.key.stage.get() == 0
+                || binding.key.domain.get() == 0
+                || binding.pool.id().domain != binding.key.domain
+            {
+                return Err(invalid(
+                    "invocation paged workspace binding has an incomplete or mismatched identity",
+                ));
+            }
+            if pools.insert(binding.key, binding.pool).is_some() {
+                return Err(invalid(
+                    "invocation paged workspace repeats one graph/stage/domain binding",
+                ));
+            }
+        }
+        Ok(Self { pools })
+    }
+
+    fn validate_for(
+        &self,
+        descriptor: &CapabilityStateDescriptorV2,
+        stages: &[crate::engine::StageDescriptor],
+    ) -> Result<()> {
+        let graph = stage_graph_fingerprint(stages)?;
+        let expected = match &descriptor.invocation {
+            InvocationWorkspaceSet::None { .. } => HashMap::new(),
+            InvocationWorkspaceSet::Bounded { profiles } => profiles
+                .iter()
+                .find(|profile| profile.stage_graph_fingerprint == graph)
+                .ok_or_else(|| invalid("invocation runtime has no selected descriptor profile"))?
+                .stages
+                .iter()
+                .flat_map(|stage| {
+                    stage.domains.iter().filter_map(move |domain| match domain {
+                        InvocationWorkspaceDomain::State {
+                            state: super::StateDomainSpec::PagedAttention(_),
+                            ..
+                        } => Some((
+                            InvocationPagedWorkspaceKeyV2 {
+                                stage_graph: graph,
+                                stage: stage.stage,
+                                domain: domain.id(),
+                            },
+                            domain,
+                        )),
+                        _ => None,
+                    })
+                })
+                .collect::<HashMap<_, _>>(),
+        };
+        let actual = self
+            .pools
+            .iter()
+            .filter(|(key, _)| key.stage_graph == graph)
+            .collect::<HashMap<_, _>>();
+        if actual.len() != expected.len() {
+            return Err(invalid(
+                "invocation paged workspace backing does not cover the selected descriptor",
+            ));
+        }
+        for (key, domain) in expected {
+            let pool = self.pools.get(&key).ok_or_else(|| {
+                invalid("invocation paged workspace is missing a graph/stage/domain pool")
+            })?;
+            if pool.workspace_domain() != domain {
+                return Err(invalid(
+                    "invocation paged workspace pool does not match its authored domain",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn pool_ids_for_graph(
+        &self,
+        graph: [u8; 32],
+    ) -> Vec<(InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolId)> {
+        let mut ids = self
+            .pools
+            .iter()
+            .filter(|(key, _)| key.stage_graph == graph)
+            .map(|(key, pool)| (*key, pool.id()))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by_key(|(key, _)| (key.stage, key.domain));
+        ids
+    }
+
+    fn lease(
+        &self,
+        graph: [u8; 32],
+        stage: StageId,
+        domain: StateDomainId,
+    ) -> Result<InvocationPagedKvLease> {
+        self.pools
+            .get(&InvocationPagedWorkspaceKeyV2 {
+                stage_graph: graph,
+                stage,
+                domain,
+            })
+            .ok_or_else(|| invalid("selected invocation paged workspace is not load-sealed"))?
+            .lease()
+    }
 }
 
 /// Canonical identity shared by every retained/workspace/runtime plan for one
@@ -152,6 +282,23 @@ impl CapabilityStateRuntimeV2 {
         }
     }
 
+    pub(crate) fn lease_invocation_paged(
+        &self,
+        stage: StageId,
+        domain: StateDomainId,
+    ) -> Result<InvocationPagedKvLease> {
+        match &self.backing {
+            CapabilityStateRuntimeBackingV2::Stateless(_) => Err(invalid(
+                "stateless runtime has no load-sealed paged invocation workspace",
+            )),
+            CapabilityStateRuntimeBackingV2::Managed(runtime) => {
+                runtime
+                    .invocation_paged
+                    .lease(runtime.stage_graph_fingerprint, stage, domain)
+            }
+        }
+    }
+
     pub(crate) fn validate_against(
         &self,
         backend: BackendKind,
@@ -198,6 +345,7 @@ pub(crate) struct ManagedCapabilityRuntimeV2 {
     pub(crate) state_plan: Arc<ResolvedStatePlan>,
     retained_state_use: RetainedStateUseV2,
     physical: Arc<ManagedKvModelRuntime>,
+    invocation_paged: InvocationPagedWorkspaceRuntimeV2,
 }
 
 impl ManagedCapabilityRuntimeV2 {
@@ -207,6 +355,24 @@ impl ManagedCapabilityRuntimeV2 {
         descriptor: CapabilityStateDescriptorV2,
         physical: Arc<ManagedKvModelRuntime>,
         retained_state_use: RetainedStateUseV2,
+    ) -> Result<Self> {
+        Self::seal_with_invocation_paged(
+            backend,
+            execution,
+            descriptor,
+            physical,
+            retained_state_use,
+            InvocationPagedWorkspaceRuntimeV2::default(),
+        )
+    }
+
+    pub(crate) fn seal_with_invocation_paged(
+        backend: BackendKind,
+        execution: &ExecutionAdapterBinding,
+        descriptor: CapabilityStateDescriptorV2,
+        physical: Arc<ManagedKvModelRuntime>,
+        retained_state_use: RetainedStateUseV2,
+        invocation_paged: InvocationPagedWorkspaceRuntimeV2,
     ) -> Result<Self> {
         execution.validate()?;
         descriptor.validate_against_stages(&execution.stages)?;
@@ -242,6 +408,7 @@ impl ManagedCapabilityRuntimeV2 {
             state_plan,
             retained_state_use,
             physical,
+            invocation_paged,
         };
         runtime.id = runtime.compute_id()?;
         runtime.validate_against(backend, execution)?;
@@ -255,6 +422,8 @@ impl ManagedCapabilityRuntimeV2 {
     ) -> Result<()> {
         self.identity.validate_against(backend, execution)?;
         self.descriptor.validate_against_stages(&execution.stages)?;
+        self.invocation_paged
+            .validate_for(&self.descriptor, &execution.stages)?;
         let RetainedStateCapability::Managed { contract } = &self.descriptor.retained else {
             return Err(invalid("managed runtime lost its retained-state contract"));
         };
@@ -283,6 +452,7 @@ impl ManagedCapabilityRuntimeV2 {
             state_plan: super::StatePlanId,
             physical_plan: crate::kv::KvPlanId,
             retained_state_use: RetainedStateUseV2,
+            invocation_paged: Vec<(InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolId)>,
         }
         let encoded = serde_json::to_vec(&Payload {
             identity: &self.identity,
@@ -291,6 +461,9 @@ impl ManagedCapabilityRuntimeV2 {
             state_plan: self.state_plan.id,
             physical_plan: self.physical.plan().id,
             retained_state_use: self.retained_state_use,
+            invocation_paged: self
+                .invocation_paged
+                .pool_ids_for_graph(self.stage_graph_fingerprint),
         })
         .map_err(|error| invalid(format!("failed to encode managed runtime: {error}")))?;
         let mut hasher = Sha256::new();
@@ -375,10 +548,22 @@ fn invalid(message: impl Into<String>) -> Error {
 mod tests {
     use std::sync::Arc;
 
+    use candle_core::DType;
+
     use super::*;
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::engine::{
-        ExecutionMode, ExecutionProfile, NativeBatchMode, StageDescriptor, StageId,
+        EngineCore, EngineCoreConfig, ExecutionMode, ExecutionProfile, NativeBatchMode,
+        StageDescriptor, StageId,
     };
+    use crate::kv::v2::{test_contract, upgrade_kv_contract_v1};
+    use crate::kv::v2::{
+        CheckpointPolicy, InvocationStageWorkspace, InvocationStateCapacity,
+        InvocationWorkspaceProfile, PlacementPolicy, PrefixPolicy, StateDType, StateDomainSpec,
+        StateGroupId, StateGroupSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    };
+    use crate::kv::{CacheCapability, KvArenaId, KvGroupId, KvLayerBinding};
 
     fn binding() -> ExecutionAdapterBinding {
         let variant = ModelVariant::Kokoro82M;
@@ -399,6 +584,130 @@ mod tests {
             capability_id: "tts".to_string(),
             stages: Arc::from([stage]),
         }
+    }
+
+    fn invocation_pool(
+        model_instance: ModelInstanceId,
+    ) -> (InvocationPagedKvPool, InvocationWorkspaceDomain) {
+        let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        domain.header.scope = StateScope::Invocation;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::None;
+        domain.accepted_dtypes = vec![StateDType::F32];
+        domain.layers[0].query_heads = 2;
+        domain.layers[0].kv_heads = 2;
+        domain.layers[0].key_head_dim = 4;
+        domain.layers[0].value_head_dim = 4;
+        domain.layers[0].key_encoding = super::super::KeyEncoding::Rotary { rotary_dim: 4 };
+        contract.groups[0].prefix_shareable = false;
+        let workspace_domain = InvocationWorkspaceDomain::State {
+            state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            formula: WorkspaceFormula {
+                fixed_bytes: 1024 * 1024,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: Some(StateDType::F32),
+            },
+        )
+        .unwrap();
+        let resolved = &plan.paged_attention[0];
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: KvArenaId {
+                    model_instance,
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    generation: 19,
+                },
+                group: KvGroupId::new(resolved.group.get()),
+                page_tokens: resolved.page_tokens,
+                capacity_pages: 1,
+                dtype: DType::F32,
+                layers: resolved
+                    .layers
+                    .iter()
+                    .map(|binding| KvLayerConfig {
+                        binding: KvLayerBinding {
+                            model_layer: binding.model_layer,
+                            physical_layer: binding.physical_layer,
+                        },
+                        num_kv_heads: 2,
+                        key_head_dim: 4,
+                        value_head_dim: 4,
+                    })
+                    .collect(),
+            })
+            .unwrap(),
+        );
+        (
+            InvocationPagedKvPool::new(&plan, &workspace_domain, arena, 0, 1, 1, 23).unwrap(),
+            workspace_domain,
+        )
+    }
+
+    fn managed_invocation_fixture() -> (
+        ExecutionAdapterBinding,
+        CapabilityStateDescriptorV2,
+        Arc<ManagedKvModelRuntime>,
+        InvocationPagedKvPool,
+    ) {
+        let model_instance = ModelInstanceId::new(37);
+        let mut execution = binding();
+        execution.model_instance_id = model_instance;
+        Arc::make_mut(&mut execution.stages)[0].max_workspace_bytes = 1024 * 1024;
+        let graph = stage_graph_fingerprint(&execution.stages).unwrap();
+        let (pool, workspace_domain) = invocation_pool(model_instance);
+        let retained_contract = upgrade_kv_contract_v1(&crate::kv::test_contract()).unwrap();
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Managed {
+                contract: retained_contract,
+            },
+            invocation: InvocationWorkspaceSet::Bounded {
+                profiles: vec![InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: graph,
+                    stages: vec![InvocationStageWorkspace {
+                        stage: execution.stages[0].id,
+                        groups: vec![StateGroupSpec {
+                            id: StateGroupId::new(1),
+                            domains: vec![StateDomainId::new(1)],
+                            prefix_shareable: false,
+                        }],
+                        domains: vec![workspace_domain],
+                    }],
+                }],
+            },
+        };
+        descriptor
+            .validate_against_stages(&execution.stages)
+            .unwrap();
+        let mut core = EngineCore::new(EngineCoreConfig {
+            max_blocks: 4,
+            block_size: 16,
+            ..EngineCoreConfig::default()
+        })
+        .unwrap();
+        let physical = core
+            .load_managed_model_cache(
+                model_instance,
+                &CacheCapability::Managed(crate::kv::test_contract()),
+            )
+            .unwrap()
+            .expect("managed physical cache");
+        (execution, descriptor, physical, pool)
     }
 
     #[test]
@@ -465,5 +774,78 @@ mod tests {
             .unwrap()
             .validate_against(BackendKind::Cpu, &binding)
             .unwrap();
+    }
+
+    #[test]
+    fn invocation_runtime_rejects_duplicate_or_mismatched_bindings() {
+        let (execution, _, _, pool) = managed_invocation_fixture();
+        let key = InvocationPagedWorkspaceKeyV2 {
+            stage_graph: stage_graph_fingerprint(&execution.stages).unwrap(),
+            stage: execution.stages[0].id,
+            domain: StateDomainId::new(1),
+        };
+        assert!(InvocationPagedWorkspaceRuntimeV2::new(vec![
+            InvocationPagedWorkspaceBindingV2 {
+                key,
+                pool: pool.clone(),
+            },
+            InvocationPagedWorkspaceBindingV2 {
+                key,
+                pool: pool.clone(),
+            },
+        ])
+        .is_err());
+        let wrong_key = InvocationPagedWorkspaceKeyV2 {
+            domain: StateDomainId::new(99),
+            ..key
+        };
+        assert!(
+            InvocationPagedWorkspaceRuntimeV2::new(vec![InvocationPagedWorkspaceBindingV2 {
+                key: wrong_key,
+                pool,
+            },])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_runtime_requires_exact_invocation_backing_before_seal() {
+        let (execution, descriptor, physical, pool) = managed_invocation_fixture();
+        assert!(ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
+            BackendKind::Cpu,
+            &execution,
+            descriptor.clone(),
+            physical.clone(),
+            RetainedStateUseV2::ExternalPaged,
+            InvocationPagedWorkspaceRuntimeV2::default(),
+        )
+        .is_err());
+
+        let stage = execution.stages[0].id;
+        let domain = StateDomainId::new(1);
+        let invocation =
+            InvocationPagedWorkspaceRuntimeV2::new(vec![InvocationPagedWorkspaceBindingV2 {
+                key: InvocationPagedWorkspaceKeyV2 {
+                    stage_graph: stage_graph_fingerprint(&execution.stages).unwrap(),
+                    stage,
+                    domain,
+                },
+                pool,
+            }])
+            .unwrap();
+        let runtime = CapabilityStateRuntimeV2::managed(
+            ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
+                BackendKind::Cpu,
+                &execution,
+                descriptor,
+                physical,
+                RetainedStateUseV2::ExternalPaged,
+                invocation,
+            )
+            .unwrap(),
+        );
+        let lease = runtime.lease_invocation_paged(stage, domain).unwrap();
+        assert_eq!(lease.cache().context_len(), 0);
+        lease.release().unwrap();
     }
 }
