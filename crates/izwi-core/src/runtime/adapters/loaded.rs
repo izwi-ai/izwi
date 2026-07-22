@@ -959,14 +959,13 @@ impl RuntimeAdapterRegistry {
             .collect()
     }
 
-    fn bind_loaded_capability(
+    fn create_loaded_adapter(
         &self,
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
-        state: Option<LoadedStatePublication>,
-    ) -> Result<LoadedCapabilityDescriptor> {
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
         let context = LoadedAdapterFactoryContext {
             execution_group_id,
             model_instance_id,
@@ -990,7 +989,118 @@ impl RuntimeAdapterRegistry {
                 metadata.model_variant, metadata.capability
             )));
         }
-        LoadedCapabilityDescriptor::new(adapter, state, backend_kind)
+        Ok(adapter)
+    }
+}
+
+/// One-shot execution identity built before physical state allocation.
+/// Factories run exactly once; sealing consumes the draft so a state plan can
+/// never bind to a different adapter instance or selectable stage graph.
+pub(crate) struct LoadedModelBundleDraft {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    model_variant: ModelVariant,
+    backend_kind: BackendKind,
+    capabilities: HashMap<CapabilityKind, Arc<dyn LoadedExecutionAdapter>>,
+}
+
+impl fmt::Debug for LoadedModelBundleDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedModelBundleDraft")
+            .field("execution_group_id", &self.execution_group_id)
+            .field("model_instance_id", &self.model_instance_id)
+            .field("model_variant", &self.model_variant)
+            .field("backend_kind", &self.backend_kind)
+            .field("capability_count", &self.capabilities.len())
+            .finish()
+    }
+}
+
+impl LoadedModelBundleDraft {
+    pub(crate) fn build(
+        registry: &RuntimeAdapterRegistry,
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+    ) -> Result<Self> {
+        let metadata = registry.capabilities_for(model_variant);
+        if metadata.is_empty() {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {model_variant} has no executable capability adapter"
+            )));
+        }
+        let mut capabilities = HashMap::with_capacity(metadata.len());
+        for metadata in metadata {
+            let adapter = registry.create_loaded_adapter(
+                execution_group_id,
+                model_instance_id,
+                metadata,
+                backend_kind,
+            )?;
+            if capabilities.insert(metadata.capability, adapter).is_some() {
+                return Err(Error::ModelLoadError(format!(
+                    "loaded model {model_variant} has duplicate {:?} adapters",
+                    metadata.capability
+                )));
+            }
+        }
+        Ok(Self {
+            execution_group_id,
+            model_instance_id,
+            model_variant,
+            backend_kind,
+            capabilities,
+        })
+    }
+
+    pub(crate) fn execution_contracts(
+        &self,
+        capability: CapabilityKind,
+    ) -> Result<Vec<LoadedExecutionContract>> {
+        let execution = self.capabilities.get(&capability).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "loaded model {} does not expose capability {:?}",
+                self.model_variant, capability
+            ))
+        })?;
+        loaded_execution_contracts(execution.as_ref())
+    }
+
+    pub(crate) fn seal(
+        self,
+        mut state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<LoadedModelBundle> {
+        let mut unmatched = state_publications
+            .keys()
+            .copied()
+            .filter(|capability| !self.capabilities.contains_key(capability))
+            .map(CapabilityKind::as_str)
+            .collect::<Vec<_>>();
+        if !unmatched.is_empty() {
+            unmatched.sort_unstable();
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {} published cache truth for unregistered capabilities: {}",
+                self.model_variant,
+                unmatched.join(", ")
+            )));
+        }
+
+        let mut capabilities = HashMap::with_capacity(self.capabilities.len());
+        for (capability, execution) in self.capabilities {
+            let state = state_publications.remove(&capability);
+            let descriptor = LoadedCapabilityDescriptor::new(execution, state, self.backend_kind)?;
+            capabilities.insert(capability, descriptor);
+        }
+        debug_assert!(state_publications.is_empty());
+        Ok(LoadedModelBundle {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            model_variant: self.model_variant,
+            backend_kind: self.backend_kind,
+            capabilities,
+        })
     }
 }
 
@@ -1042,58 +1152,16 @@ impl LoadedModelBundle {
         model_instance_id: ModelInstanceId,
         model_variant: ModelVariant,
         backend_kind: BackendKind,
-        mut state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
+        state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
     ) -> Result<Self> {
-        let metadata = registry.capabilities_for(model_variant);
-        if metadata.is_empty() {
-            return Err(Error::ModelLoadError(format!(
-                "loaded model {model_variant} has no executable capability adapter"
-            )));
-        }
-        let mut unmatched = state_publications
-            .keys()
-            .copied()
-            .filter(|capability| !metadata.iter().any(|entry| entry.capability == *capability))
-            .map(CapabilityKind::as_str)
-            .collect::<Vec<_>>();
-        if !unmatched.is_empty() {
-            unmatched.sort_unstable();
-            return Err(Error::ModelLoadError(format!(
-                "loaded model {model_variant} published cache truth for unregistered capabilities: {}",
-                unmatched.join(", ")
-            )));
-        }
-
-        let mut capabilities = HashMap::with_capacity(metadata.len());
-        for metadata in metadata {
-            let state = state_publications.remove(&metadata.capability);
-            let descriptor = registry.bind_loaded_capability(
-                execution_group_id,
-                model_instance_id,
-                metadata,
-                backend_kind,
-                state,
-            )?;
-            if capabilities
-                .insert(metadata.capability, descriptor)
-                .is_some()
-            {
-                return Err(Error::ModelLoadError(format!(
-                    "loaded model {model_variant} has duplicate {:?} adapters",
-                    metadata.capability
-                )));
-            }
-        }
-
-        debug_assert!(state_publications.is_empty());
-
-        Ok(Self {
+        LoadedModelBundleDraft::build(
+            registry,
             execution_group_id,
             model_instance_id,
             model_variant,
             backend_kind,
-            capabilities,
-        })
+        )?
+        .seal(state_publications)
     }
 
     pub(crate) fn execution_group_id(&self) -> ExecutionGroupId {
@@ -1976,6 +2044,30 @@ mod tests {
 
         assert_ne!(first_asr, first_tts);
         assert_ne!(first_asr, second_asr);
+    }
+
+    #[test]
+    fn bundle_draft_preserves_the_exact_adapter_identity_through_state_seal() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(12),
+            ModelInstanceId::new(91),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contracts = draft.execution_contracts(CapabilityKind::Tts).unwrap();
+        let adapter = contracts[0].adapter_instance_id;
+        assert!(contracts
+            .iter()
+            .all(|contract| contract.adapter_instance_id == adapter));
+
+        let bundle = draft.seal(HashMap::new()).unwrap();
+        let sealed = bundle
+            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .unwrap();
+        assert_eq!(sealed.adapter_instance_id, adapter);
     }
 
     #[test]
