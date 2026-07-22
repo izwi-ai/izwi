@@ -281,7 +281,10 @@ fn workspace_expectation(
         // capability. It must still publish a workspace contract, but an empty
         // resolved contract is valid.
         (ModelFamily::Tokenizer, Capability::Tokenizer)
-        | (ModelFamily::Qwen3ForcedAligner, Capability::ForcedAlignment) => DeclaredMayBeEmpty,
+        | (ModelFamily::Qwen3ForcedAligner, Capability::ForcedAlignment)
+        | (ModelFamily::KokoroTts, Capability::Tts | Capability::StreamingTts) => {
+            DeclaredMayBeEmpty
+        }
 
         // Qwen TTS has a frame-local code-predictor cache in addition to its
         // retained talker state. Nemotron realtime has chunk-local staging in

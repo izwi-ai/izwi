@@ -374,10 +374,10 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
-                InferenceStateRequirement::RetainedAndInvocation
-            } else {
-                InferenceStateRequirement::Invocation
+            state_requirement: match model_variant.family() {
+                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
+                ModelFamily::KokoroTts => InferenceStateRequirement::Stateless,
+                _ => InferenceStateRequirement::Invocation,
             },
         })
     }
@@ -400,10 +400,10 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
-                InferenceStateRequirement::RetainedAndInvocation
-            } else {
-                InferenceStateRequirement::Invocation
+            state_requirement: match model_variant.family() {
+                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
+                ModelFamily::KokoroTts => InferenceStateRequirement::Stateless,
+                _ => InferenceStateRequirement::Invocation,
             },
         })
     }
