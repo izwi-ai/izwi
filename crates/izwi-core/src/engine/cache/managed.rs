@@ -474,6 +474,34 @@ impl ManagedKvCacheManager {
         Ok(Some(runtime))
     }
 
+    /// Resolve an arena runtime that was allocated by model loading. Request
+    /// admission must never create backing storage or expand model residency.
+    pub(crate) fn require_loaded_runtime(
+        &self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        capability: &CacheCapability,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        let Some(contract) = capability.managed_contract() else {
+            return Ok(None);
+        };
+        let state = self.models.get(&model_instance).ok_or_else(|| {
+            Error::InferenceError(
+                "loaded adapter published managed KV without load-time physical allocation"
+                    .to_string(),
+            )
+        })?;
+        if backend != self.worker_backend
+            || state.runtime.plan.backend != backend
+            || &state.contract != contract
+        {
+            return Err(Error::InferenceError(
+                "load-time managed KV runtime does not match the request capability".to_string(),
+            ));
+        }
+        Ok(Some(state.runtime.clone()))
+    }
+
     pub(crate) fn prepare(
         &mut self,
         runtime: &ManagedKvModelRuntime,

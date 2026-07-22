@@ -336,6 +336,9 @@ impl ModelLifecycleController {
                         "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
                     )));
                 }
+                self.core_engine
+                    .load_managed_model_cache(model_instance_id, &loaded_cache.capability)
+                    .await?;
                 state_publications.insert(
                     CapabilityKind::Chat,
                     LoadedStatePublication::LegacyV1(loaded_cache),

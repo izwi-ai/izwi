@@ -87,9 +87,9 @@ pub use metrics::{
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
     ENGINE_SCHEDULER_QUEUE_DEPTH, ENGINE_SCHEDULER_RUNNING_REQUESTS,
-    ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
-    ENGINE_STREAM_BACKPRESSURE_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
-    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
+    ENGINE_SCHEDULER_STEP_TOKENS_TOTAL, ENGINE_STREAM_BACKPRESSURE_TOTAL,
+    ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL, ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
 pub use request::{
@@ -1327,6 +1327,20 @@ impl Engine {
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
         let _step = self.step_gate.lock().await;
         self.core.write().await.purge_model_cache(variant).await
+    }
+
+    /// Admit and allocate managed physical state before the model generation
+    /// becomes Ready.
+    pub async fn load_managed_model_cache(
+        &self,
+        model_instance: ModelInstanceId,
+        capability: &crate::kv::CacheCapability,
+    ) -> Result<()> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .load_managed_model_cache(model_instance, capability)
     }
 
     /// Retire the managed KV arenas for one exact loaded-model generation.

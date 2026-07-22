@@ -1545,13 +1545,7 @@ impl EngineCore {
                 let managed_backend = self.managed_kv_cache.worker_backend();
                 let runtime = self
                     .managed_kv_cache
-                    .bind_request(
-                        model_instance,
-                        managed_backend,
-                        self.config.max_blocks,
-                        self.config.block_size,
-                        &capability,
-                    )?
+                    .require_loaded_runtime(model_instance, managed_backend, &capability)?
                     .ok_or_else(|| {
                         Error::InferenceError(
                             "loaded adapter published managed KV without a resolved runtime"
@@ -2677,6 +2671,34 @@ impl EngineCore {
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&mut self, variant: ModelVariant) -> CacheReleaseReport {
         self.executor.purge_model_cache(variant).await
+    }
+
+    /// Allocate and admit physical KV backing while the authoritative model
+    /// generation is still Loading. Ready publication happens only after this
+    /// succeeds, and request admission performs lookup only.
+    pub fn load_managed_model_cache(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        capability: &crate::kv::CacheCapability,
+    ) -> Result<()> {
+        if capability.managed_contract().is_none() {
+            return Ok(());
+        }
+        let backend = self.managed_kv_cache.worker_backend();
+        self.managed_kv_cache
+            .bind_request(
+                model_instance,
+                backend,
+                self.config.max_blocks,
+                self.config.block_size,
+                capability,
+            )?
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "managed KV load did not install a physical runtime".to_string(),
+                )
+            })?;
+        Ok(())
     }
 
     /// Retire physical managed-KV state for one exact loaded-model instance.
@@ -5261,6 +5283,8 @@ mod tests {
                 crate::kv::test_contract(),
             ))
             .expect("cache contract");
+        core.load_managed_model_cache(model_instance, request.cache_capability())
+            .expect("load managed state");
         core.add_request(request).expect("add request");
         let session = core
             .get_session_key(&"managed-core".to_string())
@@ -5299,6 +5323,9 @@ mod tests {
         .expect("core");
         core.retry_policy.execution_backoff_base = Duration::ZERO;
         core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let capability = crate::kv::CacheCapability::Managed(crate::kv::test_contract());
+        core.load_managed_model_cache(model_instance, &capability)
+            .expect("load managed state");
         let managed_request = |id: &str, tokens: Vec<u32>| {
             let mut request = EngineCoreRequest::chat(vec![ChatMessage {
                 role: ChatRole::User,
@@ -5388,7 +5415,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_loaded_adapter_cannot_fall_back_after_failed_negotiation() {
+    fn managed_model_cannot_publish_ready_after_failed_load_time_negotiation() {
         let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
         let mut core = EngineCore::new_with_unified_executor(
             EngineCoreConfig {
@@ -5398,24 +5425,12 @@ mod tests {
             executor,
         )
         .unwrap();
-        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
-            role: ChatRole::User,
-            content: "managed".to_string(),
-        }])
-        .with_model_variant(ModelVariant::Qwen306B);
-        request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1], None)
-            .unwrap();
-        request
-            .bind_model_instance(ModelInstanceId::new(44))
-            .unwrap();
-        request
-            .bind_cache_capability(crate::kv::CacheCapability::Managed(
-                crate::kv::test_contract(),
-            ))
-            .unwrap();
-
-        let error = core.add_request(request).unwrap_err();
+        let error = core
+            .load_managed_model_cache(
+                ModelInstanceId::new(44),
+                &crate::kv::CacheCapability::Managed(crate::kv::test_contract()),
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("capacity"));
         assert!(core.requests.is_empty());
         assert_eq!(core.managed_kv_cache.model_count(), 0);
