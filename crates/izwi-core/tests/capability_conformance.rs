@@ -29,7 +29,11 @@ fn builtin_conformance_case_ids_are_unique_and_descriptive() {
     let mut ids = BTreeSet::new();
 
     for case in capability_conformance_cases() {
-        assert!(ids.insert(case.id), "duplicate conformance case {}", case.id);
+        assert!(
+            ids.insert(case.id),
+            "duplicate conformance case {}",
+            case.id
+        );
         assert!(
             case.id.contains(case.capability.as_str())
                 || matches!(
@@ -94,6 +98,61 @@ fn product_crates_do_not_import_internal_model_architectures() {
     assert!(
         violations.is_empty(),
         "product crates should use public runtime/runtime_models/catalog APIs:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn legacy_inference_state_surface_does_not_expand_during_migration() {
+    // This is a migration ratchet, not the final acceptance test. Every limit
+    // must trend down to zero before the v1/opaque implementation is deleted.
+    // Keeping the inventory in a compiled integration test prevents a new
+    // model from quietly adding another model-owned cache while v2 is landing.
+    const LEGACY_SYMBOL_LIMITS: &[(&str, usize)] = &[
+        ("OpaqueModelOwned", 34),
+        ("KvDomainSpec::ModelState", 9),
+        ("Qwen3ManagedCache", 33),
+        ("Qwen3Cache", 63),
+        ("DenseKvCache", 45),
+        ("Qwen35DenseKvCache", 27),
+        ("KvPage", 76),
+        ("append_to_pages", 32),
+        ("materialize_pages", 20),
+        ("paged_decode_attention", 28),
+        ("repeat_kv(", 56),
+    ];
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source_root = manifest_dir.join("src");
+    let mut sources = Vec::new();
+    collect_rs_files(&source_root, &mut |path| {
+        if let Ok(source) = fs::read_to_string(path) {
+            sources.push((path.to_path_buf(), source));
+        }
+    });
+
+    let mut violations = Vec::new();
+    for (symbol, limit) in LEGACY_SYMBOL_LIMITS {
+        let count = sources
+            .iter()
+            .map(|(_, source)| source.matches(symbol).count())
+            .sum::<usize>();
+        if count > *limit {
+            let files = sources
+                .iter()
+                .filter_map(|(path, source)| source.contains(symbol).then(|| path.display()))
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            violations.push(format!(
+                "legacy symbol `{symbol}` grew from at most {limit} to {count}: {files}"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "the v1/model-owned inference-state surface must only shrink:\n{}",
         violations.join("\n")
     );
 }
