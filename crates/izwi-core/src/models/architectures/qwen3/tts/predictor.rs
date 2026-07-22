@@ -31,6 +31,11 @@ use crate::models::shared::weights::mlx;
 /// by the selected semantic embedding.
 pub const CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS: usize = 2;
 
+/// Exact physical context occupied by one predictor frame.
+pub const fn code_predictor_physical_context_tokens(acoustic_groups: usize) -> usize {
+    CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS.saturating_add(acoustic_groups.saturating_sub(1))
+}
+
 /// KV Cache for the code predictor
 pub struct CodePredictorCache {
     k_pages: Vec<Vec<KvPage>>,
@@ -239,7 +244,37 @@ impl CodePredictor {
     /// acoustic group appends one dependent token, so a standard 15-group
     /// predictor ends at cursor 16.
     pub fn physical_context_tokens_per_frame(&self) -> usize {
-        CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS.saturating_add(self.lm_heads.len().saturating_sub(1))
+        code_predictor_physical_context_tokens(self.lm_heads.len())
+    }
+
+    /// Validate the fresh invocation workspace required for one semantic frame.
+    pub fn validate_physical_workspace(&self, cache: &CodePredictorPhysicalCache) -> Result<()> {
+        if self.lm_heads.len() != self.codec_embeddings.len() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS physical predictor has {} heads for {} acoustic embeddings",
+                self.lm_heads.len(),
+                self.codec_embeddings.len()
+            )));
+        }
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor requires a fresh cursor-0 workspace, got {}",
+                cache.context_len()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        let required_tokens = self.physical_context_tokens_per_frame();
+        if cache.capacity_tokens() < required_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor workspace holds {} tokens, requires {required_tokens}",
+                cache.capacity_tokens()
+            )));
+        }
+        Ok(())
     }
 
     /// Forward pass to predict all code groups from first codebook
@@ -369,24 +404,8 @@ impl CodePredictor {
         semantic_embed: &Tensor,
         cache: &mut CodePredictorPhysicalCache,
     ) -> Result<Vec<u32>> {
-        if cache.context_len() != 0 {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical predictor requires a fresh cursor-0 workspace, got {}",
-                cache.context_len()
-            )));
-        }
-        cache.validate_model(
-            self.cfg.num_hidden_layers,
-            self.cfg.num_key_value_heads,
-            self.cfg.head_dim(),
-        )?;
+        self.validate_physical_workspace(cache)?;
         let required_tokens = self.physical_context_tokens_per_frame();
-        if cache.capacity_tokens() < required_tokens {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3-TTS physical predictor workspace holds {} tokens, requires {required_tokens}",
-                cache.capacity_tokens()
-            )));
-        }
 
         let (talker_batch, talker_tokens, talker_dim) = talker_hidden.dims3()?;
         let (semantic_batch, semantic_tokens, semantic_dim) = semantic_embed.dims3()?;
@@ -1008,5 +1027,12 @@ mod tests {
         let logits = Tensor::new(&[[0.0f32, 1.0, 7.0, 3.0]], &Device::Cpu).unwrap();
 
         assert_eq!(argmax_token(&logits).unwrap(), 2);
+    }
+
+    #[test]
+    fn physical_predictor_cursor_matches_prefill_and_dependent_groups() {
+        assert_eq!(code_predictor_physical_context_tokens(0), 2);
+        assert_eq!(code_predictor_physical_context_tokens(1), 2);
+        assert_eq!(code_predictor_physical_context_tokens(15), 16);
     }
 }
