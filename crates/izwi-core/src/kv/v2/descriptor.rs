@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 
 use super::capacity::{WorkspaceDimensionBound, WorkspaceTerm};
 use super::contract::{
-    InferenceStateAbi, InferenceStateContract, PlacementPolicy, StateDomainSpec, StateScope,
-    CURRENT_INFERENCE_STATE_ABI,
+    InferenceStateAbi, InferenceStateContract, PlacementPolicy, StateDomainId, StateDomainSpec,
+    StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
 
 const CAPABILITY_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] =
@@ -55,10 +55,23 @@ pub(crate) struct InvocationStageWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InvocationWorkspaceDomain {
-    pub(crate) state: StateDomainSpec,
-    pub(crate) placement: PlacementPolicy,
-    pub(crate) formula: WorkspaceFormula,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum InvocationWorkspaceDomain {
+    /// Untyped temporary bytes used only during one invocation stage. Scratch
+    /// is never represented as tensor state and cannot carry a logical cursor.
+    Scratch {
+        id: StateDomainId,
+        placement: PlacementPolicy,
+        alignment_bytes: u64,
+        zero_on_release: bool,
+        formula: WorkspaceFormula,
+    },
+    /// Typed physical state with explicit tensor/page/ring semantics.
+    State {
+        state: StateDomainSpec,
+        placement: PlacementPolicy,
+        formula: WorkspaceFormula,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,35 +172,11 @@ impl CapabilityStateDescriptorV2 {
                 let domain_id = u32::try_from(index + 1)
                     .map_err(|_| invalid("execution stage count exceeds v2 domain identity"))?;
                 let domains = (stage.max_workspace_bytes > 0)
-                    .then(|| InvocationWorkspaceDomain {
-                        state: StateDomainSpec::StaticTensor(
-                            super::contract::StaticTensorDomainSpec {
-                                header: super::contract::StateDomainHeader {
-                                    id: super::contract::StateDomainId::new(domain_id),
-                                    scope: StateScope::Invocation,
-                                    clock: super::contract::StateClock::Custom(
-                                        "invocation".to_string(),
-                                    ),
-                                    placement: PlacementPolicy::BackendLocal,
-                                    prefix: super::contract::PrefixPolicy::Disabled,
-                                    checkpoint: super::contract::CheckpointPolicy::None,
-                                },
-                                components: vec![super::contract::TensorComponentSpec {
-                                    id: super::contract::StateComponentId::new(1),
-                                    role: super::contract::TensorRole::Control,
-                                    shape: super::contract::BoundedShape {
-                                        dimensions: vec![super::contract::ShapeDimension {
-                                            axis: super::contract::ShapeAxis::Hidden,
-                                            extent: super::contract::ShapeExtent::Fixed {
-                                                value: stage.max_workspace_bytes,
-                                            },
-                                        }],
-                                    },
-                                    accepted_dtypes: vec![super::contract::StateDType::I8],
-                                }],
-                            },
-                        ),
+                    .then(|| InvocationWorkspaceDomain::Scratch {
+                        id: StateDomainId::new(domain_id),
                         placement: PlacementPolicy::BackendLocal,
+                        alignment_bytes: 64,
+                        zero_on_release: false,
                         formula: WorkspaceFormula {
                             fixed_bytes: stage.max_workspace_bytes,
                             dimensions: vec![],
@@ -391,7 +380,7 @@ impl InvocationStageWorkspace {
         let mut previous = None;
         let mut maximum = 0_u64;
         for domain in &self.domains {
-            let id = domain.state.id();
+            let id = domain.id();
             if previous.is_some_and(|previous| id <= previous) {
                 return Err(invalid(
                     "invocation workspace domains require canonical unique ids",
@@ -407,28 +396,54 @@ impl InvocationStageWorkspace {
 }
 
 impl InvocationWorkspaceDomain {
+    fn id(&self) -> StateDomainId {
+        match self {
+            Self::Scratch { id, .. } => *id,
+            Self::State { state, .. } => state.id(),
+        }
+    }
+
     fn maximum_bytes(&self) -> Result<u64> {
-        self.state.validate()?;
-        if self.state.scope() != StateScope::Invocation {
-            return Err(invalid(
-                "invocation workspace contains a retained state domain",
-            ));
+        match self {
+            Self::Scratch {
+                id,
+                alignment_bytes,
+                formula,
+                ..
+            } => {
+                if id.get() == 0 || *alignment_bytes == 0 || !alignment_bytes.is_power_of_two() {
+                    return Err(invalid(
+                        "scratch workspace requires a non-zero id and power-of-two alignment",
+                    ));
+                }
+                formula.maximum_bytes()
+            }
+            Self::State {
+                state,
+                placement,
+                formula,
+            } => {
+                state.validate()?;
+                if state.scope() != StateScope::Invocation {
+                    return Err(invalid(
+                        "invocation workspace contains a retained state domain",
+                    ));
+                }
+                if state.header().placement != *placement {
+                    return Err(invalid(
+                        "invocation workspace placement disagrees with its state domain",
+                    ));
+                }
+                let maximum = formula.maximum_bytes()?;
+                let physical_minimum = minimum_physical_bytes(state)?;
+                if maximum < physical_minimum {
+                    return Err(invalid(
+                        "invocation workspace formula is smaller than its physical state geometry",
+                    ));
+                }
+                Ok(maximum)
+            }
         }
-        // Semantic placement is stated once. Resolution may choose host or
-        // backend-local only within this policy.
-        if self.state.header().placement != self.placement {
-            return Err(invalid(
-                "invocation workspace placement disagrees with its state domain",
-            ));
-        }
-        let maximum = self.formula.maximum_bytes()?;
-        let physical_minimum = minimum_physical_bytes(&self.state)?;
-        if maximum < physical_minimum {
-            return Err(invalid(
-                "invocation workspace formula is smaller than its physical state geometry",
-            ));
-        }
-        Ok(maximum)
     }
 }
 
@@ -616,7 +631,7 @@ mod tests {
     }
 
     fn workspace_domain() -> InvocationWorkspaceDomain {
-        InvocationWorkspaceDomain {
+        InvocationWorkspaceDomain::State {
             state: StateDomainSpec::StaticTensor(StaticTensorDomainSpec {
                 header: StateDomainHeader {
                     id: super::super::StateDomainId::new(1),
@@ -656,7 +671,10 @@ mod tests {
     #[test]
     fn explicit_stateless_workspace_is_stage_complete_and_bounded() {
         let mut second_domain = workspace_domain();
-        second_domain.formula = WorkspaceFormula {
+        let InvocationWorkspaceDomain::State { formula, .. } = &mut second_domain else {
+            unreachable!()
+        };
+        *formula = WorkspaceFormula {
             fixed_bytes: 64,
             dimensions: vec![],
             terms: vec![],
@@ -705,6 +723,23 @@ mod tests {
     }
 
     #[test]
+    fn stage_scratch_is_not_fabricated_as_tensor_state() {
+        let descriptor = CapabilityStateDescriptorV2::stateless_for_stage_graphs(&[&[stage(256)]])
+            .expect("scratch descriptor");
+        let InvocationWorkspaceSet::Bounded { profiles } = descriptor.invocation else {
+            panic!("non-zero stage workspace must be bounded");
+        };
+        assert!(matches!(
+            profiles[0].stages[0].domains.as_slice(),
+            [InvocationWorkspaceDomain::Scratch {
+                alignment_bytes: 64,
+                zero_on_release: false,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
     fn missing_workspace_and_wrong_lifetime_fail_closed() {
         let none = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
@@ -716,8 +751,11 @@ mod tests {
         assert!(none.validate_against_stages(&[stage(1)]).is_err());
 
         let mut wrong = workspace_domain();
-        match &mut wrong.state {
-            StateDomainSpec::StaticTensor(spec) => spec.header.scope = StateScope::Retained,
+        match &mut wrong {
+            InvocationWorkspaceDomain::State {
+                state: StateDomainSpec::StaticTensor(spec),
+                ..
+            } => spec.header.scope = StateScope::Retained,
             _ => unreachable!(),
         }
         let descriptor = CapabilityStateDescriptorV2 {
@@ -736,7 +774,10 @@ mod tests {
         assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
 
         let mut undersized = workspace_domain();
-        undersized.formula = WorkspaceFormula {
+        let InvocationWorkspaceDomain::State { formula, .. } = &mut undersized else {
+            unreachable!()
+        };
+        *formula = WorkspaceFormula {
             fixed_bytes: 15,
             dimensions: vec![],
             terms: vec![],
