@@ -181,30 +181,23 @@ impl NativeExecutor {
                         // Keep ASR decode bounded. If EOS is missed, very high caps
                         // produce runaway gibberish and extreme latency.
                         let max_new_tokens = request.params.max_tokens.clamp(1, MAX_ASR_NEW_TOKENS);
-                        let decode_state = match managed_cache.take() {
-                            Some(cache) => Self::run_blocking(|| {
-                                model.start_decode_state_with_prompt_managed(
-                                    &samples,
-                                    sample_rate,
-                                    language,
-                                    asr_prompt,
-                                    max_new_tokens,
-                                    cache,
-                                )
-                            })?,
-                            None => Self::run_blocking(|| {
-                                model.start_decode_state_with_prompt(
-                                    &samples,
-                                    sample_rate,
-                                    language,
-                                    asr_prompt,
-                                    max_new_tokens,
-                                )
-                            })?,
-                        };
-                        if request.managed_cache_runtime().is_some()
-                            && decode_state.sequence_position() != Some(request.num_prompt_tokens())
-                        {
+                        let cache = managed_cache.take().ok_or_else(|| {
+                            Error::InferenceError(
+                                "incremental Qwen3 ASR requires scheduler-owned physical KV"
+                                    .to_string(),
+                            )
+                        })?;
+                        let decode_state = Self::run_blocking(|| {
+                            model.start_decode_state_with_prompt_managed(
+                                &samples,
+                                sample_rate,
+                                language,
+                                asr_prompt,
+                                max_new_tokens,
+                                cache,
+                            )
+                        })?;
+                        if decode_state.sequence_position() != Some(request.num_prompt_tokens()) {
                             return Err(Error::InferenceError(
                                 "Qwen3 ASR prepared multimodal span does not match model prefill"
                                     .to_string(),

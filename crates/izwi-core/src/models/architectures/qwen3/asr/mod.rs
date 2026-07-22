@@ -852,7 +852,7 @@ impl Qwen3AsrModel {
                     .to_string(),
             ));
         }
-        let mut state = self.start_decode_with_prompt(
+        let mut state = self.start_invocation_decode_with_prompt(
             audio,
             sample_rate,
             language,
@@ -893,17 +893,11 @@ impl Qwen3AsrModel {
         }
     }
 
-    pub fn start_decode(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        max_new_tokens: usize,
-    ) -> Result<AsrDecodeState> {
-        self.start_decode_with_prompt(audio, sample_rate, language, None, max_new_tokens)
-    }
-
-    pub fn start_decode_with_prompt(
+    /// Run the offline atomic graph with call-local state.
+    ///
+    /// This state never crosses an engine quantum. Incremental execution uses
+    /// `start_decode_with_prompt_managed` exclusively.
+    fn start_invocation_decode_with_prompt(
         &self,
         audio: &[f32],
         sample_rate: u32,

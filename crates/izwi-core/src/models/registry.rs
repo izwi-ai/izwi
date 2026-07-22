@@ -1311,14 +1311,8 @@ impl NativeAsrModel {
         max_new_tokens: usize,
     ) -> Result<NativeAsrDecodeState> {
         match self {
-            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
-                model.start_decode_with_prompt(
-                    audio,
-                    sample_rate,
-                    language,
-                    prompt,
-                    max_new_tokens,
-                )?,
+            Self::Qwen3(_) => Err(Error::InvalidInput(
+                "Incremental Qwen3 ASR requires scheduler-owned physical state".to_string(),
             )),
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
