@@ -7,6 +7,7 @@
 //! state domains are added without weakening these boundaries.
 
 mod batch;
+mod capacity;
 mod contract;
 mod resolved;
 
@@ -14,6 +15,15 @@ mod resolved;
 pub(crate) use batch::{
     PhysicalArenaId, PhysicalArenaLease, PhysicalBlockRef, PhysicalSlotRef,
     PreparedPagedAttentionBatch, PreparedPagedAttentionRow, PreparedPagedWrite,
+};
+#[allow(unused_imports)]
+pub(crate) use capacity::{
+    AllocationReceipt, CapacityStrategy, GroupAllocationTotals, GroupCapacityPlan,
+    GroupCapacityRequest, GroupResourceQuery, ResidencyMeasurement, ResolvedGroupResourceEnvelope,
+    ResolvedWorkspaceResourceEnvelope, StateAllocationLedger, StateAllocationPlanId,
+    StateResourceRegistry, StateResourceVector, StateRuntimeAllocationPlan, WorkspaceAxis,
+    WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement, WorkspaceResourceQuery,
+    WorkspaceTerm,
 };
 #[allow(unused_imports)]
 pub(crate) use contract::{
@@ -29,8 +39,8 @@ pub(crate) use contract::{
 #[allow(unused_imports)]
 pub(crate) use resolved::{
     OperationAbi, PagedAttentionOperationQuery, RegisteredOperationId, ResolvedPagedAttentionGroup,
-    ResolvedStatePlan, StateOperationRegistry, StateOperationSet, StatePhysicalLayout,
-    StatePlanFingerprint, StatePlanId, StateStorageFormat,
+    ResolvedPlacement, ResolvedStatePlan, StateOperationRegistry, StateOperationSet,
+    StatePhysicalLayout, StatePlanFingerprint, StatePlanId, StateStorageFormat,
 };
 
 #[cfg(test)]

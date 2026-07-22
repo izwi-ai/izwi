@@ -8,8 +8,8 @@ use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 
 use super::contract::{
-    hex_fingerprint, InferenceStateContract, PagedAttentionDomainSpec, StateDType, StateDomainId,
-    StateDomainSpec, StateGroupId,
+    hex_fingerprint, InferenceStateContract, PagedAttentionDomainSpec, PlacementPolicy, StateDType,
+    StateDomainId, StateDomainSpec, StateGroupId,
 };
 #[cfg(test)]
 use super::contract::{AttentionMask, KeyEncoding, PrefixPolicy, StateClock};
@@ -132,6 +132,7 @@ pub(crate) struct PagedAttentionOperationQuery<'a> {
     pub(crate) page_tokens: u32,
     pub(crate) layout: StatePhysicalLayout,
     pub(crate) storage: StateStorageFormat,
+    pub(crate) placement: ResolvedPlacement,
     pub(crate) semantic: &'a PagedAttentionDomainSpec,
     pub(crate) layers: &'a [StateLayerBinding],
     pub(crate) operations: &'a StateOperationSet,
@@ -291,6 +292,7 @@ pub(crate) struct ResolvedPagedAttentionGroup {
     pub(crate) bytes_per_page: u64,
     pub(crate) layout: StatePhysicalLayout,
     pub(crate) storage: StateStorageFormat,
+    pub(crate) placement: ResolvedPlacement,
     pub(crate) layers: Vec<StateLayerBinding>,
     pub(crate) operations: StateOperationSet,
 }
@@ -329,6 +331,7 @@ impl ResolvedPagedAttentionGroup {
                 self.domain.get()
             )));
         }
+        self.placement.validate_against(spec.header.placement)?;
         self.storage.validate()?;
         self.operations.validate()?;
         if self.layers.len() != spec.layers.len() {
@@ -409,6 +412,7 @@ impl ResolvedPagedAttentionGroup {
             page_tokens: self.page_tokens,
             layout: self.layout,
             storage: self.storage,
+            placement: self.placement,
             semantic: spec,
             layers: &self.layers,
             operations: &self.operations,
@@ -434,6 +438,28 @@ pub(crate) struct StateLayerBinding {
 pub(crate) enum StatePhysicalLayout {
     PageTokenHeadDim,
     PageHeadTokenDim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResolvedPlacement {
+    BackendLocal,
+    Host,
+}
+
+impl ResolvedPlacement {
+    fn validate_against(self, policy: PlacementPolicy) -> Result<()> {
+        match (policy, self) {
+            (PlacementPolicy::BackendLocal, Self::BackendLocal)
+            | (PlacementPolicy::Host, Self::Host)
+            | (PlacementPolicy::BackendLocalWithHostOffload, Self::BackendLocal | Self::Host) => {
+                Ok(())
+            }
+            _ => Err(invalid(
+                "resolved state placement violates the semantic placement policy",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -516,6 +542,7 @@ impl StateOperationRegistry for TestOperationRegistry {
                     dtype: StateDType::F16
                 }
             )
+            && query.placement == ResolvedPlacement::BackendLocal
             && query.operations.write.name == "paged_kv_write"
             && query.operations.prefill.name == "paged_attention_prefill"
             && query.operations.decode.name == "paged_attention_decode"
@@ -537,6 +564,7 @@ pub(crate) fn test_plan(contract: &InferenceStateContract) -> ResolvedStatePlan 
             storage: StateStorageFormat::Dense {
                 dtype: StateDType::F16,
             },
+            placement: ResolvedPlacement::BackendLocal,
             layers: vec![StateLayerBinding {
                 model_layer: 0,
                 physical_layer: 0,
