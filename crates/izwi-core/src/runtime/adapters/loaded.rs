@@ -13,7 +13,8 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CapabilityStateRuntimeV2,
-    InferenceStateContract, ManagedCapabilityRuntimeV2, StatelessCapabilityRuntimeV2,
+    InferenceStateContract, ManagedCapabilityRuntimeV2, RetainedStateUseV2,
+    StatelessCapabilityRuntimeV2,
 };
 use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
@@ -294,21 +295,33 @@ impl LoadedCapabilityDescriptor {
                 let descriptor =
                     CapabilityStateDescriptorV2::managed_for_stage_graphs(contract, &stage_graphs)?;
                 for contract in &contracts {
-                    if contract.execution_profile.cache_mode != CacheMode::ExternalPaged
-                        || contract.execution_profile.cache_namespace.is_none()
-                        || contract.execution_profile.kv_dtype == "none"
-                    {
-                        return Err(Error::ModelLoadError(
-                            "managed state ABI v2 contradicts execution that lacks external paged state"
-                                .to_string(),
-                        ));
-                    }
+                    let retained_state_use = match contract.execution_profile.cache_mode {
+                        CacheMode::ExternalPaged
+                            if contract.execution_profile.cache_namespace.is_some()
+                                && contract.execution_profile.kv_dtype != "none" =>
+                        {
+                            RetainedStateUseV2::ExternalPaged
+                        }
+                        CacheMode::None
+                            if contract.execution_profile.cache_namespace.is_none()
+                                && contract.execution_profile.kv_dtype == "none" =>
+                        {
+                            RetainedStateUseV2::Inactive
+                        }
+                        _ => {
+                            return Err(Error::ModelLoadError(
+                                "managed state ABI v2 requires each graph to declare either external paged state or no retained state"
+                                    .to_string(),
+                            ));
+                        }
+                    };
                     let binding = contract.adapter_binding()?;
                     let managed = ManagedCapabilityRuntimeV2::seal(
                         backend_kind,
                         &binding,
                         descriptor.clone(),
                         physical.clone(),
+                        retained_state_use,
                     )?;
                     let graph = managed.stage_graph_fingerprint;
                     let runtime = Arc::new(CapabilityStateRuntimeV2::managed(managed));
@@ -1153,6 +1166,18 @@ mod tests {
             panic!("expected managed v2 runtime");
         };
         assert!(runtime.managed_kv_runtime().is_some());
+        let inactive = CapabilityStateRuntimeV2::managed(
+            ManagedCapabilityRuntimeV2::seal(
+                BackendKind::Cpu,
+                &binding.execution,
+                runtime.descriptor.clone(),
+                physical.clone(),
+                RetainedStateUseV2::Inactive,
+            )
+            .unwrap(),
+        );
+        assert!(inactive.managed_kv_runtime().is_none());
+        assert_ne!(inactive.id, runtime.id);
         assert_eq!(
             runtime
                 .managed_kv_runtime()

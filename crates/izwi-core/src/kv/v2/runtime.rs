@@ -20,6 +20,16 @@ use super::{
 const STATELESS_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.stateless-runtime.v2\0";
 const MANAGED_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.managed-runtime.v2\0";
 
+/// Whether the selected execution graph actually acquires the capability's
+/// retained physical state. A capability may own one load-scoped arena while
+/// some of its exact request graphs remain cacheless (for example offline ASR
+/// versus incremental streaming ASR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RetainedStateUseV2 {
+    Inactive,
+    ExternalPaged,
+}
+
 /// Canonical identity shared by every retained/workspace/runtime plan for one
 /// exact loaded capability. Pool sharing, when introduced, must be an explicit
 /// authorization between identities rather than an accidental fingerprint
@@ -133,7 +143,12 @@ impl CapabilityStateRuntimeV2 {
     pub(crate) fn managed_kv_runtime(&self) -> Option<&Arc<ManagedKvModelRuntime>> {
         match &self.backing {
             CapabilityStateRuntimeBackingV2::Stateless(_) => None,
-            CapabilityStateRuntimeBackingV2::Managed(runtime) => Some(&runtime.physical),
+            CapabilityStateRuntimeBackingV2::Managed(runtime)
+                if runtime.retained_state_use == RetainedStateUseV2::ExternalPaged =>
+            {
+                Some(&runtime.physical)
+            }
+            CapabilityStateRuntimeBackingV2::Managed(_) => None,
         }
     }
 
@@ -181,6 +196,7 @@ pub(crate) struct ManagedCapabilityRuntimeV2 {
     pub(crate) state_fingerprint: [u8; 32],
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) state_plan: Arc<ResolvedStatePlan>,
+    retained_state_use: RetainedStateUseV2,
     physical: Arc<ManagedKvModelRuntime>,
 }
 
@@ -190,6 +206,7 @@ impl ManagedCapabilityRuntimeV2 {
         execution: &ExecutionAdapterBinding,
         descriptor: CapabilityStateDescriptorV2,
         physical: Arc<ManagedKvModelRuntime>,
+        retained_state_use: RetainedStateUseV2,
     ) -> Result<Self> {
         execution.validate()?;
         descriptor.validate_against_stages(&execution.stages)?;
@@ -223,6 +240,7 @@ impl ManagedCapabilityRuntimeV2 {
             state_fingerprint,
             descriptor,
             state_plan,
+            retained_state_use,
             physical,
         };
         runtime.id = runtime.compute_id()?;
@@ -264,6 +282,7 @@ impl ManagedCapabilityRuntimeV2 {
             state_fingerprint: [u8; 32],
             state_plan: super::StatePlanId,
             physical_plan: crate::kv::KvPlanId,
+            retained_state_use: RetainedStateUseV2,
         }
         let encoded = serde_json::to_vec(&Payload {
             identity: &self.identity,
@@ -271,6 +290,7 @@ impl ManagedCapabilityRuntimeV2 {
             state_fingerprint: self.state_fingerprint,
             state_plan: self.state_plan.id,
             physical_plan: self.physical.plan().id,
+            retained_state_use: self.retained_state_use,
         })
         .map_err(|error| invalid(format!("failed to encode managed runtime: {error}")))?;
         let mut hasher = Sha256::new();
