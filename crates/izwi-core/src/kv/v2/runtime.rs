@@ -13,13 +13,12 @@ use super::{stage_graph_fingerprint, CapabilityStateDescriptorV2};
 
 const STATELESS_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.stateless-runtime.v2\0";
 
-/// Immutable request-selectable proof that one exact loaded capability needs
-/// neither retained physical state nor invocation workspace for this stage
-/// graph. Stateful runtime variants are added only with backend-owned storage
-/// and allocation receipts; descriptor metadata alone is never a runtime.
+/// Canonical identity shared by every retained/workspace/runtime plan for one
+/// exact loaded capability. Pool sharing, when introduced, must be an explicit
+/// authorization between identities rather than an accidental fingerprint
+/// collision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StatelessCapabilityRuntimeV2 {
-    pub(crate) id: [u8; 32],
+pub(crate) struct CapabilityRuntimeIdentityV2 {
     pub(crate) execution_group: ExecutionGroupId,
     pub(crate) model_instance: ModelInstanceId,
     pub(crate) model_variant: ModelVariant,
@@ -27,6 +26,52 @@ pub(crate) struct StatelessCapabilityRuntimeV2 {
     pub(crate) capability_id: String,
     pub(crate) adapter_instance: AdapterInstanceId,
     pub(crate) adapter_abi: AdapterAbiRevision,
+}
+
+impl CapabilityRuntimeIdentityV2 {
+    pub(crate) fn seal(backend: BackendKind, execution: &ExecutionAdapterBinding) -> Result<Self> {
+        execution.validate()?;
+        Ok(Self {
+            execution_group: execution.execution_group_id,
+            model_instance: execution.model_instance_id,
+            model_variant: execution.model_variant,
+            backend,
+            capability_id: execution.capability_id.clone(),
+            adapter_instance: execution.adapter_instance_id,
+            adapter_abi: execution.adapter_abi_revision,
+        })
+    }
+
+    pub(crate) fn validate_against(
+        &self,
+        backend: BackendKind,
+        execution: &ExecutionAdapterBinding,
+    ) -> Result<()> {
+        execution.validate()?;
+        if self.backend != backend
+            || self.execution_group != execution.execution_group_id
+            || self.model_instance != execution.model_instance_id
+            || self.model_variant != execution.model_variant
+            || self.capability_id != execution.capability_id
+            || self.adapter_instance != execution.adapter_instance_id
+            || self.adapter_abi != execution.adapter_abi_revision
+        {
+            return Err(invalid(
+                "capability runtime identity does not match the selected loaded adapter",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable request-selectable proof that one exact loaded capability needs
+/// neither retained physical state nor invocation workspace for this stage
+/// graph. Stateful runtime variants are added only with backend-owned storage
+/// and allocation receipts; descriptor metadata alone is never a runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StatelessCapabilityRuntimeV2 {
+    pub(crate) id: [u8; 32],
+    pub(crate) identity: CapabilityRuntimeIdentityV2,
     pub(crate) stage_graph_fingerprint: [u8; 32],
     pub(crate) state_fingerprint: [u8; 32],
     pub(crate) descriptor: CapabilityStateDescriptorV2,
@@ -51,13 +96,7 @@ impl StatelessCapabilityRuntimeV2 {
         let state_fingerprint = descriptor.fingerprint(&execution.stages)?;
         let mut runtime = Self {
             id: [0; 32],
-            execution_group: execution.execution_group_id,
-            model_instance: execution.model_instance_id,
-            model_variant: execution.model_variant,
-            backend,
-            capability_id: execution.capability_id.clone(),
-            adapter_instance: execution.adapter_instance_id,
-            adapter_abi: execution.adapter_abi_revision,
+            identity: CapabilityRuntimeIdentityV2::seal(backend, execution)?,
             stage_graph_fingerprint,
             state_fingerprint,
             descriptor,
@@ -73,14 +112,8 @@ impl StatelessCapabilityRuntimeV2 {
         execution: &ExecutionAdapterBinding,
     ) -> Result<()> {
         execution.validate()?;
-        if self.backend != backend
-            || self.execution_group != execution.execution_group_id
-            || self.model_instance != execution.model_instance_id
-            || self.model_variant != execution.model_variant
-            || self.capability_id != execution.capability_id
-            || self.adapter_instance != execution.adapter_instance_id
-            || self.adapter_abi != execution.adapter_abi_revision
-            || self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
+        self.identity.validate_against(backend, execution)?;
+        if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
             || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
             || !self.descriptor.is_stateless()
             || !self
@@ -98,25 +131,13 @@ impl StatelessCapabilityRuntimeV2 {
     fn compute_id(&self) -> Result<[u8; 32]> {
         #[derive(Serialize)]
         struct Payload<'a> {
-            execution_group: ExecutionGroupId,
-            model_instance: ModelInstanceId,
-            model_variant: ModelVariant,
-            backend: BackendKind,
-            capability_id: &'a str,
-            adapter_instance: AdapterInstanceId,
-            adapter_abi: AdapterAbiRevision,
+            identity: &'a CapabilityRuntimeIdentityV2,
             stage_graph_fingerprint: [u8; 32],
             state_fingerprint: [u8; 32],
         }
 
         let encoded = serde_json::to_vec(&Payload {
-            execution_group: self.execution_group,
-            model_instance: self.model_instance,
-            model_variant: self.model_variant,
-            backend: self.backend,
-            capability_id: &self.capability_id,
-            adapter_instance: self.adapter_instance,
-            adapter_abi: self.adapter_abi,
+            identity: &self.identity,
             stage_graph_fingerprint: self.stage_graph_fingerprint,
             state_fingerprint: self.state_fingerprint,
         })
