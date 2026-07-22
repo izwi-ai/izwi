@@ -45,8 +45,8 @@ use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    CapabilityKind, ExecutionTargetKind, LoadedExecutionContract, LoadedModelBundle,
-    RuntimeAdapterRegistry, StreamingRequirements,
+    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+    LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
@@ -805,13 +805,14 @@ fn bind_request_to_residency(
     } else {
         StreamingRequirements::native(model_streaming_required)
     };
-    let binding = bundle.adapter_binding_for_streaming(
+    let LoadedCapabilityBinding {
+        execution,
+        cache_capability,
+    } = bundle.capability_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
     )?;
-    let cache_capability =
-        bundle.kv_cache_capability(CapabilityKind::for_engine_task(request.task_type))?;
-    request.bind_execution_adapter(binding)?;
+    request.bind_execution_adapter(execution)?;
     request.bind_cache_capability(cache_capability)?;
     Ok(())
 }
@@ -3031,6 +3032,10 @@ mod tests {
             .expect("matching residency");
         assert_eq!(request.model_instance_id(), Some(instance));
         assert!(request.execution_adapter_binding().is_some());
+        assert_eq!(
+            request.cache_capability(),
+            &crate::kv::CacheCapability::OpaqueModelOwned
+        );
 
         let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
         assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle), false).is_err());
@@ -3040,6 +3045,44 @@ mod tests {
             EngineCoreRequest::tts("missing").with_model_variant(ModelVariant::Kokoro82M);
         assert!(bind_request_to_residency(&mut missing_bundle, Some(&lease), None, false).is_err());
         assert_eq!(missing_bundle.model_instance_id(), None);
+    }
+
+    #[test]
+    fn residency_binding_uses_one_descriptor_for_execution_and_cache_truth() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(19);
+        let variant = ModelVariant::Qwen306B;
+        let lease = residency.acquire_instance_lease(variant, instance);
+        let managed = crate::kv::CacheCapability::Managed(crate::kv::test_contract());
+        let cache_capabilities = HashMap::from([(
+            CapabilityKind::Chat,
+            crate::kv::LoadedKvCacheCapability {
+                capability: managed.clone(),
+                fallback_reason: None,
+            },
+        )]);
+        let bundle = LoadedModelBundle::bind_with_cache_capabilities(
+            &RuntimeAdapterRegistry::built_in(),
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+            cache_capabilities,
+        )
+        .expect("loaded bundle");
+        let mut request = EngineCoreRequest::chat(Vec::new()).with_model_variant(variant);
+
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
+            .expect("matching loaded capability descriptor");
+
+        assert_eq!(
+            request
+                .execution_adapter_binding()
+                .expect("execution binding")
+                .model_instance_id,
+            instance
+        );
+        assert_eq!(request.cache_capability(), &managed);
     }
 
     #[test]

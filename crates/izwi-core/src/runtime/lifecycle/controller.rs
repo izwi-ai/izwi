@@ -14,7 +14,7 @@ use crate::config::EngineConfig;
 use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, ResourceVector};
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
-use crate::runtime::adapters::{LoadedCacheActivation, LoadedModelBundle, RuntimeAdapterRegistry};
+use crate::runtime::adapters::{CapabilityKind, LoadedModelBundle, RuntimeAdapterRegistry};
 use crate::runtime::coordinator::InferenceCoordinator;
 use crate::runtime_models::ModelRegistry;
 use crate::tokenizer::Tokenizer;
@@ -280,22 +280,26 @@ impl ModelLifecycleController {
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
     ) -> Result<Arc<LoadedModelBundle>> {
-        self.bind_loaded_model_bundle_with_cache_capability(variant, model_instance_id, None)
+        self.bind_loaded_model_bundle_with_cache_capabilities(
+            variant,
+            model_instance_id,
+            HashMap::new(),
+        )
     }
 
-    pub(super) fn bind_loaded_model_bundle_with_cache_capability(
+    pub(super) fn bind_loaded_model_bundle_with_cache_capabilities(
         &self,
         variant: ModelVariant,
         model_instance_id: ModelInstanceId,
-        cache_activation: Option<LoadedCacheActivation>,
+        cache_capabilities: HashMap<CapabilityKind, crate::kv::LoadedKvCacheCapability>,
     ) -> Result<Arc<LoadedModelBundle>> {
-        let bundle = Arc::new(LoadedModelBundle::bind_with_cache_capability(
+        let bundle = Arc::new(LoadedModelBundle::bind_with_cache_capabilities(
             &self.adapter_registry,
             self.coordinator.execution_group_id(),
             model_instance_id,
             variant,
             self.backend_router.context().backend_kind,
-            cache_activation,
+            cache_capabilities,
         )?);
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {

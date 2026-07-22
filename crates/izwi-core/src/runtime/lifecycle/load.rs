@@ -14,7 +14,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
-use crate::runtime::adapters::{CapabilityKind, LoadedCacheActivation};
+use crate::runtime::adapters::CapabilityKind;
 use crate::runtime::lifecycle::controller::{
     ModelLifecycleController, SharedLoadFailure, SharedLoadOutcome,
 };
@@ -320,29 +320,28 @@ impl ModelLifecycleController {
             let instantiated = self.instantiate_model(acquired).await?;
             self.publish_loaded_model(instantiated).await?;
             let backend = self.backend_router.context().backend_kind;
-            let cache_activation = match self.model_registry.get_chat(variant).await {
-                Some(loaded) => {
-                    let loaded_cache = loaded.loaded_kv_cache_capability()?;
-                    if matches!(
-                        &loaded_cache.capability,
-                        crate::kv::CacheCapability::Managed(_)
-                    ) && !managed_kv_backend_compiled(backend)
-                    {
-                        return Err(Error::ModelLoadError(format!(
-                            "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
-                        )));
-                    }
-                    Some(LoadedCacheActivation::new(
-                        CapabilityKind::Chat,
-                        loaded_cache,
-                    )?)
+            // Transitional bridge: only the exact loaded chat implementation
+            // currently publishes non-default cache truth. Model migrations
+            // add declarations to this capability-keyed set without wrapping
+            // an already-selected execution adapter.
+            let mut cache_capabilities = HashMap::new();
+            if let Some(loaded) = self.model_registry.get_chat(variant).await {
+                let loaded_cache = loaded.loaded_kv_cache_capability()?;
+                if matches!(
+                    &loaded_cache.capability,
+                    crate::kv::CacheCapability::Managed(_)
+                ) && !managed_kv_backend_compiled(backend)
+                {
+                    return Err(Error::ModelLoadError(format!(
+                        "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
+                    )));
                 }
-                None => None,
-            };
-            self.bind_loaded_model_bundle_with_cache_capability(
+                cache_capabilities.insert(CapabilityKind::Chat, loaded_cache);
+            }
+            self.bind_loaded_model_bundle_with_cache_capabilities(
                 variant,
                 model_instance_id,
-                cache_activation,
+                cache_capabilities,
             )?;
             // The physical allocation is now visible to the live provider.
             // Reconcile before Ready publication so it is no longer counted as
@@ -502,7 +501,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn managed_cache_activation_tracks_compiled_direct_kernels() {
+    fn managed_capability_cache_truth_tracks_compiled_direct_kernels() {
         assert!(managed_kv_backend_compiled(BackendKind::Cpu));
         assert_eq!(
             managed_kv_backend_compiled(BackendKind::Metal),

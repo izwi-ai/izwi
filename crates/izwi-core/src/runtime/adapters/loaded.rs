@@ -10,7 +10,7 @@ use crate::engine::{
     NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
-use crate::kv::{CacheCapability, KvCacheContractProvider, LoadedKvCacheCapability};
+use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 
 use super::{
@@ -23,6 +23,7 @@ const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(8)
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(9);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
+const COMPATIBILITY_CACHE_FALLBACK_REASON: &str = "loaded_adapter_uses_model_owned_cache";
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Streaming has two independent meanings at the loaded-adapter boundary:
@@ -110,84 +111,57 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn adapter_instance_id(&self) -> AdapterInstanceId;
     fn adapter_abi_revision(&self) -> AdapterAbiRevision;
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract>;
+}
 
-    /// Exact loaded-adapter cache truth. Compatibility adapters remain opaque
-    /// until a model-specific implementation publishes a validated managed
-    /// contract and an execution backend can resolve it.
-    fn cache_capability(&self) -> Result<CacheCapability> {
-        Ok(CacheCapability::OpaqueModelOwned)
-    }
-
-    fn cache_fallback_reason(&self) -> Option<&'static str> {
-        Some("loaded_adapter_uses_model_owned_cache")
+fn compatibility_cache_capability() -> LoadedKvCacheCapability {
+    LoadedKvCacheCapability {
+        capability: CacheCapability::OpaqueModelOwned,
+        fallback_reason: Some(COMPATIBILITY_CACHE_FALLBACK_REASON),
     }
 }
 
-impl<T> KvCacheContractProvider for T
-where
-    T: LoadedExecutionAdapter + ?Sized,
-{
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
-        self.cache_capability()
-    }
-
-    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
-        self.cache_fallback_reason()
-    }
+/// One sealed capability declaration for an exact loaded model instance.
+///
+/// Execution remains request-resolved because streaming requirements can
+/// select a different stage contract. Cache truth is immutable for the loaded
+/// capability and can no longer be overlaid after adapter selection.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedCapabilityDescriptor {
+    execution: Arc<dyn LoadedExecutionAdapter>,
+    cache: LoadedKvCacheCapability,
 }
 
-#[derive(Debug)]
-struct CachePublishingExecutionAdapter {
-    inner: Arc<dyn LoadedExecutionAdapter>,
-    loaded_cache: LoadedKvCacheCapability,
-}
-
-impl LoadedExecutionAdapter for CachePublishingExecutionAdapter {
-    fn metadata(&self) -> AdapterMetadata {
-        self.inner.metadata()
-    }
-
-    fn adapter_instance_id(&self) -> AdapterInstanceId {
-        self.inner.adapter_instance_id()
-    }
-
-    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
-        self.inner.adapter_abi_revision()
+impl LoadedCapabilityDescriptor {
+    fn new(
+        execution: Arc<dyn LoadedExecutionAdapter>,
+        cache: LoadedKvCacheCapability,
+    ) -> Result<Self> {
+        cache.validate()?;
+        execution.contract(StreamingRequirements::NONE)?;
+        Ok(Self { execution, cache })
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
-        self.inner.contract(streaming)
+        self.execution.contract(streaming)
     }
 
-    fn cache_capability(&self) -> Result<CacheCapability> {
-        Ok(self.loaded_cache.capability.clone())
+    fn cache_capability(&self) -> CacheCapability {
+        self.cache.capability.clone()
     }
 
-    fn cache_fallback_reason(&self) -> Option<&'static str> {
-        self.loaded_cache.fallback_reason
-    }
-}
-
-/// Validated proof that one exact loaded model may activate cache semantics
-/// for its matching capability adapter. Backend support is decided by the
-/// concrete lifecycle/executor boundary before constructing this value.
-#[derive(Debug, Clone)]
-pub(crate) struct LoadedCacheActivation {
-    capability: CapabilityKind,
-    loaded_cache: LoadedKvCacheCapability,
-}
-
-impl LoadedCacheActivation {
-    pub(crate) fn new(
-        capability: CapabilityKind,
-        loaded_cache: LoadedKvCacheCapability,
-    ) -> Result<Self> {
-        loaded_cache.validate()?;
-        Ok(Self {
-            capability,
-            loaded_cache,
+    fn binding(&self, streaming: StreamingRequirements) -> Result<LoadedCapabilityBinding> {
+        Ok(LoadedCapabilityBinding {
+            execution: self.contract(streaming)?.adapter_binding()?,
+            cache_capability: self.cache_capability(),
         })
     }
+}
+
+/// Request-ready projection of one sealed loaded capability descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadedCapabilityBinding {
+    pub(crate) execution: ExecutionAdapterBinding,
+    pub(crate) cache_capability: CacheCapability,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -694,13 +668,14 @@ impl RuntimeAdapterRegistry {
             .collect()
     }
 
-    fn bind_loaded_adapter(
+    fn bind_loaded_capability(
         &self,
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
-    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        cache: LoadedKvCacheCapability,
+    ) -> Result<LoadedCapabilityDescriptor> {
         let context = LoadedAdapterFactoryContext {
             execution_group_id,
             model_instance_id,
@@ -724,9 +699,7 @@ impl RuntimeAdapterRegistry {
                 metadata.model_variant, metadata.capability
             )));
         }
-        adapter.kv_cache_contract()?.validate()?;
-        adapter.contract(StreamingRequirements::NONE)?;
-        Ok(adapter)
+        LoadedCapabilityDescriptor::new(adapter, cache)
     }
 }
 
@@ -735,7 +708,7 @@ pub(crate) struct LoadedModelBundle {
     model_instance_id: ModelInstanceId,
     model_variant: ModelVariant,
     backend_kind: BackendKind,
-    adapters: HashMap<CapabilityKind, Arc<dyn LoadedExecutionAdapter>>,
+    capabilities: HashMap<CapabilityKind, LoadedCapabilityDescriptor>,
 }
 
 impl fmt::Debug for LoadedModelBundle {
@@ -746,7 +719,7 @@ impl fmt::Debug for LoadedModelBundle {
             .field("model_instance_id", &self.model_instance_id)
             .field("model_variant", &self.model_variant)
             .field("backend_kind", &self.backend_kind)
-            .field("adapter_count", &self.adapters.len())
+            .field("capability_count", &self.capabilities.len())
             .finish()
     }
 }
@@ -759,27 +732,26 @@ impl LoadedModelBundle {
         model_variant: ModelVariant,
         backend_kind: BackendKind,
     ) -> Result<Self> {
-        Self::bind_with_cache_capability(
+        Self::bind_with_cache_capabilities(
             registry,
             execution_group_id,
             model_instance_id,
             model_variant,
             backend_kind,
-            None,
+            HashMap::new(),
         )
     }
 
-    /// Bind adapter metadata to the exact loaded model's cache truth. The
-    /// override is accepted only for the matching capability after model
-    /// tensors have been published; catalog-only bundle construction remains
-    /// opaque.
-    pub(crate) fn bind_with_cache_capability(
+    /// Bind adapter metadata and exact loaded-model cache truth into one sealed
+    /// descriptor per capability. Missing declarations retain the current
+    /// opaque compatibility behavior during model migration.
+    pub(crate) fn bind_with_cache_capabilities(
         registry: &RuntimeAdapterRegistry,
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
         model_variant: ModelVariant,
         backend_kind: BackendKind,
-        cache_activation: Option<LoadedCacheActivation>,
+        mut cache_capabilities: HashMap<CapabilityKind, LoadedKvCacheCapability>,
     ) -> Result<Self> {
         let metadata = registry.capabilities_for(model_variant);
         if metadata.is_empty() {
@@ -787,24 +759,36 @@ impl LoadedModelBundle {
                 "loaded model {model_variant} has no executable capability adapter"
             )));
         }
+        let mut unmatched = cache_capabilities
+            .keys()
+            .copied()
+            .filter(|capability| !metadata.iter().any(|entry| entry.capability == *capability))
+            .map(CapabilityKind::as_str)
+            .collect::<Vec<_>>();
+        if !unmatched.is_empty() {
+            unmatched.sort_unstable();
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {model_variant} published cache truth for unregistered capabilities: {}",
+                unmatched.join(", ")
+            )));
+        }
 
-        let mut adapters = HashMap::with_capacity(metadata.len());
+        let mut capabilities = HashMap::with_capacity(metadata.len());
         for metadata in metadata {
-            let mut adapter = registry.bind_loaded_adapter(
+            let cache = cache_capabilities
+                .remove(&metadata.capability)
+                .unwrap_or_else(compatibility_cache_capability);
+            let descriptor = registry.bind_loaded_capability(
                 execution_group_id,
                 model_instance_id,
                 metadata,
                 backend_kind,
+                cache,
             )?;
-            if let Some(activation) = cache_activation.as_ref() {
-                if metadata.capability == activation.capability {
-                    adapter = Arc::new(CachePublishingExecutionAdapter {
-                        inner: adapter,
-                        loaded_cache: activation.loaded_cache.clone(),
-                    });
-                }
-            }
-            if adapters.insert(metadata.capability, adapter).is_some() {
+            if capabilities
+                .insert(metadata.capability, descriptor)
+                .is_some()
+            {
                 return Err(Error::ModelLoadError(format!(
                     "loaded model {model_variant} has duplicate {:?} adapters",
                     metadata.capability
@@ -812,12 +796,14 @@ impl LoadedModelBundle {
             }
         }
 
+        debug_assert!(cache_capabilities.is_empty());
+
         Ok(Self {
             execution_group_id,
             model_instance_id,
             model_variant,
             backend_kind,
-            adapters,
+            capabilities,
         })
     }
 
@@ -838,14 +824,14 @@ impl LoadedModelBundle {
     }
 
     pub(crate) fn adapter_count(&self) -> usize {
-        self.adapters.len()
+        self.capabilities.len()
     }
 
-    pub(crate) fn require_adapter(
+    fn require_capability(
         &self,
         capability: CapabilityKind,
-    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        self.adapters.get(&capability).cloned().ok_or_else(|| {
+    ) -> Result<&LoadedCapabilityDescriptor> {
+        self.capabilities.get(&capability).ok_or_else(|| {
             Error::InvalidInput(format!(
                 "loaded model {} does not expose capability {:?}",
                 self.model_variant, capability
@@ -869,34 +855,15 @@ impl LoadedModelBundle {
         capability: CapabilityKind,
         streaming: StreamingRequirements,
     ) -> Result<LoadedExecutionContract> {
-        self.require_adapter(capability)?.contract(streaming)
+        self.require_capability(capability)?.contract(streaming)
     }
 
-    pub(crate) fn adapter_binding(
-        &self,
-        capability: CapabilityKind,
-        streaming_required: bool,
-    ) -> Result<ExecutionAdapterBinding> {
-        self.contract(capability, streaming_required)?
-            .adapter_binding()
-    }
-
-    pub(crate) fn adapter_binding_for_streaming(
+    pub(crate) fn capability_binding_for_streaming(
         &self,
         capability: CapabilityKind,
         streaming: StreamingRequirements,
-    ) -> Result<ExecutionAdapterBinding> {
-        self.contract_for_streaming(capability, streaming)?
-            .adapter_binding()
-    }
-
-    pub(crate) fn kv_cache_capability(
-        &self,
-        capability: CapabilityKind,
-    ) -> Result<CacheCapability> {
-        let capability = self.require_adapter(capability)?.kv_cache_contract()?;
-        capability.validate()?;
-        Ok(capability)
+    ) -> Result<LoadedCapabilityBinding> {
+        self.require_capability(capability)?.binding(streaming)
     }
 }
 
@@ -906,30 +873,31 @@ mod tests {
     use crate::runtime::adapters::ExecutionTargetKind;
 
     #[test]
-    fn exact_native_qwen3_cpu_bundle_publishes_managed_cache_only_with_runtime_proof() {
+    fn exact_native_qwen3_cpu_descriptor_seals_execution_and_managed_cache_truth() {
         let registry = RuntimeAdapterRegistry::built_in();
         let managed = CacheCapability::Managed(crate::kv::test_contract());
-        let activation = LoadedCacheActivation::new(
+        let cache_capabilities = HashMap::from([(
             CapabilityKind::Chat,
             LoadedKvCacheCapability {
                 capability: managed.clone(),
                 fallback_reason: None,
             },
-        )
-        .unwrap();
-        let exact = LoadedModelBundle::bind_with_cache_capability(
+        )]);
+        let exact = LoadedModelBundle::bind_with_cache_capabilities(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(9),
             ModelVariant::Qwen306B,
             BackendKind::Cpu,
-            Some(activation),
+            cache_capabilities,
         )
         .unwrap();
-        assert_eq!(
-            exact.kv_cache_capability(CapabilityKind::Chat).unwrap(),
-            managed
-        );
+        let binding = exact
+            .capability_binding_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
+            .unwrap();
+        assert_eq!(binding.execution.model_instance_id, ModelInstanceId::new(9));
+        assert_eq!(binding.execution.capability_id, "chat");
+        assert_eq!(binding.cache_capability, managed);
 
         let catalog_only = LoadedModelBundle::bind(
             &registry,
@@ -941,10 +909,81 @@ mod tests {
         .unwrap();
         assert_eq!(
             catalog_only
-                .kv_cache_capability(CapabilityKind::Chat)
+                .capability_binding_for_streaming(
+                    CapabilityKind::Chat,
+                    StreamingRequirements::NONE,
+                )
                 .unwrap(),
+            LoadedCapabilityBinding {
+                execution: catalog_only
+                    .contract(CapabilityKind::Chat, false)
+                    .unwrap()
+                    .adapter_binding()
+                    .unwrap(),
+                cache_capability: CacheCapability::OpaqueModelOwned,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_truth_is_scoped_to_one_capability_descriptor() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let managed = CacheCapability::Managed(crate::kv::test_contract());
+        let cache_capabilities = HashMap::from([(
+            CapabilityKind::Tts,
+            LoadedKvCacheCapability {
+                capability: managed.clone(),
+                fallback_reason: None,
+            },
+        )]);
+        let bundle = LoadedModelBundle::bind_with_cache_capabilities(
+            &registry,
+            ExecutionGroupId::new(4),
+            ModelInstanceId::new(11),
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            BackendKind::Cpu,
+            cache_capabilities,
+        )
+        .unwrap();
+
+        let tts = bundle
+            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .unwrap();
+        assert_eq!(tts.cache_capability, managed);
+        assert_eq!(
+            bundle
+                .capability_binding_for_streaming(
+                    CapabilityKind::StreamingTts,
+                    StreamingRequirements::NONE,
+                )
+                .unwrap()
+                .cache_capability,
             CacheCapability::OpaqueModelOwned
         );
+    }
+
+    #[test]
+    fn cache_truth_for_an_unregistered_capability_is_rejected() {
+        let cache_capabilities = HashMap::from([(
+            CapabilityKind::Asr,
+            LoadedKvCacheCapability {
+                capability: CacheCapability::Managed(crate::kv::test_contract()),
+                fallback_reason: None,
+            },
+        )]);
+
+        let error = LoadedModelBundle::bind_with_cache_capabilities(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(5),
+            ModelInstanceId::new(12),
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+            cache_capabilities,
+        )
+        .expect_err("an unmatched cache declaration must fail closed");
+
+        assert!(error.to_string().contains("unregistered capabilities"));
+        assert!(error.to_string().contains("asr"));
     }
 
     #[derive(Debug)]
@@ -1002,12 +1041,16 @@ mod tests {
             assert_eq!(bundle.adapter_count(), metadata.len(), "{variant}");
             assert_eq!(bundle.model_instance_id(), instance);
             for metadata in metadata {
+                let binding = bundle
+                    .capability_binding_for_streaming(
+                        metadata.capability,
+                        StreamingRequirements::NONE,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("failed to bind capability for {variant}: {error}")
+                    });
                 assert_eq!(
-                    bundle
-                        .kv_cache_capability(metadata.capability)
-                        .unwrap_or_else(|error| {
-                            panic!("failed to resolve cache capability for {variant}: {error}")
-                        }),
+                    binding.cache_capability,
                     CacheCapability::OpaqueModelOwned,
                     "cache capability changed for {variant}"
                 );
@@ -1038,12 +1081,12 @@ mod tests {
                     .all(|stage| stage.max_batch_size == 1));
                 assert_eq!(contract.execution_profile.max_batch_size, 1);
                 assert!(contract.execution_profile.resolved_from_loaded_model);
-                let binding = bundle
-                    .adapter_binding(metadata.capability, false)
-                    .expect("adapter binding");
-                assert_eq!(binding.model_variant, variant);
-                assert_eq!(binding.model_instance_id, instance);
-                assert_eq!(binding.capability_id, metadata.capability.as_str());
+                assert_eq!(binding.execution.model_variant, variant);
+                assert_eq!(binding.execution.model_instance_id, instance);
+                assert_eq!(
+                    binding.execution.capability_id,
+                    metadata.capability.as_str()
+                );
 
                 let transport = bundle
                     .contract_for_streaming(
@@ -1239,17 +1282,20 @@ mod tests {
         .expect("second bundle");
 
         let first_asr = first
-            .require_adapter(CapabilityKind::Asr)
+            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
             .expect("first asr")
-            .adapter_instance_id();
+            .execution
+            .adapter_instance_id;
         let first_tts = first
-            .require_adapter(CapabilityKind::Tts)
+            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
             .expect("first tts")
-            .adapter_instance_id();
+            .execution
+            .adapter_instance_id;
         let second_asr = second
-            .require_adapter(CapabilityKind::Asr)
+            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
             .expect("second asr")
-            .adapter_instance_id();
+            .execution
+            .adapter_instance_id;
 
         assert_ne!(first_asr, first_tts);
         assert_ne!(first_asr, second_asr);
