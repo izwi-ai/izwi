@@ -45,8 +45,8 @@ pub(crate) use contract::{
 #[allow(unused_imports)]
 pub(crate) use descriptor::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InvocationStageWorkspace,
-    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet,
-    RetainedStateCapability, WorkspaceFormula,
+    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
+    InvocationWorkspaceSet, RetainedStateCapability, WorkspaceFormula,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{

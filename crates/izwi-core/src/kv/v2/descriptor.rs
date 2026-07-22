@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use super::capacity::{WorkspaceDimensionBound, WorkspaceTerm};
 use super::contract::{
     InferenceStateAbi, InferenceStateContract, PlacementPolicy, StateDomainId, StateDomainSpec,
-    StateScope, CURRENT_INFERENCE_STATE_ABI,
+    StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
 
 const CAPABILITY_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] =
@@ -50,8 +50,20 @@ pub(crate) struct InvocationWorkspaceProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InvocationStageWorkspace {
     pub(crate) stage: StageId,
+    /// Explicit consistency groups for typed state domains in this stage.
+    /// Scratch domains do not participate in state commit groups.
+    pub(crate) groups: Vec<StateGroupSpec>,
     /// Empty is an affirmative zero-workspace declaration for this stage.
     pub(crate) domains: Vec<InvocationWorkspaceDomain>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum InvocationStateCapacity {
+    /// Exact logical cursor bound for a paged-attention invocation domain.
+    PagedTokens { max_tokens: u64 },
+    /// The state domain's own bounded shape is the complete capacity contract.
+    SemanticBounded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +81,7 @@ pub(crate) enum InvocationWorkspaceDomain {
     /// Typed physical state with explicit tensor/page/ring semantics.
     State {
         state: StateDomainSpec,
+        capacity: InvocationStateCapacity,
         placement: PlacementPolicy,
         formula: WorkspaceFormula,
     },
@@ -187,6 +200,7 @@ impl CapabilityStateDescriptorV2 {
                     .collect();
                 invocation_stages.push(InvocationStageWorkspace {
                     stage: stage.id,
+                    groups: Vec::new(),
                     domains,
                 });
             }
@@ -379,6 +393,7 @@ impl InvocationStageWorkspace {
     fn validate(&self) -> Result<u64> {
         let mut previous = None;
         let mut maximum = 0_u64;
+        let mut typed_domains = Vec::new();
         for domain in &self.domains {
             let id = domain.id();
             if previous.is_some_and(|previous| id <= previous) {
@@ -390,6 +405,23 @@ impl InvocationStageWorkspace {
             maximum = maximum
                 .checked_add(domain.maximum_bytes()?)
                 .ok_or_else(|| invalid("invocation workspace stage byte bound overflow"))?;
+            if let InvocationWorkspaceDomain::State { state, .. } = domain {
+                typed_domains.push(state.clone());
+            }
+        }
+        if typed_domains.is_empty() {
+            if !self.groups.is_empty() {
+                return Err(invalid(
+                    "invocation workspace declares state groups without typed state domains",
+                ));
+            }
+        } else {
+            InferenceStateContract {
+                abi: CURRENT_INFERENCE_STATE_ABI,
+                domains: typed_domains,
+                groups: self.groups.clone(),
+            }
+            .validate()?;
         }
         Ok(maximum)
     }
@@ -420,6 +452,7 @@ impl InvocationWorkspaceDomain {
             }
             Self::State {
                 state,
+                capacity,
                 placement,
                 formula,
             } => {
@@ -434,8 +467,25 @@ impl InvocationWorkspaceDomain {
                         "invocation workspace placement disagrees with its state domain",
                     ));
                 }
+                match (state, capacity) {
+                    (
+                        StateDomainSpec::PagedAttention(_),
+                        InvocationStateCapacity::PagedTokens { max_tokens },
+                    ) if *max_tokens > 0 => {}
+                    (StateDomainSpec::PagedAttention(_), _) => {
+                        return Err(invalid(
+                            "paged invocation workspace requires a non-zero token capacity",
+                        ));
+                    }
+                    (_, InvocationStateCapacity::SemanticBounded) => {}
+                    (_, InvocationStateCapacity::PagedTokens { .. }) => {
+                        return Err(invalid(
+                            "non-paged invocation workspace cannot use a paged token capacity",
+                        ));
+                    }
+                }
                 let maximum = formula.maximum_bytes()?;
-                let physical_minimum = minimum_physical_bytes(state)?;
+                let physical_minimum = minimum_physical_bytes_for_capacity(state, *capacity)?;
                 if maximum < physical_minimum {
                     return Err(invalid(
                         "invocation workspace formula is smaller than its physical state geometry",
@@ -445,6 +495,39 @@ impl InvocationWorkspaceDomain {
             }
         }
     }
+}
+
+fn minimum_physical_bytes_for_capacity(
+    state: &StateDomainSpec,
+    capacity: InvocationStateCapacity,
+) -> Result<u64> {
+    let (
+        StateDomainSpec::PagedAttention(spec),
+        InvocationStateCapacity::PagedTokens { max_tokens },
+    ) = (state, capacity)
+    else {
+        return minimum_physical_bytes(state);
+    };
+    let page_tokens = u64::from(spec.page_size.preferred_tokens);
+    let rounded_tokens = max_tokens
+        .checked_add(page_tokens.saturating_sub(1))
+        .and_then(|tokens| tokens.checked_div(page_tokens))
+        .and_then(|pages| pages.checked_mul(page_tokens))
+        .ok_or_else(|| invalid("paged invocation workspace capacity overflow"))?;
+    let elements_per_token = spec.layers.iter().try_fold(0_u64, |total, layer| {
+        let elements = u64::from(layer.kv_heads)
+            .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+            .ok_or_else(|| invalid("paged workspace geometry overflow"))?;
+        total
+            .checked_add(elements)
+            .ok_or_else(|| invalid("paged workspace geometry overflow"))
+    })?;
+    minimum_dtype_bytes(
+        elements_per_token
+            .checked_mul(rounded_tokens)
+            .ok_or_else(|| invalid("paged workspace geometry overflow"))?,
+        &spec.accepted_dtypes,
+    )
 }
 
 impl WorkspaceFormula {
@@ -603,8 +686,8 @@ mod tests {
     };
     use crate::kv::v2::{
         BoundedShape, CheckpointPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent,
-        StateClock, StateComponentId, StateDType, StateDomainHeader, StaticTensorDomainSpec,
-        TensorComponentSpec, TensorRole, WorkspaceAxis,
+        StateClock, StateComponentId, StateDType, StateDomainHeader, StateGroupId,
+        StaticTensorDomainSpec, TensorComponentSpec, TensorRole, WorkspaceAxis,
     };
 
     fn stage(max_workspace_bytes: u64) -> StageDescriptor {
@@ -653,6 +736,7 @@ mod tests {
                     accepted_dtypes: vec![StateDType::F16],
                 }],
             }),
+            capacity: InvocationStateCapacity::SemanticBounded,
             placement: PlacementPolicy::BackendLocal,
             formula: WorkspaceFormula {
                 fixed_bytes: 64,
@@ -666,6 +750,14 @@ mod tests {
                 }],
             },
         }
+    }
+
+    fn workspace_groups() -> Vec<StateGroupSpec> {
+        vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: vec![StateDomainId::new(1)],
+            prefix_shareable: false,
+        }]
     }
 
     #[test]
@@ -684,6 +776,7 @@ mod tests {
                 stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
+                    groups: workspace_groups(),
                     domains: vec![workspace_domain()],
                 }],
             },
@@ -691,6 +784,7 @@ mod tests {
                 stage_graph_fingerprint: stage_graph_fingerprint(&[stage(64)]).unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
+                    groups: workspace_groups(),
                     domains: vec![second_domain],
                 }],
             },
@@ -766,6 +860,7 @@ mod tests {
                     stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
+                        groups: workspace_groups(),
                         domains: vec![wrong],
                     }],
                 }],
@@ -790,11 +885,52 @@ mod tests {
                     stage_graph_fingerprint: stage_graph_fingerprint(&[stage(15)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
+                        groups: workspace_groups(),
                         domains: vec![undersized],
                     }],
                 }],
             },
         };
         assert!(descriptor.validate_against_stages(&[stage(15)]).is_err());
+    }
+
+    #[test]
+    fn typed_invocation_workspace_requires_groups_and_matching_capacity_kind() {
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::Bounded {
+                profiles: vec![InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                    stages: vec![InvocationStageWorkspace {
+                        stage: StageId::new(1),
+                        groups: Vec::new(),
+                        domains: vec![workspace_domain()],
+                    }],
+                }],
+            },
+        };
+        assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
+
+        let mut wrong_capacity = workspace_domain();
+        let InvocationWorkspaceDomain::State { capacity, .. } = &mut wrong_capacity else {
+            unreachable!()
+        };
+        *capacity = InvocationStateCapacity::PagedTokens { max_tokens: 1 };
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::Bounded {
+                profiles: vec![InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                    stages: vec![InvocationStageWorkspace {
+                        stage: StageId::new(1),
+                        groups: workspace_groups(),
+                        domains: vec![wrong_capacity],
+                    }],
+                }],
+            },
+        };
+        assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
     }
 }

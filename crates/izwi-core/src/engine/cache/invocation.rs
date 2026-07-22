@@ -13,8 +13,8 @@ use candle_core::DType;
 use crate::backends::kv::{KvArena, KvWriteBatchCompletion};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    InvocationWorkspaceDomain, ResolvedStatePlan, StateDType, StateDomainId, StateDomainSpec,
-    StateGroupId, StatePhysicalLayout, StatePlanId, StateScope,
+    InvocationStateCapacity, InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
+    StateDomainId, StateDomainSpec, StateGroupId, StatePhysicalLayout, StatePlanId, StateScope,
 };
 use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -99,6 +99,7 @@ impl InvocationPagedKvPool {
     ) -> Result<Self> {
         let InvocationWorkspaceDomain::State {
             state: StateDomainSpec::PagedAttention(semantic),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens },
             placement,
             formula,
         } = workspace_domain
@@ -164,6 +165,15 @@ impl InvocationPagedKvPool {
         if requested_backing > formula.maximum_bytes()? {
             return Err(invalid(
                 "invocation paged workspace pages exceed the domain formula maximum",
+            ));
+        }
+        let required_pages = max_tokens
+            .checked_add(u64::from(resolved.page_tokens).saturating_sub(1))
+            .and_then(|tokens| tokens.checked_div(u64::from(resolved.page_tokens)))
+            .ok_or_else(|| invalid("invocation paged workspace token capacity overflow"))?;
+        if required_pages != u64::from(pages_per_slot) {
+            return Err(invalid(
+                "invocation paged workspace page range does not match its exact token capacity",
             ));
         }
         validate_arena_geometry(resolved, semantic, arena.as_ref())?;
@@ -584,8 +594,8 @@ mod tests {
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::engine::ModelInstanceId;
     use crate::kv::v2::{
-        test_contract, CheckpointPolicy, InvocationWorkspaceDomain, PlacementPolicy, PrefixPolicy,
-        StateDomainSpec, StateScope, WorkspaceFormula,
+        test_contract, CheckpointPolicy, InvocationStateCapacity, InvocationWorkspaceDomain,
+        PlacementPolicy, PrefixPolicy, StateDomainSpec, StateScope, WorkspaceFormula,
     };
     use crate::kv::KvGroupId;
 
@@ -638,6 +648,7 @@ mod tests {
         contract.groups[0].prefix_shareable = false;
         let workspace_domain = InvocationWorkspaceDomain::State {
             state: contract.domains[0].clone(),
+            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
             placement: PlacementPolicy::BackendLocalWithHostOffload,
             formula: WorkspaceFormula {
                 fixed_bytes: 1024 * 1024,
@@ -661,14 +672,15 @@ mod tests {
     #[test]
     fn lease_zeroes_before_exposure_and_reuses_with_a_new_generation() {
         let (plan, workspace_domain) = plan();
-        let arena = arena(&plan, 2);
-        let pool = InvocationPagedKvPool::new(&plan, &workspace_domain, arena.clone(), 0, 2, 1, 4)
-            .unwrap();
-        assert_eq!(pool.maximum_tokens_per_lease().unwrap(), 32);
+        let base_arena = arena(&plan, 1);
+        let pool =
+            InvocationPagedKvPool::new(&plan, &workspace_domain, base_arena.clone(), 0, 1, 1, 4)
+                .unwrap();
+        assert_eq!(pool.maximum_tokens_per_lease().unwrap(), 16);
         let first = pool.lease().unwrap();
         let first_slot = first.slot();
         assert!(pool.contains_active_lease(first_slot));
-        assert_eq!(arena.operation_stats().page_zero_dispatches, 1);
+        assert_eq!(base_arena.operation_stats().page_zero_dispatches, 1);
         assert!(pool.lease().is_err());
         drop(first);
 
@@ -676,7 +688,7 @@ mod tests {
         assert_eq!(second.slot().slot, first_slot.slot);
         assert!(second.slot().slot_generation > first_slot.slot_generation);
         assert!(!pool.contains_active_lease(first_slot));
-        assert_eq!(arena.operation_stats().page_zero_dispatches, 2);
+        assert_eq!(base_arena.operation_stats().page_zero_dispatches, 2);
     }
 
     #[test]
@@ -705,7 +717,7 @@ mod tests {
     #[test]
     fn pool_rejects_nonmatching_domain_or_overlapping_capacity() {
         let (plan, workspace_domain) = plan();
-        let arena = arena(&plan, 1);
+        let base_arena = arena(&plan, 1);
         let mut wrong_domain = workspace_domain.clone();
         let InvocationWorkspaceDomain::State {
             state: StateDomainSpec::PagedAttention(domain),
@@ -716,8 +728,16 @@ mod tests {
         };
         domain.header.id = StateDomainId::new(99);
         assert!(
-            InvocationPagedKvPool::new(&plan, &wrong_domain, arena.clone(), 0, 1, 1, 1,).is_err()
+            InvocationPagedKvPool::new(&plan, &wrong_domain, base_arena.clone(), 0, 1, 1, 1,)
+                .is_err()
         );
-        assert!(InvocationPagedKvPool::new(&plan, &workspace_domain, arena, 0, 1, 2, 1,).is_err());
+        let oversized_range = arena(&plan, 2);
+        assert!(
+            InvocationPagedKvPool::new(&plan, &workspace_domain, oversized_range, 0, 2, 1, 1,)
+                .is_err()
+        );
+        assert!(
+            InvocationPagedKvPool::new(&plan, &workspace_domain, base_arena, 0, 1, 2, 1,).is_err()
+        );
     }
 }
