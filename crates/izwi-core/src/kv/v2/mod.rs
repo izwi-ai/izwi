@@ -69,7 +69,9 @@ pub(crate) use resolved_domains::{
     StaticTensorOperationSet, TensorPhysicalLayout, TensorStateOperationSet,
 };
 #[allow(unused_imports)]
-pub(crate) use runtime::{CapabilityRuntimeIdentityV2, StatelessCapabilityRuntimeV2};
+pub(crate) use runtime::{
+    CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, StatelessCapabilityRuntimeV2,
+};
 
 #[cfg(test)]
 pub(crate) use contract::test_contract;

@@ -77,6 +77,55 @@ pub(crate) struct StatelessCapabilityRuntimeV2 {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
 }
 
+/// Request-facing inference-state runtime. Callers bind this model-neutral
+/// handle and never branch on whether the backing is stateless, paged KV, or a
+/// future tensor/ring arena. The backing kind remains private to the state
+/// runtime so adding a physical domain cannot create another request ABI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapabilityStateRuntimeV2 {
+    pub(crate) id: [u8; 32],
+    pub(crate) state_fingerprint: [u8; 32],
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    backing: CapabilityStateRuntimeBackingV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityStateRuntimeBackingV2 {
+    Stateless(StatelessCapabilityRuntimeV2),
+}
+
+impl CapabilityStateRuntimeV2 {
+    pub(crate) fn stateless(runtime: StatelessCapabilityRuntimeV2) -> Self {
+        Self {
+            id: runtime.id,
+            state_fingerprint: runtime.state_fingerprint,
+            descriptor: runtime.descriptor.clone(),
+            backing: CapabilityStateRuntimeBackingV2::Stateless(runtime),
+        }
+    }
+
+    pub(crate) fn validate_against(
+        &self,
+        backend: BackendKind,
+        execution: &ExecutionAdapterBinding,
+    ) -> Result<()> {
+        match &self.backing {
+            CapabilityStateRuntimeBackingV2::Stateless(runtime) => {
+                runtime.validate_against(backend, execution)?;
+                if self.id != runtime.id
+                    || self.state_fingerprint != runtime.state_fingerprint
+                    || self.descriptor != runtime.descriptor
+                {
+                    return Err(invalid(
+                        "state ABI v2 runtime wrapper does not match its sealed backing",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl StatelessCapabilityRuntimeV2 {
     pub(crate) fn seal(
         backend: BackendKind,

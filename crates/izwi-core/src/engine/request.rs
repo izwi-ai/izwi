@@ -783,7 +783,7 @@ pub struct EngineCoreRequest {
     /// Exact load-sealed runtime proof for stateless/zero-workspace ABI-v2
     /// capabilities. Stateful variants replace this proof only when they own
     /// backend allocations and completion tracking.
-    pub(super) v2_stateless_runtime: Option<Arc<crate::kv::v2::StatelessCapabilityRuntimeV2>>,
+    pub(super) v2_state_runtime: Option<Arc<crate::kv::v2::CapabilityStateRuntimeV2>>,
     /// Immutable model-level physical KV runtime installed by the engine.
     pub(super) managed_cache_runtime: Option<Arc<super::cache::managed::ManagedKvModelRuntime>>,
     /// Request-specific shape/workspace facts produced by the exact loaded
@@ -2071,7 +2071,7 @@ impl EngineCoreRequest {
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
-            v2_stateless_runtime: None,
+            v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2123,7 +2123,7 @@ impl EngineCoreRequest {
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
-            v2_stateless_runtime: None,
+            v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2175,7 +2175,7 @@ impl EngineCoreRequest {
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
-            v2_stateless_runtime: None,
+            v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2224,7 +2224,7 @@ impl EngineCoreRequest {
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
-            v2_stateless_runtime: None,
+            v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2274,7 +2274,7 @@ impl EngineCoreRequest {
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
-            v2_stateless_runtime: None,
+            v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2324,7 +2324,7 @@ impl EngineCoreRequest {
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
-            v2_stateless_runtime: None,
+            v2_state_runtime: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2487,7 +2487,7 @@ impl EngineCoreRequest {
 
     pub(crate) fn bind_v2_state_runtime(
         &mut self,
-        runtime: Arc<crate::kv::v2::StatelessCapabilityRuntimeV2>,
+        runtime: Arc<crate::kv::v2::CapabilityStateRuntimeV2>,
         fingerprint: [u8; 32],
         backend: crate::backends::BackendKind,
     ) -> Result<()> {
@@ -2504,7 +2504,7 @@ impl EngineCoreRequest {
         })?;
         runtime.validate_against(backend, execution)?;
         if self
-            .v2_stateless_runtime
+            .v2_state_runtime
             .as_ref()
             .is_some_and(|current| current.id != runtime.id)
         {
@@ -2513,7 +2513,7 @@ impl EngineCoreRequest {
             ));
         }
         if self
-            .v2_stateless_runtime
+            .v2_state_runtime
             .as_ref()
             .is_some_and(|current| current.id == runtime.id)
         {
@@ -2521,14 +2521,12 @@ impl EngineCoreRequest {
         }
         self.bind_v2_state_descriptor(runtime.descriptor.clone(), fingerprint)?;
         self.cache_capability = crate::kv::CacheCapability::None;
-        self.v2_stateless_runtime = Some(runtime);
+        self.v2_state_runtime = Some(runtime);
         Ok(())
     }
 
-    pub(crate) fn v2_stateless_runtime(
-        &self,
-    ) -> Option<&Arc<crate::kv::v2::StatelessCapabilityRuntimeV2>> {
-        self.v2_stateless_runtime.as_ref()
+    pub(crate) fn v2_state_runtime(&self) -> Option<&Arc<crate::kv::v2::CapabilityStateRuntimeV2>> {
+        self.v2_state_runtime.as_ref()
     }
 
     pub(crate) fn v2_state_descriptor(

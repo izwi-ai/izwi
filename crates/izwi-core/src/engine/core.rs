@@ -1527,7 +1527,7 @@ impl EngineCore {
 
         if let Some(model_instance) = request.model_instance_id() {
             if request.v2_state_descriptor().is_some() {
-                let runtime = request.v2_stateless_runtime().ok_or_else(|| {
+                let runtime = request.v2_state_runtime().ok_or_else(|| {
                     Error::InferenceError(format!(
                         "model instance {} published state ABI v2 before a resolved v2 runtime was installed",
                         model_instance.get()
@@ -3390,14 +3390,14 @@ mod tests {
         let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(
             &execution.stages,
         );
-        let runtime = Arc::new(
+        let runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::stateless(
             crate::kv::v2::StatelessCapabilityRuntimeV2::seal(
                 BackendKind::Cpu,
                 &execution,
                 descriptor,
             )
             .unwrap(),
-        );
+        ));
         let mut request = EngineCoreRequest::tts("v2 stateless").with_model_variant(variant);
         request.bind_execution_adapter(execution.clone()).unwrap();
         request
@@ -3410,14 +3410,14 @@ mod tests {
         let cuda_descriptor = crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(
             &execution.stages,
         );
-        let cuda_runtime = Arc::new(
+        let cuda_runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::stateless(
             crate::kv::v2::StatelessCapabilityRuntimeV2::seal(
                 BackendKind::Cuda,
                 &execution,
                 cuda_descriptor,
             )
             .unwrap(),
-        );
+        ));
         let mut mismatched = EngineCoreRequest::tts("wrong backend").with_model_variant(variant);
         mismatched.bind_execution_adapter(execution).unwrap();
         mismatched

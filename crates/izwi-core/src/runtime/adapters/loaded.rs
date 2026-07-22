@@ -11,7 +11,8 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, CapabilityStateDescriptorV2, StatelessCapabilityRuntimeV2,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, CapabilityStateRuntimeV2,
+    StatelessCapabilityRuntimeV2,
 };
 use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
@@ -166,7 +167,7 @@ impl LoadedStatePublication {
 pub(crate) struct LoadedCapabilityDescriptor {
     execution: Arc<dyn LoadedExecutionAdapter>,
     state: LoadedStatePublication,
-    stateless_v2_runtimes: HashMap<[u8; 32], Arc<StatelessCapabilityRuntimeV2>>,
+    v2_runtimes: HashMap<[u8; 32], Arc<CapabilityStateRuntimeV2>>,
 }
 
 impl LoadedCapabilityDescriptor {
@@ -177,7 +178,7 @@ impl LoadedCapabilityDescriptor {
     ) -> Result<Self> {
         let execution_contract = execution.contract(StreamingRequirements::NONE)?;
         state.validate(&execution_contract.stages)?;
-        let mut stateless_v2_runtimes = HashMap::new();
+        let mut v2_runtimes = HashMap::new();
         if let LoadedStatePublication::V2(descriptor) = &state {
             if !descriptor.is_stateless()
                 || !descriptor.has_zero_invocation_workspace_for(&execution_contract.stages)?
@@ -217,12 +218,11 @@ impl LoadedCapabilityDescriptor {
                     ));
                 }
                 let binding = contract.adapter_binding()?;
-                let runtime = Arc::new(StatelessCapabilityRuntimeV2::seal(
-                    backend_kind,
-                    &binding,
-                    descriptor.clone(),
-                )?);
-                match stateless_v2_runtimes.entry(runtime.stage_graph_fingerprint) {
+                let stateless =
+                    StatelessCapabilityRuntimeV2::seal(backend_kind, &binding, descriptor.clone())?;
+                let graph = stateless.stage_graph_fingerprint;
+                let runtime = Arc::new(CapabilityStateRuntimeV2::stateless(stateless));
+                match v2_runtimes.entry(graph) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(runtime);
                     }
@@ -240,7 +240,7 @@ impl LoadedCapabilityDescriptor {
         Ok(Self {
             execution,
             state,
-            stateless_v2_runtimes,
+            v2_runtimes,
         })
     }
 
@@ -259,7 +259,7 @@ impl LoadedCapabilityDescriptor {
             ),
             LoadedStatePublication::V2(_) => {
                 let graph = stage_graph_fingerprint(&contract.stages)?;
-                let runtime = self.stateless_v2_runtimes.get(&graph).ok_or_else(|| {
+                let runtime = self.v2_runtimes.get(&graph).ok_or_else(|| {
                     Error::InferenceError(
                         "selected execution graph has no load-sealed state ABI v2 runtime"
                             .to_string(),
@@ -291,7 +291,7 @@ pub(crate) struct LoadedCapabilityBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CapabilityStateBinding {
     LegacyV1(CacheCapability),
-    V2(Arc<StatelessCapabilityRuntimeV2>),
+    V2(Arc<CapabilityStateRuntimeV2>),
 }
 
 #[derive(Debug, Clone, Copy)]

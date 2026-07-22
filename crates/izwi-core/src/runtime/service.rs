@@ -3179,7 +3179,7 @@ mod tests {
             request.v2_state_fingerprint(),
             Some(descriptor.fingerprint(&offline).unwrap())
         );
-        assert!(request.v2_stateless_runtime().is_some());
+        assert!(request.v2_state_runtime().is_some());
         assert_eq!(
             request.cache_capability(),
             &crate::kv::CacheCapability::None
