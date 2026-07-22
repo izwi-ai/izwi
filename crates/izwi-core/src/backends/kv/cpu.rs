@@ -38,7 +38,7 @@ fn ready_fence() -> DeviceFence {
 struct CpuKvSlotMap {
     arena: KvArenaId,
     flat_slots: Tensor,
-    len: usize,
+    logical_slots: Arc<[KvSlotRef]>,
 }
 
 impl KvSlotMap for CpuKvSlotMap {
@@ -47,7 +47,11 @@ impl KvSlotMap for CpuKvSlotMap {
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.logical_slots.len()
+    }
+
+    fn logical_slots(&self) -> Arc<[KvSlotRef]> {
+        self.logical_slots.clone()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -226,7 +230,7 @@ impl KvArena for CpuKvArena {
         Ok(Arc::new(CpuKvSlotMap {
             arena: self.config.id,
             flat_slots,
-            len,
+            logical_slots: Arc::from(slots),
         }))
     }
 
@@ -301,7 +305,7 @@ impl KvArena for CpuKvArena {
         let layer = self.layer(binding)?;
         validate_write_tensor(
             args.keys,
-            slots.len,
+            slots.len(),
             layer.num_kv_heads,
             layer.key_head_dim,
             self.config.dtype,
@@ -309,7 +313,7 @@ impl KvArena for CpuKvArena {
         )?;
         validate_write_tensor(
             args.values,
-            slots.len,
+            slots.len(),
             layer.num_kv_heads,
             layer.value_head_dim,
             self.config.dtype,
@@ -330,7 +334,7 @@ impl KvArena for CpuKvArena {
         Ok(KvWriteCompletion::new(
             self.config.id,
             binding,
-            slots.len,
+            args.slots.logical_slots(),
             ready_fence(),
         ))
     }

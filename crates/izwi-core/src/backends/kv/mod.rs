@@ -89,6 +89,10 @@ pub struct KvArenaOperationStats {
 pub trait KvSlotMap: Any + Send + Sync {
     fn arena_id(&self) -> KvArenaId;
     fn len(&self) -> usize;
+    /// Exact generation-safe logical slots represented by this lowering.
+    /// Backends retain this identity beside any device-native index buffer so
+    /// completion proofs can be reconciled without trusting raw indices.
+    fn logical_slots(&self) -> Arc<[KvSlotRef]>;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -147,12 +151,17 @@ pub type DeviceFence = Arc<dyn KvDeviceFence>;
 pub struct KvWriteCompletion {
     arena: KvArenaId,
     layer: KvLayerBinding,
-    slots: usize,
+    slots: Arc<[KvSlotRef]>,
     fence: DeviceFence,
 }
 
 impl KvWriteCompletion {
-    fn new(arena: KvArenaId, layer: KvLayerBinding, slots: usize, fence: DeviceFence) -> Self {
+    fn new(
+        arena: KvArenaId,
+        layer: KvLayerBinding,
+        slots: Arc<[KvSlotRef]>,
+        fence: DeviceFence,
+    ) -> Self {
         Self {
             arena,
             layer,
@@ -170,7 +179,11 @@ impl KvWriteCompletion {
     }
 
     pub(crate) fn slots(&self) -> usize {
-        self.slots
+        self.slots.len()
+    }
+
+    pub(crate) fn slot_refs(&self) -> &[KvSlotRef] {
+        &self.slots
     }
 
     pub(crate) fn is_complete(&self) -> bool {
@@ -188,10 +201,12 @@ impl KvWriteCompletion {
 /// Construction is private to [`KvWriteCompletionCollector`]. Consumers can
 /// inspect the completed shape, but cannot fabricate a successful batch from
 /// scheduler metadata or individual fences.
+#[derive(Debug)]
 pub(crate) struct KvWriteBatchCompletion {
     arena: KvArenaId,
     layers: Vec<KvLayerBinding>,
-    slots_per_layer: usize,
+    slots: Arc<[KvSlotRef]>,
+    page_tokens: u32,
 }
 
 impl KvWriteBatchCompletion {
@@ -204,11 +219,20 @@ impl KvWriteBatchCompletion {
     }
 
     pub(crate) fn slots_per_layer(&self) -> usize {
-        self.slots_per_layer
+        self.slots.len()
+    }
+
+    pub(crate) fn slots(&self) -> &[KvSlotRef] {
+        &self.slots
+    }
+
+    pub(crate) fn page_tokens(&self) -> u32 {
+        self.page_tokens
     }
 
     pub(crate) fn total_slots(&self) -> usize {
-        self.slots_per_layer
+        self.slots
+            .len()
             .checked_mul(self.layers.len())
             .expect("validated KV write batch slot count overflowed")
     }
@@ -224,23 +248,24 @@ impl KvWriteBatchCompletion {
 pub(crate) struct KvWriteCompletionCollector {
     arena: KvArenaId,
     expected_layers: Vec<KvLayerBinding>,
-    expected_slots: usize,
+    expected_slots: Arc<[KvSlotRef]>,
+    page_tokens: u32,
     completions: HashMap<KvLayerBinding, KvWriteCompletion>,
 }
 
 impl KvWriteCompletionCollector {
-    pub(crate) fn new(
-        arena: KvArenaId,
-        expected_layers: impl IntoIterator<Item = KvLayerBinding>,
-        expected_slots: usize,
-    ) -> Result<Self> {
-        if expected_slots == 0 {
+    pub(crate) fn new(config: &KvArenaConfig, expected_slots: Arc<[KvSlotRef]>) -> Result<Self> {
+        if expected_slots.is_empty() {
             return Err(Error::InvalidInput(
                 "KV write completion batch must contain at least one slot".into(),
             ));
         }
 
-        let expected_layers = expected_layers.into_iter().collect::<Vec<_>>();
+        let expected_layers = config
+            .layers
+            .iter()
+            .map(|layer| layer.binding)
+            .collect::<Vec<_>>();
         if expected_layers.is_empty() {
             return Err(Error::InvalidInput(
                 "KV write completion batch must contain at least one layer".into(),
@@ -255,17 +280,33 @@ impl KvWriteCompletionCollector {
                 )));
             }
         }
+        let mut unique_slots = HashSet::with_capacity(expected_slots.len());
+        for slot in expected_slots.iter() {
+            if slot.block.arena != config.id
+                || slot.block.group != config.group
+                || slot.block.index >= config.capacity_pages
+                || slot.offset >= config.page_tokens
+                || !unique_slots.insert(*slot)
+            {
+                return Err(Error::InvalidInput(
+                    "KV write completion batch contains a foreign, duplicate, or out-of-range slot"
+                        .into(),
+                ));
+            }
+        }
         expected_slots
+            .len()
             .checked_mul(expected_layers.len())
             .ok_or_else(|| {
                 Error::InvalidInput("KV write completion batch slot count overflow".into())
             })?;
 
         Ok(Self {
-            arena,
+            arena: config.id,
             completions: HashMap::with_capacity(expected_layers.len()),
             expected_layers,
             expected_slots,
+            page_tokens: config.page_tokens,
         })
     }
 
@@ -284,13 +325,10 @@ impl KvWriteCompletionCollector {
             );
             return Self::reject_completion(completion, message);
         }
-        if completion.slots != self.expected_slots {
+        if completion.slots.as_ref() != self.expected_slots.as_ref() {
             let message = format!(
-                "KV write completion for layer {}:{} covers {} slots, expected {}",
-                completion.layer.model_layer,
-                completion.layer.physical_layer,
-                completion.slots,
-                self.expected_slots
+                "KV write completion for layer {}:{} covers a different physical slot set",
+                completion.layer.model_layer, completion.layer.physical_layer
             );
             return Self::reject_completion(completion, message);
         }
@@ -344,7 +382,8 @@ impl KvWriteCompletionCollector {
         Ok(KvWriteBatchCompletion {
             arena: self.arena,
             layers: self.expected_layers,
-            slots_per_layer: self.expected_slots,
+            slots: self.expected_slots,
+            page_tokens: self.page_tokens,
         })
     }
 
@@ -564,10 +603,44 @@ mod tests {
         }
     }
 
+    fn config(arena: KvArenaId, layers: &[KvLayerBinding]) -> KvArenaConfig {
+        KvArenaConfig {
+            id: arena,
+            group: KvGroupId::new(1),
+            page_tokens: 4,
+            capacity_pages: 4,
+            dtype: DType::F32,
+            layers: layers
+                .iter()
+                .map(|binding| KvLayerConfig {
+                    binding: *binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                })
+                .collect(),
+        }
+    }
+
+    fn slots(arena: KvArenaId, count: usize) -> Arc<[KvSlotRef]> {
+        (0..count)
+            .map(|position| KvSlotRef {
+                block: CacheBlockRef {
+                    arena,
+                    group: KvGroupId::new(1),
+                    index: (position / 4) as u32,
+                    slot_generation: 1,
+                },
+                offset: (position % 4) as u32,
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     fn completion(
         arena: KvArenaId,
         layer: KvLayerBinding,
-        slots: usize,
+        slots: Arc<[KvSlotRef]>,
         fence: impl KvDeviceFence + 'static,
     ) -> KvWriteCompletion {
         KvWriteCompletion::new(arena, layer, slots, Arc::new(fence))
@@ -577,14 +650,17 @@ mod tests {
     fn collector_seals_exact_complete_batch_in_expected_layer_order() {
         let arena = test_arena(1);
         let layers = [layer(4, 0), layer(9, 1)];
+        let config = config(arena, &layers);
+        let slots = slots(arena, 3);
         let waits = Arc::new(AtomicUsize::new(0));
-        let mut collector = KvWriteCompletionCollector::new(arena, layers, 3).expect("collector");
+        let mut collector =
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
 
         collector
             .collect(completion(
                 arena,
                 layers[1],
-                3,
+                slots.clone(),
                 TestFence::new(waits.clone()),
             ))
             .expect("second layer completion");
@@ -592,7 +668,7 @@ mod tests {
             .collect(completion(
                 arena,
                 layers[0],
-                3,
+                slots.clone(),
                 TestFence::new(waits.clone()),
             ))
             .expect("first layer completion");
@@ -601,35 +677,47 @@ mod tests {
         assert_eq!(sealed.arena(), arena);
         assert_eq!(sealed.layers(), &layers);
         assert_eq!(sealed.slots_per_layer(), 3);
+        assert_eq!(sealed.slots(), slots.as_ref());
+        assert_eq!(sealed.page_tokens(), 4);
         assert_eq!(sealed.total_slots(), 6);
         assert_eq!(waits.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn collector_rejects_empty_duplicate_or_overflowing_expectations() {
+    fn collector_rejects_empty_duplicate_or_foreign_expectations() {
         let arena = test_arena(1);
         let binding = layer(0, 0);
-        assert!(KvWriteCompletionCollector::new(arena, [], 1).is_err());
-        assert!(KvWriteCompletionCollector::new(arena, [binding], 0).is_err());
-        assert!(KvWriteCompletionCollector::new(arena, [binding, binding], 1).is_err());
+        assert!(KvWriteCompletionCollector::new(&config(arena, &[]), slots(arena, 1)).is_err());
         assert!(
-            KvWriteCompletionCollector::new(arena, [binding, layer(1, 1)], usize::MAX,).is_err()
+            KvWriteCompletionCollector::new(&config(arena, &[binding]), Vec::new().into()).is_err()
         );
+        assert!(KvWriteCompletionCollector::new(
+            &config(arena, &[binding, binding]),
+            slots(arena, 1),
+        )
+        .is_err());
+        assert!(KvWriteCompletionCollector::new(
+            &config(arena, &[binding]),
+            slots(test_arena(2), 1),
+        )
+        .is_err());
     }
 
     #[test]
     fn collector_rejects_foreign_unexpected_and_wrong_sized_tokens() {
         let arena = test_arena(1);
         let binding = layer(0, 0);
+        let config = config(arena, &[binding]);
+        let expected_slots = slots(arena, 2);
         let waits = Arc::new(AtomicUsize::new(0));
         let mut collector =
-            KvWriteCompletionCollector::new(arena, [binding], 2).expect("collector");
+            KvWriteCompletionCollector::new(&config, expected_slots.clone()).expect("collector");
 
         assert!(collector
             .collect(completion(
                 test_arena(2),
                 binding,
-                2,
+                expected_slots.clone(),
                 TestFence::new(waits.clone()),
             ))
             .is_err());
@@ -637,12 +725,17 @@ mod tests {
             .collect(completion(
                 arena,
                 layer(1, 1),
-                2,
+                expected_slots.clone(),
                 TestFence::new(waits.clone()),
             ))
             .is_err());
         assert!(collector
-            .collect(completion(arena, binding, 3, TestFence::new(waits.clone()),))
+            .collect(completion(
+                arena,
+                binding,
+                slots(arena, 3),
+                TestFence::new(waits.clone()),
+            ))
             .is_err());
         assert_eq!(waits.load(Ordering::Relaxed), 3);
     }
@@ -651,14 +744,26 @@ mod tests {
     fn collector_rejects_duplicate_layer_tokens() {
         let arena = test_arena(1);
         let binding = layer(0, 0);
+        let config = config(arena, &[binding]);
+        let slots = slots(arena, 1);
         let waits = Arc::new(AtomicUsize::new(0));
         let mut collector =
-            KvWriteCompletionCollector::new(arena, [binding], 1).expect("collector");
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
         collector
-            .collect(completion(arena, binding, 1, TestFence::new(waits.clone())))
+            .collect(completion(
+                arena,
+                binding,
+                slots.clone(),
+                TestFence::new(waits.clone()),
+            ))
             .expect("first completion");
         assert!(collector
-            .collect(completion(arena, binding, 1, TestFence::new(waits.clone()),))
+            .collect(completion(
+                arena,
+                binding,
+                slots,
+                TestFence::new(waits.clone()),
+            ))
             .is_err());
         assert_eq!(waits.load(Ordering::Relaxed), 1);
     }
@@ -667,13 +772,16 @@ mod tests {
     fn incomplete_batch_drains_collected_fences_without_sealing() {
         let arena = test_arena(1);
         let layers = [layer(0, 0), layer(1, 1)];
+        let config = config(arena, &layers);
+        let slots = slots(arena, 1);
         let waits = Arc::new(AtomicUsize::new(0));
-        let mut collector = KvWriteCompletionCollector::new(arena, layers, 1).expect("collector");
+        let mut collector =
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
         collector
             .collect(completion(
                 arena,
                 layers[0],
-                1,
+                slots,
                 TestFence::new(waits.clone()),
             ))
             .expect("first completion");
@@ -686,13 +794,16 @@ mod tests {
     fn seal_drains_all_fences_after_failure_without_authenticating_batch() {
         let arena = test_arena(1);
         let layers = [layer(0, 0), layer(1, 1)];
+        let config = config(arena, &layers);
+        let slots = slots(arena, 1);
         let waits = Arc::new(AtomicUsize::new(0));
-        let mut collector = KvWriteCompletionCollector::new(arena, layers, 1).expect("collector");
+        let mut collector =
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
         collector
             .collect(completion(
                 arena,
                 layers[0],
-                1,
+                slots.clone(),
                 TestFence::failing(waits.clone()),
             ))
             .expect("failed fence is still an authenticated dispatch");
@@ -700,7 +811,7 @@ mod tests {
             .collect(completion(
                 arena,
                 layers[1],
-                1,
+                slots,
                 TestFence::new(waits.clone()),
             ))
             .expect("second completion");
@@ -713,14 +824,16 @@ mod tests {
     fn seal_rejects_fence_that_returns_before_completion() {
         let arena = test_arena(1);
         let binding = layer(0, 0);
+        let config = config(arena, &[binding]);
+        let slots = slots(arena, 1);
         let waits = Arc::new(AtomicUsize::new(0));
         let mut collector =
-            KvWriteCompletionCollector::new(arena, [binding], 1).expect("collector");
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
         collector
             .collect(completion(
                 arena,
                 binding,
-                1,
+                slots,
                 TestFence::incomplete(waits.clone()),
             ))
             .expect("completion token");

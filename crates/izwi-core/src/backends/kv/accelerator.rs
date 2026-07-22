@@ -104,6 +104,7 @@ fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
 struct AcceleratorSlotMap {
     arena: KvArenaId,
     flat_slots: Vec<usize>,
+    logical_slots: Arc<[KvSlotRef]>,
 }
 
 impl KvSlotMap for AcceleratorSlotMap {
@@ -113,6 +114,10 @@ impl KvSlotMap for AcceleratorSlotMap {
 
     fn len(&self) -> usize {
         self.flat_slots.len()
+    }
+
+    fn logical_slots(&self) -> Arc<[KvSlotRef]> {
+        self.logical_slots.clone()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -464,6 +469,7 @@ impl KvArena for CandleAcceleratorKvArena {
         Ok(Arc::new(AcceleratorSlotMap {
             arena: self.config.id,
             flat_slots,
+            logical_slots: Arc::from(slots),
         }))
     }
 
@@ -577,7 +583,7 @@ impl KvArena for CandleAcceleratorKvArena {
         Ok(KvWriteCompletion::new(
             self.config.id,
             binding,
-            slots.len(),
+            args.slots.logical_slots(),
             fence,
         ))
     }
