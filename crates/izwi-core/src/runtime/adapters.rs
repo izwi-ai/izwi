@@ -235,14 +235,6 @@ impl RuntimeAdapterRegistry {
         const BACKENDS: [BackendKind; 3] =
             [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
 
-        for factory in &self.loaded_adapter_factories {
-            if factory.batch_mode() == NativeBatchMode::None {
-                return Err(Error::InvalidInput(format!(
-                    "native loaded adapter factory `{}` must declare static or continuous batching",
-                    factory.id()
-                )));
-            }
-        }
         for metadata in self.adapters.values().copied() {
             for backend_kind in BACKENDS {
                 self.loaded_adapter_factory(metadata, backend_kind)?;

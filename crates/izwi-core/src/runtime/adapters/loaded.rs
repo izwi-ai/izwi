@@ -595,20 +595,18 @@ struct StaticQwenTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for StaticQwenTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.qwen_tts.tensor_static"
+        "builtin.qwen_tts.physical_sequence"
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
-        NativeBatchMode::Static
+        NativeBatchMode::None
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        metadata.capability == CapabilityKind::Tts
-            && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Tts
-            && metadata
-                .model_variant
-                .speech_capabilities()
-                .is_some_and(|capabilities| capabilities.supports_builtin_voices)
+        matches!(
+            metadata.capability,
+            CapabilityKind::Tts | CapabilityKind::StreamingTts
+        ) && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Tts
     }
 
     fn create(
@@ -616,13 +614,11 @@ impl LoadedExecutionAdapterFactory for StaticQwenTtsAdapterFactory {
         context: LoadedAdapterFactoryContext,
         metadata: AdapterMetadata,
     ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
-        Ok(Arc::new(StaticTtsExecutionAdapter::new(
+        Ok(Arc::new(PhysicalQwenTtsExecutionAdapter::new(
             context.execution_group_id,
             context.model_instance_id,
             metadata,
             context.backend_kind,
-            context.max_tensor_batch_size,
-            context.request_parallelism,
         )))
     }
 }
@@ -794,6 +790,114 @@ fn compatibility_contract(
         execution_profile,
         stages: Arc::from([stage]),
     })
+}
+
+#[derive(Debug)]
+struct PhysicalQwenTtsExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+}
+
+impl PhysicalQwenTtsExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        AdapterAbiRevision::new(3)
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        if streaming.model_native && metadata.streaming_mode == StreamingMode::None {
+            return Err(Error::InvalidInput(format!(
+                "Model {} has no native streaming TTS contract",
+                metadata.model_variant
+            )));
+        }
+        let mut execution_profile =
+            compatibility_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        execution_profile.mode = ExecutionMode::Sequence;
+        execution_profile.prefill = PrefillMode::Full;
+        execution_profile.incremental_decode = true;
+        execution_profile.prefill_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.cache_mode = CacheMode::ExternalPaged;
+        execution_profile.cache_namespace = Some(format!(
+            "{}:{}:{}:state-v2",
+            metadata.model_variant,
+            metadata.capability.as_str(),
+            self.backend_kind.as_str()
+        ));
+        execution_profile.kv_dtype = "state_v2_resolved".to_string();
+        execution_profile.cancellation = CancellationGranularity::SequenceStep;
+        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.recompute_safe = false;
+        execution_profile.cache_release_safe = true;
+        execution_profile.prefix_reuse_safe = false;
+        execution_profile.max_batch_size = 1;
+        execution_profile.resolved_from_loaded_model = true;
+
+        let mut prefill = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tts.prefill.physical",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        prefill.selector = StageWorkSelector::SequencePrefill;
+        prefill.max_workspace_bytes = 0;
+        prefill.output_visibility = output_visibility_for(
+            streaming.transport_output,
+            execution_profile.mode,
+            NativeBatchMode::None,
+        );
+        let mut decode = StageDescriptor::from_execution_profile(
+            StageId::new(2),
+            "tts.decode.physical",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        decode.selector = StageWorkSelector::SequenceDecode;
+        decode.max_workspace_bytes = STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES;
+        decode.output_visibility = prefill.output_visibility;
+        prefill.validate()?;
+        decode.validate()?;
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([prefill, decode]),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -2308,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_tts_native_factory_binds_static_generation_but_not_streaming() {
+    fn qwen_tts_factory_binds_every_capability_to_physical_sequence_stages() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
         let bundle = LoadedModelBundle::bind(
@@ -2320,27 +2424,31 @@ mod tests {
         )
         .unwrap();
 
-        let batch = bundle.contract(CapabilityKind::Tts, false).unwrap();
-        assert_eq!(batch.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
-        assert_eq!(batch.execution_profile.mode, ExecutionMode::Atomic);
+        let physical = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        assert_eq!(physical.adapter_abi_revision, AdapterAbiRevision::new(3));
+        assert_eq!(physical.execution_profile.mode, ExecutionMode::Sequence);
         assert_eq!(
-            batch.execution_profile.prefill_batch,
-            NativeBatchMode::Static
+            physical.execution_profile.cache_mode,
+            CacheMode::ExternalPaged
         );
-        assert_eq!(batch.execution_profile.max_batch_size, 4);
-        assert_eq!(batch.stages.len(), 2);
-        assert_eq!(batch.stages[0].selector, StageWorkSelector::Atomic);
-        assert_eq!(batch.stages[0].batch_mode, NativeBatchMode::Static);
-        assert_eq!(batch.stages[0].max_batch_size, 4);
+        assert_eq!(physical.execution_profile.max_batch_size, 1);
+        assert_eq!(physical.stages.len(), 2);
         assert_eq!(
-            batch.stages[0].shape_policy,
-            crate::engine::StageShapePolicy::Exact
+            physical.stages[0].selector,
+            StageWorkSelector::SequencePrefill
         );
-        assert_eq!(batch.stages[1].selector, StageWorkSelector::Any);
-        assert_eq!(batch.stages[1].batch_mode, NativeBatchMode::None);
+        assert_eq!(physical.stages[0].max_workspace_bytes, 0);
+        assert_eq!(
+            physical.stages[1].selector,
+            StageWorkSelector::SequenceDecode
+        );
+        assert_eq!(
+            physical.stages[1].max_workspace_bytes,
+            STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES
+        );
 
         let streaming = bundle.contract(CapabilityKind::Tts, true).unwrap();
-        assert_eq!(streaming.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
+        assert_eq!(streaming.adapter_abi_revision, AdapterAbiRevision::new(3));
         assert_eq!(
             streaming.execution_profile.prefill_batch,
             NativeBatchMode::None
@@ -2353,12 +2461,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             streaming_capability.adapter_abi_revision,
-            COMPATIBILITY_ADAPTER_ABI
+            AdapterAbiRevision::new(3)
+        );
+        assert_eq!(
+            streaming_capability.execution_profile.cache_mode,
+            CacheMode::ExternalPaged
         );
     }
 
     #[test]
-    fn qwen_tts_native_factory_is_enabled_on_cpu_by_default() {
+    fn qwen_tts_physical_sequence_is_enabled_on_cpu_by_default() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
         let bundle = LoadedModelBundle::bind(
@@ -2371,9 +2483,13 @@ mod tests {
         .unwrap();
 
         let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
-        assert_eq!(contract.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
-        assert_eq!(contract.execution_profile.max_batch_size, 4);
-        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
+        assert_eq!(contract.adapter_abi_revision, AdapterAbiRevision::new(3));
+        assert_eq!(contract.execution_profile.max_batch_size, 1);
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(
+            contract.execution_profile.cache_mode,
+            CacheMode::ExternalPaged
+        );
     }
 
     #[test]
