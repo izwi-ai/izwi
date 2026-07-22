@@ -336,13 +336,25 @@ impl ModelLifecycleController {
                         "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
                     )));
                 }
-                self.core_engine
+                let physical = self
+                    .core_engine
                     .load_managed_model_cache(model_instance_id, &loaded_cache.capability)
                     .await?;
-                state_publications.insert(
-                    CapabilityKind::Chat,
-                    LoadedStatePublication::LegacyV1(loaded_cache),
-                );
+                let publication = match &loaded_cache.capability {
+                    crate::kv::CacheCapability::Managed(contract) => {
+                        LoadedStatePublication::ManagedV2 {
+                            contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
+                            physical: physical.ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "managed state allocation returned no physical runtime"
+                                        .to_string(),
+                                )
+                            })?,
+                        }
+                    }
+                    _ => LoadedStatePublication::LegacyV1(loaded_cache),
+                };
+                state_publications.insert(CapabilityKind::Chat, publication);
             }
             self.bind_loaded_model_bundle_with_state_publications(
                 variant,

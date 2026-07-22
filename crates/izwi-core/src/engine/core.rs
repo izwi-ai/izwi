@@ -1539,6 +1539,9 @@ impl EngineCore {
                     )
                 })?;
                 runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
+                if let Some(physical) = runtime.managed_kv_runtime() {
+                    request.install_managed_cache_runtime(physical.clone())?;
+                }
             }
             let capability = request.cache_capability().clone();
             if capability.managed_contract().is_some() {
@@ -2676,16 +2679,17 @@ impl EngineCore {
     /// Allocate and admit physical KV backing while the authoritative model
     /// generation is still Loading. Ready publication happens only after this
     /// succeeds, and request admission performs lookup only.
-    pub fn load_managed_model_cache(
+    pub(crate) fn load_managed_model_cache(
         &mut self,
         model_instance: super::ModelInstanceId,
         capability: &crate::kv::CacheCapability,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         if capability.managed_contract().is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let backend = self.managed_kv_cache.worker_backend();
-        self.managed_kv_cache
+        let runtime = self
+            .managed_kv_cache
             .bind_request(
                 model_instance,
                 backend,
@@ -2698,7 +2702,7 @@ impl EngineCore {
                     "managed KV load did not install a physical runtime".to_string(),
                 )
             })?;
-        Ok(())
+        Ok(Some(runtime))
     }
 
     /// Retire physical managed-KV state for one exact loaded-model instance.

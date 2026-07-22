@@ -70,7 +70,8 @@ pub(crate) use resolved_domains::{
 };
 #[allow(unused_imports)]
 pub(crate) use runtime::{
-    CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, StatelessCapabilityRuntimeV2,
+    CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, ManagedCapabilityRuntimeV2,
+    StatelessCapabilityRuntimeV2,
 };
 
 #[cfg(test)]

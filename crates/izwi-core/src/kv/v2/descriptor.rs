@@ -129,78 +129,117 @@ impl CapabilityStateDescriptorV2 {
         ))
     }
 
+    pub(crate) fn managed_for_stage_graphs(
+        contract: InferenceStateContract,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Self> {
+        if stage_graphs.is_empty() {
+            return Err(invalid(
+                "managed capability must seal at least one execution stage graph",
+            ));
+        }
+        let mut profiles = Vec::with_capacity(stage_graphs.len());
+        for stages in stage_graphs {
+            validate_stage_ids(stages)?;
+            let mut ordered = stages.iter().collect::<Vec<_>>();
+            ordered.sort_unstable_by_key(|stage| stage.id);
+            let mut invocation_stages = Vec::with_capacity(ordered.len());
+            for (index, stage) in ordered.into_iter().enumerate() {
+                let domain_id = u32::try_from(index + 1)
+                    .map_err(|_| invalid("execution stage count exceeds v2 domain identity"))?;
+                let domains = (stage.max_workspace_bytes > 0)
+                    .then(|| InvocationWorkspaceDomain {
+                        state: StateDomainSpec::StaticTensor(
+                            super::contract::StaticTensorDomainSpec {
+                                header: super::contract::StateDomainHeader {
+                                    id: super::contract::StateDomainId::new(domain_id),
+                                    scope: StateScope::Invocation,
+                                    clock: super::contract::StateClock::Custom(
+                                        "invocation".to_string(),
+                                    ),
+                                    placement: PlacementPolicy::BackendLocal,
+                                    prefix: super::contract::PrefixPolicy::Disabled,
+                                    checkpoint: super::contract::CheckpointPolicy::None,
+                                },
+                                components: vec![super::contract::TensorComponentSpec {
+                                    id: super::contract::StateComponentId::new(1),
+                                    role: super::contract::TensorRole::Control,
+                                    shape: super::contract::BoundedShape {
+                                        dimensions: vec![super::contract::ShapeDimension {
+                                            axis: super::contract::ShapeAxis::Hidden,
+                                            extent: super::contract::ShapeExtent::Fixed {
+                                                value: stage.max_workspace_bytes,
+                                            },
+                                        }],
+                                    },
+                                    accepted_dtypes: vec![super::contract::StateDType::I8],
+                                }],
+                            },
+                        ),
+                        placement: PlacementPolicy::BackendLocal,
+                        formula: WorkspaceFormula {
+                            fixed_bytes: stage.max_workspace_bytes,
+                            dimensions: vec![],
+                            terms: vec![],
+                        },
+                    })
+                    .into_iter()
+                    .collect();
+                invocation_stages.push(InvocationStageWorkspace {
+                    stage: stage.id,
+                    domains,
+                });
+            }
+            profiles.push(InvocationWorkspaceProfile {
+                stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+                stages: invocation_stages,
+            });
+        }
+        profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+        profiles.dedup_by(|left, right| left == right);
+        if profiles
+            .windows(2)
+            .any(|pair| pair[0].stage_graph_fingerprint == pair[1].stage_graph_fingerprint)
+        {
+            return Err(invalid(
+                "one execution stage graph resolved inconsistent invocation workspace",
+            ));
+        }
+        let has_workspace = profiles
+            .iter()
+            .map(|profile| profile.stages.iter().any(|stage| !stage.domains.is_empty()))
+            .collect::<Vec<_>>();
+        let invocation = if has_workspace.iter().all(|has_workspace| !has_workspace) {
+            InvocationWorkspaceSet::None {
+                stage_graph_fingerprints: profiles
+                    .iter()
+                    .map(|profile| profile.stage_graph_fingerprint)
+                    .collect(),
+            }
+        } else if has_workspace.iter().all(|has_workspace| *has_workspace) {
+            InvocationWorkspaceSet::Bounded { profiles }
+        } else {
+            return Err(invalid(
+                "managed execution graphs disagree on whether physical workspace exists",
+            ));
+        };
+        let descriptor = Self {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Managed { contract },
+            invocation,
+        };
+        for stages in stage_graphs {
+            descriptor.validate_against_stages(stages)?;
+        }
+        Ok(descriptor)
+    }
+
     #[cfg(test)]
     pub(crate) fn managed_for_stages_test(
         contract: InferenceStateContract,
         stages: &[StageDescriptor],
     ) -> Self {
-        let invocation =
-            if stages.iter().all(|stage| stage.max_workspace_bytes == 0) {
-                InvocationWorkspaceSet::None {
-                    stage_graph_fingerprints: vec![
-                        stage_graph_fingerprint(stages).expect("test stages must serialize")
-                    ],
-                }
-            } else {
-                InvocationWorkspaceSet::Bounded {
-                    profiles: vec![InvocationWorkspaceProfile {
-                        stage_graph_fingerprint: stage_graph_fingerprint(stages)
-                            .expect("test stages must serialize"),
-                        stages: stages
-                            .iter()
-                            .map(|stage| InvocationStageWorkspace {
-                                stage: stage.id,
-                                domains: (stage.max_workspace_bytes > 0)
-                                    .then(|| InvocationWorkspaceDomain {
-                                        state: StateDomainSpec::StaticTensor(
-                                            super::contract::StaticTensorDomainSpec {
-                                                header: super::contract::StateDomainHeader {
-                                                    id: super::contract::StateDomainId::new(
-                                                        stage.id.get(),
-                                                    ),
-                                                    scope: StateScope::Invocation,
-                                                    clock:
-                                                        super::contract::StateClock::DecoderTokens,
-                                                    placement: PlacementPolicy::BackendLocal,
-                                                    prefix: super::contract::PrefixPolicy::Disabled,
-                                                    checkpoint:
-                                                        super::contract::CheckpointPolicy::None,
-                                                },
-                                                components:
-                                                    vec![super::contract::TensorComponentSpec {
-                                            id: super::contract::StateComponentId::new(1),
-                                            role: super::contract::TensorRole::Control,
-                                            shape: super::contract::BoundedShape {
-                                                dimensions: vec![super::contract::ShapeDimension {
-                                                    axis: super::contract::ShapeAxis::Hidden,
-                                                    extent: super::contract::ShapeExtent::Fixed {
-                                                        value: 1,
-                                                    },
-                                                }],
-                                            },
-                                            accepted_dtypes: vec![super::contract::StateDType::I8],
-                                        }],
-                                            },
-                                        ),
-                                        placement: PlacementPolicy::BackendLocal,
-                                        formula: WorkspaceFormula {
-                                            fixed_bytes: stage.max_workspace_bytes,
-                                            dimensions: vec![],
-                                            terms: vec![],
-                                        },
-                                    })
-                                    .into_iter()
-                                    .collect(),
-                            })
-                            .collect(),
-                    }],
-                }
-            };
-        Self {
-            abi: CURRENT_INFERENCE_STATE_ABI,
-            retained: RetainedStateCapability::Managed { contract },
-            invocation,
-        }
+        Self::managed_for_stage_graphs(contract, &[stages]).expect("valid managed test descriptor")
     }
 
     #[cfg(test)]

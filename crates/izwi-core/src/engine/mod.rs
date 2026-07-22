@@ -38,6 +38,7 @@ mod scheduler;
 pub mod signal_frontend;
 mod types;
 
+pub(crate) use cache::managed::ManagedKvModelRuntime;
 pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
     ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
@@ -1331,11 +1332,11 @@ impl Engine {
 
     /// Admit and allocate managed physical state before the model generation
     /// becomes Ready.
-    pub async fn load_managed_model_cache(
+    pub(crate) async fn load_managed_model_cache(
         &self,
         model_instance: ModelInstanceId,
         capability: &crate::kv::CacheCapability,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let _step = self.step_gate.lock().await;
         self.core
             .write()
