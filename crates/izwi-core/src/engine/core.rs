@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::cache::managed::ManagedKvCacheManager;
+use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
 #[cfg(test)]
 use super::execution::CacheMode;
@@ -283,6 +284,8 @@ pub struct EngineCore {
     scheduler: Scheduler,
     /// Physical managed-cache arenas and transactional block tables.
     managed_kv_cache: ManagedKvCacheManager,
+    /// Lifecycle owner for invocation-scoped physical state arenas.
+    physical_state: PhysicalStateManager,
     /// Model executor
     executor: UnifiedExecutor,
     /// Output processor
@@ -1446,16 +1449,22 @@ impl EngineCore {
             .flatten()
             .map(|salt| Sha256::digest(salt.as_bytes()).into());
 
-        let managed_kv_cache = match managed_worker {
-            Some((backend, device)) => ManagedKvCacheManager::for_worker_with_prefix_cache_salt(
-                managed_resource_authority,
-                managed_prefix_salt,
-                backend,
-                device,
+        let (managed_kv_cache, physical_state) = match managed_worker {
+            Some((backend, device)) => (
+                ManagedKvCacheManager::for_worker_with_prefix_cache_salt(
+                    managed_resource_authority.clone(),
+                    managed_prefix_salt,
+                    backend,
+                    device.clone(),
+                ),
+                PhysicalStateManager::for_worker(managed_resource_authority, backend, device),
             ),
-            None => ManagedKvCacheManager::with_prefix_cache_salt(
-                managed_resource_authority,
-                managed_prefix_salt,
+            None => (
+                ManagedKvCacheManager::with_prefix_cache_salt(
+                    managed_resource_authority.clone(),
+                    managed_prefix_salt,
+                ),
+                PhysicalStateManager::cpu(managed_resource_authority),
             ),
         };
 
@@ -1463,6 +1472,7 @@ impl EngineCore {
             config,
             scheduler,
             managed_kv_cache,
+            physical_state,
             executor,
             output_processor,
             requests: HashMap::new(),
@@ -2705,6 +2715,28 @@ impl EngineCore {
         Ok(Some(runtime))
     }
 
+    pub(crate) fn load_invocation_paged_workspace(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        stage_graph: [u8; 32],
+        stage: super::StageId,
+        plan: &crate::kv::v2::ResolvedStatePlan,
+        domain: &crate::kv::v2::InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<super::InvocationPagedKvPoolHandle> {
+        self.physical_state.allocate_invocation_paged(
+            model_instance,
+            InvocationPhysicalKey {
+                stage_graph,
+                stage,
+                domain: domain.id(),
+            },
+            plan,
+            domain,
+            slot_count,
+        )
+    }
+
     /// Retire physical managed-KV state for one exact loaded-model instance.
     /// Variant-only purge is insufficient because an unload/reload may publish
     /// a different generation of the same variant.
@@ -2712,7 +2744,9 @@ impl EngineCore {
         &mut self,
         model_instance: super::ModelInstanceId,
     ) -> Result<bool> {
-        self.managed_kv_cache.unload_model(model_instance)
+        let invocation = self.physical_state.unload_model(model_instance)?;
+        let retained = self.managed_kv_cache.unload_model(model_instance)?;
+        Ok(invocation || retained)
     }
 
     /// Abort every request tracked by the core and release executor state.

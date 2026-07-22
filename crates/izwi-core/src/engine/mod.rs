@@ -1392,6 +1392,26 @@ impl Engine {
             .load_managed_model_cache(model_instance, capability)
     }
 
+    pub(crate) async fn load_invocation_paged_workspace(
+        &self,
+        model_instance: ModelInstanceId,
+        stage_graph: [u8; 32],
+        stage: StageId,
+        plan: &crate::kv::v2::ResolvedStatePlan,
+        domain: &crate::kv::v2::InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<InvocationPagedKvPoolHandle> {
+        let _step = self.step_gate.lock().await;
+        self.core.write().await.load_invocation_paged_workspace(
+            model_instance,
+            stage_graph,
+            stage,
+            plan,
+            domain,
+            slot_count,
+        )
+    }
+
     /// Retire the managed KV arenas for one exact loaded-model generation.
     pub async fn unload_managed_model_cache(
         &self,

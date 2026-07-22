@@ -1041,7 +1041,7 @@ fn add_coordinator_stats(
         .saturating_add(arena.active_transactions);
 }
 
-fn managed_backend_runtime(
+pub(super) fn managed_backend_runtime(
     backend: BackendKind,
     device: &Device,
 ) -> (Option<Arc<dyn KvBackendRuntime>>, Option<String>) {
@@ -1108,7 +1108,7 @@ fn managed_backend_runtime(
     }
 }
 
-fn managed_device_ordinal(device: &Device) -> Option<u32> {
+pub(super) fn managed_device_ordinal(device: &Device) -> Option<u32> {
     match device.location() {
         DeviceLocation::Cpu => None,
         DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
