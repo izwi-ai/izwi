@@ -2220,14 +2220,14 @@ impl NativeChatModel {
         capture_prefix_max_bytes: Option<u64>,
     ) -> Result<NativeChatDecodeState> {
         match self {
-            Self::Qwen3(model) => {
+            Self::Qwen3(_) => {
                 if prepared_qwen35.is_some() || prefix.is_some() {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared prompt was routed to a Qwen3 model".to_string(),
                     ));
                 }
-                Ok(NativeChatDecodeState::Qwen3(
-                    model.start_decode(messages, max_new_tokens)?,
+                Err(Error::InvalidInput(
+                    "incremental Qwen3 chat requires scheduler-owned physical state".to_string(),
                 ))
             }
             Self::Qwen35(model) => {

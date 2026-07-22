@@ -352,7 +352,7 @@ impl ModelLifecycleController {
                     .await?;
                 let publication = match &loaded_cache.capability {
                     crate::kv::CacheCapability::Managed(contract) => {
-                        LoadedStatePublication::ManagedV2 {
+                        Some(LoadedStatePublication::ManagedV2 {
                             contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
                             physical: physical.ok_or_else(|| {
                                 Error::ModelLoadError(
@@ -360,11 +360,16 @@ impl ModelLifecycleController {
                                         .to_string(),
                                 )
                             })?,
-                        }
+                        })
                     }
-                    _ => LoadedStatePublication::LegacyV1(loaded_cache),
+                    crate::kv::CacheCapability::None => None,
+                    crate::kv::CacheCapability::OpaqueModelOwned => {
+                        Some(LoadedStatePublication::LegacyV1(loaded_cache))
+                    }
                 };
-                state_publications.insert(CapabilityKind::Chat, publication);
+                if let Some(publication) = publication {
+                    state_publications.insert(CapabilityKind::Chat, publication);
+                }
             }
             if self
                 .adapter_registry
