@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::tts::{
-    BatchedSpeakerRequest, SpeakerReference, TtsGenerationParams, TtsStreamingConfig,
+    BatchedSpeakerRequest, SpeakerReference, TalkerPhysicalCache, TtsGenerationParams,
+    TtsStreamingConfig,
 };
 use crate::runtime::audio_io::decode_reference_audio_base64;
 
@@ -181,28 +182,7 @@ impl NativeExecutor {
     }
 
     pub(super) fn to_tts_params(request: &EngineCoreRequest) -> TtsGenerationParams {
-        let model_max_frames = request
-            .model_variant
-            .and_then(|variant| variant.tts_max_output_frames_hint())
-            .unwrap_or(crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
-        TtsGenerationParams {
-            temperature: request.params.temperature.max(0.0),
-            top_p: request.params.top_p.clamp(0.0, 1.0),
-            top_k: if request.params.top_k == 0 {
-                50
-            } else {
-                request.params.top_k
-            },
-            repetition_penalty: request.params.repetition_penalty.max(1.0),
-            max_frames: if request.params.max_tokens == 0 {
-                model_max_frames
-            } else {
-                request
-                    .params
-                    .max_tokens
-                    .clamp(16, model_max_frames.max(16))
-            },
-        }
+        request.qwen_tts_generation_params()
     }
 
     pub(super) fn reference_from_request(
@@ -246,6 +226,33 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
+        self.qwen_tts_request_with_managed_cache(request, scheduled, None)
+    }
+
+    pub(super) fn qwen_tts_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut talker_cache: Option<TalkerPhysicalCache>,
+    ) -> Result<ModelSessionResult> {
+        if request.managed_cache_runtime().is_some() != talker_cache.is_some() {
+            return Err(Error::InferenceError(
+                "physical Qwen TTS execution requires its exact talker reservation".to_string(),
+            ));
+        }
+        if talker_cache.is_none() {
+            return Err(Error::InferenceError(
+                "Qwen TTS no longer supports model-owned decode caches".to_string(),
+            ));
+        }
+        if scheduled.is_prefill
+            && (scheduled.num_computed_tokens != 0
+                || scheduled.num_tokens != request.num_prompt_tokens())
+        {
+            return Err(Error::InvalidInput(
+                "physical Qwen TTS requires one exact full-prompt prefill quantum".to_string(),
+            ));
+        }
         let execution_started = Instant::now();
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
@@ -269,6 +276,15 @@ impl NativeExecutor {
             {
                 active_state = None;
             }
+            if let Some(state) = active_state.as_mut() {
+                state.state.install_retained_talker_reservation(
+                    talker_cache.take().ok_or_else(|| {
+                        Error::InferenceError(
+                            "active Qwen TTS state lost its talker reservation".to_string(),
+                        )
+                    })?,
+                )?;
+            }
             let (model, new_model_lease) = if let Some(state) = active_state.as_ref() {
                 (state.model.clone(), None)
             } else {
@@ -291,14 +307,7 @@ impl NativeExecutor {
                     .text
                     .as_deref()
                     .ok_or_else(|| Error::InvalidInput("TTS request missing text".to_string()))?;
-                let available_speakers = model.available_speakers();
-                let requested_speaker = request
-                    .params
-                    .speaker
-                    .as_deref()
-                    .or(request.params.voice.as_deref())
-                    .filter(|s| !s.trim().is_empty());
-                let reference = Self::reference_from_request(request)?;
+                let prepared = request.prepared_qwen_tts_input_for_executor()?;
                 let stream_config = if stream_tx.is_some() {
                     TtsStreamingConfig::default()
                 } else {
@@ -306,41 +315,54 @@ impl NativeExecutor {
                 };
                 let normalization_ms = normalization_started.elapsed().as_secs_f64() * 1000.0;
                 let prefill_started = Instant::now();
+                let cache = talker_cache.take().ok_or_else(|| {
+                    Error::InferenceError(
+                        "Qwen TTS prefill lost its retained talker reservation".to_string(),
+                    )
+                })?;
 
-                let decode_state = if let Some(reference) = reference {
+                let decode_state = if let Some(reference) = prepared.reference.as_deref() {
                     Self::run_blocking(|| {
-                        model.start_decode_with_voice_clone_params(
+                        model.start_physical_decode_with_voice_clone_params(
                             text,
-                            &reference,
+                            reference,
                             language,
                             &params,
                             stream_config,
+                            cache,
                         )
                     })?
-                } else if available_speakers.is_empty() {
+                } else if let Some(speaker) = prepared.speaker.as_deref() {
                     Self::run_blocking(|| {
-                        model.start_decode_with_text_params(
+                        model.start_physical_decode_with_speaker_params(
                             text,
+                            speaker,
                             language,
                             request.voice_description.as_deref(),
                             &params,
                             stream_config,
+                            cache,
                         )
                     })?
                 } else {
-                    let speaker_to_use =
-                        requested_speaker.unwrap_or_else(|| available_speakers[0].as_str());
                     Self::run_blocking(|| {
-                        model.start_decode_with_speaker_params(
+                        model.start_physical_decode_with_text_params(
                             text,
-                            speaker_to_use,
                             language,
                             request.voice_description.as_deref(),
                             &params,
                             stream_config,
+                            cache,
                         )
                     })?
                 };
+                if decode_state.talker_context_len() != prepared.prefill_tokens {
+                    return Err(Error::InferenceError(format!(
+                        "Qwen TTS runtime prefill produced {} tokens, but admission authorized {}",
+                        decode_state.talker_context_len(),
+                        prepared.prefill_tokens
+                    )));
+                }
 
                 ActiveQwenTtsDecode {
                     variant,
@@ -363,7 +385,7 @@ impl NativeExecutor {
             };
 
             let decode_iterations = if scheduled.is_prefill {
-                1
+                0
             } else {
                 scheduled.num_tokens.max(1)
             };
@@ -377,9 +399,13 @@ impl NativeExecutor {
                         request.id.clone(),
                     )));
                 }
+                let mut predictor = super::invocation_paged_lease_for_row(request, scheduled)?;
                 let step = Self::run_blocking(|| {
-                    active_state.model.tts_decode_step(&mut active_state.state)
+                    active_state
+                        .model
+                        .tts_decode_step_physical(&mut active_state.state, predictor.cache_mut())
                 })?;
+                let _predictor_completion = predictor.release()?;
                 if request.is_cancelled() {
                     return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                         request.id.clone(),
@@ -458,6 +484,7 @@ impl NativeExecutor {
                 ..ExecutorPhaseTiming::default()
             });
 
+            let managed_cache_completions = active_state.state.take_managed_write_completions();
             if !finished {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
                     Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
@@ -476,7 +503,8 @@ impl NativeExecutor {
                 phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
-            }))
+            })
+            .with_managed_cache_completions(managed_cache_completions))
         }
     }
 }

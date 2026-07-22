@@ -949,7 +949,49 @@ impl Engine {
                 let model = registry.get_qwen_tts_lease(variant).await.ok_or_else(|| {
                     Error::ModelNotFound(format!("Qwen TTS model {variant} is not loaded"))
                 })?;
-                request.install_qwen_tts_execution_model(variant, model)?;
+                let reference = if request.has_tts_reference_for_execution() {
+                    let encoded = request
+                        .tts_reference_audio_for_execution()
+                        .ok_or_else(|| {
+                            Error::InvalidInput(
+                                "reference_audio and reference_text must both be provided"
+                                    .to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let text = request
+                        .tts_reference_text_for_execution()
+                        .filter(|text| !text.trim().is_empty())
+                        .ok_or_else(|| {
+                            Error::InvalidInput("reference_text cannot be empty".to_string())
+                        })?
+                        .to_string();
+                    let request_id = request.id.clone();
+                    let (audio_samples, sample_rate) = tokio::task::spawn_blocking(move || {
+                        crate::runtime::audio_io::decode_reference_audio_base64(&encoded)
+                    })
+                    .await
+                    .map_err(|error| {
+                        Error::InferenceError(format!(
+                            "Qwen TTS request {request_id} reference worker failed: {error}"
+                        ))
+                    })??;
+                    Some(Arc::new(
+                        crate::models::architectures::qwen3::tts::SpeakerReference {
+                            audio_samples,
+                            text,
+                            sample_rate,
+                        },
+                    ))
+                } else {
+                    None
+                };
+                request.install_qwen_tts_execution_model(
+                    variant,
+                    model,
+                    reference,
+                    self.config.max_seq_len,
+                )?;
             }
             TaskType::ASR | TaskType::TTS | TaskType::Chat | TaskType::SpeechToSpeech => {}
         }
@@ -1395,6 +1437,7 @@ impl Engine {
     pub(crate) async fn load_invocation_paged_workspace(
         &self,
         model_instance: ModelInstanceId,
+        adapter_instance: AdapterInstanceId,
         stage_graph: [u8; 32],
         stage: StageId,
         plan: &crate::kv::v2::ResolvedStatePlan,
@@ -1404,12 +1447,38 @@ impl Engine {
         let _step = self.step_gate.lock().await;
         self.core.write().await.load_invocation_paged_workspace(
             model_instance,
+            adapter_instance,
             stage_graph,
             stage,
             plan,
             domain,
             slot_count,
         )
+    }
+
+    pub(crate) async fn resolve_and_load_invocation_paged_workspace(
+        &self,
+        model_instance: ModelInstanceId,
+        adapter_instance: AdapterInstanceId,
+        stage_graph: [u8; 32],
+        stage: StageId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        domain: &crate::kv::v2::InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<InvocationPagedKvPoolHandle> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .resolve_and_load_invocation_paged_workspace(
+                model_instance,
+                adapter_instance,
+                stage_graph,
+                stage,
+                contract,
+                domain,
+                slot_count,
+            )
     }
 
     /// Retire the managed KV arenas for one exact loaded-model generation.

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use candle_core::{DType, Device, DeviceLocation};
 
 use crate::backends::kv::{KvArenaConfig, KvBackendRuntime, KvLayerConfig};
+use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -17,12 +18,13 @@ use crate::kv::{KvArenaId, KvGroupId, KvLayerBinding};
 use super::invocation::{InvocationPagedKvPoolHandle, InvocationPagedKvPoolOwner};
 use super::managed::{managed_backend_runtime, managed_device_ordinal};
 use crate::engine::{
-    ModelInstanceId, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
-    ResourceLease, ResourceVector, StageId,
+    AdapterInstanceId, ModelInstanceId, ReservationClass, ReservationOwner, ResourceAmount,
+    ResourceAuthority, ResourceLease, ResourceVector, StageId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct InvocationPhysicalKey {
+    pub(crate) adapter_instance: AdapterInstanceId,
     pub(crate) stage_graph: [u8; 32],
     pub(crate) stage: StageId,
     pub(crate) domain: StateDomainId,
@@ -213,6 +215,32 @@ impl PhysicalStateManager {
         Ok(handle)
     }
 
+    pub(crate) fn resolve_and_allocate_invocation_paged(
+        &mut self,
+        model_instance: ModelInstanceId,
+        key: InvocationPhysicalKey,
+        contract: &crate::kv::v2::InferenceStateContract,
+        workspace_domain: &InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<InvocationPagedKvPoolHandle> {
+        let plan = negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: match workspace_domain {
+                    InvocationWorkspaceDomain::State {
+                        state: StateDomainSpec::PagedAttention(domain),
+                        ..
+                    } => Some(domain.page_size.preferred_tokens),
+                    _ => None,
+                },
+                storage_dtype_hint: None,
+            },
+        )?;
+        self.allocate_invocation_paged(model_instance, key, &plan, workspace_domain, slot_count)
+    }
+
     /// Close every pool first so a failed active-lease drain cannot admit new
     /// work. Removal and resource release occur only after all pools fence.
     pub(crate) fn unload_model(&mut self, model_instance: ModelInstanceId) -> Result<bool> {
@@ -247,7 +275,8 @@ impl PhysicalStateManager {
 }
 
 fn validate_key(key: InvocationPhysicalKey) -> Result<()> {
-    if key.stage_graph.iter().all(|byte| *byte == 0)
+    if key.adapter_instance.get() == 0
+        || key.stage_graph.iter().all(|byte| *byte == 0)
         || key.stage.get() == 0
         || key.domain.get() == 0
     {
@@ -332,8 +361,9 @@ fn reserve_arena(
     let owner = ReservationOwner::new(
         ReservationClass::Model,
         format!(
-            "invocation-state:{}:{}:{}:{backend:?}",
+            "invocation-state:{}:{}:{}:{}:{backend:?}",
             model_instance.get(),
+            key.adapter_instance.get(),
             key.stage.get(),
             key.domain.get()
         ),
@@ -397,6 +427,7 @@ mod tests {
 
     fn key() -> InvocationPhysicalKey {
         InvocationPhysicalKey {
+            adapter_instance: AdapterInstanceId::new(3),
             stage_graph: [7; 32],
             stage: StageId::new(2),
             domain: StateDomainId::new(1),

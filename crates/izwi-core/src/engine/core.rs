@@ -2718,6 +2718,7 @@ impl EngineCore {
     pub(crate) fn load_invocation_paged_workspace(
         &mut self,
         model_instance: super::ModelInstanceId,
+        adapter_instance: super::AdapterInstanceId,
         stage_graph: [u8; 32],
         stage: super::StageId,
         plan: &crate::kv::v2::ResolvedStatePlan,
@@ -2727,11 +2728,36 @@ impl EngineCore {
         self.physical_state.allocate_invocation_paged(
             model_instance,
             InvocationPhysicalKey {
+                adapter_instance,
                 stage_graph,
                 stage,
                 domain: domain.id(),
             },
             plan,
+            domain,
+            slot_count,
+        )
+    }
+
+    pub(crate) fn resolve_and_load_invocation_paged_workspace(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        adapter_instance: super::AdapterInstanceId,
+        stage_graph: [u8; 32],
+        stage: super::StageId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        domain: &crate::kv::v2::InvocationWorkspaceDomain,
+        slot_count: u32,
+    ) -> Result<super::InvocationPagedKvPoolHandle> {
+        self.physical_state.resolve_and_allocate_invocation_paged(
+            model_instance,
+            InvocationPhysicalKey {
+                adapter_instance,
+                stage_graph,
+                stage,
+                domain: domain.id(),
+            },
+            contract,
             domain,
             slot_count,
         )

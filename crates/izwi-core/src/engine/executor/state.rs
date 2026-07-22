@@ -3,8 +3,7 @@ use std::time::Instant;
 
 use super::prefix_cache::ExactPrefixHandle;
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::architectures::qwen3::tts::TtsDecodeState as QwenTtsDecodeState;
+use crate::models::architectures::qwen3::tts::{PhysicalTtsDecodeState, Qwen3TtsModel};
 use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{
     AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
@@ -37,7 +36,7 @@ pub(super) struct ActiveQwenTtsDecode {
     pub(super) variant: Option<ModelVariant>,
     pub(super) model: Arc<Qwen3TtsModel>,
     pub(super) _model_lease: Option<QwenTtsModelLease>,
-    pub(super) state: QwenTtsDecodeState,
+    pub(super) state: PhysicalTtsDecodeState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) audio_samples_accum: Vec<f32>,

@@ -136,8 +136,18 @@ impl NativeExecutor {
                         super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
                     self.transcribe_request_with_managed_cache(request, scheduled_req, Some(cache))
                 }
+                Some(reservation)
+                    if request.task_type == TaskType::TTS
+                        && request.model_variant.is_some_and(|variant| {
+                            variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+                        }) =>
+                {
+                    let cache =
+                        super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
+                    self.qwen_tts_request_with_managed_cache(request, scheduled_req, Some(cache))
+                }
                 Some(_) => Err(Error::InferenceError(
-                    "managed Qwen3 cache was routed to an unsupported executor".to_string(),
+                    "managed paged cache was routed to an unsupported executor".to_string(),
                 )),
                 None => (route.handler)(self, request, scheduled_req),
             }));
@@ -426,6 +436,11 @@ impl NativeExecutor {
                 };
                 if result.output.error.is_none()
                     && result.provenance.dispatch_state == super::DispatchState::ProducedOutput
+                    && matches!(
+                        result.disposition,
+                        super::ExecutionDisposition::Progress
+                            | super::ExecutionDisposition::Yielded(_)
+                    )
                 {
                     if let Some(reservation) = rows
                         .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
@@ -670,19 +685,23 @@ mod tests {
         let mut collector =
             KvWriteCompletionCollector::new(&arena_config, slots.logical_slots()).unwrap();
         collector.collect(completion).unwrap();
-        let output = ModelSessionResult::atomic(ExecutorOutput {
-            request_id: request.id.clone(),
-            audio: None,
-            text: Some("done".to_string()),
-            input_transcription: None,
-            tokens_processed: 1,
-            tokens_generated: 0,
-            finished: true,
-            phase_timing_override: None,
-            asr_diagnostics: None,
-            error: None,
-        })
-        .with_managed_cache_completions(vec![Arc::new(collector.seal().unwrap())]);
+        let completion = Arc::new(collector.seal().unwrap());
+        let output = ModelSessionResult::yielded(
+            ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: None,
+                text: Some("done".to_string()),
+                input_transcription: None,
+                tokens_processed: 1,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+            },
+            crate::engine::YieldReason::QuantumExhausted,
+        )
+        .with_managed_cache_completions(vec![completion.clone()]);
 
         let result = executor
             .finish_scheduled_execution(
@@ -699,6 +718,30 @@ mod tests {
             .expect("successful managed row must acknowledge writes");
         assert_eq!(receipt.reservation, reservation);
         assert_eq!(receipt.domains[0].written_blocks, vec![block]);
+
+        let terminal = ModelSessionResult::atomic(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: None,
+            text: Some("done".to_string()),
+            input_transcription: None,
+            tokens_processed: 0,
+            tokens_generated: 0,
+            finished: true,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+        })
+        .with_managed_cache_completions(vec![completion]);
+        let terminal = executor
+            .finish_scheduled_execution(
+                &[&request],
+                std::slice::from_ref(&scheduled),
+                vec![terminal],
+                BatchDispatch::serial(),
+                Some(&rows),
+            )
+            .unwrap();
+        assert!(terminal[0].managed_cache.is_none());
     }
 
     #[test]

@@ -311,6 +311,66 @@ fn physical_paged_cache_for_row(
     )
 }
 
+/// Lease the one paged invocation domain authored for this exact scheduled
+/// stage. Models receive only the physical cache view and cannot select a pool
+/// by convention or by model-family-specific IDs.
+fn invocation_paged_lease_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<super::InvocationPagedKvLease> {
+    let binding = request.execution_adapter_binding().ok_or_else(|| {
+        Error::InferenceError("physical invocation row has no loaded adapter binding".to_string())
+    })?;
+    let stage = binding.stage_for_work(&scheduled.work)?;
+    let graph = crate::kv::v2::stage_graph_fingerprint(&binding.stages)?;
+    let descriptor = request.v2_state_descriptor().ok_or_else(|| {
+        Error::InferenceError("physical invocation row has no state descriptor".to_string())
+    })?;
+    let crate::kv::v2::InvocationWorkspaceSet::Bounded { profiles } = &descriptor.invocation else {
+        return Err(Error::InferenceError(
+            "physical invocation row has no bounded workspace profile".to_string(),
+        ));
+    };
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.stage_graph_fingerprint == graph)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "physical invocation row has no workspace for its adapter graph".to_string(),
+            )
+        })?;
+    let workspace = profile
+        .stages
+        .iter()
+        .find(|workspace| workspace.stage == stage.id)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "physical invocation row has no workspace for its scheduled stage".to_string(),
+            )
+        })?;
+    let mut paged = workspace.domains.iter().filter_map(|domain| match domain {
+        crate::kv::v2::InvocationWorkspaceDomain::State {
+            state: crate::kv::v2::StateDomainSpec::PagedAttention(state),
+            ..
+        } => Some(state.header.id),
+        _ => None,
+    });
+    let domain = paged.next().ok_or_else(|| {
+        Error::InferenceError("physical invocation stage has no paged workspace domain".to_string())
+    })?;
+    if paged.next().is_some() {
+        return Err(Error::InferenceError(
+            "physical invocation stage has multiple paged workspace domains".to_string(),
+        ));
+    }
+    request
+        .v2_state_runtime()
+        .ok_or_else(|| {
+            Error::InferenceError("physical invocation row has no sealed runtime".to_string())
+        })?
+        .lease_invocation_paged(stage.id, domain)
+}
+
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
         return (*msg).to_string();

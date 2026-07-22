@@ -884,7 +884,8 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
             NativeBatchMode::None,
         );
         decode.selector = StageWorkSelector::SequenceDecode;
-        decode.max_workspace_bytes = STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES;
+        decode.max_workspace_bytes =
+            crate::models::architectures::qwen3::tts::QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES;
         decode.output_visibility = prefill.output_visibility;
         prefill.validate()?;
         decode.validate()?;
@@ -2444,7 +2445,7 @@ mod tests {
         );
         assert_eq!(
             physical.stages[1].max_workspace_bytes,
-            STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES
+            crate::models::architectures::qwen3::tts::QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES
         );
 
         let streaming = bundle.contract(CapabilityKind::Tts, true).unwrap();

@@ -12,6 +12,11 @@ use crate::engine::{
     ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
 };
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    stage_graph_fingerprint, InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
+    InvocationPagedWorkspaceRuntimeV2, InvocationWorkspaceDomain, InvocationWorkspaceSet,
+    StateDomainSpec,
+};
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
 use crate::runtime::adapters::{CapabilityKind, LoadedStatePublication};
@@ -394,6 +399,125 @@ impl ModelLifecycleController {
                             },
                         );
                     }
+                }
+            }
+            if variant.family() == crate::catalog::ModelFamily::Qwen3Tts {
+                let model = self
+                    .model_registry
+                    .get_qwen_tts(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded Qwen3 TTS model {variant} is missing from the registry"
+                        ))
+                    })?;
+                for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
+                    if self.adapter_registry.require(capability, variant).is_err() {
+                        continue;
+                    }
+                    let contracts = bundle_draft.execution_contracts(capability)?;
+                    let stage_graphs = contracts
+                        .iter()
+                        .map(|contract| contract.stages.as_ref())
+                        .collect::<Vec<_>>();
+                    let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                    let retained_capability = crate::kv::CacheCapability::Managed(
+                        physical_spec.retained_v1.clone(),
+                    );
+                    if !managed_kv_backend_compiled(backend) {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded model {variant} requires physical TTS state, but the {backend:?} build has no direct paged-attention runtime"
+                        )));
+                    }
+                    let retained = self
+                        .core_engine
+                        .load_managed_model_cache(model_instance_id, &retained_capability)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "Qwen3 TTS retained allocation returned no physical runtime"
+                                    .to_string(),
+                            )
+                        })?;
+                    let mut invocation_bindings = Vec::new();
+                    let InvocationWorkspaceSet::Bounded { profiles } =
+                        &physical_spec.descriptor.invocation
+                    else {
+                        return Err(Error::ModelLoadError(
+                            "Qwen3 TTS descriptor omitted predictor invocation state".to_string(),
+                        ));
+                    };
+                    for profile in profiles {
+                        let execution = contracts
+                            .iter()
+                            .find(|contract| {
+                                stage_graph_fingerprint(&contract.stages).ok()
+                                    == Some(profile.stage_graph_fingerprint)
+                            })
+                            .ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "Qwen3 TTS invocation profile lost its adapter graph"
+                                        .to_string(),
+                                )
+                            })?;
+                        for stage in &profile.stages {
+                            let execution_stage = execution
+                                .stages
+                                .iter()
+                                .find(|candidate| candidate.id == stage.stage)
+                                .ok_or_else(|| {
+                                    Error::ModelLoadError(
+                                        "Qwen3 TTS invocation profile lost its execution stage"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let slot_count = stage.slot_count(execution_stage.max_batch_size)?;
+                            for domain in &stage.domains {
+                                if !matches!(
+                                    domain,
+                                    InvocationWorkspaceDomain::State {
+                                        state: StateDomainSpec::PagedAttention(_),
+                                        ..
+                                    }
+                                ) {
+                                    return Err(Error::ModelLoadError(
+                                        "Qwen3 TTS published unsupported invocation backing"
+                                            .to_string(),
+                                    ));
+                                }
+                                let handle = self
+                                    .core_engine
+                                    .resolve_and_load_invocation_paged_workspace(
+                                        model_instance_id,
+                                        execution.adapter_instance_id,
+                                        profile.stage_graph_fingerprint,
+                                        stage.stage,
+                                        &physical_spec.predictor_contract,
+                                        domain,
+                                        slot_count,
+                                    )
+                                    .await?;
+                                invocation_bindings.push(InvocationPagedWorkspaceBindingV2 {
+                                    key: InvocationPagedWorkspaceKeyV2 {
+                                        stage_graph: profile.stage_graph_fingerprint,
+                                        stage: stage.stage,
+                                        domain: domain.id(),
+                                    },
+                                    pool: handle,
+                                });
+                            }
+                        }
+                    }
+                    state_publications.insert(
+                        capability,
+                        LoadedStatePublication::PhysicalV2 {
+                            descriptor: physical_spec.descriptor,
+                            retained: Some(retained),
+                            invocation_paged: InvocationPagedWorkspaceRuntimeV2::new(
+                                invocation_bindings,
+                            )?,
+                        },
+                    );
                 }
             }
             self.bind_loaded_model_bundle_draft(

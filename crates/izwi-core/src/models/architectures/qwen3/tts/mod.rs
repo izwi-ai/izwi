@@ -25,12 +25,21 @@ use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
+use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
+    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
+    InvocationWorkspaceSet, PrefixPolicy, RetainedStateCapability, StateDomainSpec, StateScope,
+    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+};
 use crate::kv::{
     CacheCapability, CacheDomainId, CacheTokenAxis, KvCacheContract, KvCacheContractProvider,
     KvDomainSpec, KvPrefixSemantics, PositionSemantics, CURRENT_KV_CONTRACT_ABI,
@@ -46,6 +55,14 @@ const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 const MAX_VOICE_CLONE_REFERENCE_FRAMES: usize = 320;
 const Q4_0_BLOCK_SIZE: u64 = 32;
+pub(crate) const QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) struct Qwen3TtsPhysicalStateSpec {
+    pub(crate) retained_v1: KvCacheContract,
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) predictor_contract: InferenceStateContract,
+}
 
 /// Runtime generation settings for semantic token sampling.
 #[derive(Debug, Clone)]
@@ -222,6 +239,10 @@ impl PhysicalTtsDecodeState {
         Some(accounting.bytes())
     }
 
+    pub fn session_cache_bytes(&self) -> Option<u64> {
+        self.allocated_session_bytes()
+    }
+
     pub fn talker_context_len(&self) -> usize {
         self.talker_cache.context_len()
     }
@@ -232,6 +253,34 @@ impl PhysicalTtsDecodeState {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        self.talker_cache.take_completed_writes()
+    }
+
+    pub(crate) fn install_retained_talker_reservation(
+        &mut self,
+        cache: TalkerPhysicalCache,
+    ) -> Result<()> {
+        if self.talker_cache.arena().id() != cache.arena().id()
+            || self.talker_cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Qwen3-TTS session cannot switch retained talker authority".to_string(),
+            ));
+        }
+        if cache.context_len() != self.offset {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS talker reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.offset
+            )));
+        }
+        self.talker_cache = cache;
+        Ok(())
     }
 
     /// Consume an in-flight or terminal state during cancellation and return
@@ -279,6 +328,16 @@ pub struct TtsSessionCacheRequest<'a> {
     pub language: Option<&'a str>,
     pub instruct: Option<&'a str>,
     pub uses_preset_speaker: bool,
+    pub max_frames: usize,
+}
+
+/// Exact host-derived sequence shape used for scheduler admission.
+///
+/// Computing this layout performs tokenization and audio-length arithmetic but
+/// does not allocate device tensors or execute either decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen3TtsPhysicalSessionLayout {
+    pub prefill_tokens: usize,
     pub max_frames: usize,
 }
 
@@ -376,6 +435,98 @@ impl Qwen3TtsModel {
             self.code_predictor_dtype,
             self.kv_page_size,
         )
+    }
+
+    /// Author the complete retained-talker + invocation-predictor state for
+    /// the exact execution graphs frozen by the loaded adapter draft.
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Qwen3TtsPhysicalStateSpec> {
+        if stage_graphs.is_empty() {
+            return Err(Error::ModelLoadError(
+                "Qwen3 TTS physical state has no execution graph".to_string(),
+            ));
+        }
+        let full = self.managed_kv_cache_contract()?;
+        let mut retained_v1 = KvCacheContract {
+            abi: full.abi,
+            domains: vec![full.domains[0].clone()],
+        };
+        let KvDomainSpec::PagedAttention(talker_v1) = &mut retained_v1.domains[0] else {
+            unreachable!("Qwen3 TTS talker is paged attention")
+        };
+        talker_v1.prefix_semantics = KvPrefixSemantics::Disabled;
+        retained_v1.validate()?;
+        let retained = upgrade_kv_contract_v1(&retained_v1)?;
+
+        let predictor_v1 = KvCacheContract {
+            abi: full.abi,
+            domains: vec![full.domains[1].clone()],
+        };
+        predictor_v1.validate()?;
+        let mut predictor_contract = upgrade_kv_contract_v1(&predictor_v1)?;
+        let StateDomainSpec::PagedAttention(predictor) = &mut predictor_contract.domains[0] else {
+            unreachable!("Qwen3 TTS predictor is paged attention")
+        };
+        predictor.header.scope = StateScope::Invocation;
+        predictor.header.prefix = PrefixPolicy::Disabled;
+        predictor.header.checkpoint = CheckpointPolicy::None;
+        predictor_contract.groups[0].prefix_shareable = false;
+        predictor_contract.validate()?;
+        let predictor_domain = predictor_contract.domains[0].clone();
+        let predictor_group = predictor_contract.groups[0].clone();
+
+        let mut profiles = Vec::with_capacity(stage_graphs.len());
+        for stages in stage_graphs {
+            let mut invocation_stages = stages
+                .iter()
+                .map(|stage| {
+                    let decode = stage.selector == StageWorkSelector::SequenceDecode;
+                    InvocationStageWorkspace {
+                        stage: stage.id,
+                        lease_scope: InvocationLeaseScope::PerRow,
+                        groups: decode
+                            .then(|| predictor_group.clone())
+                            .into_iter()
+                            .collect(),
+                        domains: decode
+                            .then(|| InvocationWorkspaceDomain::State {
+                                state: predictor_domain.clone(),
+                                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
+                                placement: predictor_domain.header().placement,
+                                formula: WorkspaceFormula {
+                                    fixed_bytes: QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES,
+                                    dimensions: vec![],
+                                    terms: vec![],
+                                },
+                            })
+                            .into_iter()
+                            .collect(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            invocation_stages.sort_unstable_by_key(|stage| stage.stage);
+            profiles.push(InvocationWorkspaceProfile {
+                stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+                stages: invocation_stages,
+            });
+        }
+        profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+        profiles.dedup();
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Managed { contract: retained },
+            invocation: InvocationWorkspaceSet::Bounded { profiles },
+        };
+        for stages in stage_graphs {
+            descriptor.validate_against_stages(stages)?;
+        }
+        Ok(Qwen3TtsPhysicalStateSpec {
+            retained_v1,
+            descriptor,
+            predictor_contract,
+        })
     }
 }
 
@@ -912,9 +1063,38 @@ impl Qwen3TtsModel {
         &self,
         request: TtsSessionCacheRequest<'_>,
     ) -> Result<u64> {
+        let layout = self.session_cache_layout(request)?;
+        qwen3_tts_session_cache_upper_bound_bytes(
+            &self.config,
+            layout,
+            self.kv_page_size,
+            self.kv_quantization,
+            self.dtype.size_in_bytes(),
+            self.code_predictor_dtype.size_in_bytes(),
+        )
+        .ok_or_else(|| Error::Overloaded("Qwen3-TTS session cache bound overflow".to_string()))
+    }
+
+    /// Resolve the exact talker prefill and bounded output shape before the
+    /// scheduler allocates retained physical pages.
+    pub fn physical_session_layout(
+        &self,
+        request: TtsSessionCacheRequest<'_>,
+    ) -> Result<Qwen3TtsPhysicalSessionLayout> {
+        let layout = self.session_cache_layout(request)?;
+        Ok(Qwen3TtsPhysicalSessionLayout {
+            prefill_tokens: layout.prefill_tokens,
+            max_frames: layout.max_frames,
+        })
+    }
+
+    fn session_cache_layout(
+        &self,
+        request: TtsSessionCacheRequest<'_>,
+    ) -> Result<TtsSessionCacheLayout> {
         let prompt_ids = self.encode_assistant_prompt_ids(request.text)?;
         let has_language = self.resolve_language_id(request.language).is_some();
-        let layout = if let Some(reference) = request.reference {
+        if let Some(reference) = request.reference {
             let reference_prompt_ids = self.encode_reference_prompt_ids(reference.text.as_str())?;
             let reference_frames = self
                 .speech_tokenizer
@@ -927,7 +1107,7 @@ impl Qwen3TtsModel {
                 reference_frames,
                 has_language,
                 request.max_frames,
-            )?
+            )
         } else {
             let instruct_tokens = self
                 .encode_instruction_ids(request.instruct)?
@@ -939,17 +1119,8 @@ impl Qwen3TtsModel {
                 request.uses_preset_speaker,
                 instruct_tokens,
                 request.max_frames,
-            )?
-        };
-        qwen3_tts_session_cache_upper_bound_bytes(
-            &self.config,
-            layout,
-            self.kv_page_size,
-            self.kv_quantization,
-            self.dtype.size_in_bytes(),
-            self.code_predictor_dtype.size_in_bytes(),
-        )
-        .ok_or_else(|| Error::Overloaded("Qwen3-TTS session cache bound overflow".to_string()))
+            )
+        }
     }
 
     /// Exact token capacity for each fresh per-frame predictor workspace.
@@ -1470,6 +1641,18 @@ impl Qwen3TtsModel {
             return Err(Error::ModelError(
                 "Voice cloning reference encoder produced no conditioning tokens".to_string(),
             ));
+        }
+        let authorized_reference_frames = self
+            .speech_tokenizer
+            .reference_frame_upper_bound(reference.audio_samples.len(), reference.sample_rate)?
+            .min(MAX_VOICE_CLONE_REFERENCE_FRAMES);
+        let encoded_reference_frames = ref_codec_tokens[0]
+            .len()
+            .min(MAX_VOICE_CLONE_REFERENCE_FRAMES);
+        if encoded_reference_frames != authorized_reference_frames {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS reference encoder produced {encoded_reference_frames} frames, but host admission authorized {authorized_reference_frames}"
+            )));
         }
 
         let prompt_ids = self.encode_assistant_prompt_ids(text)?;
@@ -2711,9 +2894,7 @@ impl Qwen3TtsModel {
 
         let prefill_len = prefill_embeds.dim(1)?;
         let max_frames = params.max_frames.max(1);
-        let required_tokens = prefill_len
-            .checked_add(max_frames)
-            .ok_or_else(|| Error::InvalidInput("Qwen3-TTS physical context overflow".into()))?;
+        let required_tokens = prefill_len;
         if talker_cache.capacity_tokens() < required_tokens {
             return Err(Error::InvalidInput(format!(
                 "Qwen3-TTS physical talker cache holds {} tokens, requires {required_tokens}",

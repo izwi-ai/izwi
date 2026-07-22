@@ -21,7 +21,9 @@ use super::{
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
+use crate::models::architectures::qwen3::tts::{
+    Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
+};
 use crate::models::architectures::qwen35::chat::Qwen35PreparedPrompt;
 use crate::models::registry::{
     AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease,
@@ -243,6 +245,15 @@ impl fmt::Debug for PreparedIncrementalModel {
 pub(super) struct IncrementalModelExecutionReady {
     model_variant: ModelVariant,
     model: PreparedIncrementalModel,
+    qwen_tts: Option<PreparedQwenTtsInput>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedQwenTtsInput {
+    pub(crate) reference: Option<Arc<SpeakerReference>>,
+    pub(crate) speaker: Option<String>,
+    pub(crate) prefill_tokens: usize,
+    pub(crate) max_frames: usize,
 }
 
 /// Exact, host-prepared cost for one loaded adapter stage. Model preparation
@@ -1878,6 +1889,7 @@ impl EngineCoreRequest {
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::Asr(model),
+            qwen_tts: None,
         });
         Ok(())
     }
@@ -1921,6 +1933,8 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         model: QwenTtsModelLease,
+        reference: Option<Arc<SpeakerReference>>,
+        max_sequence_tokens: usize,
     ) -> Result<()> {
         if self.task_type != TaskType::TTS
             || self.model_variant != Some(model_variant)
@@ -1932,66 +1946,95 @@ impl EngineCoreRequest {
             )));
         }
         self.prepared_stage_costs.clear();
-        let static_stage = self.execution_adapter_binding.as_ref().and_then(|binding| {
-            binding
-                .stages
-                .iter()
-                .find(|stage| stage.batch_mode == super::NativeBatchMode::Static)
-                .cloned()
-        });
         let model_arc = model.model_arc();
-        let prepared_static_cost = static_stage
-            .filter(|_| {
-                !self.streaming
-                    && !self.has_tts_reference_for_execution()
-                    && self
-                        .text
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty())
-                    && model_variant
-                        .speech_capabilities()
-                        .is_some_and(|capabilities| capabilities.supports_builtin_voices)
-            })
-            .map(|stage| {
-                let speakers = model_arc.available_speakers();
-                let requested = self
-                    .params
-                    .speaker
-                    .as_deref()
-                    .or(self.params.voice.as_deref())
-                    .filter(|speaker| !speaker.trim().is_empty())
-                    .or_else(|| speakers.first().map(|speaker| speaker.as_str()))
-                    .ok_or_else(|| {
-                        Error::InvalidInput(format!(
-                            "Qwen TTS request {} requires a loaded preset speaker",
-                            self.id
-                        ))
-                    })?;
-                let layout = model_arc.preset_speaker_batch_layout(
-                    self.text.as_deref().unwrap_or_default(),
-                    requested,
-                    self.language.as_deref(),
-                    self.voice_description.as_deref(),
-                )?;
-                let tensor_elements = u64::try_from(layout.prefill_tokens).map_err(|_| {
-                    Error::Overloaded(
-                        "Qwen3-TTS static prefill shape exceeds work accounting".to_string(),
-                    )
+        let text = self
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| Error::InvalidInput("Qwen TTS request is missing text".to_string()))?;
+        let speakers = model_arc.available_speakers();
+        let speaker = if reference.is_some() || speakers.is_empty() {
+            None
+        } else {
+            let requested = self
+                .params
+                .speaker
+                .as_deref()
+                .or(self.params.voice.as_deref())
+                .filter(|speaker| !speaker.trim().is_empty())
+                .unwrap_or_else(|| speakers[0].as_str());
+            let resolved = speakers
+                .iter()
+                .find(|speaker| speaker.eq_ignore_ascii_case(requested))
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "Unknown speaker '{requested}'. Available speakers: {}",
+                        speakers
+                            .iter()
+                            .map(|speaker| speaker.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
                 })?;
-                Ok::<(StageId, WorkCost), Error>((
-                    stage.id,
-                    WorkCost::new(1, tensor_elements, layout.collation_workspace_bytes),
-                ))
-            })
-            .transpose()?;
+            Some((*resolved).clone())
+        };
+        let params = self.qwen_tts_generation_params();
+        let layout = model_arc.physical_session_layout(TtsSessionCacheRequest {
+            text,
+            reference: reference.as_deref(),
+            language: self.language.as_deref(),
+            instruct: self.voice_description.as_deref(),
+            uses_preset_speaker: speaker.is_some(),
+            max_frames: params.max_frames,
+        })?;
+        if layout.prefill_tokens == 0 || layout.prefill_tokens >= max_sequence_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Qwen TTS request {} exact prefill has {} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
+                self.id, layout.prefill_tokens
+            )));
+        }
+        self.params.max_tokens = layout.max_frames;
+        self.prepared_sequence_input_tokens = Some(layout.prefill_tokens);
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
             model: PreparedIncrementalModel::QwenTts(model),
+            qwen_tts: Some(PreparedQwenTtsInput {
+                reference,
+                speaker,
+                prefill_tokens: layout.prefill_tokens,
+                max_frames: layout.max_frames,
+            }),
         });
-        if let Some((stage_id, cost)) = prepared_static_cost {
-            self.install_prepared_stage_cost(stage_id, cost)?;
-        }
         Ok(())
+    }
+
+    pub(crate) fn qwen_tts_generation_params(&self) -> TtsGenerationParams {
+        let model_max_frames = self
+            .model_variant
+            .and_then(|variant| variant.tts_max_output_frames_hint())
+            .unwrap_or(ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+        let prepared_max_frames = self
+            .incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.qwen_tts.as_ref())
+            .map(|prepared| prepared.max_frames);
+        TtsGenerationParams {
+            temperature: self.params.temperature.max(0.0),
+            top_p: self.params.top_p.clamp(0.0, 1.0),
+            top_k: if self.params.top_k == 0 {
+                50
+            } else {
+                self.params.top_k
+            },
+            repetition_penalty: self.params.repetition_penalty.max(1.0),
+            max_frames: if let Some(max_frames) = prepared_max_frames {
+                max_frames
+            } else if self.params.max_tokens == 0 {
+                model_max_frames
+            } else {
+                self.params.max_tokens.clamp(16, model_max_frames.max(16))
+            },
+        }
     }
 
     fn validate_incremental_model_execution_preparation(&self) -> Result<()> {
@@ -2011,10 +2054,13 @@ impl EngineCoreRequest {
             )));
         }
         match (&ready.model, self.task_type) {
-            (PreparedIncrementalModel::Asr(_), TaskType::ASR) => Ok(()),
+            (PreparedIncrementalModel::Asr(_), TaskType::ASR) if ready.qwen_tts.is_none() => Ok(()),
             (PreparedIncrementalModel::QwenTts(_), TaskType::TTS)
                 if ready.model_variant.family() == ModelFamily::Qwen3Tts
-                    && self.prepared_sequence_input_tokens.is_none() =>
+                    && ready.qwen_tts.as_ref().is_some_and(|prepared| {
+                        self.prepared_sequence_input_tokens == Some(prepared.prefill_tokens)
+                            && self.params.max_tokens == prepared.max_frames
+                    }) =>
             {
                 Ok(())
             }
@@ -2071,6 +2117,18 @@ impl EngineCoreRequest {
                 PreparedIncrementalModel::QwenTts(model) => Some(model.clone()),
                 PreparedIncrementalModel::Asr(_) => None,
             }))
+    }
+
+    pub(crate) fn prepared_qwen_tts_input_for_executor(&self) -> Result<&PreparedQwenTtsInput> {
+        self.validate_incremental_model_execution_preparation()?;
+        self.incremental_model_execution_ready
+            .as_ref()
+            .and_then(|ready| ready.qwen_tts.as_ref())
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen TTS request is missing exact host preparation".to_string(),
+                )
+            })
     }
 
     pub(crate) fn chat_generation_config(&self) -> ChatGenerationConfig {

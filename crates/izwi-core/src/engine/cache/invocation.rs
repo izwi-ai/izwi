@@ -17,7 +17,7 @@ use crate::kv::v2::{
     InvocationStateCapacity, InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
     StateDomainId, StateDomainSpec, StateGroupId, StatePhysicalLayout, StatePlanId, StateScope,
 };
-use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding};
+use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding, KvSlotRef};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -493,8 +493,10 @@ impl InvocationPagedKvLease {
             .cache
             .take()
             .ok_or_else(|| invalid("invocation paged workspace lease was already released"))?;
+        let committed_tokens = cache.context_len();
         let writes = cache.take_completed_writes();
-        let validation = validate_completions(self.inner.as_ref(), self.slot, &writes);
+        let validation =
+            validate_completions(self.inner.as_ref(), self.slot, committed_tokens, &writes);
         release_slot(
             self.inner.as_ref(),
             self.slot,
@@ -705,11 +707,32 @@ fn blocks_for_slot(
 fn validate_completions(
     inner: &InvocationPagedKvPoolInner,
     slot: InvocationPagedKvSlotRef,
+    committed_tokens: usize,
     writes: &[Arc<KvWriteBatchCompletion>],
 ) -> Result<()> {
     let blocks = blocks_for_slot(inner, slot)?
         .into_iter()
         .collect::<HashSet<_>>();
+    let page_tokens = usize::try_from(inner.arena.config().page_tokens)
+        .map_err(|_| invalid("invocation page size exceeds usize"))?;
+    let capacity_tokens = blocks
+        .len()
+        .checked_mul(page_tokens)
+        .ok_or_else(|| invalid("invocation paged workspace capacity overflow"))?;
+    if committed_tokens > capacity_tokens {
+        return Err(invalid(
+            "invocation paged cursor exceeds its leased page capacity",
+        ));
+    }
+    let block_table = blocks_for_slot(inner, slot)?;
+    let expected_slots = (0..committed_tokens)
+        .map(|position| KvSlotRef {
+            block: block_table[position / page_tokens],
+            offset: u32::try_from(position % page_tokens)
+                .expect("page-token remainder must fit the configured u32 page size"),
+        })
+        .collect::<HashSet<_>>();
+    let mut written_slots = HashSet::new();
     for completion in writes {
         if completion.arena() != inner.id.arena
             || completion.layers() != inner.layer_bindings.as_slice()
@@ -723,6 +746,14 @@ fn validate_completions(
                 "invocation paged completion crossed its lease generation".to_string(),
             ));
         }
+        written_slots.extend(completion.slots().iter().copied());
+    }
+    if written_slots != expected_slots {
+        return Err(Error::InferenceError(format!(
+            "invocation paged completion covers {} slots, expected {} from its cursor",
+            written_slots.len(),
+            expected_slots.len()
+        )));
     }
     Ok(())
 }
