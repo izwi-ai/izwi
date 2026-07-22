@@ -11,6 +11,7 @@ mod capacity;
 mod contract;
 mod descriptor;
 mod intent;
+mod legacy;
 mod resolved;
 mod resolved_domains;
 mod runtime;
@@ -52,6 +53,7 @@ pub(crate) use intent::{
     PrefixIntent, ShapeDimensionValue, StateUpdateKind, WorkspaceDimensionValue,
     WorkspaceShapeInstantiation,
 };
+pub(crate) use legacy::upgrade_kv_contract_v1;
 #[allow(unused_imports)]
 pub(crate) use resolved::{
     OperationAbi, PagedAttentionOperationQuery, RegisteredOperationId, ResolvedPagedAttentionGroup,

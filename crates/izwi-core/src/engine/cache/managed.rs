@@ -24,6 +24,7 @@ use crate::backends::kv::{
     CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendPlanRequest, KvBackendRuntime,
     KvLayerConfig,
 };
+use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
 use crate::backends::BackendKind;
 use crate::engine::{
     EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
@@ -31,6 +32,7 @@ use crate::engine::{
     ResourceLease, ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
+use crate::kv::v2::{upgrade_kv_contract_v1, ResolvedStatePlan};
 #[cfg(test)]
 use crate::kv::CacheDomainId;
 use crate::kv::{
@@ -97,6 +99,7 @@ pub struct ManagedKvArenaRuntimeSnapshot {
 pub struct ManagedKvModelRuntimeSnapshot {
     pub model_instance: ModelInstanceId,
     pub plan_fingerprint: String,
+    pub state_plan_v2_fingerprint: String,
     pub backend: BackendKind,
     pub device_ordinal: Option<u32>,
     pub physical_bytes: u64,
@@ -136,6 +139,7 @@ impl Default for ManagedKvRuntimeSnapshot {
 /// Immutable model-level plan and physical arenas shared by all its sessions.
 pub(crate) struct ManagedKvModelRuntime {
     plan: Arc<ResolvedKvPlan>,
+    state_plan_v2: Arc<ResolvedStatePlan>,
     arenas: HashMap<KvArenaId, Arc<dyn KvArena>>,
     physical_bytes: u64,
 }
@@ -145,6 +149,7 @@ impl fmt::Debug for ManagedKvModelRuntime {
         formatter
             .debug_struct("ManagedKvModelRuntime")
             .field("plan", &self.plan.id)
+            .field("state_plan_v2", &self.state_plan_v2.id)
             .field("arena_count", &self.arenas.len())
             .field("physical_bytes", &self.physical_bytes)
             .finish()
@@ -154,6 +159,10 @@ impl fmt::Debug for ManagedKvModelRuntime {
 impl ManagedKvModelRuntime {
     pub(crate) fn plan(&self) -> &ResolvedKvPlan {
         &self.plan
+    }
+
+    pub(crate) fn state_plan_v2(&self) -> &ResolvedStatePlan {
+        &self.state_plan_v2
     }
 
     pub(crate) fn arena(&self, id: KvArenaId) -> Option<&Arc<dyn KvArena>> {
@@ -328,6 +337,11 @@ impl ManagedKvCacheManager {
                 ManagedKvModelRuntimeSnapshot {
                     model_instance: *model_instance,
                     plan_fingerprint: state.runtime.plan.fingerprint().to_string(),
+                    state_plan_v2_fingerprint: state
+                        .runtime
+                        .state_plan_v2
+                        .fingerprint()
+                        .to_string(),
                     backend: state.runtime.plan.backend,
                     device_ordinal: state.runtime.plan.device_ordinal,
                     physical_bytes: state.runtime.physical_bytes,
@@ -400,6 +414,19 @@ impl ManagedKvCacheManager {
                 first_arena_generation,
             },
         )?;
+        let state_contract_v2 = upgrade_kv_contract_v1(contract)?;
+        let state_plan_v2 = negotiate_state_plan(
+            &state_contract_v2,
+            &StateBackendPlanRequest {
+                backend,
+                device_ordinal: self.worker_device_ordinal,
+                // Resolve against the exact page geometry selected by the
+                // allocating backend, not merely the configuration hint.
+                page_tokens_hint: plan.groups.first().map(|group| group.page_tokens),
+                storage_dtype_hint: None,
+            },
+        )?;
+        validate_v2_physical_equivalence(&plan, &state_plan_v2)?;
 
         let physical_bytes = plan_physical_bytes(&plan)?;
         let resources = managed_arena_resources(backend, physical_bytes);
@@ -451,6 +478,7 @@ impl ManagedKvCacheManager {
         }
         let runtime = Arc::new(ManagedKvModelRuntime {
             plan: Arc::new(plan),
+            state_plan_v2: Arc::new(state_plan_v2),
             arenas,
             physical_bytes,
         });
@@ -1046,6 +1074,44 @@ fn managed_device_ordinal(device: &Device) -> Option<u32> {
             Some((id ^ (id >> 32)) as u32)
         }
     }
+}
+
+/// During the declaration migration both planners inspect the same semantic
+/// model geometry. Refuse Ready publication unless v2 resolves to the exact
+/// physical page shape already allocated by the proven arena implementation.
+/// This check disappears together with the v1 planner after the final model
+/// declaration is native v2.
+fn validate_v2_physical_equivalence(legacy: &ResolvedKvPlan, v2: &ResolvedStatePlan) -> Result<()> {
+    if legacy.backend != v2.backend
+        || legacy.device_ordinal != v2.device_ordinal
+        || legacy.groups.len() != v2.paged_attention.len()
+        || !v2.non_paged.is_empty()
+    {
+        return Err(Error::ModelLoadError(
+            "v2 state plan does not match the allocating KV backend".to_string(),
+        ));
+    }
+
+    for (legacy_group, v2_group) in legacy.groups.iter().zip(&v2.paged_attention) {
+        let ResolvedKvGroupKind::PagedAttention { layers } = &legacy_group.kind else {
+            return Err(Error::ModelLoadError(
+                "v1 model-state groups require a native v2 backend allocator".to_string(),
+            ));
+        };
+        let same_layers = layers.len() == v2_group.layers.len()
+            && layers.iter().zip(&v2_group.layers).all(|(left, right)| {
+                left.model_layer == right.model_layer && left.physical_layer == right.physical_layer
+            });
+        if legacy_group.page_tokens != v2_group.page_tokens
+            || legacy_group.bytes_per_page != v2_group.bytes_per_page
+            || !same_layers
+        {
+            return Err(Error::ModelLoadError(
+                "v2 state plan resolved different physical KV geometry".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn plan_physical_bytes(plan: &ResolvedKvPlan) -> Result<u64> {

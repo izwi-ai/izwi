@@ -4505,6 +4505,7 @@ mod tests {
         let model = |model_instance, backend, allocated_pages| ManagedKvModelRuntimeSnapshot {
             model_instance: ModelInstanceId::new(model_instance),
             plan_fingerprint: format!("plan-{model_instance}"),
+            state_plan_v2_fingerprint: format!("state-plan-v2-{model_instance}"),
             backend,
             device_ordinal: Some(0),
             physical_bytes: 1_280,
