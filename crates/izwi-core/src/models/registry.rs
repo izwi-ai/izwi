@@ -548,18 +548,18 @@ impl KvCacheContractProvider for NativeAsrModel {
             | Self::Nemotron(_)
             | Self::WhisperTurbo(_)
             | Self::VibeVoice(_)
-            | Self::GraniteSpeech(_) => Ok(CacheCapability::OpaqueModelOwned),
+            | Self::GraniteSpeech(_) => Ok(CacheCapability::None),
         }
     }
 
     fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
         match self {
             Self::Qwen3(model) => model.kv_cache_fallback_reason(),
-            Self::Parakeet(_) => Some("parakeet_state_has_no_physical_runtime"),
-            Self::Nemotron(_) => Some("nemotron_state_has_no_physical_runtime"),
-            Self::WhisperTurbo(_) => Some("whisper_state_has_no_physical_runtime"),
-            Self::VibeVoice(_) => Some("vibevoice_asr_state_has_no_physical_runtime"),
-            Self::GraniteSpeech(_) => Some("granite_asr_state_has_no_physical_runtime"),
+            Self::Parakeet(_)
+            | Self::Nemotron(_)
+            | Self::WhisperTurbo(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_) => None,
         }
     }
 }
@@ -1755,7 +1755,7 @@ impl KvCacheContractProvider for NativeChatModel {
         match self {
             Self::Qwen3(model) => model.kv_cache_contract(),
             Self::Qwen35(model) => model.kv_cache_contract(),
-            Self::Gemma3(_) | Self::Lfm2(_) => Ok(CacheCapability::OpaqueModelOwned),
+            Self::Gemma3(_) | Self::Lfm2(_) => Ok(CacheCapability::None),
         }
     }
 
@@ -1763,8 +1763,7 @@ impl KvCacheContractProvider for NativeChatModel {
         match self {
             Self::Qwen3(model) => model.kv_cache_fallback_reason(),
             Self::Qwen35(model) => model.kv_cache_fallback_reason(),
-            Self::Gemma3(_) => Some("gemma3_cache_has_no_managed_runtime_injection"),
-            Self::Lfm2(_) => Some("lfm2_cache_has_no_managed_runtime_injection"),
+            Self::Gemma3(_) | Self::Lfm2(_) => None,
         }
     }
 }
