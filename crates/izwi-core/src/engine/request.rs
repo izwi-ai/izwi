@@ -775,6 +775,10 @@ pub struct EngineCoreRequest {
     /// Cache truth published by the exact loaded adapter. The core resolves a
     /// managed contract into backend-owned arenas before scheduler execution.
     pub(super) cache_capability: crate::kv::CacheCapability,
+    /// Additive ABI-v2 state truth. This is mutually exclusive with a managed
+    /// v1 cache contract and must be resolved by the v2 lifecycle before the
+    /// request can enter scheduler execution.
+    pub(super) v2_state_contract: Option<crate::kv::v2::InferenceStateContract>,
     /// Immutable model-level physical KV runtime installed by the engine.
     pub(super) managed_cache_runtime: Option<Arc<super::cache::managed::ManagedKvModelRuntime>>,
     /// Request-specific shape/workspace facts produced by the exact loaded
@@ -2060,6 +2064,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            v2_state_contract: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2109,6 +2114,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            v2_state_contract: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2158,6 +2164,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            v2_state_contract: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2204,6 +2211,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            v2_state_contract: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2251,6 +2259,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            v2_state_contract: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2298,6 +2307,7 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
+            v2_state_contract: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2396,6 +2406,13 @@ impl EngineCoreRequest {
         capability: crate::kv::CacheCapability,
     ) -> Result<()> {
         capability.validate()?;
+        if self.v2_state_contract.is_some()
+            && capability != crate::kv::CacheCapability::OpaqueModelOwned
+        {
+            return Err(Error::InvalidInput(
+                "engine request cannot bind v1 managed cache and state ABI v2 together".to_string(),
+            ));
+        }
         if self.cache_capability != crate::kv::CacheCapability::OpaqueModelOwned
             && self.cache_capability != capability
         {
@@ -2409,6 +2426,33 @@ impl EngineCoreRequest {
 
     pub(crate) fn cache_capability(&self) -> &crate::kv::CacheCapability {
         &self.cache_capability
+    }
+
+    pub(crate) fn bind_v2_state_contract(
+        &mut self,
+        contract: crate::kv::v2::InferenceStateContract,
+    ) -> Result<()> {
+        contract.validate()?;
+        if self.cache_capability != crate::kv::CacheCapability::OpaqueModelOwned {
+            return Err(Error::InvalidInput(
+                "engine request cannot bind state ABI v2 over a v1 managed cache".to_string(),
+            ));
+        }
+        if self
+            .v2_state_contract
+            .as_ref()
+            .is_some_and(|current| current != &contract)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different state ABI v2 contract".to_string(),
+            ));
+        }
+        self.v2_state_contract = Some(contract);
+        Ok(())
+    }
+
+    pub(crate) fn v2_state_contract(&self) -> Option<&crate::kv::v2::InferenceStateContract> {
+        self.v2_state_contract.as_ref()
     }
 
     pub(crate) fn install_managed_cache_runtime(

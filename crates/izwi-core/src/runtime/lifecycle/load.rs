@@ -14,7 +14,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
-use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::adapters::{CapabilityKind, LoadedStatePublication};
 use crate::runtime::lifecycle::controller::{
     ModelLifecycleController, SharedLoadFailure, SharedLoadOutcome,
 };
@@ -324,7 +324,7 @@ impl ModelLifecycleController {
             // currently publishes non-default cache truth. Model migrations
             // add declarations to this capability-keyed set without wrapping
             // an already-selected execution adapter.
-            let mut cache_capabilities = HashMap::new();
+            let mut state_publications = HashMap::new();
             if let Some(loaded) = self.model_registry.get_chat(variant).await {
                 let loaded_cache = loaded.loaded_kv_cache_capability()?;
                 if matches!(
@@ -336,12 +336,15 @@ impl ModelLifecycleController {
                         "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
                     )));
                 }
-                cache_capabilities.insert(CapabilityKind::Chat, loaded_cache);
+                state_publications.insert(
+                    CapabilityKind::Chat,
+                    LoadedStatePublication::LegacyV1(loaded_cache),
+                );
             }
-            self.bind_loaded_model_bundle_with_cache_capabilities(
+            self.bind_loaded_model_bundle_with_state_publications(
                 variant,
                 model_instance_id,
-                cache_capabilities,
+                state_publications,
             )?;
             // The physical allocation is now visible to the live provider.
             // Reconcile before Ready publication so it is no longer counted as

@@ -45,8 +45,8 @@ use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
-    LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
+    CapabilityKind, CapabilityStateBinding, ExecutionTargetKind, LoadedCapabilityBinding,
+    LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
@@ -805,15 +805,15 @@ fn bind_request_to_residency(
     } else {
         StreamingRequirements::native(model_streaming_required)
     };
-    let LoadedCapabilityBinding {
-        execution,
-        cache_capability,
-    } = bundle.capability_binding_for_streaming(
+    let LoadedCapabilityBinding { execution, state } = bundle.capability_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
     )?;
     request.bind_execution_adapter(execution)?;
-    request.bind_cache_capability(cache_capability)?;
+    match state {
+        CapabilityStateBinding::LegacyV1(cache) => request.bind_cache_capability(cache)?,
+        CapabilityStateBinding::V2(contract) => request.bind_v2_state_contract(contract)?,
+    }
     Ok(())
 }
 
@@ -3054,20 +3054,22 @@ mod tests {
         let variant = ModelVariant::Qwen306B;
         let lease = residency.acquire_instance_lease(variant, instance);
         let managed = crate::kv::CacheCapability::Managed(crate::kv::test_contract());
-        let cache_capabilities = HashMap::from([(
+        let state_publications = HashMap::from([(
             CapabilityKind::Chat,
-            crate::kv::LoadedKvCacheCapability {
-                capability: managed.clone(),
-                fallback_reason: None,
-            },
+            crate::runtime::adapters::LoadedStatePublication::LegacyV1(
+                crate::kv::LoadedKvCacheCapability {
+                    capability: managed.clone(),
+                    fallback_reason: None,
+                },
+            ),
         )]);
-        let bundle = LoadedModelBundle::bind_with_cache_capabilities(
+        let bundle = LoadedModelBundle::bind_with_state_publications(
             &RuntimeAdapterRegistry::built_in(),
             crate::engine::ExecutionGroupId::new(3),
             instance,
             variant,
             BackendKind::Cpu,
-            cache_capabilities,
+            state_publications,
         )
         .expect("loaded bundle");
         let mut request = EngineCoreRequest::chat(Vec::new()).with_model_variant(variant);
@@ -3083,6 +3085,37 @@ mod tests {
             instance
         );
         assert_eq!(request.cache_capability(), &managed);
+    }
+
+    #[test]
+    fn residency_binding_preserves_v2_state_without_opaque_fallback() {
+        let residency = crate::model::ModelResidency::default();
+        let instance = crate::engine::ModelInstanceId::new(20);
+        let variant = ModelVariant::Qwen306B;
+        let lease = residency.acquire_instance_lease(variant, instance);
+        let contract = crate::kv::v2::test_contract();
+        let bundle = LoadedModelBundle::bind_with_state_publications(
+            &RuntimeAdapterRegistry::built_in(),
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+            HashMap::from([(
+                CapabilityKind::Chat,
+                crate::runtime::adapters::LoadedStatePublication::V2(contract.clone()),
+            )]),
+        )
+        .expect("v2 loaded bundle");
+        let mut request = EngineCoreRequest::chat(Vec::new()).with_model_variant(variant);
+
+        bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
+            .expect("matching v2 loaded capability descriptor");
+
+        assert_eq!(request.v2_state_contract(), Some(&contract));
+        assert_eq!(
+            request.cache_capability(),
+            &crate::kv::CacheCapability::OpaqueModelOwned
+        );
     }
 
     #[test]

@@ -1526,6 +1526,12 @@ impl EngineCore {
         request.enforce_chat_context_window(self.config.max_seq_len)?;
 
         if let Some(model_instance) = request.model_instance_id() {
+            if request.v2_state_contract().is_some() {
+                return Err(Error::InferenceError(format!(
+                    "model instance {} published state ABI v2 before a resolved v2 runtime was installed",
+                    model_instance.get()
+                )));
+            }
             let capability = request.cache_capability().clone();
             if capability.managed_contract().is_some() {
                 let managed_backend = self.managed_kv_cache.worker_backend();
@@ -3306,6 +3312,24 @@ mod tests {
         let result = core.add_request(request);
         assert!(result.is_ok());
         assert_eq!(core.pending_request_count(), 1);
+    }
+
+    #[test]
+    fn v2_state_publication_fails_closed_until_runtime_is_resolved() {
+        let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
+        let mut request = EngineCoreRequest::tts("v2");
+        request
+            .bind_model_instance(ModelInstanceId::new(101))
+            .unwrap();
+        request
+            .bind_v2_state_contract(crate::kv::v2::test_contract())
+            .unwrap();
+
+        let error = core
+            .add_request(request)
+            .expect_err("v2 must never fall back to model-owned execution");
+        assert!(error.to_string().contains("resolved v2 runtime"));
+        assert_eq!(core.pending_request_count(), 0);
     }
 
     #[tokio::test]

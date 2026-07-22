@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 mod loaded;
 
 pub(crate) use loaded::{
-    LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, StreamingRequirements,
+    CapabilityStateBinding, LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle,
+    LoadedStatePublication, StreamingRequirements,
 };
 
 #[allow(dead_code)]
