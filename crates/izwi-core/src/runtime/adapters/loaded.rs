@@ -584,6 +584,18 @@ fn compatibility_contract(
 
     let mut execution_profile =
         compatibility_execution_profile(metadata, backend_kind, streaming.model_native);
+    if metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
+        && streaming.model_native
+    {
+        execution_profile.cache_mode = CacheMode::ExternalPaged;
+        execution_profile.cache_namespace = Some(format!(
+            "{}:{}:state-v2",
+            metadata.model_variant,
+            backend_kind.as_str()
+        ));
+        execution_profile.kv_dtype = "state_v2_resolved".to_string();
+    }
     execution_profile.resolved_from_loaded_model = true;
     execution_profile.prefill_batch = NativeBatchMode::None;
     execution_profile.decode_batch = NativeBatchMode::None;
@@ -1207,6 +1219,66 @@ mod tests {
             .unwrap();
         assert_eq!(request.cache_capability(), &CacheCapability::None);
         assert!(request.v2_state_runtime().is_some());
+    }
+
+    #[test]
+    fn qwen_asr_activates_one_managed_arena_only_for_native_streaming() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let model_instance = ModelInstanceId::new(81);
+        let legacy_contract = crate::kv::test_contract();
+        let capability = CacheCapability::Managed(legacy_contract.clone());
+        let mut core = EngineCore::new(EngineCoreConfig {
+            max_blocks: 4,
+            block_size: 32,
+            ..EngineCoreConfig::default()
+        })
+        .unwrap();
+        let physical = core
+            .load_managed_model_cache(model_instance, &capability)
+            .unwrap()
+            .expect("physical managed runtime");
+        let bundle = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            ExecutionGroupId::new(31),
+            model_instance,
+            ModelVariant::Qwen3Asr06BGguf,
+            BackendKind::Cpu,
+            HashMap::from([(
+                CapabilityKind::Asr,
+                LoadedStatePublication::ManagedV2 {
+                    contract: crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).unwrap(),
+                    physical,
+                },
+            )]),
+        )
+        .unwrap();
+
+        let offline = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+            .unwrap();
+        let CapabilityStateBinding::V2(offline) = offline.state else {
+            panic!("expected offline v2 runtime");
+        };
+        assert!(offline.managed_kv_runtime().is_none());
+
+        let streaming = bundle
+            .capability_binding_for_streaming(
+                CapabilityKind::Asr,
+                StreamingRequirements::native(true),
+            )
+            .unwrap();
+        let CapabilityStateBinding::V2(streaming) = streaming.state else {
+            panic!("expected streaming v2 runtime");
+        };
+        assert!(streaming.managed_kv_runtime().is_some());
+        assert_eq!(
+            bundle
+                .contract(CapabilityKind::Asr, true)
+                .unwrap()
+                .execution_profile
+                .cache_mode,
+            CacheMode::ExternalPaged
+        );
     }
 
     #[test]

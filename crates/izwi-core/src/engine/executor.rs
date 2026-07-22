@@ -58,7 +58,7 @@ use crate::backends::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
+pub(super) use crate::models::architectures::qwen3::core::Qwen3ManagedCache as ManagedQwenCache;
 use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
 use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
@@ -70,7 +70,7 @@ fn qwen3_managed_cache_for_row(
     request: &EngineCoreRequest,
     scheduled: &ScheduledRequest,
     reservation: &super::ManagedCacheReservation,
-) -> Result<Qwen3ManagedCache> {
+) -> Result<ManagedQwenCache> {
     if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
         return Err(Error::InferenceError(
             "managed Qwen3 reservation crossed its scheduled row fence".to_string(),
@@ -81,7 +81,7 @@ fn qwen3_managed_cache_for_row(
     })?;
     if reservation.domains.len() != 1 {
         return Err(Error::InvalidInput(
-            "native Qwen3 chat requires exactly one managed KV domain".to_string(),
+            "native Qwen3 sequence requires exactly one managed KV domain".to_string(),
         ));
     }
     let domain = &reservation.domains[0];
@@ -104,7 +104,7 @@ fn qwen3_managed_cache_for_row(
         })?;
     let crate::kv::ResolvedKvGroupKind::PagedAttention { layers } = &group.kind else {
         return Err(Error::InvalidInput(
-            "native Qwen3 chat cannot consume a model-state KV group".to_string(),
+            "native Qwen3 sequence cannot consume a model-state KV group".to_string(),
         ));
     };
     if domain.first_page_offset != domain.target_window_start % group.page_tokens {
@@ -124,7 +124,7 @@ fn qwen3_managed_cache_for_row(
     let arena = runtime.arena(group.arena).ok_or_else(|| {
         Error::InferenceError("managed Qwen3 arena is no longer live".to_string())
     })?;
-    Qwen3ManagedCache::new_windowed(
+    ManagedQwenCache::new_windowed(
         arena.clone(),
         layers.clone(),
         table.blocks.clone(),

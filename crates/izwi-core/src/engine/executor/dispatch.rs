@@ -131,8 +131,13 @@ impl NativeExecutor {
                         super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
                     self.chat_request_with_managed_cache(request, scheduled_req, Some(cache))
                 }
+                Some(reservation) if request.task_type == TaskType::ASR => {
+                    let cache =
+                        super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
+                    self.transcribe_request_with_managed_cache(request, scheduled_req, Some(cache))
+                }
                 Some(_) => Err(Error::InferenceError(
-                    "managed Qwen3 cache was routed to a non-chat executor".to_string(),
+                    "managed Qwen3 cache was routed to an unsupported executor".to_string(),
                 )),
                 None => (route.handler)(self, request, scheduled_req),
             }));

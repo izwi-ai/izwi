@@ -10,7 +10,9 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
+use super::{
+    ExecutorOutput, ExecutorPhaseTiming, ManagedQwenCache, ModelSessionResult, NativeExecutor,
+};
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
@@ -22,6 +24,30 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
+        self.transcribe_request_with_managed_cache(request, scheduled, None)
+    }
+
+    pub(super) fn transcribe_request_with_managed_cache(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        mut managed_cache: Option<ManagedQwenCache>,
+    ) -> Result<ModelSessionResult> {
+        if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR request and scheduler reservation disagree on managed KV authority"
+                    .to_string(),
+            ));
+        }
+        if managed_cache.is_some()
+            && scheduled.is_prefill
+            && (scheduled.num_computed_tokens != 0
+                || scheduled.num_tokens != request.num_prompt_tokens())
+        {
+            return Err(Error::InferenceError(
+                "managed Qwen3 ASR requires one exact full multimodal prefill quantum".to_string(),
+            ));
+        }
         let variant = Self::resolve_variant(request)?;
         let family = variant.family();
         let language = request.asr_language_for_execution();
@@ -56,7 +82,10 @@ impl NativeExecutor {
 
                 if model.supports_incremental_decode() {
                     let mut initial_media_decode_ms = None;
-                    let mut active_state = if let Some(state) = active_state {
+                    let mut active_state = if let Some(mut state) = active_state {
+                        if let Some(cache) = managed_cache.take() {
+                            state.state.install_qwen3_managed_reservation(cache)?;
+                        }
                         state
                     } else {
                         if request.is_cancelled() {
@@ -79,6 +108,12 @@ impl NativeExecutor {
                             matches!(family, ModelFamily::WhisperAsr),
                         );
                         if chunk_plan.requires_chunk_path() {
+                            if managed_cache.is_some() {
+                                return Err(Error::InvalidInput(
+                                    "managed Qwen3 ASR cannot switch a scheduled sequence row to the chunked executor"
+                                        .to_string(),
+                                ));
+                            }
                             let mut sequence = 0usize;
                             let chunk_stream_options = if matches!(family, ModelFamily::Qwen3Asr) {
                                 Self::qwen_asr_chunk_stream_options()
@@ -146,15 +181,36 @@ impl NativeExecutor {
                         // Keep ASR decode bounded. If EOS is missed, very high caps
                         // produce runaway gibberish and extreme latency.
                         let max_new_tokens = request.params.max_tokens.clamp(1, MAX_ASR_NEW_TOKENS);
-                        let decode_state = Self::run_blocking(|| {
-                            model.start_decode_state_with_prompt(
-                                &samples,
-                                sample_rate,
-                                language,
-                                asr_prompt,
-                                max_new_tokens,
-                            )
-                        })?;
+                        let decode_state = match managed_cache.take() {
+                            Some(cache) => Self::run_blocking(|| {
+                                model.start_decode_state_with_prompt_managed(
+                                    &samples,
+                                    sample_rate,
+                                    language,
+                                    asr_prompt,
+                                    max_new_tokens,
+                                    cache,
+                                )
+                            })?,
+                            None => Self::run_blocking(|| {
+                                model.start_decode_state_with_prompt(
+                                    &samples,
+                                    sample_rate,
+                                    language,
+                                    asr_prompt,
+                                    max_new_tokens,
+                                )
+                            })?,
+                        };
+                        if request.managed_cache_runtime().is_some()
+                            && decode_state.sequence_position()
+                                != Some(request.num_prompt_tokens())
+                        {
+                            return Err(Error::InferenceError(
+                                "Qwen3 ASR prepared multimodal span does not match model prefill"
+                                    .to_string(),
+                            ));
+                        }
                         ActiveAsrDecode {
                             variant,
                             model: model.clone(),
@@ -259,7 +315,19 @@ impl NativeExecutor {
                         error: None,
                     }));
                 }
+                if managed_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "managed Qwen3 ASR reservation reached a non-incremental model".to_string(),
+                    ));
+                }
             }
+        }
+
+        if managed_cache.is_some() {
+            return Err(Error::InferenceError(
+                "managed Qwen3 ASR reservation requires the incremental streaming graph"
+                    .to_string(),
+            ));
         }
 
         let audio_decode_started = Instant::now();

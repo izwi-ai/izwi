@@ -540,6 +540,30 @@ pub enum NativeAsrModel {
     GraniteSpeech(GraniteSpeechAsrModel),
 }
 
+impl KvCacheContractProvider for NativeAsrModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        match self {
+            Self::Qwen3(model) => model.kv_cache_contract(),
+            Self::Parakeet(_)
+            | Self::Nemotron(_)
+            | Self::WhisperTurbo(_)
+            | Self::VibeVoice(_)
+            | Self::GraniteSpeech(_) => Ok(CacheCapability::OpaqueModelOwned),
+        }
+    }
+
+    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Qwen3(model) => model.kv_cache_fallback_reason(),
+            Self::Parakeet(_) => Some("parakeet_state_has_no_physical_runtime"),
+            Self::Nemotron(_) => Some("nemotron_state_has_no_physical_runtime"),
+            Self::WhisperTurbo(_) => Some("whisper_state_has_no_physical_runtime"),
+            Self::VibeVoice(_) => Some("vibevoice_asr_state_has_no_physical_runtime"),
+            Self::GraniteSpeech(_) => Some("granite_asr_state_has_no_physical_runtime"),
+        }
+    }
+}
+
 pub enum NativeAudioChatModel {
     Lfm25Audio(Lfm25AudioModel),
 }
@@ -571,6 +595,13 @@ impl NativeAsrDecodeState {
 
     pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
         matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
+    }
+
+    pub(crate) fn sequence_position(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.sequence_position()),
+            Self::Nemotron(_) => None,
+        }
     }
 
     pub(crate) fn install_qwen3_managed_reservation(

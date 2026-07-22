@@ -356,6 +356,41 @@ impl ModelLifecycleController {
                 };
                 state_publications.insert(CapabilityKind::Chat, publication);
             }
+            if self
+                .adapter_registry
+                .require(CapabilityKind::Asr, variant)
+                .is_ok()
+            {
+                if let Some(loaded) = self.model_registry.get_asr(variant).await {
+                    let loaded_cache = loaded.loaded_kv_cache_capability()?;
+                    if let crate::kv::CacheCapability::Managed(contract) =
+                        &loaded_cache.capability
+                    {
+                        if !managed_kv_backend_compiled(backend) {
+                            return Err(Error::ModelLoadError(format!(
+                                "loaded model {variant} publishes managed ASR KV, but the {backend:?} build has no direct paged-attention runtime"
+                            )));
+                        }
+                        let physical = self
+                            .core_engine
+                            .load_managed_model_cache(model_instance_id, &loaded_cache.capability)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "managed ASR state allocation returned no physical runtime"
+                                        .to_string(),
+                                )
+                            })?;
+                        state_publications.insert(
+                            CapabilityKind::Asr,
+                            LoadedStatePublication::ManagedV2 {
+                                contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
+                                physical,
+                            },
+                        );
+                    }
+                }
+            }
             self.bind_loaded_model_bundle_with_state_publications(
                 variant,
                 model_instance_id,
