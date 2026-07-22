@@ -55,8 +55,8 @@ pub(crate) use intent::{
 #[allow(unused_imports)]
 pub(crate) use resolved::{
     OperationAbi, PagedAttentionOperationQuery, RegisteredOperationId, ResolvedPagedAttentionGroup,
-    ResolvedPlacement, ResolvedStatePlan, StateOperationRegistry, StateOperationSet,
-    StatePhysicalLayout, StatePlanFingerprint, StatePlanId, StateStorageFormat,
+    ResolvedPlacement, ResolvedStatePlan, StateLayerBinding, StateOperationRegistry,
+    StateOperationSet, StatePhysicalLayout, StatePlanFingerprint, StatePlanId, StateStorageFormat,
 };
 #[allow(unused_imports)]
 pub(crate) use resolved_domains::{

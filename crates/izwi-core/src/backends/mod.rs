@@ -7,6 +7,7 @@ pub mod kv;
 pub mod model_io;
 pub mod policy;
 pub mod router;
+pub(crate) mod state;
 pub mod types;
 
 pub use capabilities::BackendCapabilities;
