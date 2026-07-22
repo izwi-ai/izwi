@@ -114,6 +114,10 @@ impl InferenceStateRequirement {
     pub(crate) const fn requires_retained(self) -> bool {
         matches!(self, Self::Retained | Self::RetainedAndInvocation)
     }
+
+    pub(crate) const fn requires_invocation(self) -> bool {
+        matches!(self, Self::Invocation | Self::RetainedAndInvocation)
+    }
 }
 
 impl SequenceExecutionMode {

@@ -20,8 +20,8 @@ use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 
 use super::{
-    compatibility_execution_profile, AdapterMetadata, CapabilityKind, RuntimeAdapterRegistry,
-    StreamingMode,
+    compatibility_execution_profile, AdapterMetadata, CapabilityKind, InferenceStateRequirement,
+    RuntimeAdapterRegistry, StreamingMode,
 };
 
 const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(7);
@@ -226,10 +226,15 @@ impl LoadedCapabilityDescriptor {
         }
         let state = match state {
             Some(state) => state,
-            None if !execution.metadata().state_requirement.requires_retained()
-                && contracts
-                    .iter()
-                    .all(|contract| contract.execution_profile.cache_mode == CacheMode::None) =>
+            None if execution.metadata().state_requirement
+                == InferenceStateRequirement::Stateless
+                && contracts.iter().all(|contract| {
+                    contract.execution_profile.cache_mode == CacheMode::None
+                        && contract
+                            .stages
+                            .iter()
+                            .all(|stage| stage.max_workspace_bytes == 0)
+                }) =>
             {
                 let stage_graphs = contracts
                     .iter()
@@ -268,7 +273,21 @@ impl LoadedCapabilityDescriptor {
                         return Err(Error::ModelLoadError(
                         "stateless state ABI v2 contradicts execution that declares retained cache state"
                             .to_string(),
-                    ));
+                        ));
+                    }
+                    let has_invocation =
+                        !descriptor.has_zero_invocation_workspace_for(&contract.stages)?;
+                    if has_invocation {
+                        return Err(Error::ModelLoadError(
+                            "state ABI v2 invocation workspace requires load-sealed physical backing"
+                                .to_string(),
+                        ));
+                    }
+                    if execution.metadata().state_requirement.requires_invocation() {
+                        return Err(Error::ModelLoadError(
+                            "capability requiring invocation state cannot publish a zero-workspace runtime"
+                                .to_string(),
+                        ));
                     }
                     let binding = contract.adapter_binding()?;
                     let stateless = StatelessCapabilityRuntimeV2::seal(
@@ -1351,58 +1370,40 @@ mod tests {
     #[test]
     fn v2_state_publication_is_preserved_without_legacy_fallback() {
         let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::Qwen3TtsTokenizer12Hz;
+        let capability = CapabilityKind::Tokenizer;
         let compatibility = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(10),
-            ModelVariant::Kokoro82M,
+            variant,
             BackendKind::Cpu,
         )
         .unwrap();
         let offline = compatibility
-            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .contract_for_streaming(capability, StreamingRequirements::NONE)
             .unwrap()
             .stages;
         let transport = compatibility
-            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::transport_only())
-            .unwrap()
-            .stages;
-        let native = compatibility
-            .contract_for_streaming(
-                CapabilityKind::Tts,
-                StreamingRequirements {
-                    transport_output: false,
-                    model_native: true,
-                },
-            )
-            .unwrap()
-            .stages;
-        let native_transport = compatibility
-            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::native(true))
+            .contract_for_streaming(capability, StreamingRequirements::transport_only())
             .unwrap()
             .stages;
         let descriptor =
             crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stage_graphs_test(&[
-                &offline,
-                &transport,
-                &native,
-                &native_transport,
+                &offline, &transport,
             ]);
         let bundle = LoadedModelBundle::bind_with_state_publications(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(10),
-            ModelVariant::Kokoro82M,
+            variant,
             BackendKind::Cpu,
-            HashMap::from([(
-                CapabilityKind::Tts,
-                LoadedStatePublication::V2(descriptor.clone()),
-            )]),
+            HashMap::from([(capability, LoadedStatePublication::V2(descriptor.clone()))]),
         )
         .unwrap();
 
         let binding = bundle
-            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .capability_binding_for_streaming(capability, StreamingRequirements::NONE)
             .unwrap();
         let CapabilityStateBinding::V2(runtime) = binding.state else {
             panic!("expected stateless v2 runtime");
@@ -1414,9 +1415,10 @@ mod tests {
     }
 
     #[test]
-    fn v2_runtime_preseals_every_selectable_stage_graph() {
+    fn v2_runtime_reuses_one_seal_for_identical_selectable_stage_graphs() {
         let registry = RuntimeAdapterRegistry::built_in();
-        let variant = ModelVariant::Kokoro82M;
+        let variant = ModelVariant::Qwen3TtsTokenizer12Hz;
+        let capability = CapabilityKind::Tokenizer;
         let compatibility = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(3),
@@ -1426,21 +1428,69 @@ mod tests {
         )
         .unwrap();
         let offline = compatibility
-            .contract_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .contract_for_streaming(capability, StreamingRequirements::NONE)
             .unwrap();
-        let incomplete =
+        let descriptor =
             crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_stages_test(&offline.stages);
 
-        let error = LoadedModelBundle::bind_with_state_publications(
+        let bundle = LoadedModelBundle::bind_with_state_publications(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(11),
             variant,
             BackendKind::Cpu,
-            HashMap::from([(CapabilityKind::Tts, LoadedStatePublication::V2(incomplete))]),
+            HashMap::from([(capability, LoadedStatePublication::V2(descriptor))]),
         )
-        .expect_err("missing transport/native stage graphs must fail during loading");
-        assert!(error.to_string().contains("selected stage graph"));
+        .unwrap();
+        let offline = bundle
+            .capability_binding_for_streaming(capability, StreamingRequirements::NONE)
+            .unwrap();
+        let transport = bundle
+            .capability_binding_for_streaming(capability, StreamingRequirements::transport_only())
+            .unwrap();
+        assert_eq!(offline.state_fingerprint, transport.state_fingerprint);
+    }
+
+    #[test]
+    fn invocation_capability_cannot_publish_ready_without_physical_workspace() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let variant = ModelVariant::Kokoro82M;
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(14),
+            variant,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let binding = compatibility
+            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .unwrap();
+        assert!(matches!(binding.state, CapabilityStateBinding::LegacyV1(_)));
+
+        let graphs = loaded_execution_contracts(
+            compatibility
+                .require_capability(CapabilityKind::Tts)
+                .unwrap()
+                .execution
+                .as_ref(),
+        )
+        .unwrap();
+        let graph_slices = graphs
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let zero = CapabilityStateDescriptorV2::stateless_for_stage_graphs(&graph_slices).unwrap();
+        let error = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(14),
+            variant,
+            BackendKind::Cpu,
+            HashMap::from([(CapabilityKind::Tts, LoadedStatePublication::V2(zero))]),
+        )
+        .expect_err("invocation-state metadata without a physical pool must fail before Ready");
+        assert!(error.to_string().contains("invocation state"));
     }
 
     #[test]
@@ -1637,20 +1687,35 @@ mod tests {
                 let contract = bundle
                     .contract(metadata.capability, false)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
-                let all_graphs_cacheless = loaded_execution_contracts(
+                let execution_contracts = loaded_execution_contracts(
                     bundle
                         .require_capability(metadata.capability)
                         .unwrap()
                         .execution
                         .as_ref(),
                 )
-                .unwrap()
-                .iter()
-                .all(|contract| contract.execution_profile.cache_mode == CacheMode::None);
-                if all_graphs_cacheless && !metadata.state_requirement.requires_retained() {
+                .unwrap();
+                let all_graphs_cacheless = execution_contracts
+                    .iter()
+                    .all(|contract| contract.execution_profile.cache_mode == CacheMode::None);
+                let all_graphs_zero_workspace = execution_contracts
+                    .iter()
+                    .flat_map(|contract| contract.stages.iter())
+                    .all(|stage| stage.max_workspace_bytes == 0);
+                if all_graphs_cacheless
+                    && all_graphs_zero_workspace
+                    && metadata.state_requirement == InferenceStateRequirement::Stateless
+                {
                     assert!(
                         matches!(binding.state, CapabilityStateBinding::V2(_)),
-                        "fully cacheless capability remained legacy for {variant}"
+                        "explicitly stateless zero-workspace capability remained legacy for {variant}"
+                    );
+                }
+                if metadata.state_requirement.requires_invocation()
+                    && !matches!(binding.state, CapabilityStateBinding::LegacyV1(_))
+                {
+                    panic!(
+                        "invocation capability was published without physical workspace for {variant}"
                     );
                 }
                 if metadata.state_requirement.requires_retained()
