@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 
 use super::contract::{StateDomainId, StateGroupId};
 use super::resolved::{ResolvedPlacement, ResolvedStatePlan, StatePlanId};
+use super::resolved_domains::ResolvedNonPagedDomainPlan;
 
 const ALLOCATION_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.allocation-plan.v2\0";
 
@@ -119,8 +120,44 @@ impl CapacityStrategy {
 pub(crate) struct GroupResourceQuery<'a> {
     pub(crate) backend: BackendKind,
     pub(crate) device_ordinal: Option<u32>,
-    pub(crate) resolved: &'a super::resolved::ResolvedPagedAttentionGroup,
+    pub(crate) resolved: ResolvedCapacityDomain<'a>,
     pub(crate) strategy: CapacityStrategy,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResolvedCapacityDomain<'a> {
+    Paged(&'a super::resolved::ResolvedPagedAttentionGroup),
+    NonPaged(&'a ResolvedNonPagedDomainPlan),
+}
+
+impl ResolvedCapacityDomain<'_> {
+    const fn group(self) -> StateGroupId {
+        match self {
+            Self::Paged(plan) => plan.group,
+            Self::NonPaged(plan) => plan.group(),
+        }
+    }
+
+    const fn domain(self) -> StateDomainId {
+        match self {
+            Self::Paged(plan) => plan.domain,
+            Self::NonPaged(plan) => plan.domain(),
+        }
+    }
+
+    const fn bytes_per_block(self) -> u64 {
+        match self {
+            Self::Paged(plan) => plan.bytes_per_page,
+            Self::NonPaged(plan) => plan.maximum_bytes(),
+        }
+    }
+
+    const fn placement(self) -> ResolvedPlacement {
+        match self {
+            Self::Paged(plan) => plan.placement,
+            Self::NonPaged(plan) => plan.placement(),
+        }
+    }
 }
 
 pub(crate) struct WorkspaceResourceQuery<'a> {
@@ -506,6 +543,17 @@ impl StateRuntimeAllocationPlan {
                 .find(|candidate| {
                     candidate.group == request.group && candidate.domain == request.domain
                 })
+                .map(ResolvedCapacityDomain::Paged)
+                .or_else(|| {
+                    state_plan
+                        .non_paged
+                        .iter()
+                        .find(|candidate| {
+                            candidate.group() == request.group
+                                && candidate.domain() == request.domain
+                        })
+                        .map(ResolvedCapacityDomain::NonPaged)
+                })
                 .ok_or_else(|| invalid("capacity request references an unknown state group"))?;
             let resources = resource_registry.resolve_group_resources(&GroupResourceQuery {
                 backend: state_plan.backend,
@@ -514,10 +562,10 @@ impl StateRuntimeAllocationPlan {
                 strategy: request.strategy,
             })?;
             resolved_groups.push(GroupCapacityPlan {
-                group: request.group,
-                domain: request.domain,
+                group: resolved.group(),
+                domain: resolved.domain(),
                 strategy: request.strategy,
-                bytes_per_block: resolved.bytes_per_page,
+                bytes_per_block: resolved.bytes_per_block(),
                 resources,
             });
         }
@@ -556,7 +604,7 @@ impl StateRuntimeAllocationPlan {
         }
         self.workspace.validate()?;
 
-        let expected = state_plan
+        let mut expected = state_plan
             .paged_attention
             .iter()
             .map(|group| {
@@ -567,6 +615,14 @@ impl StateRuntimeAllocationPlan {
                 )
             })
             .collect::<Vec<_>>();
+        expected.extend(state_plan.non_paged.iter().map(|domain| {
+            (
+                (domain.group(), domain.domain()),
+                domain.maximum_bytes(),
+                domain.placement(),
+            )
+        }));
+        expected.sort_unstable_by_key(|(key, _, _)| *key);
         if self.groups.len() != expected.len() {
             return Err(invalid(
                 "runtime allocation plan does not cover every resolved state group",
@@ -835,6 +891,9 @@ fn invalid(message: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::kv::v2::resolved::test_plan;
+    use crate::kv::v2::resolved_domains::tests::{
+        contract as tensor_contract, tensor_plan, TestRegistry as TensorOperationRegistry,
+    };
     use crate::kv::v2::test_contract;
 
     struct TestResources;
@@ -1192,5 +1251,44 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn non_paged_state_is_hard_admitted_from_its_resolved_byte_bound() {
+        let contract = tensor_contract();
+        let state_plan = ResolvedStatePlan::build(
+            BackendKind::Cpu,
+            None,
+            &contract,
+            vec![],
+            vec![tensor_plan(16)],
+            &TensorOperationRegistry,
+        )
+        .unwrap();
+        let allocation = StateRuntimeAllocationPlan::build(
+            &state_plan,
+            ModelInstanceId::new(9),
+            vec![GroupCapacityRequest {
+                group: StateGroupId::new(1),
+                domain: StateDomainId::new(1),
+                strategy: CapacityStrategy::Fixed { blocks: 1 },
+            }],
+            WorkspaceContract {
+                fixed_bytes: 0,
+                dimensions: vec![],
+                terms: vec![],
+                placement: WorkspacePlacement::Host,
+                concurrency_slots: 1,
+            },
+            StateResourceVector {
+                host_bytes: 8192,
+                pinned_bytes: 16,
+                metadata_bytes: 32,
+                ..StateResourceVector::default()
+            },
+            &TestResources,
+        )
+        .unwrap();
+        assert_eq!(allocation.groups[0].bytes_per_block, 16);
     }
 }

@@ -13,6 +13,9 @@ use super::contract::{
 };
 #[cfg(test)]
 use super::contract::{AttentionMask, KeyEncoding, PrefixPolicy, StateClock};
+use super::resolved_domains::{
+    NonPagedStateOperationQuery, NonPagedStateOperationRegistry, ResolvedNonPagedDomainPlan,
+};
 
 const PLAN_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.resolved-plan.v2\0";
 
@@ -88,7 +91,7 @@ impl RegisteredOperationId {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.name.is_empty()
             || self.name.len() > 96
             || !self
@@ -140,7 +143,7 @@ pub(crate) struct PagedAttentionOperationQuery<'a> {
 
 /// Backend-owned proof used when a plan is built or revalidated. Operation
 /// names alone never make a layout executable on CPU, Metal, or CUDA.
-pub(crate) trait StateOperationRegistry {
+pub(crate) trait StateOperationRegistry: NonPagedStateOperationRegistry {
     fn supports_paged_attention(&self, query: &PagedAttentionOperationQuery<'_>) -> bool;
 }
 
@@ -154,6 +157,7 @@ pub(crate) struct ResolvedStatePlan {
     pub(crate) device_ordinal: Option<u32>,
     pub(crate) contract_fingerprint: [u8; 32],
     pub(crate) paged_attention: Vec<ResolvedPagedAttentionGroup>,
+    pub(crate) non_paged: Vec<ResolvedNonPagedDomainPlan>,
 }
 
 impl ResolvedStatePlan {
@@ -162,6 +166,7 @@ impl ResolvedStatePlan {
         device_ordinal: Option<u32>,
         contract: &InferenceStateContract,
         paged_attention: Vec<ResolvedPagedAttentionGroup>,
+        non_paged: Vec<ResolvedNonPagedDomainPlan>,
         operations: &dyn StateOperationRegistry,
     ) -> Result<Self> {
         let mut plan = Self {
@@ -170,6 +175,7 @@ impl ResolvedStatePlan {
             device_ordinal,
             contract_fingerprint: contract.fingerprint()?,
             paged_attention,
+            non_paged,
         };
         plan.id = StatePlanId::new(plan.compute_fingerprint()?);
         plan.validate_against(contract, operations)?;
@@ -252,6 +258,40 @@ impl ResolvedStatePlan {
             group.validate(domain, self.backend, self.device_ordinal, operations)?;
         }
 
+        let mut previous_non_paged = None;
+        for plan in &self.non_paged {
+            let pair = (plan.group(), plan.domain());
+            if previous_non_paged.is_some_and(|previous| pair <= previous) {
+                return Err(invalid(
+                    "resolved non-paged domains must be in canonical group/domain order",
+                ));
+            }
+            previous_non_paged = Some(pair);
+            if !resolved_pairs.insert(pair) || !resolved_domains.insert(plan.domain()) {
+                return Err(invalid("resolved state domain appears more than once"));
+            }
+            let semantic_group = expected_groups.get(&plan.group()).ok_or_else(|| {
+                invalid(format!(
+                    "resolved state plan references unknown group {}",
+                    plan.group().get()
+                ))
+            })?;
+            if !semantic_group.domains.contains(&plan.domain()) {
+                return Err(invalid(format!(
+                    "domain {} does not belong to consistency group {}",
+                    plan.domain().get(),
+                    plan.group().get()
+                )));
+            }
+            let domain = domains.get(&plan.domain()).ok_or_else(|| {
+                invalid(format!(
+                    "resolved state plan references unknown domain {}",
+                    plan.domain().get()
+                ))
+            })?;
+            plan.validate_against(domain, self.backend, self.device_ordinal, operations)?;
+        }
+
         if resolved_domains.len() != domains.len() {
             return Err(invalid(
                 "resolved state plan does not cover every semantic domain",
@@ -267,6 +307,7 @@ impl ResolvedStatePlan {
             device_ordinal: Option<u32>,
             contract_fingerprint: &'a [u8; 32],
             paged_attention: &'a [ResolvedPagedAttentionGroup],
+            non_paged: &'a [ResolvedNonPagedDomainPlan],
         }
 
         let payload = FingerprintPayload {
@@ -274,6 +315,7 @@ impl ResolvedStatePlan {
             device_ordinal: self.device_ordinal,
             contract_fingerprint: &self.contract_fingerprint,
             paged_attention: &self.paged_attention,
+            non_paged: &self.non_paged,
         };
         let encoded = serde_json::to_vec(&payload)
             .map_err(|error| invalid(format!("failed to encode resolved state plan: {error}")))?;
@@ -448,7 +490,7 @@ pub(crate) enum ResolvedPlacement {
 }
 
 impl ResolvedPlacement {
-    fn validate_against(self, policy: PlacementPolicy) -> Result<()> {
+    pub(crate) fn validate_against(self, policy: PlacementPolicy) -> Result<()> {
         match (policy, self) {
             (PlacementPolicy::BackendLocal, Self::BackendLocal)
             | (PlacementPolicy::Host, Self::Host)
@@ -478,7 +520,7 @@ impl StateStorageFormat {
         }
     }
 
-    fn bytes_for_elements(self, elements: u64) -> Result<u64> {
+    pub(crate) fn bytes_for_elements(self, elements: u64) -> Result<u64> {
         match self {
             Self::Dense {
                 dtype: StateDType::F32,
@@ -499,7 +541,7 @@ impl StateStorageFormat {
         }
     }
 
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         match self {
             Self::Dense {
                 dtype: StateDType::Q4,
@@ -550,6 +592,13 @@ impl StateOperationRegistry for TestOperationRegistry {
 }
 
 #[cfg(test)]
+impl NonPagedStateOperationRegistry for TestOperationRegistry {
+    fn supports_non_paged(&self, _query: &NonPagedStateOperationQuery<'_>) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn test_plan(contract: &InferenceStateContract) -> ResolvedStatePlan {
     ResolvedStatePlan::build(
         BackendKind::Cpu,
@@ -578,6 +627,7 @@ pub(crate) fn test_plan(contract: &InferenceStateContract) -> ResolvedStatePlan 
                 decode: RegisteredOperationId::new("paged_attention_decode", OperationAbi::new(1)),
             },
         }],
+        vec![],
         &TestOperationRegistry,
     )
     .unwrap()
@@ -592,6 +642,12 @@ mod tests {
 
     impl StateOperationRegistry for RejectAllOperations {
         fn supports_paged_attention(&self, _query: &PagedAttentionOperationQuery<'_>) -> bool {
+            false
+        }
+    }
+
+    impl NonPagedStateOperationRegistry for RejectAllOperations {
+        fn supports_non_paged(&self, _query: &NonPagedStateOperationQuery<'_>) -> bool {
             false
         }
     }
@@ -611,6 +667,7 @@ mod tests {
                 layout: StatePhysicalLayout::PageHeadTokenDim,
                 ..first.paged_attention[0].clone()
             }],
+            vec![],
             &TestOperationRegistry,
         )
         .unwrap();
@@ -630,6 +687,7 @@ mod tests {
             None,
             &contract,
             vec![invalid_operation],
+            vec![],
             &TestOperationRegistry,
         )
         .is_err());
@@ -644,6 +702,7 @@ mod tests {
             None,
             &unsupported_semantics,
             valid.paged_attention.clone(),
+            vec![],
             &TestOperationRegistry,
         )
         .is_err());
@@ -653,6 +712,7 @@ mod tests {
             None,
             &contract,
             valid.paged_attention.clone(),
+            vec![],
             &RejectAllOperations,
         )
         .is_err());
@@ -664,6 +724,7 @@ mod tests {
             None,
             &contract,
             vec![invalid_bytes],
+            vec![],
             &TestOperationRegistry
         )
         .is_err());
@@ -677,6 +738,7 @@ mod tests {
             None,
             &contract,
             vec![invalid_storage],
+            vec![],
             &TestOperationRegistry
         )
         .is_err());
@@ -704,6 +766,7 @@ mod tests {
             None,
             &contract,
             vec![group],
+            vec![],
             &TestOperationRegistry,
         )
         .is_err());

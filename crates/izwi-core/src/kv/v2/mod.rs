@@ -9,7 +9,9 @@
 mod batch;
 mod capacity;
 mod contract;
+mod intent;
 mod resolved;
+mod resolved_domains;
 
 #[allow(unused_imports)]
 pub(crate) use batch::{
@@ -19,11 +21,11 @@ pub(crate) use batch::{
 #[allow(unused_imports)]
 pub(crate) use capacity::{
     AllocationReceipt, CapacityStrategy, GroupAllocationTotals, GroupCapacityPlan,
-    GroupCapacityRequest, GroupResourceQuery, ResidencyMeasurement, ResolvedGroupResourceEnvelope,
-    ResolvedWorkspaceResourceEnvelope, StateAllocationLedger, StateAllocationPlanId,
-    StateResourceRegistry, StateResourceVector, StateRuntimeAllocationPlan, WorkspaceAxis,
-    WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement, WorkspaceResourceQuery,
-    WorkspaceTerm,
+    GroupCapacityRequest, GroupResourceQuery, ResidencyMeasurement, ResolvedCapacityDomain,
+    ResolvedGroupResourceEnvelope, ResolvedWorkspaceResourceEnvelope, StateAllocationLedger,
+    StateAllocationPlanId, StateResourceRegistry, StateResourceVector, StateRuntimeAllocationPlan,
+    WorkspaceAxis, WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement,
+    WorkspaceResourceQuery, WorkspaceTerm,
 };
 #[allow(unused_imports)]
 pub(crate) use contract::{
@@ -37,10 +39,24 @@ pub(crate) use contract::{
     CURRENT_INFERENCE_STATE_ABI,
 };
 #[allow(unused_imports)]
+pub(crate) use intent::{
+    AdapterStateIntent, ComponentShapeInstantiation, DomainStepIntent, IntentResourceUsage,
+    PrefixIntent, ShapeDimensionValue, StateUpdateKind, WorkspaceDimensionValue,
+    WorkspaceShapeInstantiation,
+};
+#[allow(unused_imports)]
 pub(crate) use resolved::{
     OperationAbi, PagedAttentionOperationQuery, RegisteredOperationId, ResolvedPagedAttentionGroup,
     ResolvedPlacement, ResolvedStatePlan, StateOperationRegistry, StateOperationSet,
     StatePhysicalLayout, StatePlanFingerprint, StatePlanId, StateStorageFormat,
+};
+#[allow(unused_imports)]
+pub(crate) use resolved_domains::{
+    AppendStateOperationSet, NonPagedStateOperationQuery, NonPagedStateOperationRegistry,
+    ResolvedAppendStatePlan, ResolvedNonPagedDomainPlan, ResolvedRingStatePlan,
+    ResolvedStaticAttentionPlan, ResolvedStaticTensorPlan, ResolvedTensorComponent,
+    ResolvedTensorStatePlan, RingStateOperationSet, StaticAttentionOperationSet,
+    StaticTensorOperationSet, TensorPhysicalLayout, TensorStateOperationSet,
 };
 
 #[cfg(test)]

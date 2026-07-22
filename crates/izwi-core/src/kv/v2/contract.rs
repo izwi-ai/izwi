@@ -232,15 +232,31 @@ impl StateDomainSpec {
         }
     }
 
-    fn validate(&self) -> Result<()> {
-        match self {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let result = match self {
             Self::PagedAttention(spec) => spec.validate(),
             Self::StaticAttention(spec) => spec.validate(),
             Self::Tensor(spec) => spec.validate(),
             Self::Append(spec) => spec.validate(),
             Self::Ring(spec) => spec.validate(),
             Self::StaticTensor(spec) => spec.validate(),
+        };
+        result?;
+        match (self, self.prefix_policy()) {
+            (Self::PagedAttention(_), PrefixPolicy::CommittedSnapshots { .. }) => {
+                return Err(invalid(
+                    "paged attention requires physical-page prefix boundaries",
+                ));
+            }
+            (Self::PagedAttention(_), _) => {}
+            (_, PrefixPolicy::CommittedPages { .. }) => {
+                return Err(invalid(
+                    "committed-page prefix sharing is valid only for paged-attention domains",
+                ));
+            }
+            _ => {}
         }
+        Ok(())
     }
 }
 
@@ -511,10 +527,17 @@ impl ShapeExtent {
         }
     }
 
-    const fn max(self) -> u64 {
+    pub(crate) const fn max(self) -> u64 {
         match self {
             Self::Fixed { value } => value,
             Self::RuntimeBounded { max, .. } => max,
+        }
+    }
+
+    pub(crate) const fn accepts(self, value: u64) -> bool {
+        match self {
+            Self::Fixed { value: expected } => value == expected,
+            Self::RuntimeBounded { min, max } => value >= min && value <= max,
         }
     }
 }
@@ -531,7 +554,7 @@ pub(crate) struct BoundedShape {
 }
 
 impl BoundedShape {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.dimensions.is_empty() {
             return Err(invalid("bounded tensor shape has no dimensions"));
         }
@@ -548,6 +571,17 @@ impl BoundedShape {
                 .ok_or_else(|| invalid("bounded tensor shape element count overflow"))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn maximum_elements(&self) -> Result<u64> {
+        self.validate()?;
+        self.dimensions
+            .iter()
+            .try_fold(1_u64, |elements, dimension| {
+                elements
+                    .checked_mul(dimension.extent.max())
+                    .ok_or_else(|| invalid("bounded tensor shape element count overflow"))
+            })
     }
 }
 
@@ -846,11 +880,15 @@ impl AttentionPattern {
 pub(crate) enum PrefixPolicy {
     Disabled,
     CommittedPages { positions: PositionSemantics },
+    CommittedSnapshots { interval_steps: u64 },
 }
 
 impl PrefixPolicy {
     const fn is_shareable(&self) -> bool {
-        matches!(self, Self::CommittedPages { .. })
+        matches!(
+            self,
+            Self::CommittedPages { .. } | Self::CommittedSnapshots { .. }
+        )
     }
 
     fn validate(&self, scope: StateScope) -> Result<()> {
@@ -861,6 +899,11 @@ impl PrefixPolicy {
         }
         if let Self::CommittedPages { positions } = self {
             positions.validate()?;
+        }
+        if matches!(self, Self::CommittedSnapshots { interval_steps: 0 }) {
+            return Err(invalid(
+                "committed-snapshot prefix interval must be non-zero",
+            ));
         }
         Ok(())
     }
@@ -1151,6 +1194,32 @@ mod tests {
             unreachable!()
         };
         append.max_steps = 0;
+        assert!(contract.validate().is_err());
+    }
+
+    #[test]
+    fn composite_prefix_groups_join_pages_and_non_paged_snapshots() {
+        let mut contract = test_contract();
+        let mut tensor_header = header(
+            2,
+            StateScope::Retained,
+            StateClock::DecoderTokens,
+            CheckpointPolicy::Transactional,
+        );
+        tensor_header.prefix = PrefixPolicy::CommittedSnapshots { interval_steps: 8 };
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: tensor_header,
+                components: vec![component(1, TensorRole::RecurrentHidden)],
+            }));
+        contract.groups[0].domains.push(StateDomainId::new(2));
+        contract.validate().unwrap();
+
+        let StateDomainSpec::Tensor(tensor) = &mut contract.domains[1] else {
+            unreachable!()
+        };
+        tensor.header.prefix = PrefixPolicy::CommittedSnapshots { interval_steps: 0 };
         assert!(contract.validate().is_err());
     }
 }
