@@ -818,6 +818,7 @@ mod tests {
                     stage_graph_fingerprint: graph,
                     stages: vec![InvocationStageWorkspace {
                         stage: execution.stages[0].id,
+                        lease_scope: super::super::InvocationLeaseScope::PerStageBatch,
                         groups: vec![StateGroupSpec {
                             id: StateGroupId::new(1),
                             domains: vec![StateDomainId::new(1)],

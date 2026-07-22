@@ -50,11 +50,21 @@ pub(crate) struct InvocationWorkspaceProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InvocationStageWorkspace {
     pub(crate) stage: StageId,
+    /// One pool slot can cover the whole serialized worker stage, or each row
+    /// in its maximum physical batch can require an isolated state instance.
+    pub(crate) lease_scope: InvocationLeaseScope,
     /// Explicit consistency groups for typed state domains in this stage.
     /// Scratch domains do not participate in state commit groups.
     pub(crate) groups: Vec<StateGroupSpec>,
     /// Empty is an affirmative zero-workspace declaration for this stage.
     pub(crate) domains: Vec<InvocationWorkspaceDomain>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvocationLeaseScope {
+    PerStageBatch,
+    PerRow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +210,7 @@ impl CapabilityStateDescriptorV2 {
                     .collect();
                 invocation_stages.push(InvocationStageWorkspace {
                     stage: stage.id,
+                    lease_scope: InvocationLeaseScope::PerStageBatch,
                     groups: Vec::new(),
                     domains,
                 });
@@ -378,7 +389,7 @@ impl InvocationWorkspaceProfile {
                 .iter()
                 .find(|candidate| candidate.id == stage.stage)
                 .expect("execution stage membership was checked");
-            let maximum = stage.validate()?;
+            let maximum = stage.validate(execution.max_batch_size)?;
             if maximum != execution.max_workspace_bytes {
                 return Err(invalid(
                     "invocation workspace formula disagrees with the loaded execution stage",
@@ -390,7 +401,15 @@ impl InvocationWorkspaceProfile {
 }
 
 impl InvocationStageWorkspace {
-    fn validate(&self) -> Result<u64> {
+    pub(crate) fn slot_count(&self, max_batch_size: usize) -> Result<u32> {
+        match self.lease_scope {
+            InvocationLeaseScope::PerStageBatch => Ok(1),
+            InvocationLeaseScope::PerRow => u32::try_from(max_batch_size)
+                .map_err(|_| invalid("invocation workspace row count exceeds u32")),
+        }
+    }
+
+    fn validate(&self, max_batch_size: usize) -> Result<u64> {
         let mut previous = None;
         let mut maximum = 0_u64;
         let mut typed_domains = Vec::new();
@@ -423,7 +442,9 @@ impl InvocationStageWorkspace {
             }
             .validate()?;
         }
-        Ok(maximum)
+        maximum
+            .checked_mul(u64::from(self.slot_count(max_batch_size)?))
+            .ok_or_else(|| invalid("invocation workspace aggregate byte bound overflow"))
     }
 }
 
@@ -776,6 +797,7 @@ mod tests {
                 stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
+                    lease_scope: InvocationLeaseScope::PerStageBatch,
                     groups: workspace_groups(),
                     domains: vec![workspace_domain()],
                 }],
@@ -784,6 +806,7 @@ mod tests {
                 stage_graph_fingerprint: stage_graph_fingerprint(&[stage(64)]).unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
+                    lease_scope: InvocationLeaseScope::PerStageBatch,
                     groups: workspace_groups(),
                     domains: vec![second_domain],
                 }],
@@ -834,6 +857,30 @@ mod tests {
     }
 
     #[test]
+    fn per_row_workspace_charges_every_possible_physical_row() {
+        let execution = stage(192 * 4);
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::Bounded {
+                profiles: vec![InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[execution.clone()]).unwrap(),
+                    stages: vec![InvocationStageWorkspace {
+                        stage: StageId::new(1),
+                        lease_scope: InvocationLeaseScope::PerRow,
+                        groups: workspace_groups(),
+                        domains: vec![workspace_domain()],
+                    }],
+                }],
+            },
+        };
+        descriptor
+            .validate_against_stages(&[execution])
+            .expect("four rows require four isolated workspace slots");
+        assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
+    }
+
+    #[test]
     fn missing_workspace_and_wrong_lifetime_fail_closed() {
         let none = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
@@ -860,6 +907,7 @@ mod tests {
                     stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
+                        lease_scope: InvocationLeaseScope::PerStageBatch,
                         groups: workspace_groups(),
                         domains: vec![wrong],
                     }],
@@ -885,6 +933,7 @@ mod tests {
                     stage_graph_fingerprint: stage_graph_fingerprint(&[stage(15)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
+                        lease_scope: InvocationLeaseScope::PerStageBatch,
                         groups: workspace_groups(),
                         domains: vec![undersized],
                     }],
@@ -904,6 +953,7 @@ mod tests {
                     stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
+                        lease_scope: InvocationLeaseScope::PerStageBatch,
                         groups: Vec::new(),
                         domains: vec![workspace_domain()],
                     }],
@@ -925,6 +975,7 @@ mod tests {
                     stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
+                        lease_scope: InvocationLeaseScope::PerStageBatch,
                         groups: workspace_groups(),
                         domains: vec![wrong_capacity],
                     }],
