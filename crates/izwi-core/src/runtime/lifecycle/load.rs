@@ -314,6 +314,11 @@ impl ModelLifecycleController {
         }
 
         let publication = async {
+            // Adapter factories are one-shot. Freeze their exact identities
+            // and selectable stage graphs before model-derived state planning
+            // or any physical state allocation can occur.
+            let bundle_draft =
+                self.draft_loaded_model_bundle(variant, model_instance_id)?;
             // This is the first operation allowed to allocate model tensors;
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
@@ -391,7 +396,8 @@ impl ModelLifecycleController {
                     }
                 }
             }
-            self.bind_loaded_model_bundle_with_state_publications(
+            self.bind_loaded_model_bundle_draft(
+                bundle_draft,
                 variant,
                 model_instance_id,
                 state_publications,

@@ -15,7 +15,8 @@ use crate::engine::{Engine as CoreEngine, ModelInstanceId, ResourceLease, Resour
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::runtime::adapters::{
-    CapabilityKind, LoadedModelBundle, LoadedStatePublication, RuntimeAdapterRegistry,
+    CapabilityKind, LoadedModelBundle, LoadedModelBundleDraft, LoadedStatePublication,
+    RuntimeAdapterRegistry,
 };
 use crate::runtime::coordinator::InferenceCoordinator;
 use crate::runtime_models::ModelRegistry;
@@ -295,14 +296,56 @@ impl ModelLifecycleController {
         model_instance_id: ModelInstanceId,
         state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
     ) -> Result<Arc<LoadedModelBundle>> {
-        let bundle = Arc::new(LoadedModelBundle::bind_with_state_publications(
+        let draft = self.draft_loaded_model_bundle(variant, model_instance_id)?;
+        self.bind_loaded_model_bundle_draft(draft, variant, model_instance_id, state_publications)
+    }
+
+    /// Freeze the exact adapter instances and every selectable stage graph
+    /// before model-derived physical state is planned or allocated.
+    pub(super) fn draft_loaded_model_bundle(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<LoadedModelBundleDraft> {
+        let state = self.state();
+        let slot = state.residents.get(&variant).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "model {variant} lost its resource lease before adapter drafting"
+            ))
+        })?;
+        if slot.phase != ResidentPhase::Loading || slot.model_instance_id != model_instance_id {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} changed lifecycle identity before adapter drafting"
+            )));
+        }
+        if slot.bundle.is_some() {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} already has a loaded execution bundle"
+            )));
+        }
+        drop(state);
+        LoadedModelBundleDraft::build(
             &self.adapter_registry,
             self.coordinator.execution_group_id(),
             model_instance_id,
             variant,
             self.backend_router.context().backend_kind,
-            state_publications,
-        )?);
+        )
+    }
+
+    pub(super) fn bind_loaded_model_bundle_draft(
+        &self,
+        draft: LoadedModelBundleDraft,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+        state_publications: HashMap<CapabilityKind, LoadedStatePublication>,
+    ) -> Result<Arc<LoadedModelBundle>> {
+        let bundle = Arc::new(draft.seal(state_publications)?);
+        if bundle.model_instance_id() != model_instance_id || bundle.model_variant() != variant {
+            return Err(Error::ModelLoadError(format!(
+                "model {variant} draft sealed a different lifecycle identity"
+            )));
+        }
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(

@@ -18,7 +18,7 @@ mod loaded;
 
 pub(crate) use loaded::{
     CapabilityStateBinding, LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle,
-    LoadedStatePublication, StreamingRequirements,
+    LoadedModelBundleDraft, LoadedStatePublication, StreamingRequirements,
 };
 
 #[allow(dead_code)]
