@@ -11,9 +11,12 @@ mod talker;
 mod tokenizer;
 
 pub use config::Qwen3TtsConfig;
-pub use predictor::{CodePredictor, CodePredictorCache};
+pub use predictor::{
+    CodePredictor, CodePredictorCache, CodePredictorPhysicalCache,
+    CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
+};
 pub use speech_tokenizer::SpeechTokenizerDecoder;
-pub use talker::{TalkerCache, TalkerModel};
+pub use talker::{TalkerCache, TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
 use candle_core::{DType, IndexOp, Tensor, D};

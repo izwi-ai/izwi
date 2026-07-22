@@ -22,8 +22,14 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, repeat_kv, KvCacheQuantization, KvPage,
 };
+pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as CodePredictorPhysicalCache;
+use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
+
+/// The predictor starts each semantic frame from talker hidden state followed
+/// by the selected semantic embedding.
+pub const CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS: usize = 2;
 
 /// KV Cache for the code predictor
 pub struct CodePredictorCache {
@@ -227,6 +233,15 @@ impl CodePredictor {
         self.codec_embeddings.len()
     }
 
+    /// Exact physical KV capacity required by one predictor invocation.
+    ///
+    /// The two-token prefill produces the first acoustic code. Each remaining
+    /// acoustic group appends one dependent token, so a standard 15-group
+    /// predictor ends at cursor 16.
+    pub fn physical_context_tokens_per_frame(&self) -> usize {
+        CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS.saturating_add(self.lm_heads.len().saturating_sub(1))
+    }
+
     /// Forward pass to predict all code groups from first codebook
     pub fn forward(
         &self,
@@ -256,6 +271,31 @@ impl CodePredictor {
             outputs.push(logits);
         }
 
+        Ok(outputs)
+    }
+
+    /// Forward a predictor input against scheduler-owned invocation pages.
+    ///
+    /// This mirrors [`Self::forward`] while keeping K/V in the backend arena.
+    /// The supplied start position must be the workspace's exact cursor.
+    pub fn forward_physical(
+        &self,
+        first_codebook: &Tensor,
+        start_pos: usize,
+        cache: &mut CodePredictorPhysicalCache,
+    ) -> Result<Vec<Tensor>> {
+        let mut x = self.codec_embeddings[0].forward(first_codebook)?;
+        if let Some(proj) = &self.small_to_mtp_projection {
+            x = proj.forward(&x)?;
+        }
+
+        let sequence_len = x.dim(1)?;
+        let x = self.forward_physical_hidden_uncommitted(&x, start_pos, cache)?;
+        let mut outputs = Vec::with_capacity(self.num_code_groups);
+        for head in &self.lm_heads {
+            outputs.push(head.forward(&x)?);
+        }
+        cache.commit_append(start_pos, sequence_len)?;
         Ok(outputs)
     }
 
@@ -317,6 +357,138 @@ impl CodePredictor {
         }
 
         Ok(all_codes)
+    }
+
+    /// Generate one frame's acoustic groups using a fresh physical workspace.
+    ///
+    /// The workspace is invocation-local: callers must provide cursor 0 for
+    /// every semantic frame and discard it on error. Successful generation
+    /// advances the cursor from 0 to [`Self::physical_context_tokens_per_frame`].
+    pub fn generate_acoustic_codes_physical(
+        &self,
+        talker_hidden: &Tensor,
+        semantic_embed: &Tensor,
+        cache: &mut CodePredictorPhysicalCache,
+    ) -> Result<Vec<u32>> {
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor requires a fresh cursor-0 workspace, got {}",
+                cache.context_len()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        let required_tokens = self.physical_context_tokens_per_frame();
+        if cache.capacity_tokens() < required_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor workspace holds {} tokens, requires {required_tokens}",
+                cache.capacity_tokens()
+            )));
+        }
+
+        let (talker_batch, talker_tokens, talker_dim) = talker_hidden.dims3()?;
+        let (semantic_batch, semantic_tokens, semantic_dim) = semantic_embed.dims3()?;
+        if talker_batch != 1
+            || talker_tokens != 1
+            || semantic_batch != 1
+            || semantic_tokens != 1
+            || talker_dim != semantic_dim
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor expects matching [1,1,hidden] inputs, got {:?} and {:?}",
+                talker_hidden.dims(),
+                semantic_embed.dims()
+            )));
+        }
+
+        let input = Tensor::cat(&[talker_hidden, semantic_embed], 1)?;
+        let mut hidden = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(&input)?
+        } else {
+            input
+        };
+        let prefill_tokens = hidden.dim(1)?;
+        if prefill_tokens != CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS physical predictor formed {prefill_tokens} prefill tokens, expected {CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS}"
+            )));
+        }
+        hidden = self.forward_physical_hidden_uncommitted(&hidden, 0, cache)?;
+
+        let last_hidden = hidden.i((.., prefill_tokens - 1..prefill_tokens, ..))?;
+        let num_acoustic = self.lm_heads.len();
+        if num_acoustic == 0 {
+            cache.commit_append(0, prefill_tokens)?;
+            return Ok(Vec::new());
+        }
+
+        let first_logits = self.lm_heads[0].forward(&last_hidden)?;
+        let mut prev_code = argmax_token(&first_logits.i((0, 0))?)?;
+        cache.commit_append(0, prefill_tokens)?;
+
+        let mut all_codes = Vec::with_capacity(num_acoustic);
+        all_codes.push(prev_code);
+        for group_idx in 1..num_acoustic {
+            let mut step_hidden = self
+                .codec_embedding_row(group_idx - 1, prev_code)?
+                .unsqueeze(0)?;
+            if let Some(proj) = &self.small_to_mtp_projection {
+                step_hidden = proj.forward(&step_hidden)?;
+            }
+
+            let step_start = cache.context_len();
+            step_hidden =
+                self.forward_physical_hidden_uncommitted(&step_hidden, step_start, cache)?;
+            let logits = self.lm_heads[group_idx].forward(&step_hidden)?;
+            prev_code = argmax_token(&logits.i((0, 0))?)?;
+            cache.commit_append(step_start, 1)?;
+            all_codes.push(prev_code);
+        }
+
+        if cache.context_len() != required_tokens {
+            return Err(Error::InferenceError(format!(
+                "Qwen3-TTS physical predictor ended at cursor {}, expected {required_tokens}",
+                cache.context_len()
+            )));
+        }
+        Ok(all_codes)
+    }
+
+    fn forward_physical_hidden_uncommitted(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        cache: &CodePredictorPhysicalCache,
+    ) -> Result<Tensor> {
+        let (batch_size, sequence_len, hidden_size) = x.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor expects [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                x.dims()
+            )));
+        }
+        if start_pos != cache.context_len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor starts at {start_pos}, expected invocation cursor {}",
+                cache.context_len()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        let prepared = cache.prepare_append(start_pos, sequence_len)?;
+
+        let mut hidden = x.clone();
+        for (idx, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward_physical(&hidden, start_pos, cache, &prepared, idx)?;
+        }
+        self.norm.forward(&hidden).map_err(Error::from)
     }
 
     /// Sum acoustic embeddings for the 15 generated acoustic codes.
@@ -401,6 +573,25 @@ impl Layer {
         let x = x.broadcast_add(&attn_out)?;
 
         // MLP with residual
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_physical(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        cache: &CodePredictorPhysicalCache,
+        prepared: &PreparedPhysicalPagedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self
+            .self_attn
+            .forward_physical(&normed, start_pos, cache, prepared, layer_idx)?;
+        let x = x.broadcast_add(&attn_out)?;
+
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
@@ -637,6 +828,62 @@ impl Attention {
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
 
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
+
+    /// Direct grouped-query attention over scheduler-owned predictor pages.
+    fn forward_physical(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        cache: &CodePredictorPhysicalCache,
+        prepared: &PreparedPhysicalPagedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (bsz, seq_len, _) = x.dims3()?;
+        if bsz != 1 || seq_len == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical predictor attention expects [1,sequence,hidden], got {:?}",
+                x.dims()
+            )));
+        }
+
+        let mut q =
+            self.q_proj
+                .forward(x)?
+                .reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let mut k =
+            self.k_proj
+                .forward(x)?
+                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v =
+            self.v_proj
+                .forward(x)?
+                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+
+        q = self.apply_qk_norm(q, self.num_heads, seq_len, &self.q_norm)?;
+        k = self.apply_qk_norm(k, self.num_kv_heads, seq_len, &self.k_norm)?;
+        q = self.apply_rope(q, start_pos)?;
+        k = self.apply_rope(k, start_pos)?;
+
+        let q = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let k = k
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let v = v
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let out = cache.write_and_attend(
+            layer_idx,
+            prepared,
+            &q,
+            &k,
+            &v,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
 }

@@ -22,6 +22,8 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, repeat_kv, KvCacheQuantization, KvPage,
 };
+pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as TalkerPhysicalCache;
+use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 
@@ -424,6 +426,67 @@ impl Attention {
         // Output projection
         self.o_proj.forward(&out).map_err(Error::from)
     }
+
+    /// Execute this layer against scheduler-owned physical pages.
+    ///
+    /// Q/K/V stay in grouped-query layout and are written directly into the
+    /// prepared slots. The backend consumes the page table without rebuilding
+    /// dense K/V tensors or expanding KV heads with `repeat_kv`.
+    fn forward_physical(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: &TalkerPhysicalCache,
+        prepared: &PreparedPhysicalPagedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let (bsz, seq_len, _) = x.dims3()?;
+        if bsz != 1 || seq_len == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker attention expects [1,sequence,hidden], got {:?}",
+                x.dims()
+            )));
+        }
+
+        let mut q =
+            self.q_proj
+                .forward(x)?
+                .reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
+        let mut k =
+            self.k_proj
+                .forward(x)?
+                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let v =
+            self.v_proj
+                .forward(x)?
+                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
+
+        q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
+        k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
+        q = self.apply_rope(q, start_pos, position_ids)?;
+        k = self.apply_rope(k, start_pos, position_ids)?;
+
+        let q = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let k = k
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let v = v
+            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let out = cache.write_and_attend(
+            layer_idx,
+            prepared,
+            &q,
+            &k,
+            &v,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
 }
 
 /// SwiGLU MLP
@@ -502,6 +565,31 @@ impl Layer {
         let x = x.broadcast_add(&attn_out)?;
 
         // MLP with residual
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_physical(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        cache: &TalkerPhysicalCache,
+        prepared: &PreparedPhysicalPagedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_physical(
+            &normed,
+            start_pos,
+            position_ids,
+            cache,
+            prepared,
+            layer_idx,
+        )?;
+        let x = x.broadcast_add(&attn_out)?;
+
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
         x.broadcast_add(&mlp_out).map_err(Error::from)
@@ -608,6 +696,17 @@ impl TalkerModel {
         self.forward_with_embeds(&embeds, start_pos, cache, None)
     }
 
+    /// Forward token IDs against scheduler-owned retained talker pages.
+    pub fn forward_physical(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        cache: &mut TalkerPhysicalCache,
+    ) -> Result<Tensor> {
+        let embeds = self.embeddings(input_ids)?;
+        self.forward_physical_with_embeds(&embeds, start_pos, cache, None)
+    }
+
     /// Get embeddings for token IDs
     /// Uses text_embedding for text tokens and codec_embedding for codec tokens
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -673,6 +772,19 @@ impl TalkerModel {
         Ok(logits)
     }
 
+    /// Forward pre-computed embeddings against retained physical talker pages.
+    pub fn forward_physical_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut TalkerPhysicalCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (_hidden, logits) =
+            self.forward_physical_with_embeds_and_hidden(embeds, start_pos, cache, position_ids)?;
+        Ok(logits)
+    }
+
     /// Forward pass with pre-computed embeddings, returning both hidden states and logits.
     pub fn forward_with_embeds_and_hidden(
         &self,
@@ -688,6 +800,49 @@ impl TalkerModel {
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.lm_head.forward(&hidden)?;
+        Ok((hidden, logits))
+    }
+
+    /// Physical-cache counterpart of [`Self::forward_with_embeds_and_hidden`].
+    ///
+    /// `start_pos` must equal the cache's authoritative cursor. Every layer
+    /// writes the same prepared slots, and the cursor advances only after all
+    /// layers, final normalization, and the language-model head succeed.
+    pub fn forward_physical_with_embeds_and_hidden(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut TalkerPhysicalCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker expects [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        if start_pos != cache.context_len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker starts at {start_pos}, expected retained cursor {}",
+                cache.context_len()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        let prepared = cache.prepare_append(start_pos, sequence_len)?;
+
+        let mut x = embeds.clone();
+        for (idx, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_physical(&x, start_pos, position_ids, cache, &prepared, idx)?;
+        }
+        let hidden = self.norm.forward(&x)?;
+        let logits = self.lm_head.forward(&hidden)?;
+        cache.commit_append(start_pos, sequence_len)?;
         Ok((hidden, logits))
     }
 
@@ -707,6 +862,27 @@ impl TalkerModel {
         Ok((last_hidden, last_logits))
     }
 
+    /// Prefill a fresh retained physical talker cache.
+    pub fn prefill_physical_with_embeds(
+        &self,
+        embeds: &Tensor,
+        cache: &mut TalkerPhysicalCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker prefill requires cursor 0, got {}",
+                cache.context_len()
+            )));
+        }
+        let (hidden, logits) =
+            self.forward_physical_with_embeds_and_hidden(embeds, 0, cache, position_ids)?;
+        let seq_len = hidden.dim(1)?;
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let last_logits = logits.i((.., seq_len - 1..seq_len, ..))?;
+        Ok((last_hidden, last_logits))
+    }
+
     /// Incremental generation step from an externally assembled single-step embedding.
     /// Returns (hidden, logits) for the provided step; shapes are [1, 1, ...].
     pub fn generate_step_with_embed(
@@ -716,6 +892,24 @@ impl TalkerModel {
         offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         self.forward_with_embeds_and_hidden(input_embed, offset, Some(cache), None)
+    }
+
+    /// Append one generation token at the retained physical cursor.
+    pub fn generate_physical_step_with_embed(
+        &self,
+        input_embed: &Tensor,
+        cache: &mut TalkerPhysicalCache,
+    ) -> Result<(Tensor, Tensor)> {
+        let (batch_size, sequence_len, hidden_size) = input_embed.dims3()?;
+        if batch_size != 1 || sequence_len != 1 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS physical talker step expects [1,1,{}], got {:?}",
+                self.cfg.hidden_size,
+                input_embed.dims()
+            )));
+        }
+        let start_pos = cache.context_len();
+        self.forward_physical_with_embeds_and_hidden(input_embed, start_pos, cache, None)
     }
 
     /// Get projected text embeddings for a sequence of token IDs.
