@@ -133,9 +133,20 @@ impl CapabilityStateDescriptorV2 {
         contract: InferenceStateContract,
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<Self> {
+        Self::for_stage_graphs(RetainedStateCapability::Managed { contract }, stage_graphs)
+    }
+
+    pub(crate) fn stateless_for_stage_graphs(stage_graphs: &[&[StageDescriptor]]) -> Result<Self> {
+        Self::for_stage_graphs(RetainedStateCapability::Stateless, stage_graphs)
+    }
+
+    fn for_stage_graphs(
+        retained: RetainedStateCapability,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Self> {
         if stage_graphs.is_empty() {
             return Err(invalid(
-                "managed capability must seal at least one execution stage graph",
+                "capability must seal at least one execution stage graph",
             ));
         }
         let mut profiles = Vec::with_capacity(stage_graphs.len());
@@ -220,12 +231,12 @@ impl CapabilityStateDescriptorV2 {
             InvocationWorkspaceSet::Bounded { profiles }
         } else {
             return Err(invalid(
-                "managed execution graphs disagree on whether physical workspace exists",
+                "execution graphs disagree on whether physical workspace exists",
             ));
         };
         let descriptor = Self {
             abi: CURRENT_INFERENCE_STATE_ABI,
-            retained: RetainedStateCapability::Managed { contract },
+            retained,
             invocation,
         };
         for stages in stage_graphs {

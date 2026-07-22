@@ -237,12 +237,6 @@ impl LoadedCapabilityDescriptor {
                     ));
                 }
                 for contract in &contracts {
-                    if !descriptor.has_zero_invocation_workspace_for(&contract.stages)? {
-                        return Err(Error::ModelLoadError(
-                            "stateless state ABI v2 cannot publish bounded physical workspace"
-                                .to_string(),
-                        ));
-                    }
                     if contract.execution_profile.cache_mode != CacheMode::None
                         || contract.execution_profile.cache_namespace.is_some()
                         || contract.execution_profile.kv_dtype != "none"

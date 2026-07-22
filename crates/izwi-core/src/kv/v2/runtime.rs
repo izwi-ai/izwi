@@ -71,10 +71,9 @@ impl CapabilityRuntimeIdentityV2 {
     }
 }
 
-/// Immutable request-selectable proof that one exact loaded capability needs
-/// neither retained physical state nor invocation workspace for this stage
-/// graph. Stateful runtime variants are added only with backend-owned storage
-/// and allocation receipts; descriptor metadata alone is never a runtime.
+/// Immutable request-selectable proof that one exact loaded capability has no
+/// retained session state. Its invocation workspace may still be bounded by
+/// the descriptor and is leased by the engine's physical-batch authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StatelessCapabilityRuntimeV2 {
     pub(crate) id: [u8; 32],
@@ -289,11 +288,9 @@ impl StatelessCapabilityRuntimeV2 {
     ) -> Result<Self> {
         execution.validate()?;
         descriptor.validate_against_stages(&execution.stages)?;
-        if !descriptor.is_stateless()
-            || !descriptor.has_zero_invocation_workspace_for(&execution.stages)?
-        {
+        if !descriptor.is_stateless() {
             return Err(invalid(
-                "only stateless zero-workspace state ABI v2 capabilities can be sealed without a physical backend runtime",
+                "stateless state ABI v2 runtime cannot seal retained physical state",
             ));
         }
         let stage_graph_fingerprint = stage_graph_fingerprint(&execution.stages)?;
@@ -320,9 +317,6 @@ impl StatelessCapabilityRuntimeV2 {
         if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
             || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
             || !self.descriptor.is_stateless()
-            || !self
-                .descriptor
-                .has_zero_invocation_workspace_for(&execution.stages)?
             || self.id != self.compute_id()?
         {
             return Err(invalid(
@@ -435,5 +429,21 @@ mod tests {
         assert!(runtime
             .validate_against(BackendKind::Cpu, &changed)
             .is_err());
+    }
+
+    #[test]
+    fn stateless_runtime_seals_bounded_invocation_workspace() {
+        let mut binding = binding();
+        Arc::make_mut(&mut binding.stages)[0].max_workspace_bytes = 4096;
+        let descriptor =
+            CapabilityStateDescriptorV2::stateless_for_stage_graphs(&[binding.stages.as_ref()])
+                .unwrap();
+        assert!(!descriptor
+            .has_zero_invocation_workspace_for(&binding.stages)
+            .unwrap());
+        StatelessCapabilityRuntimeV2::seal(BackendKind::Cpu, &binding, descriptor)
+            .unwrap()
+            .validate_against(BackendKind::Cpu, &binding)
+            .unwrap();
     }
 }
