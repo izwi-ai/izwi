@@ -438,7 +438,7 @@ impl Attention {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: &TalkerPhysicalCache,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let (bsz, seq_len, _) = x.dims3()?;
@@ -576,7 +576,7 @@ impl Layer {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: &TalkerPhysicalCache,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
@@ -834,15 +834,15 @@ impl TalkerModel {
             self.cfg.num_key_value_heads,
             self.cfg.head_dim(),
         )?;
-        let prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
 
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_physical(&x, start_pos, position_ids, cache, &prepared, idx)?;
+            x = layer.forward_physical(&x, start_pos, position_ids, cache, &mut prepared, idx)?;
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.lm_head.forward(&hidden)?;
-        cache.commit_append(start_pos, sequence_len)?;
+        cache.commit_prepared(prepared)?;
         Ok((hidden, logits))
     }
 

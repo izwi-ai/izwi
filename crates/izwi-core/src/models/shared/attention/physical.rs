@@ -6,7 +6,8 @@ use std::sync::Arc;
 use candle_core::Tensor;
 
 use crate::backends::kv::{
-    KvArena, KvSlotMap, KvWriteArgs, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+    KvArena, KvSlotMap, KvWriteArgs, KvWriteBatchCompletion, KvWriteCompletionCollector,
+    PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
 };
 use crate::error::{Error, Result};
 use crate::kv::{
@@ -23,6 +24,7 @@ pub(crate) struct PreparedPhysicalPagedStep {
     slots: Arc<dyn KvSlotMap>,
     decode: KvDecodeBatchMetadata,
     prefill: Vec<PagedKvPrefillRow>,
+    completions: KvWriteCompletionCollector,
 }
 
 /// A generation-pinned logical block table over one physical paged-attention
@@ -33,6 +35,7 @@ pub struct PhysicalPagedKvCache {
     pub(crate) blocks: Vec<CacheBlockRef>,
     window_start: usize,
     context_len: usize,
+    completed_writes: Vec<Arc<KvWriteBatchCompletion>>,
 }
 
 impl PhysicalPagedKvCache {
@@ -117,6 +120,7 @@ impl PhysicalPagedKvCache {
             blocks,
             window_start,
             context_len,
+            completed_writes: Vec::new(),
         })
     }
 
@@ -260,6 +264,8 @@ impl PhysicalPagedKvCache {
         let table = self.sequence_table(end_pos)?;
         let query_len = u32::try_from(token_count)
             .map_err(|_| Error::InvalidInput("physical paged query length exceeds u32".into()))?;
+        let completions =
+            KvWriteCompletionCollector::new(self.arena.config(), slots.logical_slots())?;
         Ok(PreparedPhysicalPagedStep {
             arena: self.arena.id(),
             start_pos,
@@ -275,6 +281,7 @@ impl PhysicalPagedKvCache {
                 query_len,
                 context_len: table.context_len,
             }],
+            completions,
         })
     }
 
@@ -288,7 +295,7 @@ impl PhysicalPagedKvCache {
     pub(crate) fn write_and_attend(
         &self,
         layer_idx: usize,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         queries: &Tensor,
         keys: &Tensor,
         values: &Tensor,
@@ -326,9 +333,8 @@ impl PhysicalPagedKvCache {
                 "physical paged write returned a mismatched backend completion".into(),
             ));
         }
-        if !completion.is_complete() {
-            completion.wait()?;
-        }
+        completion.wait()?;
+        prepared.completions.collect(completion)?;
 
         if token_count == 1 {
             return self.arena.paged_decode(
@@ -351,9 +357,43 @@ impl PhysicalPagedKvCache {
         )
     }
 
-    pub(crate) fn commit_append(&mut self, start_pos: usize, token_count: usize) -> Result<()> {
-        self.slots_for_append(start_pos, token_count)?;
-        self.context_len += token_count;
+    pub(crate) fn commit_prepared(&mut self, prepared: PreparedPhysicalPagedStep) -> Result<()> {
+        if prepared.arena != self.arena.id() || prepared.start_pos != self.context_len {
+            return Err(Error::InvalidInput(
+                "physical paged commit received a stale prepared step".into(),
+            ));
+        }
+        let completion = Arc::new(prepared.completions.seal()?);
+        self.commit_shared_completion(prepared.start_pos, prepared.token_count, completion)
+    }
+
+    pub(crate) fn commit_shared_completion(
+        &mut self,
+        start_pos: usize,
+        token_count: usize,
+        completion: Arc<KvWriteBatchCompletion>,
+    ) -> Result<()> {
+        let expected = self.slots_for_append(start_pos, token_count)?;
+        if completion.arena() != self.arena.id()
+            || completion.layers() != self.layer_bindings.as_slice()
+            || completion.page_tokens() != self.arena.config().page_tokens
+            || expected
+                .iter()
+                .any(|slot| !completion.slots().contains(slot))
+        {
+            return Err(Error::InferenceError(
+                "physical paged completion does not authenticate this append".into(),
+            ));
+        }
+        self.context_len = self
+            .context_len
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
+        self.completed_writes.push(completion);
         Ok(())
+    }
+
+    pub(crate) fn take_completed_writes(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
+        std::mem::take(&mut self.completed_writes)
     }
 }

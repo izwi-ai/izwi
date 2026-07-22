@@ -289,13 +289,12 @@ impl CodePredictor {
             x = proj.forward(&x)?;
         }
 
-        let sequence_len = x.dim(1)?;
-        let x = self.forward_physical_hidden_uncommitted(&x, start_pos, cache)?;
+        let (x, prepared) = self.forward_physical_hidden_uncommitted(&x, start_pos, cache)?;
         let mut outputs = Vec::with_capacity(self.num_code_groups);
         for head in &self.lm_heads {
             outputs.push(head.forward(&x)?);
         }
-        cache.commit_append(start_pos, sequence_len)?;
+        cache.commit_prepared(prepared)?;
         Ok(outputs)
     }
 
@@ -416,18 +415,19 @@ impl CodePredictor {
                 "Qwen3-TTS physical predictor formed {prefill_tokens} prefill tokens, expected {CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS}"
             )));
         }
-        hidden = self.forward_physical_hidden_uncommitted(&hidden, 0, cache)?;
+        let (next_hidden, prefill) = self.forward_physical_hidden_uncommitted(&hidden, 0, cache)?;
+        hidden = next_hidden;
 
         let last_hidden = hidden.i((.., prefill_tokens - 1..prefill_tokens, ..))?;
         let num_acoustic = self.lm_heads.len();
         if num_acoustic == 0 {
-            cache.commit_append(0, prefill_tokens)?;
+            cache.commit_prepared(prefill)?;
             return Ok(Vec::new());
         }
 
         let first_logits = self.lm_heads[0].forward(&last_hidden)?;
         let mut prev_code = argmax_token(&first_logits.i((0, 0))?)?;
-        cache.commit_append(0, prefill_tokens)?;
+        cache.commit_prepared(prefill)?;
 
         let mut all_codes = Vec::with_capacity(num_acoustic);
         all_codes.push(prev_code);
@@ -440,11 +440,12 @@ impl CodePredictor {
             }
 
             let step_start = cache.context_len();
-            step_hidden =
+            let (next_hidden, step_prepared) =
                 self.forward_physical_hidden_uncommitted(&step_hidden, step_start, cache)?;
+            step_hidden = next_hidden;
             let logits = self.lm_heads[group_idx].forward(&step_hidden)?;
             prev_code = argmax_token(&logits.i((0, 0))?)?;
-            cache.commit_append(step_start, 1)?;
+            cache.commit_prepared(step_prepared)?;
             all_codes.push(prev_code);
         }
 
@@ -462,7 +463,7 @@ impl CodePredictor {
         x: &Tensor,
         start_pos: usize,
         cache: &CodePredictorPhysicalCache,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
         let (batch_size, sequence_len, hidden_size) = x.dims3()?;
         if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
             return Err(Error::InvalidInput(format!(
@@ -482,13 +483,14 @@ impl CodePredictor {
             self.cfg.num_key_value_heads,
             self.cfg.head_dim(),
         )?;
-        let prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
 
         let mut hidden = x.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward_physical(&hidden, start_pos, cache, &prepared, idx)?;
+            hidden = layer.forward_physical(&hidden, start_pos, cache, &mut prepared, idx)?;
         }
-        self.norm.forward(&hidden).map_err(Error::from)
+        let hidden = self.norm.forward(&hidden)?;
+        Ok((hidden, prepared))
     }
 
     /// Sum acoustic embeddings for the 15 generated acoustic codes.
@@ -583,7 +585,7 @@ impl Layer {
         x: &Tensor,
         start_pos: usize,
         cache: &CodePredictorPhysicalCache,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
@@ -837,7 +839,7 @@ impl Attention {
         x: &Tensor,
         start_pos: usize,
         cache: &CodePredictorPhysicalCache,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let (bsz, seq_len, _) = x.dims3()?;

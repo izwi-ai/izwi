@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::BackendKind;
 use crate::engine::cache::coordinator::GroupBlockTable;
 use crate::error::{Error, Result};
-use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId};
+use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvSlotRef};
 use crate::model::ModelVariant;
 
 use super::resources::{ResourceEstimate, ResourceVector};
@@ -973,9 +974,98 @@ impl ManagedCacheReservation {
         Ok(())
     }
 
-    /// Build the exact acknowledgement after the backend has completed and
-    /// fenced every write in this reservation.
-    pub fn completed_write_receipt(&self) -> ManagedCacheReceipt {
+    /// Reconcile backend-sealed physical writes with this exact row.
+    pub(crate) fn completed_write_receipt(
+        &self,
+        completions: &[Arc<KvWriteBatchCompletion>],
+    ) -> Result<ManagedCacheReceipt> {
+        if completions.is_empty() {
+            return Err(Error::InferenceError(
+                "managed-cache row returned no backend write completion".into(),
+            ));
+        }
+        let mut receipts = Vec::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            let writable = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            if writable.len() != domain.writable_blocks.len() || writable.is_empty() {
+                return Err(Error::InferenceError(
+                    "managed-cache reservation has an invalid writable block set".into(),
+                ));
+            }
+            let group = domain
+                .provisional_groups
+                .iter()
+                .find(|table| writable.iter().any(|block| block.group == table.group))
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache reservation has no table for its writable blocks".into(),
+                    )
+                })?;
+            if writable.iter().any(|block| {
+                block.arena != domain.arena
+                    || block.group != group.group
+                    || !group.blocks.contains(block)
+            }) {
+                return Err(Error::InferenceError(
+                    "managed-cache writable blocks cross an arena or group fence".into(),
+                ));
+            }
+
+            let matching = completions
+                .iter()
+                .filter(|completion| completion.arena() == domain.arena)
+                .collect::<Vec<_>>();
+            let page_tokens = matching
+                .first()
+                .map(|completion| completion.page_tokens())
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache domain has no matching backend completion".into(),
+                    )
+                })?;
+            if page_tokens == 0
+                || matching
+                    .iter()
+                    .any(|completion| completion.page_tokens() != page_tokens)
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache completions disagree on page geometry".into(),
+                ));
+            }
+            let expected = expected_domain_slots(domain, group, page_tokens)?;
+            let mut observed = HashSet::with_capacity(expected.len());
+            for completion in matching {
+                for slot in completion.slots() {
+                    if writable.contains(&slot.block) && !observed.insert(*slot) {
+                        return Err(Error::InferenceError(
+                            "managed-cache physical slot was acknowledged more than once".into(),
+                        ));
+                    }
+                }
+            }
+            if observed != expected {
+                return Err(Error::InferenceError(
+                    "managed-cache completion does not match the row's exact physical slots".into(),
+                ));
+            }
+            receipts.push(ManagedCacheDomainReceipt {
+                arena: domain.arena,
+                domain: domain.domain,
+                written_blocks: domain.writable_blocks.clone(),
+            });
+        }
+        Ok(ManagedCacheReceipt {
+            reservation: self.clone(),
+            domains: receipts,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_write_receipt_for_test(&self) -> ManagedCacheReceipt {
         ManagedCacheReceipt {
             reservation: self.clone(),
             domains: self
@@ -989,6 +1079,42 @@ impl ManagedCacheReservation {
                 .collect(),
         }
     }
+}
+
+fn expected_domain_slots(
+    domain: &ManagedCacheDomainReservation,
+    table: &GroupBlockTable,
+    page_tokens: u32,
+) -> Result<HashSet<KvSlotRef>> {
+    if domain.target_committed_tokens <= domain.execution_start_tokens {
+        return Err(Error::InferenceError(
+            "managed-cache reservation has no physical append range".into(),
+        ));
+    }
+    let first_logical_page = domain.target_window_start / page_tokens;
+    let mut slots = HashSet::with_capacity(
+        (domain.target_committed_tokens - domain.execution_start_tokens) as usize,
+    );
+    for position in domain.execution_start_tokens..domain.target_committed_tokens {
+        let logical_page = position / page_tokens;
+        let table_index = logical_page
+            .checked_sub(first_logical_page)
+            .ok_or_else(|| {
+                Error::InferenceError("managed-cache append precedes its physical window".into())
+            })?;
+        let block = table
+            .blocks
+            .get(table_index as usize)
+            .copied()
+            .ok_or_else(|| {
+                Error::InferenceError("managed-cache append exceeds its physical table".into())
+            })?;
+        slots.insert(KvSlotRef {
+            block,
+            offset: position % page_tokens,
+        });
+    }
+    Ok(slots)
 }
 
 /// Physical completion acknowledgement for one managed-cache row.

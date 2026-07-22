@@ -407,6 +407,10 @@ pub struct ModelSessionResult {
     pub safe_point: bool,
     pub provenance: OutcomeProvenance,
     pub staged_stream_outputs: Vec<StreamingOutput>,
+    /// Backend-sealed physical write batches produced by this safe point.
+    /// The executor reconciles these against the exact row reservation before
+    /// it can construct a managed-cache receipt.
+    pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
 }
 
 impl ModelSessionResult {
@@ -439,6 +443,7 @@ impl ModelSessionResult {
             safe_point: true,
             provenance,
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
         }
     }
 
@@ -449,6 +454,7 @@ impl ModelSessionResult {
             safe_point: true,
             provenance: OutcomeProvenance::produced_output(),
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
         }
     }
 
@@ -460,6 +466,7 @@ impl ModelSessionResult {
             safe_point: true,
             provenance: OutcomeProvenance::started(),
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
         }
     }
 
@@ -471,6 +478,7 @@ impl ModelSessionResult {
             safe_point: true,
             provenance: OutcomeProvenance::not_started(),
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
         }
     }
 
@@ -496,11 +504,20 @@ impl ModelSessionResult {
             safe_point: true,
             provenance,
             staged_stream_outputs: Vec::new(),
+            managed_cache_completions: Vec::new(),
         }
     }
 
     fn with_staged_stream_outputs(mut self, outputs: Vec<StreamingOutput>) -> Self {
         self.staged_stream_outputs = outputs;
+        self
+    }
+
+    pub(crate) fn with_managed_cache_completions(
+        mut self,
+        completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
+    ) -> Self {
+        self.managed_cache_completions = completions;
         self
     }
 }
@@ -521,6 +538,7 @@ pub struct ExecutorStepResult {
     pub staged_stream_outputs: Vec<StreamingOutput>,
     /// Optional physical KV write acknowledgement for this exact row.
     pub managed_cache: Option<super::ManagedCacheReceipt>,
+    pub(crate) managed_cache_completions: Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>>,
 }
 
 impl ExecutorStepResult {
@@ -547,6 +565,7 @@ impl ExecutorStepResult {
             output: session_result.output,
             staged_stream_outputs: session_result.staged_stream_outputs,
             managed_cache: None,
+            managed_cache_completions: session_result.managed_cache_completions,
         }
     }
 

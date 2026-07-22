@@ -2984,7 +2984,7 @@ mod tests {
                     );
                     result.dispatch = dispatch;
                     if let Some(reservation) = &row.managed_cache {
-                        result.managed_cache = Some(reservation.completed_write_receipt());
+                        result.managed_cache = Some(reservation.completed_write_receipt_for_test());
                     }
                     result
                 })
@@ -4580,6 +4580,7 @@ mod tests {
                     DispatchState::Started,
                 ),
                 staged_stream_outputs: Vec::new(),
+                managed_cache_completions: Vec::new(),
             },
         )
     }

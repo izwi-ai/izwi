@@ -413,6 +413,7 @@ impl NativeExecutor {
         } else {
             decode_steps_ran.max(1)
         };
+        let managed_cache_completions = active_state.state.take_managed_write_completions();
         if !finished {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {
                 Error::InferenceError("Chat decode state mutex poisoned".to_string())
@@ -431,7 +432,8 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        }))
+        })
+        .with_managed_cache_completions(managed_cache_completions))
     }
 
     pub(super) fn chat_decode_batch(
@@ -600,22 +602,26 @@ impl NativeExecutor {
                 }
             }
 
-            outputs.push(ModelSessionResult::sequence(ExecutorOutput {
-                request_id: request.id.clone(),
-                audio: Some(AudioOutput::empty(24_000)),
-                text: Some(if step.finished {
-                    canonical_chat_terminal_text(&active_state.streamed_text, step.text)
-                } else {
-                    step.text
-                }),
-                input_transcription: None,
-                tokens_processed: 1,
-                tokens_generated: step_tokens_generated,
-                finished: step.finished,
-                phase_timing_override: None,
-                asr_diagnostics: None,
-                error: None,
-            }));
+            let managed_cache_completions = active_state.state.take_managed_write_completions();
+            outputs.push(
+                ModelSessionResult::sequence(ExecutorOutput {
+                    request_id: request.id.clone(),
+                    audio: Some(AudioOutput::empty(24_000)),
+                    text: Some(if step.finished {
+                        canonical_chat_terminal_text(&active_state.streamed_text, step.text)
+                    } else {
+                        step.text
+                    }),
+                    input_transcription: None,
+                    tokens_processed: 1,
+                    tokens_generated: step_tokens_generated,
+                    finished: step.finished,
+                    phase_timing_override: None,
+                    asr_diagnostics: None,
+                    error: None,
+                })
+                .with_managed_cache_completions(managed_cache_completions),
+            );
             if !step.finished {
                 continuing.push((scheduled.session_key(), active_state));
             }

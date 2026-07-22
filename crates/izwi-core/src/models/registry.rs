@@ -597,6 +597,15 @@ impl NativeAsrDecodeState {
         matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
     }
 
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        match self {
+            Self::Qwen3(state) => state.take_managed_write_completions(),
+            Self::Nemotron(_) => Vec::new(),
+        }
+    }
+
     pub(crate) fn sequence_position(&self) -> Option<usize> {
         match self {
             Self::Qwen3(state) => Some(state.sequence_position()),
@@ -1965,6 +1974,15 @@ impl NativeChatDecodeState {
 
     pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
         matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
+    }
+
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        match self {
+            Self::Qwen3(state) => state.take_managed_write_completions(),
+            Self::Qwen35(_) => Vec::new(),
+        }
     }
 }
 

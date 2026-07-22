@@ -1659,7 +1659,7 @@ mod tests {
         assert_eq!(first.domains.len(), 1);
         assert_eq!(first.domains[0].writable_blocks.len(), 1);
         manager
-            .finalize(&first, Some(&first.completed_write_receipt()), true)
+            .finalize(&first, Some(&first.completed_write_receipt_for_test()), true)
             .expect("commit");
         let snapshot = manager.snapshot(model, &session, domain).expect("snapshot");
         assert_eq!(snapshot.version, 1);
@@ -1768,7 +1768,7 @@ mod tests {
             manager
                 .finalize(
                     &reservation,
-                    Some(&reservation.completed_write_receipt()),
+                    Some(&reservation.completed_write_receipt_for_test()),
                     true,
                 )
                 .expect("commit");
@@ -1810,7 +1810,7 @@ mod tests {
             .expect("first reservation");
         assert_eq!(first.domains[0].execution_start_tokens, 0);
         manager
-            .finalize(&first, Some(&first.completed_write_receipt()), true)
+            .finalize(&first, Some(&first.completed_write_receipt_for_test()), true)
             .expect("first commit");
         manager
             .release_session(&first_session)
@@ -1974,7 +1974,7 @@ mod tests {
         manager
             .finalize(
                 &reservation,
-                Some(&reservation.completed_write_receipt()),
+                Some(&reservation.completed_write_receipt_for_test()),
                 true,
             )
             .expect("composite commit");

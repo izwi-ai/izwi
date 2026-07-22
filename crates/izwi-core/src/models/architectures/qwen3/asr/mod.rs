@@ -158,6 +158,15 @@ impl AsrDecodeState {
         matches!(self.cache, AsrKvCache::Managed(_))
     }
 
+    pub(crate) fn take_managed_write_completions(
+        &mut self,
+    ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
+        match &mut self.cache {
+            AsrKvCache::Managed(cache) => cache.take_completed_writes(),
+            AsrKvCache::ModelOwned(_) => Vec::new(),
+        }
+    }
+
     pub(crate) fn sequence_position(&self) -> usize {
         self.pos
     }

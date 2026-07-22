@@ -203,8 +203,7 @@ impl NativeExecutor {
                             })?,
                         };
                         if request.managed_cache_runtime().is_some()
-                            && decode_state.sequence_position()
-                                != Some(request.num_prompt_tokens())
+                            && decode_state.sequence_position() != Some(request.num_prompt_tokens())
                         {
                             return Err(Error::InferenceError(
                                 "Qwen3 ASR prepared multimodal span does not match model prefill"
@@ -285,6 +284,8 @@ impl NativeExecutor {
                     };
                     let input_sample_rate = active_state.input_sample_rate;
                     let input_sample_count = active_state.input_sample_count;
+                    let managed_cache_completions =
+                        active_state.state.take_managed_write_completions();
 
                     if !finished {
                         let mut guard = self.asr_decode_states.lock().map_err(|_| {
@@ -313,7 +314,8 @@ impl NativeExecutor {
                             .map(ExecutorPhaseTiming::with_media_decode_ms),
                         asr_diagnostics: None,
                         error: None,
-                    }));
+                    })
+                    .with_managed_cache_completions(managed_cache_completions));
                 }
                 if managed_cache.is_some() {
                     return Err(Error::InferenceError(

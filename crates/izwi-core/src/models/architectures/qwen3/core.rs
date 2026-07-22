@@ -14,7 +14,7 @@ use std::time::Instant;
 
 #[cfg(test)]
 use crate::backends::kv::KvArena;
-use crate::backends::kv::{KvWriteArgs, PagedKvDecodeArgs};
+use crate::backends::kv::{KvSlotMap, KvWriteArgs, KvWriteCompletionCollector, PagedKvDecodeArgs};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::{
@@ -1882,7 +1882,7 @@ impl Qwen3Attention {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: &Qwen3ManagedCache,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
@@ -1925,6 +1925,9 @@ impl Qwen3Attention {
         x: &Tensor,
         start_positions: &[usize],
         caches: &[&Qwen3ManagedCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
@@ -1952,8 +1955,6 @@ impl Qwen3Attention {
         let mut query_rows = Vec::with_capacity(bsz);
         let mut key_rows = Vec::with_capacity(bsz);
         let mut value_rows = Vec::with_capacity(bsz);
-        let mut slots = Vec::with_capacity(bsz);
-        let mut sequences = Vec::with_capacity(bsz);
         for row in 0..bsz {
             let q_row = q.i(row)?.unsqueeze(0)?;
             let k_row = k.i(row)?.unsqueeze(0)?;
@@ -1962,8 +1963,6 @@ impl Qwen3Attention {
             query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
             key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
             value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
-            slots.push(caches[row].slots_for_append(start_positions[row], 1)?[0]);
-            sequences.push(caches[row].sequence_table(start_positions[row] + 1)?);
         }
 
         let query_rows = query_rows.iter().collect::<Vec<_>>();
@@ -1972,25 +1971,27 @@ impl Qwen3Attention {
         let queries = Tensor::stack(&query_rows, 0)?.contiguous()?;
         let keys = Tensor::stack(&key_rows, 0)?.contiguous()?;
         let values = Tensor::stack(&value_rows, 0)?.contiguous()?;
-        let lowered = first.arena.lower_slots(&slots)?;
+        if slots.arena_id() != first.arena.id() || slots.len() != bsz {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed decode received an incompatible prepared slot map".into(),
+            ));
+        }
         let binding = first.layer_binding(layer_idx)?;
-        first
-            .arena
-            .write_slots(
-                binding,
-                KvWriteArgs {
-                    keys: &keys,
-                    values: &values,
-                    slots: lowered.as_ref(),
-                },
-            )?
-            .wait()?;
-        let metadata = KvDecodeBatchMetadata { sequences };
+        let completion = first.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        completion.wait()?;
+        completions.collect(completion)?;
         let out = first.arena.paged_decode(
             binding,
             PagedKvDecodeArgs {
                 queries: &queries,
-                batch: &metadata,
+                batch: metadata,
                 softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
             },
         )?;
@@ -2248,7 +2249,7 @@ impl Qwen3Layer {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: &Qwen3ManagedCache,
-        prepared: &PreparedPhysicalPagedStep,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
@@ -2271,6 +2272,9 @@ impl Qwen3Layer {
         x: &Tensor,
         start_positions: &[usize],
         caches: &[&Qwen3ManagedCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
@@ -2278,6 +2282,9 @@ impl Qwen3Layer {
             &normed,
             start_positions,
             caches,
+            slots,
+            metadata,
+            completions,
             layer_idx,
         )?;
         let x = x.broadcast_add(&attn_out)?;
@@ -2622,15 +2629,22 @@ impl Qwen3Model {
             self.cfg.head_dim(),
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
-        let prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
 
         let mut x = embeds.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_managed(&x, start_pos, position_ids, cache, &prepared, layer_idx)?;
+            x = layer.forward_managed(
+                &x,
+                start_pos,
+                position_ids,
+                cache,
+                &mut prepared,
+                layer_idx,
+            )?;
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.logits_from_hidden(&hidden)?;
-        cache.commit_append(start_pos, sequence_len)?;
+        cache.commit_prepared(prepared)?;
         Ok(logits)
     }
 
@@ -2668,18 +2682,47 @@ impl Qwen3Model {
             cache.slots_for_append(start_positions[row], 1)?;
         }
 
+        let first = &*caches[0];
+        let combined_slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena.lower_slots(&combined_slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena.config(), lowered.logical_slots())?;
         let mut x = self.embeddings(input_ids)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let cache_refs = caches
                 .iter()
                 .map(|cache| &**cache)
                 .collect::<Vec<&Qwen3ManagedCache>>();
-            x = layer.forward_managed_decode_batch(&x, start_positions, &cache_refs, layer_idx)?;
+            x = layer.forward_managed_decode_batch(
+                &x,
+                start_positions,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                layer_idx,
+            )?;
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.logits_from_hidden(&hidden)?;
+        let completion = Arc::new(completions.seal()?);
         for (row, cache) in caches.iter_mut().enumerate() {
-            cache.commit_append(start_positions[row], 1)?;
+            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
         Ok(logits)
     }
@@ -3393,6 +3436,9 @@ mod tests {
         assert_eq!(managed.context_len(), 3);
         assert_eq!(arena.operation_stats().slot_write_dispatches, 1);
         assert_eq!(arena.operation_stats().paged_decode_dispatches, 0);
+        let prefill_completions = managed.take_completed_writes();
+        assert_eq!(prefill_completions.len(), 1);
+        assert_eq!(prefill_completions[0].slots_per_layer(), 3);
 
         let token = Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap();
         let owned_decode = model.forward(&token, 3, Some(&mut owned)).unwrap();
@@ -3401,6 +3447,9 @@ mod tests {
         assert_eq!(managed.context_len(), 4);
         assert_eq!(arena.operation_stats().slot_write_dispatches, 2);
         assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+        let decode_completions = managed.take_completed_writes();
+        assert_eq!(decode_completions.len(), 1);
+        assert_eq!(decode_completions[0].slots_per_layer(), 1);
     }
 
     #[test]
@@ -3439,6 +3488,8 @@ mod tests {
         model.forward(&prompt_b, 0, Some(&mut owned_b)).unwrap();
         model.forward_managed(&prompt_a, 0, &mut managed_a).unwrap();
         model.forward_managed(&prompt_b, 0, &mut managed_b).unwrap();
+        assert_eq!(managed_a.take_completed_writes().len(), 1);
+        assert_eq!(managed_b.take_completed_writes().len(), 1);
 
         let scalar_a = model
             .forward(
@@ -3467,6 +3518,12 @@ mod tests {
         assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
         assert_eq!(managed_a.context_len(), 3);
         assert_eq!(managed_b.context_len(), 4);
+        let completion_a = managed_a.take_completed_writes();
+        let completion_b = managed_b.take_completed_writes();
+        assert_eq!(completion_a.len(), 1);
+        assert_eq!(completion_b.len(), 1);
+        assert!(Arc::ptr_eq(&completion_a[0], &completion_b[0]));
+        assert_eq!(completion_a[0].slots_per_layer(), 2);
         // One batched slot write and one paged-attention call per layer, not
         // one arena operation per ragged row.
         assert_eq!(arena.operation_stats().slot_write_dispatches, 3);

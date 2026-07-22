@@ -431,9 +431,37 @@ impl NativeExecutor {
                         .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
                         .and_then(|row| row.managed_cache.as_ref())
                     {
-                        result.managed_cache = Some(reservation.completed_write_receipt());
+                        match reservation
+                            .completed_write_receipt(&result.managed_cache_completions)
+                        {
+                            Ok(receipt) => result.managed_cache = Some(receipt),
+                            Err(error) => {
+                                result = ExecutorStepResult::from_session(
+                                    scheduled,
+                                    ModelSessionResult::atomic(ExecutorOutput::error(
+                                        scheduled.request_id.clone(),
+                                        format!(
+                                            "physical cache completion reconciliation failed: {error}"
+                                        ),
+                                    )),
+                                )
+                                .with_dispatch(dispatch)
+                                .with_observed_resources(result.observed_resources);
+                            }
+                        }
+                    } else if !result.managed_cache_completions.is_empty() {
+                        result = ExecutorStepResult::from_session(
+                            scheduled,
+                            ModelSessionResult::atomic(ExecutorOutput::error(
+                                scheduled.request_id.clone(),
+                                "executor returned an unplanned physical cache completion",
+                            )),
+                        )
+                        .with_dispatch(dispatch)
+                        .with_observed_resources(result.observed_resources);
                     }
                 }
+                result.managed_cache_completions.clear();
                 result
             })
             .collect())
@@ -443,6 +471,10 @@ impl NativeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::kv::{
+        CpuKvBackendRuntime, KvArenaConfig, KvBackendRuntime, KvLayerConfig, KvWriteArgs,
+        KvWriteCompletionCollector,
+    };
     use crate::backends::BackendKind;
     use crate::engine::cache::coordinator::GroupBlockTable;
     use crate::engine::{
@@ -451,6 +483,7 @@ mod tests {
         SequencePhase, StageId, WorkCost, WorkUnit,
     };
     use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId};
+    use candle_core::{DType, Device, Tensor};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -599,6 +632,44 @@ mod tests {
             cost: WorkCost::new(1, 1, 0),
             managed_cache: Some(reservation.clone()),
         }];
+        let binding = crate::kv::KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena_config = KvArenaConfig {
+            id: arena,
+            group: block.group,
+            page_tokens: 4,
+            capacity_pages: 4,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        };
+        let physical_arena = CpuKvBackendRuntime
+            .allocate_arena(arena_config.clone())
+            .unwrap();
+        let slots = physical_arena
+            .lower_slots(&[crate::kv::KvSlotRef { block, offset: 0 }])
+            .unwrap();
+        let keys = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let values = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let completion = physical_arena
+            .write_slots(
+                binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: slots.as_ref(),
+                },
+            )
+            .unwrap();
+        let mut collector =
+            KvWriteCompletionCollector::new(&arena_config, slots.logical_slots()).unwrap();
+        collector.collect(completion).unwrap();
         let output = ModelSessionResult::atomic(ExecutorOutput {
             request_id: request.id.clone(),
             audio: None,
@@ -610,7 +681,8 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
-        });
+        })
+        .with_managed_cache_completions(vec![Arc::new(collector.seal().unwrap())]);
 
         let result = executor
             .finish_scheduled_execution(
@@ -627,5 +699,94 @@ mod tests {
             .expect("successful managed row must acknowledge writes");
         assert_eq!(receipt.reservation, reservation);
         assert_eq!(receipt.domains[0].written_blocks, vec![block]);
+    }
+
+    #[test]
+    fn one_backend_batch_completion_authenticates_each_ragged_row_subset() {
+        let arena = KvArenaId {
+            model_instance: ModelInstanceId::new(9),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let binding = crate::kv::KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let config = KvArenaConfig {
+            id: arena,
+            group: KvGroupId::new(2),
+            page_tokens: 4,
+            capacity_pages: 2,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        };
+        let physical_arena = CpuKvBackendRuntime.allocate_arena(config.clone()).unwrap();
+        let blocks = (0..2)
+            .map(|index| CacheBlockRef {
+                arena,
+                group: config.group,
+                index,
+                slot_generation: 1,
+            })
+            .collect::<Vec<_>>();
+        let slot_refs = blocks
+            .iter()
+            .map(|block| crate::kv::KvSlotRef {
+                block: *block,
+                offset: 0,
+            })
+            .collect::<Vec<_>>();
+        let slots = physical_arena.lower_slots(&slot_refs).unwrap();
+        let keys = Tensor::zeros((2, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let values = Tensor::zeros((2, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let completion = physical_arena
+            .write_slots(
+                binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: slots.as_ref(),
+                },
+            )
+            .unwrap();
+        let mut collector =
+            KvWriteCompletionCollector::new(&config, slots.logical_slots()).unwrap();
+        collector.collect(completion).unwrap();
+        let completion = Arc::new(collector.seal().unwrap());
+
+        for (row, block) in blocks.into_iter().enumerate() {
+            let reservation = ManagedCacheReservation {
+                txn_id: row as u64 + 1,
+                session: crate::engine::SessionKey {
+                    request_id: format!("row-{row}"),
+                    epoch: 1,
+                },
+                domains: vec![ManagedCacheDomainReservation {
+                    arena,
+                    domain: CacheDomainId::new(1),
+                    expected_version: 0,
+                    expected_committed_tokens: 0,
+                    execution_start_tokens: 0,
+                    target_committed_tokens: 1,
+                    target_window_start: 0,
+                    first_page_offset: 0,
+                    provisional_groups: vec![GroupBlockTable {
+                        group: config.group,
+                        blocks: vec![block],
+                    }],
+                    writable_blocks: vec![block],
+                }],
+            };
+            let receipt = reservation
+                .completed_write_receipt(std::slice::from_ref(&completion))
+                .unwrap();
+            assert_eq!(receipt.domains[0].written_blocks, vec![block]);
+        }
     }
 }

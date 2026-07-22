@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use candle_core::quantized::gguf_file;
@@ -13,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
 
+use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::DeviceProfile;
 use crate::backends::{open_gguf_reader, BackendKind};
 use crate::catalog::ModelFamily;
@@ -66,6 +68,13 @@ impl ChatDecodeState {
 
     pub fn uses_managed_kv(&self) -> bool {
         matches!(self.cache, ChatKvCache::Managed(_))
+    }
+
+    pub(crate) fn take_managed_write_completions(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
+        match &mut self.cache {
+            ChatKvCache::Managed(cache) => cache.take_completed_writes(),
+            ChatKvCache::ModelOwned(_) => Vec::new(),
+        }
     }
 
     pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
