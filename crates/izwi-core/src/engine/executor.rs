@@ -57,11 +57,13 @@ use crate::backends::{
     BackendSelectionSource,
 };
 use crate::error::{Error, Result};
+use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat, ResolvedKvGroupKind};
 use crate::model::ModelVariant;
 pub(super) use crate::models::architectures::qwen3::core::Qwen3ManagedCache as ManagedQwenCache;
 use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
 use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use prefix_cache::{configured_qwen35_prefix_cache_bytes, ExactPrefixCache};
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
@@ -71,65 +73,241 @@ fn qwen3_managed_cache_for_row(
     scheduled: &ScheduledRequest,
     reservation: &super::ManagedCacheReservation,
 ) -> Result<ManagedQwenCache> {
-    if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
-        return Err(Error::InferenceError(
-            "managed Qwen3 reservation crossed its scheduled row fence".to_string(),
-        ));
-    }
     let runtime = request.managed_cache_runtime().ok_or_else(|| {
         Error::InferenceError("managed Qwen3 row has no model runtime".to_string())
     })?;
-    if reservation.domains.len() != 1 {
+    let mut groups = runtime.plan().groups.iter().filter(|group| {
+        matches!(&group.kind, ResolvedKvGroupKind::PagedAttention { .. })
+            && reservation
+                .domains
+                .iter()
+                .any(|domain| domain.domain == group.domain && domain.arena == group.arena)
+    });
+    let group = groups.next().ok_or_else(|| {
+        Error::InvalidInput("native Qwen3 reservation has no resolved paged-attention group".into())
+    })?;
+    if groups.next().is_some() {
         return Err(Error::InvalidInput(
-            "native Qwen3 sequence requires exactly one managed KV domain".to_string(),
+            "native Qwen3 reservation resolves more than one paged-attention group".into(),
         ));
     }
-    let domain = &reservation.domains[0];
-    if runtime.plan().model_instance != domain.arena.model_instance
-        || runtime.plan().backend != domain.arena.backend
-    {
+    physical_paged_cache_for_row(request, scheduled, reservation, group.domain, group.id)
+}
+
+/// Resolve one exact scheduler-owned paged-attention view without assuming
+/// that the row reservation contains only one state domain or physical group.
+fn physical_paged_cache_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+    domain_id: CacheDomainId,
+    group_id: KvGroupId,
+) -> Result<PhysicalPagedKvCache> {
+    if reservation.txn_id != scheduled.plan_id || reservation.session != scheduled.session_key() {
         return Err(Error::InferenceError(
-            "managed Qwen3 reservation does not match its loaded worker runtime".to_string(),
+            "managed-cache reservation crossed its scheduled row fence".to_string(),
         ));
     }
-    let group = runtime
-        .plan()
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed-cache row has no physical model runtime".to_string())
+    })?;
+    let plan = runtime.plan();
+    if request.model_instance_id() != Some(plan.model_instance) {
+        return Err(Error::InferenceError(
+            "managed-cache runtime does not match the row's loaded model instance".into(),
+        ));
+    }
+
+    let mut groups = plan
         .groups
         .iter()
-        .find(|group| group.arena == domain.arena && group.domain == domain.domain)
-        .ok_or_else(|| {
-            Error::InferenceError(
-                "managed Qwen3 reservation references an unresolved arena domain".to_string(),
-            )
-        })?;
-    let crate::kv::ResolvedKvGroupKind::PagedAttention { layers } = &group.kind else {
-        return Err(Error::InvalidInput(
-            "native Qwen3 sequence cannot consume a model-state KV group".to_string(),
-        ));
-    };
-    if domain.first_page_offset != domain.target_window_start % group.page_tokens {
-        return Err(Error::InvalidInput(
-            "managed Qwen3 first-page offset does not match its logical window".to_string(),
+        .filter(|group| group.domain == domain_id && group.id == group_id);
+    let group = groups.next().ok_or_else(|| {
+        Error::InferenceError("managed-cache row references an unresolved domain/group pair".into())
+    })?;
+    if groups.next().is_some() {
+        return Err(Error::InferenceError(
+            "managed-cache plan repeats a domain/group pair".into(),
         ));
     }
-    let table = domain
+    let ResolvedKvGroupKind::PagedAttention { layers } = &group.kind else {
+        return Err(Error::InvalidInput(
+            "managed-cache domain/group is not paged attention".to_string(),
+        ));
+    };
+    if layers.is_empty() {
+        return Err(Error::InferenceError(
+            "managed-cache paged-attention group has no layer bindings".into(),
+        ));
+    }
+    if group.arena.model_instance != plan.model_instance
+        || group.arena.backend != plan.backend
+        || group.arena.device_ordinal != plan.device_ordinal
+    {
+        return Err(Error::InferenceError(
+            "managed-cache group crossed its resolved runtime identity".into(),
+        ));
+    }
+
+    let mut domains = reservation
+        .domains
+        .iter()
+        .filter(|domain| domain.domain == domain_id && domain.arena == group.arena);
+    let domain = domains.next().ok_or_else(|| {
+        Error::InferenceError(
+            "managed-cache reservation omitted the selected domain/group arena".into(),
+        )
+    })?;
+    if domains.next().is_some() {
+        return Err(Error::InvalidInput(
+            "managed-cache reservation repeats the selected domain/group arena".into(),
+        ));
+    }
+    if domain.execution_start_tokens < domain.expected_committed_tokens
+        || domain.target_committed_tokens < domain.execution_start_tokens
+        || domain.target_window_start > domain.execution_start_tokens
+    {
+        return Err(Error::InvalidInput(
+            "managed-cache domain has an invalid execution/window range".into(),
+        ));
+    }
+    if group.page_tokens == 0
+        || domain.first_page_offset >= group.page_tokens
+        || domain.first_page_offset != domain.target_window_start % group.page_tokens
+    {
+        return Err(Error::InvalidInput(
+            "managed-cache first-page offset does not match its logical window".to_string(),
+        ));
+    }
+
+    let mut tables = domain
         .provisional_groups
         .iter()
-        .find(|table| table.group == group.id)
-        .ok_or_else(|| {
-            Error::InferenceError(
-                "managed Qwen3 reservation omitted its resolved block table".to_string(),
-            )
-        })?;
-    let arena = runtime.arena(group.arena).ok_or_else(|| {
-        Error::InferenceError("managed Qwen3 arena is no longer live".to_string())
+        .filter(|table| table.group == group_id);
+    let table = tables.next().ok_or_else(|| {
+        Error::InferenceError("managed-cache reservation omitted its selected block table".into())
     })?;
-    ManagedQwenCache::new_windowed(
+    if tables.next().is_some() {
+        return Err(Error::InvalidInput(
+            "managed-cache reservation repeats its selected block table".into(),
+        ));
+    }
+
+    let arena = runtime.arena(group.arena).ok_or_else(|| {
+        Error::InferenceError("managed-cache physical arena is no longer live".to_string())
+    })?;
+    let config = arena.config();
+    if arena.id() != group.arena
+        || arena.backend_kind() != plan.backend
+        || config.id != group.arena
+        || config.group != group_id
+        || config.page_tokens != group.page_tokens
+        || config.capacity_pages != group.capacity_pages
+    {
+        return Err(Error::InferenceError(
+            "managed-cache arena geometry does not match its resolved group".into(),
+        ));
+    }
+    let storage_matches = matches!(
+        (group.storage, config.dtype),
+        (
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::F32
+            },
+            candle_core::DType::F32
+        ) | (
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::F16
+            },
+            candle_core::DType::F16
+        ) | (
+            KvStorageFormat::Dense {
+                dtype: KvStorageDType::Bf16
+            },
+            candle_core::DType::BF16
+        )
+    );
+    if !storage_matches
+        || config.layers.len() != layers.len()
+        || config
+            .layers
+            .iter()
+            .zip(layers)
+            .any(|(configured, resolved)| {
+                configured.binding != *resolved
+                    || configured.num_kv_heads == 0
+                    || configured.key_head_dim == 0
+                    || configured.value_head_dim == 0
+            })
+    {
+        return Err(Error::InferenceError(
+            "managed-cache arena layer or storage geometry is stale".into(),
+        ));
+    }
+    let element_bytes = match config.dtype {
+        candle_core::DType::F32 => 4_u64,
+        candle_core::DType::F16 | candle_core::DType::BF16 => 2_u64,
+        _ => {
+            return Err(Error::InferenceError(
+                "managed-cache arena uses unsupported paged storage".into(),
+            ));
+        }
+    };
+    let bytes_per_page = config.layers.iter().try_fold(0_u64, |total, layer| {
+        let per_token = u64::from(layer.num_kv_heads)
+            .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+            .ok_or_else(|| Error::InferenceError("managed-cache layer geometry overflow".into()))?;
+        let bytes = u64::from(config.page_tokens)
+            .checked_mul(per_token)
+            .and_then(|elements| elements.checked_mul(element_bytes))
+            .ok_or_else(|| Error::InferenceError("managed-cache page geometry overflow".into()))?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| Error::InferenceError("managed-cache page geometry overflow".into()))
+    })?;
+    if bytes_per_page != group.bytes_per_page {
+        return Err(Error::InferenceError(
+            "managed-cache arena byte geometry does not match its resolved group".into(),
+        ));
+    }
+
+    let visible_target = domain
+        .target_committed_tokens
+        .checked_sub(domain.target_window_start)
+        .ok_or_else(|| Error::InvalidInput("managed-cache window exceeds its target".into()))?;
+    let physical_target = visible_target
+        .checked_add(domain.first_page_offset)
+        .ok_or_else(|| Error::InvalidInput("managed-cache window geometry overflow".into()))?;
+    let required_pages = usize::try_from(physical_target.div_ceil(group.page_tokens))
+        .map_err(|_| Error::InvalidInput("managed-cache page count exceeds usize".into()))?;
+    if required_pages == 0 || table.blocks.len() != required_pages {
+        return Err(Error::InvalidInput(format!(
+            "managed-cache block table has {} pages, expected {required_pages}",
+            table.blocks.len()
+        )));
+    }
+    let mut unique_blocks = HashSet::with_capacity(table.blocks.len());
+    if table.blocks.iter().any(|block| {
+        block.arena != group.arena
+            || block.group != group_id
+            || block.index >= group.capacity_pages
+            || block.slot_generation == 0
+            || !unique_blocks.insert(*block)
+    }) {
+        return Err(Error::InvalidInput(
+            "managed-cache block table contains a foreign, stale, duplicate, or out-of-range page"
+                .into(),
+        ));
+    }
+
+    PhysicalPagedKvCache::new_windowed(
         arena.clone(),
         layers.clone(),
         table.blocks.clone(),
-        domain.target_window_start as usize,
-        domain.execution_start_tokens as usize,
+        usize::try_from(domain.target_window_start)
+            .map_err(|_| Error::InvalidInput("managed-cache window exceeds usize".into()))?,
+        usize::try_from(domain.execution_start_tokens)
+            .map_err(|_| Error::InvalidInput("managed-cache context exceeds usize".into()))?,
     )
 }
 
