@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use crate::backends::kv::{KvWriteArgs, PagedKvDecodeArgs};
 #[cfg(test)]
 use crate::backends::kv::KvArena;
+use crate::backends::kv::{KvWriteArgs, PagedKvDecodeArgs};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::{
@@ -1890,12 +1890,6 @@ impl Qwen3Attention {
                 "Qwen3 managed prefill expects one sequence per call".to_string(),
             ));
         }
-        if seq_len > 1 && start_pos != 0 {
-            return Err(Error::InvalidInput(
-                "Qwen3 managed chunked prefill is not implemented".to_string(),
-            ));
-        }
-
         let (q, k, v) = self.qkv_proj.forward(x)?;
         let q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
         let k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
@@ -1903,79 +1897,24 @@ impl Qwen3Attention {
         let (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
         let (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, None)?;
 
-        let slots = cache.slots_for_append(start_pos, seq_len)?;
-        let lowered = cache.arena.lower_slots(&slots)?;
+        let queries = q
+            .reshape((seq_len, self.num_heads, self.head_dim))?
+            .contiguous()?;
         let keys = k
             .reshape((seq_len, self.num_kv_heads, self.head_dim))?
             .contiguous()?;
         let values = v
             .reshape((seq_len, self.num_kv_heads, self.head_dim))?
             .contiguous()?;
-        cache
-            .arena
-            .write_slots(
-                cache.layer_binding(layer_idx)?,
-                KvWriteArgs {
-                    keys: &keys,
-                    values: &values,
-                    slots: lowered.as_ref(),
-                },
-            )?
-            .wait()?;
-
-        if seq_len == 1 {
-            let queries = q
-                .reshape((1, self.num_heads, self.head_dim))?
-                .contiguous()?;
-            let metadata = KvDecodeBatchMetadata {
-                sequences: vec![cache.sequence_table(start_pos + 1)?],
-            };
-            let out = cache.arena.paged_decode(
-                cache.layer_binding(layer_idx)?,
-                PagedKvDecodeArgs {
-                    queries: &queries,
-                    batch: &metadata,
-                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-                },
-            )?;
-            let out = out.reshape((1, 1, self.num_heads * self.head_dim))?;
-            return self.o_proj.forward(&out).map_err(Error::from);
-        }
-
-        // Initial prefill writes the authoritative pages and computes causal
-        // attention from the already projected tensors. No model-owned cache
-        // is created, and subsequent decode starts directly from the arena.
-        let q = q.transpose(1, 2)?;
-        let k_kv = k.transpose(1, 2)?;
-        let v_kv = v.transpose(1, 2)?;
-        if let Some(fused_out) =
-            try_fused_self_attention(&q, &k_kv, &v_kv, None, self.head_dim, true)?
-        {
-            let out = fused_out.transpose(1, 2)?.reshape((
-                bsz,
-                seq_len,
-                self.num_heads * self.head_dim,
-            ))?;
-            return self.o_proj.forward(&out).map_err(Error::from);
-        }
-
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
-        let q = q.reshape((self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((self.num_heads, seq_len, self.head_dim))?;
-        let v = v.reshape((self.num_heads, seq_len, self.head_dim))?;
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale = Tensor::from_vec(vec![(self.head_dim as f32).sqrt()], (1,), att.device())?
-            .to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-        let mask = causal_mask(seq_len, seq_len, 0, att.device(), att.dtype())?;
-        let att = ops::softmax(&att.broadcast_add(&mask)?, D::Minus1)?;
-        let out = att
-            .matmul(&v)?
-            .reshape((1, self.num_heads, seq_len, self.head_dim))?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((1, seq_len, self.num_heads * self.head_dim))?;
+        let out = cache.write_and_attend(
+            layer_idx,
+            start_pos,
+            &queries,
+            &keys,
+            &values,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
 
@@ -3550,6 +3489,25 @@ mod tests {
         let reused_logits = model.forward_managed(&suffix, 4, &mut reused).unwrap();
         let expected_last = full_logits.i((.., 4..5, ..)).unwrap();
         assert_tensor_close(&expected_last, &reused_logits);
+    }
+
+    #[test]
+    fn managed_multi_token_prefix_extension_matches_full_prefill_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
+        let mut owned = test_cache();
+        let full_logits = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        let prefix = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        model.forward_managed(&prefix, 0, &mut managed).unwrap();
+        let suffix = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
+        let suffix_logits = model.forward_managed(&suffix, 2, &mut managed).unwrap();
+
+        assert_tensor_close(&full_logits.i((.., 2.., ..)).unwrap(), &suffix_logits);
+        assert_eq!(managed.context_len(), 5);
     }
 
     #[test]

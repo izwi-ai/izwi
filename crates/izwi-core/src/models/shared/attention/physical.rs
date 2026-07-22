@@ -3,7 +3,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::backends::kv::KvArena;
+use candle_core::Tensor;
+
+use crate::backends::kv::{
+    KvArena, KvWriteArgs, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+};
 use crate::error::{Error, Result};
 use crate::kv::{CacheBlockRef, KvLayerBinding, KvSequenceBlockTable, KvSlotRef};
 
@@ -221,6 +225,77 @@ impl PhysicalPagedKvCache {
                 "physical paged cache has no binding for layer {layer_idx}"
             ))
         })
+    }
+
+    /// Write one layer's projected K/V directly into its prepared physical
+    /// slots and execute causal attention against the same authoritative pages.
+    ///
+    /// The tensors are token-major: queries are `[tokens, query_heads, dim]`
+    /// and keys/values are `[tokens, kv_heads, dim]`. Multi-token calls use the
+    /// page-native ragged prefill/extend operation, including non-zero-prefix
+    /// continuation; one-token calls use the batched decode operation.
+    pub(crate) fn write_and_attend(
+        &self,
+        layer_idx: usize,
+        start_pos: usize,
+        queries: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        let token_count = queries.dim(0)?;
+        if token_count == 0 || keys.dim(0)? != token_count || values.dim(0)? != token_count {
+            return Err(Error::InvalidInput(
+                "physical paged attention requires matching non-empty token dimensions".into(),
+            ));
+        }
+        let end_pos = start_pos
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
+        let slots = self.slots_for_append(start_pos, token_count)?;
+        let lowered = self.arena.lower_slots(&slots)?;
+        let binding = self.layer_binding(layer_idx)?;
+        self.arena
+            .write_slots(
+                binding,
+                KvWriteArgs {
+                    keys,
+                    values,
+                    slots: lowered.as_ref(),
+                },
+            )?
+            .wait()?;
+
+        let table = self.sequence_table(end_pos)?;
+        if token_count == 1 {
+            return self.arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries,
+                    batch: &crate::kv::KvDecodeBatchMetadata {
+                        sequences: vec![table],
+                    },
+                    softmax_scale,
+                },
+            );
+        }
+
+        let query_len = u32::try_from(token_count)
+            .map_err(|_| Error::InvalidInput("physical paged query length exceeds u32".into()))?;
+        self.arena.paged_prefill(
+            binding,
+            PagedKvPrefillArgs {
+                queries,
+                rows: &[PagedKvPrefillRow {
+                    blocks: table.blocks,
+                    first_page_offset: table.first_page_offset,
+                    query_start: 0,
+                    query_len,
+                    context_len: table.context_len,
+                }],
+                softmax_scale,
+            },
+        )
     }
 
     pub(crate) fn commit_append(&mut self, start_pos: usize, token_count: usize) -> Result<()> {
