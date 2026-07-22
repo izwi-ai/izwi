@@ -20,6 +20,8 @@ use super::{
 };
 
 const STATELESS_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.stateless-runtime.v2\0";
+const INVOCATION_RUNTIME_FINGERPRINT_DOMAIN: &[u8] =
+    b"izwi.inference-state.invocation-runtime.v2\0";
 const MANAGED_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.managed-runtime.v2\0";
 
 /// Whether the selected execution graph actually acquires the capability's
@@ -224,6 +226,18 @@ pub(crate) struct StatelessCapabilityRuntimeV2 {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
 }
 
+/// Load-sealed physical invocation state for a capability with no retained
+/// session state. This is the normal runtime for atomic ASR/TTS pipelines.
+#[derive(Debug, Clone)]
+pub(crate) struct InvocationCapabilityRuntimeV2 {
+    pub(crate) id: [u8; 32],
+    pub(crate) identity: CapabilityRuntimeIdentityV2,
+    pub(crate) stage_graph_fingerprint: [u8; 32],
+    pub(crate) state_fingerprint: [u8; 32],
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    invocation_paged: InvocationPagedWorkspaceRuntimeV2,
+}
+
 /// Request-facing inference-state runtime. Callers bind this model-neutral
 /// handle and never branch on whether the backing is stateless, paged KV, or a
 /// future tensor/ring arena. The backing kind remains private to the state
@@ -239,6 +253,7 @@ pub(crate) struct CapabilityStateRuntimeV2 {
 #[derive(Debug, Clone)]
 enum CapabilityStateRuntimeBackingV2 {
     Stateless(StatelessCapabilityRuntimeV2),
+    Invocation(InvocationCapabilityRuntimeV2),
     Managed(ManagedCapabilityRuntimeV2),
 }
 
@@ -271,9 +286,19 @@ impl CapabilityStateRuntimeV2 {
         }
     }
 
+    pub(crate) fn invocation(runtime: InvocationCapabilityRuntimeV2) -> Self {
+        Self {
+            id: runtime.id,
+            state_fingerprint: runtime.state_fingerprint,
+            descriptor: runtime.descriptor.clone(),
+            backing: CapabilityStateRuntimeBackingV2::Invocation(runtime),
+        }
+    }
+
     pub(crate) fn managed_kv_runtime(&self) -> Option<Arc<ManagedKvModelRuntime>> {
         match &self.backing {
             CapabilityStateRuntimeBackingV2::Stateless(_) => None,
+            CapabilityStateRuntimeBackingV2::Invocation(_) => None,
             CapabilityStateRuntimeBackingV2::Managed(runtime)
                 if runtime.retained_state_use == RetainedStateUseV2::ExternalPaged =>
             {
@@ -292,6 +317,11 @@ impl CapabilityStateRuntimeV2 {
             CapabilityStateRuntimeBackingV2::Stateless(_) => Err(invalid(
                 "stateless runtime has no load-sealed paged invocation workspace",
             )),
+            CapabilityStateRuntimeBackingV2::Invocation(runtime) => {
+                runtime
+                    .invocation_paged
+                    .lease(runtime.stage_graph_fingerprint, stage, domain)
+            }
             CapabilityStateRuntimeBackingV2::Managed(runtime) => {
                 runtime
                     .invocation_paged
@@ -319,6 +349,18 @@ impl CapabilityStateRuntimeV2 {
                 Ok(())
             }
             CapabilityStateRuntimeBackingV2::Managed(runtime) => {
+                runtime.validate_against(backend, execution)?;
+                if self.id != runtime.id
+                    || self.state_fingerprint != runtime.state_fingerprint
+                    || self.descriptor != runtime.descriptor
+                {
+                    return Err(invalid(
+                        "state ABI v2 runtime wrapper does not match its sealed backing",
+                    ));
+                }
+                Ok(())
+            }
+            CapabilityStateRuntimeBackingV2::Invocation(runtime) => {
                 runtime.validate_against(backend, execution)?;
                 if self.id != runtime.id
                     || self.state_fingerprint != runtime.state_fingerprint
@@ -483,6 +525,86 @@ impl ManagedCapabilityRuntimeV2 {
     }
 }
 
+impl InvocationCapabilityRuntimeV2 {
+    pub(crate) fn seal(
+        backend: BackendKind,
+        execution: &ExecutionAdapterBinding,
+        descriptor: CapabilityStateDescriptorV2,
+        invocation_paged: InvocationPagedWorkspaceRuntimeV2,
+    ) -> Result<Self> {
+        execution.validate()?;
+        descriptor.validate_against_stages(&execution.stages)?;
+        if !descriptor.is_stateless()
+            || descriptor.has_zero_invocation_workspace_for(&execution.stages)?
+        {
+            return Err(invalid(
+                "invocation state ABI v2 runtime requires physical invocation state and no retained state",
+            ));
+        }
+        invocation_paged.validate_for(&descriptor, &execution.stages)?;
+        let stage_graph_fingerprint = stage_graph_fingerprint(&execution.stages)?;
+        let state_fingerprint = descriptor.fingerprint(&execution.stages)?;
+        let mut runtime = Self {
+            id: [0; 32],
+            identity: CapabilityRuntimeIdentityV2::seal(backend, execution)?,
+            stage_graph_fingerprint,
+            state_fingerprint,
+            descriptor,
+            invocation_paged,
+        };
+        runtime.id = runtime.compute_id()?;
+        runtime.validate_against(backend, execution)?;
+        Ok(runtime)
+    }
+
+    fn validate_against(
+        &self,
+        backend: BackendKind,
+        execution: &ExecutionAdapterBinding,
+    ) -> Result<()> {
+        self.identity.validate_against(backend, execution)?;
+        self.descriptor.validate_against_stages(&execution.stages)?;
+        self.invocation_paged
+            .validate_for(&self.descriptor, &execution.stages)?;
+        if !self.descriptor.is_stateless()
+            || self
+                .descriptor
+                .has_zero_invocation_workspace_for(&execution.stages)?
+            || self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
+            || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
+            || self.id != self.compute_id()?
+        {
+            return Err(invalid(
+                "invocation state ABI v2 runtime does not match the selected loaded capability",
+            ));
+        }
+        Ok(())
+    }
+
+    fn compute_id(&self) -> Result<[u8; 32]> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            identity: &'a CapabilityRuntimeIdentityV2,
+            stage_graph_fingerprint: [u8; 32],
+            state_fingerprint: [u8; 32],
+            invocation_paged: Vec<(InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolId)>,
+        }
+        let encoded = serde_json::to_vec(&Payload {
+            identity: &self.identity,
+            stage_graph_fingerprint: self.stage_graph_fingerprint,
+            state_fingerprint: self.state_fingerprint,
+            invocation_paged: self
+                .invocation_paged
+                .pool_ids_for_graph(self.stage_graph_fingerprint),
+        })
+        .map_err(|error| invalid(format!("failed to encode invocation runtime: {error}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(INVOCATION_RUNTIME_FINGERPRINT_DOMAIN);
+        hasher.update(encoded);
+        Ok(hasher.finalize().into())
+    }
+}
+
 impl StatelessCapabilityRuntimeV2 {
     pub(crate) fn seal(
         backend: BackendKind,
@@ -491,9 +613,11 @@ impl StatelessCapabilityRuntimeV2 {
     ) -> Result<Self> {
         execution.validate()?;
         descriptor.validate_against_stages(&execution.stages)?;
-        if !descriptor.is_stateless() {
+        if !descriptor.is_stateless()
+            || !descriptor.has_zero_invocation_workspace_for(&execution.stages)?
+        {
             return Err(invalid(
-                "stateless state ABI v2 runtime cannot seal retained physical state",
+                "stateless state ABI v2 runtime cannot seal retained or invocation physical state",
             ));
         }
         let stage_graph_fingerprint = stage_graph_fingerprint(&execution.stages)?;
@@ -520,6 +644,9 @@ impl StatelessCapabilityRuntimeV2 {
         if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
             || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
             || !self.descriptor.is_stateless()
+            || !self
+                .descriptor
+                .has_zero_invocation_workspace_for(&execution.stages)?
             || self.id != self.compute_id()?
         {
             return Err(invalid(
@@ -771,18 +898,38 @@ mod tests {
     }
 
     #[test]
-    fn stateless_runtime_seals_bounded_invocation_workspace() {
-        let mut binding = binding();
-        Arc::make_mut(&mut binding.stages)[0].max_workspace_bytes = 4096;
-        let descriptor =
-            CapabilityStateDescriptorV2::stateless_for_stage_graphs(&[binding.stages.as_ref()])
-                .unwrap();
+    fn invocation_only_runtime_owns_bounded_physical_workspace() {
+        let (binding, mut descriptor, _, pool) = managed_invocation_fixture();
+        descriptor.retained = RetainedStateCapability::Stateless;
         assert!(!descriptor
             .has_zero_invocation_workspace_for(&binding.stages)
             .unwrap());
-        StatelessCapabilityRuntimeV2::seal(BackendKind::Cpu, &binding, descriptor)
-            .unwrap()
+        assert!(
+            StatelessCapabilityRuntimeV2::seal(BackendKind::Cpu, &binding, descriptor.clone())
+                .is_err()
+        );
+        let stage = binding.stages[0].id;
+        let domain = StateDomainId::new(1);
+        let pools =
+            InvocationPagedWorkspaceRuntimeV2::new(vec![InvocationPagedWorkspaceBindingV2 {
+                key: InvocationPagedWorkspaceKeyV2 {
+                    stage_graph: stage_graph_fingerprint(&binding.stages).unwrap(),
+                    stage,
+                    domain,
+                },
+                pool: pool.handle(),
+            }])
+            .unwrap();
+        let runtime =
+            InvocationCapabilityRuntimeV2::seal(BackendKind::Cpu, &binding, descriptor, pools)
+                .unwrap();
+        runtime
             .validate_against(BackendKind::Cpu, &binding)
+            .unwrap();
+        CapabilityStateRuntimeV2::invocation(runtime)
+            .lease_invocation_paged(stage, domain)
+            .unwrap()
+            .release()
             .unwrap();
     }
 
