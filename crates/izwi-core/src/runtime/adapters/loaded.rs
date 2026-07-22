@@ -226,9 +226,10 @@ impl LoadedCapabilityDescriptor {
         }
         let state = match state {
             Some(state) => state,
-            None if contracts
-                .iter()
-                .all(|contract| contract.execution_profile.cache_mode == CacheMode::None) =>
+            None if !execution.metadata().state_requirement.requires_retained()
+                && contracts
+                    .iter()
+                    .all(|contract| contract.execution_profile.cache_mode == CacheMode::None) =>
             {
                 let stage_graphs = contracts
                     .iter()
@@ -251,6 +252,12 @@ impl LoadedCapabilityDescriptor {
                 if !descriptor.is_stateless() {
                     return Err(Error::ModelLoadError(
                         "managed state ABI v2 publication requires physical backing".to_string(),
+                    ));
+                }
+                if execution.metadata().state_requirement.requires_retained() {
+                    return Err(Error::ModelLoadError(
+                        "capability requiring retained inference state cannot publish a stateless runtime"
+                            .to_string(),
                     ));
                 }
                 for contract in &contracts {
@@ -288,6 +295,12 @@ impl LoadedCapabilityDescriptor {
                 LoadedStatePublication::V2(descriptor)
             }
             LoadedStatePublication::ManagedV2 { contract, physical } => {
+                if !execution.metadata().state_requirement.requires_retained() {
+                    return Err(Error::ModelLoadError(
+                        "capability declared without retained state published a retained physical runtime"
+                            .to_string(),
+                    ));
+                }
                 let stage_graphs = contracts
                     .iter()
                     .map(|contract| contract.stages.as_ref())
@@ -1490,7 +1503,9 @@ mod tests {
         )
         .expect_err("stateless v2 must not relabel an opaque sequence cache");
         assert!(
-            error.to_string().contains("retained cache state"),
+            error
+                .to_string()
+                .contains("requiring retained inference state"),
             "unexpected error: {error}"
         );
     }
@@ -1632,11 +1647,17 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|contract| contract.execution_profile.cache_mode == CacheMode::None);
-                if all_graphs_cacheless {
+                if all_graphs_cacheless && !metadata.state_requirement.requires_retained() {
                     assert!(
                         matches!(binding.state, CapabilityStateBinding::V2(_)),
                         "fully cacheless capability remained legacy for {variant}"
                     );
+                }
+                if metadata.state_requirement.requires_retained()
+                    && all_graphs_cacheless
+                    && !matches!(binding.state, CapabilityStateBinding::LegacyV1(_))
+                {
+                    panic!("retained capability was mislabeled cacheless for {variant}");
                 }
                 match &binding.state {
                     CapabilityStateBinding::V2(runtime) => {

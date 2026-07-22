@@ -98,6 +98,24 @@ pub(crate) enum SequenceExecutionMode {
     StreamingOnly,
 }
 
+/// Capability-authored lifetime truth for mutable inference data. This is
+/// independent of whether the current compatibility execution profile happens
+/// to expose a scheduler cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InferenceStateRequirement {
+    Stateless,
+    Invocation,
+    Retained,
+    RetainedAndInvocation,
+}
+
+impl InferenceStateRequirement {
+    pub(crate) const fn requires_retained(self) -> bool {
+        matches!(self, Self::Retained | Self::RetainedAndInvocation)
+    }
+}
+
 impl SequenceExecutionMode {
     const fn enabled(self, streaming_required: bool) -> bool {
         match self {
@@ -117,6 +135,7 @@ pub(crate) struct AdapterMetadata {
     pub(crate) streaming_mode: StreamingMode,
     pub(crate) execution_target: ExecutionTargetKind,
     pub(crate) sequence_execution: SequenceExecutionMode,
+    pub(crate) state_requirement: InferenceStateRequirement,
 }
 
 pub(crate) trait ModelCapabilityAdapter {
@@ -359,6 +378,11 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
+            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
+                InferenceStateRequirement::RetainedAndInvocation
+            } else {
+                InferenceStateRequirement::Invocation
+            },
         })
     }
 }
@@ -379,6 +403,11 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
                 SequenceExecutionMode::Always
             } else {
                 SequenceExecutionMode::None
+            },
+            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
+                InferenceStateRequirement::RetainedAndInvocation
+            } else {
+                InferenceStateRequirement::Invocation
             },
         })
     }
@@ -408,6 +437,11 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 } else {
                     SequenceExecutionMode::None
                 },
+                state_requirement: if model_variant.family() == ModelFamily::Qwen3Asr {
+                    InferenceStateRequirement::Retained
+                } else {
+                    InferenceStateRequirement::Invocation
+                },
             })
     }
 }
@@ -426,6 +460,7 @@ impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -442,6 +477,7 @@ impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
             streaming_mode: StreamingMode::Realtime,
             execution_target: ExecutionTargetKind::RealtimeRunner,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::RetainedAndInvocation,
         })
     }
 }
@@ -458,6 +494,7 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: chat_sequence_execution(model_variant),
+            state_requirement: InferenceStateRequirement::Retained,
         })
     }
 }
@@ -474,6 +511,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::Invocation,
         })
     }
 }
@@ -490,6 +528,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::Invocation,
         })
     }
 }
@@ -508,6 +547,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -526,6 +566,7 @@ impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::BatchRunner,
                 sequence_execution: SequenceExecutionMode::None,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -542,6 +583,7 @@ impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
             streaming_mode: StreamingMode::None,
             execution_target: ExecutionTargetKind::Artifact,
             sequence_execution: SequenceExecutionMode::None,
+            state_requirement: InferenceStateRequirement::Stateless,
         })
     }
 }
