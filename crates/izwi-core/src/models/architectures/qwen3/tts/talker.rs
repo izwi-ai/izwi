@@ -4,7 +4,7 @@
 //! It uses a Qwen3 architecture with MRoPE (Multi-modal Rotary Position Embeddings)
 //! to handle both text and audio modalities.
 
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
@@ -12,129 +12,9 @@ use crate::models::architectures::qwen3::tts::config::TalkerConfig;
 use crate::models::architectures::qwen3::tts::rope::{
     build_rope_inv_freq, build_rope_window, duplicate_rope_window, qwen_rotate_half,
 };
-use crate::models::shared::attention::batched::{
-    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
-};
-use crate::models::shared::attention::flash::{
-    flash_attention_requested, try_fused_self_attention,
-};
-use crate::models::shared::attention::paged::{
-    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
-    paged_decode_attention, repeat_kv, KvCacheQuantization, KvPage,
-};
 pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as TalkerPhysicalCache;
 use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
-
-/// KV Cache for the talker model
-pub struct TalkerCache {
-    k_pages: Vec<Vec<KvPage>>,
-    v_pages: Vec<Vec<KvPage>>,
-    page_size: usize,
-    quantization: KvCacheQuantization,
-}
-
-impl TalkerCache {
-    pub fn storage_bytes(&self) -> usize {
-        self.k_pages
-            .iter()
-            .chain(self.v_pages.iter())
-            .flat_map(|pages| pages.iter())
-            .map(KvPage::storage_bytes)
-            .sum()
-    }
-
-    pub fn allocated_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        self.account_storage(&mut accounting)?;
-        Some(accounting.bytes())
-    }
-
-    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
-        for page in self
-            .k_pages
-            .iter()
-            .chain(self.v_pages.iter())
-            .flat_map(|pages| pages.iter())
-        {
-            page.account_storage(accounting)?;
-        }
-        Some(())
-    }
-
-    /// Create a new cache for the specified number of layers
-    pub fn new(num_layers: usize) -> Self {
-        Self::with_page_size_and_quantization(
-            num_layers,
-            default_kv_page_size(),
-            default_kv_quantization(),
-        )
-    }
-
-    /// Create a new cache with explicit page size.
-    pub fn with_page_size(num_layers: usize, page_size: usize) -> Self {
-        Self::with_page_size_and_quantization(num_layers, page_size, default_kv_quantization())
-    }
-
-    pub fn with_page_size_and_quantization(
-        num_layers: usize,
-        page_size: usize,
-        quantization: KvCacheQuantization,
-    ) -> Self {
-        Self {
-            k_pages: vec![Vec::new(); num_layers],
-            v_pages: vec![Vec::new(); num_layers],
-            page_size: page_size.max(1),
-            quantization,
-        }
-    }
-
-    /// Append new k, v to paged cache.
-    fn append(&mut self, layer: usize, k: Tensor, v: Tensor) -> Result<()> {
-        append_to_pages(
-            self.page_size,
-            &mut self.k_pages[layer],
-            &k,
-            self.quantization,
-        )?;
-        append_to_pages(
-            self.page_size,
-            &mut self.v_pages[layer],
-            &v,
-            self.quantization,
-        )?;
-        Ok(())
-    }
-
-    fn pages(&self, layer: usize) -> Option<(&[KvPage], &[KvPage])> {
-        let k = self.k_pages.get(layer)?;
-        let v = self.v_pages.get(layer)?;
-        if k.is_empty() || v.is_empty() {
-            None
-        } else {
-            Some((k.as_slice(), v.as_slice()))
-        }
-    }
-
-    fn materialize(&self, layer: usize) -> Result<(Tensor, Tensor)> {
-        let k = self.k_pages.get(layer).ok_or_else(|| {
-            Error::InferenceError(format!("Invalid TalkerCache layer index: {layer}"))
-        })?;
-        let v = self.v_pages.get(layer).ok_or_else(|| {
-            Error::InferenceError(format!("Invalid TalkerCache layer index: {layer}"))
-        })?;
-        Ok((materialize_pages(k)?, materialize_pages(v)?))
-    }
-
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        for i in 0..self.k_pages.len() {
-            self.k_pages[i].clear();
-            self.v_pages[i].clear();
-        }
-    }
-}
 
 /// Multi-head attention with optional Q/K normalization
 struct Attention {
@@ -275,163 +155,6 @@ impl Attention {
             .map_err(Error::from)
     }
 
-    fn forward(
-        &self,
-        x: &Tensor,
-        start_pos: usize,
-        position_ids: Option<&Tensor>,
-        cache: Option<&mut TalkerCache>,
-        layer_idx: usize,
-    ) -> Result<Tensor> {
-        let bsz = x.dim(0)?;
-        let seq_len = x.dim(1)?;
-        let use_batched = cache.is_none() && start_pos == 0 && bsz > 1;
-
-        // Project to Q, K, V
-        let mut q =
-            self.q_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
-        let mut k =
-            self.k_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v =
-            self.v_proj
-                .forward(x)?
-                .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
-
-        // Apply Q/K normalization if present
-        q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
-        k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
-
-        // Apply RoPE
-        q = self.apply_rope(q, start_pos, position_ids)?;
-        k = self.apply_rope(k, start_pos, position_ids)?;
-
-        // Update cache and resolve KV view.
-        // Store cache pages in KV-head layout so paged decode can expand exactly once.
-        let (mut k, mut v) = if let Some(cache) = cache {
-            cache.append(layer_idx, k, v)?;
-
-            // Decode path hot loop: for single-token decode, avoid rematerializing full KV.
-            if seq_len == 1 && start_pos > 0 {
-                if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
-                    let out = paged_decode_attention(
-                        &q,
-                        k_pages,
-                        v_pages,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    )?;
-                    let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
-                }
-            }
-
-            cache.materialize(layer_idx)?
-        } else {
-            (k, v)
-        };
-
-        // Attention compute paths below expect K/V expanded to query-head count.
-        k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
-        if use_batched {
-            let q = q.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            k = k.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            v = v.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            let attention_mask = if seq_len > 1 {
-                Some(causal_mask(
-                    seq_len,
-                    seq_len,
-                    start_pos,
-                    q.device(),
-                    q.dtype(),
-                )?)
-            } else {
-                None
-            };
-            let input = BatchedAttentionInput {
-                queries: q,
-                keys: k,
-                values: v,
-                attention_mask,
-                seq_lengths: vec![seq_len; bsz],
-            };
-            let config = BatchedAttentionConfig::new(self.num_heads, self.head_dim);
-            let out = batched_scaled_dot_product_attention(&input, &config)?;
-            return self.o_proj.forward(&out).map_err(Error::from);
-        }
-
-        // Transpose for attention
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-        let total_len = k.dim(2)?;
-        if seq_len == 1 {
-            let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-            if let Ok(sdpa_out) = ops::sdpa(&q, &k, &v, None, false, scale, 1.0) {
-                let out = sdpa_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
-            }
-        }
-        if flash_attention_requested() && start_pos == 0 && total_len == seq_len {
-            if let Some(fused_out) =
-                try_fused_self_attention(&q, &k, &v, None, self.head_dim, true)?
-            {
-                let out = fused_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
-            }
-        }
-
-        // Reshape for batch matrix multiply
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        // Compute attention
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale = (self.head_dim as f64).sqrt();
-        let scale_t =
-            Tensor::from_vec(vec![scale as f32], (1,), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale_t)?;
-
-        // Apply causal mask
-        if seq_len > 1 {
-            let mask = causal_mask(seq_len, total_len, start_pos, att.device(), att.dtype())?;
-            att = att.broadcast_add(&mask)?;
-        }
-
-        // Softmax and apply to values
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-
-        // Reshape back
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-
-        // Output projection
-        self.o_proj.forward(&out).map_err(Error::from)
-    }
-
-    /// Execute this layer against scheduler-owned physical pages.
-    ///
-    /// Q/K/V stay in grouped-query layout and are written directly into the
-    /// prepared slots. The backend consumes the page table without rebuilding
-    /// dense K/V tensors or expanding KV heads with `repeat_kv`.
     fn forward_physical(
         &self,
         x: &Tensor,
@@ -549,27 +272,6 @@ impl Layer {
         })
     }
 
-    fn forward(
-        &self,
-        x: &Tensor,
-        start_pos: usize,
-        position_ids: Option<&Tensor>,
-        cache: Option<&mut TalkerCache>,
-        layer_idx: usize,
-    ) -> Result<Tensor> {
-        // Self-attention with residual
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out =
-            self.self_attn
-                .forward(&normed, start_pos, position_ids, cache, layer_idx)?;
-        let x = x.broadcast_add(&attn_out)?;
-
-        // MLP with residual
-        let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        x.broadcast_add(&mlp_out).map_err(Error::from)
-    }
-
     fn forward_physical(
         &self,
         x: &Tensor,
@@ -685,125 +387,7 @@ impl TalkerModel {
         self.layers.len()
     }
 
-    /// Forward pass starting from token IDs
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut TalkerCache>,
-    ) -> Result<Tensor> {
-        let embeds = self.embeddings(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache, None)
-    }
-
-    /// Forward token IDs against scheduler-owned retained talker pages.
-    pub fn forward_physical(
-        &self,
-        input_ids: &Tensor,
-        start_pos: usize,
-        cache: &mut TalkerPhysicalCache,
-    ) -> Result<Tensor> {
-        let embeds = self.embeddings(input_ids)?;
-        self.forward_physical_with_embeds(&embeds, start_pos, cache, None)
-    }
-
-    /// Get embeddings for token IDs
-    /// Uses text_embedding for text tokens and codec_embedding for codec tokens
-    pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let ids = input_ids.to_vec2::<u32>()?;
-
-        // Fast path: all text ids.
-        if ids.iter().all(|row| {
-            row.iter()
-                .all(|id| (*id as usize) < self.cfg.text_vocab_size)
-        }) {
-            let text_embeds = self.text_embedding.forward(input_ids)?;
-            return self.text_projection.forward(&text_embeds);
-        }
-
-        // Mixed text/codec path:
-        // - text ids: [0, text_vocab_size)
-        // - codec/control ids: text_vocab_size + codec_id
-        let mut batch_embeds = Vec::with_capacity(ids.len());
-        for row in ids.iter() {
-            if row.is_empty() {
-                return Err(Error::InvalidInput(
-                    "Empty token row in talker embeddings".to_string(),
-                ));
-            }
-
-            let mut token_embeds = Vec::with_capacity(row.len());
-            for &token_id in row {
-                let embed = if (token_id as usize) < self.cfg.text_vocab_size {
-                    let token = Tensor::from_vec(vec![token_id], (1,), &self.device)?;
-                    let text = self.text_embedding.forward(&token)?;
-                    self.text_projection.forward(&text)?
-                } else {
-                    let codec_id = token_id - self.cfg.text_vocab_size as u32;
-                    if (codec_id as usize) >= self.cfg.vocab_size {
-                        return Err(Error::InvalidInput(format!(
-                            "Codec token out of range: token_id={token_id}, codec_id={codec_id}, codec_vocab={}",
-                            self.cfg.vocab_size
-                        )));
-                    }
-                    let token = Tensor::from_vec(vec![codec_id], (1,), &self.device)?;
-                    self.codec_embedding.forward(&token)?
-                };
-                token_embeds.push(embed);
-            }
-
-            let row_embed = Tensor::cat(&token_embeds, 0)?;
-            batch_embeds.push(row_embed);
-        }
-
-        Tensor::stack(&batch_embeds, 0).map_err(Error::from)
-    }
-
-    /// Forward pass with pre-computed embeddings
-    pub fn forward_with_embeds(
-        &self,
-        embeds: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut TalkerCache>,
-        position_ids: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let (_hidden, logits) =
-            self.forward_with_embeds_and_hidden(embeds, start_pos, cache, position_ids)?;
-        Ok(logits)
-    }
-
-    /// Forward pre-computed embeddings against retained physical talker pages.
-    pub fn forward_physical_with_embeds(
-        &self,
-        embeds: &Tensor,
-        start_pos: usize,
-        cache: &mut TalkerPhysicalCache,
-        position_ids: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let (_hidden, logits) =
-            self.forward_physical_with_embeds_and_hidden(embeds, start_pos, cache, position_ids)?;
-        Ok(logits)
-    }
-
-    /// Forward pass with pre-computed embeddings, returning both hidden states and logits.
-    pub fn forward_with_embeds_and_hidden(
-        &self,
-        embeds: &Tensor,
-        start_pos: usize,
-        mut cache: Option<&mut TalkerCache>,
-        position_ids: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
-        let mut x = embeds.clone();
-        for (idx, layer) in self.layers.iter().enumerate() {
-            let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, position_ids, cache_ref, idx)?;
-        }
-        let hidden = self.norm.forward(&x)?;
-        let logits = self.lm_head.forward(&hidden)?;
-        Ok((hidden, logits))
-    }
-
-    /// Physical-cache counterpart of [`Self::forward_with_embeds_and_hidden`].
+    /// Run pre-computed embeddings against retained physical pages.
     ///
     /// `start_pos` must equal the cache's authoritative cursor. Every layer
     /// writes the same prepared slots, and the cursor advances only after all
@@ -846,22 +430,6 @@ impl TalkerModel {
         Ok((hidden, logits))
     }
 
-    /// Prefill pass from externally assembled embeddings.
-    /// Returns (last_hidden, last_logits), each shaped [1, 1, ...].
-    pub fn prefill_with_embeds(
-        &self,
-        embeds: &Tensor,
-        cache: &mut TalkerCache,
-        position_ids: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
-        let (hidden, logits) =
-            self.forward_with_embeds_and_hidden(embeds, 0, Some(cache), position_ids)?;
-        let seq_len = hidden.dim(1)?;
-        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
-        let last_logits = logits.i((.., seq_len - 1..seq_len, ..))?;
-        Ok((last_hidden, last_logits))
-    }
-
     /// Prefill a fresh retained physical talker cache.
     pub fn prefill_physical_with_embeds(
         &self,
@@ -881,17 +449,6 @@ impl TalkerModel {
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
         let last_logits = logits.i((.., seq_len - 1..seq_len, ..))?;
         Ok((last_hidden, last_logits))
-    }
-
-    /// Incremental generation step from an externally assembled single-step embedding.
-    /// Returns (hidden, logits) for the provided step; shapes are [1, 1, ...].
-    pub fn generate_step_with_embed(
-        &self,
-        input_embed: &Tensor,
-        cache: &mut TalkerCache,
-        offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        self.forward_with_embeds_and_hidden(input_embed, offset, Some(cache), None)
     }
 
     /// Append one generation token at the retained physical cursor.
@@ -1025,28 +582,6 @@ fn repeated_mrope_position_ids(
         }
     }
     Tensor::from_vec(data, (3, seq_len), device).map_err(Error::from)
-}
-
-/// Create causal attention mask
-fn causal_mask(
-    seq_len: usize,
-    total_len: usize,
-    start_pos: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<Tensor> {
-    let mut data = vec![0f32; seq_len * total_len];
-    for i in 0..seq_len {
-        let limit = start_pos + i;
-        for j in 0..total_len {
-            if j > limit {
-                data[i * total_len + j] = -1e4;
-            }
-        }
-    }
-    Tensor::from_vec(data, (1, seq_len, total_len), device)?
-        .to_dtype(dtype)
-        .map_err(Error::from)
 }
 
 #[cfg(test)]
