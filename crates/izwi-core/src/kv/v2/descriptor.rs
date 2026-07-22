@@ -227,12 +227,8 @@ impl CapabilityStateDescriptorV2 {
                     .map(|profile| profile.stage_graph_fingerprint)
                     .collect(),
             }
-        } else if has_workspace.iter().all(|has_workspace| *has_workspace) {
-            InvocationWorkspaceSet::Bounded { profiles }
         } else {
-            return Err(invalid(
-                "execution graphs disagree on whether physical workspace exists",
-            ));
+            InvocationWorkspaceSet::Bounded { profiles }
         };
         let descriptor = Self {
             abi: CURRENT_INFERENCE_STATE_ABI,
@@ -330,6 +326,14 @@ impl InvocationWorkspaceSet {
                         "bounded invocation workspace profiles require canonical unique stage-graph order",
                     ));
                 }
+                if !profiles
+                    .iter()
+                    .any(|profile| profile.stages.iter().any(|stage| !stage.domains.is_empty()))
+                {
+                    return Err(invalid(
+                        "bounded invocation workspace has no physical workspace domains",
+                    ));
+                }
                 let fingerprint = stage_graph_fingerprint(execution_stages)?;
                 let matching = profiles
                     .iter()
@@ -358,7 +362,6 @@ impl InvocationWorkspaceProfile {
             .map(|stage| stage.id)
             .collect::<HashSet<_>>();
         let mut previous = None;
-        let mut has_domain = false;
         for stage in &self.stages {
             if previous.is_some_and(|previous| stage.stage <= previous)
                 || !execution_ids.contains(&stage.stage)
@@ -373,17 +376,11 @@ impl InvocationWorkspaceProfile {
                 .find(|candidate| candidate.id == stage.stage)
                 .expect("execution stage membership was checked");
             let maximum = stage.validate()?;
-            has_domain |= !stage.domains.is_empty();
             if maximum != execution.max_workspace_bytes {
                 return Err(invalid(
                     "invocation workspace formula disagrees with the loaded execution stage",
                 ));
             }
-        }
-        if !has_domain {
-            return Err(invalid(
-                "bounded invocation workspace has no physical workspace domains",
-            ));
         }
         Ok(())
     }

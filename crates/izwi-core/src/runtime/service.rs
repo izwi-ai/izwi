@@ -3060,8 +3060,9 @@ mod tests {
         assert!(request.execution_adapter_binding().is_some());
         assert_eq!(
             request.cache_capability(),
-            &crate::kv::CacheCapability::OpaqueModelOwned
+            &crate::kv::CacheCapability::None
         );
+        assert!(request.v2_state_runtime().is_some());
 
         let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
         assert!(bind_request_to_residency(&mut wrong, Some(&lease), Some(&bundle), false).is_err());
@@ -3170,6 +3171,7 @@ mod tests {
         )
         .expect("v2 loaded bundle");
         let mut request = EngineCoreRequest::tts("stateless").with_model_variant(variant);
+        let legacy_cache = request.cache_capability().clone();
 
         bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
             .expect("matching v2 loaded capability descriptor");
@@ -3184,9 +3186,7 @@ mod tests {
             request.cache_capability(),
             &crate::kv::CacheCapability::None
         );
-        assert!(request
-            .bind_cache_capability(crate::kv::CacheCapability::OpaqueModelOwned)
-            .is_err());
+        assert!(request.bind_cache_capability(legacy_cache).is_err());
         let direct = loaded_contract_for_residency(
             &lease,
             Some(&bundle),

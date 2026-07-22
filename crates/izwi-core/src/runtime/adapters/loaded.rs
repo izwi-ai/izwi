@@ -118,7 +118,7 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract>;
 }
 
-fn compatibility_state_publication() -> LoadedStatePublication {
+fn legacy_model_owned_state_publication() -> LoadedStatePublication {
     LoadedStatePublication::LegacyV1(LoadedKvCacheCapability {
         capability: CacheCapability::OpaqueModelOwned,
         fallback_reason: Some(COMPATIBILITY_CACHE_FALLBACK_REASON),
@@ -211,7 +211,7 @@ fn loaded_execution_contracts(
 impl LoadedCapabilityDescriptor {
     fn new(
         execution: Arc<dyn LoadedExecutionAdapter>,
-        state: LoadedStatePublication,
+        state: Option<LoadedStatePublication>,
         backend_kind: BackendKind,
     ) -> Result<Self> {
         let contracts = loaded_execution_contracts(execution.as_ref())?;
@@ -223,6 +223,22 @@ impl LoadedCapabilityDescriptor {
                 ));
             }
         }
+        let state = match state {
+            Some(state) => state,
+            None if contracts
+                .iter()
+                .all(|contract| contract.execution_profile.cache_mode == CacheMode::None) =>
+            {
+                let stage_graphs = contracts
+                    .iter()
+                    .map(|contract| contract.stages.as_ref())
+                    .collect::<Vec<_>>();
+                LoadedStatePublication::V2(CapabilityStateDescriptorV2::stateless_for_stage_graphs(
+                    &stage_graphs,
+                )?)
+            }
+            None => legacy_model_owned_state_publication(),
+        };
         let mut v2_runtimes = HashMap::new();
         let state = match state {
             LoadedStatePublication::LegacyV1(cache) => {
@@ -892,7 +908,7 @@ impl RuntimeAdapterRegistry {
         model_instance_id: ModelInstanceId,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
-        state: LoadedStatePublication,
+        state: Option<LoadedStatePublication>,
     ) -> Result<LoadedCapabilityDescriptor> {
         let context = LoadedAdapterFactoryContext {
             execution_group_id,
@@ -993,9 +1009,7 @@ impl LoadedModelBundle {
 
         let mut capabilities = HashMap::with_capacity(metadata.len());
         for metadata in metadata {
-            let state = state_publications
-                .remove(&metadata.capability)
-                .unwrap_or_else(compatibility_state_publication);
+            let state = state_publications.remove(&metadata.capability);
             let descriptor = registry.bind_loaded_capability(
                 execution_group_id,
                 model_instance_id,
@@ -1090,6 +1104,14 @@ mod tests {
     use super::*;
     use crate::engine::{EngineCore, EngineCoreConfig};
     use crate::runtime::adapters::ExecutionTargetKind;
+
+    fn legacy_model_owned_capability() -> CacheCapability {
+        let LoadedStatePublication::LegacyV1(loaded) = legacy_model_owned_state_publication()
+        else {
+            unreachable!("legacy helper must remain a v1 publication")
+        };
+        loaded.capability
+    }
 
     #[test]
     fn managed_qwen_publication_seals_a_physical_v2_runtime() {
@@ -1210,7 +1232,7 @@ mod tests {
                     .unwrap()
                     .adapter_binding()
                     .unwrap(),
-                state: CapabilityStateBinding::LegacyV1(CacheCapability::OpaqueModelOwned),
+                state: CapabilityStateBinding::LegacyV1(legacy_model_owned_capability()),
                 state_fingerprint: None,
             }
         );
@@ -1409,7 +1431,7 @@ mod tests {
                 )
                 .unwrap()
                 .state,
-            CapabilityStateBinding::LegacyV1(CacheCapability::OpaqueModelOwned)
+            CapabilityStateBinding::LegacyV1(legacy_model_owned_capability())
         );
     }
 
@@ -1500,14 +1522,35 @@ mod tests {
                     .unwrap_or_else(|error| {
                         panic!("failed to bind capability for {variant}: {error}")
                     });
-                assert_eq!(
-                    binding.state,
-                    CapabilityStateBinding::LegacyV1(CacheCapability::OpaqueModelOwned),
-                    "cache capability changed for {variant}"
-                );
                 let contract = bundle
                     .contract(metadata.capability, false)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
+                let all_graphs_cacheless = loaded_execution_contracts(
+                    bundle
+                        .require_capability(metadata.capability)
+                        .unwrap()
+                        .execution
+                        .as_ref(),
+                )
+                .unwrap()
+                .iter()
+                .all(|contract| contract.execution_profile.cache_mode == CacheMode::None);
+                if all_graphs_cacheless {
+                    assert!(
+                        matches!(binding.state, CapabilityStateBinding::V2(_)),
+                        "fully cacheless capability remained legacy for {variant}"
+                    );
+                }
+                match &binding.state {
+                    CapabilityStateBinding::V2(runtime) => {
+                        assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
+                        assert!(runtime.descriptor.is_stateless(), "{variant}");
+                        assert!(binding.state_fingerprint.is_some(), "{variant}");
+                    }
+                    CapabilityStateBinding::LegacyV1(capability)
+                        if capability == &legacy_model_owned_capability() => {}
+                    state => panic!("unexpected state binding {state:?} for {variant}"),
+                }
                 assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
                 assert_eq!(contract.model_instance_id, instance);
                 assert_eq!(contract.metadata, metadata);
