@@ -562,7 +562,7 @@ impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::BatchRunner,
                 sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Invocation,
+                state_requirement: InferenceStateRequirement::Stateless,
             })
     }
 }

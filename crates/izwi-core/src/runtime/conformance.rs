@@ -280,7 +280,8 @@ fn workspace_expectation(
         // The tokenizer is an artifact operation, not a tensor execution
         // capability. It must still publish a workspace contract, but an empty
         // resolved contract is valid.
-        (ModelFamily::Tokenizer, Capability::Tokenizer) => DeclaredMayBeEmpty,
+        (ModelFamily::Tokenizer, Capability::Tokenizer)
+        | (ModelFamily::Qwen3ForcedAligner, Capability::ForcedAlignment) => DeclaredMayBeEmpty,
 
         // Qwen TTS has a frame-local code-predictor cache in addition to its
         // retained talker state. Nemotron realtime has chunk-local staging in

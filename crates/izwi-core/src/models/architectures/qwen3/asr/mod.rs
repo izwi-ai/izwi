@@ -1028,7 +1028,7 @@ impl Qwen3AsrModel {
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            &mut cache,
+            Some(&mut cache),
         )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let pos = embeds.dim(1)?;
@@ -1283,7 +1283,7 @@ impl Qwen3AsrModel {
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            &mut cache,
+            Some(&mut cache),
         )?;
 
         let mut pos = embeds.dim(1)?;
@@ -1377,13 +1377,12 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let mut cache = AsrKvCache::ModelOwned(self.build_decode_cache(prompt.ids.len(), 1));
         let logits = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            &mut cache,
+            None,
         )?;
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
@@ -1475,7 +1474,7 @@ impl Qwen3AsrModel {
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
-        cache: &mut AsrKvCache,
+        cache: Option<&mut AsrKvCache>,
     ) -> Result<Tensor> {
         let embeds = self.text_model.embeddings(input_ids)?;
         let seq_len = embeds.dim(1)?;
@@ -1523,16 +1522,19 @@ impl Qwen3AsrModel {
             None
         };
         match cache {
-            AsrKvCache::ModelOwned(cache) => {
+            Some(AsrKvCache::ModelOwned(cache)) => {
                 self.text_model
                     .forward_with_embeds(&embeds, 0, Some(cache), position_ids.as_ref())
             }
-            AsrKvCache::Managed(cache) => self.text_model.forward_managed_with_embeds(
+            Some(AsrKvCache::Managed(cache)) => self.text_model.forward_managed_with_embeds(
                 &embeds,
                 0,
                 cache,
                 position_ids.as_ref(),
             ),
+            None => self
+                .text_model
+                .forward_with_embeds(&embeds, 0, None, position_ids.as_ref()),
         }
     }
 
