@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::backends::state::StateBackendRegistry;
 use crate::backends::BackendKind;
@@ -270,13 +270,13 @@ impl CapabilityStateRuntimeV2 {
         }
     }
 
-    pub(crate) fn managed_kv_runtime(&self) -> Option<&Arc<ManagedKvModelRuntime>> {
+    pub(crate) fn managed_kv_runtime(&self) -> Option<Arc<ManagedKvModelRuntime>> {
         match &self.backing {
             CapabilityStateRuntimeBackingV2::Stateless(_) => None,
             CapabilityStateRuntimeBackingV2::Managed(runtime)
                 if runtime.retained_state_use == RetainedStateUseV2::ExternalPaged =>
             {
-                Some(&runtime.physical)
+                runtime.physical.upgrade()
             }
             CapabilityStateRuntimeBackingV2::Managed(_) => None,
         }
@@ -343,8 +343,12 @@ pub(crate) struct ManagedCapabilityRuntimeV2 {
     pub(crate) state_fingerprint: [u8; 32],
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) state_plan: Arc<ResolvedStatePlan>,
+    physical_plan: crate::kv::KvPlanId,
     retained_state_use: RetainedStateUseV2,
-    physical: Arc<ManagedKvModelRuntime>,
+    /// The lifecycle manager is the physical owner. A sealed adapter proves
+    /// the exact generation without pinning that generation through unload;
+    /// admitted requests upgrade this weak handle while holding residency.
+    physical: Weak<ManagedKvModelRuntime>,
     invocation_paged: InvocationPagedWorkspaceRuntimeV2,
 }
 
@@ -406,8 +410,9 @@ impl ManagedCapabilityRuntimeV2 {
             state_fingerprint,
             descriptor,
             state_plan,
+            physical_plan: physical.plan().id,
             retained_state_use,
-            physical,
+            physical: Arc::downgrade(&physical),
             invocation_paged,
         };
         runtime.id = runtime.compute_id()?;
@@ -430,10 +435,14 @@ impl ManagedCapabilityRuntimeV2 {
         let registry =
             StateBackendRegistry::new(self.state_plan.backend, self.state_plan.device_ordinal)?;
         self.state_plan.validate_against(contract, &registry)?;
+        let physical = self.physical.upgrade().ok_or_else(|| {
+            invalid("managed state ABI v2 runtime refers to an unloaded physical generation")
+        })?;
         if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
             || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
-            || self.state_plan.id != self.physical.state_plan_v2().id
-            || execution.model_instance_id != self.physical.plan().model_instance
+            || self.state_plan.id != physical.state_plan_v2().id
+            || self.physical_plan != physical.plan().id
+            || execution.model_instance_id != physical.plan().model_instance
             || self.id != self.compute_id()?
         {
             return Err(invalid(
@@ -459,7 +468,7 @@ impl ManagedCapabilityRuntimeV2 {
             stage_graph_fingerprint: self.stage_graph_fingerprint,
             state_fingerprint: self.state_fingerprint,
             state_plan: self.state_plan.id,
-            physical_plan: self.physical.plan().id,
+            physical_plan: self.physical_plan,
             retained_state_use: self.retained_state_use,
             invocation_paged: self
                 .invocation_paged

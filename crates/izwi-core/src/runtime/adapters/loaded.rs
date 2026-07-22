@@ -1419,6 +1419,56 @@ mod tests {
     }
 
     #[test]
+    fn sealed_adapter_bundle_does_not_pin_an_idle_physical_generation() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let model_instance = ModelInstanceId::new(80);
+        let legacy_contract = crate::kv::test_contract();
+        let mut core = EngineCore::new(EngineCoreConfig {
+            max_blocks: 4,
+            block_size: 32,
+            ..EngineCoreConfig::default()
+        })
+        .unwrap();
+        let physical = core
+            .load_managed_model_cache(
+                model_instance,
+                &CacheCapability::Managed(legacy_contract.clone()),
+            )
+            .unwrap()
+            .expect("physical managed runtime");
+        let bundle = LoadedModelBundle::bind_with_state_publications(
+            &registry,
+            ExecutionGroupId::new(30),
+            model_instance,
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+            HashMap::from([(
+                CapabilityKind::Chat,
+                LoadedStatePublication::ManagedV2 {
+                    contract: crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).unwrap(),
+                    physical: physical.clone(),
+                },
+            )]),
+        )
+        .unwrap();
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
+            .unwrap();
+        let CapabilityStateBinding::V2(runtime) = binding.state else {
+            panic!("expected managed v2 runtime");
+        };
+        drop(physical);
+
+        assert!(core
+            .unload_managed_model_cache(model_instance)
+            .expect("idle physical generation unload"));
+        assert!(runtime.managed_kv_runtime().is_none());
+        assert!(runtime
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .is_err());
+    }
+
+    #[test]
     fn qwen_asr_activates_one_managed_arena_only_for_native_streaming() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(81);

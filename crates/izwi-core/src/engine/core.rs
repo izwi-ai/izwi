@@ -1540,7 +1540,7 @@ impl EngineCore {
                 })?;
                 runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
                 if let Some(physical) = runtime.managed_kv_runtime() {
-                    request.install_managed_cache_runtime(physical.clone())?;
+                    request.install_managed_cache_runtime(physical)?;
                 }
             }
             let capability = request.cache_capability().clone();
