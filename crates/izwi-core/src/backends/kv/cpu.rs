@@ -14,7 +14,7 @@ use crate::Result;
 
 use super::{
     DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvBackendRuntime, KvDeviceFence,
-    KvPageCopy, KvSlotMap, KvWriteArgs, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
 };
 
 #[derive(Debug)]
@@ -292,7 +292,11 @@ impl KvArena for CpuKvArena {
         Ok(ready_fence())
     }
 
-    fn write_slots(&self, binding: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence> {
+    fn write_slots(
+        &self,
+        binding: KvLayerBinding,
+        args: KvWriteArgs<'_>,
+    ) -> Result<KvWriteCompletion> {
         let slots = self.cpu_slots(args.slots)?;
         let layer = self.layer(binding)?;
         validate_write_tensor(
@@ -323,7 +327,12 @@ impl KvArena for CpuKvArena {
             .values
             .inplace_op3(args.values, &slots.flat_slots, &SlotScatterOp)?;
         self.slot_write_dispatches.fetch_add(1, Ordering::Relaxed);
-        Ok(ready_fence())
+        Ok(KvWriteCompletion::new(
+            self.config.id,
+            binding,
+            slots.len,
+            ready_fence(),
+        ))
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {

@@ -138,6 +138,49 @@ pub trait KvDeviceFence: Send + Sync {
 
 pub type DeviceFence = Arc<dyn KvDeviceFence>;
 
+/// Backend-authenticated completion for one physical K/V write dispatch.
+///
+/// The constructor is private to the backend module tree, so model and
+/// executor code can wait on or collect a real dispatch result but cannot
+/// fabricate one from reservation metadata.
+pub struct KvWriteCompletion {
+    arena: KvArenaId,
+    layer: KvLayerBinding,
+    slots: usize,
+    fence: DeviceFence,
+}
+
+impl KvWriteCompletion {
+    fn new(arena: KvArenaId, layer: KvLayerBinding, slots: usize, fence: DeviceFence) -> Self {
+        Self {
+            arena,
+            layer,
+            slots,
+            fence,
+        }
+    }
+
+    pub(crate) fn arena(&self) -> KvArenaId {
+        self.arena
+    }
+
+    pub(crate) fn layer(&self) -> KvLayerBinding {
+        self.layer
+    }
+
+    pub(crate) fn slots(&self) -> usize {
+        self.slots
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.fence.is_complete()
+    }
+
+    pub(crate) fn wait(&self) -> Result<()> {
+        self.fence.wait()
+    }
+}
+
 /// Physical arena mutation ABI shared by CPU and accelerator backends.
 pub trait KvArena: Send + Sync {
     fn id(&self) -> KvArenaId;
@@ -151,7 +194,11 @@ pub trait KvArena: Send + Sync {
 
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence>;
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
-    fn write_slots(&self, layer: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence>;
+    fn write_slots(
+        &self,
+        layer: KvLayerBinding,
+        args: KvWriteArgs<'_>,
+    ) -> Result<KvWriteCompletion>;
     /// Direct paged prefill/extend. Backends may fuse this operation; the
     /// portable default remains page-native by issuing the already-attested
     /// direct decode operation for each causal query position.

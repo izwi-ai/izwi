@@ -13,7 +13,7 @@ use crate::Result;
 use super::KvBackendRuntime;
 use super::{
     DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvDeviceFence, KvPageCopy,
-    KvSlotMap, KvWriteArgs, PagedKvDecodeArgs,
+    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -528,7 +528,11 @@ impl KvArena for CandleAcceleratorKvArena {
         self.mutation_fence()
     }
 
-    fn write_slots(&self, binding: KvLayerBinding, args: KvWriteArgs<'_>) -> Result<DeviceFence> {
+    fn write_slots(
+        &self,
+        binding: KvLayerBinding,
+        args: KvWriteArgs<'_>,
+    ) -> Result<KvWriteCompletion> {
         let slots = self.accelerator_slots(args.slots)?;
         let layer = self.layer(binding)?;
         validate_write_tensor(
@@ -569,7 +573,13 @@ impl KvArena for CandleAcceleratorKvArena {
             flat_values.slice_set(&args.values.narrow(0, token, 1)?, 0, slot)?;
         }
         self.slot_write_dispatches.fetch_add(1, Ordering::Relaxed);
-        self.mutation_fence()
+        let fence = self.mutation_fence()?;
+        Ok(KvWriteCompletion::new(
+            self.config.id,
+            binding,
+            slots.len(),
+            fence,
+        ))
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {

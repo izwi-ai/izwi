@@ -255,16 +255,25 @@ impl PhysicalPagedKvCache {
         let slots = self.slots_for_append(start_pos, token_count)?;
         let lowered = self.arena.lower_slots(&slots)?;
         let binding = self.layer_binding(layer_idx)?;
-        self.arena
-            .write_slots(
-                binding,
-                KvWriteArgs {
-                    keys,
-                    values,
-                    slots: lowered.as_ref(),
-                },
-            )?
-            .wait()?;
+        let completion = self.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys,
+                values,
+                slots: lowered.as_ref(),
+            },
+        )?;
+        if completion.arena() != self.arena.id()
+            || completion.layer() != binding
+            || completion.slots() != token_count
+        {
+            return Err(Error::InferenceError(
+                "physical paged write returned a mismatched backend completion".into(),
+            ));
+        }
+        if !completion.is_complete() {
+            completion.wait()?;
+        }
 
         let table = self.sequence_table(end_pos)?;
         if token_count == 1 {
