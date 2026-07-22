@@ -18,9 +18,7 @@ use crate::backends::{open_gguf_reader, BackendKind};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
-use crate::models::shared::telemetry::{
-    record_prefill_sequence_span, record_prefill_token_mode_step,
-};
+use crate::models::shared::telemetry::record_prefill_sequence_span;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -87,14 +85,12 @@ impl Lfm2PrefillMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lfm2PrefillExecution {
     Full,
-    Token,
 }
 
 impl Lfm2PrefillExecution {
     fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
-            Self::Token => "token",
         }
     }
 }
@@ -108,18 +104,12 @@ struct Lfm2PrefillConfig {
 impl Lfm2PrefillConfig {
     const DEFAULT_TOKEN_THRESHOLD: usize = 64;
 
-    fn resolve(self, prompt_tokens: usize) -> Lfm2PrefillExecution {
-        match self.mode {
-            Lfm2PrefillMode::Full => Lfm2PrefillExecution::Full,
-            Lfm2PrefillMode::Token => Lfm2PrefillExecution::Token,
-            Lfm2PrefillMode::Auto => {
-                if prompt_tokens <= self.token_prompt_threshold {
-                    Lfm2PrefillExecution::Token
-                } else {
-                    Lfm2PrefillExecution::Full
-                }
-            }
-        }
+    fn resolve(self, _prompt_tokens: usize) -> Lfm2PrefillExecution {
+        // Candle's quantized LFM2 ShortConv cache ignores `index_pos` for
+        // one-token calls, so token prefill can reuse state from a previous
+        // request. A full prompt pass replaces both attention and ShortConv
+        // state deterministically at the request boundary.
+        Lfm2PrefillExecution::Full
     }
 }
 
@@ -190,14 +180,18 @@ fn should_prepend_default_system(
     messages: &[ChatMessage],
     policy: Lfm2DefaultSystemPolicy,
 ) -> bool {
-    if matches!(messages.first().map(|message| &message.role), Some(ChatRole::System)) {
+    if matches!(
+        messages.first().map(|message| &message.role),
+        Some(ChatRole::System)
+    ) {
         return false;
     }
     match policy {
         Lfm2DefaultSystemPolicy::Always => true,
         Lfm2DefaultSystemPolicy::Never => false,
         Lfm2DefaultSystemPolicy::Auto => {
-            !(messages.len() == 1 && matches!(messages.first().map(|m| &m.role), Some(ChatRole::User)))
+            !(messages.len() == 1
+                && matches!(messages.first().map(|m| &m.role), Some(ChatRole::User)))
         }
     }
 }
@@ -246,8 +240,11 @@ fn should_use_aggressive_single_turn_prompt(
     if prepend_default_system {
         return false;
     }
-    let single_user_turn =
-        messages.len() == 1 && matches!(messages.first().map(|message| &message.role), Some(ChatRole::User));
+    let single_user_turn = messages.len() == 1
+        && matches!(
+            messages.first().map(|message| &message.role),
+            Some(ChatRole::User)
+        );
     if !single_user_turn {
         return false;
     }
@@ -641,24 +638,6 @@ impl Lfm2ChatModel {
                     .map_err(|e| Error::InferenceError(format!("LFM2 GGUF forward failed: {e}")))?;
                 Ok((logits, prompt_ids.len(), 1))
             }
-            Lfm2PrefillExecution::Token => {
-                let mut position = 0usize;
-                let mut logits: Option<Tensor> = None;
-                for &token in prompt_ids {
-                    record_prefill_token_mode_step();
-                    let token_ids = Tensor::from_slice(&[token], (1, 1), &self.device.device)?;
-                    logits = Some(model.forward(&token_ids, position).map_err(|e| {
-                        Error::InferenceError(format!("LFM2 GGUF token prefill failed: {e}"))
-                    })?);
-                    position += 1;
-                }
-                let logits = logits.ok_or_else(|| {
-                    Error::InferenceError(
-                        "LFM2 chat token prefill did not produce logits".to_string(),
-                    )
-                })?;
-                Ok((logits, position, prompt_ids.len()))
-            }
         }
     }
 }
@@ -731,12 +710,11 @@ fn has_token_repetition_loop(ids: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_token_repetition_loop, parse_lfm2_default_system_policy,
-        parse_lfm2_prefill_mode, parse_lfm2_prefill_threshold, parse_lfm2_prompt_style_policy,
-        should_check_repetition_loop, should_prepend_default_system,
-        should_use_aggressive_single_turn_prompt, strip_past_assistant_thinking,
-        Lfm2DefaultSystemPolicy, Lfm2PrefillConfig, Lfm2PrefillExecution, Lfm2PrefillMode,
-        Lfm2PromptStylePolicy,
+        has_token_repetition_loop, parse_lfm2_default_system_policy, parse_lfm2_prefill_mode,
+        parse_lfm2_prefill_threshold, parse_lfm2_prompt_style_policy, should_check_repetition_loop,
+        should_prepend_default_system, should_use_aggressive_single_turn_prompt,
+        strip_past_assistant_thinking, Lfm2DefaultSystemPolicy, Lfm2PrefillConfig,
+        Lfm2PrefillExecution, Lfm2PrefillMode, Lfm2PromptStylePolicy,
     };
     use crate::models::shared::chat::{ChatMessage, ChatRole};
 
@@ -808,14 +786,20 @@ mod tests {
     }
 
     #[test]
-    fn prefill_auto_policy_uses_token_mode_for_short_prompts() {
+    fn prefill_policy_forces_request_isolated_full_passes() {
         let config = Lfm2PrefillConfig {
             mode: Lfm2PrefillMode::Auto,
             token_prompt_threshold: 64,
         };
-        assert_eq!(config.resolve(16), Lfm2PrefillExecution::Token);
-        assert_eq!(config.resolve(64), Lfm2PrefillExecution::Token);
+        assert_eq!(config.resolve(16), Lfm2PrefillExecution::Full);
+        assert_eq!(config.resolve(64), Lfm2PrefillExecution::Full);
         assert_eq!(config.resolve(65), Lfm2PrefillExecution::Full);
+
+        let explicitly_unsafe = Lfm2PrefillConfig {
+            mode: Lfm2PrefillMode::Token,
+            token_prompt_threshold: usize::MAX,
+        };
+        assert_eq!(explicitly_unsafe.resolve(1), Lfm2PrefillExecution::Full);
     }
 
     #[test]
