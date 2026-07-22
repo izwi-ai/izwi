@@ -15,6 +15,7 @@ mod legacy;
 mod resolved;
 mod resolved_domains;
 mod runtime;
+mod scratch;
 
 #[allow(unused_imports)]
 pub(crate) use batch::{
@@ -72,6 +73,12 @@ pub(crate) use resolved_domains::{
 pub(crate) use runtime::{
     CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, ManagedCapabilityRuntimeV2,
     RetainedStateUseV2, StatelessCapabilityRuntimeV2,
+};
+#[allow(unused_imports)]
+pub(crate) use scratch::{
+    ResolvedScratchPlacement, ResolvedScratchWorkspace, ScratchMemoryDomain,
+    ScratchWorkspaceAllocationId, ScratchWorkspaceLease, ScratchWorkspaceOwner,
+    ScratchWorkspacePlanId, ScratchWorkspacePool, ScratchWorkspaceSlotRef,
 };
 
 #[cfg(test)]
