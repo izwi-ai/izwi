@@ -257,6 +257,18 @@ struct Transaction {
     state: KvTransactionState,
 }
 
+/// Fully validated metadata delta. Construction performs every fallible CAS,
+/// ownership, reference-count, and version check; applying it under the same
+/// engine state lock is infallible.
+pub(crate) struct KvCoordinatorCommitPlan {
+    txn: Transaction,
+    retain_prefix: Vec<CacheBlockRef>,
+    release_prefix: Vec<CacheBlockRef>,
+    old_blocks: HashSet<CacheBlockRef>,
+    new_blocks: HashSet<CacheBlockRef>,
+    next_version: u64,
+}
+
 /// Transactional metadata coordinator for one physical arena generation.
 pub struct KvCacheCoordinator {
     arena: KvArenaId,
@@ -687,6 +699,26 @@ impl KvCacheCoordinator {
         retain_prefix: &[CacheBlockRef],
         release_prefix: &[CacheBlockRef],
     ) -> KvCoordinatorResult<KvSnapshot> {
+        let plan =
+            match self.stage_commit_with_prefix_updates(txn_id, retain_prefix, release_prefix) {
+                Err(KvCoordinatorError::VersionConflict) => {
+                    self.abort_internal(txn_id);
+                    return Err(KvCoordinatorError::VersionConflict);
+                }
+                Err(error) => return Err(error),
+                Ok(plan) => plan,
+            };
+        Ok(self.apply_staged_commit(plan))
+    }
+
+    /// Validate a written transaction without publishing any table or
+    /// reference-count mutation.
+    pub(crate) fn stage_commit_with_prefix_updates(
+        &self,
+        txn_id: PlanId,
+        retain_prefix: &[CacheBlockRef],
+        release_prefix: &[CacheBlockRef],
+    ) -> KvCoordinatorResult<KvCoordinatorCommitPlan> {
         let txn = self
             .transactions
             .get(&txn_id)
@@ -704,7 +736,6 @@ impl KvCacheCoordinator {
             .get(&txn.key)
             .ok_or(KvCoordinatorError::MissingTable)?;
         if current != &txn.expected {
-            self.abort_internal(txn_id);
             return Err(KvCoordinatorError::VersionConflict);
         }
 
@@ -739,18 +770,55 @@ impl KvCacheCoordinator {
                 return Err(KvCoordinatorError::ReferenceUnderflow);
             }
         }
+        for block in new_blocks.difference(&old_blocks) {
+            self.slots[block.index as usize]
+                .table_refs
+                .checked_add(1)
+                .ok_or_else(|| {
+                    KvCoordinatorError::Invariant("table reference overflow".to_string())
+                })?;
+        }
+        for block in retain_prefix {
+            self.slots[block.index as usize]
+                .prefix_refs
+                .checked_add(1)
+                .ok_or_else(|| {
+                    KvCoordinatorError::Invariant("prefix reference overflow".to_string())
+                })?;
+        }
         let next_version = txn.expected.version.checked_add(1).ok_or_else(|| {
             KvCoordinatorError::Invariant("request table version overflow".to_string())
         })?;
 
+        Ok(KvCoordinatorCommitPlan {
+            txn,
+            retain_prefix: retain_prefix.to_vec(),
+            release_prefix: released,
+            old_blocks,
+            new_blocks,
+            next_version,
+        })
+    }
+
+    /// Apply a plan produced by [`Self::stage_commit_with_prefix_updates`].
+    /// The engine holds the coordinator state lock between staging and apply.
+    pub(crate) fn apply_staged_commit(&mut self, plan: KvCoordinatorCommitPlan) -> KvSnapshot {
+        let KvCoordinatorCommitPlan {
+            txn,
+            retain_prefix,
+            release_prefix,
+            old_blocks,
+            new_blocks,
+            next_version,
+        } = plan;
         // Add new ownership before releasing reservations or removed table refs.
         for block in new_blocks.difference(&old_blocks) {
             self.slots[block.index as usize].table_refs += 1;
         }
-        for block in retain_prefix {
+        for block in &retain_prefix {
             self.slots[block.index as usize].prefix_refs += 1;
         }
-        for block in &released {
+        for block in &release_prefix {
             self.slots[block.index as usize].prefix_refs -= 1;
         }
 
@@ -761,10 +829,11 @@ impl KvCacheCoordinator {
             slot.table_refs -= 1;
             self.recycle_if_unowned(block.index);
         }
-        for block in released {
+        for block in release_prefix {
             self.recycle_if_unowned(block.index);
         }
 
+        let txn_id = txn.id;
         let committed = KvSnapshot {
             arena: self.arena,
             session: txn.expected.session,
@@ -778,7 +847,7 @@ impl KvCacheCoordinator {
         self.transactions.remove(&txn_id);
         self.terminal_transactions
             .insert(txn_id, KvTerminalState::Committed);
-        Ok(committed)
+        committed
     }
 
     /// Idempotently abort a reservation and release all pins/private ownership.

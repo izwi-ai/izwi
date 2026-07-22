@@ -298,6 +298,22 @@ pub struct CoordinatedPrefixIndex {
     telemetry: Arc<ManagedKvTelemetry>,
 }
 
+pub(crate) struct StagedPrefixCommit {
+    index: CommittedPrefixIndex,
+    retained: Vec<CacheBlockRef>,
+    released: Vec<CacheBlockRef>,
+}
+
+impl StagedPrefixCommit {
+    pub(crate) fn retained(&self) -> &[CacheBlockRef] {
+        &self.retained
+    }
+
+    pub(crate) fn released(&self) -> &[CacheBlockRef] {
+        &self.released
+    }
+}
+
 impl CoordinatedPrefixIndex {
     pub fn new(capacity_pages: usize) -> Self {
         Self::with_telemetry(capacity_pages, Arc::new(ManagedKvTelemetry::default()))
@@ -332,6 +348,20 @@ impl CoordinatedPrefixIndex {
         page_tokens: u32,
         publications: &[KvPrefixPublication],
     ) -> Result<KvSnapshot, KvPrefixIndexError> {
+        let staged = self.stage_transaction(page_tokens, publications)?;
+        let snapshot =
+            coordinator.commit_with_prefix_updates(txn_id, staged.retained(), staged.released())?;
+        self.apply_staged(staged);
+        Ok(snapshot)
+    }
+
+    /// Build the next index and its coordinator reference delta without
+    /// changing live lookup visibility or page ownership.
+    pub(crate) fn stage_transaction(
+        &self,
+        page_tokens: u32,
+        publications: &[KvPrefixPublication],
+    ) -> Result<StagedPrefixCommit, KvPrefixIndexError> {
         let before = self
             .index
             .entries
@@ -349,12 +379,18 @@ impl CoordinatedPrefixIndex {
             .collect::<std::collections::HashSet<_>>();
         let retained = after.difference(&before).copied().collect::<Vec<_>>();
         let released = before.difference(&after).copied().collect::<Vec<_>>();
-        let snapshot = coordinator.commit_with_prefix_updates(txn_id, &retained, &released)?;
-        self.index = staged;
-        for _ in &released {
+        Ok(StagedPrefixCommit {
+            index: staged,
+            retained,
+            released,
+        })
+    }
+
+    pub(crate) fn apply_staged(&mut self, staged: StagedPrefixCommit) {
+        self.index = staged.index;
+        for _ in &staged.released {
             self.telemetry.record_prefix_eviction();
         }
-        Ok(snapshot)
     }
 
     /// Return the longest exact chain of committed, complete pages. Partial

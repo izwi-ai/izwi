@@ -9,11 +9,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::coordinator::{
-    KvBlockIntent, KvCacheCoordinator, KvCoordinatorError, KvGroupReservation, KvReserveRequest,
-    KvSnapshot, KvWindowReserveRequest, KvWriteReceipt,
+    KvBlockIntent, KvCacheCoordinator, KvCoordinatorCommitPlan, KvCoordinatorError,
+    KvGroupReservation, KvReserveRequest, KvSnapshot, KvWindowReserveRequest, KvWriteReceipt,
 };
 use super::prefix::{
     CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
+    StagedPrefixCommit,
 };
 use super::telemetry::{ManagedKvTelemetry, ManagedKvTelemetrySnapshot};
 #[cfg(feature = "flash-attn")]
@@ -184,6 +185,7 @@ struct ManagedKvModelState {
     resource_lease: Option<ResourceLease>,
 }
 
+#[derive(Clone)]
 struct PendingPrefixCommit {
     arena: KvArenaId,
     page_tokens: u32,
@@ -810,7 +812,8 @@ impl ManagedKvCacheManager {
             ));
         }
 
-        // Validate every backend acknowledgement before publishing any table.
+        // Mark every live transaction written. This changes no table/index
+        // ownership and is rolled back by abort if any later validation fails.
         for domain in &reservation.domains {
             let Some(written) = receipt
                 .domains
@@ -836,40 +839,83 @@ impl ManagedKvCacheManager {
                 return Err(coordinator_error(error));
             }
         }
-        // The engine serializes this loop under its state lock. Every domain
-        // has already passed version/write validation, so no competing table
-        // update can interleave between these publications.
         let mut pending = state
             .pending_prefixes
-            .remove(&reservation.txn_id)
+            .get(&reservation.txn_id)
+            .cloned()
             .unwrap_or_default();
+        let mut staged = Vec::<(
+            KvArenaId,
+            KvCoordinatorCommitPlan,
+            Option<StagedPrefixCommit>,
+        )>::with_capacity(reservation.domains.len());
         for domain in &reservation.domains {
-            let coordinator = state
-                .coordinators
-                .get_mut(&domain.arena)
-                .expect("reservation arena has a coordinator");
-            if let Some(index) = pending
+            let prefix = if let Some(index) = pending
                 .iter()
                 .position(|publication| publication.arena == domain.arena)
             {
                 let publication = pending.swap_remove(index);
-                state
+                let staged_prefix = state
                     .prefix_indexes
-                    .get_mut(&domain.arena)
+                    .get(&domain.arena)
                     .expect("reservation arena has a prefix index")
-                    .commit_transaction(
-                        coordinator,
-                        reservation.txn_id,
-                        publication.page_tokens,
-                        &publication.publications,
-                    )
-                    .map_err(prefix_error)?;
+                    .stage_transaction(publication.page_tokens, &publication.publications);
+                Some(match staged_prefix {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        abort_reservation(state, reservation);
+                        return Err(prefix_error(error));
+                    }
+                })
             } else {
-                coordinator
-                    .commit(reservation.txn_id, &[])
-                    .map_err(coordinator_error)?;
+                None
+            };
+            let coordinator = state
+                .coordinators
+                .get(&domain.arena)
+                .expect("reservation arena has a coordinator");
+            let commit = coordinator.stage_commit_with_prefix_updates(
+                reservation.txn_id,
+                prefix
+                    .as_ref()
+                    .map(StagedPrefixCommit::retained)
+                    .unwrap_or(&[]),
+                prefix
+                    .as_ref()
+                    .map(StagedPrefixCommit::released)
+                    .unwrap_or(&[]),
+            );
+            match commit {
+                Ok(commit) => staged.push((domain.arena, commit, prefix)),
+                Err(error) => {
+                    abort_reservation(state, reservation);
+                    return Err(coordinator_error(error));
+                }
             }
         }
+        if !pending.is_empty() {
+            abort_reservation(state, reservation);
+            return Err(Error::InferenceError(
+                "managed KV transaction contains a prefix publication for an unknown domain".into(),
+            ));
+        }
+        // Every fallible operation has succeeded. Applying these plans cannot
+        // fail, and the engine state lock prevents an interleaving mutation.
+        for (arena, commit, prefix) in staged {
+            state
+                .coordinators
+                .get_mut(&arena)
+                .expect("staged arena has a coordinator")
+                .apply_staged_commit(commit);
+            if let Some(prefix) = prefix {
+                state
+                    .prefix_indexes
+                    .get_mut(&arena)
+                    .expect("staged arena has a prefix index")
+                    .apply_staged(prefix);
+            }
+        }
+        state.pending_prefixes.remove(&reservation.txn_id);
         self.telemetry.record_commit();
         Ok(())
     }
@@ -1639,7 +1685,7 @@ mod tests {
         let model = ModelInstanceId::new(41);
         let session = SessionKey::new("managed-live".to_string(), 7);
         let domain = CacheDomainId::new(1);
-        let mut manager = ManagedKvCacheManager::default();
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([5; 32]));
         let runtime = manager
             .bind_request(
                 model,
@@ -1659,7 +1705,11 @@ mod tests {
         assert_eq!(first.domains.len(), 1);
         assert_eq!(first.domains[0].writable_blocks.len(), 1);
         manager
-            .finalize(&first, Some(&first.completed_write_receipt_for_test()), true)
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
             .expect("commit");
         let snapshot = manager.snapshot(model, &session, domain).expect("snapshot");
         assert_eq!(snapshot.version, 1);
@@ -1810,7 +1860,11 @@ mod tests {
             .expect("first reservation");
         assert_eq!(first.domains[0].execution_start_tokens, 0);
         manager
-            .finalize(&first, Some(&first.completed_write_receipt_for_test()), true)
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
             .expect("first commit");
         manager
             .release_session(&first_session)
@@ -1983,6 +2037,58 @@ mod tests {
             assert_eq!(snapshot.version, 1);
             assert_eq!(snapshot.committed_tokens, 8);
         }
+    }
+
+    #[test]
+    fn composite_domain_failure_publishes_no_table() {
+        let model = ModelInstanceId::new(45);
+        let session = SessionKey::new("managed-composite-failure".to_string(), 1);
+        let mut contract = test_contract();
+        let mut second = contract.domains[0].clone();
+        if let KvDomainSpec::PagedAttention(domain) = &mut second {
+            domain.id = CacheDomainId::new(2);
+        }
+        contract.domains.push(second);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([5; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(contract),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let request = prefix_request(model, (0..16).collect());
+        let reservation = manager
+            .prepare(&runtime, 9, &session, &sequence_work(0, 16), Some(&request))
+            .expect("prepare")
+            .expect("reservation");
+        let receipt = reservation.completed_write_receipt_for_test();
+        let state = manager.models.get_mut(&model).expect("model state");
+        let pending = state
+            .pending_prefixes
+            .get_mut(&9)
+            .expect("pending prefixes");
+        assert_eq!(pending.len(), 2);
+        assert!(!pending[1].publications.is_empty());
+        pending[1].publications[0].block = reservation.domains[0].writable_blocks[0];
+
+        assert!(manager
+            .finalize(&reservation, Some(&receipt), true)
+            .is_err());
+        for domain in [CacheDomainId::new(1), CacheDomainId::new(2)] {
+            let snapshot = manager.snapshot(model, &session, domain).expect("snapshot");
+            assert_eq!(snapshot.version, 0);
+            assert_eq!(snapshot.committed_tokens, 0);
+        }
+        assert!(manager
+            .runtime_snapshot()
+            .models
+            .iter()
+            .flat_map(|model| &model.arenas)
+            .all(|arena| arena.coordinator.active_transactions == 0));
     }
 
     #[test]
