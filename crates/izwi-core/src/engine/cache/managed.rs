@@ -1013,8 +1013,27 @@ impl ManagedKvCacheManager {
 
     pub(crate) fn release_session(&mut self, session: &SessionKey) -> Result<()> {
         for state in self.models.values_mut() {
-            if !state.registered_sessions.remove(session) {
+            if !state.registered_sessions.contains(session) {
                 continue;
+            }
+            for group in &state.runtime.plan.groups {
+                state
+                    .coordinators
+                    .get(&group.arena)
+                    .expect("resolved arena has a coordinator")
+                    .validate_table_release(session, group.domain)
+                    .map_err(coordinator_error)?;
+            }
+            if let Some(sequence) = state.tensor_sequences.get(session).copied() {
+                state
+                    .runtime
+                    .tensor_state()
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "registered tensor-state sequence lost its arena".into(),
+                        )
+                    })?
+                    .validate_release(sequence)?;
             }
             for group in &state.runtime.plan.groups {
                 state
@@ -1035,6 +1054,7 @@ impl ManagedKvCacheManager {
                     })?
                     .release(sequence)?;
             }
+            state.registered_sessions.remove(session);
         }
         Ok(())
     }
@@ -1884,6 +1904,41 @@ mod tests {
         assert_eq!(unchanged.committed_tokens, 5);
 
         manager.release_session(&session).expect("release");
+        assert!(manager.snapshot(model, &session, domain).is_none());
+    }
+
+    #[test]
+    fn session_release_is_retryable_while_a_row_transaction_is_active() {
+        let model = ModelInstanceId::new(53);
+        let session = SessionKey::new("managed-release-retry".into(), 1);
+        let domain = CacheDomainId::new(1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let reservation = manager
+            .prepare(&runtime, 41, &session, &sequence_work(0, 1), None)
+            .unwrap()
+            .unwrap();
+
+        assert!(manager.release_session(&session).is_err());
+        assert!(manager.models[&model]
+            .registered_sessions
+            .contains(&session));
+        assert!(manager.snapshot(model, &session, domain).is_some());
+
+        manager.finalize(&reservation, None, false).unwrap();
+        manager.release_session(&session).unwrap();
+        assert!(!manager.models[&model]
+            .registered_sessions
+            .contains(&session));
         assert!(manager.snapshot(model, &session, domain).is_none());
     }
 

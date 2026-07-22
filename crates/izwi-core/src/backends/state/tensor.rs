@@ -279,18 +279,17 @@ impl TensorStateArena {
 
     pub(crate) fn release(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
         let mut state = self.lock()?;
-        if state
-            .transactions
-            .values()
-            .any(|transaction| transaction.sequence == sequence)
-        {
-            return Err(invalid("physical state sequence has an active transaction"));
-        }
+        validate_sequence_release(&state, sequence)?;
         state
             .sequences
             .remove(&sequence)
-            .map(|_| ())
-            .ok_or_else(|| invalid("physical state sequence is not registered"))
+            .expect("validated physical state sequence remains registered");
+        Ok(())
+    }
+
+    pub(crate) fn validate_release(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
+        let state = self.lock()?;
+        validate_sequence_release(&state, sequence)
     }
 
     fn validate_components(
@@ -396,6 +395,20 @@ fn candle_dtype(dtype: StateDType) -> Result<DType> {
             "quantized tensor state requires an explicit packing ABI",
         )),
     }
+}
+
+fn validate_sequence_release(state: &ArenaState, sequence: PhysicalStateSequenceId) -> Result<()> {
+    if state
+        .transactions
+        .values()
+        .any(|transaction| transaction.sequence == sequence)
+    {
+        return Err(invalid("physical state sequence has an active transaction"));
+    }
+    if !state.sequences.contains_key(&sequence) {
+        return Err(invalid("physical state sequence is not registered"));
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -537,5 +550,19 @@ mod tests {
             .read(sequence, StateDomainId::new(1))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn sequence_release_preflight_preserves_an_active_transaction() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        arena.begin(transaction, sequence).unwrap();
+        assert!(arena.validate_release(sequence).is_err());
+        assert!(arena.release(sequence).is_err());
+        arena.abort(transaction).unwrap();
+        arena.validate_release(sequence).unwrap();
+        arena.release(sequence).unwrap();
     }
 }

@@ -862,9 +862,9 @@ impl KvCacheCoordinator {
         Err(KvCoordinatorError::MissingTransaction(txn_id))
     }
 
-    /// Release a completed request table. Active reservations must abort first.
-    pub fn release_table(
-        &mut self,
+    /// Preflight table release without mutating page ownership.
+    pub fn validate_table_release(
+        &self,
         session: &SessionKey,
         domain: CacheDomainId,
     ) -> KvCoordinatorResult<()> {
@@ -875,15 +875,30 @@ impl KvCacheCoordinator {
         let snapshot = self
             .tables
             .get(&key)
-            .cloned()
             .ok_or(KvCoordinatorError::MissingTable)?;
-        let blocks = unique_table_blocks(&snapshot.groups);
-        for block in &blocks {
-            self.validate_block(*block, None)?;
+        for block in unique_table_blocks(&snapshot.groups) {
+            self.validate_block(block, None)?;
             if self.slots[block.index as usize].table_refs == 0 {
                 return Err(KvCoordinatorError::ReferenceUnderflow);
             }
         }
+        Ok(())
+    }
+
+    /// Release a completed request table. Active reservations must abort first.
+    pub fn release_table(
+        &mut self,
+        session: &SessionKey,
+        domain: CacheDomainId,
+    ) -> KvCoordinatorResult<()> {
+        self.validate_table_release(session, domain)?;
+        let key = TableKey::new(session.clone(), domain);
+        let snapshot = self
+            .tables
+            .get(&key)
+            .cloned()
+            .ok_or(KvCoordinatorError::MissingTable)?;
+        let blocks = unique_table_blocks(&snapshot.groups);
         self.tables.remove(&key);
         for block in blocks {
             self.validate_block(block, None)?;
