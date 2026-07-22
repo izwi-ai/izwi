@@ -63,11 +63,12 @@ pub(crate) use resolved::{
 };
 #[allow(unused_imports)]
 pub(crate) use resolved_domains::{
-    AppendStateOperationSet, NonPagedStateOperationQuery, NonPagedStateOperationRegistry,
-    ResolvedAppendStatePlan, ResolvedNonPagedDomainPlan, ResolvedRingStatePlan,
-    ResolvedStaticAttentionPlan, ResolvedStaticTensorPlan, ResolvedTensorComponent,
-    ResolvedTensorStatePlan, RingStateOperationSet, StaticAttentionOperationSet,
-    StaticTensorOperationSet, TensorPhysicalLayout, TensorStateOperationSet,
+    align_bytes, AppendStateOperationSet, NonPagedStateOperationQuery,
+    NonPagedStateOperationRegistry, ResolvedAppendStatePlan, ResolvedNonPagedDomainPlan,
+    ResolvedRingStatePlan, ResolvedStaticAttentionPlan, ResolvedStaticTensorPlan,
+    ResolvedTensorComponent, ResolvedTensorStatePlan, RingStateOperationSet,
+    StaticAttentionOperationSet, StaticTensorOperationSet, TensorPhysicalLayout,
+    TensorStateOperationSet,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime::{

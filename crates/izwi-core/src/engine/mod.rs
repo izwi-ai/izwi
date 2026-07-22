@@ -44,6 +44,8 @@ pub(crate) use cache::invocation::{
     InvocationPagedKvPoolId, InvocationPagedKvPoolOwner, InvocationPagedKvSlotRef,
 };
 
+#[cfg(test)]
+pub(crate) use cache::managed::ManagedKvCacheManager;
 pub(crate) use cache::managed::ManagedKvModelRuntime;
 pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,

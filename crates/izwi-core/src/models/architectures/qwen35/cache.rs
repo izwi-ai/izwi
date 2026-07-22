@@ -251,4 +251,28 @@ mod tests {
             "qwen35_hybrid_state_is_not_injected_as_one_atomic_managed_transaction"
         );
     }
+
+    #[test]
+    fn composite_contract_allocates_paged_and_transactional_tensor_arenas() {
+        use crate::backends::BackendKind;
+        use crate::engine::{ManagedKvCacheManager, ModelInstanceId};
+        use crate::kv::CacheCapability;
+
+        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                ModelInstanceId::new(71),
+                BackendKind::Cpu,
+                2,
+                32,
+                &CacheCapability::Managed(contract),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(runtime.state_plan_v2().paged_attention.len(), 1);
+        assert_eq!(runtime.state_plan_v2().non_paged.len(), 2);
+        assert!(runtime.tensor_state().is_some());
+    }
 }

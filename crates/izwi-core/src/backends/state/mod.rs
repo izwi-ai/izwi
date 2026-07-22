@@ -1,27 +1,40 @@
 //! Backend policy and attestation for inference-state ABI v2.
 //!
-//! This module deliberately contains no tensor allocation. It resolves the
-//! physical choices a backend is prepared to implement and attests only
-//! operation sets that are complete today. KV arenas expose in-place writes,
+//! This module resolves the physical choices a backend is prepared to
+//! implement and attests only operation sets that are complete today. KV
+//! arenas expose in-place writes,
 //! ragged causal prefill/extend, and paged decode without materializing K/V or
 //! expanding grouped-query heads. Fixed logical backing and unpinned workspace
 //! envelopes are exact; unsupported growth, pinned memory, domains, and builds
 //! remain fail-closed.
 
+mod tensor;
+
+#[allow(unused_imports)]
+pub(crate) use tensor::{
+    PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, StateDomainSnapshot,
+    TensorStateArena,
+};
+
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    AttentionPattern, CapacityStrategy, GroupResourceQuery, InferenceStateContract,
-    NonPagedStateOperationQuery, NonPagedStateOperationRegistry, OperationAbi,
-    PagedAttentionDomainSpec, PagedAttentionOperationQuery, PlacementPolicy, RegisteredOperationId,
-    ResolvedCapacityDomain, ResolvedGroupResourceEnvelope, ResolvedPagedAttentionGroup,
-    ResolvedPlacement, ResolvedStatePlan, ResolvedWorkspaceResourceEnvelope, StateDType,
-    StateDomainSpec, StateLayerBinding, StateOperationRegistry, StateOperationSet,
-    StatePhysicalLayout, StateResourceRegistry, StateStorageFormat, WorkspacePlacement,
-    WorkspaceResourceQuery,
+    align_bytes, AppendStateOperationSet, AttentionPattern, CapacityStrategy, GroupResourceQuery,
+    InferenceStateContract, NonPagedStateOperationQuery, NonPagedStateOperationRegistry,
+    OperationAbi, PagedAttentionDomainSpec, PagedAttentionOperationQuery, PlacementPolicy,
+    RegisteredOperationId, ResolvedAppendStatePlan, ResolvedCapacityDomain,
+    ResolvedGroupResourceEnvelope, ResolvedNonPagedDomainPlan, ResolvedPagedAttentionGroup,
+    ResolvedPlacement, ResolvedRingStatePlan, ResolvedStatePlan, ResolvedStaticAttentionPlan,
+    ResolvedStaticTensorPlan, ResolvedTensorComponent, ResolvedTensorStatePlan,
+    ResolvedWorkspaceResourceEnvelope, RingStateOperationSet, StateDType, StateDomainSpec,
+    StateLayerBinding, StateOperationRegistry, StateOperationSet, StatePhysicalLayout,
+    StateResourceRegistry, StateStorageFormat, StaticAttentionOperationSet,
+    StaticTensorOperationSet, TensorComponentSpec, TensorPhysicalLayout, TensorStateOperationSet,
+    WorkspacePlacement, WorkspaceResourceQuery,
 };
 
 const PAGED_OPERATION_ABI: OperationAbi = OperationAbi::new(1);
+const NON_PAGED_OPERATION_ABI: OperationAbi = OperationAbi::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StateBackendPlanRequest {
@@ -119,7 +132,7 @@ impl StateBackendRegistry {
         }
     }
 
-    const fn backend_compiled(self) -> bool {
+    const fn paged_backend_compiled(self) -> bool {
         match self.backend {
             BackendKind::Cpu => true,
             BackendKind::Metal => cfg!(feature = "metal"),
@@ -132,7 +145,7 @@ impl StateBackendRegistry {
     }
 
     fn require_compiled(self) -> Result<()> {
-        if self.backend_compiled() {
+        if self.paged_backend_compiled() {
             Ok(())
         } else {
             Err(invalid(format!(
@@ -144,7 +157,7 @@ impl StateBackendRegistry {
 
     fn supports_paged_policy(self, query: &PagedAttentionOperationQuery<'_>) -> bool {
         if !self.validate_identity(query.backend, query.device_ordinal)
-            || !self.backend_compiled()
+            || !self.paged_backend_compiled()
             || query.layout != StatePhysicalLayout::PageTokenHeadDim
             || query.operations != &paged_operation_set()
             || query.layers.len() != query.semantic.layers.len()
@@ -171,9 +184,9 @@ impl StateBackendRegistry {
 
 impl NonPagedStateOperationRegistry for StateBackendRegistry {
     fn supports_non_paged(&self, query: &NonPagedStateOperationQuery<'_>) -> bool {
-        // No backend-owned static/tensor/append/ring arena exists yet. Merely
-        // being able to allocate a Candle tensor is not operation attestation.
-        self.validate_identity(query.backend, query.device_ordinal) && false
+        self.validate_identity(query.backend, query.device_ordinal)
+            && non_paged_backend_compiled(self.backend)
+            && non_paged_plan_is_supported(query.resolved, query.semantic, self.backend)
     }
 }
 
@@ -193,25 +206,33 @@ impl StateResourceRegistry for StateBackendRegistry {
                 "state resource query targets a different backend or device",
             ));
         }
-        self.require_compiled()?;
+        if matches!(query.resolved, ResolvedCapacityDomain::Paged(_)) {
+            self.require_compiled()?;
+        } else if !non_paged_backend_compiled(self.backend) {
+            return Err(invalid(format!(
+                "inference-state backend {:?} is not compiled for tensor state",
+                self.backend
+            )));
+        }
         if !matches!(query.strategy, CapacityStrategy::Fixed { .. }) {
             return Err(invalid(
                 "state backend currently supports only fully-backed fixed capacity",
             ));
         }
-        let ResolvedCapacityDomain::Paged(plan) = query.resolved else {
-            return Err(invalid(
-                "non-paged inference-state backing is not implemented",
-            ));
-        };
-        if plan.layout != StatePhysicalLayout::PageTokenHeadDim
-            || !placement_is_allocatable(self.backend, plan.placement)
-            || !dtype_is_supported(self.backend, plan.storage.dtype())
-            || (self.backend == BackendKind::Cuda && plan.page_tokens % 32 != 0)
-        {
-            return Err(invalid(
-                "resolved state group is not allocatable by the selected backend",
-            ));
+        match query.resolved {
+            ResolvedCapacityDomain::Paged(plan)
+                if plan.layout == StatePhysicalLayout::PageTokenHeadDim
+                    && placement_is_allocatable(self.backend, plan.placement)
+                    && dtype_is_supported(self.backend, plan.storage.dtype())
+                    && (self.backend != BackendKind::Cuda || plan.page_tokens % 32 == 0) => {}
+            ResolvedCapacityDomain::NonPaged(plan)
+                if placement_is_allocatable(self.backend, plan.placement())
+                    && non_paged_resolved_dtypes_supported(plan, self.backend) => {}
+            _ => {
+                return Err(invalid(
+                    "resolved state group is not allocatable by the selected backend",
+                ));
+            }
         }
 
         // The fixed arena allocates one immutable logical backing whose Candle
@@ -263,9 +284,21 @@ pub(crate) fn negotiate_state_plan(
 ) -> Result<ResolvedStatePlan> {
     contract.validate()?;
     let registry = StateBackendRegistry::new(request.backend, request.device_ordinal)?;
-    registry.require_compiled()?;
+    if contract
+        .domains
+        .iter()
+        .any(|domain| matches!(domain, StateDomainSpec::PagedAttention(_)))
+    {
+        registry.require_compiled()?;
+    } else if !non_paged_backend_compiled(request.backend) {
+        return Err(invalid(format!(
+            "inference-state backend {:?} is not compiled for tensor state",
+            request.backend
+        )));
+    }
 
     let mut paged_attention = Vec::new();
+    let mut non_paged = Vec::new();
     for domain in &contract.domains {
         match domain {
             StateDomainSpec::PagedAttention(spec) => {
@@ -319,24 +352,301 @@ pub(crate) fn negotiate_state_plan(
                 }
                 paged_attention.push(resolved);
             }
-            _ => {
-                return Err(invalid(format!(
-                    "backend {:?} has no physical implementation for non-paged state domain {}",
-                    request.backend,
-                    domain.id().get()
-                )));
-            }
+            _ => non_paged.push(resolve_non_paged_domain(
+                contract, domain, request, &registry,
+            )?),
         }
     }
     paged_attention.sort_unstable_by_key(|group| (group.group, group.domain));
+    non_paged.sort_unstable_by_key(|plan| (plan.group(), plan.domain()));
     ResolvedStatePlan::build(
         request.backend,
         request.device_ordinal,
         contract,
         paged_attention,
-        Vec::new(),
+        non_paged,
         &registry,
     )
+}
+
+fn resolve_non_paged_domain(
+    contract: &InferenceStateContract,
+    domain: &StateDomainSpec,
+    request: &StateBackendPlanRequest,
+    registry: &StateBackendRegistry,
+) -> Result<ResolvedNonPagedDomainPlan> {
+    let group = contract
+        .groups
+        .iter()
+        .find(|group| group.domains.contains(&domain.id()))
+        .ok_or_else(|| invalid("non-paged state domain has no consistency group"))?;
+    let placement = resolve_non_paged_placement(domain.header().placement, request.backend)?;
+    let resolved = match domain {
+        StateDomainSpec::StaticAttention(spec) => {
+            let storage = dense_storage(&spec.accepted_dtypes, request.backend)?;
+            let layers = spec
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(physical_layer, layer)| {
+                    Ok(StateLayerBinding {
+                        model_layer: layer.model_layer,
+                        physical_layer: u32::try_from(physical_layer)
+                            .map_err(|_| invalid("static-attention layer count exceeds u32"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let elements = spec.layers.iter().try_fold(0_u64, |total, layer| {
+                let per_token = u64::from(layer.kv_heads)
+                    .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+                    .ok_or_else(|| invalid("static-attention geometry overflow"))?;
+                total
+                    .checked_add(
+                        per_token
+                            .checked_mul(spec.max_memory_tokens)
+                            .ok_or_else(|| invalid("static-attention geometry overflow"))?,
+                    )
+                    .ok_or_else(|| invalid("static-attention geometry overflow"))
+            })?;
+            ResolvedNonPagedDomainPlan::StaticAttention(ResolvedStaticAttentionPlan {
+                group: group.id,
+                domain: spec.header.id,
+                placement,
+                layers,
+                storage,
+                layout: TensorPhysicalLayout::ContiguousRowMajor,
+                alignment_bytes: 1,
+                maximum_bytes: storage.bytes_for_elements(elements)?,
+                operations: static_attention_operations(),
+            })
+        }
+        StateDomainSpec::StaticTensor(spec) => {
+            let components = resolve_components(&spec.components, request.backend)?;
+            ResolvedNonPagedDomainPlan::StaticTensor(ResolvedStaticTensorPlan {
+                group: group.id,
+                domain: spec.header.id,
+                placement,
+                maximum_bytes: component_bytes(&components)?,
+                components,
+                operations: static_tensor_operations(),
+            })
+        }
+        StateDomainSpec::Tensor(spec) => {
+            let components = resolve_components(&spec.components, request.backend)?;
+            ResolvedNonPagedDomainPlan::Tensor(ResolvedTensorStatePlan {
+                group: group.id,
+                domain: spec.header.id,
+                placement,
+                maximum_bytes: component_bytes(&components)?,
+                components,
+                operations: tensor_operations(),
+            })
+        }
+        StateDomainSpec::Append(spec) => {
+            let components_per_step =
+                resolve_components(&spec.components_per_step, request.backend)?;
+            let maximum_bytes = component_bytes(&components_per_step)?
+                .checked_mul(spec.max_steps)
+                .ok_or_else(|| invalid("append-state byte bound overflow"))?;
+            ResolvedNonPagedDomainPlan::Append(ResolvedAppendStatePlan {
+                group: group.id,
+                domain: spec.header.id,
+                placement,
+                components_per_step,
+                maximum_bytes,
+                operations: append_operations(),
+            })
+        }
+        StateDomainSpec::Ring(spec) => {
+            let components_per_step =
+                resolve_components(&spec.components_per_step, request.backend)?;
+            let maximum_bytes = component_bytes(&components_per_step)?
+                .checked_mul(spec.capacity_steps)
+                .ok_or_else(|| invalid("ring-state byte bound overflow"))?;
+            ResolvedNonPagedDomainPlan::Ring(ResolvedRingStatePlan {
+                group: group.id,
+                domain: spec.header.id,
+                placement,
+                components_per_step,
+                maximum_bytes,
+                operations: ring_operations(),
+            })
+        }
+        StateDomainSpec::PagedAttention(_) => {
+            return Err(invalid("paged state was routed to the non-paged resolver"));
+        }
+    };
+    resolved.validate_against(domain, request.backend, request.device_ordinal, registry)?;
+    Ok(resolved)
+}
+
+fn resolve_components(
+    components: &[TensorComponentSpec],
+    backend: BackendKind,
+) -> Result<Vec<ResolvedTensorComponent>> {
+    components
+        .iter()
+        .map(|component| {
+            let storage = dense_storage(&component.accepted_dtypes, backend)?;
+            Ok(ResolvedTensorComponent {
+                component: component.id,
+                layout: TensorPhysicalLayout::ContiguousRowMajor,
+                storage,
+                alignment_bytes: 1,
+                maximum_bytes: align_bytes(
+                    storage.bytes_for_elements(component.shape.maximum_elements()?)?,
+                    1,
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn component_bytes(components: &[ResolvedTensorComponent]) -> Result<u64> {
+    components.iter().try_fold(0_u64, |total, component| {
+        total
+            .checked_add(component.maximum_bytes)
+            .ok_or_else(|| invalid("non-paged state byte bound overflow"))
+    })
+}
+
+fn dense_storage(accepted: &[StateDType], backend: BackendKind) -> Result<StateStorageFormat> {
+    accepted
+        .iter()
+        .copied()
+        .find(|dtype| tensor_dtype_is_supported(backend, *dtype))
+        .map(|dtype| StateStorageFormat::Dense { dtype })
+        .ok_or_else(|| {
+            invalid(format!(
+                "backend {backend:?} found no supported tensor-state dtype"
+            ))
+        })
+}
+
+fn resolve_non_paged_placement(
+    policy: PlacementPolicy,
+    backend: BackendKind,
+) -> Result<ResolvedPlacement> {
+    match (policy, backend) {
+        (PlacementPolicy::Host, BackendKind::Cpu) => Ok(ResolvedPlacement::Host),
+        (PlacementPolicy::BackendLocal, _) | (PlacementPolicy::BackendLocalWithHostOffload, _) => {
+            Ok(ResolvedPlacement::BackendLocal)
+        }
+        (PlacementPolicy::Host, BackendKind::Metal | BackendKind::Cuda) => Err(invalid(
+            "accelerator tensor state must be backend-local for direct operations",
+        )),
+    }
+}
+
+const fn non_paged_backend_compiled(backend: BackendKind) -> bool {
+    match backend {
+        BackendKind::Cpu => true,
+        BackendKind::Metal => cfg!(feature = "metal"),
+        BackendKind::Cuda => cfg!(feature = "cuda"),
+    }
+}
+
+const fn tensor_dtype_is_supported(backend: BackendKind, dtype: StateDType) -> bool {
+    match backend {
+        BackendKind::Cpu => matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::Bf16),
+        BackendKind::Metal => matches!(dtype, StateDType::F32 | StateDType::F16),
+        BackendKind::Cuda => matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::Bf16),
+    }
+}
+
+fn non_paged_resolved_dtypes_supported(
+    plan: &ResolvedNonPagedDomainPlan,
+    backend: BackendKind,
+) -> bool {
+    let components = match plan {
+        ResolvedNonPagedDomainPlan::StaticTensor(plan) => plan.components.as_slice(),
+        ResolvedNonPagedDomainPlan::Tensor(plan) => plan.components.as_slice(),
+        ResolvedNonPagedDomainPlan::Append(plan) => plan.components_per_step.as_slice(),
+        ResolvedNonPagedDomainPlan::Ring(plan) => plan.components_per_step.as_slice(),
+        ResolvedNonPagedDomainPlan::StaticAttention(plan) => {
+            return tensor_dtype_is_supported(backend, plan.storage.dtype());
+        }
+    };
+    components
+        .iter()
+        .all(|component| tensor_dtype_is_supported(backend, component.storage.dtype()))
+}
+
+fn non_paged_plan_is_supported(
+    resolved: &ResolvedNonPagedDomainPlan,
+    semantic: &StateDomainSpec,
+    backend: BackendKind,
+) -> bool {
+    if !placement_is_allocatable(backend, resolved.placement())
+        || !non_paged_resolved_dtypes_supported(resolved, backend)
+    {
+        return false;
+    }
+    match (resolved, semantic) {
+        // Static attention needs a direct K/V install+attend arena. A generic
+        // tensor replacement cell is not sufficient operation attestation.
+        (ResolvedNonPagedDomainPlan::StaticAttention(_), StateDomainSpec::StaticAttention(_)) => {
+            false
+        }
+        (ResolvedNonPagedDomainPlan::StaticTensor(plan), StateDomainSpec::StaticTensor(_)) => {
+            plan.operations == static_tensor_operations()
+        }
+        (ResolvedNonPagedDomainPlan::Tensor(plan), StateDomainSpec::Tensor(_)) => {
+            plan.operations == tensor_operations()
+        }
+        (ResolvedNonPagedDomainPlan::Append(plan), StateDomainSpec::Append(_)) => {
+            plan.operations == append_operations()
+        }
+        (ResolvedNonPagedDomainPlan::Ring(plan), StateDomainSpec::Ring(_)) => {
+            plan.operations == ring_operations()
+        }
+        _ => false,
+    }
+}
+
+fn operation(name: &'static str) -> RegisteredOperationId {
+    RegisteredOperationId::new(name, NON_PAGED_OPERATION_ABI)
+}
+
+fn static_attention_operations() -> StaticAttentionOperationSet {
+    StaticAttentionOperationSet {
+        install: operation("static_attention_install"),
+        attend: operation("static_attention_attend"),
+    }
+}
+
+fn static_tensor_operations() -> StaticTensorOperationSet {
+    StaticTensorOperationSet {
+        install: operation("static_tensor_install"),
+        read: operation("static_tensor_read"),
+    }
+}
+
+fn tensor_operations() -> TensorStateOperationSet {
+    TensorStateOperationSet {
+        initialize: operation("tensor_state_initialize"),
+        read: operation("tensor_state_read"),
+        stage_replace: operation("tensor_state_stage_replace"),
+        reset: operation("tensor_state_reset"),
+    }
+}
+
+fn append_operations() -> AppendStateOperationSet {
+    AppendStateOperationSet {
+        initialize: operation("append_state_initialize"),
+        read: operation("append_state_read"),
+        append: operation("append_state_append"),
+        reset: operation("append_state_reset"),
+    }
+}
+
+fn ring_operations() -> RingStateOperationSet {
+    RingStateOperationSet {
+        initialize: operation("ring_state_initialize"),
+        read: operation("ring_state_read"),
+        advance: operation("ring_state_advance"),
+        reset: operation("ring_state_reset"),
+    }
 }
 
 pub(crate) fn resolve_paged_policy(

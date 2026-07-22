@@ -25,7 +25,7 @@ use crate::backends::kv::{
     CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendPlanRequest, KvBackendRuntime,
     KvLayerConfig,
 };
-use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest, TensorStateArena};
 use crate::backends::BackendKind;
 use crate::engine::{
     EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
@@ -142,6 +142,7 @@ pub(crate) struct ManagedKvModelRuntime {
     plan: Arc<ResolvedKvPlan>,
     state_plan_v2: Arc<ResolvedStatePlan>,
     arenas: HashMap<KvArenaId, Arc<dyn KvArena>>,
+    tensor_state: Option<Arc<TensorStateArena>>,
     physical_bytes: u64,
 }
 
@@ -168,6 +169,10 @@ impl ManagedKvModelRuntime {
 
     pub(crate) fn arena(&self, id: KvArenaId) -> Option<&Arc<dyn KvArena>> {
         self.arenas.get(&id)
+    }
+
+    pub(crate) fn tensor_state(&self) -> Option<&Arc<TensorStateArena>> {
+        self.tensor_state.as_ref()
     }
 
     pub(crate) fn physical_bytes(&self) -> u64 {
@@ -202,6 +207,7 @@ pub(crate) struct ManagedKvCacheManager {
     prefix_cache_salt: Option<[u8; 32]>,
     worker_backend: BackendKind,
     worker_device_location: DeviceLocation,
+    worker_device: Device,
     worker_device_ordinal: Option<u32>,
     backend_runtime: Option<Arc<dyn KvBackendRuntime>>,
     backend_unavailable: Option<String>,
@@ -237,6 +243,7 @@ impl ManagedKvCacheManager {
             prefix_cache_salt: None,
             worker_backend: backend,
             worker_device_location: device.location(),
+            worker_device: device.clone(),
             worker_device_ordinal: managed_device_ordinal(&device),
             backend_runtime,
             backend_unavailable,
@@ -404,8 +411,9 @@ impl ManagedKvCacheManager {
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".to_string()))?;
         let first_arena_generation = self.next_arena_generation;
+        let paged_contract = paged_only_contract(contract)?;
         let plan = backend_runtime.negotiate(
-            contract,
+            &paged_contract,
             &KvBackendPlanRequest {
                 model_instance,
                 backend,
@@ -429,6 +437,12 @@ impl ManagedKvCacheManager {
             },
         )?;
         validate_v2_physical_equivalence(&plan, &state_plan_v2)?;
+        let tensor_state = (!state_plan_v2.non_paged.is_empty())
+            .then(|| {
+                TensorStateArena::new(Arc::new(state_plan_v2.clone()), self.worker_device.clone())
+            })
+            .transpose()?
+            .map(Arc::new);
 
         let physical_bytes = plan_physical_bytes(&plan)?;
         let resources = managed_arena_resources(backend, physical_bytes);
@@ -482,6 +496,7 @@ impl ManagedKvCacheManager {
             plan: Arc::new(plan),
             state_plan_v2: Arc::new(state_plan_v2),
             arenas,
+            tensor_state,
             physical_bytes,
         });
         self.models.insert(
@@ -1131,7 +1146,6 @@ fn validate_v2_physical_equivalence(legacy: &ResolvedKvPlan, v2: &ResolvedStateP
     if legacy.backend != v2.backend
         || legacy.device_ordinal != v2.device_ordinal
         || legacy.groups.len() != v2.paged_attention.len()
-        || !v2.non_paged.is_empty()
     {
         return Err(Error::ModelLoadError(
             "v2 state plan does not match the allocating KV backend".to_string(),
@@ -1158,6 +1172,25 @@ fn validate_v2_physical_equivalence(legacy: &ResolvedKvPlan, v2: &ResolvedStateP
         }
     }
     Ok(())
+}
+
+fn paged_only_contract(contract: &KvCacheContract) -> Result<KvCacheContract> {
+    let paged = KvCacheContract {
+        abi: contract.abi,
+        domains: contract
+            .domains
+            .iter()
+            .filter(|domain| matches!(domain, KvDomainSpec::PagedAttention(_)))
+            .cloned()
+            .collect(),
+    };
+    if paged.domains.is_empty() {
+        return Err(Error::ModelLoadError(
+            "retained tensor-only state requires the native v2 runtime loader".into(),
+        ));
+    }
+    paged.validate()?;
+    Ok(paged)
 }
 
 fn plan_physical_bytes(plan: &ResolvedKvPlan) -> Result<u64> {
