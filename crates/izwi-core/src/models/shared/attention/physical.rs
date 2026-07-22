@@ -6,10 +6,24 @@ use std::sync::Arc;
 use candle_core::Tensor;
 
 use crate::backends::kv::{
-    KvArena, KvWriteArgs, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+    KvArena, KvSlotMap, KvWriteArgs, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
 };
 use crate::error::{Error, Result};
-use crate::kv::{CacheBlockRef, KvLayerBinding, KvSequenceBlockTable, KvSlotRef};
+use crate::kv::{
+    CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSequenceBlockTable,
+    KvSlotRef,
+};
+
+/// One immutable append/decode view lowered once and reused by every model
+/// layer in an execution quantum.
+pub(crate) struct PreparedPhysicalPagedStep {
+    arena: KvArenaId,
+    start_pos: usize,
+    token_count: usize,
+    slots: Arc<dyn KvSlotMap>,
+    decode: KvDecodeBatchMetadata,
+    prefill: Vec<PagedKvPrefillRow>,
+}
 
 /// A generation-pinned logical block table over one physical paged-attention
 /// arena. Models retain only this view; K/V tensors remain backend-owned.
@@ -227,6 +241,43 @@ impl PhysicalPagedKvCache {
         })
     }
 
+    pub(crate) fn prepare_append(
+        &self,
+        start_pos: usize,
+        token_count: usize,
+    ) -> Result<PreparedPhysicalPagedStep> {
+        if token_count == 0 {
+            return Err(Error::InvalidInput(
+                "physical paged append cannot prepare zero tokens".into(),
+            ));
+        }
+        let end_pos = start_pos
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
+        let slots = self
+            .arena
+            .lower_slots(&self.slots_for_append(start_pos, token_count)?)?;
+        let table = self.sequence_table(end_pos)?;
+        let query_len = u32::try_from(token_count)
+            .map_err(|_| Error::InvalidInput("physical paged query length exceeds u32".into()))?;
+        Ok(PreparedPhysicalPagedStep {
+            arena: self.arena.id(),
+            start_pos,
+            token_count,
+            slots,
+            decode: KvDecodeBatchMetadata {
+                sequences: vec![table.clone()],
+            },
+            prefill: vec![PagedKvPrefillRow {
+                blocks: table.blocks,
+                first_page_offset: table.first_page_offset,
+                query_start: 0,
+                query_len,
+                context_len: table.context_len,
+            }],
+        })
+    }
+
     /// Write one layer's projected K/V directly into its prepared physical
     /// slots and execute causal attention against the same authoritative pages.
     ///
@@ -237,7 +288,7 @@ impl PhysicalPagedKvCache {
     pub(crate) fn write_and_attend(
         &self,
         layer_idx: usize,
-        start_pos: usize,
+        prepared: &PreparedPhysicalPagedStep,
         queries: &Tensor,
         keys: &Tensor,
         values: &Tensor,
@@ -249,18 +300,22 @@ impl PhysicalPagedKvCache {
                 "physical paged attention requires matching non-empty token dimensions".into(),
             ));
         }
-        let end_pos = start_pos
-            .checked_add(token_count)
-            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
-        let slots = self.slots_for_append(start_pos, token_count)?;
-        let lowered = self.arena.lower_slots(&slots)?;
+        if prepared.arena != self.arena.id()
+            || prepared.start_pos != self.context_len
+            || prepared.token_count != token_count
+            || prepared.slots.len() != token_count
+        {
+            return Err(Error::InvalidInput(
+                "physical paged attention received a stale or incompatible prepared step".into(),
+            ));
+        }
         let binding = self.layer_binding(layer_idx)?;
         let completion = self.arena.write_slots(
             binding,
             KvWriteArgs {
                 keys,
                 values,
-                slots: lowered.as_ref(),
+                slots: prepared.slots.as_ref(),
             },
         )?;
         if completion.arena() != self.arena.id()
@@ -275,33 +330,22 @@ impl PhysicalPagedKvCache {
             completion.wait()?;
         }
 
-        let table = self.sequence_table(end_pos)?;
         if token_count == 1 {
             return self.arena.paged_decode(
                 binding,
                 PagedKvDecodeArgs {
                     queries,
-                    batch: &crate::kv::KvDecodeBatchMetadata {
-                        sequences: vec![table],
-                    },
+                    batch: &prepared.decode,
                     softmax_scale,
                 },
             );
         }
 
-        let query_len = u32::try_from(token_count)
-            .map_err(|_| Error::InvalidInput("physical paged query length exceeds u32".into()))?;
         self.arena.paged_prefill(
             binding,
             PagedKvPrefillArgs {
                 queries,
-                rows: &[PagedKvPrefillRow {
-                    blocks: table.blocks,
-                    first_page_offset: table.first_page_offset,
-                    query_start: 0,
-                    query_len,
-                    context_len: table.context_len,
-                }],
+                rows: &prepared.prefill,
                 softmax_scale,
             },
         )

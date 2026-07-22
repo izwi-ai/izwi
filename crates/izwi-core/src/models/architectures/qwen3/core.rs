@@ -33,6 +33,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
+use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
@@ -1881,6 +1882,7 @@ impl Qwen3Attention {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: &Qwen3ManagedCache,
+        prepared: &PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
@@ -1908,7 +1910,7 @@ impl Qwen3Attention {
             .contiguous()?;
         let out = cache.write_and_attend(
             layer_idx,
-            start_pos,
+            prepared,
             &queries,
             &keys,
             &values,
@@ -2246,12 +2248,18 @@ impl Qwen3Layer {
         start_pos: usize,
         position_ids: Option<&Tensor>,
         cache: &Qwen3ManagedCache,
+        prepared: &PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out =
-            self.self_attn
-                .forward_managed(&normed, start_pos, position_ids, cache, layer_idx)?;
+        let attn_out = self.self_attn.forward_managed(
+            &normed,
+            start_pos,
+            position_ids,
+            cache,
+            prepared,
+            layer_idx,
+        )?;
         let x = x.broadcast_add(&attn_out)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
@@ -2614,10 +2622,11 @@ impl Qwen3Model {
             self.cfg.head_dim(),
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
+        let prepared = cache.prepare_append(start_pos, sequence_len)?;
 
         let mut x = embeds.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_managed(&x, start_pos, position_ids, cache, layer_idx)?;
+            x = layer.forward_managed(&x, start_pos, position_ids, cache, &prepared, layer_idx)?;
         }
         let hidden = self.norm.forward(&x)?;
         let logits = self.logits_from_hidden(&hidden)?;
