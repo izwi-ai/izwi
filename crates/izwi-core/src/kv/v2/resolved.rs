@@ -303,7 +303,12 @@ impl ResolvedPagedAttentionGroup {
         device_ordinal: Option<u32>,
         operation_registry: &dyn StateOperationRegistry,
     ) -> Result<()> {
-        let StateDomainSpec::PagedAttention(spec) = domain;
+        let StateDomainSpec::PagedAttention(spec) = domain else {
+            return Err(invalid(format!(
+                "resolved paged-attention group references non-paged domain {}",
+                self.domain.get()
+            )));
+        };
         if !spec.page_size.accepts(self.page_tokens) {
             return Err(invalid(format!(
                 "resolved page size {} violates domain {} constraints",
@@ -492,8 +497,11 @@ impl StateOperationRegistry for TestOperationRegistry {
             && query.device_ordinal.is_none()
             && query.page_tokens == 16
             && !query.layers.is_empty()
-            && query.semantic.clock == StateClock::DecoderTokens
-            && matches!(query.semantic.prefix, PrefixPolicy::CommittedPages { .. })
+            && query.semantic.header.clock == StateClock::DecoderTokens
+            && matches!(
+                query.semantic.header.prefix,
+                PrefixPolicy::CommittedPages { .. }
+            )
             && query.semantic.layers.iter().all(|layer| {
                 layer.mask == AttentionMask::Causal
                     && matches!(layer.key_encoding, KeyEncoding::Rotary { .. })
@@ -599,7 +607,9 @@ mod tests {
         .is_err());
 
         let mut unsupported_semantics = contract.clone();
-        let StateDomainSpec::PagedAttention(domain) = &mut unsupported_semantics.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut unsupported_semantics.domains[0] else {
+            unreachable!()
+        };
         domain.layers[0].mask = AttentionMask::Bidirectional;
         assert!(ResolvedStatePlan::build(
             BackendKind::Cpu,
@@ -647,7 +657,9 @@ mod tests {
     #[test]
     fn plan_rejects_duplicate_semantic_layer_bindings() {
         let mut contract = test_contract();
-        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
         let mut second = domain.layers[0].clone();
         second.model_layer = 1;
         domain.layers.push(second);

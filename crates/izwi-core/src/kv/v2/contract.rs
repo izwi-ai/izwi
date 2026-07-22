@@ -201,31 +201,65 @@ impl StateGroupSpec {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum StateDomainSpec {
     PagedAttention(PagedAttentionDomainSpec),
+    StaticAttention(StaticAttentionDomainSpec),
+    Tensor(TensorStateDomainSpec),
+    Append(AppendStateDomainSpec),
+    Ring(RingStateDomainSpec),
+    StaticTensor(StaticTensorDomainSpec),
 }
 
 impl StateDomainSpec {
     pub(crate) const fn id(&self) -> StateDomainId {
-        match self {
-            Self::PagedAttention(spec) => spec.id,
-        }
+        self.header().id
     }
 
     pub(crate) const fn scope(&self) -> StateScope {
-        match self {
-            Self::PagedAttention(spec) => spec.scope,
-        }
+        self.header().scope
     }
 
     pub(crate) const fn prefix_policy(&self) -> &PrefixPolicy {
+        &self.header().prefix
+    }
+
+    pub(crate) const fn header(&self) -> &StateDomainHeader {
         match self {
-            Self::PagedAttention(spec) => &spec.prefix,
+            Self::PagedAttention(spec) => &spec.header,
+            Self::StaticAttention(spec) => &spec.header,
+            Self::Tensor(spec) => &spec.header,
+            Self::Append(spec) => &spec.header,
+            Self::Ring(spec) => &spec.header,
+            Self::StaticTensor(spec) => &spec.header,
         }
     }
 
     fn validate(&self) -> Result<()> {
         match self {
             Self::PagedAttention(spec) => spec.validate(),
+            Self::StaticAttention(spec) => spec.validate(),
+            Self::Tensor(spec) => spec.validate(),
+            Self::Append(spec) => spec.validate(),
+            Self::Ring(spec) => spec.validate(),
+            Self::StaticTensor(spec) => spec.validate(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StateDomainHeader {
+    pub(crate) id: StateDomainId,
+    pub(crate) scope: StateScope,
+    pub(crate) clock: StateClock,
+    pub(crate) placement: PlacementPolicy,
+    pub(crate) prefix: PrefixPolicy,
+    pub(crate) checkpoint: CheckpointPolicy,
+}
+
+impl StateDomainHeader {
+    fn validate(&self) -> Result<()> {
+        self.clock.validate()?;
+        self.placement.validate()?;
+        self.prefix.validate(self.scope)?;
+        self.checkpoint.validate(self.scope)
     }
 }
 
@@ -234,6 +268,54 @@ impl StateDomainSpec {
 pub(crate) enum StateScope {
     Retained,
     Invocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlacementPolicy {
+    BackendLocal,
+    Host,
+    BackendLocalWithHostOffload,
+}
+
+impl PlacementPolicy {
+    fn validate(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CheckpointPolicy {
+    None,
+    Transactional,
+    CopyOnWrite,
+    Replay {
+        interval_steps: u32,
+        max_replay_steps: u32,
+    },
+}
+
+impl CheckpointPolicy {
+    fn validate(self, scope: StateScope) -> Result<()> {
+        if scope == StateScope::Invocation && !matches!(self, Self::None) {
+            return Err(invalid(
+                "invocation-scoped state cannot publish retained checkpoints",
+            ));
+        }
+        if let Self::Replay {
+            interval_steps,
+            max_replay_steps,
+        } = self
+        {
+            if interval_steps == 0 || max_replay_steps == 0 || interval_steps > max_replay_steps {
+                return Err(invalid(
+                    "replay checkpoint policy requires 0 < interval <= max replay steps",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -318,26 +400,22 @@ impl PageSizeConstraint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PagedAttentionDomainSpec {
-    pub(crate) id: StateDomainId,
-    pub(crate) scope: StateScope,
-    pub(crate) clock: StateClock,
+    pub(crate) header: StateDomainHeader,
     pub(crate) layers: Vec<PagedAttentionLayerSpec>,
     pub(crate) page_size: PageSizeConstraint,
     /// Ordered storage preference. Reordering this list is a semantic change
     /// and therefore intentionally changes the contract fingerprint.
     pub(crate) accepted_dtypes: Vec<StateDType>,
-    pub(crate) prefix: PrefixPolicy,
 }
 
 impl PagedAttentionDomainSpec {
     fn validate(&self) -> Result<()> {
-        self.clock.validate()?;
+        self.header.validate()?;
         self.page_size.validate()?;
-        self.prefix.validate(self.scope)?;
         if self.layers.is_empty() {
             return Err(invalid(format!(
                 "paged-attention domain {} has no layers",
-                self.id.get()
+                self.header.id.get()
             )));
         }
         let mut layer_ids = HashSet::with_capacity(self.layers.len());
@@ -346,14 +424,14 @@ impl PagedAttentionDomainSpec {
             if previous_layer.is_some_and(|previous| layer.model_layer <= previous) {
                 return Err(invalid(format!(
                     "paged-attention domain {} layers must be in increasing model-layer order",
-                    self.id.get()
+                    self.header.id.get()
                 )));
             }
             previous_layer = Some(layer.model_layer);
             if !layer_ids.insert(layer.model_layer) {
                 return Err(invalid(format!(
                     "paged-attention domain {} repeats model layer {}",
-                    self.id.get(),
+                    self.header.id.get(),
                     layer.model_layer
                 )));
             }
@@ -362,17 +440,312 @@ impl PagedAttentionDomainSpec {
         if self.accepted_dtypes.is_empty() {
             return Err(invalid(format!(
                 "paged-attention domain {} has no accepted storage dtype",
-                self.id.get()
+                self.header.id.get()
             )));
         }
         let unique = self.accepted_dtypes.iter().copied().collect::<HashSet<_>>();
         if unique.len() != self.accepted_dtypes.len() {
             return Err(invalid(format!(
                 "paged-attention domain {} repeats a storage dtype",
-                self.id.get()
+                self.header.id.get()
             )));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct StateComponentId(u32);
+
+impl StateComponentId {
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub(crate) enum ShapeAxis {
+    Batch,
+    Sequence,
+    Heads,
+    HeadDim,
+    Channels,
+    Hidden,
+    Layers,
+    Samples,
+    Frames,
+    Codebooks,
+    Custom(String),
+}
+
+impl ShapeAxis {
+    fn validate(&self) -> Result<()> {
+        if let Self::Custom(name) = self {
+            require_non_empty(name, "custom shape axis")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ShapeExtent {
+    Fixed { value: u64 },
+    RuntimeBounded { min: u64, max: u64 },
+}
+
+impl ShapeExtent {
+    fn validate(self) -> Result<()> {
+        match self {
+            Self::Fixed { value } if value > 0 => Ok(()),
+            Self::RuntimeBounded { min, max } if min > 0 && min <= max => Ok(()),
+            _ => Err(invalid(
+                "shape extent must be non-zero and satisfy min <= max",
+            )),
+        }
+    }
+
+    const fn max(self) -> u64 {
+        match self {
+            Self::Fixed { value } => value,
+            Self::RuntimeBounded { max, .. } => max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct ShapeDimension {
+    pub(crate) axis: ShapeAxis,
+    pub(crate) extent: ShapeExtent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct BoundedShape {
+    pub(crate) dimensions: Vec<ShapeDimension>,
+}
+
+impl BoundedShape {
+    fn validate(&self) -> Result<()> {
+        if self.dimensions.is_empty() {
+            return Err(invalid("bounded tensor shape has no dimensions"));
+        }
+        let mut axes = HashSet::with_capacity(self.dimensions.len());
+        let mut max_elements = 1_u64;
+        for dimension in &self.dimensions {
+            dimension.axis.validate()?;
+            dimension.extent.validate()?;
+            if !axes.insert(&dimension.axis) {
+                return Err(invalid("bounded tensor shape repeats an axis"));
+            }
+            max_elements = max_elements
+                .checked_mul(dimension.extent.max())
+                .ok_or_else(|| invalid("bounded tensor shape element count overflow"))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub(crate) enum TensorRole {
+    RecurrentHidden,
+    RecurrentCell,
+    ConvolutionState,
+    RetainedEmbedding,
+    RetainedLogits,
+    AudioHistory,
+    EncoderMemory,
+    Control,
+    Custom(String),
+}
+
+impl TensorRole {
+    fn validate(&self) -> Result<()> {
+        if let Self::Custom(name) = self {
+            require_non_empty(name, "custom tensor role")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TensorComponentSpec {
+    pub(crate) id: StateComponentId,
+    pub(crate) role: TensorRole,
+    pub(crate) shape: BoundedShape,
+    /// Ordered storage preference, as for paged attention.
+    pub(crate) accepted_dtypes: Vec<StateDType>,
+}
+
+fn validate_components(domain_id: StateDomainId, components: &[TensorComponentSpec]) -> Result<()> {
+    if components.is_empty() {
+        return Err(invalid(format!(
+            "state domain {} has no tensor components",
+            domain_id.get()
+        )));
+    }
+    let mut previous = None;
+    for component in components {
+        if component.id.get() == 0 || previous.is_some_and(|previous| component.id <= previous) {
+            return Err(invalid(format!(
+                "state domain {} components require non-zero increasing ids",
+                domain_id.get()
+            )));
+        }
+        previous = Some(component.id);
+        component.role.validate()?;
+        component.shape.validate()?;
+        validate_dtype_preferences(domain_id, &component.accepted_dtypes)?;
+    }
+    Ok(())
+}
+
+fn validate_dtype_preferences(domain_id: StateDomainId, dtypes: &[StateDType]) -> Result<()> {
+    if dtypes.is_empty() {
+        return Err(invalid(format!(
+            "state domain {} has no accepted storage dtype",
+            domain_id.get()
+        )));
+    }
+    if dtypes.iter().copied().collect::<HashSet<_>>().len() != dtypes.len() {
+        return Err(invalid(format!(
+            "state domain {} repeats a storage dtype",
+            domain_id.get()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TensorStateDomainSpec {
+    pub(crate) header: StateDomainHeader,
+    pub(crate) components: Vec<TensorComponentSpec>,
+}
+
+impl TensorStateDomainSpec {
+    fn validate(&self) -> Result<()> {
+        self.header.validate()?;
+        validate_components(self.header.id, &self.components)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StaticTensorDomainSpec {
+    pub(crate) header: StateDomainHeader,
+    pub(crate) components: Vec<TensorComponentSpec>,
+}
+
+impl StaticTensorDomainSpec {
+    fn validate(&self) -> Result<()> {
+        self.header.validate()?;
+        validate_components(self.header.id, &self.components)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AppendStateDomainSpec {
+    pub(crate) header: StateDomainHeader,
+    /// Shape of one appended clock step for each component.
+    pub(crate) components_per_step: Vec<TensorComponentSpec>,
+    pub(crate) max_steps: u64,
+}
+
+impl AppendStateDomainSpec {
+    fn validate(&self) -> Result<()> {
+        self.header.validate()?;
+        if self.max_steps == 0 {
+            return Err(invalid(format!(
+                "append state domain {} has zero maximum steps",
+                self.header.id.get()
+            )));
+        }
+        validate_components(self.header.id, &self.components_per_step)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RingStateDomainSpec {
+    pub(crate) header: StateDomainHeader,
+    /// Shape of one ring position for each component.
+    pub(crate) components_per_step: Vec<TensorComponentSpec>,
+    pub(crate) capacity_steps: u64,
+}
+
+impl RingStateDomainSpec {
+    fn validate(&self) -> Result<()> {
+        self.header.validate()?;
+        if self.capacity_steps == 0 {
+            return Err(invalid(format!(
+                "ring state domain {} has zero capacity",
+                self.header.id.get()
+            )));
+        }
+        validate_components(self.header.id, &self.components_per_step)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StaticAttentionDomainSpec {
+    pub(crate) header: StateDomainHeader,
+    pub(crate) layers: Vec<StaticAttentionLayerSpec>,
+    pub(crate) max_memory_tokens: u64,
+    pub(crate) accepted_dtypes: Vec<StateDType>,
+}
+
+impl StaticAttentionDomainSpec {
+    fn validate(&self) -> Result<()> {
+        self.header.validate()?;
+        if self.max_memory_tokens == 0 || self.layers.is_empty() {
+            return Err(invalid(format!(
+                "static-attention domain {} requires layers and bounded memory tokens",
+                self.header.id.get()
+            )));
+        }
+        let mut previous = None;
+        for layer in &self.layers {
+            if previous.is_some_and(|previous| layer.model_layer <= previous) {
+                return Err(invalid(format!(
+                    "static-attention domain {} layers must be in increasing model-layer order",
+                    self.header.id.get()
+                )));
+            }
+            previous = Some(layer.model_layer);
+            layer.validate()?;
+        }
+        validate_dtype_preferences(self.header.id, &self.accepted_dtypes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StaticAttentionLayerSpec {
+    pub(crate) model_layer: u32,
+    pub(crate) query_heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) key_head_dim: u32,
+    pub(crate) value_head_dim: u32,
+    pub(crate) key_encoding: KeyEncoding,
+}
+
+impl StaticAttentionLayerSpec {
+    fn validate(&self) -> Result<()> {
+        if self.query_heads == 0
+            || self.kv_heads == 0
+            || self.key_head_dim == 0
+            || self.value_head_dim == 0
+            || self.query_heads % self.kv_heads != 0
+        {
+            return Err(invalid(format!(
+                "static-attention layer {} has invalid geometry",
+                self.model_layer
+            )));
+        }
+        self.key_encoding.validate(self.key_head_dim)
     }
 }
 
@@ -533,9 +906,16 @@ pub(crate) fn test_contract() -> InferenceStateContract {
     InferenceStateContract {
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-            id: StateDomainId::new(1),
-            scope: StateScope::Retained,
-            clock: StateClock::DecoderTokens,
+            header: StateDomainHeader {
+                id: StateDomainId::new(1),
+                scope: StateScope::Retained,
+                clock: StateClock::DecoderTokens,
+                placement: PlacementPolicy::BackendLocalWithHostOffload,
+                prefix: PrefixPolicy::CommittedPages {
+                    positions: PositionSemantics::Absolute,
+                },
+                checkpoint: CheckpointPolicy::CopyOnWrite,
+            },
             layers: vec![PagedAttentionLayerSpec {
                 model_layer: 0,
                 query_heads: 16,
@@ -553,9 +933,6 @@ pub(crate) fn test_contract() -> InferenceStateContract {
                 multiple_of: 8,
             },
             accepted_dtypes: vec![StateDType::F16, StateDType::Bf16],
-            prefix: PrefixPolicy::CommittedPages {
-                positions: PositionSemantics::Absolute,
-            },
         })],
         groups: vec![StateGroupSpec {
             id: StateGroupId::new(1),
@@ -569,6 +946,36 @@ pub(crate) fn test_contract() -> InferenceStateContract {
 mod tests {
     use super::*;
 
+    fn header(
+        id: u32,
+        scope: StateScope,
+        clock: StateClock,
+        checkpoint: CheckpointPolicy,
+    ) -> StateDomainHeader {
+        StateDomainHeader {
+            id: StateDomainId::new(id),
+            scope,
+            clock,
+            placement: PlacementPolicy::BackendLocal,
+            prefix: PrefixPolicy::Disabled,
+            checkpoint,
+        }
+    }
+
+    fn component(id: u32, role: TensorRole) -> TensorComponentSpec {
+        TensorComponentSpec {
+            id: StateComponentId::new(id),
+            role,
+            shape: BoundedShape {
+                dimensions: vec![ShapeDimension {
+                    axis: ShapeAxis::Hidden,
+                    extent: ShapeExtent::Fixed { value: 64 },
+                }],
+            },
+            accepted_dtypes: vec![StateDType::F16, StateDType::Bf16],
+        }
+    }
+
     #[test]
     fn canonical_contract_fingerprint_is_stable_and_semantic() {
         let first = test_contract();
@@ -576,7 +983,9 @@ mod tests {
         assert_eq!(first.fingerprint().unwrap(), second.fingerprint().unwrap());
 
         let mut changed = second;
-        let StateDomainSpec::PagedAttention(domain) = &mut changed.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut changed.domains[0] else {
+            unreachable!()
+        };
         domain.layers[0].kv_heads = 8;
         assert_ne!(first.fingerprint().unwrap(), changed.fingerprint().unwrap());
     }
@@ -584,13 +993,17 @@ mod tests {
     #[test]
     fn contract_rejects_invalid_geometry_and_noncanonical_ids() {
         let mut invalid_geometry = test_contract();
-        let StateDomainSpec::PagedAttention(domain) = &mut invalid_geometry.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut invalid_geometry.domains[0] else {
+            unreachable!()
+        };
         domain.layers[0].query_heads = 10;
         assert!(invalid_geometry.validate().is_err());
 
         let mut zero_id = test_contract();
-        let StateDomainSpec::PagedAttention(domain) = &mut zero_id.domains[0];
-        domain.id = StateDomainId::new(0);
+        let StateDomainSpec::PagedAttention(domain) = &mut zero_id.domains[0] else {
+            unreachable!()
+        };
+        domain.header.id = StateDomainId::new(0);
         assert!(zero_id.validate().is_err());
 
         let mut duplicate = test_contract();
@@ -598,7 +1011,9 @@ mod tests {
         assert!(duplicate.validate().is_err());
 
         let mut noncanonical_layers = test_contract();
-        let StateDomainSpec::PagedAttention(domain) = &mut noncanonical_layers.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut noncanonical_layers.domains[0] else {
+            unreachable!()
+        };
         let mut second_layer = domain.layers[0].clone();
         second_layer.model_layer = 1;
         domain.layers.push(second_layer);
@@ -611,7 +1026,9 @@ mod tests {
         let contract = test_contract();
 
         let mut changed_mask = contract.clone();
-        let StateDomainSpec::PagedAttention(domain) = &mut changed_mask.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut changed_mask.domains[0] else {
+            unreachable!()
+        };
         domain.layers[0].mask = AttentionMask::Bidirectional;
         assert_ne!(
             contract.fingerprint().unwrap(),
@@ -619,7 +1036,9 @@ mod tests {
         );
 
         let mut changed_preference = contract.clone();
-        let StateDomainSpec::PagedAttention(domain) = &mut changed_preference.domains[0];
+        let StateDomainSpec::PagedAttention(domain) = &mut changed_preference.domains[0] else {
+            unreachable!()
+        };
         domain.accepted_dtypes.reverse();
         assert_ne!(
             contract.fingerprint().unwrap(),
@@ -630,13 +1049,108 @@ mod tests {
     #[test]
     fn prefix_sharing_requires_retained_shareable_domains() {
         let mut contract = test_contract();
-        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0];
-        domain.scope = StateScope::Invocation;
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        domain.header.scope = StateScope::Invocation;
         assert!(contract.validate().is_err());
 
         let mut contract = test_contract();
-        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0];
-        domain.prefix = PrefixPolicy::Disabled;
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        domain.header.prefix = PrefixPolicy::Disabled;
+        assert!(contract.validate().is_err());
+    }
+
+    #[test]
+    fn composite_contract_covers_static_tensor_append_ring_and_cross_attention_state() {
+        let mut contract = test_contract();
+        contract.domains.push(StateDomainSpec::StaticAttention(
+            StaticAttentionDomainSpec {
+                header: header(
+                    2,
+                    StateScope::Retained,
+                    StateClock::EncoderTokens,
+                    CheckpointPolicy::Transactional,
+                ),
+                layers: vec![StaticAttentionLayerSpec {
+                    model_layer: 0,
+                    query_heads: 16,
+                    kv_heads: 4,
+                    key_head_dim: 64,
+                    value_head_dim: 64,
+                    key_encoding: KeyEncoding::Raw,
+                }],
+                max_memory_tokens: 2048,
+                accepted_dtypes: vec![StateDType::F16],
+            },
+        ));
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: header(
+                    3,
+                    StateScope::Retained,
+                    StateClock::DecoderTokens,
+                    CheckpointPolicy::Transactional,
+                ),
+                components: vec![component(1, TensorRole::RecurrentHidden)],
+            }));
+        contract
+            .domains
+            .push(StateDomainSpec::Append(AppendStateDomainSpec {
+                header: header(
+                    4,
+                    StateScope::Retained,
+                    StateClock::AudioSamples,
+                    CheckpointPolicy::Replay {
+                        interval_steps: 64,
+                        max_replay_steps: 256,
+                    },
+                ),
+                components_per_step: vec![component(1, TensorRole::AudioHistory)],
+                max_steps: 16_000,
+            }));
+        contract
+            .domains
+            .push(StateDomainSpec::Ring(RingStateDomainSpec {
+                header: header(
+                    5,
+                    StateScope::Retained,
+                    StateClock::AudioFrames,
+                    CheckpointPolicy::CopyOnWrite,
+                ),
+                components_per_step: vec![component(1, TensorRole::ConvolutionState)],
+                capacity_steps: 32,
+            }));
+        contract
+            .domains
+            .push(StateDomainSpec::StaticTensor(StaticTensorDomainSpec {
+                header: header(
+                    6,
+                    StateScope::Invocation,
+                    StateClock::CodecFrames,
+                    CheckpointPolicy::None,
+                ),
+                components: vec![component(1, TensorRole::EncoderMemory)],
+            }));
+        contract.groups = vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: (1..=6).map(StateDomainId::new).collect(),
+            prefix_shareable: false,
+        }];
+
+        contract.validate().unwrap();
+        assert_ne!(
+            contract.fingerprint().unwrap(),
+            test_contract().fingerprint().unwrap()
+        );
+
+        let StateDomainSpec::Append(append) = &mut contract.domains[3] else {
+            unreachable!()
+        };
+        append.max_steps = 0;
         assert!(contract.validate().is_err());
     }
 }

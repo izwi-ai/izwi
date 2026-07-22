@@ -17,10 +17,14 @@ pub(crate) use batch::{
 };
 #[allow(unused_imports)]
 pub(crate) use contract::{
-    AttentionMask, AttentionPattern, InferenceStateAbi, InferenceStateContract, KeyEncoding,
-    PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PositionSemantics,
-    PrefixPolicy, StateClock, StateDType, StateDomainId, StateDomainSpec, StateGroupId,
-    StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
+    AppendStateDomainSpec, AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy,
+    InferenceStateAbi, InferenceStateContract, KeyEncoding, PageSizeConstraint,
+    PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy, PositionSemantics,
+    PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, StateScope, StaticAttentionDomainSpec, StaticAttentionLayerSpec,
+    StaticTensorDomainSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+    CURRENT_INFERENCE_STATE_ABI,
 };
 #[allow(unused_imports)]
 pub(crate) use resolved::{
