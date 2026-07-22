@@ -10,7 +10,7 @@ use crate::engine::{
     NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
 };
 use crate::error::{Error, Result};
-use crate::kv::v2::InferenceStateContract;
+use crate::kv::v2::CapabilityStateDescriptorV2;
 use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 
@@ -127,21 +127,28 @@ fn compatibility_state_publication() -> LoadedStatePublication {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoadedStatePublication {
     LegacyV1(LoadedKvCacheCapability),
-    V2(InferenceStateContract),
+    V2(CapabilityStateDescriptorV2),
 }
 
 impl LoadedStatePublication {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, stages: &[StageDescriptor]) -> Result<()> {
         match self {
             Self::LegacyV1(cache) => cache.validate(),
-            Self::V2(contract) => contract.validate(),
+            Self::V2(descriptor) => descriptor.validate_against_stages(stages),
         }
     }
 
     fn binding(&self) -> CapabilityStateBinding {
         match self {
             Self::LegacyV1(cache) => CapabilityStateBinding::LegacyV1(cache.capability.clone()),
-            Self::V2(contract) => CapabilityStateBinding::V2(contract.clone()),
+            Self::V2(descriptor) => CapabilityStateBinding::V2(descriptor.clone()),
+        }
+    }
+
+    fn fingerprint(&self, stages: &[StageDescriptor]) -> Result<Option<[u8; 32]>> {
+        match self {
+            Self::LegacyV1(_) => Ok(None),
+            Self::V2(descriptor) => Ok(Some(descriptor.fingerprint(stages)?)),
         }
     }
 }
@@ -162,8 +169,8 @@ impl LoadedCapabilityDescriptor {
         execution: Arc<dyn LoadedExecutionAdapter>,
         state: LoadedStatePublication,
     ) -> Result<Self> {
-        state.validate()?;
-        execution.contract(StreamingRequirements::NONE)?;
+        let execution_contract = execution.contract(StreamingRequirements::NONE)?;
+        state.validate(&execution_contract.stages)?;
         Ok(Self { execution, state })
     }
 
@@ -172,9 +179,12 @@ impl LoadedCapabilityDescriptor {
     }
 
     fn binding(&self, streaming: StreamingRequirements) -> Result<LoadedCapabilityBinding> {
+        let contract = self.contract(streaming)?;
+        self.state.validate(&contract.stages)?;
         Ok(LoadedCapabilityBinding {
-            execution: self.contract(streaming)?.adapter_binding()?,
+            execution: contract.adapter_binding()?,
             state: self.state.binding(),
+            state_fingerprint: self.state.fingerprint(&contract.stages)?,
         })
     }
 }
@@ -184,12 +194,13 @@ impl LoadedCapabilityDescriptor {
 pub(crate) struct LoadedCapabilityBinding {
     pub(crate) execution: ExecutionAdapterBinding,
     pub(crate) state: CapabilityStateBinding,
+    pub(crate) state_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CapabilityStateBinding {
     LegacyV1(CacheCapability),
-    V2(InferenceStateContract),
+    V2(CapabilityStateDescriptorV2),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -949,6 +960,7 @@ mod tests {
                     .adapter_binding()
                     .unwrap(),
                 state: CapabilityStateBinding::LegacyV1(CacheCapability::OpaqueModelOwned),
+                state_fingerprint: None,
             }
         );
     }
@@ -956,15 +968,30 @@ mod tests {
     #[test]
     fn v2_state_publication_is_preserved_without_legacy_fallback() {
         let contract = crate::kv::v2::test_contract();
+        let registry = RuntimeAdapterRegistry::built_in();
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(10),
+            ModelVariant::Qwen306B,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let stages = compatibility
+            .contract(CapabilityKind::Chat, false)
+            .unwrap()
+            .stages;
+        let descriptor =
+            crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(contract, &stages);
         let bundle = LoadedModelBundle::bind_with_state_publications(
-            &RuntimeAdapterRegistry::built_in(),
+            &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(10),
             ModelVariant::Qwen306B,
             BackendKind::Cpu,
             HashMap::from([(
                 CapabilityKind::Chat,
-                LoadedStatePublication::V2(contract.clone()),
+                LoadedStatePublication::V2(descriptor.clone()),
             )]),
         )
         .unwrap();
@@ -977,7 +1004,7 @@ mod tests {
                 )
                 .unwrap()
                 .state,
-            CapabilityStateBinding::V2(contract)
+            CapabilityStateBinding::V2(descriptor)
         );
     }
 

@@ -778,7 +778,8 @@ pub struct EngineCoreRequest {
     /// Additive ABI-v2 state truth. This is mutually exclusive with a managed
     /// v1 cache contract and must be resolved by the v2 lifecycle before the
     /// request can enter scheduler execution.
-    pub(super) v2_state_contract: Option<crate::kv::v2::InferenceStateContract>,
+    pub(super) v2_state_descriptor: Option<crate::kv::v2::CapabilityStateDescriptorV2>,
+    pub(super) v2_state_fingerprint: Option<[u8; 32]>,
     /// Immutable model-level physical KV runtime installed by the engine.
     pub(super) managed_cache_runtime: Option<Arc<super::cache::managed::ManagedKvModelRuntime>>,
     /// Request-specific shape/workspace facts produced by the exact loaded
@@ -2064,7 +2065,8 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
-            v2_state_contract: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2114,7 +2116,8 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
-            v2_state_contract: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2164,7 +2167,8 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
-            v2_state_contract: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2211,7 +2215,8 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
-            v2_state_contract: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2259,7 +2264,8 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
-            v2_state_contract: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2307,7 +2313,8 @@ impl EngineCoreRequest {
             model_instance_id: None,
             execution_adapter_binding: None,
             cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
-            v2_state_contract: None,
+            v2_state_descriptor: None,
+            v2_state_fingerprint: None,
             managed_cache_runtime: None,
             prepared_stage_costs: Vec::new(),
             stream_staging: StreamStagingBuffer::default(),
@@ -2406,7 +2413,7 @@ impl EngineCoreRequest {
         capability: crate::kv::CacheCapability,
     ) -> Result<()> {
         capability.validate()?;
-        if self.v2_state_contract.is_some()
+        if self.v2_state_descriptor.is_some()
             && capability != crate::kv::CacheCapability::OpaqueModelOwned
         {
             return Err(Error::InvalidInput(
@@ -2428,31 +2435,56 @@ impl EngineCoreRequest {
         &self.cache_capability
     }
 
-    pub(crate) fn bind_v2_state_contract(
+    pub(crate) fn bind_v2_state_descriptor(
         &mut self,
-        contract: crate::kv::v2::InferenceStateContract,
+        descriptor: crate::kv::v2::CapabilityStateDescriptorV2,
+        fingerprint: [u8; 32],
     ) -> Result<()> {
-        contract.validate()?;
         if self.cache_capability != crate::kv::CacheCapability::OpaqueModelOwned {
             return Err(Error::InvalidInput(
                 "engine request cannot bind state ABI v2 over a v1 managed cache".to_string(),
             ));
         }
         if self
-            .v2_state_contract
+            .v2_state_descriptor
             .as_ref()
-            .is_some_and(|current| current != &contract)
+            .is_some_and(|current| current != &descriptor)
         {
             return Err(Error::InvalidInput(
                 "engine request is already bound to a different state ABI v2 contract".to_string(),
             ));
         }
-        self.v2_state_contract = Some(contract);
+        if self
+            .v2_state_fingerprint
+            .is_some_and(|current| current != fingerprint)
+        {
+            return Err(Error::InvalidInput(
+                "engine request is already bound to a different state ABI v2 fingerprint"
+                    .to_string(),
+            ));
+        }
+        if let Some(execution) = &self.execution_adapter_binding {
+            let expected = descriptor.fingerprint(&execution.stages)?;
+            if expected != fingerprint {
+                return Err(Error::InvalidInput(
+                    "state ABI v2 fingerprint does not match the bound execution stages"
+                        .to_string(),
+                ));
+            }
+        }
+        self.v2_state_descriptor = Some(descriptor);
+        self.v2_state_fingerprint = Some(fingerprint);
         Ok(())
     }
 
-    pub(crate) fn v2_state_contract(&self) -> Option<&crate::kv::v2::InferenceStateContract> {
-        self.v2_state_contract.as_ref()
+    pub(crate) fn v2_state_descriptor(
+        &self,
+    ) -> Option<&crate::kv::v2::CapabilityStateDescriptorV2> {
+        self.v2_state_descriptor.as_ref()
+    }
+
+    pub(crate) fn v2_state_fingerprint(&self) -> Option<[u8; 32]> {
+        self.v2_state_fingerprint
     }
 
     pub(crate) fn install_managed_cache_runtime(

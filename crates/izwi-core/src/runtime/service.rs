@@ -805,14 +805,32 @@ fn bind_request_to_residency(
     } else {
         StreamingRequirements::native(model_streaming_required)
     };
-    let LoadedCapabilityBinding { execution, state } = bundle.capability_binding_for_streaming(
+    let LoadedCapabilityBinding {
+        execution,
+        state,
+        state_fingerprint,
+    } = bundle.capability_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
     )?;
     request.bind_execution_adapter(execution)?;
     match state {
-        CapabilityStateBinding::LegacyV1(cache) => request.bind_cache_capability(cache)?,
-        CapabilityStateBinding::V2(contract) => request.bind_v2_state_contract(contract)?,
+        CapabilityStateBinding::LegacyV1(cache) => {
+            if state_fingerprint.is_some() {
+                return Err(Error::InferenceError(
+                    "legacy capability carried a v2 state fingerprint".to_string(),
+                ));
+            }
+            request.bind_cache_capability(cache)?
+        }
+        CapabilityStateBinding::V2(descriptor) => request.bind_v2_state_descriptor(
+            descriptor,
+            state_fingerprint.ok_or_else(|| {
+                Error::InferenceError(
+                    "v2 capability is missing its sealed state fingerprint".to_string(),
+                )
+            })?,
+        )?,
     }
     Ok(())
 }
@@ -864,6 +882,16 @@ fn loaded_contract_for_residency(
             contract.metadata.execution_target,
             expected_target.expect("checked as some")
         )));
+    }
+    let state_binding = bundle.capability_binding_for_streaming(
+        capability,
+        StreamingRequirements::native(streaming_required),
+    )?;
+    if matches!(state_binding.state, CapabilityStateBinding::V2(_)) {
+        return Err(Error::InferenceError(
+            "direct capability execution requires a resolved v2 physical state/workspace runtime"
+                .to_string(),
+        ));
     }
     Ok(contract)
 }
@@ -3094,15 +3122,30 @@ mod tests {
         let variant = ModelVariant::Qwen306B;
         let lease = residency.acquire_instance_lease(variant, instance);
         let contract = crate::kv::v2::test_contract();
+        let registry = RuntimeAdapterRegistry::built_in();
+        let compatibility = LoadedModelBundle::bind(
+            &registry,
+            crate::engine::ExecutionGroupId::new(3),
+            instance,
+            variant,
+            BackendKind::Cpu,
+        )
+        .expect("compatibility bundle");
+        let stages = compatibility
+            .contract(CapabilityKind::Chat, false)
+            .expect("chat contract")
+            .stages;
+        let descriptor =
+            crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(contract, &stages);
         let bundle = LoadedModelBundle::bind_with_state_publications(
-            &RuntimeAdapterRegistry::built_in(),
+            &registry,
             crate::engine::ExecutionGroupId::new(3),
             instance,
             variant,
             BackendKind::Cpu,
             HashMap::from([(
                 CapabilityKind::Chat,
-                crate::runtime::adapters::LoadedStatePublication::V2(contract.clone()),
+                crate::runtime::adapters::LoadedStatePublication::V2(descriptor.clone()),
             )]),
         )
         .expect("v2 loaded bundle");
@@ -3111,11 +3154,28 @@ mod tests {
         bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
             .expect("matching v2 loaded capability descriptor");
 
-        assert_eq!(request.v2_state_contract(), Some(&contract));
+        assert_eq!(request.v2_state_descriptor(), Some(&descriptor));
+        assert_eq!(
+            request.v2_state_fingerprint(),
+            Some(descriptor.fingerprint(&stages).unwrap())
+        );
         assert_eq!(
             request.cache_capability(),
             &crate::kv::CacheCapability::OpaqueModelOwned
         );
+        let direct_error = loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::Chat,
+            false,
+            crate::engine::ExecutionGroupId::new(3),
+            BackendKind::Cpu,
+            None,
+        )
+        .expect_err("direct runners must not discard a v2 physical state descriptor");
+        assert!(direct_error
+            .to_string()
+            .contains("resolved v2 physical state/workspace runtime"));
     }
 
     #[test]

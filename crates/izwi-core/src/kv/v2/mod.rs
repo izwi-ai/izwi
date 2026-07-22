@@ -9,6 +9,7 @@
 mod batch;
 mod capacity;
 mod contract;
+mod descriptor;
 mod intent;
 mod resolved;
 mod resolved_domains;
@@ -37,6 +38,12 @@ pub(crate) use contract::{
     StateGroupSpec, StateScope, StaticAttentionDomainSpec, StaticAttentionLayerSpec,
     StaticTensorDomainSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
     CURRENT_INFERENCE_STATE_ABI,
+};
+#[allow(unused_imports)]
+pub(crate) use descriptor::{
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, InvocationStageWorkspace,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet,
+    RetainedStateCapability, WorkspaceFormula,
 };
 #[allow(unused_imports)]
 pub(crate) use intent::{

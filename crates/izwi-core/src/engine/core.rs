@@ -1526,7 +1526,7 @@ impl EngineCore {
         request.enforce_chat_context_window(self.config.max_seq_len)?;
 
         if let Some(model_instance) = request.model_instance_id() {
-            if request.v2_state_contract().is_some() {
+            if request.v2_state_descriptor().is_some() {
                 return Err(Error::InferenceError(format!(
                     "model instance {} published state ABI v2 before a resolved v2 runtime was installed",
                     model_instance.get()
@@ -3322,7 +3322,10 @@ mod tests {
             .bind_model_instance(ModelInstanceId::new(101))
             .unwrap();
         request
-            .bind_v2_state_contract(crate::kv::v2::test_contract())
+            .bind_v2_state_descriptor(
+                crate::kv::v2::CapabilityStateDescriptorV2::stateless_for_test(),
+                [7; 32],
+            )
             .unwrap();
 
         let error = core
