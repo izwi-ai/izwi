@@ -591,9 +591,9 @@ pub(super) trait LoadedExecutionAdapterFactory: fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StaticQwenTtsAdapterFactory;
+struct PhysicalQwenTtsAdapterFactory;
 
-impl LoadedExecutionAdapterFactory for StaticQwenTtsAdapterFactory {
+impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
     fn id(&self) -> &'static str {
         "builtin.qwen_tts.physical_sequence"
     }
@@ -664,7 +664,7 @@ impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
 
 pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecutionAdapterFactory>> {
     vec![
-        Arc::new(StaticQwenTtsAdapterFactory),
+        Arc::new(PhysicalQwenTtsAdapterFactory),
         Arc::new(ContinuousQwenChatAdapterFactory),
     ]
 }

@@ -1454,28 +1454,6 @@ fn unknown_cache_observation() -> ResourceVector {
     }
 }
 
-fn static_qwen_tts_batch_eligible(
-    request: &EngineCoreRequest,
-    loaded_has_speakers: bool,
-    native_variant_enabled: bool,
-) -> bool {
-    matches!(request.task_type, super::types::TaskType::TTS)
-        && !request.streaming
-        && !request.has_tts_reference_for_execution()
-        && request
-            .model_variant
-            .and_then(|variant| variant.speech_capabilities())
-            .is_some_and(|capabilities| capabilities.supports_builtin_voices)
-        && loaded_has_speakers
-        && native_variant_enabled
-        && request.execution_adapter_binding().is_some_and(|binding| {
-            binding.stages.iter().any(|stage| {
-                stage.batch_mode == NativeBatchMode::Static
-                    && request.prepared_stage_cost(stage.id).is_some()
-            })
-        })
-}
-
 impl ModelExecutor for NativeExecutor {
     fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
         let variant = request.model_variant?;
@@ -1538,23 +1516,6 @@ impl ModelExecutor for NativeExecutor {
                 .and_then(|registry| registry.try_get_audio_chat(variant))
                 .map(|_| false),
         };
-        let loaded_has_speakers = request
-            .prepared_qwen_tts_model_for_executor()
-            .ok()
-            .flatten()
-            .or_else(|| {
-                self.config
-                    .model_registry
-                    .as_ref()
-                    .and_then(|registry| registry.try_get_qwen_tts(variant))
-            })
-            .or_else(|| self.loaded_tts_model.clone())
-            .is_some_and(|model| !model.available_speakers().is_empty());
-        let static_tts_batch = static_qwen_tts_batch_eligible(
-            request,
-            loaded_has_speakers,
-            self.config.static_tensor_batch_variants.contains(&variant),
-        );
         let continuous_chat_batch = matches!(request.task_type, super::types::TaskType::Chat)
             && request
                 .prepared_chat_model_for_executor()
@@ -1607,20 +1568,7 @@ impl ModelExecutor for NativeExecutor {
             profile.cancellation = CancellationGranularity::OperationBoundary;
         }
 
-        if static_tts_batch {
-            // Preset-speaker Qwen TTS owns a real model tensor-batch API. It is
-            // an atomic full-generation operation, not a continuous sequence.
-            profile.mode = ExecutionMode::Atomic;
-            profile.prefill = PrefillMode::None;
-            profile.incremental_decode = false;
-            profile.cache_mode = CacheMode::None;
-            profile.recompute_safe = false;
-            profile.cache_release_safe = false;
-            profile.prefill_batch = NativeBatchMode::Static;
-            profile.decode_batch = NativeBatchMode::None;
-            profile.concurrency = ConcurrencyClass::Batchable;
-            profile.max_batch_size = self.config.max_tensor_batch_size.max(1);
-        } else if continuous_chat_batch {
+        if continuous_chat_batch {
             profile.prefill_batch = NativeBatchMode::None;
             profile.decode_batch = NativeBatchMode::Continuous;
             profile.concurrency = ConcurrencyClass::Batchable;
@@ -1688,11 +1636,13 @@ impl ModelExecutor for NativeExecutor {
                     FailureOrigin::ExecutorValidation,
                 ));
             }
-            return self
-                .execute_static_tts_requests(execution.requests, execution.scheduled)
-                .map_err(|error| {
-                    PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
-                });
+            return Err(PhysicalDispatchError::not_started(
+                Error::InferenceError(
+                    "no loaded physical static-batch implementation is registered".to_string(),
+                ),
+                width,
+                FailureOrigin::ExecutorValidation,
+            ));
         }
         if execution.batch.mode == NativeBatchMode::Continuous {
             if execution.is_prefill()
@@ -2275,55 +2225,6 @@ mod tests {
             drop(workspace);
             assert_eq!(authority.snapshot().reservations, 0);
         }
-    }
-
-    #[test]
-    fn static_tts_batch_eligibility_is_fail_closed() {
-        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        let mut request = EngineCoreRequest::tts("hello").with_model_variant(variant);
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-
-        let model_instance = super::super::ModelInstanceId::new(1);
-        request.bind_model_instance(model_instance).unwrap();
-        let mut profile =
-            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
-        profile.max_batch_size = 2;
-        let stage = super::super::StageDescriptor::from_execution_profile(
-            super::super::StageId::new(1),
-            "tts.generate",
-            &profile,
-            NativeBatchMode::Static,
-        );
-        let stage_id = stage.id;
-        request
-            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
-                execution_group_id: super::super::ExecutionGroupId::new(1),
-                model_instance_id: model_instance,
-                adapter_instance_id: super::super::AdapterInstanceId::new(1),
-                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
-                model_variant: variant,
-                capability_id: "tts".to_string(),
-                stages: Arc::from([stage]),
-            })
-            .unwrap();
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-        request
-            .install_prepared_stage_cost(stage_id, super::super::WorkCost::new(1, 1, 0))
-            .unwrap();
-        assert!(static_qwen_tts_batch_eligible(&request, true, true));
-        assert!(!static_qwen_tts_batch_eligible(&request, true, false));
-        assert!(!static_qwen_tts_batch_eligible(&request, false, true));
-
-        request.streaming = true;
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-        request.streaming = false;
-        request.reference_audio = Some("audio".to_string());
-        request.reference_text = Some("reference".to_string());
-        assert!(!static_qwen_tts_batch_eligible(&request, true, true));
-
-        let voice_design = EngineCoreRequest::tts("hello")
-            .with_model_variant(ModelVariant::Qwen3Tts12Hz17BVoiceDesign);
-        assert!(!static_qwen_tts_batch_eligible(&voice_design, true, true));
     }
 
     #[test]

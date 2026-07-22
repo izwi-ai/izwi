@@ -706,14 +706,14 @@ mod tests {
     }
 
     #[test]
-    fn native_static_factories_publish_supported_variants_on_every_backend() {
+    fn physical_qwen_tts_factory_does_not_publish_the_removed_static_route() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
 
         assert_eq!(registry.max_tensor_batch_size(), 4);
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let variants = registry.static_tensor_batch_variants(backend);
-            assert!(variants.contains(&variant));
+            assert!(!variants.contains(&variant));
             assert!(!variants.contains(&ModelVariant::Qwen306B));
         }
     }
