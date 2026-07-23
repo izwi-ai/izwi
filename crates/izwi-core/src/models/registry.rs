@@ -11,8 +11,10 @@ use std::sync::Arc;
 use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
 
+use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
+use crate::engine::{RetainedTensorStateRuntimeV2, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kv::{CacheCapability, KvCacheContractProvider};
 use crate::model::ModelVariant;
@@ -29,7 +31,7 @@ use crate::models::architectures::lfm25_audio::{
 };
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
-    NemotronRealtimeResourceReservation, NemotronStreamingState,
+    NemotronRealtimePhysicalStateSpec, NemotronRealtimeResourceReservation, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput,
@@ -1189,6 +1191,65 @@ impl NativeAsrModel {
             )),
             _ => Err(Error::InvalidInput(
                 "Realtime audio stream state is not available for this ASR model".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn realtime_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<NemotronRealtimePhysicalStateSpec> {
+        match self {
+            Self::Nemotron(model) => model.realtime_physical_state_spec(stage_graphs),
+            _ => Err(Error::InvalidInput(
+                "Realtime physical state is not available for this ASR model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn hydrate_realtime_physical_state(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                model.hydrate_realtime_physical_state(state, runtime, transaction)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR realtime physical state does not match the loaded model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn stage_realtime_physical_state(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                model.stage_realtime_physical_state(state, runtime, transaction, target_cursor)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR realtime physical state does not match the loaded model".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn clear_realtime_tensor_handles(
+        &self,
+        state: &mut NativeAsrRealtimeState,
+    ) -> Result<()> {
+        match (self, state) {
+            (Self::Nemotron(model), NativeAsrRealtimeState::Nemotron(state)) => {
+                model.clear_realtime_tensor_handles(state)
+            }
+            _ => Err(Error::InvalidInput(
+                "ASR realtime physical state does not match the loaded model".into(),
             )),
         }
     }

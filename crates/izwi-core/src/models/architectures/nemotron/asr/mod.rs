@@ -9,14 +9,24 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use serde_json::json;
 use tracing::info;
 
+use crate::backends::state::{PhysicalStateTransactionId, StateComponentValue};
 use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
+use crate::engine::RetainedTensorStateRuntimeV2;
+use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    AppendStateDomainSpec, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InferenceStateContract, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis,
+    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
+    StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec,
+    TensorRole, TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
+};
 use crate::model::ModelVariant;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
@@ -40,6 +50,12 @@ const CONSERVATIVE_DECODED_TOKEN_EXPANSION: usize = 4;
 const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
 const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
 const REALTIME_PEAK_TEXT_COPIES: u64 = 4;
+pub(crate) const NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
+const NEMOTRON_FEATURE_HISTORY_DOMAIN: StateDomainId = StateDomainId::new(1);
+const NEMOTRON_PENDING_ENCODER_DOMAIN: StateDomainId = StateDomainId::new(2);
+const NEMOTRON_ATTENTION_HISTORY_DOMAIN: StateDomainId = StateDomainId::new(3);
+const NEMOTRON_CONVOLUTION_HISTORY_DOMAIN: StateDomainId = StateDomainId::new(4);
+const NEMOTRON_RNNT_STATE_DOMAIN: StateDomainId = StateDomainId::new(5);
 const SUPPORTED_TARGET_LANGS: &[&str] = &[
     "auto", "en-US", "en-GB", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "pt-PT",
     "nl-NL", "de-DE", "tr-TR", "ru-RU", "ar-AR", "hi-IN", "ja-JP", "ko-KR", "vi-VN", "uk-UA",
@@ -76,6 +92,11 @@ pub struct NemotronRealtimeResourceReservation {
 pub struct NemotronRealtimeResourceUsage {
     pub host_bytes: u64,
     pub tensor_bytes: u64,
+}
+
+pub(crate) struct NemotronRealtimePhysicalStateSpec {
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
 }
 
 pub struct NemotronAsrModel {
@@ -328,7 +349,7 @@ impl NemotronStreamingProfile {
             "att_context_size": [self.left_context_frames, self.right_context_frames],
             "chunk_frames": self.chunk_frames,
             "chunk_ms": self.chunk_ms,
-            "cache_reuse_ready": false,
+            "cache_reuse_ready": true,
         })
     }
 }
@@ -433,7 +454,7 @@ pub struct NemotronRealtimeStreamEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NemotronStreamingCacheStatus {
-    PendingNativeCacheImplementation,
+    PhysicalStateV2,
 }
 
 pub struct NemotronStreamingState {
@@ -741,7 +762,7 @@ impl NemotronStreamingState {
             events_emitted: 0,
             input_finished: false,
             final_event_emitted: false,
-            cache_status: NemotronStreamingCacheStatus::PendingNativeCacheImplementation,
+            cache_status: NemotronStreamingCacheStatus::PhysicalStateV2,
             feature_state: NemotronStreamingFeatureState::new(),
             pre_encode_state: NemotronStreamingPreEncodeState::new(),
             encoder_state,
@@ -917,7 +938,7 @@ impl NemotronStreamingState {
             "final_event_emitted": self.final_event_emitted,
             "emitted_tokens": self.emitted_tokens,
             "cache_status": format!("{:?}", self.cache_status),
-            "supports_realtime_cache_decode": false,
+            "supports_realtime_cache_decode": true,
             "supports_realtime_stream_decode": self.rnnt_state.is_some(),
         })
     }
@@ -954,6 +975,255 @@ fn configured_realtime_max_samples(sample_rate: u32) -> Result<usize> {
         }
     };
     realtime_max_samples_for_seconds(sample_rate, seconds)
+}
+
+fn state_dtype(dtype: DType) -> Result<StateDType> {
+    match dtype {
+        DType::F32 => Ok(StateDType::F32),
+        DType::F16 => Ok(StateDType::F16),
+        DType::BF16 => Ok(StateDType::Bf16),
+        other => Err(Error::ModelLoadError(format!(
+            "Nemotron realtime physical state does not support {other:?}"
+        ))),
+    }
+}
+
+fn state_header(id: StateDomainId) -> StateDomainHeader {
+    StateDomainHeader {
+        id,
+        scope: StateScope::Retained,
+        clock: StateClock::Custom("realtime_operation_revision".into()),
+        placement: PlacementPolicy::BackendLocal,
+        prefix: PrefixPolicy::Disabled,
+        checkpoint: CheckpointPolicy::Transactional,
+    }
+}
+
+fn fixed_component(
+    id: u32,
+    role: TensorRole,
+    axis: ShapeAxis,
+    elements: usize,
+    dtype: StateDType,
+) -> Result<TensorComponentSpec> {
+    Ok(TensorComponentSpec {
+        id: StateComponentId::new(id),
+        role,
+        shape: BoundedShape {
+            dimensions: vec![ShapeDimension {
+                axis,
+                extent: ShapeExtent::Fixed {
+                    value: u64::try_from(elements).map_err(|_| realtime_reservation_overflow())?,
+                },
+            }],
+        },
+        accepted_dtypes: vec![dtype],
+    })
+}
+
+fn nemotron_realtime_state_contract(
+    max_samples: usize,
+    shape: NemotronRealtimeStateShape,
+    left_context_frames: usize,
+    dtype: StateDType,
+) -> Result<InferenceStateContract> {
+    if max_samples == 0
+        || shape.hop_length == 0
+        || shape.subsampling_factor == 0
+        || shape.encoder_layers == 0
+        || left_context_frames == 0
+        || shape.conv_kernel_size <= 1
+    {
+        return Err(Error::ModelLoadError(
+            "Nemotron realtime physical state contains a zero capacity".into(),
+        ));
+    }
+    let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
+    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    let feature = fixed_component(
+        1,
+        TensorRole::AudioHistory,
+        ShapeAxis::Channels,
+        shape.feature_bins,
+        dtype,
+    )?;
+    let encoder = fixed_component(
+        1,
+        TensorRole::EncoderMemory,
+        ShapeAxis::Hidden,
+        shape.encoder_dim,
+        dtype,
+    )?;
+    let attention = (0..shape.encoder_layers)
+        .map(|layer| {
+            fixed_component(
+                u32::try_from(layer + 1).map_err(|_| realtime_reservation_overflow())?,
+                TensorRole::EncoderMemory,
+                ShapeAxis::Hidden,
+                shape.encoder_dim,
+                dtype,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let convolution = (0..shape.encoder_layers)
+        .map(|layer| {
+            fixed_component(
+                u32::try_from(layer + 1).map_err(|_| realtime_reservation_overflow())?,
+                TensorRole::ConvolutionState,
+                ShapeAxis::Hidden,
+                shape.encoder_dim,
+                dtype,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rnnt = vec![
+        fixed_component(
+            1,
+            TensorRole::RecurrentHidden,
+            ShapeAxis::Hidden,
+            shape.predictor_hidden,
+            dtype,
+        )?,
+        fixed_component(
+            2,
+            TensorRole::RecurrentCell,
+            ShapeAxis::Hidden,
+            shape.predictor_hidden,
+            dtype,
+        )?,
+        fixed_component(
+            3,
+            TensorRole::RecurrentHidden,
+            ShapeAxis::Hidden,
+            shape.predictor_hidden,
+            dtype,
+        )?,
+        fixed_component(
+            4,
+            TensorRole::RecurrentCell,
+            ShapeAxis::Hidden,
+            shape.predictor_hidden,
+            dtype,
+        )?,
+        fixed_component(
+            5,
+            TensorRole::RetainedEmbedding,
+            ShapeAxis::Hidden,
+            shape.predictor_hidden,
+            dtype,
+        )?,
+        fixed_component(
+            6,
+            TensorRole::Custom("rnnt_predictor_projection".into()),
+            ShapeAxis::Hidden,
+            shape.joint_hidden,
+            dtype,
+        )?,
+    ];
+    let domains = vec![
+        StateDomainSpec::Append(AppendStateDomainSpec {
+            header: state_header(NEMOTRON_FEATURE_HISTORY_DOMAIN),
+            components_per_step: vec![feature],
+            max_steps: u64::try_from(feature_frames)
+                .map_err(|_| realtime_reservation_overflow())?,
+        }),
+        StateDomainSpec::Append(AppendStateDomainSpec {
+            header: state_header(NEMOTRON_PENDING_ENCODER_DOMAIN),
+            components_per_step: vec![encoder],
+            max_steps: u64::try_from(encoded_frames)
+                .map_err(|_| realtime_reservation_overflow())?,
+        }),
+        StateDomainSpec::Ring(RingStateDomainSpec {
+            header: state_header(NEMOTRON_ATTENTION_HISTORY_DOMAIN),
+            components_per_step: attention,
+            capacity_steps: u64::try_from(left_context_frames)
+                .map_err(|_| realtime_reservation_overflow())?,
+        }),
+        StateDomainSpec::Ring(RingStateDomainSpec {
+            header: state_header(NEMOTRON_CONVOLUTION_HISTORY_DOMAIN),
+            components_per_step: convolution,
+            capacity_steps: u64::try_from(shape.conv_kernel_size - 1)
+                .map_err(|_| realtime_reservation_overflow())?,
+        }),
+        StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: state_header(NEMOTRON_RNNT_STATE_DOMAIN),
+            components: rnnt,
+        }),
+    ];
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        groups: vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: domains.iter().map(StateDomainSpec::id).collect(),
+            prefix_shareable: false,
+        }],
+        domains,
+    };
+    contract.validate()?;
+    Ok(contract)
+}
+
+fn physical_components(
+    runtime: &RetainedTensorStateRuntimeV2,
+    transaction: PhysicalStateTransactionId,
+    domain: StateDomainId,
+    expected_components: usize,
+) -> Result<Vec<Option<Tensor>>> {
+    let snapshot = runtime
+        .read_transaction_base(transaction, domain)?
+        .ok_or_else(|| {
+            Error::InferenceError(format!(
+                "Nemotron physical domain {} has no committed snapshot",
+                domain.get()
+            ))
+        })?;
+    if snapshot.components.len() != expected_components {
+        return Err(Error::InferenceError(format!(
+            "Nemotron physical domain {} expected {} components, found {}",
+            domain.get(),
+            expected_components,
+            snapshot.components.len()
+        )));
+    }
+    snapshot
+        .components
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.component != StateComponentId::new((index + 1) as u32) {
+                return Err(Error::InferenceError(format!(
+                    "Nemotron physical domain {} has non-canonical components",
+                    domain.get()
+                )));
+            }
+            Ok(value.tensor.clone())
+        })
+        .collect()
+}
+
+fn stage_physical_components(
+    runtime: &RetainedTensorStateRuntimeV2,
+    transaction: PhysicalStateTransactionId,
+    domain: StateDomainId,
+    target_cursor: u64,
+    tensors: Vec<Option<Tensor>>,
+) -> Result<()> {
+    let expected_cursor = runtime
+        .read_transaction_base(transaction, domain)?
+        .map_or(0, |snapshot| snapshot.cursor);
+    let values = tensors
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| {
+            Ok(StateComponentValue {
+                component: StateComponentId::new(
+                    u32::try_from(index + 1).map_err(|_| realtime_reservation_overflow())?,
+                ),
+                tensor,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    runtime.stage_replace(transaction, domain, expected_cursor, target_cursor, values)
 }
 
 fn estimate_realtime_resource_reservation(
@@ -1213,6 +1483,148 @@ impl NemotronDecodeRequest {
 }
 
 impl NemotronAsrModel {
+    pub(crate) fn realtime_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<NemotronRealtimePhysicalStateSpec> {
+        let retained = nemotron_realtime_state_contract(
+            configured_realtime_max_samples(self.runtime_plan.sample_rate)?,
+            self.network.realtime_state_shape(),
+            self.runtime_plan
+                .streaming_profiles
+                .iter()
+                .map(|profile| profile.left_context_frames)
+                .max()
+                .unwrap_or(56),
+            state_dtype(self.network.dtype())?,
+        )?;
+        let descriptor =
+            CapabilityStateDescriptorV2::managed_for_stage_graphs(retained.clone(), stage_graphs)?;
+        Ok(NemotronRealtimePhysicalStateSpec {
+            retained,
+            descriptor,
+        })
+    }
+
+    pub(crate) fn hydrate_realtime_physical_state(
+        &self,
+        state: &mut NemotronStreamingState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+    ) -> Result<()> {
+        let feature =
+            physical_components(runtime, transaction, NEMOTRON_FEATURE_HISTORY_DOMAIN, 1)?;
+        let pending =
+            physical_components(runtime, transaction, NEMOTRON_PENDING_ENCODER_DOMAIN, 1)?;
+        let attention = physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_ATTENTION_HISTORY_DOMAIN,
+            self.network.realtime_state_shape().encoder_layers,
+        )?;
+        let convolution = physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_CONVOLUTION_HISTORY_DOMAIN,
+            self.network.realtime_state_shape().encoder_layers,
+        )?;
+        let rnnt = physical_components(runtime, transaction, NEMOTRON_RNNT_STATE_DOMAIN, 6)?;
+
+        state
+            .pre_encode_state
+            .install_retained_tensor(feature.into_iter().next().flatten());
+        state.encoder_state.install_retained_tensors(
+            pending.into_iter().next().flatten(),
+            attention,
+            convolution,
+        )?;
+        let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
+            Error::InferenceError("Nemotron realtime state has no RNNT control state".into())
+        })?;
+        rnnt_state.install_retained_tensors(rnnt.try_into().map_err(|_| {
+            Error::InferenceError("Nemotron physical RNNT state is incomplete".into())
+        })?);
+        Ok(())
+    }
+
+    pub(crate) fn stage_realtime_physical_state(
+        &self,
+        state: &mut NemotronStreamingState,
+        runtime: &RetainedTensorStateRuntimeV2,
+        transaction: PhysicalStateTransactionId,
+        target_cursor: u64,
+    ) -> Result<()> {
+        let feature = vec![state.pre_encode_state.retained_tensor()];
+        let (pending, attention, convolution) = state.encoder_state.retained_tensors();
+        let rnnt_state = state.rnnt_state.as_ref().ok_or_else(|| {
+            Error::InferenceError("Nemotron realtime state has no RNNT control state".into())
+        })?;
+        let rnnt = rnnt_state
+            .retained_tensors()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        stage_physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_FEATURE_HISTORY_DOMAIN,
+            target_cursor,
+            feature,
+        )?;
+        stage_physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_PENDING_ENCODER_DOMAIN,
+            target_cursor,
+            vec![pending],
+        )?;
+        stage_physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_ATTENTION_HISTORY_DOMAIN,
+            target_cursor,
+            attention,
+        )?;
+        stage_physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_CONVOLUTION_HISTORY_DOMAIN,
+            target_cursor,
+            convolution,
+        )?;
+        stage_physical_components(
+            runtime,
+            transaction,
+            NEMOTRON_RNNT_STATE_DOMAIN,
+            target_cursor,
+            rnnt,
+        )?;
+
+        self.clear_realtime_tensor_handles(state)
+    }
+
+    pub(crate) fn clear_realtime_tensor_handles(
+        &self,
+        state: &mut NemotronStreamingState,
+    ) -> Result<()> {
+        // The committed arena or active transaction owns the retained
+        // handles. Between operations the native state keeps only
+        // host/control metadata.
+        state.pre_encode_state.install_retained_tensor(None);
+        let layers = self.network.realtime_state_shape().encoder_layers;
+        state.encoder_state.install_retained_tensors(
+            None,
+            vec![None; layers],
+            vec![None; layers],
+        )?;
+        state
+            .rnnt_state
+            .as_mut()
+            .expect("validated above")
+            .install_retained_tensors(std::array::from_fn(|_| None));
+        Ok(())
+    }
+
     pub fn diagnostics(&self) -> serde_json::Value {
         json!({
             "variant": self.variant.dir_name(),
@@ -1232,7 +1644,8 @@ impl NemotronAsrModel {
             ),
             "blank_id": self.network.blank_idx(),
             "native_forward_status": "enabled_offline_fastconformer_rnnt",
-            "supports_realtime_cache_decode": false,
+            "supports_realtime_cache_decode": true,
+            "realtime_state_abi": "physical_v2",
             "supports_realtime_stream_decode": true,
         })
     }
@@ -1704,7 +2117,7 @@ impl NemotronAsrModel {
             "prompt_id": prompt_id,
             "blank_id": self.network.blank_idx(),
             "native_forward_status": "enabled_offline_fastconformer_rnnt",
-            "supports_realtime_cache_decode": false,
+            "supports_realtime_cache_decode": true,
         }))
     }
 
@@ -1874,7 +2287,7 @@ impl NemotronAsrModel {
                 "decode_mode": decode_mode,
                 "decode": decoded.stats.diagnostics(),
                 "timings_ms": timings.diagnostics(),
-                "supports_realtime_cache_decode": false,
+                "supports_realtime_cache_decode": true,
             })),
         }
     }
@@ -2645,18 +3058,65 @@ mod tests {
     }
 
     #[test]
-    fn streaming_state_contract_does_not_claim_native_cache_before_wiring() {
+    fn streaming_state_reports_physical_v2_cache_wiring() {
         let profile = NemotronStreamingProfile::new(56, 3).unwrap();
         let prompt = NemotronPromptCondition::resolve(Some("auto"), None).unwrap();
         let state = NemotronStreamingState::new(profile, prompt, 16_000, 4_096, 4_096, true);
         let diagnostics = state.diagnostics();
 
-        assert_eq!(diagnostics["supports_realtime_cache_decode"], false);
+        assert_eq!(diagnostics["supports_realtime_cache_decode"], true);
+        assert_eq!(diagnostics["cache_status"], "PhysicalStateV2");
+        assert_eq!(diagnostics["profile"]["cache_reuse_ready"], true);
+    }
+
+    #[test]
+    fn realtime_physical_contract_covers_every_tensor_without_paged_state() {
+        let shape = default_realtime_state_shape();
+        let contract =
+            nemotron_realtime_state_contract(16_000 * 300, shape, 56, StateDType::F16).unwrap();
+
+        assert_eq!(contract.domains.len(), 5);
+        assert!(matches!(contract.domains[0], StateDomainSpec::Append(_)));
+        assert!(matches!(contract.domains[1], StateDomainSpec::Append(_)));
+        assert!(matches!(contract.domains[2], StateDomainSpec::Ring(_)));
+        assert!(matches!(contract.domains[3], StateDomainSpec::Ring(_)));
+        assert!(matches!(contract.domains[4], StateDomainSpec::Tensor(_)));
+        assert!(!contract.domains.iter().any(|domain| matches!(
+            domain,
+            StateDomainSpec::PagedAttention(_) | StateDomainSpec::StaticAttention(_)
+        )));
+        let StateDomainSpec::Ring(attention) = &contract.domains[2] else {
+            unreachable!()
+        };
+        let StateDomainSpec::Ring(convolution) = &contract.domains[3] else {
+            unreachable!()
+        };
+        let StateDomainSpec::Tensor(rnnt) = &contract.domains[4] else {
+            unreachable!()
+        };
+        assert_eq!(attention.components_per_step.len(), shape.encoder_layers);
+        assert_eq!(attention.capacity_steps, 56);
+        assert_eq!(convolution.components_per_step.len(), shape.encoder_layers);
         assert_eq!(
-            diagnostics["cache_status"],
-            "PendingNativeCacheImplementation"
+            convolution.capacity_steps,
+            (shape.conv_kernel_size - 1) as u64
         );
-        assert_eq!(diagnostics["profile"]["cache_reuse_ready"], false);
+        assert_eq!(rnnt.components.len(), 6);
+        assert!(contract.domains.iter().all(|domain| match domain {
+            StateDomainSpec::Append(spec) => spec
+                .components_per_step
+                .iter()
+                .all(|component| component.accepted_dtypes == vec![StateDType::F16]),
+            StateDomainSpec::Ring(spec) => spec
+                .components_per_step
+                .iter()
+                .all(|component| component.accepted_dtypes == vec![StateDType::F16]),
+            StateDomainSpec::Tensor(spec) => spec
+                .components
+                .iter()
+                .all(|component| component.accepted_dtypes == vec![StateDType::F16]),
+            _ => false,
+        }));
     }
 
     #[test]

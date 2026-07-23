@@ -42,7 +42,9 @@ impl PhysicalStateTransactionId {
 #[derive(Debug, Clone)]
 pub(crate) struct StateComponentValue {
     pub(crate) component: StateComponentId,
-    pub(crate) tensor: Tensor,
+    /// `None` is a first-class committed absence for optional or not-yet
+    /// initialized state. It avoids fake sentinel allocations.
+    pub(crate) tensor: Option<Tensor>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,7 +373,9 @@ impl TensorStateArena {
                     "physical state components must use canonical resolved identities",
                 ));
             }
-            validate_tensor(value, component, multiplier, &self.device)?;
+            if let Some(tensor) = value.tensor.as_ref() {
+                validate_tensor(tensor, component, multiplier, &self.device)?;
+            }
         }
         Ok(())
     }
@@ -384,23 +388,22 @@ impl TensorStateArena {
 }
 
 fn validate_tensor(
-    value: &StateComponentValue,
+    tensor: &Tensor,
     component: &ResolvedTensorComponent,
     multiplier: u64,
     device: &Device,
 ) -> Result<()> {
-    if value.tensor.device().location() != device.location()
-        || value.tensor.dtype() != candle_dtype(component.storage.dtype())?
+    if tensor.device().location() != device.location()
+        || tensor.dtype() != candle_dtype(component.storage.dtype())?
     {
         return Err(invalid(
             "physical state tensor device or dtype does not match its resolved component",
         ));
     }
     let bytes = u64::try_from(
-        value
-            .tensor
+        tensor
             .elem_count()
-            .checked_mul(value.tensor.dtype().size_in_bytes())
+            .checked_mul(tensor.dtype().size_in_bytes())
             .ok_or_else(|| invalid("physical state tensor byte count overflow"))?,
     )
     .map_err(|_| invalid("physical state tensor byte count exceeds u64"))?;
@@ -506,7 +509,14 @@ mod tests {
     fn value(values: &[f32]) -> StateComponentValue {
         StateComponentValue {
             component: StateComponentId::new(1),
-            tensor: Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap(),
+            tensor: Some(Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap()),
+        }
+    }
+
+    fn absent_value() -> StateComponentValue {
+        StateComponentValue {
+            component: StateComponentId::new(1),
+            tensor: None,
         }
     }
 
@@ -531,9 +541,41 @@ mod tests {
             .unwrap();
         assert_eq!(committed.cursor, 1);
         assert_eq!(
-            committed.components[0].tensor.to_vec1::<f32>().unwrap(),
+            committed.components[0]
+                .tensor
+                .as_ref()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
             vec![1.0, 2.0]
         );
+    }
+
+    #[test]
+    fn explicit_absence_is_transactional_without_sentinel_storage() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        arena.begin(transaction, sequence).unwrap();
+        arena
+            .stage_replace(
+                transaction,
+                StateDomainId::new(1),
+                0,
+                1,
+                vec![absent_value()],
+            )
+            .unwrap();
+        arena.commit(transaction, 1).unwrap();
+
+        let snapshot = arena
+            .read(sequence, StateDomainId::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.cursor, 1);
+        assert!(snapshot.components[0].tensor.is_none());
+        arena.release(sequence).unwrap();
     }
 
     #[test]
@@ -561,6 +603,8 @@ mod tests {
                 .unwrap()
                 .components[0]
                 .tensor
+                .as_ref()
+                .unwrap()
                 .to_vec1::<f32>()
                 .unwrap(),
             vec![3.0]

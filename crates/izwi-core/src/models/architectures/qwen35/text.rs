@@ -106,10 +106,16 @@ impl Qwen35TextRuntimeState {
             let convolution = convolution_components.next().ok_or_else(|| {
                 Error::InferenceError("Qwen3.5 convolution component coverage is incomplete".into())
             })?;
-            *recurrent_state = Some(recurrent.tensor.clone());
-            let history_len = convolution.tensor.dim(0)?;
+            let recurrent_tensor = recurrent.tensor.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 recurrent component is absent".into())
+            })?;
+            let convolution_tensor = convolution.tensor.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 convolution component is absent".into())
+            })?;
+            *recurrent_state = Some(recurrent_tensor.clone());
+            let history_len = convolution_tensor.dim(0)?;
             let slots = (0..history_len)
-                .map(|index| convolution.tensor.i(index).map_err(Error::from))
+                .map(|index| convolution_tensor.i(index).map_err(Error::from))
                 .collect::<Result<Vec<_>>>()?;
             *conv_state = Some(ConvRingState { slots, next_idx: 0 });
         }
@@ -164,11 +170,11 @@ impl Qwen35TextRuntimeState {
                 .map_err(|_| Error::InvalidInput("Qwen3.5 state component overflow".into()))?;
             recurrent.push(StateComponentValue {
                 component: StateComponentId::new(component),
-                tensor: recurrent_tensor.clone(),
+                tensor: Some(recurrent_tensor.clone()),
             });
             convolution.push(StateComponentValue {
                 component: StateComponentId::new(component),
-                tensor: ring_tensor,
+                tensor: Some(ring_tensor),
             });
         }
         arena.stage_replace(

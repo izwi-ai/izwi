@@ -133,6 +133,7 @@ pub(crate) struct ModelLifecycleController {
     pub(super) tokenizer: Arc<RwLock<Option<Tokenizer>>>,
     pub(super) codec: Arc<RwLock<AudioCodec>>,
     pub(super) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
+    pub(super) realtime_asr_sequence_capacity: u32,
     pub(super) model_last_used: Mutex<HashMap<ModelVariant, u64>>,
     pub(super) mutation_gate: Mutex<()>,
     state: StdMutex<LifecycleState>,
@@ -157,6 +158,7 @@ impl ModelLifecycleController {
         tokenizer: Arc<RwLock<Option<Tokenizer>>>,
         codec: Arc<RwLock<AudioCodec>>,
         loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
+        realtime_asr_sequence_capacity: u32,
     ) -> Self {
         Self {
             config,
@@ -169,6 +171,7 @@ impl ModelLifecycleController {
             tokenizer,
             codec,
             loaded_tts_variant,
+            realtime_asr_sequence_capacity,
             model_last_used: Mutex::new(HashMap::new()),
             mutation_gate: Mutex::new(()),
             state: StdMutex::new(LifecycleState::default()),

@@ -894,6 +894,40 @@ fn loaded_contract_for_residency(
     Ok(contract)
 }
 
+fn loaded_binding_for_residency(
+    lease: &ModelResidencyLease,
+    bundle: Option<&LoadedModelBundle>,
+    capability: CapabilityKind,
+    streaming_required: bool,
+    execution_group_id: crate::engine::ExecutionGroupId,
+    backend_kind: BackendKind,
+    expected_target: Option<ExecutionTargetKind>,
+) -> Result<(LoadedExecutionContract, LoadedCapabilityBinding)> {
+    let contract = loaded_contract_for_residency(
+        lease,
+        bundle,
+        capability,
+        streaming_required,
+        execution_group_id,
+        backend_kind,
+        expected_target,
+    )?;
+    let bundle = bundle.expect("validated by loaded_contract_for_residency");
+    let binding = bundle.capability_binding_for_streaming(
+        capability,
+        StreamingRequirements::native(streaming_required),
+    )?;
+    if binding.execution != contract.adapter_binding()? {
+        return Err(Error::InferenceError(
+            "loaded capability state binding does not match its execution contract".into(),
+        ));
+    }
+    if let CapabilityStateBinding::V2(runtime) = &binding.state {
+        runtime.validate_against(backend_kind, &binding.execution)?;
+    }
+    Ok((contract, binding))
+}
+
 struct WaiterRegistrationGuard {
     request_id: String,
     registration_id: u64,
@@ -1157,6 +1191,7 @@ impl RuntimeService {
             config.max_batch_size.max(1).saturating_mul(16).max(64),
         )?);
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
+        let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
         let backend_router = BackendRouter::from_context(backend_context);
@@ -1174,6 +1209,7 @@ impl RuntimeService {
             tokenizer.clone(),
             codec.clone(),
             loaded_tts_variant.clone(),
+            realtime_asr_sequence_capacity,
         ));
 
         Ok(Self {
@@ -1975,6 +2011,32 @@ impl RuntimeService {
             Some(expected_target),
         )?;
         Ok((lease, contract))
+    }
+
+    pub(crate) async fn load_capability_with_state_for_job(
+        &self,
+        job: &JobLease,
+        variant: ModelVariant,
+        capability: CapabilityKind,
+        streaming_required: bool,
+        expected_target: ExecutionTargetKind,
+    ) -> Result<(
+        ModelResidencyLease,
+        LoadedExecutionContract,
+        LoadedCapabilityBinding,
+    )> {
+        let lease = self.load_model_for_job(job, variant).await?;
+        let bundle = self.model_lifecycle.try_get_ready_bundle(variant);
+        let (contract, binding) = loaded_binding_for_residency(
+            &lease,
+            bundle.as_deref(),
+            capability,
+            streaming_required,
+            self.coordinator.execution_group_id(),
+            self.backend_router.context().backend_kind,
+            Some(expected_target),
+        )?;
+        Ok((lease, contract, binding))
     }
 
     /// Bound the pre-session Engine admission transaction by the request's

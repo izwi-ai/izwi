@@ -2337,7 +2337,7 @@ mod tests {
                 1,
                 vec![StateComponentValue {
                     component: crate::kv::v2::StateComponentId::new(1),
-                    tensor: Tensor::from_slice(&[1.0_f32], 1, &Device::Cpu).unwrap(),
+                    tensor: Some(Tensor::from_slice(&[1.0_f32], 1, &Device::Cpu).unwrap()),
                 }],
             )
             .unwrap();
@@ -2363,7 +2363,7 @@ mod tests {
                 1,
                 vec![StateComponentValue {
                     component: crate::kv::v2::StateComponentId::new(1),
-                    tensor: Tensor::from_slice(&[2.0_f32], 1, &Device::Cpu).unwrap(),
+                    tensor: Some(Tensor::from_slice(&[2.0_f32], 1, &Device::Cpu).unwrap()),
                 }],
             )
             .unwrap();
@@ -2381,6 +2381,8 @@ mod tests {
                 .unwrap()
                 .components[0]
                 .tensor
+                .as_ref()
+                .unwrap()
                 .to_vec1::<f32>()
                 .unwrap(),
             vec![2.0]

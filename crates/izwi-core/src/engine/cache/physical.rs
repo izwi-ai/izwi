@@ -900,7 +900,7 @@ mod tests {
                 1,
                 vec![crate::backends::state::StateComponentValue {
                     component: StateComponentId::new(1),
-                    tensor: Tensor::from_slice(&[1.0_f32, 2.0], 2, &Device::Cpu).unwrap(),
+                    tensor: Some(Tensor::from_slice(&[1.0_f32, 2.0], 2, &Device::Cpu).unwrap()),
                 }],
             )
             .unwrap();

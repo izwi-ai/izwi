@@ -28,6 +28,7 @@ use super::{
 const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(7);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(8);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(9);
+const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(10);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 const COMPATIBILITY_CACHE_FALLBACK_REASON: &str = "loaded_adapter_uses_model_owned_cache";
@@ -285,6 +286,14 @@ impl LoadedCapabilityDescriptor {
                 LoadedStatePublication::V2(CapabilityStateDescriptorV2::stateless_for_stage_graphs(
                     &stage_graphs,
                 )?)
+            }
+            None if execution.metadata().capability == CapabilityKind::RealtimeAsr
+                && execution.metadata().model_variant.family()
+                    == crate::catalog::ModelFamily::NemotronAsr =>
+            {
+                return Err(Error::ModelLoadError(
+                    "Nemotron realtime ASR requires a load-sealed physical tensor runtime".into(),
+                ));
             }
             None => legacy_model_owned_state_publication(),
         };
@@ -671,6 +680,37 @@ impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct NemotronRealtimeAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.nemotron_realtime.physical_tensor"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::None
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        metadata.capability == CapabilityKind::RealtimeAsr
+            && metadata.model_variant.family() == crate::catalog::ModelFamily::NemotronAsr
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(NemotronRealtimeExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ContinuousQwenChatAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
@@ -712,6 +752,7 @@ impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
 pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecutionAdapterFactory>> {
     vec![
         Arc::new(PhysicalQwenTtsAdapterFactory),
+        Arc::new(NemotronRealtimeAdapterFactory),
         Arc::new(ContinuousQwenChatAdapterFactory),
     ]
 }
@@ -837,6 +878,91 @@ fn compatibility_contract(
         execution_profile,
         stages: Arc::from([stage]),
     })
+}
+
+#[derive(Debug)]
+struct NemotronRealtimeExecutionAdapter {
+    execution_group_id: ExecutionGroupId,
+    model_instance_id: ModelInstanceId,
+    adapter_instance_id: AdapterInstanceId,
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+}
+
+impl NemotronRealtimeExecutionAdapter {
+    fn new(
+        execution_group_id: ExecutionGroupId,
+        model_instance_id: ModelInstanceId,
+        metadata: AdapterMetadata,
+        backend_kind: BackendKind,
+    ) -> Self {
+        Self {
+            execution_group_id,
+            model_instance_id,
+            adapter_instance_id: AdapterInstanceId::new(
+                NEXT_ADAPTER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            ),
+            metadata,
+            backend_kind,
+        }
+    }
+}
+
+impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
+    fn metadata(&self) -> AdapterMetadata {
+        self.metadata
+    }
+
+    fn adapter_instance_id(&self) -> AdapterInstanceId {
+        self.adapter_instance_id
+    }
+
+    fn adapter_abi_revision(&self) -> AdapterAbiRevision {
+        NEMOTRON_REALTIME_ADAPTER_ABI
+    }
+
+    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+        let metadata = self.metadata();
+        let mut execution_profile =
+            compatibility_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        execution_profile.mode = ExecutionMode::Atomic;
+        execution_profile.prefill = PrefillMode::Full;
+        execution_profile.incremental_decode = false;
+        execution_profile.prefill_batch = NativeBatchMode::None;
+        execution_profile.decode_batch = NativeBatchMode::None;
+        execution_profile.cache_mode = CacheMode::None;
+        execution_profile.cache_namespace = None;
+        execution_profile.kv_dtype = "none".into();
+        execution_profile.cancellation = CancellationGranularity::RealtimeChunk;
+        execution_profile.concurrency = ConcurrencyClass::Exclusive;
+        execution_profile.recompute_safe = false;
+        execution_profile.cache_release_safe = true;
+        execution_profile.prefix_reuse_safe = false;
+        execution_profile.max_batch_size = 1;
+        execution_profile.resolved_from_loaded_model = true;
+
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "asr.realtime.physical_tensor",
+            &execution_profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.max_workspace_bytes =
+            crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES;
+        stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+        stage.validate()?;
+
+        Ok(LoadedExecutionContract {
+            execution_group_id: self.execution_group_id,
+            model_instance_id: self.model_instance_id,
+            adapter_instance_id: self.adapter_instance_id(),
+            adapter_abi_revision: self.adapter_abi_revision(),
+            metadata,
+            execution_profile,
+            stages: Arc::from([stage]),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1859,48 +1985,45 @@ mod tests {
     fn stateful_capability_cannot_publish_ready_without_physical_backing() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Nemotron35AsrStreaming06B;
-        let compatibility = LoadedModelBundle::bind(
+        let error = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(14),
             variant,
             BackendKind::Cpu,
         )
-        .unwrap();
-        let binding = compatibility
-            .capability_binding_for_streaming(
-                CapabilityKind::RealtimeAsr,
-                StreamingRequirements::NONE,
-            )
-            .unwrap();
-        assert!(matches!(binding.state, CapabilityStateBinding::LegacyV1(_)));
+        .expect_err("Nemotron realtime must fail closed without physical publication");
+        assert!(error
+            .to_string()
+            .contains("load-sealed physical tensor runtime"));
+    }
 
-        let graphs = loaded_execution_contracts(
-            compatibility
-                .require_capability(CapabilityKind::RealtimeAsr)
-                .unwrap()
-                .execution
-                .as_ref(),
+    #[test]
+    fn nemotron_realtime_factory_authors_atomic_physical_tensor_workspace() {
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(15),
+            ModelVariant::Nemotron35AsrStreaming06B,
+            BackendKind::Cpu,
         )
         .unwrap();
-        let graph_slices = graphs
-            .iter()
-            .map(|contract| contract.stages.as_ref())
-            .collect::<Vec<_>>();
-        let zero = CapabilityStateDescriptorV2::stateless_for_stage_graphs(&graph_slices).unwrap();
-        let error = LoadedModelBundle::bind_with_state_publications(
-            &registry,
-            ExecutionGroupId::new(3),
-            ModelInstanceId::new(14),
-            variant,
-            BackendKind::Cpu,
-            HashMap::from([(
-                CapabilityKind::RealtimeAsr,
-                LoadedStatePublication::V2(zero),
-            )]),
-        )
-        .expect_err("retained-state metadata without physical backing must fail before Ready");
-        assert!(error.to_string().contains("retained inference state"));
+        let contracts = draft
+            .execution_contracts(CapabilityKind::RealtimeAsr)
+            .unwrap();
+
+        assert!(!contracts.is_empty());
+        for contract in contracts {
+            assert_eq!(contract.adapter_abi_revision, NEMOTRON_REALTIME_ADAPTER_ABI);
+            assert_eq!(contract.execution_profile.mode, ExecutionMode::Atomic);
+            assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
+            assert_eq!(contract.stages.len(), 1);
+            assert_eq!(contract.stages[0].selector, StageWorkSelector::Atomic);
+            assert_eq!(
+                contract.stages[0].max_workspace_bytes,
+                crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES
+            );
+        }
     }
 
     #[test]
@@ -2073,6 +2196,37 @@ mod tests {
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
             let instance = ModelInstanceId::new(index as u64 + 1);
+            if variant.family() == crate::catalog::ModelFamily::NemotronAsr {
+                let draft = LoadedModelBundleDraft::build(
+                    &registry,
+                    ExecutionGroupId::new(7),
+                    instance,
+                    variant,
+                    BackendKind::Cpu,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("failed to build physical-state draft for {variant}: {error}")
+                });
+                let metadata = registry.capabilities_for(variant);
+                assert_eq!(draft.capabilities.len(), metadata.len(), "{variant}");
+                for metadata in metadata {
+                    let contracts = draft
+                        .execution_contracts(metadata.capability)
+                        .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
+                    for contract in contracts {
+                        assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
+                        assert_eq!(contract.model_instance_id, instance);
+                        assert_eq!(contract.metadata, metadata);
+                        assert!(contract
+                            .stages
+                            .iter()
+                            .all(|stage| stage.max_batch_size == 1));
+                        assert_eq!(contract.execution_profile.max_batch_size, 1);
+                        assert!(contract.execution_profile.resolved_from_loaded_model);
+                    }
+                }
+                continue;
+            }
             let bundle = LoadedModelBundle::bind(
                 &registry,
                 ExecutionGroupId::new(7),
@@ -2206,14 +2360,14 @@ mod tests {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
-            let bundle = LoadedModelBundle::bind(
+            let draft = LoadedModelBundleDraft::build(
                 &registry,
                 ExecutionGroupId::new(9),
                 ModelInstanceId::new(index as u64 + 1),
                 variant,
                 BackendKind::Cpu,
             )
-            .unwrap_or_else(|error| panic!("failed to bind {variant}: {error}"));
+            .unwrap_or_else(|error| panic!("failed to build {variant}: {error}"));
             for metadata in registry.capabilities_for(variant) {
                 if registry
                     .loaded_adapter_factory(metadata, BackendKind::Cpu)
@@ -2222,20 +2376,22 @@ mod tests {
                 {
                     continue;
                 }
-                let contract = bundle
-                    .contract(metadata.capability, false)
+                let contract = draft
+                    .execution_contracts(metadata.capability)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
-                assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
-                assert_eq!(contract.execution_profile.max_batch_size, 3);
-                assert_eq!(
-                    contract.execution_profile.concurrency,
-                    ConcurrencyClass::Batchable
-                );
-                assert_eq!(contract.stages[0].max_batch_size, 3);
-                assert_eq!(
-                    contract.stages[0].shape_policy,
-                    crate::engine::StageShapePolicy::Independent
-                );
+                for contract in contract {
+                    assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
+                    assert_eq!(contract.execution_profile.max_batch_size, 3);
+                    assert_eq!(
+                        contract.execution_profile.concurrency,
+                        ConcurrencyClass::Batchable
+                    );
+                    assert_eq!(contract.stages[0].max_batch_size, 3);
+                    assert_eq!(
+                        contract.stages[0].shape_policy,
+                        crate::engine::StageShapePolicy::Independent
+                    );
+                }
             }
         }
 

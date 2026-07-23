@@ -602,7 +602,7 @@ impl NemotronNetwork {
 
         Ok(NemotronRnntStreamState {
             predictor_state,
-            predictor_out,
+            predictor_out: Some(predictor_out),
             predictor_projection,
             token_ids: Vec::new(),
             max_output_tokens,
@@ -652,8 +652,12 @@ impl NemotronNetwork {
                     self.joint
                         .joint_from_projections(&enc_t, predictor_projection)?
                 } else {
-                    self.joint
-                        .joint_after_projection(&enc_t, &state.predictor_out)?
+                    let predictor_out = state.predictor_out.as_ref().ok_or_else(|| {
+                        Error::InferenceError(
+                            "Nemotron RNNT predictor output is not hydrated".into(),
+                        )
+                    })?;
+                    self.joint.joint_after_projection(&enc_t, predictor_out)?
                 }
                 .squeeze(0)?
                 .squeeze(0)?
@@ -692,12 +696,20 @@ impl NemotronNetwork {
                     break;
                 }
 
-                state.predictor_out =
-                    self.predictor
-                        .step(label, &mut state.predictor_state, encoded.device())?;
+                state.predictor_out = Some(self.predictor.step(
+                    label,
+                    &mut state.predictor_state,
+                    encoded.device(),
+                )?);
                 if encoded_projection.is_some() {
-                    state.predictor_projection =
-                        Some(self.joint.project_predictor(&state.predictor_out)?);
+                    state.predictor_projection = Some(
+                        self.joint.project_predictor(
+                            state
+                                .predictor_out
+                                .as_ref()
+                                .expect("assigned immediately above"),
+                        )?,
+                    );
                 }
             }
         }
@@ -1105,7 +1117,7 @@ pub(super) struct NemotronStreamingEncoderChunk {
 
 pub(super) struct NemotronRnntStreamState {
     predictor_state: PredictorState,
-    predictor_out: Tensor,
+    predictor_out: Option<Tensor>,
     predictor_projection: Option<Tensor>,
     token_ids: Vec<usize>,
     max_output_tokens: usize,
@@ -1230,6 +1242,14 @@ impl NemotronStreamingPreEncodeState {
     pub(super) fn finish_input(&mut self) {
         self.input_finished = true;
     }
+
+    pub(super) fn retained_tensor(&self) -> Option<Tensor> {
+        self.features.clone()
+    }
+
+    pub(super) fn install_retained_tensor(&mut self, tensor: Option<Tensor>) {
+        self.features = tensor;
+    }
 }
 
 impl NemotronStreamingEncoderState {
@@ -1351,6 +1371,45 @@ impl NemotronStreamingEncoderState {
         };
         Ok(Some(chunk))
     }
+
+    pub(super) fn retained_tensors(
+        &self,
+    ) -> (Option<Tensor>, Vec<Option<Tensor>>, Vec<Option<Tensor>>) {
+        (
+            self.pending_pre_encoded.clone(),
+            self.layer_states
+                .iter()
+                .map(|state| state.attn_cache.clone())
+                .collect(),
+            self.layer_states
+                .iter()
+                .map(|state| state.conv_cache.clone())
+                .collect(),
+        )
+    }
+
+    pub(super) fn install_retained_tensors(
+        &mut self,
+        pending: Option<Tensor>,
+        attention: Vec<Option<Tensor>>,
+        convolution: Vec<Option<Tensor>>,
+    ) -> Result<()> {
+        if attention.len() != self.layer_states.len()
+            || convolution.len() != self.layer_states.len()
+        {
+            return Err(Error::InferenceError(
+                "Nemotron physical encoder state has incomplete layer coverage".into(),
+            ));
+        }
+        self.pending_pre_encoded = pending;
+        for ((layer, attention), convolution) in
+            self.layer_states.iter_mut().zip(attention).zip(convolution)
+        {
+            layer.attn_cache = attention;
+            layer.conv_cache = convolution;
+        }
+        Ok(())
+    }
 }
 
 impl NemotronRnntStreamState {
@@ -1369,15 +1428,46 @@ impl NemotronRnntStreamState {
         &self,
         accounting: &mut TensorStorageAccounting,
     ) -> Option<()> {
-        accounting.add_tensor(&self.predictor_state.h0)?;
-        accounting.add_tensor(&self.predictor_state.c0)?;
-        accounting.add_tensor(&self.predictor_state.h1)?;
-        accounting.add_tensor(&self.predictor_state.c1)?;
-        accounting.add_tensor(&self.predictor_out)?;
+        if let Some(tensor) = &self.predictor_state.h0 {
+            accounting.add_tensor(tensor)?;
+        }
+        if let Some(tensor) = &self.predictor_state.c0 {
+            accounting.add_tensor(tensor)?;
+        }
+        if let Some(tensor) = &self.predictor_state.h1 {
+            accounting.add_tensor(tensor)?;
+        }
+        if let Some(tensor) = &self.predictor_state.c1 {
+            accounting.add_tensor(tensor)?;
+        }
+        if let Some(tensor) = &self.predictor_out {
+            accounting.add_tensor(tensor)?;
+        }
         if let Some(projection) = &self.predictor_projection {
             accounting.add_tensor(projection)?;
         }
         Some(())
+    }
+
+    pub(super) fn retained_tensors(&self) -> [Option<Tensor>; 6] {
+        [
+            self.predictor_state.h0.clone(),
+            self.predictor_state.c0.clone(),
+            self.predictor_state.h1.clone(),
+            self.predictor_state.c1.clone(),
+            self.predictor_out.clone(),
+            self.predictor_projection.clone(),
+        ]
+    }
+
+    pub(super) fn install_retained_tensors(&mut self, tensors: [Option<Tensor>; 6]) {
+        let [h0, c0, h1, c1, predictor_out, predictor_projection] = tensors;
+        self.predictor_state.h0 = h0;
+        self.predictor_state.c0 = c0;
+        self.predictor_state.h1 = h1;
+        self.predictor_state.c1 = c1;
+        self.predictor_out = predictor_out;
+        self.predictor_projection = predictor_projection;
     }
 }
 
@@ -2320,10 +2410,10 @@ struct Predictor {
 
 #[derive(Clone)]
 struct PredictorState {
-    h0: Tensor,
-    c0: Tensor,
-    h1: Tensor,
-    c1: Tensor,
+    h0: Option<Tensor>,
+    c0: Option<Tensor>,
+    h1: Option<Tensor>,
+    c1: Option<Tensor>,
 }
 
 impl Predictor {
@@ -2349,10 +2439,10 @@ impl Predictor {
         let dtype = self.embed.dtype();
         let zeros = |dim| Tensor::zeros((batch, dim), dtype, device).map_err(Error::from);
         Ok(PredictorState {
-            h0: zeros(PRED_HIDDEN)?,
-            c0: zeros(PRED_HIDDEN)?,
-            h1: zeros(PRED_HIDDEN)?,
-            c1: zeros(PRED_HIDDEN)?,
+            h0: Some(zeros(PRED_HIDDEN)?),
+            c0: Some(zeros(PRED_HIDDEN)?),
+            h1: Some(zeros(PRED_HIDDEN)?),
+            c1: Some(zeros(PRED_HIDDEN)?),
         })
     }
 
@@ -2363,15 +2453,33 @@ impl Predictor {
             self.embed.i((label, ..))?.unsqueeze(0)?
         };
 
-        let (h0, c0) = self.lstm_l0.step(&x, &state.h0, &state.c0)?;
-        state.h0 = h0;
-        state.c0 = c0;
+        let h0 = state
+            .h0
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Nemotron predictor h0 is not hydrated".into()))?;
+        let c0 = state
+            .c0
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Nemotron predictor c0 is not hydrated".into()))?;
+        let (h0, c0) = self.lstm_l0.step(&x, h0, c0)?;
+        state.h0 = Some(h0);
+        state.c0 = Some(c0);
 
-        let (h1, c1) = self.lstm_l1.step(&state.h0, &state.h1, &state.c1)?;
-        state.h1 = h1;
-        state.c1 = c1;
+        let h1 = state
+            .h1
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Nemotron predictor h1 is not hydrated".into()))?;
+        let c1 = state
+            .c1
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Nemotron predictor c1 is not hydrated".into()))?;
+        let (h1, c1) = self
+            .lstm_l1
+            .step(state.h0.as_ref().expect("assigned above"), h1, c1)?;
+        state.h1 = Some(h1);
+        state.c1 = Some(c1);
 
-        Ok(state.h1.unsqueeze(1)?)
+        Ok(state.h1.as_ref().expect("assigned above").unsqueeze(1)?)
     }
 }
 

@@ -406,6 +406,50 @@ impl ModelLifecycleController {
                     }
                 }
             }
+            if self
+                .adapter_registry
+                .require(CapabilityKind::RealtimeAsr, variant)
+                .is_ok()
+            {
+                let model = self.model_registry.get_asr(variant).await.ok_or_else(|| {
+                    Error::ModelLoadError(format!(
+                        "loaded realtime ASR model {variant} is missing from the registry"
+                    ))
+                })?;
+                let contracts =
+                    bundle_draft.execution_contracts(CapabilityKind::RealtimeAsr)?;
+                let stage_graphs = contracts
+                    .iter()
+                    .map(|contract| contract.stages.as_ref())
+                    .collect::<Vec<_>>();
+                let physical_spec = model.realtime_physical_state_spec(&stage_graphs)?;
+                let retained = self
+                    .core_engine
+                    .load_retained_tensor_state(
+                        model_instance_id,
+                        &physical_spec.retained,
+                        self.realtime_asr_sequence_capacity,
+                    )
+                    .await?;
+                let retained_uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        Ok((
+                            stage_graph_fingerprint(&contract.stages)?,
+                            RetainedStateUseV2::ExternalTensor,
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                state_publications.insert(
+                    CapabilityKind::RealtimeAsr,
+                    LoadedStatePublication::PhysicalV2 {
+                        descriptor: physical_spec.descriptor,
+                        retained: Some(retained.into()),
+                        retained_uses,
+                        invocation_paged: InvocationPagedWorkspaceRuntimeV2::default(),
+                    },
+                );
+            }
             if variant.family() == crate::catalog::ModelFamily::Qwen3Tts {
                 let model = self
                     .model_registry

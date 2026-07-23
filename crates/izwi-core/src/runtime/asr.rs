@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId};
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::{
-    AsrProgress, AsrProgressPhase, ResourceAmount, ResourceVector, TaskType, WorkUnit,
+    AsrProgress, AsrProgressPhase, ResourceAmount, ResourceVector, RetainedTensorStateRuntimeV2,
+    TaskType, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
@@ -20,7 +22,9 @@ use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, LoadedExecutionContract};
+use crate::runtime::adapters::{
+    CapabilityKind, CapabilityStateBinding, ExecutionTargetKind, LoadedExecutionContract,
+};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
@@ -253,6 +257,14 @@ impl RealtimeAsrSessionPolicy {
         })
     }
 
+    pub(super) fn retained_sequence_capacity(&self) -> Result<u32> {
+        u32::try_from(self.limits.max_sessions).map_err(|_| {
+            Error::ConfigError(
+                "realtime ASR session quota exceeds physical sequence capacity".into(),
+            )
+        })
+    }
+
     fn try_acquire(&self) -> Result<Arc<RealtimeAsrSessionLease>> {
         let permit = self
             .permits
@@ -297,9 +309,142 @@ fn positive_u64_env_or_default(name: &str, default: u64) -> Result<u64> {
     }
 }
 
+struct RealtimeAsrPhysicalSession {
+    runtime: Arc<RetainedTensorStateRuntimeV2>,
+    sequence: PhysicalStateSequenceId,
+    active_transaction: Option<PhysicalStateTransactionId>,
+    revision: u64,
+}
+
+impl RealtimeAsrPhysicalSession {
+    fn new(runtime: Arc<RetainedTensorStateRuntimeV2>) -> Result<Self> {
+        let sequence = runtime.register_sequence()?;
+        Ok(Self {
+            runtime,
+            sequence,
+            active_transaction: None,
+            revision: 0,
+        })
+    }
+
+    fn begin(&mut self) -> Result<PhysicalStateTransactionId> {
+        if self.active_transaction.is_some() {
+            return Err(Error::InferenceError(
+                "realtime ASR physical transaction is already active".into(),
+            ));
+        }
+        let transaction = self.runtime.begin_transaction(self.sequence)?;
+        self.active_transaction = Some(transaction);
+        Ok(transaction)
+    }
+
+    fn commit(&mut self, transaction: PhysicalStateTransactionId, revision: u64) -> Result<()> {
+        if self.active_transaction != Some(transaction) {
+            return Err(Error::InferenceError(
+                "realtime ASR physical transaction identity changed".into(),
+            ));
+        }
+        self.runtime.commit_transaction(transaction, revision)?;
+        self.active_transaction = None;
+        self.revision = revision;
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        if let Some(transaction) = self.active_transaction.take() {
+            let _ = self.runtime.abort_transaction(transaction);
+        }
+    }
+}
+
+impl Drop for RealtimeAsrPhysicalSession {
+    fn drop(&mut self) {
+        self.abort();
+        if let Err(error) = self.runtime.release_sequence(self.sequence) {
+            tracing::error!(
+                sequence = self.sequence.get(),
+                error = %error,
+                "failed to release realtime ASR physical sequence"
+            );
+        }
+    }
+}
+
+struct RuntimeAsrRealtimeState {
+    native: NativeAsrRealtimeState,
+    physical: RealtimeAsrPhysicalSession,
+}
+
+impl RuntimeAsrRealtimeState {
+    fn new(
+        model: &NativeAsrModel,
+        native: NativeAsrRealtimeState,
+        runtime: Arc<RetainedTensorStateRuntimeV2>,
+    ) -> Result<Self> {
+        let mut owner = Self {
+            native,
+            physical: RealtimeAsrPhysicalSession::new(runtime)?,
+        };
+        let transaction = owner.physical.begin()?;
+        let revision = 1;
+        let result = model.stage_realtime_physical_state(
+            &mut owner.native,
+            &owner.physical.runtime,
+            transaction,
+            revision,
+        );
+        if let Err(error) = result {
+            owner.physical.abort();
+            return Err(error);
+        }
+        if let Err(error) = owner.physical.commit(transaction, revision) {
+            owner.physical.abort();
+            return Err(error);
+        }
+        Ok(owner)
+    }
+
+    fn transact<T>(
+        &mut self,
+        model: &NativeAsrModel,
+        operation: impl FnOnce(&mut NativeAsrRealtimeState) -> Result<T>,
+    ) -> Result<T> {
+        let transaction = self.physical.begin()?;
+        let result = (|| {
+            model.hydrate_realtime_physical_state(
+                &mut self.native,
+                &self.physical.runtime,
+                transaction,
+            )?;
+            let output = operation(&mut self.native)?;
+            let revision = self.physical.revision.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("realtime ASR physical revision overflowed".into())
+            })?;
+            model.stage_realtime_physical_state(
+                &mut self.native,
+                &self.physical.runtime,
+                transaction,
+                revision,
+            )?;
+            self.physical.commit(transaction, revision)?;
+            Ok(output)
+        })();
+        if result.is_err() {
+            if let Err(error) = model.clear_realtime_tensor_handles(&mut self.native) {
+                tracing::error!(
+                    error = %error,
+                    "failed to drain Nemotron tensor handles after aborted operation"
+                );
+            }
+            self.physical.abort();
+        }
+        result
+    }
+}
+
 struct RuntimeAsrRealtimeResources {
     model: Option<Arc<NativeAsrModel>>,
-    state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    state: Option<Arc<StdMutex<RuntimeAsrRealtimeState>>>,
     execution_contract: Option<LoadedExecutionContract>,
     residency_lease: Option<ModelResidencyLease>,
     job: Option<JobLease>,
@@ -368,7 +513,7 @@ impl RuntimeAsrRealtimeResources {
 }
 
 struct RealtimeAsrDetachedResources {
-    state: Option<Arc<StdMutex<NativeAsrRealtimeState>>>,
+    state: Option<Arc<StdMutex<RuntimeAsrRealtimeState>>>,
     model: Option<Arc<NativeAsrModel>>,
     execution_contract: Option<LoadedExecutionContract>,
     residency_lease: Option<ModelResidencyLease>,
@@ -402,7 +547,7 @@ fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) 
 
 struct RealtimeAsrOperationHandles {
     model: Arc<NativeAsrModel>,
-    state: Arc<StdMutex<NativeAsrRealtimeState>>,
+    state: Arc<StdMutex<RuntimeAsrRealtimeState>>,
     execution_contract: LoadedExecutionContract,
     job: JobLease,
     session_lease: Arc<RealtimeAsrSessionLease>,
@@ -772,7 +917,7 @@ fn add_realtime_stream_reservation(
     base.checked_add(realtime_stream_resource_vector(
         backend,
         reservation.host_bytes(),
-        reservation.tensor_bytes(),
+        crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES,
     )?)
 }
 
@@ -816,8 +961,8 @@ impl RuntimeService {
             .coordinator
             .admit_observed(job_spec, host_input_observation(metadata_bytes)?)
             .await?;
-        let (lease, execution_contract) = self
-            .load_capability_for_job(
+        let (lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 &job,
                 variant,
                 CapabilityKind::RealtimeAsr,
@@ -825,6 +970,20 @@ impl RuntimeService {
                 ExecutionTargetKind::RealtimeRunner,
             )
             .await?;
+        let physical_runtime = match state_binding.state {
+            CapabilityStateBinding::V2(runtime) => {
+                runtime.retained_tensor_state_runtime().ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "realtime ASR did not bind its retained tensor runtime".into(),
+                    )
+                })?
+            }
+            CapabilityStateBinding::LegacyV1(_) => {
+                return Err(Error::ModelLoadError(
+                    "realtime ASR cannot execute through legacy model-owned state".into(),
+                ));
+            }
+        };
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
                 Error::ModelNotFound(format!("ASR model {variant} is not loaded"))
@@ -860,17 +1019,22 @@ impl RuntimeService {
                 move || {
                     let _operation_lease = operation_lease;
                     let _session_lease = task_session_lease;
-                    let state = task_model.start_realtime_stream_state_with_reservation(
+                    let native = task_model.start_realtime_stream_state_with_reservation(
                         language.as_deref(),
                         prompt.as_deref(),
                         None,
                         reservation,
                     )?;
+                    let state = RuntimeAsrRealtimeState::new(
+                        task_model.as_ref(),
+                        native,
+                        physical_runtime,
+                    )?;
                     Ok((state, language, prompt))
                 },
             )
             .await?;
-        let steady_usage = realtime_state_observation(&state)?;
+        let steady_usage = realtime_state_observation(&state.native)?;
         job.record_materialized_usage(add_retained_host_bytes(
             steady_usage,
             retained_metadata_bytes,
@@ -964,12 +1128,13 @@ impl RuntimeService {
                     // cannot be observed as unclaimed headroom.
                     observation_job
                         .prepare_materialized_release(JobResourceObservation::default())?;
-                    let events =
-                        model.push_realtime_stream_samples(&mut state, &samples, sample_rate);
+                    let events = state.transact(model.as_ref(), |native| {
+                        model.push_realtime_stream_samples(native, &samples, sample_rate)
+                    });
                     observation_job.record_materialized_usage(
-                        realtime_state_with_input_observation(&state, samples.capacity())?,
+                        realtime_state_with_input_observation(&state.native, samples.capacity())?,
                     )?;
-                    let steady_usage = realtime_state_observation(&state)?;
+                    let steady_usage = realtime_state_observation(&state.native)?;
                     observation_job.prepare_materialized_release(steady_usage)?;
                     drop(samples);
                     events
@@ -1032,7 +1197,9 @@ impl RuntimeService {
                     })?;
                     observation_job
                         .prepare_materialized_release(JobResourceObservation::default())?;
-                    model.finish_realtime_stream(&mut state)
+                    state.transact(model.as_ref(), |native| {
+                        model.finish_realtime_stream(native)
+                    })
                 })
             },
         )
@@ -3510,7 +3677,7 @@ mod tests {
     use crate::backends::BackendPreference;
     use crate::config::EngineConfig;
     use crate::engine::{ModelInstanceId, Priority, WorkloadClass};
-    use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+    use crate::runtime::adapters::{LoadedModelBundleDraft, RuntimeAdapterRegistry};
     use crate::runtime::coordinator::JobSpec;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
@@ -3690,17 +3857,20 @@ mod tests {
         coordinator: &InferenceCoordinator,
         backend: BackendKind,
     ) -> LoadedExecutionContract {
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             coordinator.execution_group_id(),
             ModelInstanceId::new(1),
             ModelVariant::Nemotron35AsrStreaming06B,
             backend,
         )
-        .expect("realtime test bundle");
-        bundle
-            .contract(CapabilityKind::RealtimeAsr, true)
-            .expect("realtime test contract")
+        .expect("realtime test bundle draft");
+        draft
+            .execution_contracts(CapabilityKind::RealtimeAsr)
+            .expect("realtime test contracts")
+            .into_iter()
+            .next()
+            .expect("realtime adapter publishes a contract")
     }
 
     #[test]
