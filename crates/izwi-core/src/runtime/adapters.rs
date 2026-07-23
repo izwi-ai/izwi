@@ -99,7 +99,7 @@ pub(crate) enum SequenceExecutionMode {
 }
 
 /// Capability-authored lifetime truth for mutable inference data. This is
-/// independent of whether the current compatibility execution profile happens
+/// independent of whether the current scalar execution profile happens
 /// to expose a scheduler cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -256,7 +256,7 @@ impl RuntimeAdapterRegistry {
     }
 }
 
-pub(crate) fn compatibility_execution_profile(
+pub(crate) fn scalar_execution_profile(
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
     streaming_required: bool,
@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_metadata_owns_compatibility_sequence_semantics() {
+    fn capability_metadata_owns_scalar_sequence_semantics() {
         let registry = RuntimeAdapterRegistry::built_in();
         let qwen_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
@@ -702,11 +702,11 @@ mod tests {
         );
         assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
         assert_eq!(
-            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
+            scalar_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
             ExecutionMode::Atomic
         );
         assert_eq!(
-            compatibility_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
+            scalar_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
             ExecutionMode::Sequence
         );
     }

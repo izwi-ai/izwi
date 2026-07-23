@@ -10,7 +10,7 @@ use crate::catalog::ModelVariant;
 use crate::engine::ExecutionProfile;
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{
-    compatibility_execution_profile, AdapterMetadata, CapabilityKind, ExecutionTargetKind,
+    scalar_execution_profile, AdapterMetadata, CapabilityKind, ExecutionTargetKind,
     RuntimeAdapterRegistry, StreamingMode,
 };
 use serde::Serialize;
@@ -60,7 +60,7 @@ impl CapabilityExecutionPlan {
         streaming_required: bool,
     ) -> Self {
         let mut execution_profile =
-            compatibility_execution_profile(metadata, backend_kind, streaming_required);
+            scalar_execution_profile(metadata, backend_kind, streaming_required);
         execution_profile.resolved_from_loaded_model = false;
         Self {
             adapter_id: metadata.id,

@@ -21,11 +21,11 @@ use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 
 use super::{
-    compatibility_execution_profile, AdapterMetadata, CapabilityKind, InferenceStateRequirement,
+    scalar_execution_profile, AdapterMetadata, CapabilityKind, InferenceStateRequirement,
     RuntimeAdapterRegistry, StreamingMode,
 };
 
-const COMPATIBILITY_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(7);
+const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(7);
 const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(8);
 const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(9);
 const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(10);
@@ -79,7 +79,7 @@ fn output_visibility_for(
     }
 }
 
-fn compatible_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
+fn scalar_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
     if backend_kind == BackendKind::Metal {
         1
     } else {
@@ -646,6 +646,29 @@ pub(super) trait LoadedExecutionAdapterFactory: fmt::Debug + Send + Sync {
     ) -> Result<Arc<dyn LoadedExecutionAdapter>>;
 }
 
+fn is_physical_qwen_tts(metadata: AdapterMetadata) -> bool {
+    matches!(
+        metadata.capability,
+        CapabilityKind::Tts | CapabilityKind::StreamingTts
+    ) && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+}
+
+fn is_nemotron_realtime(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::RealtimeAsr
+        && metadata.model_variant.family() == crate::catalog::ModelFamily::NemotronAsr
+}
+
+fn is_continuous_qwen_chat(metadata: AdapterMetadata) -> bool {
+    metadata.capability == CapabilityKind::Chat
+        && matches!(
+            metadata.model_variant,
+            ModelVariant::Qwen306B
+                | ModelVariant::Qwen306B4Bit
+                | ModelVariant::Qwen317B
+                | ModelVariant::Qwen317B4Bit
+        )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
@@ -659,10 +682,7 @@ impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        matches!(
-            metadata.capability,
-            CapabilityKind::Tts | CapabilityKind::StreamingTts
-        ) && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Tts
+        is_physical_qwen_tts(metadata)
     }
 
     fn create(
@@ -692,8 +712,7 @@ impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        metadata.capability == CapabilityKind::RealtimeAsr
-            && metadata.model_variant.family() == crate::catalog::ModelFamily::NemotronAsr
+        is_nemotron_realtime(metadata)
     }
 
     fn create(
@@ -723,14 +742,7 @@ impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        metadata.capability == CapabilityKind::Chat
-            && matches!(
-                metadata.model_variant,
-                ModelVariant::Qwen306B
-                    | ModelVariant::Qwen306B4Bit
-                    | ModelVariant::Qwen317B
-                    | ModelVariant::Qwen317B4Bit
-            )
+        is_continuous_qwen_chat(metadata)
     }
 
     fn create(
@@ -749,16 +761,50 @@ impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScalarExecutionAdapterFactory;
+
+impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
+    fn id(&self) -> &'static str {
+        "builtin.scalar"
+    }
+
+    fn batch_mode(&self) -> NativeBatchMode {
+        NativeBatchMode::None
+    }
+
+    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        !is_physical_qwen_tts(metadata)
+            && !is_nemotron_realtime(metadata)
+            && !is_continuous_qwen_chat(metadata)
+    }
+
+    fn create(
+        &self,
+        context: LoadedAdapterFactoryContext,
+        metadata: AdapterMetadata,
+    ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+        Ok(Arc::new(ScalarExecutionAdapter::new(
+            context.execution_group_id,
+            context.model_instance_id,
+            metadata,
+            context.backend_kind,
+            context.request_parallelism,
+        )))
+    }
+}
+
 pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecutionAdapterFactory>> {
     vec![
         Arc::new(PhysicalQwenTtsAdapterFactory),
         Arc::new(NemotronRealtimeAdapterFactory),
         Arc::new(ContinuousQwenChatAdapterFactory),
+        Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
 
 #[derive(Debug)]
-struct CompatibilityExecutionAdapter {
+struct ScalarExecutionAdapter {
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
     adapter_instance_id: AdapterInstanceId,
@@ -767,7 +813,7 @@ struct CompatibilityExecutionAdapter {
     request_parallelism: usize,
 }
 
-impl CompatibilityExecutionAdapter {
+impl ScalarExecutionAdapter {
     fn new(
         execution_group_id: ExecutionGroupId,
         model_instance_id: ModelInstanceId,
@@ -783,12 +829,12 @@ impl CompatibilityExecutionAdapter {
             ),
             metadata,
             backend_kind,
-            request_parallelism: compatible_request_parallelism(backend_kind, request_parallelism),
+            request_parallelism: scalar_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
 
-impl LoadedExecutionAdapter for CompatibilityExecutionAdapter {
+impl LoadedExecutionAdapter for ScalarExecutionAdapter {
     fn metadata(&self) -> AdapterMetadata {
         self.metadata
     }
@@ -798,11 +844,11 @@ impl LoadedExecutionAdapter for CompatibilityExecutionAdapter {
     }
 
     fn adapter_abi_revision(&self) -> AdapterAbiRevision {
-        COMPATIBILITY_ADAPTER_ABI
+        SCALAR_ADAPTER_ABI
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
-        compatibility_contract(
+        scalar_contract(
             self.execution_group_id,
             self.model_instance_id,
             self.adapter_instance_id(),
@@ -815,7 +861,7 @@ impl LoadedExecutionAdapter for CompatibilityExecutionAdapter {
     }
 }
 
-fn compatibility_contract(
+fn scalar_contract(
     execution_group_id: ExecutionGroupId,
     model_instance_id: ModelInstanceId,
     adapter_instance_id: AdapterInstanceId,
@@ -833,7 +879,7 @@ fn compatibility_contract(
     }
 
     let mut execution_profile =
-        compatibility_execution_profile(metadata, backend_kind, streaming.model_native);
+        scalar_execution_profile(metadata, backend_kind, streaming.model_native);
     if metadata.capability == CapabilityKind::Asr
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
         && streaming.model_native
@@ -858,7 +904,7 @@ fn compatibility_contract(
 
     let mut stage = StageDescriptor::from_execution_profile(
         StageId::new(0),
-        format!("{}.compatibility", metadata.capability.as_str()),
+        format!("{}.scalar", metadata.capability.as_str()),
         &execution_profile,
         NativeBatchMode::None,
     );
@@ -924,7 +970,7 @@ impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let metadata = self.metadata();
         let mut execution_profile =
-            compatibility_execution_profile(metadata, self.backend_kind, streaming.model_native);
+            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
         execution_profile.mode = ExecutionMode::Atomic;
         execution_profile.prefill = PrefillMode::Full;
         execution_profile.incremental_decode = false;
@@ -1015,7 +1061,7 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
             )));
         }
         let mut execution_profile =
-            compatibility_execution_profile(metadata, self.backend_kind, streaming.model_native);
+            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
         execution_profile.mode = ExecutionMode::Sequence;
         execution_profile.prefill = PrefillMode::Full;
         execution_profile.incremental_decode = true;
@@ -1103,7 +1149,7 @@ impl StaticTtsExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
-            request_parallelism: compatible_request_parallelism(backend_kind, request_parallelism),
+            request_parallelism: scalar_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
@@ -1123,7 +1169,7 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         if streaming.model_native {
-            return compatibility_contract(
+            return scalar_contract(
                 self.execution_group_id,
                 self.model_instance_id,
                 self.adapter_instance_id(),
@@ -1136,8 +1182,7 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
         }
 
         let metadata = self.metadata();
-        let mut execution_profile =
-            compatibility_execution_profile(metadata, self.backend_kind, false);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind, false);
         execution_profile.mode = ExecutionMode::Atomic;
         execution_profile.prefill = PrefillMode::None;
         execution_profile.incremental_decode = false;
@@ -1167,31 +1212,31 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
             Error::Overloaded("static TTS batch width exceeds work accounting".to_string())
         })?;
         stage.max_workspace_bytes = STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES;
-        let mut compatibility = StageDescriptor::from_execution_profile(
+        let mut scalar = StageDescriptor::from_execution_profile(
             StageId::new(0),
-            "tts.generate.compatibility",
+            "tts.generate.scalar",
             &execution_profile,
             NativeBatchMode::None,
         );
-        compatibility.selector = StageWorkSelector::Any;
-        compatibility.max_batch_size = self.request_parallelism;
-        compatibility.concurrency = if self.request_parallelism > 1 {
+        scalar.selector = StageWorkSelector::Any;
+        scalar.max_batch_size = self.request_parallelism;
+        scalar.concurrency = if self.request_parallelism > 1 {
             ConcurrencyClass::Batchable
         } else {
             ConcurrencyClass::Exclusive
         };
-        compatibility.shape_policy = if self.request_parallelism > 1 {
+        scalar.shape_policy = if self.request_parallelism > 1 {
             crate::engine::StageShapePolicy::Independent
         } else {
             crate::engine::StageShapePolicy::Exact
         };
-        compatibility.output_visibility = output_visibility_for(
+        scalar.output_visibility = output_visibility_for(
             streaming.transport_output,
             execution_profile.mode,
             NativeBatchMode::None,
         );
         stage.validate()?;
-        compatibility.validate()?;
+        scalar.validate()?;
 
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
@@ -1200,7 +1245,7 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([stage, compatibility]),
+            stages: Arc::from([stage, scalar]),
         })
     }
 }
@@ -1234,7 +1279,7 @@ impl ContinuousChatExecutionAdapter {
             metadata,
             backend_kind,
             max_batch_size: max_batch_size.max(1),
-            request_parallelism: compatible_request_parallelism(backend_kind, request_parallelism),
+            request_parallelism: scalar_request_parallelism(backend_kind, request_parallelism),
         }
     }
 }
@@ -1261,7 +1306,7 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
             )));
         }
         let mut execution_profile =
-            compatibility_execution_profile(metadata, self.backend_kind, streaming.model_native);
+            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
         execution_profile.prefill_batch = NativeBatchMode::None;
         execution_profile.decode_batch = NativeBatchMode::Continuous;
         execution_profile.cache_mode = CacheMode::ExternalPaged;
@@ -1277,7 +1322,7 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
 
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
-            "chat.prefill.compatibility",
+            "chat.prefill.scalar",
             &execution_profile,
             NativeBatchMode::None,
         );
@@ -1333,24 +1378,27 @@ impl RuntimeAdapterRegistry {
         &self,
         metadata: AdapterMetadata,
         backend_kind: BackendKind,
-    ) -> Result<Option<&dyn LoadedExecutionAdapterFactory>> {
+    ) -> Result<&dyn LoadedExecutionAdapterFactory> {
         let mut matches = self
             .loaded_adapter_factories
             .iter()
             .filter(|factory| factory.supports(metadata, backend_kind));
         let Some(selected) = matches.next() else {
-            return Ok(None);
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {} capability {:?} has no execution adapter factory for {backend_kind:?}",
+                metadata.model_variant, metadata.capability,
+            )));
         };
         if let Some(ambiguous) = matches.next() {
             return Err(Error::ModelLoadError(format!(
-                "loaded model {} capability {:?} matches both native factories `{}` and `{}`",
+                "loaded model {} capability {:?} matches both execution adapter factories `{}` and `{}`",
                 metadata.model_variant,
                 metadata.capability,
                 selected.id(),
                 ambiguous.id(),
             )));
         }
-        Ok(Some(selected.as_ref()))
+        Ok(selected.as_ref())
     }
 
     pub(super) fn loaded_native_variants(
@@ -1365,7 +1413,8 @@ impl RuntimeAdapterRegistry {
                 self.capabilities_for(*variant).into_iter().any(|metadata| {
                     self.loaded_adapter_factory(metadata, backend_kind)
                         .expect("factory ambiguity is rejected when the registry is built")
-                        .is_some_and(|factory| factory.batch_mode() == batch_mode)
+                        .batch_mode()
+                        == batch_mode
                 })
             })
             .collect()
@@ -1385,16 +1434,9 @@ impl RuntimeAdapterRegistry {
             max_tensor_batch_size: self.max_tensor_batch_size(),
             request_parallelism: self.request_parallelism(),
         };
-        let adapter = match self.loaded_adapter_factory(metadata, backend_kind)? {
-            Some(factory) => factory.create(context, metadata)?,
-            None => Arc::new(CompatibilityExecutionAdapter::new(
-                execution_group_id,
-                model_instance_id,
-                metadata,
-                backend_kind,
-                self.request_parallelism(),
-            )),
-        };
+        let adapter = self
+            .loaded_adapter_factory(metadata, backend_kind)?
+            .create(context, metadata)?;
         if adapter.metadata() != metadata {
             return Err(Error::ModelLoadError(format!(
                 "loaded adapter factory returned mismatched metadata for {} capability {:?}",
@@ -2171,7 +2213,10 @@ mod tests {
 
         fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
             metadata.model_variant == self.model_variant
-                && metadata.capability == CapabilityKind::Tts
+                && matches!(
+                    metadata.capability,
+                    CapabilityKind::Tts | CapabilityKind::StreamingTts
+                )
         }
 
         fn create(
@@ -2185,6 +2230,42 @@ mod tests {
                 metadata,
                 context.backend_kind,
                 context.max_tensor_batch_size,
+                context.request_parallelism,
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestScalarFactory {
+        excluded_model_variant: ModelVariant,
+    }
+
+    impl LoadedExecutionAdapterFactory for TestScalarFactory {
+        fn id(&self) -> &'static str {
+            "test.scalar"
+        }
+
+        fn batch_mode(&self) -> NativeBatchMode {
+            NativeBatchMode::None
+        }
+
+        fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+            metadata.model_variant != self.excluded_model_variant
+                && !is_physical_qwen_tts(metadata)
+                && !is_nemotron_realtime(metadata)
+                && !is_continuous_qwen_chat(metadata)
+        }
+
+        fn create(
+            &self,
+            context: LoadedAdapterFactoryContext,
+            metadata: AdapterMetadata,
+        ) -> Result<Arc<dyn LoadedExecutionAdapter>> {
+            Ok(Arc::new(ScalarExecutionAdapter::new(
+                context.execution_group_id,
+                context.model_instance_id,
+                metadata,
+                context.backend_kind,
                 context.request_parallelism,
             )))
         }
@@ -2301,20 +2382,19 @@ mod tests {
                 assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
                 assert_eq!(contract.model_instance_id, instance);
                 assert_eq!(contract.metadata, metadata);
-                let native_mode = registry
+                let factory = registry
                     .loaded_adapter_factory(metadata, BackendKind::Cpu)
-                    .unwrap()
-                    .map(|factory| factory.batch_mode());
-                match native_mode {
-                    Some(mode) => {
-                        assert_ne!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
-                        assert!(contract.stages.iter().any(|stage| stage.batch_mode == mode));
-                    }
-                    None => {
-                        assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
-                        assert_eq!(contract.stages.len(), 1);
-                        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
-                    }
+                    .unwrap();
+                if factory.id() == "builtin.scalar" {
+                    assert_eq!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
+                    assert_eq!(contract.stages.len(), 1);
+                    assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+                } else {
+                    assert_ne!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
+                    assert!(contract
+                        .stages
+                        .iter()
+                        .any(|stage| stage.batch_mode == factory.batch_mode()));
                 }
                 assert!(contract
                     .stages
@@ -2356,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn every_compatibility_adapter_uses_the_configured_independent_row_width() {
+    fn every_scalar_adapter_uses_the_configured_independent_row_width() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
@@ -2372,7 +2452,8 @@ mod tests {
                 if registry
                     .loaded_adapter_factory(metadata, BackendKind::Cpu)
                     .unwrap()
-                    .is_some()
+                    .id()
+                    != "builtin.scalar"
                 {
                     continue;
                 }
@@ -2380,7 +2461,7 @@ mod tests {
                     .execution_contracts(metadata.capability)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
                 for contract in contract {
-                    assert_eq!(contract.adapter_abi_revision, COMPATIBILITY_ADAPTER_ABI);
+                    assert_eq!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
                     assert_eq!(contract.execution_profile.max_batch_size, 3);
                     assert_eq!(
                         contract.execution_profile.concurrency,
@@ -2569,9 +2650,17 @@ mod tests {
     }
 
     #[test]
-    fn registering_a_factory_adds_an_optimized_model_without_bundle_branching() {
+    fn replacing_the_scalar_factory_adds_an_optimized_model_without_bundle_branching() {
         let variant = ModelVariant::Kokoro82M;
         let mut registry = RuntimeAdapterRegistry::built_in();
+        registry
+            .loaded_adapter_factories
+            .retain(|factory| factory.id() != "builtin.scalar");
+        registry
+            .loaded_adapter_factories
+            .push(Arc::new(TestScalarFactory {
+                excluded_model_variant: variant,
+            }));
         registry
             .loaded_adapter_factories
             .push(Arc::new(TestStaticTtsFactory {
@@ -2579,7 +2668,6 @@ mod tests {
                 model_variant: variant,
             }));
         registry.validate_loaded_adapter_factories().unwrap();
-
         let bundle = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(1),
@@ -2595,6 +2683,24 @@ mod tests {
         assert!(registry
             .static_tensor_batch_variants(BackendKind::Cpu)
             .contains(&variant));
+    }
+
+    #[test]
+    fn missing_loaded_factory_fails_closed() {
+        let variant = ModelVariant::Kokoro82M;
+        let mut registry = RuntimeAdapterRegistry::built_in();
+        registry
+            .loaded_adapter_factories
+            .retain(|factory| factory.id() != "builtin.scalar");
+        let metadata = *registry.require(CapabilityKind::Tts, variant).unwrap();
+
+        let error = registry
+            .loaded_adapter_factory(metadata, BackendKind::Cpu)
+            .expect_err("every loaded capability requires exactly one factory");
+
+        let message = error.to_string();
+        assert!(message.contains("has no execution adapter factory"));
+        assert!(message.contains(&variant.to_string()));
     }
 
     #[test]
