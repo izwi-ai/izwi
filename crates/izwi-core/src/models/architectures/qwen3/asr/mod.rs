@@ -35,7 +35,6 @@ use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
@@ -103,7 +102,9 @@ impl KvCacheContractProvider for Qwen3AsrModel {
 
 pub struct AsrDecodeState {
     cache: AsrKvCache,
-    embeds: Tensor,
+    /// Model output awaiting sampling inside the current executor quantum.
+    /// This slot is always empty before an incremental state is yielded.
+    unconsumed_output: Option<Tensor>,
     pos: usize,
     /// Token emitted by the previous quantum but not yet appended to KV.
     /// Deferring the write keeps physical progress aligned with the
@@ -144,16 +145,6 @@ impl AsrKvCache {
 }
 
 impl AsrDecodeState {
-    /// All Candle backing allocations retained by this incremental session.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        if let AsrKvCache::ModelOwned(cache) = &self.cache {
-            cache.account_storage(&mut accounting)?;
-        }
-        accounting.add_tensor(&self.embeds)?;
-        Some(accounting.bytes())
-    }
-
     pub(crate) fn uses_managed_kv(&self) -> bool {
         matches!(self.cache, AsrKvCache::Managed(_))
     }
@@ -788,33 +779,6 @@ impl Qwen3AsrModel {
             .len())
     }
 
-    /// Model-derived authorization for the largest incremental ASR session
-    /// accepted by this checkpoint's audio preprocessor.
-    pub fn session_cache_reservation_bytes(
-        &self,
-        language: Option<&str>,
-        system_prompt: Option<&str>,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        let hop_length = self.mel.config().hop_length.max(1);
-        let max_audio_tokens = self
-            .preprocessor
-            .nb_max_frames
-            .max(self.preprocessor.n_samples.saturating_add(hop_length - 1) / hop_length);
-        if max_audio_tokens == 0 {
-            return Err(Error::InvalidInput(
-                "Qwen3 ASR checkpoint does not declare a bounded audio context".to_string(),
-            ));
-        }
-        let prompt_tokens = self
-            .build_prompt(max_audio_tokens, language, system_prompt)?
-            .ids
-            .len();
-        self.text_model
-            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
-            .ok_or_else(|| Error::Overloaded("Qwen3 ASR session cache bound overflow".to_string()))
-    }
-
     pub fn transcribe_with_callback(
         &self,
         audio: &[f32],
@@ -1064,7 +1028,7 @@ impl Qwen3AsrModel {
 
         Ok(AsrDecodeState {
             cache,
-            embeds,
+            unconsumed_output: Some(embeds),
             pos,
             pending_token: None,
             language: language.map(ToString::to_string),
@@ -1147,7 +1111,7 @@ impl Qwen3AsrModel {
 
         if let Some(pending) = state.pending_token.take() {
             let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
-            state.embeds = match &mut state.cache {
+            state.unconsumed_output = Some(match &mut state.cache {
                 AsrKvCache::ModelOwned(cache) => {
                     self.text_model
                         .forward(&next_tensor, state.pos, Some(cache))?
@@ -1156,17 +1120,16 @@ impl Qwen3AsrModel {
                     self.text_model
                         .forward_managed(&next_tensor, state.pos, cache)?
                 }
-            };
+            });
             state.pos += 1;
         }
 
-        let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
         let argmax_started = state
             .diagnostics
             .profile
             .qwen3_profile_enabled
             .then(Instant::now);
-        let next = argmax(&logits)?;
+        let next = take_quantum_argmax(&mut state.unconsumed_output)?;
         if let Some(started) = argmax_started {
             state.diagnostics.profile.argmax_calls =
                 state.diagnostics.profile.argmax_calls.saturating_add(1);
@@ -3039,6 +3002,20 @@ fn argmax(logits: &Tensor) -> Result<u32> {
         .map_err(Error::from)
 }
 
+fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
+    let output = output.take().ok_or_else(|| {
+        Error::InferenceError("Qwen3 ASR decode quantum has no unconsumed model output".to_string())
+    })?;
+    let (batch, sequence, _width) = output.dims3()?;
+    if batch != 1 || sequence == 0 {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR decode output expects [1,sequence,width], got {:?}",
+            output.dims()
+        )));
+    }
+    argmax(&output.i((0, sequence - 1))?)
+}
+
 fn text_delta(previous: &str, current: &str) -> String {
     if let Some(delta) = current.strip_prefix(previous) {
         return delta.to_string();
@@ -3617,6 +3594,18 @@ mod tests {
         let logits = Tensor::from_vec(vec![0.1f32, 3.2, -1.0, 2.7], 4, &device).expect("logits");
         let idx = argmax(&logits).expect("argmax");
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn sampling_consumes_asr_quantum_output_without_changing_argmax() {
+        let device = candle_core::Device::Cpu;
+        let output = Tensor::from_vec(vec![0.1f32, 3.2, -1.0, 2.7], (1, 1, 4), &device).unwrap();
+        let expected = argmax(&output.i((0, 0)).unwrap()).unwrap();
+        let mut unconsumed = Some(output);
+
+        assert_eq!(take_quantum_argmax(&mut unconsumed).unwrap(), expected);
+        assert!(unconsumed.is_none());
+        assert!(take_quantum_argmax(&mut unconsumed).is_err());
     }
 
     #[test]

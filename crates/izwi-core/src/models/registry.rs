@@ -575,14 +575,6 @@ pub enum NativeAsrDecodeState {
 }
 
 impl NativeAsrDecodeState {
-    /// Complete model-owned session cache claim when it can be observed.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Qwen3(state) => state.session_cache_bytes(),
-            Self::Nemotron(state) => state.session_cache_bytes(),
-        }
-    }
-
     pub(crate) fn uses_managed_qwen3_kv(&self) -> bool {
         matches!(self, Self::Qwen3(state) if state.uses_managed_kv())
     }
@@ -1106,22 +1098,6 @@ impl NativeAsrModel {
 
     pub fn supports_incremental_decode(&self) -> bool {
         matches!(self, Self::Qwen3(_))
-    }
-
-    pub fn session_cache_reservation_bytes(
-        &self,
-        language: Option<&str>,
-        prompt: Option<&str>,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        match self {
-            Self::Qwen3(model) => {
-                model.session_cache_reservation_bytes(language, prompt, max_new_tokens)
-            }
-            _ => Err(Error::InvalidInput(
-                "Loaded ASR model does not expose incremental cache authorization".to_string(),
-            )),
-        }
     }
 
     pub fn supports_realtime_stream_decode(&self) -> bool {
@@ -1971,14 +1947,6 @@ pub enum NativeChatDecodeState {
 }
 
 impl NativeChatDecodeState {
-    /// Complete model-owned session cache claim when it can be observed.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Qwen3(state) => state.session_cache_bytes(),
-            Self::Qwen35(state) => state.session_cache_bytes(),
-        }
-    }
-
     pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
@@ -2176,24 +2144,6 @@ impl NativeChatModel {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
                 "loaded chat model has no continuous decode workspace contract".to_string(),
-            )),
-        }
-    }
-
-    pub fn session_cache_reservation_bytes(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        match self {
-            Self::Qwen3(model) => {
-                model.session_cache_reservation_bytes(prompt_tokens, max_new_tokens)
-            }
-            Self::Qwen35(model) => {
-                model.session_cache_reservation_bytes(prompt_tokens, max_new_tokens)
-            }
-            Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
-                "Loaded chat model does not expose incremental cache authorization".to_string(),
             )),
         }
     }

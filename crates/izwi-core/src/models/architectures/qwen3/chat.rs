@@ -25,7 +25,6 @@ use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3ManagedCache, 
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -36,7 +35,10 @@ pub struct ChatGenerationOutput {
 
 pub struct ChatDecodeState {
     cache: Qwen3ManagedCache,
-    embeds: Tensor,
+    /// Model output that has not yet been sampled by the current executor
+    /// quantum. The first decode step consumes prefill output in the same
+    /// invocation; later quanta compute and consume their output locally.
+    unconsumed_output: Option<Tensor>,
     pos: usize,
     /// Token already emitted to the caller but not yet appended to KV. The
     /// next decode quantum consumes exactly this token, keeping physical KV
@@ -49,13 +51,6 @@ pub struct ChatDecodeState {
 }
 
 impl ChatDecodeState {
-    /// All Candle backing allocations retained by this incremental session.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        accounting.add_tensor(&self.embeds)?;
-        Some(accounting.bytes())
-    }
-
     pub fn uses_managed_kv(&self) -> bool {
         true
     }
@@ -395,7 +390,7 @@ impl Qwen3ChatModel {
         let pos = prompt_ids.len();
         Ok(ChatDecodeState {
             cache,
-            embeds,
+            unconsumed_output: Some(embeds),
             pos,
             pending_token: None,
             generated_ids: Vec::new(),
@@ -428,12 +423,12 @@ impl Qwen3ChatModel {
 
         if let Some(pending) = state.pending_token.take() {
             let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
-            state.embeds = text_model.forward_managed(&next_tensor, state.pos, &mut state.cache)?;
+            state.unconsumed_output =
+                Some(text_model.forward_managed(&next_tensor, state.pos, &mut state.cache)?);
             state.pos += 1;
         }
 
-        let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
-        let next = argmax(&logits)?;
+        let next = take_quantum_argmax(&mut state.unconsumed_output)?;
 
         if next == self.tokenizer.specials.im_end
             || next == self.tokenizer.specials.eos
@@ -485,6 +480,12 @@ impl Qwen3ChatModel {
         if states.is_empty() {
             return Ok(Vec::new());
         }
+        if states.iter().any(|state| state.unconsumed_output.is_some()) {
+            return Err(Error::InferenceError(
+                "continuous Qwen3 decode crossed a quantum with unconsumed model output"
+                    .to_string(),
+            ));
+        }
 
         let pending_tokens = states
             .iter_mut()
@@ -504,21 +505,20 @@ impl Qwen3ChatModel {
             .collect::<Vec<_>>();
         let next_logits =
             text_model.forward_managed_decode_batch(&input_ids, &positions, &mut caches)?;
-        for (row, state) in states.iter_mut().enumerate() {
-            state.embeds = next_logits.i(row)?.unsqueeze(0)?;
+        for state in states.iter_mut() {
             state.pos = state.pos.saturating_add(1);
         }
 
         let mut steps = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
+        for (row, state) in states.iter_mut().enumerate() {
             if state.finished || state.generated_ids.len() >= state.max_new_tokens {
                 return Err(Error::InvalidInput(
                     "Continuous chat batch contains a terminal decode state".to_string(),
                 ));
             }
 
-            let logits = state.embeds.i((0, state.embeds.dim(1)? - 1))?;
-            let next = argmax(&logits)?;
+            let row_output = next_logits.i(row)?.unsqueeze(0)?;
+            let next = argmax_last_sequence_output(&row_output)?;
             if next == self.tokenizer.specials.im_end
                 || next == self.tokenizer.specials.eos
                 || self.tokenizer.specials.eos_alt == Some(next)
@@ -644,30 +644,6 @@ impl Qwen3ChatModel {
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         self.build_prompt(messages)
-    }
-
-    /// Model-derived authorization for all retained incremental decode tensors.
-    pub fn session_cache_reservation_bytes(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        if prompt_tokens == 0 {
-            return Err(Error::InvalidInput(
-                "Qwen3 cache authorization requires exact precomputed prompt tokens".to_string(),
-            ));
-        }
-        let text_model = match &self.backend {
-            Qwen3ChatBackend::Native { text_model } => text_model,
-            Qwen3ChatBackend::Gguf { gguf_file, .. } => {
-                return Err(Error::InvalidInput(format!(
-                    "Incremental chat cache authorization is unavailable for GGUF model {gguf_file}"
-                )))
-            }
-        };
-        text_model
-            .session_cache_upper_bound_bytes(prompt_tokens, max_new_tokens)
-            .ok_or_else(|| Error::Overloaded("Qwen3 session cache bound overflow".to_string()))
     }
 
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -821,6 +797,24 @@ fn argmax(logits: &Tensor) -> Result<u32> {
         .map_err(Error::from)
 }
 
+fn argmax_last_sequence_output(output: &Tensor) -> Result<u32> {
+    let (batch, sequence, _width) = output.dims3()?;
+    if batch != 1 || sequence == 0 {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 decode output expects [1,sequence,width], got {:?}",
+            output.dims()
+        )));
+    }
+    argmax(&output.i((0, sequence - 1))?)
+}
+
+fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
+    let output = output.take().ok_or_else(|| {
+        Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".to_string())
+    })?;
+    argmax_last_sequence_output(&output)
+}
+
 fn text_delta(previous: &str, current: &str) -> String {
     if let Some(delta) = current.strip_prefix(previous) {
         return delta.to_string();
@@ -836,10 +830,11 @@ fn text_delta(previous: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        continuous_decode_collation_workspace_bytes, select_qwen3_dense_dtype, strip_think_blocks,
+        argmax_last_sequence_output, continuous_decode_collation_workspace_bytes,
+        select_qwen3_dense_dtype, strip_think_blocks, take_quantum_argmax,
     };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, IndexOp, Tensor};
 
     #[test]
     fn strip_think_blocks_handles_explicit_tags() {
@@ -863,6 +858,35 @@ mod tests {
             continuous_decode_collation_workspace_bytes(3_584, 4).unwrap(),
             14_336
         );
+    }
+
+    #[test]
+    fn sampling_consumes_quantum_output_without_changing_argmax() {
+        let output = Tensor::from_vec(vec![0.5f32, 7.0, 2.0], (1, 1, 3), &Device::Cpu).unwrap();
+        let expected = argmax_last_sequence_output(&output).unwrap();
+        let mut unconsumed = Some(output);
+
+        assert_eq!(take_quantum_argmax(&mut unconsumed).unwrap(), expected);
+        assert!(unconsumed.is_none());
+        assert!(take_quantum_argmax(&mut unconsumed).is_err());
+    }
+
+    #[test]
+    fn continuous_rows_are_sampled_from_batch_output_without_state_tensors() {
+        let batch = Tensor::from_vec(
+            vec![0.0f32, 4.0, 1.0, 9.0, 3.0, 2.0],
+            (2, 1, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let sampled = (0..2)
+            .map(|row| {
+                let row_output = batch.i(row).unwrap().unsqueeze(0).unwrap();
+                argmax_last_sequence_output(&row_output).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sampled, vec![1, 0]);
     }
 
     #[test]

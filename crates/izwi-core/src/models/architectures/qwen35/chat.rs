@@ -21,7 +21,6 @@ use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
@@ -94,7 +93,9 @@ pub struct ChatDecodeState {
     text_state: Qwen35TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
     physical_tensor_sequence: Option<PhysicalStateSequenceId>,
-    logits: Tensor,
+    /// Model output awaiting sampling inside the current executor quantum.
+    /// This slot is drained before the state is returned to the executor.
+    unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
     history_ids: Vec<u32>,
     decoder: IncrementalDecoder,
@@ -109,20 +110,6 @@ pub struct ChatDecodeState {
 }
 
 impl ChatDecodeState {
-    /// Observable per-request allocations. Rotary windows are transient and
-    /// no longer retained in model-global caches.
-    pub fn allocated_session_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        self.text_state.account_storage(&mut accounting)?;
-        accounting.add_tensor(&self.logits)?;
-        Some(accounting.bytes())
-    }
-
-    /// Complete per-session scheduler accounting.
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        self.allocated_session_bytes()
-    }
-
     pub(crate) fn uses_physical_kv(&self) -> bool {
         true
     }
@@ -555,20 +542,6 @@ impl Qwen35ChatModel {
         self.prepare_prompt(messages, config)
     }
 
-    /// Model-derived authorization for all retained incremental decode tensors.
-    pub fn session_cache_reservation_bytes(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-    ) -> Result<u64> {
-        qwen35_session_cache_reservation_bytes(
-            &self.text_config,
-            self.tokenizer.vocab_size,
-            prompt_tokens,
-            max_new_tokens,
-        )
-    }
-
     pub fn supports_incremental_decode(&self) -> bool {
         true
     }
@@ -614,7 +587,7 @@ impl Qwen35ChatModel {
             text_state,
             physical_kv: cache,
             physical_tensor_sequence: None,
-            logits,
+            unconsumed_output: Some(logits),
             pending_token: None,
             history_ids: initial_penalty_history(
                 &prepared.prompt_ids,
@@ -647,12 +620,12 @@ impl Qwen35ChatModel {
         }
 
         if let Some(pending) = state.pending_token.take() {
-            state.logits = self.text_model.forward_token_id_at_physical(
+            state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
                 pending,
                 [state.next_text_position; 3],
                 &mut state.text_state,
                 &mut state.physical_kv,
-            )?;
+            )?);
             state.next_text_position += 1;
         }
 
@@ -661,8 +634,8 @@ impl Qwen35ChatModel {
         } else {
             &[]
         };
-        let next = sample_next_token(
-            &state.logits,
+        let next = take_quantum_sample(
+            &mut state.unconsumed_output,
             self.tokenizer.vocab_size,
             &state.config,
             history,
@@ -855,87 +828,6 @@ impl Qwen35ChatModel {
             vision_inputs: Some(vision_inputs),
         })
     }
-}
-
-fn qwen35_session_cache_reservation_bytes(
-    cfg: &Qwen35TextConfig,
-    vocab_size: usize,
-    prompt_tokens: usize,
-    max_new_tokens: usize,
-) -> Result<u64> {
-    if prompt_tokens == 0 {
-        return Err(Error::InvalidInput(
-            "Qwen3.5 cache authorization requires exact precomputed prompt tokens".to_string(),
-        ));
-    }
-    let total_tokens = prompt_tokens
-        .checked_add(max_new_tokens.max(1))
-        .ok_or_else(|| Error::Overloaded("Qwen3.5 session token bound overflow".to_string()))?;
-    if total_tokens > cfg.context_length {
-        return Err(Error::InvalidInput(format!(
-            "Qwen3.5 session requires {total_tokens} tokens but the model context is {}",
-            cfg.context_length
-        )));
-    }
-    qwen35_session_cache_upper_bound_bytes(cfg, vocab_size, prompt_tokens, max_new_tokens)
-        .ok_or_else(|| Error::Overloaded("Qwen3.5 session cache bound overflow".to_string()))
-}
-
-fn qwen35_session_cache_upper_bound_bytes(
-    cfg: &Qwen35TextConfig,
-    vocab_size: usize,
-    prompt_tokens: usize,
-    max_new_tokens: usize,
-) -> Option<u64> {
-    let total_tokens = prompt_tokens.max(1).checked_add(max_new_tokens.max(1))?;
-    let cache_capacity = total_tokens.checked_next_power_of_two()?;
-    let full_layers = if cfg.full_attention_interval == 0 {
-        0
-    } else {
-        cfg.block_count / cfg.full_attention_interval
-    };
-    let linear_layers = cfg.block_count.checked_sub(full_layers)?;
-    let bytes_per_element = 4u64;
-
-    // Candle's Metal allocator rounds pooled buffers to byte-sized powers of
-    // two. Reserve each persistent tensor at that physical bucket rather than
-    // forcing a second exact-size allocation after every operation. This is
-    // conservative on backends whose allocator returns the logical size.
-    let allocation_bucket = |elements: usize| {
-        let bytes = u64::try_from(elements)
-            .ok()?
-            .checked_mul(bytes_per_element)?;
-        bytes.checked_next_power_of_two()
-    };
-
-    let key_elements = cache_capacity
-        .checked_mul(cfg.attention_head_count_kv)?
-        .checked_mul(cfg.attention_key_length)?;
-    let value_elements = cache_capacity
-        .checked_mul(cfg.attention_head_count_kv)?
-        .checked_mul(cfg.attention_value_length)?;
-    let kv_bytes = allocation_bucket(key_elements)?
-        .checked_add(allocation_bucket(value_elements)?)?
-        .checked_mul(u64::try_from(full_layers).ok()?)?;
-
-    let conv_width = cfg
-        .ssm_state_size
-        .checked_mul(cfg.ssm_group_count)?
-        .checked_mul(2)?
-        .checked_add(cfg.ssm_inner_size)?;
-    let conv_slots = cfg.ssm_conv_kernel.saturating_sub(1);
-    let recurrent_width = cfg.ssm_state_size.checked_mul(cfg.ssm_inner_size)?;
-    let one_linear_layer = allocation_bucket(conv_width)?
-        .checked_mul(u64::try_from(conv_slots).ok()?)?
-        .checked_add(allocation_bucket(recurrent_width)?)?;
-    let linear_bytes = u64::try_from(linear_layers)
-        .ok()?
-        .checked_mul(one_linear_layer)?;
-    let logits_bytes = allocation_bucket(vocab_size)?;
-
-    kv_bytes
-        .checked_add(linear_bytes)?
-        .checked_add(logits_bytes)
 }
 
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
@@ -1424,6 +1316,19 @@ fn gguf_to_f64(value: &GgufValue) -> Option<f64> {
     }
 }
 
+fn take_quantum_sample(
+    output: &mut Option<Tensor>,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    let output = output.take().ok_or_else(|| {
+        Error::InferenceError("Qwen3.5 decode quantum has no unconsumed model output".to_string())
+    })?;
+    sample_next_token(&output, vocab_size, config, history, rng)
+}
+
 fn sample_next_token(
     logits: &Tensor,
     vocab_size: usize,
@@ -1892,49 +1797,6 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_bound_covers_physical_kv_and_tensor_state() {
-        let config = Qwen35TextConfig {
-            architecture: "qwen35".to_string(),
-            block_count: 8,
-            context_length: 4_096,
-            embedding_length: 1_024,
-            feed_forward_length: 3_072,
-            attention_head_count: 16,
-            attention_head_count_kv: 4,
-            attention_key_length: 64,
-            attention_value_length: 64,
-            rope_dimension_sections: vec![8, 12, 12],
-            rope_dimension_count: 64,
-            rope_freq_base: 10_000.0,
-            attention_layer_norm_rms_epsilon: 1e-6,
-            ssm_conv_kernel: 4,
-            ssm_state_size: 64,
-            ssm_group_count: 4,
-            ssm_time_step_rank: 8,
-            ssm_inner_size: 1_024,
-            full_attention_interval: 4,
-        };
-
-        let bound = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 32, 16).unwrap();
-        let larger = qwen35_session_cache_upper_bound_bytes(&config, 32_000, 64, 32).unwrap();
-        let authorized = qwen35_session_cache_reservation_bytes(&config, 32_000, 32, 16).unwrap();
-        let cache_capacity = (32usize + 16).next_power_of_two() as u64;
-        let one_kv_copy = 2u64 * cache_capacity * 4 * (64 + 64) * 4;
-
-        assert_eq!(authorized, bound);
-        assert!(bound >= one_kv_copy);
-        assert!(larger > bound);
-        assert!(matches!(
-            qwen35_session_cache_reservation_bytes(&config, 32_000, 0, 16),
-            Err(Error::InvalidInput(_))
-        ));
-        assert!(matches!(
-            qwen35_session_cache_reservation_bytes(&config, 32_000, 4_090, 16),
-            Err(Error::InvalidInput(message)) if message.contains("model context is 4096")
-        ));
-    }
-
-    #[test]
     fn resolve_default_thinking_depends_on_variant_not_template_signature() {
         let small = "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is true %}<think>\n{%- endif %}{%- endif %}";
         let large = "{%- if add_generation_prompt %}{%- if enable_thinking is defined and enable_thinking is false %}{%- else %}<think>\n{%- endif %}{%- endif %}";
@@ -2159,6 +2021,40 @@ mod tests {
         let mut rng = SimpleRng::new(7);
         let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
         assert_eq!(token, 2);
+    }
+
+    #[test]
+    fn sampling_consumes_qwen35_quantum_output_without_changing_result() {
+        let output = Tensor::from_vec(
+            vec![0.1f32, 1.2, 0.4, 0.8],
+            (1, 4),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let config = ChatGenerationConfig {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 3,
+            repetition_penalty: 1.1,
+            presence_penalty: 0.2,
+            stop_token_ids: Vec::new(),
+            seed: 17,
+            request: ChatRequestConfig::default(),
+        };
+        let history = [1u32];
+        let mut direct_rng = SimpleRng::new(17);
+        let expected = sample_next_token(&output, 4, &config, &history, &mut direct_rng).unwrap();
+        let mut quantum_rng = SimpleRng::new(17);
+        let mut unconsumed = Some(output);
+
+        assert_eq!(
+            take_quantum_sample(&mut unconsumed, 4, &config, &history, &mut quantum_rng).unwrap(),
+            expected
+        );
+        assert!(unconsumed.is_none());
+        assert!(
+            take_quantum_sample(&mut unconsumed, 4, &config, &history, &mut quantum_rng).is_err()
+        );
     }
 
     #[test]
