@@ -149,7 +149,12 @@ impl NativeExecutor {
                 {
                     let cache =
                         super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
-                    self.qwen_tts_request_with_managed_cache(request, scheduled_req, Some(cache))
+                    self.qwen_tts_request_with_managed_cache(
+                        request,
+                        scheduled_req,
+                        Some(cache),
+                        reservation.tensor_state,
+                    )
                 }
                 Some(_) => Err(Error::InferenceError(
                     "managed paged cache was routed to an unsupported executor".to_string(),

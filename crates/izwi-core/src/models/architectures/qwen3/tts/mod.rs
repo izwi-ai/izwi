@@ -29,16 +29,21 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
+use crate::backends::state::{
+    PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
+};
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
-    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
+    stage_graph_fingerprint, upgrade_kv_contract_v1, BoundedShape, CapabilityStateDescriptorV2,
+    CheckpointPolicy, InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
     InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PrefixPolicy, RetainedStateCapability, StateDomainSpec, StateScope,
-    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, ShapeAxis,
+    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
+    StateDomainId, StateDomainSpec, StateScope, TensorComponentSpec, TensorRole,
+    TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::{
     CacheDomainId, CacheTokenAxis, KvCacheContract, KvDomainSpec, KvPrefixSemantics,
@@ -48,18 +53,18 @@ use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
 };
 use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
 
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 const MAX_VOICE_CLONE_REFERENCE_FRAMES: usize = 320;
-const Q4_0_BLOCK_SIZE: u64 = 32;
 pub(crate) const QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const QWEN3_TTS_MODEL_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3TtsPhysicalStateSpec {
     pub(crate) retained_v1: KvCacheContract,
+    pub(crate) retained: InferenceStateContract,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) predictor_contract: InferenceStateContract,
 }
@@ -143,16 +148,17 @@ pub struct PhysicalTtsDecodeState {
     text_vocab_size: u32,
     acoustic_vocab_size: u32,
     semantic_vocab_size: u32,
-    trailing_text_hidden: Tensor,
+    trailing_text_hidden: Option<Tensor>,
     trailing_text_len: usize,
-    tts_pad_embed: Tensor,
+    tts_pad_embed: Option<Tensor>,
     max_frames: usize,
     frame_idx: usize,
     offset: usize,
     all_code_groups: Vec<Vec<u32>>,
     semantic_history: Vec<u32>,
-    last_hidden: Tensor,
-    last_logits: Tensor,
+    last_hidden: Option<Tensor>,
+    last_logits: Option<Tensor>,
+    tensor_sequence: Option<PhysicalStateSequenceId>,
     rng: SimpleRng,
     params: TtsGenerationParams,
     stream_config: TtsStreamingConfig,
@@ -174,21 +180,6 @@ pub struct PhysicalTtsDecodeCompletion {
 }
 
 impl PhysicalTtsDecodeState {
-    /// Supplemental tensors owned by the model state. Physical KV pages are
-    /// excluded because the scheduler-owned arena accounts for them directly.
-    pub fn allocated_session_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        accounting.add_tensor(&self.trailing_text_hidden)?;
-        accounting.add_tensor(&self.tts_pad_embed)?;
-        accounting.add_tensor(&self.last_hidden)?;
-        accounting.add_tensor(&self.last_logits)?;
-        Some(accounting.bytes())
-    }
-
-    pub fn session_cache_bytes(&self) -> Option<u64> {
-        self.allocated_session_bytes()
-    }
-
     pub fn talker_context_len(&self) -> usize {
         self.talker_cache.context_len()
     }
@@ -227,6 +218,103 @@ impl PhysicalTtsDecodeState {
         }
         self.talker_cache = cache;
         Ok(())
+    }
+
+    pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
+        let sequence = PhysicalStateSequenceId::new(sequence)?;
+        if self
+            .tensor_sequence
+            .is_some_and(|current| current != sequence)
+        {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS tensor-state sequence identity changed".into(),
+            ));
+        }
+        self.tensor_sequence = Some(sequence);
+        Ok(())
+    }
+
+    pub(crate) fn restore_tensor_state(&mut self, arena: &TensorStateArena) -> Result<()> {
+        let sequence = self.tensor_sequence.ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS physical state has no tensor sequence".into())
+        })?;
+        let snapshot = arena
+            .read(sequence, QWEN3_TTS_MODEL_STATE_DOMAIN)?
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS tensor state has no committed snapshot".into())
+            })?;
+        if snapshot.components.len() != 4 {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS tensor snapshot has incomplete component coverage".into(),
+            ));
+        }
+        let mut tensors = snapshot
+            .components
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if value.component != StateComponentId::new((index + 1) as u32) {
+                    return Err(Error::InferenceError(
+                        "Qwen3-TTS tensor snapshot has non-canonical components".into(),
+                    ));
+                }
+                value.tensor.clone().ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS required tensor component is absent".into())
+                })
+            });
+        self.trailing_text_hidden = Some(tensors.next().expect("four components")?);
+        self.tts_pad_embed = Some(tensors.next().expect("four components")?);
+        self.last_hidden = Some(tensors.next().expect("four components")?);
+        self.last_logits = Some(tensors.next().expect("four components")?);
+        Ok(())
+    }
+
+    pub(crate) fn stage_tensor_state(
+        &mut self,
+        arena: &TensorStateArena,
+        transaction: u64,
+    ) -> Result<()> {
+        let transaction = PhysicalStateTransactionId::new(transaction)?;
+        let expected_cursor = arena
+            .read_transaction_base(transaction, QWEN3_TTS_MODEL_STATE_DOMAIN)?
+            .map_or(0, |snapshot| snapshot.cursor);
+        let target_cursor = self.talker_cache.context_len() as u64;
+        let components = [
+            self.trailing_text_hidden.clone(),
+            self.tts_pad_embed.clone(),
+            self.last_hidden.clone(),
+            self.last_logits.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| {
+            let tensor = tensor.ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS tensor state was not hydrated".into())
+            })?;
+            Ok(StateComponentValue {
+                component: StateComponentId::new(u32::try_from(index + 1).map_err(|_| {
+                    Error::InferenceError("Qwen3-TTS component id overflow".into())
+                })?),
+                tensor: Some(tensor),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        arena.stage_replace(
+            transaction,
+            QWEN3_TTS_MODEL_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            components,
+        )?;
+        self.clear_tensor_handles();
+        Ok(())
+    }
+
+    pub(crate) fn clear_tensor_handles(&mut self) {
+        self.trailing_text_hidden = None;
+        self.tts_pad_embed = None;
+        self.last_hidden = None;
+        self.last_logits = None;
     }
 
     /// Consume an in-flight or terminal state during cancellation and return
@@ -369,7 +457,7 @@ impl Qwen3TtsModel {
         };
         talker_v1.prefix_semantics = KvPrefixSemantics::Disabled;
         retained_v1.validate()?;
-        let retained = upgrade_kv_contract_v1(&retained_v1)?;
+        let retained = qwen3_tts_retained_state_contract(&retained_v1, &self.config, self.dtype)?;
 
         let predictor_v1 = KvCacheContract {
             abi: full.abi,
@@ -427,7 +515,9 @@ impl Qwen3TtsModel {
         profiles.dedup();
         let descriptor = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
-            retained: RetainedStateCapability::Managed { contract: retained },
+            retained: RetainedStateCapability::Managed {
+                contract: retained.clone(),
+            },
             invocation: InvocationWorkspaceSet::Bounded { profiles },
         };
         for stages in stage_graphs {
@@ -435,10 +525,111 @@ impl Qwen3TtsModel {
         }
         Ok(Qwen3TtsPhysicalStateSpec {
             retained_v1,
+            retained,
             descriptor,
             predictor_contract,
         })
     }
+}
+
+fn qwen3_tts_state_dtype(dtype: DType) -> Result<StateDType> {
+    match dtype {
+        DType::F32 => Ok(StateDType::F32),
+        DType::F16 => Ok(StateDType::F16),
+        DType::BF16 => Ok(StateDType::Bf16),
+        other => Err(Error::ModelLoadError(format!(
+            "Qwen3 TTS retained model state does not support {other:?}"
+        ))),
+    }
+}
+
+fn qwen3_tts_retained_state_contract(
+    retained_v1: &KvCacheContract,
+    config: &Qwen3TtsConfig,
+    dtype: DType,
+) -> Result<InferenceStateContract> {
+    let mut retained = upgrade_kv_contract_v1(retained_v1)?;
+    let state_dtype = qwen3_tts_state_dtype(dtype)?;
+    let hidden = config.talker_config.hidden_size;
+    let max_sequence = config.talker_config.max_position_embeddings;
+    let vocab = config.talker_config.vocab_size;
+    retained
+        .domains
+        .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: StateDomainHeader {
+                id: QWEN3_TTS_MODEL_STATE_DOMAIN,
+                scope: StateScope::Retained,
+                clock: StateClock::Custom("qwen3_tts_talker_tokens".into()),
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::Transactional,
+            },
+            components: vec![
+                qwen3_tts_state_component(
+                    1,
+                    TensorRole::EncoderMemory,
+                    &[("sequence", max_sequence), ("hidden", hidden)],
+                    state_dtype,
+                )?,
+                qwen3_tts_state_component(
+                    2,
+                    TensorRole::RetainedEmbedding,
+                    &[("sequence", 1), ("hidden", hidden)],
+                    state_dtype,
+                )?,
+                qwen3_tts_state_component(
+                    3,
+                    TensorRole::RecurrentHidden,
+                    &[("sequence", 1), ("hidden", hidden)],
+                    state_dtype,
+                )?,
+                qwen3_tts_state_component(
+                    4,
+                    TensorRole::RetainedLogits,
+                    &[("sequence", 1), ("vocabulary", vocab)],
+                    state_dtype,
+                )?,
+            ],
+        }));
+    retained.groups[0]
+        .domains
+        .push(QWEN3_TTS_MODEL_STATE_DOMAIN);
+    retained.groups[0].prefix_shareable = false;
+    retained.validate()?;
+    Ok(retained)
+}
+
+fn qwen3_tts_state_component(
+    id: u32,
+    role: TensorRole,
+    dimensions: &[(&str, usize)],
+    dtype: StateDType,
+) -> Result<TensorComponentSpec> {
+    let dimensions = dimensions
+        .iter()
+        .map(|(axis, extent)| {
+            let axis = match *axis {
+                "sequence" => ShapeAxis::Sequence,
+                "hidden" => ShapeAxis::Hidden,
+                other => ShapeAxis::Custom(other.into()),
+            };
+            Ok(ShapeDimension {
+                axis,
+                extent: ShapeExtent::RuntimeBounded {
+                    min: 1,
+                    max: u64::try_from(*extent).map_err(|_| {
+                        Error::ModelLoadError("Qwen3 TTS state extent exceeds u64".into())
+                    })?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TensorComponentSpec {
+        id: StateComponentId::new(id),
+        role,
+        shape: BoundedShape { dimensions },
+        accepted_dtypes: vec![dtype],
+    })
 }
 
 fn qwen3_tts_managed_kv_cache_contract(
@@ -574,11 +765,6 @@ fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
 struct TtsSessionCacheLayout {
     prefill_tokens: usize,
     max_frames: usize,
-    /// Talker-dtype tokens retained outside KV pages. For ordinary synthesis
-    /// this is the exact trailing-text tensor. Voice cloning conservatively
-    /// prices the complete text backing allocation because a retained suffix
-    /// view can keep that allocation alive.
-    retained_text_tokens: usize,
 }
 
 impl TtsSessionCacheLayout {
@@ -612,7 +798,6 @@ fn resolve_session_cache_layout(
     max_position_embeddings: usize,
     prefill_tokens: usize,
     requested_max_frames: usize,
-    retained_text_tokens: usize,
 ) -> Result<TtsSessionCacheLayout> {
     let first_decode_position = prefill_tokens
         .checked_add(1)
@@ -634,7 +819,6 @@ fn resolve_session_cache_layout(
     Ok(TtsSessionCacheLayout {
         prefill_tokens,
         max_frames,
-        retained_text_tokens,
     })
 }
 
@@ -649,38 +833,10 @@ fn standard_session_cache_layout(
     let prefill_tokens =
         conditioned_prefill_tokens(prompt_tokens, has_language, has_speaker, instruct_tokens)
             .ok_or_else(cache_layout_overflow)?;
-    let context_budget = max_position_embeddings
-        .checked_sub(
-            prefill_tokens
-                .checked_add(1)
-                .ok_or_else(cache_layout_overflow)?,
-        )
-        .filter(|budget| *budget > 0)
-        .ok_or_else(|| {
-            Error::InferenceError(
-                "Qwen3-TTS prompt exceeds model context window; no room for audio generation"
-                    .to_string(),
-            )
-        })?;
-    let resolved_max_frames = if requested_max_frames == 0 {
-        context_budget
-    } else {
-        requested_max_frames.max(1).min(context_budget)
-    };
-    let trailing_prompt_tokens = if prompt_tokens > 9 {
-        prompt_tokens - 9
-    } else {
-        prompt_tokens.saturating_sub(4)
-    };
-    let retained_text_tokens = trailing_prompt_tokens
-        .min(resolved_max_frames)
-        .checked_add(1)
-        .ok_or_else(cache_layout_overflow)?;
     resolve_session_cache_layout(
         max_position_embeddings,
         prefill_tokens,
         requested_max_frames,
-        retained_text_tokens,
     )
 }
 
@@ -726,122 +882,11 @@ fn voice_clone_session_cache_layout(
         .checked_add(text_tokens.max(codec_tokens))
         .ok_or_else(cache_layout_overflow)?;
 
-    // When text extends beyond codec conditioning, trailing_text_hidden is a
-    // view into the complete text allocation. Price that complete allocation
-    // regardless of the estimated codec length so an unexpectedly short
-    // encoder result can never under-authorize the retained backing storage.
     resolve_session_cache_layout(
         max_position_embeddings,
         prefill_tokens,
         requested_max_frames,
-        text_tokens,
     )
-}
-
-fn kv_page_storage_bytes(
-    page_tokens: usize,
-    num_heads: usize,
-    head_dim: usize,
-    quantization: KvCacheQuantization,
-    element_bytes: usize,
-) -> Option<u64> {
-    let elements = u64::try_from(page_tokens)
-        .ok()?
-        .checked_mul(u64::try_from(num_heads).ok()?)?
-        .checked_mul(u64::try_from(head_dim).ok()?)?;
-    match quantization {
-        KvCacheQuantization::None => elements.checked_mul(u64::try_from(element_bytes).ok()?),
-        KvCacheQuantization::Int8 => elements.checked_add(std::mem::size_of::<f32>() as u64),
-        KvCacheQuantization::Q4_0 => elements
-            .checked_add(Q4_0_BLOCK_SIZE - 1)?
-            .checked_div(Q4_0_BLOCK_SIZE)?
-            .checked_mul(16 + std::mem::size_of::<f32>() as u64),
-    }
-}
-
-fn paged_kv_storage_bytes(
-    num_layers: usize,
-    tokens: usize,
-    num_heads: usize,
-    head_dim: usize,
-    page_size: usize,
-    quantization: KvCacheQuantization,
-    element_bytes: usize,
-) -> Option<u64> {
-    if tokens == 0 {
-        return Some(0);
-    }
-    let page_size = page_size.max(1);
-    let full_pages = tokens / page_size;
-    let remainder = tokens % page_size;
-    let full_page_bytes =
-        kv_page_storage_bytes(page_size, num_heads, head_dim, quantization, element_bytes)?;
-    let mut one_side_one_layer = u64::try_from(full_pages)
-        .ok()?
-        .checked_mul(full_page_bytes)?;
-    if remainder > 0 {
-        one_side_one_layer = one_side_one_layer.checked_add(kv_page_storage_bytes(
-            remainder,
-            num_heads,
-            head_dim,
-            quantization,
-            element_bytes,
-        )?)?;
-    }
-    one_side_one_layer
-        .checked_mul(2)?
-        .checked_mul(u64::try_from(num_layers).ok()?)
-}
-
-fn qwen3_tts_session_cache_upper_bound_bytes(
-    config: &Qwen3TtsConfig,
-    layout: TtsSessionCacheLayout,
-    page_size: usize,
-    quantization: KvCacheQuantization,
-    talker_element_bytes: usize,
-    predictor_element_bytes: usize,
-) -> Option<u64> {
-    let talker = &config.talker_config;
-    let predictor = &talker.code_predictor_config;
-    let talker_kv = paged_kv_storage_bytes(
-        talker.num_hidden_layers,
-        layout.talker_cache_tokens()?,
-        talker.num_key_value_heads,
-        talker.head_dim,
-        page_size,
-        quantization,
-        talker_element_bytes,
-    )?;
-
-    // The predictor cache is cleared for every semantic frame. It retains the
-    // two-token prefill followed by one token for every acoustic group after
-    // the first prediction (at most 15 predictor heads in loaded checkpoints).
-    let predictor_tokens = talker.num_code_groups.min(15).saturating_sub(1) + 2;
-    let predictor_kv = paged_kv_storage_bytes(
-        predictor.num_hidden_layers,
-        predictor_tokens,
-        predictor.num_key_value_heads,
-        predictor.head_dim,
-        page_size,
-        quantization,
-        predictor_element_bytes,
-    )?;
-
-    // In addition to trailing text, the state retains a TTS-pad embedding, the
-    // latest talker hidden state, and the latest talker logits.
-    let retained_hidden_tokens = layout.retained_text_tokens.checked_add(2)?;
-    let retained_hidden = u64::try_from(retained_hidden_tokens)
-        .ok()?
-        .checked_mul(u64::try_from(talker.hidden_size).ok()?)?
-        .checked_mul(u64::try_from(talker_element_bytes).ok()?)?;
-    let retained_logits = u64::try_from(talker.vocab_size)
-        .ok()?
-        .checked_mul(u64::try_from(talker_element_bytes).ok()?)?;
-
-    talker_kv
-        .checked_add(predictor_kv)?
-        .checked_add(retained_hidden)?
-        .checked_add(retained_logits)
 }
 
 impl Qwen3TtsModel {
@@ -957,23 +1002,6 @@ impl Qwen3TtsModel {
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
         })
-    }
-
-    /// Request-derived authorization for all retained incremental decode tensors.
-    pub fn session_cache_reservation_bytes(
-        &self,
-        request: TtsSessionCacheRequest<'_>,
-    ) -> Result<u64> {
-        let layout = self.session_cache_layout(request)?;
-        qwen3_tts_session_cache_upper_bound_bytes(
-            &self.config,
-            layout,
-            self.kv_page_size,
-            self.kv_quantization,
-            self.dtype.size_in_bytes(),
-            self.code_predictor_dtype.size_in_bytes(),
-        )
-        .ok_or_else(|| Error::Overloaded("Qwen3-TTS session cache bound overflow".to_string()))
     }
 
     /// Resolve the exact talker prefill and bounded output shape before the
@@ -1339,8 +1367,11 @@ impl Qwen3TtsModel {
         let allow_eos = qwen_tts_allows_eos(state.frames_generated());
         let semantic_start = Instant::now();
         let mut next_rng = state.rng;
+        let last_logits = state.last_logits.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS last logits are not hydrated".into())
+        })?;
         let semantic_token = sample_semantic(
-            &state.last_logits.i((0, 0))?,
+            &last_logits.i((0, 0))?,
             state.semantic_vocab_size,
             self.specials.codec_eos_token_id,
             allow_eos,
@@ -1380,8 +1411,11 @@ impl Qwen3TtsModel {
 
         let predictor_start = Instant::now();
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
+        let last_hidden = state.last_hidden.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
+        })?;
         let acoustic_codes = self.code_predictor.generate_acoustic_codes_physical(
-            &state.last_hidden,
+            last_hidden,
             &semantic_embed,
             predictor_cache,
         )?;
@@ -1393,9 +1427,15 @@ impl Qwen3TtsModel {
         let text_addition = if state.frame_idx < state.trailing_text_len {
             state
                 .trailing_text_hidden
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::InferenceError("Qwen3-TTS trailing text state is not hydrated".into())
+                })?
                 .i((.., state.frame_idx..state.frame_idx + 1, ..))?
         } else {
-            state.tts_pad_embed.clone()
+            state.tts_pad_embed.clone().ok_or_else(|| {
+                Error::InferenceError("Qwen3-TTS pad embedding is not hydrated".into())
+            })?
         };
         let step_input = semantic_embed
             .broadcast_add(&acoustic_embed_sum)?
@@ -1419,8 +1459,8 @@ impl Qwen3TtsModel {
                 state.all_code_groups[group_idx].push(combined_token);
             }
         }
-        state.last_hidden = new_hidden;
-        state.last_logits = new_logits;
+        state.last_hidden = Some(new_hidden);
+        state.last_logits = Some(new_logits);
         state.frame_idx += 1;
         state.offset = state.talker_cache.context_len();
 
@@ -1675,16 +1715,17 @@ impl Qwen3TtsModel {
             text_vocab_size,
             acoustic_vocab_size,
             semantic_vocab_size,
-            trailing_text_hidden,
+            trailing_text_hidden: Some(trailing_text_hidden),
             trailing_text_len,
-            tts_pad_embed,
+            tts_pad_embed: Some(tts_pad_embed),
             max_frames,
             frame_idx: 0,
             offset: prefill_len,
             all_code_groups: vec![Vec::new(); self.config.talker_config.num_code_groups],
             semantic_history: Vec::new(),
-            last_hidden,
-            last_logits,
+            last_hidden: Some(last_hidden),
+            last_logits: Some(last_logits),
+            tensor_sequence: None,
             rng: SimpleRng::new(),
             params: params.clone(),
             stream_config,
@@ -2664,7 +2705,8 @@ pub fn load_model(model_path: &Path, device: DeviceProfile) -> Result<Qwen3TtsMo
 
 #[cfg(test)]
 mod tests {
-    use crate::backends::{DeviceCapabilities, DeviceKind};
+    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+    use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind};
 
     use super::config::{CodePredictorConfig, TalkerConfig};
     use super::*;
@@ -2775,6 +2817,122 @@ mod tests {
         );
     }
 
+    fn retained_state_test_contract() -> InferenceStateContract {
+        let full =
+            qwen3_tts_managed_kv_cache_contract(&cache_test_config(), DType::F32, DType::F32, 32)
+                .expect("managed contract");
+        let mut retained_v1 = KvCacheContract {
+            abi: full.abi,
+            domains: vec![full.domains[0].clone()],
+        };
+        let KvDomainSpec::PagedAttention(talker) = &mut retained_v1.domains[0] else {
+            panic!("talker domain must be paged attention");
+        };
+        talker.prefix_semantics = KvPrefixSemantics::Disabled;
+        qwen3_tts_retained_state_contract(&retained_v1, &cache_test_config(), DType::F32)
+            .expect("retained state contract")
+    }
+
+    #[test]
+    fn retained_state_contract_groups_talker_pages_and_all_decode_tensors() {
+        let contract = retained_state_test_contract();
+        assert_eq!(contract.domains.len(), 2);
+        assert_eq!(contract.groups.len(), 1);
+        assert_eq!(
+            contract.groups[0].domains,
+            vec![StateDomainId::new(1), QWEN3_TTS_MODEL_STATE_DOMAIN]
+        );
+        assert!(!contract.groups[0].prefix_shareable);
+
+        let StateDomainSpec::Tensor(tensor) = &contract.domains[1] else {
+            panic!("second retained domain must be tensor state");
+        };
+        assert_eq!(
+            tensor.header.clock,
+            StateClock::Custom("qwen3_tts_talker_tokens".into())
+        );
+        assert_eq!(tensor.header.checkpoint, CheckpointPolicy::Transactional);
+        assert_eq!(tensor.header.prefix, PrefixPolicy::Disabled);
+        assert_eq!(tensor.components.len(), 4);
+        assert_eq!(
+            tensor
+                .components
+                .iter()
+                .map(|component| component.role.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                TensorRole::EncoderMemory,
+                TensorRole::RetainedEmbedding,
+                TensorRole::RecurrentHidden,
+                TensorRole::RetainedLogits,
+            ]
+        );
+        assert!(tensor
+            .components
+            .iter()
+            .all(|component| component.accepted_dtypes == vec![StateDType::F32]));
+    }
+
+    #[test]
+    fn retained_tensor_arena_roundtrip_abort_and_release_are_transactional() {
+        let contract = retained_state_test_contract();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(32),
+                storage_dtype_hint: Some(StateDType::F32),
+            },
+        )
+        .expect("state plan");
+        let arena =
+            TensorStateArena::new(Arc::new(plan), candle_core::Device::Cpu).expect("tensor arena");
+        let sequence = PhysicalStateSequenceId::new(7).unwrap();
+        arena.register(sequence).unwrap();
+
+        let values = |scalar: f32| {
+            (1..=4)
+                .map(|component| StateComponentValue {
+                    component: StateComponentId::new(component),
+                    tensor: Some(
+                        Tensor::from_slice(&[scalar], 1, &candle_core::Device::Cpu).unwrap(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
+        let committed = PhysicalStateTransactionId::new(11).unwrap();
+        arena.begin(committed, sequence).unwrap();
+        arena
+            .stage_replace(committed, QWEN3_TTS_MODEL_STATE_DOMAIN, 0, 9, values(1.0))
+            .unwrap();
+        arena.commit(committed, 9).unwrap();
+        let snapshot = arena
+            .read(sequence, QWEN3_TTS_MODEL_STATE_DOMAIN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.cursor, 9);
+        assert_eq!(snapshot.components.len(), 4);
+
+        let aborted = PhysicalStateTransactionId::new(12).unwrap();
+        arena.begin(aborted, sequence).unwrap();
+        arena
+            .stage_replace(aborted, QWEN3_TTS_MODEL_STATE_DOMAIN, 9, 10, values(2.0))
+            .unwrap();
+        arena.abort(aborted).unwrap();
+        let snapshot = arena
+            .read(sequence, QWEN3_TTS_MODEL_STATE_DOMAIN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.cursor, 9);
+        assert!(snapshot.components.iter().all(|component| {
+            component.tensor.as_ref().unwrap().to_vec1::<f32>().unwrap() == vec![1.0]
+        }));
+
+        arena.release(sequence).unwrap();
+        assert!(arena.read(sequence, QWEN3_TTS_MODEL_STATE_DOMAIN).is_err());
+    }
+
     #[test]
     fn test_special_tokens_creation() {
         let main_config = cache_test_config();
@@ -2782,43 +2940,6 @@ mod tests {
         let specials = TtsSpecialTokens::from_configs(&main_config, &main_config.talker_config);
         assert_eq!(specials.codec_bos_id, 2149);
         assert_eq!(specials.codec_eos_token_id, 2150);
-
-        let short_layout =
-            standard_session_cache_layout(32_768, 12, false, true, 0, 16).expect("short layout");
-        let long_layout =
-            standard_session_cache_layout(32_768, 64, true, true, 16, 128).expect("long layout");
-        let short = qwen3_tts_session_cache_upper_bound_bytes(
-            &main_config,
-            short_layout,
-            64,
-            KvCacheQuantization::None,
-            2,
-            2,
-        )
-        .unwrap();
-        let long = qwen3_tts_session_cache_upper_bound_bytes(
-            &main_config,
-            long_layout,
-            64,
-            KvCacheQuantization::None,
-            2,
-            2,
-        )
-        .unwrap();
-        assert!(short > 0);
-        assert!(long > short);
-        // Element widths come from the actual loaded backend dtypes rather
-        // than a scheduler-global architecture guess.
-        let f32 = qwen3_tts_session_cache_upper_bound_bytes(
-            &main_config,
-            short_layout,
-            64,
-            KvCacheQuantization::None,
-            4,
-            4,
-        )
-        .unwrap();
-        assert_eq!(f32, short * 2);
     }
 
     #[test]
@@ -2863,83 +2984,11 @@ mod tests {
     }
 
     #[test]
-    fn session_cache_layout_and_byte_arithmetic_fail_closed_on_overflow() {
+    fn session_cache_layout_fails_closed_on_overflow() {
         let layout_error =
             standard_session_cache_layout(usize::MAX, 1, false, false, usize::MAX, 1)
                 .expect_err("instruction-token overflow must fail");
         assert!(matches!(layout_error, Error::Overloaded(_)));
-
-        let mut config = cache_test_config();
-        config.talker_config.num_hidden_layers = usize::MAX;
-        let layout = TtsSessionCacheLayout {
-            prefill_tokens: 1,
-            max_frames: usize::MAX,
-            retained_text_tokens: 1,
-        };
-        assert!(qwen3_tts_session_cache_upper_bound_bytes(
-            &config,
-            layout,
-            64,
-            KvCacheQuantization::None,
-            usize::MAX,
-            2,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn session_cache_bound_covers_every_retained_dense_tensor() {
-        let config = cache_test_config();
-        let layout = TtsSessionCacheLayout {
-            prefill_tokens: 11,
-            max_frames: 19,
-            retained_text_tokens: 7,
-        };
-        let element_bytes = 2u64;
-        let talker = &config.talker_config;
-        let predictor = &talker.code_predictor_config;
-        let talker_tokens = 30u64;
-        let predictor_tokens = 16u64;
-        let expected_talker_kv = 2
-            * talker.num_hidden_layers as u64
-            * talker_tokens
-            * talker.num_key_value_heads as u64
-            * talker.head_dim as u64
-            * element_bytes;
-        let expected_predictor_kv = 2
-            * predictor.num_hidden_layers as u64
-            * predictor_tokens
-            * predictor.num_key_value_heads as u64
-            * predictor.head_dim as u64
-            * element_bytes;
-        let expected_retained = ((layout.retained_text_tokens + 2) as u64
-            * talker.hidden_size as u64
-            + talker.vocab_size as u64)
-            * element_bytes;
-        let authorized = qwen3_tts_session_cache_upper_bound_bytes(
-            &config,
-            layout,
-            64,
-            KvCacheQuantization::None,
-            element_bytes as usize,
-            element_bytes as usize,
-        )
-        .unwrap();
-
-        assert_eq!(
-            authorized,
-            expected_talker_kv + expected_predictor_kv + expected_retained
-        );
-        // Per-page metadata can exceed a one-byte dense element for tiny
-        // shapes; quantized authorization must include that overhead.
-        assert_eq!(
-            kv_page_storage_bytes(1, 1, 1, KvCacheQuantization::Int8, 1),
-            Some(5)
-        );
-        assert_eq!(
-            kv_page_storage_bytes(1, 1, 1, KvCacheQuantization::Q4_0, 1),
-            Some(20)
-        );
     }
 
     #[test]

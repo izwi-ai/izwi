@@ -12,6 +12,38 @@ use super::super::types::AudioOutput;
 use super::state::ActiveQwenTtsDecode;
 use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
+fn validate_qwen_tts_physical_bindings(
+    has_managed_runtime: bool,
+    has_talker_cache: bool,
+    has_tensor_arena: bool,
+    has_tensor_reservation: bool,
+) -> Result<()> {
+    if has_managed_runtime != has_talker_cache {
+        return Err(Error::InferenceError(
+            "physical Qwen TTS execution requires its exact talker reservation".to_string(),
+        ));
+    }
+    if !has_talker_cache {
+        return Err(Error::InferenceError(
+            "Qwen TTS no longer supports model-owned decode caches".to_string(),
+        ));
+    }
+    if has_tensor_arena != has_tensor_reservation {
+        return Err(Error::InferenceError(
+            "physical Qwen TTS tensor state requires its exact row reservation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn qwen_tts_decode_iterations(scheduled: &ScheduledRequest) -> usize {
+    if scheduled.is_prefill {
+        0
+    } else {
+        scheduled.num_tokens.max(1)
+    }
+}
+
 impl NativeExecutor {
     pub(super) fn to_tts_params(request: &EngineCoreRequest) -> TtsGenerationParams {
         request.qwen_tts_generation_params()
@@ -58,7 +90,7 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
-        self.qwen_tts_request_with_managed_cache(request, scheduled, None)
+        self.qwen_tts_request_with_managed_cache(request, scheduled, None, None)
     }
 
     pub(super) fn qwen_tts_request_with_managed_cache(
@@ -66,17 +98,17 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
         mut talker_cache: Option<TalkerPhysicalCache>,
+        tensor_reservation: Option<crate::engine::ManagedTensorStateReservation>,
     ) -> Result<ModelSessionResult> {
-        if request.managed_cache_runtime().is_some() != talker_cache.is_some() {
-            return Err(Error::InferenceError(
-                "physical Qwen TTS execution requires its exact talker reservation".to_string(),
-            ));
-        }
-        if talker_cache.is_none() {
-            return Err(Error::InferenceError(
-                "Qwen TTS no longer supports model-owned decode caches".to_string(),
-            ));
-        }
+        let tensor_arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state().cloned());
+        validate_qwen_tts_physical_bindings(
+            request.managed_cache_runtime().is_some(),
+            talker_cache.is_some(),
+            tensor_arena.is_some(),
+            tensor_reservation.is_some(),
+        )?;
         if scheduled.is_prefill
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens != request.num_prompt_tokens())
@@ -116,6 +148,12 @@ impl NativeExecutor {
                         )
                     })?,
                 )?;
+                if let (Some(arena), Some(reservation)) =
+                    (tensor_arena.as_ref(), tensor_reservation)
+                {
+                    state.state.bind_tensor_sequence(reservation.sequence)?;
+                    state.state.restore_tensor_state(arena)?;
+                }
             }
             let (model, new_model_lease) = if let Some(state) = active_state.as_ref() {
                 (state.model.clone(), None)
@@ -196,7 +234,7 @@ impl NativeExecutor {
                     )));
                 }
 
-                ActiveQwenTtsDecode {
+                let mut active = ActiveQwenTtsDecode {
                     variant,
                     model: model_arc.clone(),
                     _model_lease: new_model_lease,
@@ -213,14 +251,14 @@ impl NativeExecutor {
                     postprocess_ms: 0.0,
                     first_output_ms_since_start: None,
                     decode_steps: 0,
+                };
+                if let Some(reservation) = tensor_reservation {
+                    active.state.bind_tensor_sequence(reservation.sequence)?;
                 }
+                active
             };
 
-            let decode_iterations = if scheduled.is_prefill {
-                0
-            } else {
-                scheduled.num_tokens.max(1)
-            };
+            let decode_iterations = qwen_tts_decode_iterations(scheduled);
             let mut total_tokens_generated = 0usize;
             let mut decode_steps_ran = 0usize;
             let mut finished = false;
@@ -316,6 +354,11 @@ impl NativeExecutor {
                 ..ExecutorPhaseTiming::default()
             });
 
+            if let Some(arena) = tensor_arena.as_ref() {
+                active_state
+                    .state
+                    .stage_tensor_state(arena, scheduled.plan_id)?;
+            }
             let managed_cache_completions = active_state.state.take_managed_write_completions();
             if !finished {
                 let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
@@ -345,6 +388,44 @@ impl NativeExecutor {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    fn scheduled(is_prefill: bool, num_tokens: usize) -> ScheduledRequest {
+        ScheduledRequest {
+            plan_id: 1,
+            request_id: "tts-transition".into(),
+            sequence_id: 1,
+            num_tokens,
+            is_prefill,
+            num_computed_tokens: usize::from(!is_prefill),
+            work: crate::engine::WorkUnit::SequenceStep {
+                phase: if is_prefill {
+                    crate::engine::SequencePhase::Prefill
+                } else {
+                    crate::engine::SequencePhase::Decode
+                },
+                input: crate::engine::InputRange {
+                    start: usize::from(!is_prefill),
+                    end: usize::from(!is_prefill) + num_tokens,
+                },
+                max_output_steps: num_tokens.max(1),
+            },
+        }
+    }
+
+    #[test]
+    fn qwen_tts_physical_binding_rejects_legacy_and_partial_ownership() {
+        assert!(validate_qwen_tts_physical_bindings(true, true, true, true).is_ok());
+        assert!(validate_qwen_tts_physical_bindings(false, false, false, false).is_err());
+        assert!(validate_qwen_tts_physical_bindings(true, false, true, true).is_err());
+        assert!(validate_qwen_tts_physical_bindings(true, true, true, false).is_err());
+    }
+
+    #[test]
+    fn qwen_tts_prefill_only_hydrates_and_decode_consumes_the_row_budget() {
+        assert_eq!(qwen_tts_decode_iterations(&scheduled(true, 17)), 0);
+        assert_eq!(qwen_tts_decode_iterations(&scheduled(false, 0)), 1);
+        assert_eq!(qwen_tts_decode_iterations(&scheduled(false, 4)), 4);
+    }
 
     #[test]
     fn qwen_reference_audio_uses_the_thirty_second_decode_contract() {

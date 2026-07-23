@@ -2701,6 +2701,23 @@ impl EngineCore {
         Ok(Some(runtime))
     }
 
+    pub(crate) fn load_managed_model_state(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        retained_kv: &crate::kv::KvCacheContract,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        let backend = self.managed_kv_cache.worker_backend();
+        self.managed_kv_cache.bind_model_state(
+            model_instance,
+            backend,
+            self.config.max_blocks,
+            self.config.block_size,
+            retained_kv,
+            retained_state,
+        )
+    }
+
     pub(crate) fn load_invocation_paged_workspace(
         &mut self,
         model_instance: super::ModelInstanceId,

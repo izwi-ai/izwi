@@ -1439,6 +1439,20 @@ impl Engine {
             .load_managed_model_cache(model_instance, capability)
     }
 
+    pub(crate) async fn load_managed_model_state(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_kv: &crate::kv::KvCacheContract,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        let _step = self.step_gate.lock().await;
+        self.core.write().await.load_managed_model_state(
+            model_instance,
+            retained_kv,
+            retained_state,
+        )
+    }
+
     pub(crate) async fn load_invocation_paged_workspace(
         &self,
         model_instance: ModelInstanceId,

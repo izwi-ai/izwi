@@ -465,9 +465,6 @@ impl ModelLifecycleController {
                         .map(|contract| contract.stages.as_ref())
                         .collect::<Vec<_>>();
                     let physical_spec = model.physical_state_spec(&stage_graphs)?;
-                    let retained_capability = crate::kv::CacheCapability::Managed(
-                        physical_spec.retained_v1.clone(),
-                    );
                     if !managed_kv_backend_compiled(backend) {
                         return Err(Error::ModelLoadError(format!(
                             "loaded model {variant} requires physical TTS state, but the {backend:?} build has no direct paged-attention runtime"
@@ -475,14 +472,12 @@ impl ModelLifecycleController {
                     }
                     let retained = self
                         .core_engine
-                        .load_managed_model_cache(model_instance_id, &retained_capability)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::ModelLoadError(
-                                "Qwen3 TTS retained allocation returned no physical runtime"
-                                    .to_string(),
-                            )
-                        })?;
+                        .load_managed_model_state(
+                            model_instance_id,
+                            &physical_spec.retained_v1,
+                            &physical_spec.retained,
+                        )
+                        .await?;
                     let mut invocation_bindings = Vec::new();
                     let InvocationWorkspaceSet::Bounded { profiles } =
                         &physical_spec.descriptor.invocation

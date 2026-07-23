@@ -36,7 +36,7 @@ use crate::engine::{
     ResourceAmount, ResourceAuthority, ResourceLease, ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
-use crate::kv::v2::{upgrade_kv_contract_v1, ResolvedStatePlan};
+use crate::kv::v2::{upgrade_kv_contract_v1, InferenceStateContract, ResolvedStatePlan};
 #[cfg(test)]
 use crate::kv::CacheDomainId;
 use crate::kv::{
@@ -389,15 +389,40 @@ impl ManagedKvCacheManager {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
         };
+        let state_contract_v2 = upgrade_kv_contract_v1(contract)?;
+        self.bind_model_state(
+            model_instance,
+            backend,
+            capacity_pages,
+            page_tokens_hint,
+            contract,
+            &state_contract_v2,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn bind_model_state(
+        &mut self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        capacity_pages: usize,
+        page_tokens_hint: usize,
+        contract: &KvCacheContract,
+        state_contract_v2: &InferenceStateContract,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
         validate_sliding_contract(contract, backend)?;
         if let Some(state) = self.models.get(&model_instance) {
-            if &state.contract != contract || state.runtime.plan.backend != backend {
+            if &state.contract != contract
+                || state.runtime.plan.backend != backend
+                || state.runtime.state_plan_v2.contract_fingerprint
+                    != state_contract_v2.fingerprint()?
+            {
                 return Err(Error::InvalidInput(
                     "one loaded model instance published incompatible managed KV contracts"
                         .to_string(),
                 ));
             }
-            return Ok(Some(state.runtime.clone()));
+            return Ok(state.runtime.clone());
         }
         if backend != self.worker_backend {
             return Err(Error::InvalidInput(format!(
@@ -430,9 +455,8 @@ impl ManagedKvCacheManager {
                 first_arena_generation,
             },
         )?;
-        let state_contract_v2 = upgrade_kv_contract_v1(contract)?;
         let state_plan_v2 = negotiate_state_plan(
-            &state_contract_v2,
+            state_contract_v2,
             &StateBackendPlanRequest {
                 backend,
                 device_ordinal: self.worker_device_ordinal,
@@ -523,7 +547,7 @@ impl ManagedKvCacheManager {
                 Error::InvalidInput("managed KV arena count exceeds u32".to_string())
             })?)
             .ok_or_else(|| Error::InvalidInput("managed KV arena generation overflow".into()))?;
-        Ok(Some(runtime))
+        Ok(runtime)
     }
 
     /// Resolve an arena runtime that was allocated by model loading. Request
