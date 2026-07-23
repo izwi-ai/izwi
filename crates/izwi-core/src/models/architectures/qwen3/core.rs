@@ -2601,6 +2601,39 @@ impl Qwen3Model {
         cache: &mut Qwen3ManagedCache,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
+        let logits = self.logits_from_hidden(&hidden)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
+    }
+
+    /// Execute caller-provided embeddings against authoritative KV pages and
+    /// return the normalized decoder hidden states without applying `lm_head`.
+    ///
+    /// Diffusion-conditioned adapters consume these states directly. The
+    /// physical page transition remains atomic: the prepared write set is
+    /// committed only after all decoder layers and the final norm succeed.
+    pub fn forward_managed_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut Qwen3ManagedCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
+        cache.commit_prepared(prepared)?;
+        Ok(hidden)
+    }
+
+    fn prepare_managed_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &Qwen3ManagedCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
         let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
         if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
             return Err(Error::InvalidInput(format!(
@@ -2635,9 +2668,7 @@ impl Qwen3Model {
             )?;
         }
         let hidden = self.norm.forward(&x)?;
-        let logits = self.logits_from_hidden(&hidden)?;
-        cache.commit_prepared(prepared)?;
-        Ok(logits)
+        Ok((hidden, prepared))
     }
 
     /// One direct paged-attention call per layer for a ragged batch of native
@@ -3459,6 +3490,31 @@ mod tests {
         // one arena operation per ragged row.
         assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
         assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+    }
+
+    #[test]
+    fn managed_hidden_forward_matches_owned_and_exposes_early_release_receipt() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let input_ids = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
+        let embeds = model.embeddings(&input_ids).unwrap();
+        let mut owned = test_cache();
+        let owned_hidden = model
+            .forward_hidden_with_embeds(&embeds, 0, Some(&mut owned), None)
+            .unwrap();
+
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        let managed_hidden = model
+            .forward_managed_hidden_with_embeds(&embeds, 0, &mut managed, None)
+            .unwrap();
+
+        assert_tensor_close(&owned_hidden, &managed_hidden);
+        assert_eq!(managed.context_len(), 3);
+        let completions = managed.take_completed_writes();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].slots_per_layer(), 3);
+        assert!(managed.take_completed_writes().is_empty());
     }
 
     #[test]

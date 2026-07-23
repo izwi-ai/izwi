@@ -374,10 +374,10 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
-                InferenceStateRequirement::RetainedAndInvocation
-            } else {
-                InferenceStateRequirement::Stateless
+            state_requirement: match model_variant.family() {
+                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
+                ModelFamily::VibeVoiceTts => InferenceStateRequirement::Invocation,
+                _ => InferenceStateRequirement::Stateless,
             },
         })
     }
@@ -433,10 +433,10 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 } else {
                     SequenceExecutionMode::None
                 },
-                state_requirement: if model_variant.family() == ModelFamily::Qwen3Asr {
-                    InferenceStateRequirement::RetainedAndInvocation
-                } else {
-                    InferenceStateRequirement::Stateless
+                state_requirement: match model_variant.family() {
+                    ModelFamily::Qwen3Asr => InferenceStateRequirement::RetainedAndInvocation,
+                    ModelFamily::VibeVoiceAsr => InferenceStateRequirement::Invocation,
+                    _ => InferenceStateRequirement::Stateless,
                 },
             })
     }
@@ -900,6 +900,10 @@ mod tests {
             .expect("vibevoice tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(
+            adapter.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());

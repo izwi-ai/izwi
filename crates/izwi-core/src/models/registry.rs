@@ -56,6 +56,7 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
 };
 use crate::models::architectures::vibevoice::tts::VibeVoiceTtsModel;
+use crate::models::architectures::vibevoice::VibeVoicePhysicalStateSpec;
 use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
 use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
@@ -712,6 +713,77 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    pub(crate) fn vibevoice_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VibeVoicePhysicalStateSpec> {
+        match self {
+            Self::VibeVoice(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-VibeVoice ASR model cannot author VibeVoice physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_vibevoice_with_details_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut Qwen3ManagedCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::VibeVoice(model) = self else {
+            return Err(Error::InferenceError(
+                "VibeVoice physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let VibeVoiceAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            vibevoice_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut Qwen3ManagedCache,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::VibeVoice(model) = self else {
+            return Err(Error::InferenceError(
+                "VibeVoice physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            vibevoice_asr_options(options),
+            cache,
+            on_delta,
+        )
+    }
+
     pub(crate) fn qwen3_physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],

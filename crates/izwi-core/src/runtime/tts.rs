@@ -696,8 +696,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -717,13 +717,14 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let reference = vibevoice_reference_from_request(&request)?;
                     let requested_speaker = request.config.options.speaker.as_deref().or(request
@@ -737,11 +738,22 @@ impl RuntimeService {
                         model.default_diffusion_steps(),
                     );
                     let started = Instant::now();
-                    let output = model.generate_with_reference(
+                    let domains = leases.domains().collect::<Vec<_>>();
+                    let [positive_domain, negative_domain] = domains.as_slice() else {
+                        return Err(Error::InferenceError(format!(
+                            "VibeVoice TTS requires two invocation KV domains, found {}",
+                            domains.len()
+                        )));
+                    };
+                    let (positive_cache, negative_cache) =
+                        leases.cache_pair_mut(*positive_domain, *negative_domain)?;
+                    let output = model.generate_with_reference_physical(
                         &text,
                         &reference,
                         requested_speaker,
                         params,
+                        positive_cache,
+                        negative_cache,
                     )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 

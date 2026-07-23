@@ -206,6 +206,38 @@ impl InvocationPagedLeaseSetV2 {
             })
     }
 
+    pub(crate) fn cache_pair_mut(
+        &mut self,
+        first: StateDomainId,
+        second: StateDomainId,
+    ) -> Result<(
+        &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
+        &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
+    )> {
+        if first == second {
+            return Err(invalid(
+                "invocation cache pair requires two distinct domains",
+            ));
+        }
+        let first_index = self
+            .leases
+            .iter()
+            .position(|(domain, _)| *domain == first)
+            .ok_or_else(|| invalid("invocation lease set is missing its first cache domain"))?;
+        let second_index = self
+            .leases
+            .iter()
+            .position(|(domain, _)| *domain == second)
+            .ok_or_else(|| invalid("invocation lease set is missing its second cache domain"))?;
+        if first_index < second_index {
+            let (left, right) = self.leases.split_at_mut(second_index);
+            Ok((left[first_index].1.cache_mut(), right[0].1.cache_mut()))
+        } else {
+            let (left, right) = self.leases.split_at_mut(first_index);
+            Ok((right[0].1.cache_mut(), left[second_index].1.cache_mut()))
+        }
+    }
+
     /// Release every domain even if one completion fails authentication. A
     /// failed set never exposes a partial collection of completions.
     pub(crate) fn release(mut self) -> Result<Vec<InvocationPagedDomainCompletionV2>> {
@@ -570,6 +602,52 @@ impl CapabilityStateRuntimeV2 {
                 .invocation_paged
                 .lease_set(runtime.stage_graph_fingerprint, stage, domains),
         }
+    }
+
+    /// Lease every paged domain authored for one exact stage. Domain selection
+    /// is sealed into the runtime descriptor so direct and engine runners
+    /// cannot accidentally execute with a partial cache set.
+    pub(crate) fn lease_complete_invocation_paged_set(
+        &self,
+        stage: StageId,
+    ) -> Result<InvocationPagedLeaseSetV2> {
+        let graph = match &self.backing {
+            CapabilityStateRuntimeBackingV2::Stateless(_) => {
+                return Err(invalid(
+                    "stateless runtime has no load-sealed paged invocation workspace",
+                ));
+            }
+            CapabilityStateRuntimeBackingV2::Invocation(runtime) => runtime.stage_graph_fingerprint,
+            CapabilityStateRuntimeBackingV2::Managed(runtime) => runtime.stage_graph_fingerprint,
+        };
+        let InvocationWorkspaceSet::Bounded { profiles } = &self.descriptor.invocation else {
+            return Err(invalid(
+                "physical invocation runtime has no bounded workspace profile",
+            ));
+        };
+        let workspace = profiles
+            .iter()
+            .find(|profile| profile.stage_graph_fingerprint == graph)
+            .and_then(|profile| {
+                profile
+                    .stages
+                    .iter()
+                    .find(|workspace| workspace.stage == stage)
+            })
+            .ok_or_else(|| invalid("physical invocation runtime has no exact stage workspace"))?;
+        let domains = workspace
+            .domains
+            .iter()
+            .filter_map(|domain| match domain {
+                InvocationWorkspaceDomain::State {
+                    state: super::StateDomainSpec::PagedAttention(state),
+                    capacity: super::InvocationStateCapacity::PagedTokens { .. },
+                    ..
+                } => Some(state.header.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.lease_invocation_paged_set(stage, &domains)
     }
 
     pub(crate) fn validate_against(
@@ -1270,11 +1348,17 @@ mod tests {
         runtime
             .validate_against(BackendKind::Cpu, &binding)
             .unwrap();
-        CapabilityStateRuntimeV2::invocation(runtime)
+        let runtime = CapabilityStateRuntimeV2::invocation(runtime);
+        runtime
             .lease_invocation_paged(stage, domain)
             .unwrap()
             .release()
             .unwrap();
+        let leases = runtime
+            .lease_complete_invocation_paged_set(stage)
+            .expect("complete descriptor-authored lease set");
+        assert_eq!(leases.domains().collect::<Vec<_>>(), vec![domain]);
+        leases.release().unwrap();
     }
 
     #[test]

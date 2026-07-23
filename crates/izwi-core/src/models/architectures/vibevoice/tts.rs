@@ -10,10 +10,10 @@ use tracing::{debug, info, warn};
 
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
+use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::{
-    Qwen3Cache, Qwen3Model, Qwen3WeightLayout, qwen3_dense_decode_max_tokens,
-};
+use crate::kv::CacheDomainId;
+use crate::models::architectures::qwen3::core::{Qwen3Model, Qwen3WeightLayout};
 use crate::models::architectures::vibevoice::config::{
     VibeVoiceConfig, VibeVoicePreprocessorConfig,
 };
@@ -27,13 +27,17 @@ use crate::models::architectures::vibevoice::prompt::{
 use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerStreamingCache,
 };
+use crate::models::architectures::vibevoice::{
+    vibevoice_invocation_contract, vibevoice_physical_state_spec, VibeVoicePhysicalStateSpec,
+};
 use crate::models::shared::attention::flash::{
     cuda_flash_attention_head_dim_supported, flash_attention_compiled, flash_attention_requested,
     should_enable_flash_attention_v2,
 };
-use crate::models::shared::attention::paged::{KvCacheQuantization, default_kv_page_size};
+use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::telemetry::{
-    KernelPathTelemetrySnapshot, snapshot as kernel_telemetry_snapshot,
+    snapshot as kernel_telemetry_snapshot, KernelPathTelemetrySnapshot,
 };
 use crate::models::shared::weights::gguf::load_model_weights;
 
@@ -300,6 +304,28 @@ impl VibeVoiceTtsModel {
         })
     }
 
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VibeVoicePhysicalStateSpec> {
+        let contract = vibevoice_invocation_contract(
+            &self.language_model,
+            self.dtype,
+            default_kv_page_size(),
+            &[CacheDomainId::new(0), CacheDomainId::new(1)],
+        )?;
+        let max_context_tokens = self
+            .config
+            .decoder_config
+            .max_position_embeddings
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "VibeVoice TTS decoder config has no maximum context length".into(),
+                )
+            })?;
+        vibevoice_physical_state_spec(stage_graphs, contract, max_context_tokens)
+    }
+
     pub fn default_diffusion_steps(&self) -> usize {
         self.prediction_head
             .config()
@@ -313,12 +339,7 @@ impl VibeVoiceTtsModel {
 
     pub fn diagnostics(&self) -> VibeVoiceTtsDiagnostics {
         let projection_diagnostics = self.language_model.projection_diagnostics();
-        let page_size = default_kv_page_size();
-        let dense_decode_max_tokens = qwen3_dense_decode_max_tokens(
-            &self.device.device,
-            page_size,
-            KvCacheQuantization::None,
-        );
+        let dense_decode_max_tokens = 0;
         let head_dim = self.language_model.attention_head_dim();
         let cuda_flash_attention_head_dim_supported =
             cuda_flash_attention_head_dim_supported(head_dim);
@@ -352,6 +373,40 @@ impl VibeVoiceTtsModel {
         reference: &VibeVoiceSpeakerReference,
         speaker: Option<&str>,
         params: VibeVoiceTtsGenerationParams,
+    ) -> Result<VibeVoiceTtsOutput> {
+        let _ = (text, reference, speaker, params);
+        Err(Error::InferenceError(
+            "VibeVoice TTS requires lifecycle-owned physical invocation caches".into(),
+        ))
+    }
+
+    pub(crate) fn generate_with_reference_physical(
+        &self,
+        text: &str,
+        reference: &VibeVoiceSpeakerReference,
+        speaker: Option<&str>,
+        params: VibeVoiceTtsGenerationParams,
+        positive_cache: &mut PhysicalPagedKvCache,
+        negative_cache: &mut PhysicalPagedKvCache,
+    ) -> Result<VibeVoiceTtsOutput> {
+        self.generate_with_reference_internal(
+            text,
+            reference,
+            speaker,
+            params,
+            positive_cache,
+            negative_cache,
+        )
+    }
+
+    fn generate_with_reference_internal(
+        &self,
+        text: &str,
+        reference: &VibeVoiceSpeakerReference,
+        speaker: Option<&str>,
+        params: VibeVoiceTtsGenerationParams,
+        positive_cache: &mut PhysicalPagedKvCache,
+        negative_cache: &mut PhysicalPagedKvCache,
     ) -> Result<VibeVoiceTtsOutput> {
         if text.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -398,26 +453,33 @@ impl VibeVoiceTtsModel {
         profile.prompt_embed_ms = elapsed_ms(started);
 
         let max_frames = params.max_frames.max(1);
-        let mut cache = self.build_decode_cache(prompt.input_ids.len().saturating_add(max_frames));
+        if positive_cache.context_len() != 0
+            || negative_cache.context_len() != 0
+            || positive_cache.arena().id() == negative_cache.arena().id()
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice TTS requires empty, domain-isolated positive and negative invocation caches"
+                    .into(),
+            ));
+        }
         let started = Instant::now();
-        let prefill_hidden = self.language_model.forward_hidden_with_embeds(
+        let prefill_hidden = self.language_model.forward_managed_hidden_with_embeds(
             &input_embeds,
             0,
-            Some(&mut cache),
+            positive_cache,
             None,
         )?;
         profile.positive_prefill_ms = elapsed_ms(started);
         let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "VibeVoice TTS prefill")?;
 
-        let mut negative_cache = self.build_decode_cache(1usize.saturating_add(max_frames));
         let negative_id = vibevoice_tts_negative_prefill_token(self.tokenizer.specials());
         let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
         let started = Instant::now();
-        let negative_hidden = self.language_model.forward_hidden_with_embeds(
+        let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
             &self.language_model.embeddings(&negative_ids)?,
             0,
-            Some(&mut negative_cache),
+            negative_cache,
             None,
         )?;
         profile.negative_prefill_ms = elapsed_ms(started);
@@ -481,10 +543,10 @@ impl VibeVoiceTtsModel {
             scaled_latents.push(latent_frame);
 
             let started = Instant::now();
-            let hidden = self.language_model.forward_hidden_with_embeds(
+            let hidden = self.language_model.forward_managed_hidden_with_embeds(
                 &feedback.embed,
                 pos,
-                Some(&mut cache),
+                positive_cache,
                 None,
             )?;
             profile.positive_decode_ms += elapsed_ms(started);
@@ -492,10 +554,10 @@ impl VibeVoiceTtsModel {
             last_hidden = last_sequence_hidden(&hidden, "VibeVoice TTS generated frame")?;
 
             let started = Instant::now();
-            let negative_hidden = self.language_model.forward_hidden_with_embeds(
+            let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
                 &feedback.embed,
                 negative_pos,
-                Some(&mut negative_cache),
+                negative_cache,
                 None,
             )?;
             profile.negative_decode_ms += elapsed_ms(started);
@@ -627,20 +689,6 @@ impl VibeVoiceTtsModel {
         })
     }
 
-    fn build_decode_cache(&self, max_tokens: usize) -> Qwen3Cache {
-        let page_size = default_kv_page_size();
-        Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            self.language_model.num_layers(),
-            page_size,
-            KvCacheQuantization::None,
-            vibevoice_dense_decode_max_tokens_for_device(
-                &self.device.device,
-                page_size,
-                max_tokens,
-            ),
-        )
-    }
-
     fn sample_speech_latent(
         &self,
         condition: &Tensor,
@@ -741,23 +789,6 @@ pub fn vibevoice_tts_auto_max_frames_for_text(text: &str) -> usize {
     let estimated_frames =
         (estimated_secs * ModelVariant::VIBEVOICE_TTS_FRAME_RATE_HZ).ceil() as usize;
     estimated_frames.clamp(AUTO_MIN_OUTPUT_FRAMES, AUTO_MAX_OUTPUT_FRAMES)
-}
-
-fn vibevoice_dense_decode_max_tokens_for_device(
-    device: &Device,
-    page_size: usize,
-    max_tokens: usize,
-) -> usize {
-    let qwen_budget = qwen3_dense_decode_max_tokens(device, page_size, KvCacheQuantization::None);
-    cap_vibevoice_dense_decode_tokens(max_tokens, qwen_budget)
-}
-
-fn cap_vibevoice_dense_decode_tokens(max_tokens: usize, qwen_budget: usize) -> usize {
-    if qwen_budget == 0 {
-        0
-    } else {
-        max_tokens.max(1).min(qwen_budget)
-    }
 }
 
 fn vibevoice_diffusion_plan(
@@ -1302,19 +1333,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_cache_policy_uses_qwen_gate_and_caps_requested_tokens() {
-        let device = Device::Cpu;
-
-        assert_eq!(
-            vibevoice_dense_decode_max_tokens_for_device(&device, 64, 128),
-            0
-        );
-        assert_eq!(cap_vibevoice_dense_decode_tokens(32, 128), 32);
-        assert_eq!(cap_vibevoice_dense_decode_tokens(4096, 128), 128);
-        assert_eq!(cap_vibevoice_dense_decode_tokens(128, 0), 0);
-    }
-
-    #[test]
     fn cfg_batching_policy_defaults_to_accelerators() {
         assert!(!vibevoice_cfg_batching_enabled_for(DeviceKind::Cpu, None));
         assert!(vibevoice_cfg_batching_enabled_for(DeviceKind::Metal, None));
@@ -1358,11 +1376,10 @@ mod tests {
         assert_eq!(plan.steps.len(), 3);
         assert!(plan.batch_cfg_prediction);
         assert!(!plan.cuda_prebatched_cfg);
-        assert!(
-            plan.steps
-                .iter()
-                .all(|step| step.cuda_batched_timestep_embedding.is_none())
-        );
+        assert!(plan
+            .steps
+            .iter()
+            .all(|step| step.cuda_batched_timestep_embedding.is_none()));
         assert_eq!(
             plan.cfg_tensor.as_ref().unwrap().to_vec0::<f32>().unwrap(),
             1.5

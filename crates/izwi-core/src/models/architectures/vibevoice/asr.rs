@@ -10,9 +10,11 @@ use tracing::info;
 
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
+use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kv::CacheDomainId;
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::core::{Qwen3Cache, Qwen3Model, Qwen3WeightLayout};
+use crate::models::architectures::qwen3::core::{Qwen3Model, Qwen3WeightLayout};
 use crate::models::architectures::vibevoice::config::{
     VibeVoiceConfig, VibeVoicePreprocessorConfig,
 };
@@ -22,7 +24,11 @@ use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerEncoderOutput,
     VibeVoiceTokenizerStreamingCache,
 };
+use crate::models::architectures::vibevoice::{
+    vibevoice_invocation_contract, vibevoice_physical_state_spec, VibeVoicePhysicalStateSpec,
+};
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
@@ -174,6 +180,28 @@ impl VibeVoiceAsrModel {
         })
     }
 
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VibeVoicePhysicalStateSpec> {
+        let contract = vibevoice_invocation_contract(
+            &self.language_model,
+            self.dtype,
+            default_kv_page_size(),
+            &[CacheDomainId::new(0)],
+        )?;
+        let max_context_tokens = self
+            .config
+            .decoder_config
+            .max_position_embeddings
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "VibeVoice-ASR decoder config has no maximum context length".into(),
+                )
+            })?;
+        vibevoice_physical_state_spec(stage_graphs, contract, max_context_tokens)
+    }
+
     pub fn transcribe_with_details_and_prompt(
         &self,
         audio: &[f32],
@@ -198,8 +226,10 @@ impl VibeVoiceAsrModel {
         prompt: Option<&str>,
         options: VibeVoiceAsrGenerationOptions,
     ) -> Result<VibeVoiceAsrTranscriptionOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_internal(audio, sample_rate, language, prompt, options, &mut no_op)
+        let _ = (audio, sample_rate, language, prompt, options);
+        Err(Error::InferenceError(
+            "VibeVoice ASR requires a lifecycle-owned physical invocation cache".into(),
+        ))
     }
 
     pub fn transcribe_with_callback_and_prompt(
@@ -229,9 +259,54 @@ impl VibeVoiceAsrModel {
         options: VibeVoiceAsrGenerationOptions,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        let _ = (audio, sample_rate, language, prompt, options, on_delta);
+        Err(Error::InferenceError(
+            "VibeVoice ASR requires a lifecycle-owned physical invocation cache".into(),
+        ))
+    }
+
+    pub(crate) fn transcribe_with_callback_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: VibeVoiceAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
         Ok(self
-            .transcribe_internal(audio, sample_rate, language, prompt, options, on_delta)?
+            .transcribe_internal(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                options,
+                cache,
+                on_delta,
+            )?
             .text)
+    }
+
+    pub(crate) fn transcribe_with_details_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: VibeVoiceAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<VibeVoiceAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_internal(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            options,
+            cache,
+            &mut no_op,
+        )
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -245,6 +320,7 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: VibeVoiceAsrGenerationOptions,
+        physical_cache: &mut PhysicalPagedKvCache,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<VibeVoiceAsrTranscriptionOutput> {
         if audio.is_empty() {
@@ -300,13 +376,20 @@ impl VibeVoiceAsrModel {
             &speech_features.to_dtype(input_embeds.dtype())?,
         )?;
 
-        let mut cache = self.build_decode_cache();
-        let decode_cache_dense_max_tokens = cache.dense_decode_max_tokens();
+        if physical_cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "VibeVoice-ASR invocation cache must start empty".into(),
+            ));
+        }
+        let decode_cache_dense_max_tokens = 0;
         let cuda_device_argmax = self.device.kind.is_cuda();
         let prefill_started = Instant::now();
-        let logits =
-            self.language_model
-                .forward_with_embeds(&input_embeds, 0, Some(&mut cache), None)?;
+        let logits = self.language_model.forward_managed_with_embeds(
+            &input_embeds,
+            0,
+            physical_cache,
+            None,
+        )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let mut pos = prompt.input_ids.len();
         let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
@@ -349,7 +432,9 @@ impl VibeVoiceAsrModel {
             }
 
             let token = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-            let logits = self.language_model.forward(&token, pos, Some(&mut cache))?;
+            let logits = self
+                .language_model
+                .forward_managed(&token, pos, physical_cache)?;
             pos += 1;
             next = argmax_last_logits(&logits, cuda_device_argmax)?;
         }
@@ -424,17 +509,6 @@ impl VibeVoiceAsrModel {
                 }
             })),
         })
-    }
-
-    fn build_decode_cache(&self) -> Qwen3Cache {
-        if self.device.kind.is_cuda() {
-            return Qwen3Cache::with_page_size_and_dense_decode(
-                self.language_model.num_layers(),
-                default_kv_page_size(),
-                &self.device.device,
-            );
-        }
-        Qwen3Cache::new(self.language_model.num_layers())
     }
 
     fn encode_speech(&self, speech: &Tensor) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {

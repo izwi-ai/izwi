@@ -691,6 +691,31 @@ impl ModelLifecycleController {
                             CapabilityKind::Asr,
                             publication,
                         );
+                    } else if variant.family()
+                        == crate::catalog::ModelFamily::VibeVoiceAsr
+                    {
+                        if !managed_kv_backend_compiled(backend) {
+                            return Err(Error::ModelLoadError(format!(
+                                "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                            )));
+                        }
+                        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                        let stage_graphs = contracts
+                            .iter()
+                            .map(|contract| contract.stages.as_ref())
+                            .collect::<Vec<_>>();
+                        let physical_spec = loaded.vibevoice_physical_state_spec(&stage_graphs)?;
+                        let publication = self
+                            .load_invocation_paged_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                &physical_spec.invocation,
+                                None,
+                                HashMap::new(),
+                            )
+                            .await?;
+                        state_publications.insert(CapabilityKind::Asr, publication);
                     } else if let crate::kv::CacheCapability::Managed(contract) = &loaded_cache {
                         return Err(Error::ModelLoadError(format!(
                             "loaded non-Qwen ASR model {variant} still publishes legacy managed state with {} domains",
@@ -815,6 +840,39 @@ impl ModelLifecycleController {
                         .await?;
                     state_publications.insert(capability, publication);
                 }
+            }
+            if variant.family() == crate::catalog::ModelFamily::VibeVoiceTts {
+                if !managed_kv_backend_compiled(backend) {
+                    return Err(Error::ModelLoadError(format!(
+                        "loaded model {variant} requires physical TTS invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                    )));
+                }
+                let model = self
+                    .model_registry
+                    .get_vibevoice_tts(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded VibeVoice TTS model {variant} is missing from the registry"
+                        ))
+                    })?;
+                let contracts = bundle_draft.execution_contracts(CapabilityKind::Tts)?;
+                let stage_graphs = contracts
+                    .iter()
+                    .map(|contract| contract.stages.as_ref())
+                    .collect::<Vec<_>>();
+                let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                let publication = self
+                    .load_invocation_paged_publication(
+                        model_instance_id,
+                        &contracts,
+                        physical_spec.descriptor,
+                        &physical_spec.invocation,
+                        None,
+                        HashMap::new(),
+                    )
+                    .await?;
+                state_publications.insert(CapabilityKind::Tts, publication);
             }
             self.bind_loaded_model_bundle_draft(
                 bundle_draft,

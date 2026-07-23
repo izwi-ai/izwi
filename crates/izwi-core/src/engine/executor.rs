@@ -407,14 +407,14 @@ pub(super) fn invocation_paged_leases_for_atomic_scalar_row(
     request: &EngineCoreRequest,
     scheduled: &ScheduledRequest,
 ) -> Result<crate::kv::v2::InvocationPagedLeaseSetV2> {
-    let (stage, authored) = invocation_paged_stage_and_domains(request, scheduled)?;
+    let (stage, _) = invocation_paged_stage_and_domains(request, scheduled)?;
     validate_atomic_scalar_invocation_stage(stage, &scheduled.work)?;
     request
         .v2_state_runtime()
         .ok_or_else(|| {
             Error::InferenceError("physical invocation row has no sealed runtime".to_string())
         })?
-        .lease_invocation_paged_set(stage.id, &authored)
+        .lease_complete_invocation_paged_set(stage.id)
 }
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
