@@ -240,6 +240,7 @@ impl From<MistralConfig> for Qwen3Config {
             num_attention_heads: cfg.num_attention_heads,
             num_hidden_layers: cfg.num_hidden_layers,
             num_key_value_heads: cfg.num_key_value_heads,
+            max_position_embeddings: Some(cfg.max_position_embeddings),
             head_dim: if cfg.head_dim > 0 {
                 Some(cfg.head_dim)
             } else {

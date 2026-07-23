@@ -331,6 +331,12 @@ impl LoadedCapabilityDescriptor {
                             .to_string(),
                     ));
                 }
+                if execution.metadata().state_requirement.requires_invocation() {
+                    return Err(Error::ModelLoadError(
+                        "capability requiring invocation state cannot publish a retained-only physical runtime"
+                            .to_string(),
+                    ));
+                }
                 let stage_graphs = contracts
                     .iter()
                     .map(|contract| contract.stages.as_ref())
@@ -415,17 +421,25 @@ impl LoadedCapabilityDescriptor {
                             .to_string(),
                     ));
                 }
+                let capability_has_invocation =
+                    contracts
+                        .iter()
+                        .try_fold(false, |has_invocation, contract| {
+                            Ok::<_, Error>(
+                                has_invocation
+                                    || !descriptor
+                                        .has_zero_invocation_workspace_for(&contract.stages)?,
+                            )
+                        })?;
+                if execution.metadata().state_requirement.requires_invocation()
+                    != capability_has_invocation
+                {
+                    return Err(Error::ModelLoadError(
+                        "physical invocation workspace does not match the capability lifetime declaration"
+                            .to_string(),
+                    ));
+                }
                 for contract in &contracts {
-                    let has_invocation =
-                        !descriptor.has_zero_invocation_workspace_for(&contract.stages)?;
-                    if execution.metadata().state_requirement.requires_invocation()
-                        != has_invocation
-                    {
-                        return Err(Error::ModelLoadError(
-                            "physical invocation workspace does not match the capability lifetime declaration"
-                                .to_string(),
-                        ));
-                    }
                     let binding = contract.adapter_binding()?;
                     let (graph, runtime) = if let Some(retained) = retained.as_ref() {
                         let graph = stage_graph_fingerprint(&contract.stages)?;
@@ -1753,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_asr_activates_one_managed_arena_only_for_native_streaming() {
+    fn qwen_asr_rejects_retained_only_publication() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(81);
         let legacy_contract = crate::kv::test_contract();
@@ -1768,7 +1782,7 @@ mod tests {
             .load_managed_model_cache(model_instance, &capability)
             .unwrap()
             .expect("physical managed runtime");
-        let bundle = LoadedModelBundle::bind_with_state_publications(
+        let error = LoadedModelBundle::bind_with_state_publications(
             &registry,
             ExecutionGroupId::new(31),
             model_instance,
@@ -1782,30 +1796,10 @@ mod tests {
                 },
             )]),
         )
-        .unwrap();
-
-        let offline = bundle
-            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
-            .unwrap();
-        let offline = offline.state;
-        assert!(offline.managed_kv_runtime().is_none());
-
-        let streaming = bundle
-            .capability_binding_for_streaming(
-                CapabilityKind::Asr,
-                StreamingRequirements::native(true),
-            )
-            .unwrap();
-        let streaming = streaming.state;
-        assert!(streaming.managed_kv_runtime().is_some());
-        assert_eq!(
-            bundle
-                .contract(CapabilityKind::Asr, true)
-                .unwrap()
-                .execution_profile
-                .cache_mode,
-            CacheMode::ExternalPaged
-        );
+        .expect_err("Qwen3 ASR needs both retained and invocation backing");
+        assert!(error
+            .to_string()
+            .contains("invocation state cannot publish a retained-only"));
     }
 
     #[test]

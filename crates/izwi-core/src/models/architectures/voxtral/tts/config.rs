@@ -226,6 +226,7 @@ impl VoxtralTtsConfig {
             num_attention_heads: self.text_n_heads,
             num_hidden_layers: self.text_n_layers,
             num_key_value_heads: self.text_n_kv_heads,
+            max_position_embeddings: Some(self.max_position_embeddings()),
             head_dim: Some(self.head_dim),
             rms_norm_eps: self.norm_eps,
             rope_theta: self.rope_theta,

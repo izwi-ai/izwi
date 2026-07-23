@@ -20,16 +20,23 @@ use tracing::{debug, info, warn};
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
+use crate::engine::{StageDescriptor, StageProgressKind};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
+use crate::kv::v2::{
+    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PrefixPolicy,
+    RetainedStateCapability, StateDType, StateDomainSpec, StateScope, WorkspaceFormula,
+    CURRENT_INFERENCE_STATE_ABI,
+};
 use crate::kv::{
     CacheCapability, CacheDomainId, KvCacheContractProvider, KvDomainSpec, KvPrefixSemantics,
 };
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     qwen3_runtime_profile_delta, qwen3_runtime_profile_snapshot, qwen3_runtime_profiling_enabled,
-    Qwen3Cache, Qwen3Config, Qwen3ManagedCache, Qwen3Model, Qwen3RuntimeProfileSnapshot,
-    RopeScalingConfig,
+    Qwen3Config, Qwen3ManagedCache, Qwen3Model, Qwen3RuntimeProfileSnapshot, RopeScalingConfig,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
@@ -69,8 +76,17 @@ pub struct Qwen3AsrModel {
     specials: SpecialTokenIds,
     audio_tower: AudioTower,
     text_model: Qwen3Model,
+    text_context_tokens: Option<usize>,
     mel: MelSpectrogram,
     preprocessor: PreprocessorConfig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Qwen3AsrPhysicalStateSpec {
+    pub(crate) retained_v1: crate::kv::KvCacheContract,
+    pub(crate) retained: crate::kv::v2::InferenceStateContract,
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) invocation: crate::kv::v2::InferenceStateContract,
 }
 
 impl Qwen3AsrModel {
@@ -92,6 +108,176 @@ impl Qwen3AsrModel {
         contract.validate()?;
         Ok(contract)
     }
+
+    /// Author the retained streaming state and invocation-only offline state
+    /// for the exact ASR graphs frozen by the loaded adapter.
+    ///
+    /// Qwen3-ASR's autoregressive decoder gets one isolated paged cache per
+    /// physical row of an atomic graph. Native streaming continues to use the
+    /// scheduler-owned retained cache. Qwen3-ForcedAligner uses its cacheless
+    /// NAR head and therefore seals an explicitly stateless descriptor.
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Qwen3AsrPhysicalStateSpec> {
+        if self.is_forced_aligner {
+            return Err(Error::ModelLoadError(
+                "Qwen3-ForcedAligner does not own autoregressive ASR state".to_string(),
+            ));
+        }
+        let max_tokens = self.text_context_tokens.ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 ASR text config is missing max_position_embeddings; an exact invocation KV capacity cannot be sealed"
+                    .to_string(),
+            )
+        })?;
+        qwen3_asr_physical_state_spec(&self.managed_kv_cache_contract()?, max_tokens, stage_graphs)
+    }
+}
+
+fn qwen3_asr_physical_state_spec(
+    retained_v1: &crate::kv::KvCacheContract,
+    max_tokens: usize,
+    stage_graphs: &[&[StageDescriptor]],
+) -> Result<Qwen3AsrPhysicalStateSpec> {
+    if stage_graphs.is_empty() {
+        return Err(Error::ModelLoadError(
+            "Qwen3 ASR physical state has no execution graph".to_string(),
+        ));
+    }
+    let max_tokens = u64::try_from(max_tokens)
+        .map_err(|_| Error::ModelLoadError("Qwen3 ASR context exceeds u64".to_string()))?;
+    if max_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Qwen3 ASR physical state requires a non-zero text context".to_string(),
+        ));
+    }
+
+    let retained = upgrade_kv_contract_v1(retained_v1)?;
+    let mut invocation_contract = retained.clone();
+    let StateDomainSpec::PagedAttention(invocation_domain) = &mut invocation_contract.domains[0]
+    else {
+        return Err(Error::ModelLoadError(
+            "Qwen3 ASR KV contract is not paged attention".to_string(),
+        ));
+    };
+    invocation_domain.header.scope = StateScope::Invocation;
+    invocation_domain.header.prefix = PrefixPolicy::Disabled;
+    invocation_domain.header.checkpoint = CheckpointPolicy::None;
+    invocation_contract.groups[0].prefix_shareable = false;
+    invocation_contract.validate()?;
+    let invocation_domain = invocation_contract.domains[0].clone();
+    let invocation_group = invocation_contract.groups[0].clone();
+    let physical_bytes = qwen3_asr_invocation_workspace_bytes(&invocation_domain, max_tokens)?;
+
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    let mut has_invocation_state = false;
+    for stages in stage_graphs {
+        let mut invocation_stages = stages
+            .iter()
+            .map(|stage| {
+                let atomic = stage.progress == StageProgressKind::Atomic;
+                has_invocation_state |= atomic;
+                InvocationStageWorkspace {
+                    stage: stage.id,
+                    lease_scope: InvocationLeaseScope::PerRow,
+                    groups: atomic
+                        .then(|| invocation_group.clone())
+                        .into_iter()
+                        .collect(),
+                    domains: atomic
+                        .then(|| InvocationWorkspaceDomain::State {
+                            state: invocation_domain.clone(),
+                            capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+                            placement: invocation_domain.header().placement,
+                            formula: WorkspaceFormula {
+                                fixed_bytes: physical_bytes,
+                                dimensions: vec![],
+                                terms: vec![],
+                            },
+                        })
+                        .into_iter()
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        invocation_stages.sort_unstable_by_key(|stage| stage.stage);
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let invocation = if has_invocation_state {
+        InvocationWorkspaceSet::Bounded { profiles }
+    } else {
+        InvocationWorkspaceSet::None {
+            stage_graph_fingerprints: profiles
+                .into_iter()
+                .map(|profile| profile.stage_graph_fingerprint)
+                .collect(),
+        }
+    };
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation,
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(Qwen3AsrPhysicalStateSpec {
+        retained_v1: retained_v1.clone(),
+        retained,
+        descriptor,
+        invocation: invocation_contract,
+    })
+}
+
+fn qwen3_asr_invocation_workspace_bytes(domain: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+    let StateDomainSpec::PagedAttention(domain) = domain else {
+        return Err(Error::ModelLoadError(
+            "Qwen3 ASR invocation state is not paged attention".to_string(),
+        ));
+    };
+    let page_tokens = u64::from(domain.page_size.preferred_tokens);
+    let rounded_tokens = max_tokens
+        .checked_add(page_tokens.saturating_sub(1))
+        .and_then(|tokens| tokens.checked_div(page_tokens))
+        .and_then(|pages| pages.checked_mul(page_tokens))
+        .ok_or_else(|| {
+            Error::ModelLoadError("Qwen3 ASR invocation token capacity overflow".to_string())
+        })?;
+    let elements_per_token = domain.layers.iter().try_fold(0_u64, |total, layer| {
+        let per_layer = u64::from(layer.kv_heads)
+            .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+            .ok_or_else(|| Error::ModelLoadError("Qwen3 ASR KV geometry overflow".to_string()))?;
+        total
+            .checked_add(per_layer)
+            .ok_or_else(|| Error::ModelLoadError("Qwen3 ASR KV geometry overflow".to_string()))
+    })?;
+    let elements = elements_per_token
+        .checked_mul(rounded_tokens)
+        .ok_or_else(|| Error::ModelLoadError("Qwen3 ASR KV capacity overflow".to_string()))?;
+    domain
+        .accepted_dtypes
+        .iter()
+        .map(|dtype| match dtype {
+            StateDType::F32 => elements.checked_mul(4),
+            StateDType::F16 | StateDType::Bf16 => elements.checked_mul(2),
+            StateDType::I8 => Some(elements),
+            StateDType::Q4 => elements.checked_add(1).map(|value| value / 2),
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|bytes| bytes.into_iter().min())
+        .ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 ASR KV dtype capacity overflow or missing dtype".to_string(),
+            )
+        })
 }
 
 impl KvCacheContractProvider for Qwen3AsrModel {
@@ -101,7 +287,7 @@ impl KvCacheContractProvider for Qwen3AsrModel {
 }
 
 pub struct AsrDecodeState {
-    cache: AsrKvCache,
+    cache: Option<Qwen3ManagedCache>,
     /// Model output awaiting sampling inside the current executor quantum.
     /// This slot is always empty before an incremental state is yielded.
     unconsumed_output: Option<Tensor>,
@@ -123,39 +309,23 @@ pub struct AsrDecodeState {
     finished: bool,
 }
 
-enum AsrKvCache {
-    ModelOwned(Qwen3Cache),
-    Managed(Qwen3ManagedCache),
-}
-
-impl AsrKvCache {
-    fn page_size(&self) -> usize {
-        match self {
-            Self::ModelOwned(cache) => cache.page_size(),
-            Self::Managed(cache) => cache.arena().config().page_tokens as usize,
-        }
-    }
-
-    fn dense_decode_max_tokens(&self) -> usize {
-        match self {
-            Self::ModelOwned(cache) => cache.dense_decode_max_tokens(),
-            Self::Managed(_) => 0,
-        }
-    }
+enum AsrForwardCache<'a> {
+    Managed(&'a mut Qwen3ManagedCache),
+    None,
 }
 
 impl AsrDecodeState {
     pub(crate) fn uses_managed_kv(&self) -> bool {
-        matches!(self.cache, AsrKvCache::Managed(_))
+        self.cache.is_some()
     }
 
     pub(crate) fn take_managed_write_completions(
         &mut self,
     ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
-        match &mut self.cache {
-            AsrKvCache::Managed(cache) => cache.take_completed_writes(),
-            AsrKvCache::ModelOwned(_) => Vec::new(),
-        }
+        self.cache
+            .as_mut()
+            .map(Qwen3ManagedCache::take_completed_writes)
+            .unwrap_or_default()
     }
 
     pub(crate) fn sequence_position(&self) -> usize {
@@ -163,9 +333,9 @@ impl AsrDecodeState {
     }
 
     pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
-        let AsrKvCache::Managed(current) = &self.cache else {
+        let Some(current) = &self.cache else {
             return Err(Error::InferenceError(
-                "a model-owned Qwen3 ASR session cannot switch to managed KV".to_string(),
+                "an invocation-scoped Qwen3 ASR decode cannot switch to retained KV".to_string(),
             ));
         };
         if current.arena().id() != cache.arena().id()
@@ -182,7 +352,7 @@ impl AsrDecodeState {
                 self.pos
             )));
         }
-        self.cache = AsrKvCache::Managed(cache);
+        self.cache = Some(cache);
         Ok(())
     }
 }
@@ -367,48 +537,6 @@ impl Qwen3AsrDiagnostics {
 const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
 const ASR_INCREMENTAL_DECODE_RESYNC_TOKENS: usize = 32;
 
-fn parse_env_positive_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
-fn qwen3_asr_kv_page_size(device: &candle_core::Device, prompt_tokens: usize) -> usize {
-    let default_page_size = default_kv_page_size().max(1);
-    let global_override = std::env::var_os("IZWI_KV_PAGE_SIZE").is_some();
-    let asr_override = parse_env_positive_usize("IZWI_QWEN3_ASR_KV_PAGE_SIZE");
-    qwen3_asr_kv_page_size_policy(
-        default_page_size,
-        device.is_metal(),
-        prompt_tokens,
-        global_override,
-        asr_override,
-    )
-}
-
-fn qwen3_asr_kv_page_size_policy(
-    default_page_size: usize,
-    is_metal: bool,
-    prompt_tokens: usize,
-    global_override: bool,
-    asr_override: Option<usize>,
-) -> usize {
-    if let Some(override_page_size) = asr_override {
-        return override_page_size.max(1);
-    }
-    if global_override || !is_metal {
-        return default_page_size.max(1);
-    }
-
-    // Long ASR prompts are heavily page-bound in decode; larger pages reduce
-    // per-token page-loop/kernel-launch overhead on Metal.
-    if prompt_tokens >= 4096 {
-        return default_page_size.max(128);
-    }
-    default_page_size.max(1)
-}
-
 impl Qwen3AsrModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let gguf_path = resolve_qwen_asr_gguf_path(model_dir, variant);
@@ -564,6 +692,7 @@ impl Qwen3AsrModel {
         let _ = metal_pool_for_device(&device.device);
 
         let audio_cfg = config.thinker_config.audio_config.clone();
+        let text_context_tokens = text_cfg.context_length();
         let gguf_qmatmul_text_enabled = is_gguf && qwen3_asr_use_gguf_qmatmul_text(&device.device);
         let (audio_tower, text_model) = if let Some(gguf_path) = gguf_path.as_ref() {
             let loader = gguf_loader.as_ref().ok_or_else(|| {
@@ -640,22 +769,27 @@ impl Qwen3AsrModel {
             specials,
             audio_tower,
             text_model,
+            text_context_tokens,
             mel,
             preprocessor,
         })
     }
 
-    fn build_decode_cache(&self, prompt_tokens: usize, max_new_tokens: usize) -> Qwen3Cache {
-        let page_size = qwen3_asr_kv_page_size(&self.device.device, prompt_tokens);
-        Qwen3Cache::with_page_size_and_dense_decode_tokens(
-            self.text_model.num_layers(),
-            page_size,
-            &self.device.device,
-            prompt_tokens.saturating_add(max_new_tokens.max(1)),
+    fn execution_diagnostics_for_physical(
+        &self,
+        cache: &Qwen3ManagedCache,
+    ) -> Qwen3AsrExecutionDiagnostics {
+        self.execution_diagnostics_with_cache_geometry(
+            cache.arena().config().page_tokens as usize,
+            0,
         )
     }
 
-    fn execution_diagnostics(&self, cache: &AsrKvCache) -> Qwen3AsrExecutionDiagnostics {
+    fn execution_diagnostics_with_cache_geometry(
+        &self,
+        page_size: usize,
+        dense_decode_max_tokens: usize,
+    ) -> Qwen3AsrExecutionDiagnostics {
         let projection_diagnostics = self.text_model.projection_diagnostics();
         let text_projection_quantized = projection_diagnostics.quantized_projection_count > 0;
         let text_projection_backend = if text_projection_quantized {
@@ -671,9 +805,9 @@ impl Qwen3AsrModel {
             checkpoint_format: self.checkpoint_format.to_string(),
             flash_attention_requested: flash_attention_requested(),
             flash_attention_compiled: flash_attention_compiled(),
-            kv_page_size: cache.page_size(),
-            dense_decode_enabled: cache.dense_decode_max_tokens() > 0,
-            dense_decode_max_tokens: cache.dense_decode_max_tokens(),
+            kv_page_size: page_size,
+            dense_decode_enabled: dense_decode_max_tokens > 0,
+            dense_decode_max_tokens,
             gguf_qmatmul_text_enabled: self.gguf_qmatmul_text_enabled,
             text_projection_backend: text_projection_backend.to_string(),
             text_projection_quantized,
@@ -699,9 +833,11 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<String> {
-        Ok(self
-            .transcribe_impl(audio, sample_rate, language, system_prompt, None)?
-            .text)
+        let _ = (audio, sample_rate, language, system_prompt);
+        Err(Error::InferenceError(
+            "Qwen3 ASR transcription requires a lifecycle-owned physical invocation cache"
+                .to_string(),
+        ))
     }
 
     pub fn transcribe_with_details(
@@ -720,7 +856,11 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<AsrTranscriptionOutput> {
-        self.transcribe_impl(audio, sample_rate, language, system_prompt, None)
+        let _ = (audio, sample_rate, language, system_prompt);
+        Err(Error::InferenceError(
+            "Qwen3 ASR transcription requires a lifecycle-owned physical invocation cache"
+                .to_string(),
+        ))
     }
 
     /// Upper-bound hint for chunk sizing in long-form ASR orchestration.
@@ -797,38 +937,87 @@ impl Qwen3AsrModel {
         system_prompt: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        Ok(self
-            .transcribe_impl(audio, sample_rate, language, system_prompt, Some(on_delta))?
-            .text)
+        let _ = (audio, sample_rate, language, system_prompt, on_delta);
+        Err(Error::InferenceError(
+            "Qwen3 ASR transcription requires a lifecycle-owned physical invocation cache"
+                .to_string(),
+        ))
     }
 
-    fn transcribe_impl(
+    /// Run one offline ASR invocation against a load-owned exclusive page
+    /// lease. The caller retains the lease so it can validate and fence every
+    /// write before returning the slot to the invocation pool.
+    pub(crate) fn transcribe_with_details_and_prompt_physical(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
         system_prompt: Option<&str>,
-        mut on_delta: Option<&mut dyn FnMut(&str)>,
+        cache: &mut Qwen3ManagedCache,
     ) -> Result<AsrTranscriptionOutput> {
-        if self.is_forced_aligner {
+        self.transcribe_impl_physical(audio, sample_rate, language, system_prompt, None, cache)
+    }
+
+    pub(crate) fn transcribe_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+        cache: &mut Qwen3ManagedCache,
+    ) -> Result<String> {
+        Ok(self
+            .transcribe_impl_physical(
+                audio,
+                sample_rate,
+                language,
+                system_prompt,
+                Some(on_delta),
+                cache,
+            )?
+            .text)
+    }
+
+    fn transcribe_impl_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        on_delta: Option<&mut dyn FnMut(&str)>,
+        cache: &mut Qwen3ManagedCache,
+    ) -> Result<AsrTranscriptionOutput> {
+        if cache.context_len() != 0 {
             return Err(Error::InvalidInput(
-                "Qwen3-ForcedAligner models do not support transcription. Use forced alignment instead."
-                    .to_string(),
+                "Qwen3 ASR invocation cache must start at context zero".to_string(),
             ));
         }
-        let mut state = self.start_invocation_decode_with_prompt(
+        let mut state = self.start_decode_with_prompt_and_cache(
             audio,
             sample_rate,
             language,
             system_prompt,
             DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS,
+            None,
+            Some(cache),
         )?;
+        self.finish_transcription(&mut state, language, on_delta, Some(cache))
+    }
+
+    fn finish_transcription(
+        &self,
+        state: &mut AsrDecodeState,
+        language: Option<&str>,
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
+        mut invocation_cache: Option<&mut Qwen3ManagedCache>,
+    ) -> Result<AsrTranscriptionOutput> {
         let decode_started = Instant::now();
         loop {
             let step = if on_delta.is_some() {
-                self.decode_step(&mut state)?
+                self.decode_step_inner(state, true, invocation_cache.as_deref_mut())?
             } else {
-                self.decode_step_without_delta(&mut state)?
+                self.decode_step_inner(state, false, invocation_cache.as_deref_mut())?
             };
             if !step.delta.is_empty() {
                 if let Some(on_delta) = on_delta.as_deref_mut() {
@@ -855,28 +1044,6 @@ impl Qwen3AsrModel {
                 });
             }
         }
-    }
-
-    /// Run the offline atomic graph with call-local state.
-    ///
-    /// This state never crosses an engine quantum. Incremental execution uses
-    /// `start_decode_with_prompt_managed` exclusively.
-    fn start_invocation_decode_with_prompt(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        system_prompt: Option<&str>,
-        max_new_tokens: usize,
-    ) -> Result<AsrDecodeState> {
-        self.start_decode_with_prompt_and_cache(
-            audio,
-            sample_rate,
-            language,
-            system_prompt,
-            max_new_tokens,
-            None,
-        )
     }
 
     /// Start incremental ASR decode with scheduler-owned authoritative pages.
@@ -907,6 +1074,7 @@ impl Qwen3AsrModel {
             system_prompt,
             max_new_tokens,
             Some(cache),
+            None,
         )
     }
 
@@ -918,6 +1086,7 @@ impl Qwen3AsrModel {
         system_prompt: Option<&str>,
         max_new_tokens: usize,
         managed_cache: Option<Qwen3ManagedCache>,
+        mut invocation_cache: Option<&mut Qwen3ManagedCache>,
     ) -> Result<AsrDecodeState> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -969,6 +1138,14 @@ impl Qwen3AsrModel {
         let audio_len = audio_embeds.dim(1)?;
 
         let prompt = self.build_prompt(audio_len, language, system_prompt)?;
+        if let Some(context_tokens) = self.text_context_tokens {
+            let required = prompt.ids.len().saturating_add(max_new_tokens.max(1));
+            if required > context_tokens {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 ASR prompt plus decode budget ({required}) exceeds model context ({context_tokens})"
+                )));
+            }
+        }
         let input_ids = Tensor::from_vec(
             prompt.ids.clone(),
             (1, prompt.ids.len()),
@@ -976,17 +1153,31 @@ impl Qwen3AsrModel {
         )?;
 
         let max_new_tokens = max_new_tokens.max(1);
-        let mut cache = managed_cache.map(AsrKvCache::Managed).unwrap_or_else(|| {
-            AsrKvCache::ModelOwned(self.build_decode_cache(prompt.ids.len(), max_new_tokens))
-        });
-        let execution = self.execution_diagnostics(&cache);
+        if managed_cache.is_some() == invocation_cache.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3 ASR decode requires exactly one physical cache authority".to_string(),
+            ));
+        }
+        let mut cache = managed_cache;
+        let execution = if let Some(cache) = invocation_cache.as_deref() {
+            self.execution_diagnostics_for_physical(cache)
+        } else {
+            self.execution_diagnostics_for_physical(
+                cache.as_ref().expect("retained Qwen3 ASR cache"),
+            )
+        };
         let prefill_started = Instant::now();
+        let forward_cache = if let Some(cache) = invocation_cache.as_deref_mut() {
+            AsrForwardCache::Managed(cache)
+        } else {
+            AsrForwardCache::Managed(cache.as_mut().expect("retained Qwen3 ASR cache"))
+        };
         let embeds = self.forward_with_audio(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            Some(&mut cache),
+            forward_cache,
         )?;
         let prefill_ms = elapsed_ms(prefill_started);
         let pos = embeds.dim(1)?;
@@ -1086,17 +1277,18 @@ impl Qwen3AsrModel {
     }
 
     pub fn decode_step(&self, state: &mut AsrDecodeState) -> Result<AsrDecodeStep> {
-        self.decode_step_inner(state, true)
+        self.decode_step_inner(state, true, None)
     }
 
     fn decode_step_without_delta(&self, state: &mut AsrDecodeState) -> Result<AsrDecodeStep> {
-        self.decode_step_inner(state, false)
+        self.decode_step_inner(state, false, None)
     }
 
     fn decode_step_inner(
         &self,
         state: &mut AsrDecodeState,
         emit_delta: bool,
+        mut invocation_cache: Option<&mut Qwen3ManagedCache>,
     ) -> Result<AsrDecodeStep> {
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
@@ -1111,15 +1303,19 @@ impl Qwen3AsrModel {
 
         if let Some(pending) = state.pending_token.take() {
             let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
-            state.unconsumed_output = Some(match &mut state.cache {
-                AsrKvCache::ModelOwned(cache) => {
-                    self.text_model
-                        .forward(&next_tensor, state.pos, Some(cache))?
-                }
-                AsrKvCache::Managed(cache) => {
-                    self.text_model
-                        .forward_managed(&next_tensor, state.pos, cache)?
-                }
+            state.unconsumed_output = Some(if let Some(cache) = invocation_cache.as_deref_mut() {
+                self.text_model
+                    .forward_managed(&next_tensor, state.pos, cache)?
+            } else {
+                self.text_model.forward_managed(
+                    &next_tensor,
+                    state.pos,
+                    state.cache.as_mut().ok_or_else(|| {
+                        Error::InferenceError(
+                            "Qwen3 ASR decode state has no physical cache authority".to_string(),
+                        )
+                    })?,
+                )?
             });
             state.pos += 1;
         }
@@ -1185,86 +1381,13 @@ impl Qwen3AsrModel {
         reference_text: &str,
         _language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
-        if self.is_forced_aligner {
-            return self.force_align_with_nar_head(audio, sample_rate, reference_text);
+        if !self.is_forced_aligner {
+            return Err(Error::InvalidInput(
+                "Forced alignment requires a Qwen3-ForcedAligner model; Qwen3 ASR does not expose an autoregressive alignment capability"
+                    .to_string(),
+            ));
         }
-
-        let audio = if sample_rate != 16_000 {
-            resample(audio, sample_rate, 16_000)?
-        } else {
-            audio.to_vec()
-        };
-
-        let mut mel_spec = self.mel.compute(&audio)?;
-        if self.preprocessor.nb_max_frames > 0 && mel_spec.len() > self.preprocessor.nb_max_frames {
-            mel_spec.truncate(self.preprocessor.nb_max_frames);
-        }
-
-        let n_mels = self.mel.config().n_mels;
-        if mel_spec.is_empty() {
-            return Err(Error::InvalidInput("Empty audio input".to_string()));
-        }
-
-        let frames = mel_spec.len();
-        let mut flat = Vec::with_capacity(frames * n_mels);
-        for frame in mel_spec.iter() {
-            flat.extend_from_slice(frame);
-        }
-
-        let mel = Tensor::from_vec(flat, (frames, n_mels), &self.device.device)?
-            .transpose(0, 1)?
-            .unsqueeze(0)?
-            .unsqueeze(0)? // [1, 1, n_mels, frames]
-            .to_dtype(self.audio_dtype)?;
-
-        let feature_lens = vec![frames];
-        let mut audio_embeds = self.audio_tower.forward(&mel, Some(&feature_lens))?;
-        if audio_embeds.dtype() != self.text_dtype {
-            audio_embeds = audio_embeds.to_dtype(self.text_dtype)?;
-        }
-        let audio_len = audio_embeds.dim(1)?;
-
-        // Build alignment prompt with reference text
-        let prompt = self.build_alignment_prompt(audio_len, reference_text)?;
-        let input_ids = Tensor::from_vec(
-            prompt.ids.clone(),
-            (1, prompt.ids.len()),
-            &self.device.device,
-        )?;
-
-        let max_tokens = 2048usize;
-        let mut cache =
-            AsrKvCache::ModelOwned(self.build_decode_cache(prompt.ids.len(), max_tokens));
-        let mut embeds = self.forward_with_audio(
-            &input_ids,
-            &audio_embeds,
-            prompt.audio_pad_start,
-            prompt.audio_pad_len,
-            Some(&mut cache),
-        )?;
-
-        let mut pos = embeds.dim(1)?;
-
-        let mut generated: Vec<u32> = Vec::new();
-
-        for _ in 0..max_tokens {
-            let logits = embeds.i((0, embeds.dim(1)? - 1))?;
-            let next = argmax(&logits)?;
-
-            if next == self.specials.im_end || next == self.specials.eos {
-                break;
-            }
-            generated.push(next);
-
-            let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
-            let AsrKvCache::ModelOwned(cache) = &mut cache else {
-                unreachable!("forced alignment always uses a model-owned cache")
-            };
-            embeds = self.text_model.forward(&next_tensor, pos, Some(cache))?;
-            pos += 1;
-        }
-
-        self.parse_alignment(&generated, reference_text, audio.len() as u32 / 16)
+        self.force_align_with_nar_head(audio, sample_rate, reference_text)
     }
 
     fn force_align_with_nar_head(
@@ -1339,7 +1462,7 @@ impl Qwen3AsrModel {
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
-            None,
+            AsrForwardCache::None,
         )?;
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
@@ -1431,7 +1554,7 @@ impl Qwen3AsrModel {
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
-        cache: Option<&mut AsrKvCache>,
+        cache: AsrForwardCache<'_>,
     ) -> Result<Tensor> {
         let embeds = self.text_model.embeddings(input_ids)?;
         let seq_len = embeds.dim(1)?;
@@ -1479,19 +1602,16 @@ impl Qwen3AsrModel {
             None
         };
         match cache {
-            Some(AsrKvCache::ModelOwned(cache)) => {
-                self.text_model
-                    .forward_with_embeds(&embeds, 0, Some(cache), position_ids.as_ref())
-            }
-            Some(AsrKvCache::Managed(cache)) => self.text_model.forward_managed_with_embeds(
+            AsrForwardCache::Managed(cache) => self.text_model.forward_managed_with_embeds(
                 &embeds,
                 0,
                 cache,
                 position_ids.as_ref(),
             ),
-            None => self
-                .text_model
-                .forward_with_embeds(&embeds, 0, None, position_ids.as_ref()),
+            AsrForwardCache::None => {
+                self.text_model
+                    .forward_with_embeds(&embeds, 0, None, position_ids.as_ref())
+            }
         }
     }
 
@@ -1504,139 +1624,6 @@ impl Qwen3AsrModel {
         build_qwen_asr_prompt_tokens(&self.specials, audio_len, language, system_prompt, |text| {
             self.tokenizer.encode_text(text)
         })
-    }
-
-    fn build_alignment_prompt(
-        &self,
-        audio_len: usize,
-        reference_text: &str,
-    ) -> Result<PromptTokens> {
-        let mut ids = Vec::new();
-
-        ids.push(self.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("system\n")?);
-        ids.push(self.specials.im_end);
-        ids.extend(self.tokenizer.encode_text("\n")?);
-
-        ids.push(self.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("user\n")?);
-
-        ids.push(self.specials.audio_start);
-        let audio_pad_start = ids.len();
-        ids.extend(std::iter::repeat_n(self.specials.audio_token, audio_len));
-        ids.push(self.specials.audio_end);
-        ids.extend(
-            self.tokenizer
-                .encode_text(&format!("Reference: {}\n", reference_text))?,
-        );
-
-        ids.push(self.specials.im_end);
-        ids.extend(self.tokenizer.encode_text("\n")?);
-
-        ids.push(self.specials.im_start);
-        ids.extend(self.tokenizer.encode_text("assistant\n")?);
-
-        Ok(PromptTokens {
-            ids,
-            audio_pad_start,
-            audio_pad_len: audio_len,
-            system_prompt_requested: false,
-            system_prompt_token_count: 0,
-            forced_language: None,
-            forced_language_token_count: 0,
-            asr_text_token_available: self.specials.asr_text.is_some(),
-            asr_text_token_appended: false,
-        })
-    }
-
-    fn parse_alignment(
-        &self,
-        generated_ids: &[u32],
-        reference_text: &str,
-        audio_duration_ms: u32,
-    ) -> Result<Vec<(String, u32, u32)>> {
-        let mut alignments = self.parse_alignment_from_timestamp_tokens(generated_ids)?;
-
-        if alignments.is_empty() {
-            let decoded = self
-                .tokenizer
-                .decode_text_with_special_tokens(generated_ids)
-                .unwrap_or_default();
-            alignments = fallback_alignment_from_text(&decoded, audio_duration_ms);
-        }
-
-        if alignments.is_empty() {
-            alignments = fallback_alignment_from_text(reference_text, audio_duration_ms);
-        }
-
-        if alignments.is_empty() {
-            return Err(Error::InferenceError(
-                "Forced alignment produced no aligned words".to_string(),
-            ));
-        }
-
-        normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        if alignment_distribution_is_degenerate(&alignments, audio_duration_ms) {
-            warn!(
-                "Parsed forced alignment timestamps looked degenerate; falling back to text interval distribution"
-            );
-            alignments = fallback_alignment_from_text(reference_text, audio_duration_ms.max(1));
-            normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        }
-        Ok(alignments)
-    }
-
-    fn parse_alignment_from_timestamp_tokens(
-        &self,
-        generated_ids: &[u32],
-    ) -> Result<Vec<(String, u32, u32)>> {
-        let mut results = Vec::new();
-        let mut text_ids = Vec::new();
-        let mut last_ts_ms = 0u32;
-
-        let segment_time_ms = self
-            .timestamp_segment_time_ms
-            .or_else(|| self.timestamp_token_id.map(|_| 20))
-            .unwrap_or(20)
-            .max(1);
-
-        for token_id in generated_ids.iter().copied() {
-            if let Some(timestamp_index) = self.tokenizer.timestamp_index_for_token(token_id) {
-                let ts_ms = timestamp_index.saturating_mul(segment_time_ms);
-                if !text_ids.is_empty() {
-                    let chunk_text = self.tokenizer.decode_text(&text_ids)?;
-                    let words = extract_alignment_words(&chunk_text);
-                    results.extend(distribute_words_over_interval(
-                        &words,
-                        last_ts_ms,
-                        ts_ms.max(last_ts_ms.saturating_add(1)),
-                    ));
-                    text_ids.clear();
-                }
-                last_ts_ms = ts_ms;
-                continue;
-            }
-
-            if is_special_generation_token(&self.specials, token_id) {
-                continue;
-            }
-            text_ids.push(token_id);
-        }
-
-        if !text_ids.is_empty() {
-            let chunk_text = self.tokenizer.decode_text(&text_ids)?;
-            let words = extract_alignment_words(&chunk_text);
-            let default_end = last_ts_ms
-                .saturating_add((words.len() as u32).saturating_mul(segment_time_ms.max(1)))
-                .max(last_ts_ms.saturating_add(1));
-            results.extend(distribute_words_over_interval(
-                &words,
-                last_ts_ms,
-                default_end,
-            ));
-        }
-
-        Ok(results)
     }
 
     fn build_position_ids(
@@ -1743,11 +1730,6 @@ fn distribute_words_over_interval(
         .collect()
 }
 
-fn fallback_alignment_from_text(text: &str, audio_duration_ms: u32) -> Vec<(String, u32, u32)> {
-    let words = extract_alignment_words(text);
-    distribute_words_over_interval(&words, 0, audio_duration_ms.max(1))
-}
-
 fn normalize_alignment_bounds(alignments: &mut [(String, u32, u32)], audio_duration_ms: u32) {
     if alignments.is_empty() {
         return;
@@ -1852,6 +1834,8 @@ fn parse_qwen3_asr_config_from_gguf(loader: &GgufLoader) -> Result<Qwen3AsrConfi
         num_attention_heads: required_usize_metadata(loader, "qwen3_asr.text.num_attention_heads")?,
         num_hidden_layers: required_usize_metadata(loader, "qwen3_asr.text.num_hidden_layers")?,
         num_key_value_heads: required_usize_metadata(loader, "qwen3_asr.text.num_key_value_heads")?,
+        max_position_embeddings: optional_usize_metadata(loader, "qwen3_asr.text.context_length")
+            .or_else(|| optional_usize_metadata(loader, "qwen3_asr.context_length")),
         head_dim: Some(required_usize_metadata(loader, "qwen3_asr.text.head_dim")?),
         rms_norm_eps: required_f64_metadata(loader, "qwen3_asr.text.rms_norm_eps")?,
         rope_theta,
@@ -3070,8 +3054,72 @@ mod tests {
     use super::*;
     use candle_core::DType;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use crate::backends::DeviceSelector;
+    use crate::engine::{
+        ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
+        StageId, StageShapePolicy, StageWorkSelector,
+    };
+    use crate::kv::v2::{InvocationWorkspaceSet, RetainedStateCapability};
+
+    fn physical_spec_stage(id: u32, progress: StageProgressKind) -> StageDescriptor {
+        StageDescriptor {
+            id: StageId::new(id),
+            name: format!("qwen3-asr-{id}"),
+            selector: StageWorkSelector::Any,
+            domain: ExecutionDomain::ExecutionGroup,
+            progress,
+            concurrency: ConcurrencyClass::Exclusive,
+            batch_mode: NativeBatchMode::None,
+            max_batch_size: 1,
+            max_work_units: 1,
+            workspace_base_bytes: 0,
+            workspace_per_row_bytes: 0,
+            workspace_per_work_unit_bytes: 0,
+            max_workspace_bytes: 0,
+            max_padding_basis_points: 0,
+            max_formation_delay: Duration::ZERO,
+            shape_policy: StageShapePolicy::Exact,
+            membership_safe_point: MembershipSafePoint::OperationBoundary,
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+        }
+    }
+
+    #[test]
+    fn qwen_asr_physical_spec_separates_offline_and_streaming_state() {
+        let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
+        let streaming = [physical_spec_stage(2, StageProgressKind::Iterative)];
+        let graphs = vec![offline.as_slice(), streaming.as_slice()];
+        let spec = qwen3_asr_physical_state_spec(&crate::kv::test_contract(), 4096, &graphs)
+            .expect("physical ASR spec");
+
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Managed { .. }
+        ));
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("offline Qwen3 ASR must declare invocation pages");
+        };
+        assert_eq!(profiles.len(), graphs.len());
+        for graph in graphs {
+            let profile = profiles
+                .iter()
+                .find(|profile| {
+                    profile.stage_graph_fingerprint == stage_graph_fingerprint(graph).unwrap()
+                })
+                .expect("exact graph profile");
+            let domain_count = profile
+                .stages
+                .iter()
+                .flat_map(|stage| stage.domains.iter())
+                .count();
+            let atomic = graph
+                .iter()
+                .any(|stage| stage.progress == StageProgressKind::Atomic);
+            assert_eq!(domain_count, usize::from(atomic));
+        }
+    }
 
     #[test]
     fn gguf_qmatmul_text_defaults_on_with_env_override() {
@@ -3647,27 +3695,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_asr_kv_page_size_policy_upsizes_long_metal_prompts() {
-        let size = qwen3_asr_kv_page_size_policy(64, true, 9306, false, None);
-        assert_eq!(size, 128);
-
-        let size = qwen3_asr_kv_page_size_policy(96, true, 9306, false, None);
-        assert_eq!(size, 128);
-    }
-
-    #[test]
-    fn qwen3_asr_kv_page_size_policy_respects_env_override_priority() {
-        let asr_override = qwen3_asr_kv_page_size_policy(64, true, 9306, false, Some(256));
-        assert_eq!(asr_override, 256);
-
-        let global_override = qwen3_asr_kv_page_size_policy(192, true, 9306, true, None);
-        assert_eq!(global_override, 192);
-
-        let non_metal = qwen3_asr_kv_page_size_policy(64, false, 9306, false, None);
-        assert_eq!(non_metal, 64);
-    }
-
-    #[test]
     #[ignore = "requires local Qwen3-ForcedAligner checkpoint"]
     fn forced_aligner_local_checkpoint_loads_and_aligns() {
         let models_root = std::env::var("IZWI_MODELS_DIR")
@@ -3699,59 +3726,6 @@ mod tests {
         assert!(
             !alignment.is_empty(),
             "forced aligner should return timestamps"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires local Qwen3-ASR-0.6B-GGUF assets and fox.wav fixture"]
-    fn qwen3_asr_local_fox_transcription_smoke_if_available() {
-        let models_root = std::env::var("IZWI_MODELS_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("izwi")
-                    .join("models")
-            });
-        let model_dir = models_root.join("Qwen3-ASR-0.6B-GGUF");
-        let gguf_path = model_dir.join("qwen3_asr_0.6b_q8_0.gguf");
-        if !gguf_path.exists() {
-            eprintln!(
-                "Skipping local ASR smoke test, model not found at {}",
-                gguf_path.display()
-            );
-            return;
-        }
-
-        let fox_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
-        if !fox_path.exists() {
-            eprintln!(
-                "Skipping local ASR smoke test, fixture not found at {}",
-                fox_path.display()
-            );
-            return;
-        }
-
-        let wav_bytes = std::fs::read(&fox_path).expect("read fox.wav");
-        let (samples, sample_rate) =
-            crate::runtime::audio_io::decode_wav_bytes(&wav_bytes).expect("decode fox.wav");
-
-        let device = DeviceSelector::detect_with_preference(Some("cpu")).expect("cpu device");
-        let model = Qwen3AsrModel::load(&model_dir, ModelVariant::Qwen3Asr06BGguf, device)
-            .expect("qwen3 asr model should load");
-        let raw = model
-            .transcribe(&samples, sample_rate, None)
-            .expect("transcription should run");
-        let (_, text) = parse_asr_output(&raw, None);
-        assert!(
-            !text.trim().is_empty(),
-            "local ASR output should not be empty"
-        );
-        assert!(
-            text.to_ascii_lowercase().contains("quick brown fox"),
-            "unexpected local ASR transcript: {text}"
         );
     }
 }

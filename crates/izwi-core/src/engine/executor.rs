@@ -403,8 +403,7 @@ fn validate_atomic_scalar_invocation_stage(
 /// canonical identity order. Callers cannot omit a required domain. The
 /// returned set releases every already-acquired lease if a later domain fails,
 /// and explicit completion returns only authenticated writes.
-#[allow(dead_code)]
-fn invocation_paged_leases_for_atomic_scalar_row(
+pub(super) fn invocation_paged_leases_for_atomic_scalar_row(
     request: &EngineCoreRequest,
     scheduled: &ScheduledRequest,
 ) -> Result<crate::kv::v2::InvocationPagedLeaseSetV2> {

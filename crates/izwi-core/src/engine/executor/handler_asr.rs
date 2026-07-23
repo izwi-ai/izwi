@@ -18,6 +18,24 @@ const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX: usize = 240;
 
+fn with_qwen3_invocation_cache<T>(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    run: impl FnOnce(&mut crate::models::shared::attention::physical::PhysicalPagedKvCache) -> Result<T>,
+) -> Result<T> {
+    let mut leases = super::invocation_paged_leases_for_atomic_scalar_row(request, scheduled)?;
+    let domains = leases.domains().collect::<Vec<_>>();
+    let [domain] = domains.as_slice() else {
+        return Err(Error::InferenceError(format!(
+            "Qwen3 ASR requires exactly one invocation KV domain, found {}",
+            domains.len()
+        )));
+    };
+    let output = run(leases.cache_mut(*domain)?)?;
+    let _completions = leases.release()?;
+    Ok(output)
+}
+
 impl NativeExecutor {
     pub(super) fn transcribe_request(
         &self,
@@ -441,14 +459,26 @@ impl NativeExecutor {
                             sr,
                             &generation_options,
                         );
-                        let mut details = model.transcribe_with_details_prompt_prefix_and_options(
-                            chunk_audio,
-                            sr,
-                            language,
-                            asr_prompt,
-                            prefix_text,
-                            chunk_generation_options.clone(),
-                        )?;
+                        let mut details = if matches!(family, ModelFamily::Qwen3Asr) {
+                            with_qwen3_invocation_cache(request, scheduled, |cache| {
+                                model.transcribe_qwen3_with_details_and_prompt_physical(
+                                    chunk_audio,
+                                    sr,
+                                    language,
+                                    asr_prompt,
+                                    cache,
+                                )
+                            })?
+                        } else {
+                            model.transcribe_with_details_prompt_prefix_and_options(
+                                chunk_audio,
+                                sr,
+                                language,
+                                asr_prompt,
+                                prefix_text,
+                                chunk_generation_options.clone(),
+                            )?
+                        };
                         if matches!(family, ModelFamily::GraniteSpeechAsr) {
                             details = Self::recover_granite_chunk_loop(
                                 &model,
@@ -523,13 +553,25 @@ impl NativeExecutor {
                     return Ok((text, None));
                 }
             }
-            let details = model.transcribe_with_details_and_prompt_and_options(
-                &samples,
-                sample_rate,
-                language,
-                asr_prompt,
-                segment_generation_options,
-            )?;
+            let details = if matches!(family, ModelFamily::Qwen3Asr) {
+                with_qwen3_invocation_cache(request, scheduled, |cache| {
+                    model.transcribe_qwen3_with_details_and_prompt_physical(
+                        &samples,
+                        sample_rate,
+                        language,
+                        asr_prompt,
+                        cache,
+                    )
+                })?
+            } else {
+                model.transcribe_with_details_and_prompt_and_options(
+                    &samples,
+                    sample_rate,
+                    language,
+                    asr_prompt,
+                    segment_generation_options,
+                )?
+            };
             Ok((details.text, details.diagnostics))
         })?;
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);

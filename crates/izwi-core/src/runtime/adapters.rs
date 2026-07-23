@@ -434,7 +434,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     SequenceExecutionMode::None
                 },
                 state_requirement: if model_variant.family() == ModelFamily::Qwen3Asr {
-                    InferenceStateRequirement::Retained
+                    InferenceStateRequirement::RetainedAndInvocation
                 } else {
                     InferenceStateRequirement::Stateless
                 },
@@ -699,6 +699,10 @@ mod tests {
         assert_eq!(
             qwen_asr.sequence_execution,
             SequenceExecutionMode::StreamingOnly
+        );
+        assert_eq!(
+            qwen_asr.state_requirement,
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
         assert_eq!(

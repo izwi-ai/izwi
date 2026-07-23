@@ -630,31 +630,72 @@ impl ModelLifecycleController {
                 if let Some(loaded) = self.model_registry.get_asr(variant).await {
                     let loaded_cache = loaded.kv_cache_contract()?;
                     loaded_cache.validate()?;
-                    if let crate::kv::CacheCapability::Managed(contract) =
-                        &loaded_cache
-                    {
+                    if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
                         if !managed_kv_backend_compiled(backend) {
                             return Err(Error::ModelLoadError(format!(
-                                "loaded model {variant} publishes managed ASR KV, but the {backend:?} build has no direct paged-attention runtime"
+                                "loaded model {variant} requires physical ASR state, but the {backend:?} build has no direct paged-attention runtime"
                             )));
                         }
+                        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                        let stage_graphs = contracts
+                            .iter()
+                            .map(|contract| contract.stages.as_ref())
+                            .collect::<Vec<_>>();
+                        let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
                         let physical = self
                             .core_engine
-                            .load_managed_model_cache(model_instance_id, &loaded_cache)
-                            .await?
-                            .ok_or_else(|| {
-                                Error::ModelLoadError(
-                                    "managed ASR state allocation returned no physical runtime"
-                                        .to_string(),
-                                )
-                            })?;
+                            .load_managed_model_state(
+                                model_instance_id,
+                                &physical_spec.retained_v1,
+                                &physical_spec.retained,
+                            )
+                            .await?;
+                        let retained_uses = contracts
+                            .iter()
+                            .map(|contract| {
+                                let graph = stage_graph_fingerprint(&contract.stages)?;
+                                let retained_use = match contract.execution_profile.cache_mode {
+                                    CacheMode::ExternalPaged
+                                        if contract.execution_profile.cache_namespace.is_some()
+                                            && contract.execution_profile.kv_dtype != "none" =>
+                                    {
+                                        RetainedStateUseV2::ExternalPaged
+                                    }
+                                    CacheMode::None
+                                        if contract.execution_profile.cache_namespace.is_none()
+                                            && contract.execution_profile.kv_dtype == "none" =>
+                                    {
+                                        RetainedStateUseV2::Inactive
+                                    }
+                                    _ => {
+                                        return Err(Error::ModelLoadError(
+                                            "Qwen3 ASR graph has an incompatible retained-state profile"
+                                                .to_string(),
+                                        ));
+                                    }
+                                };
+                                Ok((graph, retained_use))
+                            })
+                            .collect::<Result<HashMap<_, _>>>()?;
+                        let publication = self
+                            .load_invocation_paged_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                &physical_spec.invocation,
+                                Some(physical.into()),
+                                retained_uses,
+                            )
+                            .await?;
                         state_publications.insert(
                             CapabilityKind::Asr,
-                            LoadedStatePublication::ManagedV2 {
-                                contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
-                                physical,
-                            },
+                            publication,
                         );
+                    } else if let crate::kv::CacheCapability::Managed(contract) = &loaded_cache {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded non-Qwen ASR model {variant} still publishes legacy managed state with {} domains",
+                            contract.domains.len()
+                        )));
                     }
                 }
             }

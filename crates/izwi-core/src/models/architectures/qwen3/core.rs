@@ -63,6 +63,8 @@ pub struct Qwen3Config {
     pub num_hidden_layers: usize,
     pub num_key_value_heads: usize,
     #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    #[serde(default)]
     pub head_dim: Option<usize>,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
@@ -91,6 +93,10 @@ impl Qwen3Config {
 
     pub fn kv_groups(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    pub fn context_length(&self) -> Option<usize> {
+        self.max_position_embeddings.filter(|length| *length > 0)
     }
 
     pub fn sliding_window(&self) -> Option<usize> {
@@ -3167,6 +3173,7 @@ mod tests {
             num_attention_heads: 2,
             num_hidden_layers: 1,
             num_key_value_heads: 1,
+            max_position_embeddings: Some(32),
             head_dim: Some(2),
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,

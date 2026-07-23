@@ -5,16 +5,16 @@
 //! root-level layer structure compared to standard Qwen3.
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder, ops};
+use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::{
-    Qwen3Cache, Qwen3Config, build_mrope_cache, build_rope_cache, causal_mask,
-    dense_decode_attention, repeat_kv,
+    build_mrope_cache, build_rope_cache, causal_mask, dense_decode_attention, repeat_kv,
+    Qwen3Cache, Qwen3Config,
 };
 use crate::models::shared::attention::flash::{
-    CudaFlashAttentionOptions, flash_attention_requested, try_fused_self_attention,
-    try_fused_self_attention_with_options,
+    flash_attention_requested, try_fused_self_attention, try_fused_self_attention_with_options,
+    CudaFlashAttentionOptions,
 };
 use crate::models::shared::attention::paged::paged_decode_attention;
 
@@ -690,7 +690,7 @@ impl VoxtralMlp {
 mod tests {
     use super::*;
     use crate::models::shared::attention::paged::KvCacheQuantization;
-    use candle_core::{D, DType};
+    use candle_core::{DType, D};
     use std::collections::HashMap;
 
     fn tiny_cfg() -> Qwen3Config {
@@ -700,6 +700,7 @@ mod tests {
             num_attention_heads: 2,
             num_hidden_layers: 0,
             num_key_value_heads: 1,
+            max_position_embeddings: None,
             head_dim: Some(2),
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,

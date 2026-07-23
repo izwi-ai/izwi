@@ -39,6 +39,7 @@ use crate::models::architectures::parakeet::asr::{
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
     AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput, Qwen3AsrModel,
+    Qwen3AsrPhysicalStateSpec,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
@@ -711,6 +712,73 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    pub(crate) fn qwen3_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Qwen3AsrPhysicalStateSpec> {
+        match self {
+            Self::Qwen3(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Qwen ASR model cannot author Qwen3 physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_qwen3_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        cache: &mut Qwen3ManagedCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::Qwen3(model) = self else {
+            return Err(Error::InferenceError(
+                "Qwen3 physical ASR pages were routed to a non-Qwen model".to_string(),
+            ));
+        };
+        let Qwen3AsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_qwen3_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+        cache: &mut Qwen3ManagedCache,
+    ) -> Result<String> {
+        let Self::Qwen3(model) = self else {
+            return Err(Error::InferenceError(
+                "Qwen3 physical ASR pages were routed to a non-Qwen model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            on_delta,
+            cache,
+        )
+    }
+
     pub fn transcribe(
         &self,
         audio: &[f32],
