@@ -9,17 +9,20 @@ use tracing::info;
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::engine::{
-    CacheMode, ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
+    AdapterInstanceId, CacheMode, ReservationClass, ReservationOwner, ResourceAmount,
+    ResourceLease, ResourceVector,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
-    InvocationPagedWorkspaceRuntimeV2, InvocationWorkspaceDomain, InvocationWorkspaceSet,
-    RetainedStateUseV2, StateDomainSpec,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
+    InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
+    InvocationPagedWorkspaceRuntimeV2, InvocationStateCapacity, InvocationWorkspaceDomain,
+    InvocationWorkspaceSet, RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2,
+    StateDomainId, StateDomainSpec, StateScope,
 };
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
-use crate::runtime::adapters::{CapabilityKind, LoadedStatePublication};
+use crate::runtime::adapters::{CapabilityKind, LoadedExecutionContract, LoadedStatePublication};
 use crate::runtime::lifecycle::controller::{
     ModelLifecycleController, SharedLoadFailure, SharedLoadOutcome,
 };
@@ -140,7 +143,261 @@ fn model_load_capacity_is_guarded(backend: BackendKind) -> bool {
     backend == BackendKind::Cuda
 }
 
+#[derive(Debug, Clone)]
+struct InvocationPagedAllocationV2 {
+    adapter_instance: AdapterInstanceId,
+    key: InvocationPagedWorkspaceKeyV2,
+    domain: InvocationWorkspaceDomain,
+    slot_count: u32,
+}
+
+fn invalid_invocation_publication(message: impl Into<String>) -> Error {
+    Error::ModelLoadError(message.into())
+}
+
+fn validate_physical_publication_backing(
+    descriptor: &CapabilityStateDescriptorV2,
+    executions: &[LoadedExecutionContract],
+    retained: Option<&RetainedStateRuntimeV2>,
+    retained_uses: &HashMap<[u8; 32], RetainedStateUseV2>,
+) -> Result<()> {
+    let execution_graphs = executions
+        .iter()
+        .map(|execution| stage_graph_fingerprint(&execution.stages))
+        .collect::<Result<HashSet<_>>>()?;
+    match (&descriptor.retained, retained) {
+        (RetainedStateCapability::Stateless, None) if retained_uses.is_empty() => Ok(()),
+        (RetainedStateCapability::Managed { contract }, Some(retained))
+            if contract.fingerprint()? == retained.state_plan_v2().contract_fingerprint
+                && retained_uses.keys().copied().collect::<HashSet<_>>() == execution_graphs =>
+        {
+            Ok(())
+        }
+        (RetainedStateCapability::Stateless, None) => Err(invalid_invocation_publication(
+            "invocation-only publication cannot declare retained graph mappings",
+        )),
+        (RetainedStateCapability::Stateless, Some(_)) => Err(invalid_invocation_publication(
+            "invocation-only publication unexpectedly owns retained backing",
+        )),
+        (RetainedStateCapability::Managed { .. }, None) => Err(invalid_invocation_publication(
+            "retained invocation publication is missing physical retained backing",
+        )),
+        (RetainedStateCapability::Managed { .. }, Some(_)) => Err(invalid_invocation_publication(
+            "retained invocation publication has mismatched backing or graph mappings",
+        )),
+    }
+}
+
+/// Resolve one capability-authored invocation descriptor into exact physical
+/// allocations. This is deliberately model-neutral: graph, stage, domain, and
+/// concurrency identities all come from the sealed execution/state contracts.
+fn plan_invocation_paged_allocations(
+    descriptor: &CapabilityStateDescriptorV2,
+    invocation_contract: &InferenceStateContract,
+    executions: &[LoadedExecutionContract],
+) -> Result<Vec<InvocationPagedAllocationV2>> {
+    if executions.is_empty() {
+        return Err(invalid_invocation_publication(
+            "physical invocation publication has no execution stage graphs",
+        ));
+    }
+    invocation_contract.validate()?;
+
+    let mut contract_domains = HashMap::new();
+    for domain in &invocation_contract.domains {
+        if domain.scope() != StateScope::Invocation {
+            return Err(invalid_invocation_publication(
+                "physical invocation contract contains retained state",
+            ));
+        }
+        if !matches!(domain, StateDomainSpec::PagedAttention(_)) {
+            return Err(invalid_invocation_publication(
+                "physical invocation contract contains state without a paged allocator",
+            ));
+        }
+        if contract_domains.insert(domain.id(), domain).is_some() {
+            return Err(invalid_invocation_publication(
+                "physical invocation contract repeats a state domain",
+            ));
+        }
+    }
+
+    let mut executions_by_graph = HashMap::new();
+    for execution in executions {
+        let graph = stage_graph_fingerprint(&execution.stages)?;
+        match executions_by_graph.entry(graph) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(execution);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let current = entry.get();
+                if current.adapter_instance_id != execution.adapter_instance_id
+                    || current.stages != execution.stages
+                {
+                    return Err(invalid_invocation_publication(
+                        "one invocation stage graph maps to multiple loaded adapters",
+                    ));
+                }
+            }
+        }
+    }
+
+    let InvocationWorkspaceSet::Bounded { profiles } = &descriptor.invocation else {
+        return Err(invalid_invocation_publication(
+            "physical invocation publication has no bounded workspace profiles",
+        ));
+    };
+    let execution_graphs = executions_by_graph.keys().copied().collect::<HashSet<_>>();
+    let profile_graphs = profiles
+        .iter()
+        .map(|profile| profile.stage_graph_fingerprint)
+        .collect::<HashSet<_>>();
+    if profile_graphs.len() != profiles.len() || profile_graphs != execution_graphs {
+        return Err(invalid_invocation_publication(
+            "physical invocation profiles do not map exactly to the loaded stage graphs",
+        ));
+    }
+
+    let mut mapped_domains: HashMap<StateDomainId, &StateDomainSpec> = HashMap::new();
+    let mut physical_keys = HashSet::new();
+    let mut allocations = Vec::new();
+    for profile in profiles {
+        let execution = executions_by_graph
+            .get(&profile.stage_graph_fingerprint)
+            .copied()
+            .ok_or_else(|| {
+                invalid_invocation_publication(
+                    "physical invocation profile lost its loaded stage graph",
+                )
+            })?;
+        descriptor.validate_against_stages(&execution.stages)?;
+        for workspace in &profile.stages {
+            let stage = execution
+                .stages
+                .iter()
+                .find(|candidate| candidate.id == workspace.stage)
+                .ok_or_else(|| {
+                    invalid_invocation_publication(
+                        "physical invocation profile lost its execution stage",
+                    )
+                })?;
+            let slot_count = workspace.slot_count(stage.max_batch_size)?;
+            for domain in &workspace.domains {
+                let InvocationWorkspaceDomain::State {
+                    state, capacity, ..
+                } = domain
+                else {
+                    // Scratch is accounted by the stage workspace formula and
+                    // has no persistent typed backing to allocate here.
+                    continue;
+                };
+                if !matches!(
+                    (state, capacity),
+                    (
+                        StateDomainSpec::PagedAttention(_),
+                        InvocationStateCapacity::PagedTokens { .. }
+                    )
+                ) {
+                    return Err(invalid_invocation_publication(
+                        "physical invocation descriptor contains typed state without a paged allocator",
+                    ));
+                }
+                match mapped_domains.entry(state.id()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(state);
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == state => {
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        return Err(invalid_invocation_publication(
+                            "one invocation domain has inconsistent physical definitions",
+                        ));
+                    }
+                }
+                let key = InvocationPagedWorkspaceKeyV2 {
+                    stage_graph: profile.stage_graph_fingerprint,
+                    stage: workspace.stage,
+                    domain: state.id(),
+                };
+                if !physical_keys.insert(key) {
+                    return Err(invalid_invocation_publication(
+                        "physical invocation publication repeats a graph/stage/domain mapping",
+                    ));
+                }
+                allocations.push(InvocationPagedAllocationV2 {
+                    adapter_instance: execution.adapter_instance_id,
+                    key,
+                    domain: domain.clone(),
+                    slot_count,
+                });
+            }
+        }
+    }
+
+    if mapped_domains.len() != contract_domains.len()
+        || mapped_domains.iter().any(|(id, state)| {
+            contract_domains
+                .get(id)
+                .is_none_or(|contract_state| *contract_state != *state)
+        })
+    {
+        return Err(invalid_invocation_publication(
+            "physical invocation descriptor and contract have missing or extra domain mappings",
+        ));
+    }
+    if allocations.is_empty() {
+        return Err(invalid_invocation_publication(
+            "physical invocation publication has no paged token domains",
+        ));
+    }
+    Ok(allocations)
+}
+
 impl ModelLifecycleController {
+    async fn load_invocation_paged_publication(
+        &self,
+        model_instance_id: crate::engine::ModelInstanceId,
+        executions: &[LoadedExecutionContract],
+        descriptor: CapabilityStateDescriptorV2,
+        invocation_contract: &InferenceStateContract,
+        retained: Option<RetainedStateRuntimeV2>,
+        retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
+    ) -> Result<LoadedStatePublication> {
+        validate_physical_publication_backing(
+            &descriptor,
+            executions,
+            retained.as_ref(),
+            &retained_uses,
+        )?;
+        let allocations =
+            plan_invocation_paged_allocations(&descriptor, invocation_contract, executions)?;
+        let mut bindings = Vec::with_capacity(allocations.len());
+        for allocation in allocations {
+            let pool = self
+                .core_engine
+                .resolve_and_load_invocation_paged_workspace(
+                    model_instance_id,
+                    allocation.adapter_instance,
+                    allocation.key.stage_graph,
+                    allocation.key.stage,
+                    invocation_contract,
+                    &allocation.domain,
+                    allocation.slot_count,
+                )
+                .await?;
+            bindings.push(InvocationPagedWorkspaceBindingV2 {
+                key: allocation.key,
+                pool,
+            });
+        }
+        Ok(LoadedStatePublication::PhysicalV2 {
+            descriptor,
+            retained,
+            retained_uses,
+            invocation_paged: InvocationPagedWorkspaceRuntimeV2::new(bindings)?,
+        })
+    }
+
     pub(super) async fn touch_model_usage(&self, variant: ModelVariant) {
         let mut last_used = self.model_last_used.lock().await;
         last_used.insert(variant, now_unix_millis());
@@ -478,75 +735,6 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                         )
                         .await?;
-                    let mut invocation_bindings = Vec::new();
-                    let InvocationWorkspaceSet::Bounded { profiles } =
-                        &physical_spec.descriptor.invocation
-                    else {
-                        return Err(Error::ModelLoadError(
-                            "Qwen3 TTS descriptor omitted predictor invocation state".to_string(),
-                        ));
-                    };
-                    for profile in profiles {
-                        let execution = contracts
-                            .iter()
-                            .find(|contract| {
-                                stage_graph_fingerprint(&contract.stages).ok()
-                                    == Some(profile.stage_graph_fingerprint)
-                            })
-                            .ok_or_else(|| {
-                                Error::ModelLoadError(
-                                    "Qwen3 TTS invocation profile lost its adapter graph"
-                                        .to_string(),
-                                )
-                            })?;
-                        for stage in &profile.stages {
-                            let execution_stage = execution
-                                .stages
-                                .iter()
-                                .find(|candidate| candidate.id == stage.stage)
-                                .ok_or_else(|| {
-                                    Error::ModelLoadError(
-                                        "Qwen3 TTS invocation profile lost its execution stage"
-                                            .to_string(),
-                                    )
-                                })?;
-                            let slot_count = stage.slot_count(execution_stage.max_batch_size)?;
-                            for domain in &stage.domains {
-                                if !matches!(
-                                    domain,
-                                    InvocationWorkspaceDomain::State {
-                                        state: StateDomainSpec::PagedAttention(_),
-                                        ..
-                                    }
-                                ) {
-                                    return Err(Error::ModelLoadError(
-                                        "Qwen3 TTS published unsupported invocation backing"
-                                            .to_string(),
-                                    ));
-                                }
-                                let handle = self
-                                    .core_engine
-                                    .resolve_and_load_invocation_paged_workspace(
-                                        model_instance_id,
-                                        execution.adapter_instance_id,
-                                        profile.stage_graph_fingerprint,
-                                        stage.stage,
-                                        &physical_spec.predictor_contract,
-                                        domain,
-                                        slot_count,
-                                    )
-                                    .await?;
-                                invocation_bindings.push(InvocationPagedWorkspaceBindingV2 {
-                                    key: InvocationPagedWorkspaceKeyV2 {
-                                        stage_graph: profile.stage_graph_fingerprint,
-                                        stage: stage.stage,
-                                        domain: domain.id(),
-                                    },
-                                    pool: handle,
-                                });
-                            }
-                        }
-                    }
                     let retained_uses = contracts
                         .iter()
                         .map(|contract| {
@@ -574,17 +762,17 @@ impl ModelLifecycleController {
                             Ok((graph, retained_use))
                         })
                         .collect::<Result<HashMap<_, _>>>()?;
-                    state_publications.insert(
-                        capability,
-                        LoadedStatePublication::PhysicalV2 {
-                            descriptor: physical_spec.descriptor,
-                            retained: Some(retained.into()),
+                    let publication = self
+                        .load_invocation_paged_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            &physical_spec.predictor_contract,
+                            Some(retained.into()),
                             retained_uses,
-                            invocation_paged: InvocationPagedWorkspaceRuntimeV2::new(
-                                invocation_bindings,
-                            )?,
-                        },
-                    );
+                        )
+                        .await?;
+                    state_publications.insert(capability, publication);
                 }
             }
             self.bind_loaded_model_bundle_draft(
@@ -728,17 +916,31 @@ impl RuntimeService {
 mod tests {
     use super::{
         model_load_capacity_is_guarded, model_memory_estimate, model_resource_plan,
-        residency_budget_has_capacity, select_lru_eviction_candidate, ModelMemoryEstimate,
+        plan_invocation_paged_allocations, residency_budget_has_capacity,
+        select_lru_eviction_candidate, ModelMemoryEstimate,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
     use crate::config::EngineConfig;
     use crate::engine::{
-        CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
-        ReservationOwner, ResourceAmount, ResourceAuthority, ResourceLease, ResourceVector,
+        AdapterAbiRevision, AdapterInstanceId, CapacitySource, ConcurrencyClass, ExecutionGroupId,
+        ExecutionMode, ExecutionProfile, ModelInstanceId, NativeBatchMode,
+        PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass, ReservationOwner,
+        ResourceAmount, ResourceAuthority, ResourceLease, ResourceVector, StageDescriptor, StageId,
+        StageWorkSelector,
     };
     use crate::error::Error;
+    use crate::kv::v2::{
+        stage_graph_fingerprint, test_contract, CapabilityStateDescriptorV2, CheckpointPolicy,
+        InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+        InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet,
+        PrefixPolicy, RetainedStateCapability, StateDType, StateDomainId, StateDomainSpec,
+        StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    };
     use crate::model::ModelVariant;
+    use crate::runtime::adapters::{
+        CapabilityKind, LoadedExecutionContract, RuntimeAdapterRegistry,
+    };
     use crate::runtime::lifecycle::controller::{
         ResidentPhase, SharedLoadFailure, SharedLoadOutcome,
     };
@@ -749,6 +951,98 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::{oneshot, Barrier};
     use uuid::Uuid;
+
+    fn invocation_execution(max_batch_size: usize) -> LoadedExecutionContract {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let metadata = *RuntimeAdapterRegistry::built_in()
+            .require(CapabilityKind::Tts, variant)
+            .unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.max_batch_size = max_batch_size;
+        profile.concurrency = if max_batch_size > 1 {
+            ConcurrencyClass::Batchable
+        } else {
+            ConcurrencyClass::Exclusive
+        };
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "test.atomic.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.max_workspace_bytes = 0;
+        stage.validate().unwrap();
+        LoadedExecutionContract {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(2),
+            adapter_instance_id: AdapterInstanceId::new(3),
+            adapter_abi_revision: AdapterAbiRevision::new(4),
+            metadata,
+            execution_profile: profile,
+            stages: Arc::from([stage]),
+        }
+    }
+
+    fn invocation_contract(domain_count: u32) -> crate::kv::v2::InferenceStateContract {
+        let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(first) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        first.header.scope = StateScope::Invocation;
+        first.header.prefix = PrefixPolicy::Disabled;
+        first.header.checkpoint = CheckpointPolicy::None;
+        first.accepted_dtypes = vec![StateDType::F32];
+        contract.groups[0].prefix_shareable = false;
+        for id in 2..=domain_count {
+            let mut state = contract.domains[0].clone();
+            let StateDomainSpec::PagedAttention(domain) = &mut state else {
+                unreachable!()
+            };
+            domain.header.id = StateDomainId::new(id);
+            contract.domains.push(state);
+        }
+        contract.groups[0].domains = (1..=domain_count).map(StateDomainId::new).collect();
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn invocation_descriptor(
+        execution: &LoadedExecutionContract,
+        contract: &crate::kv::v2::InferenceStateContract,
+        lease_scope: InvocationLeaseScope,
+    ) -> CapabilityStateDescriptorV2 {
+        let domains = contract
+            .domains
+            .iter()
+            .map(|state| InvocationWorkspaceDomain::State {
+                state: state.clone(),
+                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
+                placement: state.header().placement,
+                formula: WorkspaceFormula {
+                    fixed_bytes: 1024 * 1024,
+                    dimensions: vec![],
+                    terms: vec![],
+                },
+            })
+            .collect();
+        CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::Bounded {
+                profiles: vec![InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: stage_graph_fingerprint(&execution.stages).unwrap(),
+                    stages: vec![InvocationStageWorkspace {
+                        stage: execution.stages[0].id,
+                        lease_scope,
+                        groups: contract.groups.clone(),
+                        domains,
+                    }],
+                }],
+            },
+        }
+    }
 
     #[test]
     fn managed_capability_cache_truth_tracks_compiled_direct_kernels() {
@@ -761,6 +1055,68 @@ mod tests {
             managed_kv_backend_compiled(BackendKind::Cuda),
             cfg!(feature = "flash-attn")
         );
+    }
+
+    #[test]
+    fn generic_invocation_planner_allocates_every_domain_at_exact_row_concurrency() {
+        let execution = invocation_execution(3);
+        let contract = invocation_contract(2);
+        let descriptor = invocation_descriptor(&execution, &contract, InvocationLeaseScope::PerRow);
+
+        let allocations =
+            plan_invocation_paged_allocations(&descriptor, &contract, &[execution]).unwrap();
+        assert_eq!(allocations.len(), 2);
+        assert!(allocations
+            .iter()
+            .all(|allocation| allocation.slot_count == 3));
+        assert_eq!(
+            allocations
+                .iter()
+                .map(|allocation| allocation.key.domain)
+                .collect::<Vec<_>>(),
+            vec![StateDomainId::new(1), StateDomainId::new(2)]
+        );
+    }
+
+    #[test]
+    fn generic_invocation_planner_rejects_missing_extra_and_foreign_graph_mappings() {
+        let execution = invocation_execution(1);
+        let contract = invocation_contract(2);
+        let descriptor =
+            invocation_descriptor(&execution, &contract, InvocationLeaseScope::PerStageBatch);
+
+        let mut missing_contract = contract.clone();
+        missing_contract.domains.pop();
+        missing_contract.groups[0].domains.pop();
+        missing_contract.validate().unwrap();
+        assert!(plan_invocation_paged_allocations(
+            &descriptor,
+            &missing_contract,
+            &[execution.clone()]
+        )
+        .is_err());
+
+        let mut missing_descriptor = descriptor.clone();
+        let InvocationWorkspaceSet::Bounded { profiles } = &mut missing_descriptor.invocation
+        else {
+            unreachable!()
+        };
+        profiles[0].stages[0].domains.pop();
+        profiles[0].stages[0].groups[0].domains.pop();
+        assert!(plan_invocation_paged_allocations(
+            &missing_descriptor,
+            &contract,
+            &[execution.clone()]
+        )
+        .is_err());
+
+        let foreign_execution = invocation_execution(2);
+        assert!(plan_invocation_paged_allocations(
+            &descriptor,
+            &contract,
+            &[execution, foreign_execution]
+        )
+        .is_err());
     }
 
     fn one_byte_host_reservation() -> ResourceVector {

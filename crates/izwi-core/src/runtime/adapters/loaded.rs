@@ -1045,8 +1045,9 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
             NativeBatchMode::None,
         );
         decode.selector = StageWorkSelector::SequenceDecode;
-        decode.max_workspace_bytes =
-            crate::models::architectures::qwen3::tts::QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES;
+        // Predictor KV is load-owned typed invocation state, not scheduler
+        // scratch. Its physical pool is authorized and charged by lifecycle.
+        decode.max_workspace_bytes = 0;
         decode.output_visibility = prefill.output_visibility;
         prefill.validate()?;
         decode.validate()?;
@@ -2537,10 +2538,7 @@ mod tests {
             physical.stages[1].selector,
             StageWorkSelector::SequenceDecode
         );
-        assert_eq!(
-            physical.stages[1].max_workspace_bytes,
-            crate::models::architectures::qwen3::tts::QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES
-        );
+        assert_eq!(physical.stages[1].max_workspace_bytes, 0);
 
         let streaming = tts.contract(StreamingRequirements::native(true)).unwrap();
         assert_eq!(streaming.adapter_abi_revision, AdapterAbiRevision::new(3));

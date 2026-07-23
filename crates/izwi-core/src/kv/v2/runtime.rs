@@ -9,7 +9,10 @@ use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, ExecutionAdapterBinding, ExecutionGroupId,
     ModelInstanceId,
 };
-use crate::engine::{InvocationPagedKvLease, InvocationPagedKvPoolHandle, InvocationPagedKvPoolId};
+use crate::engine::{
+    InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
+    InvocationPagedKvPoolId,
+};
 use crate::engine::{
     ManagedKvModelRuntime, RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2, StageId,
 };
@@ -153,6 +156,80 @@ pub(crate) struct InvocationPagedWorkspaceRuntimeV2 {
     pools: HashMap<InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolHandle>,
 }
 
+/// One atomic row's canonically ordered set of exact invocation-domain leases.
+/// Partially acquired sets release through each lease's Drop implementation.
+#[derive(Debug)]
+pub(crate) struct InvocationPagedLeaseSetV2 {
+    stage: StageId,
+    leases: Vec<(StateDomainId, InvocationPagedKvLease)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InvocationPagedDomainCompletionV2 {
+    pub(crate) stage: StageId,
+    pub(crate) domain: StateDomainId,
+    pub(crate) physical: InvocationPagedKvCompletion,
+}
+
+impl InvocationPagedLeaseSetV2 {
+    pub(crate) const fn stage(&self) -> StageId {
+        self.stage
+    }
+
+    pub(crate) fn domains(&self) -> impl ExactSizeIterator<Item = StateDomainId> + '_ {
+        self.leases.iter().map(|(domain, _)| *domain)
+    }
+
+    pub(crate) fn cache(
+        &self,
+        domain: StateDomainId,
+    ) -> Result<&crate::models::shared::attention::physical::PhysicalPagedKvCache> {
+        self.leases
+            .iter()
+            .find(|(candidate, _)| *candidate == domain)
+            .map(|(_, lease)| lease.cache())
+            .ok_or_else(|| {
+                invalid("atomic invocation lease set does not contain the requested domain")
+            })
+    }
+
+    pub(crate) fn cache_mut(
+        &mut self,
+        domain: StateDomainId,
+    ) -> Result<&mut crate::models::shared::attention::physical::PhysicalPagedKvCache> {
+        self.leases
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == domain)
+            .map(|(_, lease)| lease.cache_mut())
+            .ok_or_else(|| {
+                invalid("atomic invocation lease set does not contain the requested domain")
+            })
+    }
+
+    /// Release every domain even if one completion fails authentication. A
+    /// failed set never exposes a partial collection of completions.
+    pub(crate) fn release(mut self) -> Result<Vec<InvocationPagedDomainCompletionV2>> {
+        let leases = std::mem::take(&mut self.leases);
+        let mut completions = Vec::with_capacity(leases.len());
+        let mut first_error = None;
+        for (domain, lease) in leases {
+            match lease.release() {
+                Ok(physical) => completions.push(InvocationPagedDomainCompletionV2 {
+                    stage: self.stage,
+                    domain,
+                    physical,
+                }),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(completions),
+        }
+    }
+}
+
 impl InvocationPagedWorkspaceRuntimeV2 {
     pub(crate) fn new(bindings: Vec<InvocationPagedWorkspaceBindingV2>) -> Result<Self> {
         let mut pools = HashMap::with_capacity(bindings.len());
@@ -259,6 +336,33 @@ impl InvocationPagedWorkspaceRuntimeV2 {
             })
             .ok_or_else(|| invalid("selected invocation paged workspace is not load-sealed"))?
             .lease()
+    }
+
+    fn lease_set(
+        &self,
+        graph: [u8; 32],
+        stage: StageId,
+        domains: &[StateDomainId],
+    ) -> Result<InvocationPagedLeaseSetV2> {
+        if domains.is_empty() {
+            return Err(invalid(
+                "atomic invocation lease set requires at least one state domain",
+            ));
+        }
+        let mut canonical = domains.to_vec();
+        canonical.sort_unstable();
+        if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid(
+                "atomic invocation lease set repeats a state domain",
+            ));
+        }
+        let mut leases = Vec::with_capacity(canonical.len());
+        for domain in canonical {
+            // If a later domain is unavailable, every lease already pushed
+            // here is released by Drop before the error escapes.
+            leases.push((domain, self.lease(graph, stage, domain)?));
+        }
+        Ok(InvocationPagedLeaseSetV2 { stage, leases })
     }
 }
 
@@ -447,6 +551,24 @@ impl CapabilityStateRuntimeV2 {
                     .invocation_paged
                     .lease(runtime.stage_graph_fingerprint, stage, domain)
             }
+        }
+    }
+
+    pub(crate) fn lease_invocation_paged_set(
+        &self,
+        stage: StageId,
+        domains: &[StateDomainId],
+    ) -> Result<InvocationPagedLeaseSetV2> {
+        match &self.backing {
+            CapabilityStateRuntimeBackingV2::Stateless(_) => Err(invalid(
+                "stateless runtime has no load-sealed paged invocation workspace",
+            )),
+            CapabilityStateRuntimeBackingV2::Invocation(runtime) => runtime
+                .invocation_paged
+                .lease_set(runtime.stage_graph_fingerprint, stage, domains),
+            CapabilityStateRuntimeBackingV2::Managed(runtime) => runtime
+                .invocation_paged
+                .lease_set(runtime.stage_graph_fingerprint, stage, domains),
         }
     }
 
@@ -883,10 +1005,19 @@ mod tests {
     fn invocation_pool(
         model_instance: ModelInstanceId,
     ) -> (InvocationPagedKvPoolOwner, InvocationWorkspaceDomain) {
+        invocation_pool_for_domain(model_instance, StateDomainId::new(1), 19)
+    }
+
+    fn invocation_pool_for_domain(
+        model_instance: ModelInstanceId,
+        domain_id: StateDomainId,
+        arena_generation: u32,
+    ) -> (InvocationPagedKvPoolOwner, InvocationWorkspaceDomain) {
         let mut contract = test_contract();
         let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
             unreachable!()
         };
+        domain.header.id = domain_id;
         domain.header.scope = StateScope::Invocation;
         domain.header.prefix = PrefixPolicy::Disabled;
         domain.header.checkpoint = CheckpointPolicy::None;
@@ -896,6 +1027,7 @@ mod tests {
         domain.layers[0].key_head_dim = 4;
         domain.layers[0].value_head_dim = 4;
         domain.layers[0].key_encoding = super::super::KeyEncoding::Rotary { rotary_dim: 4 };
+        contract.groups[0].domains = vec![domain_id];
         contract.groups[0].prefix_shareable = false;
         let workspace_domain = InvocationWorkspaceDomain::State {
             state: contract.domains[0].clone(),
@@ -924,7 +1056,7 @@ mod tests {
                     model_instance,
                     backend: BackendKind::Cpu,
                     device_ordinal: None,
-                    generation: 19,
+                    generation: arena_generation,
                 },
                 group: KvGroupId::new(resolved.group.get()),
                 page_tokens: resolved.page_tokens,
@@ -961,7 +1093,6 @@ mod tests {
         let model_instance = ModelInstanceId::new(37);
         let mut execution = binding();
         execution.model_instance_id = model_instance;
-        Arc::make_mut(&mut execution.stages)[0].max_workspace_bytes = 1024 * 1024;
         let graph = stage_graph_fingerprint(&execution.stages).unwrap();
         let (pool, workspace_domain) = invocation_pool(model_instance);
         let retained_contract = upgrade_kv_contract_v1(&crate::kv::test_contract()).unwrap();
@@ -1222,6 +1353,104 @@ mod tests {
         assert!(runtime.lease_invocation_paged(stage, domain).is_err());
         assert!(runtime
             .validate_against(BackendKind::Cpu, &execution)
+            .is_err());
+    }
+
+    #[test]
+    fn invocation_lease_set_is_canonical_and_returns_every_completion() {
+        let graph = [7; 32];
+        let stage = StageId::new(4);
+        let model = ModelInstanceId::new(51);
+        let (first, _) = invocation_pool_for_domain(model, StateDomainId::new(1), 31);
+        let (second, _) = invocation_pool_for_domain(model, StateDomainId::new(2), 32);
+        let runtime = InvocationPagedWorkspaceRuntimeV2::new(vec![
+            InvocationPagedWorkspaceBindingV2 {
+                key: InvocationPagedWorkspaceKeyV2 {
+                    stage_graph: graph,
+                    stage,
+                    domain: StateDomainId::new(1),
+                },
+                pool: first.handle(),
+            },
+            InvocationPagedWorkspaceBindingV2 {
+                key: InvocationPagedWorkspaceKeyV2 {
+                    stage_graph: graph,
+                    stage,
+                    domain: StateDomainId::new(2),
+                },
+                pool: second.handle(),
+            },
+        ])
+        .unwrap();
+
+        let mut leases = runtime
+            .lease_set(
+                graph,
+                stage,
+                &[StateDomainId::new(2), StateDomainId::new(1)],
+            )
+            .unwrap();
+        assert_eq!(leases.stage(), stage);
+        assert_eq!(
+            leases.domains().collect::<Vec<_>>(),
+            vec![StateDomainId::new(1), StateDomainId::new(2)]
+        );
+        assert_eq!(
+            leases.cache(StateDomainId::new(1)).unwrap().context_len(),
+            0
+        );
+        assert_eq!(
+            leases
+                .cache_mut(StateDomainId::new(2))
+                .unwrap()
+                .context_len(),
+            0
+        );
+
+        let completions = leases.release().unwrap();
+        assert_eq!(completions.len(), 2);
+        assert!(completions.iter().all(|completion| {
+            completion.stage == stage
+                && completion.domain == completion.physical.slot.pool.domain
+                && completion.physical.writes.is_empty()
+        }));
+    }
+
+    #[test]
+    fn invocation_lease_set_rolls_back_partial_acquisition_on_error() {
+        let graph = [9; 32];
+        let stage = StageId::new(5);
+        let model = ModelInstanceId::new(52);
+        let (owner, _) = invocation_pool_for_domain(model, StateDomainId::new(1), 33);
+        let runtime =
+            InvocationPagedWorkspaceRuntimeV2::new(vec![InvocationPagedWorkspaceBindingV2 {
+                key: InvocationPagedWorkspaceKeyV2 {
+                    stage_graph: graph,
+                    stage,
+                    domain: StateDomainId::new(1),
+                },
+                pool: owner.handle(),
+            }])
+            .unwrap();
+
+        assert!(runtime
+            .lease_set(
+                graph,
+                stage,
+                &[StateDomainId::new(1), StateDomainId::new(99)],
+            )
+            .is_err());
+        runtime
+            .lease_set(graph, stage, &[StateDomainId::new(1)])
+            .expect("the first lease must be released after later acquisition fails")
+            .release()
+            .unwrap();
+        assert!(runtime
+            .lease_set(
+                graph,
+                stage,
+                &[StateDomainId::new(1), StateDomainId::new(1)],
+            )
             .is_err());
     }
 }

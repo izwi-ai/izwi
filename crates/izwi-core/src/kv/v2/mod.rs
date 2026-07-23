@@ -73,6 +73,7 @@ pub(crate) use resolved_domains::{
 #[allow(unused_imports)]
 pub(crate) use runtime::{
     CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, InvocationCapabilityRuntimeV2,
+    InvocationPagedDomainCompletionV2, InvocationPagedLeaseSetV2,
     InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
     InvocationPagedWorkspaceRuntimeV2, ManagedCapabilityRuntimeV2, RetainedStateRuntimeV2,
     RetainedStateUseV2, StatelessCapabilityRuntimeV2,

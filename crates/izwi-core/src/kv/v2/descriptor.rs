@@ -411,7 +411,7 @@ impl InvocationStageWorkspace {
 
     fn validate(&self, max_batch_size: usize) -> Result<u64> {
         let mut previous = None;
-        let mut maximum = 0_u64;
+        let mut scratch_maximum = 0_u64;
         let mut typed_domains = Vec::new();
         for domain in &self.domains {
             let id = domain.id();
@@ -421,11 +421,20 @@ impl InvocationStageWorkspace {
                 ));
             }
             previous = Some(id);
-            maximum = maximum
-                .checked_add(domain.maximum_bytes()?)
-                .ok_or_else(|| invalid("invocation workspace stage byte bound overflow"))?;
-            if let InvocationWorkspaceDomain::State { state, .. } = domain {
-                typed_domains.push(state.clone());
+            let maximum = domain.maximum_bytes()?;
+            match domain {
+                InvocationWorkspaceDomain::Scratch { .. } => {
+                    scratch_maximum = scratch_maximum
+                        .checked_add(maximum)
+                        .ok_or_else(|| invalid("invocation scratch byte bound overflow"))?;
+                }
+                InvocationWorkspaceDomain::State { state, .. } => {
+                    // Typed state is allocated and charged by the physical
+                    // lifecycle. Its formula still validates the pool's own
+                    // geometry, but it must not be counted again as scheduler
+                    // stage scratch.
+                    typed_domains.push(state.clone());
+                }
             }
         }
         if typed_domains.is_empty() {
@@ -442,9 +451,9 @@ impl InvocationStageWorkspace {
             }
             .validate()?;
         }
-        maximum
+        scratch_maximum
             .checked_mul(u64::from(self.slot_count(max_batch_size)?))
-            .ok_or_else(|| invalid("invocation workspace aggregate byte bound overflow"))
+            .ok_or_else(|| invalid("invocation scratch aggregate byte bound overflow"))
     }
 }
 
@@ -734,6 +743,13 @@ mod tests {
         }
     }
 
+    fn named_stage(name: &str, max_workspace_bytes: u64) -> StageDescriptor {
+        StageDescriptor {
+            name: name.to_string(),
+            ..stage(max_workspace_bytes)
+        }
+    }
+
     fn workspace_domain() -> InvocationWorkspaceDomain {
         InvocationWorkspaceDomain::State {
             state: StateDomainSpec::StaticTensor(StaticTensorDomainSpec {
@@ -783,18 +799,11 @@ mod tests {
 
     #[test]
     fn explicit_stateless_workspace_is_stage_complete_and_bounded() {
-        let mut second_domain = workspace_domain();
-        let InvocationWorkspaceDomain::State { formula, .. } = &mut second_domain else {
-            unreachable!()
-        };
-        *formula = WorkspaceFormula {
-            fixed_bytes: 64,
-            dimensions: vec![],
-            terms: vec![],
-        };
+        let first_stage = named_stage("first", 0);
+        let second_stage = named_stage("second", 0);
         let mut profiles = vec![
             InvocationWorkspaceProfile {
-                stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                stage_graph_fingerprint: stage_graph_fingerprint(&[first_stage.clone()]).unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
                     lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -803,12 +812,12 @@ mod tests {
                 }],
             },
             InvocationWorkspaceProfile {
-                stage_graph_fingerprint: stage_graph_fingerprint(&[stage(64)]).unwrap(),
+                stage_graph_fingerprint: stage_graph_fingerprint(&[second_stage.clone()]).unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
                     lease_scope: InvocationLeaseScope::PerStageBatch,
                     groups: workspace_groups(),
-                    domains: vec![second_domain],
+                    domains: vec![workspace_domain()],
                 }],
             },
         ];
@@ -822,20 +831,24 @@ mod tests {
                 profiles: noncanonical,
             },
         };
-        assert!(noncanonical.validate_against_stages(&[stage(192)]).is_err());
+        assert!(noncanonical
+            .validate_against_stages(&[first_stage.clone()])
+            .is_err());
 
         let descriptor = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded { profiles },
         };
-        descriptor.validate_against_stages(&[stage(192)]).unwrap();
-        descriptor.validate_against_stages(&[stage(64)]).unwrap();
+        descriptor
+            .validate_against_stages(&[first_stage.clone()])
+            .unwrap();
+        descriptor.validate_against_stages(&[second_stage]).unwrap();
         assert!(descriptor.is_stateless());
-        assert!(descriptor.validate_against_stages(&[stage(191)]).is_err());
+        assert!(descriptor.validate_against_stages(&[stage(1)]).is_err());
         assert_eq!(
-            descriptor.fingerprint(&[stage(192)]).unwrap(),
-            descriptor.fingerprint(&[stage(192)]).unwrap()
+            descriptor.fingerprint(&[first_stage.clone()]).unwrap(),
+            descriptor.fingerprint(&[first_stage]).unwrap()
         );
     }
 
@@ -857,8 +870,8 @@ mod tests {
     }
 
     #[test]
-    fn per_row_workspace_charges_every_possible_physical_row() {
-        let execution = stage(192 * 4);
+    fn typed_invocation_state_is_not_double_charged_as_stage_scratch() {
+        let execution = stage(0);
         let descriptor = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
             retained: RetainedStateCapability::Stateless,
@@ -876,8 +889,45 @@ mod tests {
         };
         descriptor
             .validate_against_stages(&[execution])
-            .expect("four rows require four isolated workspace slots");
+            .expect("typed physical state is charged by lifecycle, not stage scratch");
         assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
+    }
+
+    #[test]
+    fn per_row_stage_workspace_charges_only_scratch_for_every_row() {
+        let execution = stage(32 * 4);
+        let descriptor = CapabilityStateDescriptorV2 {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            retained: RetainedStateCapability::Stateless,
+            invocation: InvocationWorkspaceSet::Bounded {
+                profiles: vec![InvocationWorkspaceProfile {
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[execution.clone()]).unwrap(),
+                    stages: vec![InvocationStageWorkspace {
+                        stage: StageId::new(1),
+                        lease_scope: InvocationLeaseScope::PerRow,
+                        groups: workspace_groups(),
+                        domains: vec![
+                            workspace_domain(),
+                            InvocationWorkspaceDomain::Scratch {
+                                id: StateDomainId::new(2),
+                                placement: PlacementPolicy::BackendLocal,
+                                alignment_bytes: 64,
+                                zero_on_release: false,
+                                formula: WorkspaceFormula {
+                                    fixed_bytes: 32,
+                                    dimensions: vec![],
+                                    terms: vec![],
+                                },
+                            },
+                        ],
+                    }],
+                }],
+            },
+        };
+        descriptor
+            .validate_against_stages(&[execution])
+            .expect("four rows require four isolated scratch slots");
+        assert!(descriptor.validate_against_stages(&[stage(32)]).is_err());
     }
 
     #[test]
@@ -904,7 +954,7 @@ mod tests {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
                 profiles: vec![InvocationWorkspaceProfile {
-                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(0)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
                         lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -914,7 +964,7 @@ mod tests {
                 }],
             },
         };
-        assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
+        assert!(descriptor.validate_against_stages(&[stage(0)]).is_err());
 
         let mut undersized = workspace_domain();
         let InvocationWorkspaceDomain::State { formula, .. } = &mut undersized else {
@@ -930,7 +980,7 @@ mod tests {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
                 profiles: vec![InvocationWorkspaceProfile {
-                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(15)]).unwrap(),
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(0)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
                         lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -940,7 +990,7 @@ mod tests {
                 }],
             },
         };
-        assert!(descriptor.validate_against_stages(&[stage(15)]).is_err());
+        assert!(descriptor.validate_against_stages(&[stage(0)]).is_err());
     }
 
     #[test]
@@ -950,7 +1000,7 @@ mod tests {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
                 profiles: vec![InvocationWorkspaceProfile {
-                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(0)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
                         lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -960,7 +1010,7 @@ mod tests {
                 }],
             },
         };
-        assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
+        assert!(descriptor.validate_against_stages(&[stage(0)]).is_err());
 
         let mut wrong_capacity = workspace_domain();
         let InvocationWorkspaceDomain::State { capacity, .. } = &mut wrong_capacity else {
@@ -972,7 +1022,7 @@ mod tests {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
                 profiles: vec![InvocationWorkspaceProfile {
-                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(192)]).unwrap(),
+                    stage_graph_fingerprint: stage_graph_fingerprint(&[stage(0)]).unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
                         lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -982,6 +1032,6 @@ mod tests {
                 }],
             },
         };
-        assert!(descriptor.validate_against_stages(&[stage(192)]).is_err());
+        assert!(descriptor.validate_against_stages(&[stage(0)]).is_err());
     }
 }

@@ -40,7 +40,7 @@ use super::execution::{
     ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile,
     FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, NativeBatchMode,
     OutcomeProvenance, PhysicalBatch, PlanId, PrefillMode, RetryDisposition, SessionKey,
-    YieldReason,
+    StageProgressKind, WorkUnit, YieldReason,
 };
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
@@ -304,13 +304,13 @@ fn physical_paged_cache_for_row(
     )
 }
 
-/// Lease the one paged invocation domain authored for this exact scheduled
-/// stage. Models receive only the physical cache view and cannot select a pool
-/// by convention or by model-family-specific IDs.
-fn invocation_paged_lease_for_row(
-    request: &EngineCoreRequest,
+fn invocation_paged_stage_and_domains<'a>(
+    request: &'a EngineCoreRequest,
     scheduled: &ScheduledRequest,
-) -> Result<super::InvocationPagedKvLease> {
+) -> Result<(
+    &'a super::StageDescriptor,
+    Vec<crate::kv::v2::StateDomainId>,
+)> {
     let binding = request.execution_adapter_binding().ok_or_else(|| {
         Error::InferenceError("physical invocation row has no loaded adapter binding".to_string())
     })?;
@@ -341,17 +341,35 @@ fn invocation_paged_lease_for_row(
                 "physical invocation row has no workspace for its scheduled stage".to_string(),
             )
         })?;
-    let mut paged = workspace.domains.iter().filter_map(|domain| match domain {
-        crate::kv::v2::InvocationWorkspaceDomain::State {
-            state: crate::kv::v2::StateDomainSpec::PagedAttention(state),
-            ..
-        } => Some(state.header.id),
-        _ => None,
-    });
-    let domain = paged.next().ok_or_else(|| {
-        Error::InferenceError("physical invocation stage has no paged workspace domain".to_string())
-    })?;
-    if paged.next().is_some() {
+    let paged = workspace
+        .domains
+        .iter()
+        .filter_map(|domain| match domain {
+            crate::kv::v2::InvocationWorkspaceDomain::State {
+                state: crate::kv::v2::StateDomainSpec::PagedAttention(state),
+                capacity: crate::kv::v2::InvocationStateCapacity::PagedTokens { .. },
+                ..
+            } => Some(state.header.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if paged.is_empty() {
+        return Err(Error::InferenceError(
+            "physical invocation stage has no paged workspace domain".to_string(),
+        ));
+    }
+    Ok((stage, paged))
+}
+
+/// Lease the one paged invocation domain authored for this exact scheduled
+/// stage. Models receive only the physical cache view and cannot select a pool
+/// by convention or by model-family-specific IDs.
+fn invocation_paged_lease_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<super::InvocationPagedKvLease> {
+    let (stage, domains) = invocation_paged_stage_and_domains(request, scheduled)?;
+    if domains.len() != 1 {
         return Err(Error::InferenceError(
             "physical invocation stage has multiple paged workspace domains".to_string(),
         ));
@@ -361,7 +379,43 @@ fn invocation_paged_lease_for_row(
         .ok_or_else(|| {
             Error::InferenceError("physical invocation row has no sealed runtime".to_string())
         })?
-        .lease_invocation_paged(stage.id, domain)
+        .lease_invocation_paged(stage.id, domains[0])
+}
+
+fn validate_atomic_scalar_invocation_stage(
+    stage: &super::StageDescriptor,
+    work: &WorkUnit,
+) -> Result<()> {
+    if !matches!(work, WorkUnit::AtomicJob { .. }) {
+        return Err(Error::InvalidInput(
+            "scalar invocation workspace requires an atomic scheduled row".to_string(),
+        ));
+    }
+    if stage.progress != StageProgressKind::Atomic || stage.batch_mode != NativeBatchMode::None {
+        return Err(Error::InvalidInput(
+            "atomic invocation workspace requires a scalar atomic execution stage".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Acquire one atomic scalar row's complete authored paged-domain set in
+/// canonical identity order. Callers cannot omit a required domain. The
+/// returned set releases every already-acquired lease if a later domain fails,
+/// and explicit completion returns only authenticated writes.
+#[allow(dead_code)]
+fn invocation_paged_leases_for_atomic_scalar_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<crate::kv::v2::InvocationPagedLeaseSetV2> {
+    let (stage, authored) = invocation_paged_stage_and_domains(request, scheduled)?;
+    validate_atomic_scalar_invocation_stage(stage, &scheduled.work)?;
+    request
+        .v2_state_runtime()
+        .ok_or_else(|| {
+            Error::InferenceError("physical invocation row has no sealed runtime".to_string())
+        })?
+        .lease_invocation_paged_set(stage.id, &authored)
 }
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
@@ -1647,6 +1701,36 @@ mod tests {
     fn test_worker_config_default() {
         let config = WorkerConfig::default();
         assert_eq!(config.backend, config.backend_context.backend_kind);
+    }
+
+    #[test]
+    fn atomic_invocation_leases_reject_non_atomic_or_tensor_stages() {
+        let profile = ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        let scalar = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "atomic.scalar",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let atomic = WorkUnit::AtomicJob {
+            kind: "test".to_string(),
+        };
+        validate_atomic_scalar_invocation_stage(&scalar, &atomic).unwrap();
+
+        let sequence = WorkUnit::SequenceStep {
+            phase: super::super::SequencePhase::Decode,
+            input: super::super::InputRange { start: 0, end: 1 },
+            max_output_steps: 1,
+        };
+        assert!(validate_atomic_scalar_invocation_stage(&scalar, &sequence).is_err());
+
+        let tensor = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "atomic.tensor",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        assert!(validate_atomic_scalar_invocation_stage(&tensor, &atomic).is_err());
     }
 
     #[test]
