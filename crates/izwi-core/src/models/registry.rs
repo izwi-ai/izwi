@@ -44,8 +44,7 @@ use crate::models::architectures::qwen3::chat::{
 use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PrefixSnapshot,
-    Qwen35PreparedPrompt,
+    ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
 };
 use crate::models::architectures::sortformer::diarization::{
     SortformerDiarizerModel, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
@@ -1938,20 +1937,6 @@ impl NativeChatDecodeState {
         }
     }
 
-    pub(crate) fn take_pending_qwen35_prefix_snapshot(&mut self) -> Option<Qwen35PrefixSnapshot> {
-        match self {
-            Self::Qwen35(state) => state.take_pending_prefix_snapshot(),
-            Self::Qwen3(_) => None,
-        }
-    }
-
-    pub(crate) fn reused_qwen35_prefix_tokens(&self) -> usize {
-        match self {
-            Self::Qwen35(state) => state.reused_prefix_tokens(),
-            Self::Qwen3(_) => 0,
-        }
-    }
-
     pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
@@ -2065,17 +2050,13 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
-            Self::Qwen35(model) => {
-                let output = model.generate_with_config(messages, max_new_tokens, config)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
+            )),
             Self::Gemma3(model) => {
                 let output = model.generate(messages, max_new_tokens)?;
                 Ok(ChatGenerationOutput {
@@ -2107,23 +2088,14 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _config: &ChatGenerationConfig,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
         match self {
             Self::Qwen3(model) => model.generate_with_callback(messages, max_new_tokens, on_delta),
-            Self::Qwen35(model) => {
-                let output = model.generate_with_callback_and_config(
-                    messages,
-                    max_new_tokens,
-                    config,
-                    on_delta,
-                )?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
+            )),
             Self::Gemma3(model) => {
                 let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
                 Ok(ChatGenerationOutput {
@@ -2249,33 +2221,14 @@ impl NativeChatModel {
 
     pub fn start_decode_state_with_prepared(
         &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        config: &ChatGenerationConfig,
+        _messages: &[ChatMessage],
+        _max_new_tokens: usize,
+        _config: &ChatGenerationConfig,
         prepared_qwen35: Option<&Qwen35PreparedPrompt>,
-    ) -> Result<NativeChatDecodeState> {
-        self.start_decode_state_with_prefix(
-            messages,
-            max_new_tokens,
-            config,
-            prepared_qwen35,
-            None,
-            None,
-        )
-    }
-
-    pub(crate) fn start_decode_state_with_prefix(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        config: &ChatGenerationConfig,
-        prepared_qwen35: Option<&Qwen35PreparedPrompt>,
-        prefix: Option<&Qwen35PrefixSnapshot>,
-        capture_prefix_max_bytes: Option<u64>,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(_) => {
-                if prepared_qwen35.is_some() || prefix.is_some() {
+                if prepared_qwen35.is_some() {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared prompt was routed to a Qwen3 model".to_string(),
                     ));
@@ -2284,17 +2237,9 @@ impl NativeChatModel {
                     "incremental Qwen3 chat requires scheduler-owned physical state".to_string(),
                 ))
             }
-            Self::Qwen35(model) => {
-                let state = model.start_decode_state_with_optional_prepared_and_prefix(
-                    messages,
-                    max_new_tokens,
-                    config,
-                    prepared_qwen35,
-                    prefix,
-                    capture_prefix_max_bytes,
-                )?;
-                Ok(NativeChatDecodeState::Qwen35(state))
-            }
+            Self::Qwen35(_) => Err(Error::InvalidInput(
+                "incremental Qwen3.5 chat requires scheduler-owned physical state".into(),
+            )),
             Self::Gemma3(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this chat model".to_string(),
             )),

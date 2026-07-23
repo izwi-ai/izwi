@@ -1,13 +1,8 @@
-use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::debug;
-
-use crate::engine::resources::{ReservationClass, ReservationOwner, ResourceLease};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
-use crate::models::architectures::qwen35::chat::{Qwen35PrefixSnapshot, Qwen35PreparedPrompt};
 use crate::models::registry::NativeChatModel;
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
@@ -15,17 +10,11 @@ use crate::models::shared::chat::ChatMessage;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
-use super::prefix_cache::{ExactPrefixHandle, ExactPrefixScope};
 use super::state::ActiveChatDecode;
 use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
-
-struct PendingPrefixAuthorization {
-    max_bytes: u64,
-    lease: ResourceLease,
-}
 
 #[derive(Debug, Default)]
 struct StreamDeltaBatch {
@@ -138,15 +127,6 @@ impl NativeExecutor {
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
         let model = request.prepared_chat_model_for_executor()?;
-        let prefix_scope = ExactPrefixScope {
-            variant,
-            backend: self.config.backend,
-            activation_dtype: self.config.dtype.clone(),
-            kv_cache_dtype: self.config.kv_cache_dtype.clone(),
-        };
-        let prefix_cache_enabled = managed_cache.is_none()
-            && self.qwen35_prefix_cache_enabled(prepared_qwen35_prompt, model.as_ref());
-
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
             let mut phase_timing_override: Option<ExecutorPhaseTiming> = None;
@@ -290,31 +270,6 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
-            let cached_prefix = prefix_cache_enabled
-                .then(|| {
-                    let prepared = prepared_qwen35_prompt
-                        .expect("enabled Qwen3.5 prefix cache requires prepared prompt");
-                    self.qwen35_prefix_cache.lookup(
-                        &model,
-                        &prefix_scope,
-                        prepared.prompt_ids(),
-                        prepared.prompt_positions(),
-                    )
-                })
-                .flatten();
-            let pending_prefix_authorization = prefix_cache_enabled
-                .then(|| {
-                    self.preauthorize_qwen35_prefix_snapshot(
-                        request,
-                        &prefix_scope,
-                        prepared_qwen35_prompt
-                            .expect("enabled Qwen3.5 prefix cache requires prepared prompt"),
-                    )
-                })
-                .flatten();
-            let capture_prefix_max_bytes = pending_prefix_authorization
-                .as_ref()
-                .map(|authorization| authorization.max_bytes);
             let mut decode_state = match managed_cache.take() {
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35(_)) => {
                     Self::run_blocking(|| {
@@ -330,45 +285,21 @@ impl NativeExecutor {
                 Some(cache) => Self::run_blocking(|| {
                     model.start_qwen3_decode_state_managed(messages, max_new_tokens, cache)
                 })?,
-                None => Self::run_blocking(|| {
-                    model.start_decode_state_with_prefix(
-                        messages,
-                        max_new_tokens,
-                        &generation_config,
-                        prepared_qwen35_prompt,
-                        cached_prefix.as_ref().map(|cached| cached.snapshot()),
-                        capture_prefix_max_bytes,
-                    )
-                })?,
+                None => {
+                    return Err(Error::InferenceError(
+                        "incremental chat execution requires scheduler-owned physical state".into(),
+                    ))
+                }
             };
             if let Some(reservation) = tensor_reservation {
                 decode_state.bind_qwen35_tensor_sequence(reservation.sequence)?;
             }
-            let reused_prefix_tokens = decode_state.reused_qwen35_prefix_tokens();
-            if reused_prefix_tokens > 0 {
-                debug!(
-                    model = %variant,
-                    reused_prefix_tokens,
-                    prompt_tokens = request.num_prompt_tokens(),
-                    "Qwen3.5 exact-prefix cache hit"
-                );
-            }
-            let pending_prefix_snapshot = match (
-                decode_state.take_pending_qwen35_prefix_snapshot(),
-                pending_prefix_authorization,
-            ) {
-                (Some(snapshot), Some(authorization)) => {
-                    self.materialize_qwen35_prefix_snapshot(&prefix_scope, snapshot, authorization)
-                }
-                _ => None,
-            };
             ActiveChatDecode {
                 variant,
                 state: decode_state,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 streamed_text: String::new(),
-                pending_prefix_snapshot,
             }
         };
 
@@ -427,11 +358,6 @@ impl NativeExecutor {
             }
 
             if step.finished {
-                if let Some(snapshot) = active_state.pending_prefix_snapshot.take() {
-                    let _ = self
-                        .qwen35_prefix_cache
-                        .insert(&model, prefix_scope.clone(), snapshot);
-                }
                 finished = true;
                 break;
             }
@@ -672,83 +598,6 @@ impl NativeExecutor {
             }
         }
         Ok(outputs)
-    }
-
-    fn qwen35_prefix_cache_enabled(
-        &self,
-        prepared: Option<&Qwen35PreparedPrompt>,
-        model: &NativeChatModel,
-    ) -> bool {
-        self.config.resource_authority.is_some()
-            && self.qwen35_prefix_cache.max_retained_bytes() > 0
-            && matches!(model, NativeChatModel::Qwen35(_))
-            && prepared.is_some_and(Qwen35PreparedPrompt::supports_exact_prefix_reuse)
-    }
-
-    fn preauthorize_qwen35_prefix_snapshot(
-        &self,
-        request: &EngineCoreRequest,
-        scope: &ExactPrefixScope,
-        prepared: &Qwen35PreparedPrompt,
-    ) -> Option<PendingPrefixAuthorization> {
-        let state_bytes = self.authorized_session_cache_bytes(request).ok()?;
-        let metadata_per_token = size_of::<u32>().checked_add(size_of::<[usize; 3]>())?;
-        let metadata_bytes = prepared
-            .prompt_ids()
-            .len()
-            .checked_mul(metadata_per_token)?
-            .checked_add(size_of::<Qwen35PrefixSnapshot>())?;
-        let max_bytes = state_bytes.checked_add(u64::try_from(metadata_bytes).ok()?)?;
-        if max_bytes == 0 || max_bytes > self.qwen35_prefix_cache.max_retained_bytes() {
-            return None;
-        }
-        let Some(authority) = self.config.resource_authority.as_ref() else {
-            return None;
-        };
-        let resources = super::cache_resource_vector(scope.backend, max_bytes);
-        let owner = ReservationOwner::new(
-            ReservationClass::Cache,
-            format!("qwen35-prefix-pending:{}", scope.variant),
-        );
-        let lease = authority.reserve(owner, resources).ok()?;
-        Some(PendingPrefixAuthorization { max_bytes, lease })
-    }
-
-    fn materialize_qwen35_prefix_snapshot(
-        &self,
-        scope: &ExactPrefixScope,
-        snapshot: Qwen35PrefixSnapshot,
-        mut authorization: PendingPrefixAuthorization,
-    ) -> Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>> {
-        let Some(bytes) = snapshot.retained_bytes() else {
-            drop(snapshot);
-            drop(authorization);
-            return None;
-        };
-        if bytes == 0 || bytes > authorization.max_bytes {
-            drop(snapshot);
-            drop(authorization);
-            return None;
-        }
-        let resources = super::cache_resource_vector(scope.backend, bytes);
-        if authorization
-            .lease
-            .record_materialized_usage(resources)
-            .is_err()
-        {
-            drop(snapshot);
-            drop(authorization);
-            return None;
-        }
-        // The copy is complete and its exact backing size is known. Relinquish
-        // unused preauthorization while keeping the materialized snapshot fully
-        // covered for its retained lifetime.
-        let _ = authorization.lease.resize(resources);
-        Some(ExactPrefixHandle::new(
-            scope.backend,
-            snapshot,
-            Some(authorization.lease),
-        ))
     }
 }
 

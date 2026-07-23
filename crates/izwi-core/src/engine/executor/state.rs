@@ -1,10 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::prefix_cache::ExactPrefixHandle;
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::{PhysicalTtsDecodeState, Qwen3TtsModel};
-use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{
     AsrModelLease, NativeAsrDecodeState, NativeAsrModel, NativeChatDecodeState, QwenTtsModelLease,
 };
@@ -18,7 +16,6 @@ pub(super) struct ActiveChatDecode {
     /// Tokenizer decoders may normalize or rewrite their cumulative terminal
     /// string, but an SSE delta cannot be retracted after publication.
     pub(super) streamed_text: String,
-    pub(super) pending_prefix_snapshot: Option<Arc<ExactPrefixHandle<Qwen35PrefixSnapshot>>>,
 }
 
 pub(super) struct ActiveAsrDecode {

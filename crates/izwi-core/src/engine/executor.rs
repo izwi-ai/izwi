@@ -18,8 +18,6 @@ mod handler_audio_chat;
 mod handler_chat;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
-#[path = "executor/prefix_cache.rs"]
-mod prefix_cache;
 #[path = "executor/state.rs"]
 mod state;
 #[path = "executor/streaming.rs"]
@@ -61,11 +59,9 @@ use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat, Resol
 use crate::model::ModelVariant;
 pub(super) use crate::models::architectures::qwen3::core::Qwen3ManagedCache as ManagedQwenCache;
 use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
-use crate::models::architectures::qwen35::chat::Qwen35PrefixSnapshot;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
-use prefix_cache::{configured_qwen35_prefix_cache_bytes, ExactPrefixCache};
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
 fn qwen3_managed_cache_for_row(
@@ -1063,7 +1059,6 @@ pub struct NativeExecutor {
     initialized: bool,
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
     chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
-    qwen35_prefix_cache: ExactPrefixCache<NativeChatModel, Qwen35PrefixSnapshot>,
     asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
     qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
     cache_resource_leases: Mutex<HashMap<SessionKey, CacheResourceReservation>>,
@@ -1072,13 +1067,11 @@ pub struct NativeExecutor {
 impl NativeExecutor {
     /// Create a new native executor.
     pub fn new(config: WorkerConfig) -> Self {
-        let qwen35_prefix_cache = ExactPrefixCache::new(configured_qwen35_prefix_cache_bytes());
         Self {
             config,
             initialized: false,
             loaded_tts_model: None,
             chat_decode_states: Mutex::new(HashMap::new()),
-            qwen35_prefix_cache,
             asr_decode_states: Mutex::new(HashMap::new()),
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
             cache_resource_leases: Mutex::new(HashMap::new()),
@@ -1770,7 +1763,6 @@ impl ModelExecutor for NativeExecutor {
             lease.prepare_materialized_release(zero)?;
         }
         chat.clear();
-        self.qwen35_prefix_cache.clear();
         asr.clear();
         tts.clear();
         reservations.clear();
@@ -1839,8 +1831,8 @@ impl ModelExecutor for NativeExecutor {
         CacheReleaseReport::confirmed(released)
     }
 
-    fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
-        CacheReleaseReport::confirmed(self.qwen35_prefix_cache.purge_variant(variant))
+    fn purge_model_cache(&self, _variant: ModelVariant) -> CacheReleaseReport {
+        CacheReleaseReport::confirmed(0)
     }
 }
 
