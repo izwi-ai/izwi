@@ -1553,20 +1553,6 @@ impl EngineCore {
                     request.install_managed_cache_runtime(physical)?;
                 }
             }
-            let capability = request.cache_capability().clone();
-            if capability.managed_contract().is_some() {
-                let managed_backend = self.managed_kv_cache.worker_backend();
-                let runtime = self
-                    .managed_kv_cache
-                    .require_loaded_runtime(model_instance, managed_backend, &capability)?
-                    .ok_or_else(|| {
-                        Error::InferenceError(
-                            "loaded adapter published managed KV without a resolved runtime"
-                                .to_string(),
-                        )
-                    })?;
-                request.install_managed_cache_runtime(runtime)?;
-            }
         }
 
         // Add to scheduler. A public ID remains unavailable while an expired
@@ -3398,6 +3384,86 @@ mod tests {
         fn shutdown(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    fn bind_managed_test_state(
+        core: &mut EngineCore,
+        request: &mut EngineCoreRequest,
+        model_instance: ModelInstanceId,
+    ) {
+        let variant = request.model_variant.expect("managed test model");
+        let legacy_contract = crate::kv::test_contract();
+        let capability = crate::kv::CacheCapability::Managed(legacy_contract.clone());
+        let physical = core
+            .load_managed_model_cache(model_instance, &capability)
+            .expect("load managed state")
+            .expect("physical managed state");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.cache_mode = CacheMode::ExternalPaged;
+        profile.cache_namespace = Some("core-test-state-v2".to_string());
+        profile.kv_dtype = "state_v2_resolved".to_string();
+        profile.resolved_from_loaded_model = true;
+        let stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(1),
+            "chat.test.physical",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let execution = super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: model_instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(model_instance.get()),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "chat".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(
+            crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).expect("upgrade test contract"),
+            &execution.stages,
+        );
+        let runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::managed(
+            crate::kv::v2::ManagedCapabilityRuntimeV2::seal(
+                BackendKind::Cpu,
+                &execution,
+                descriptor,
+                physical,
+                crate::kv::v2::RetainedStateUseV2::ExternalPaged,
+            )
+            .expect("seal managed test runtime"),
+        ));
+        request
+            .bind_execution_adapter(execution)
+            .expect("bind test execution");
+        request
+            .bind_v2_state_runtime(runtime.clone(), runtime.state_fingerprint, BackendKind::Cpu)
+            .expect("bind managed test state");
+    }
+
+    fn managed_test_request(
+        core: &mut EngineCore,
+        model_instance: ModelInstanceId,
+        id: &str,
+        tokens: Vec<u32>,
+    ) -> EngineCoreRequest {
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: id.to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        request.id = id.to_string();
+        request.params.max_tokens = 1;
+        request
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, tokens, None)
+            .expect("prepare prompt");
+        request
+            .bind_model_instance(model_instance)
+            .expect("model instance");
+        bind_managed_test_state(core, &mut request, model_instance);
+        request
     }
 
     #[test]
@@ -5353,13 +5419,7 @@ mod tests {
         request
             .bind_model_instance(model_instance)
             .expect("model instance");
-        request
-            .bind_cache_capability(crate::kv::CacheCapability::Managed(
-                crate::kv::test_contract(),
-            ))
-            .expect("cache contract");
-        core.load_managed_model_cache(model_instance, request.cache_capability())
-            .expect("load managed state");
+        bind_managed_test_state(&mut core, &mut request, model_instance);
         core.add_request(request).expect("add request");
         let session = core
             .get_session_key(&"managed-core".to_string())
@@ -5398,41 +5458,26 @@ mod tests {
         .expect("core");
         core.retry_policy.execution_backoff_base = Duration::ZERO;
         core.retry_policy.execution_backoff_max = Duration::ZERO;
-        let capability = crate::kv::CacheCapability::Managed(crate::kv::test_contract());
-        core.load_managed_model_cache(model_instance, &capability)
-            .expect("load managed state");
-        let managed_request = |id: &str, tokens: Vec<u32>| {
-            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
-                role: ChatRole::User,
-                content: id.to_string(),
-            }])
-            .with_model_variant(ModelVariant::Qwen306B);
-            request.id = id.to_string();
-            request.params.max_tokens = 1;
-            request
-                .install_chat_execution_preparation(ModelVariant::Qwen306B, tokens, None)
-                .expect("prepare prompt");
-            request
-                .bind_model_instance(model_instance)
-                .expect("model instance");
-            request
-                .bind_cache_capability(crate::kv::CacheCapability::Managed(
-                    crate::kv::test_contract(),
-                ))
-                .expect("cache contract");
-            request
-        };
-
-        core.add_request(managed_request("capacity-owner", vec![1, 2, 3, 4]))
-            .expect("add owner");
+        let owner = managed_test_request(
+            &mut core,
+            model_instance,
+            "capacity-owner",
+            vec![1, 2, 3, 4],
+        );
+        core.add_request(owner).expect("add owner");
         core.step().await.expect("commit owner prefill");
         let owner_session = core
             .get_session_key(&"capacity-owner".to_string())
             .expect("owner session");
         core.scheduler.finish_request(&"capacity-owner".to_string());
 
-        core.add_request(managed_request("capacity-waiter", vec![5, 6, 7, 8]))
-            .expect("add waiter");
+        let waiter = managed_test_request(
+            &mut core,
+            model_instance,
+            "capacity-waiter",
+            vec![5, 6, 7, 8],
+        );
+        core.add_request(waiter).expect("add waiter");
         assert!(core
             .prepare_step()
             .await
@@ -5462,13 +5507,13 @@ mod tests {
     }
 
     #[test]
-    fn opaque_loaded_adapter_does_not_allocate_managed_cache() {
+    fn unbound_request_does_not_allocate_managed_cache() {
         let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
         let mut core =
             EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
         let mut request = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
-            content: "opaque".to_string(),
+            content: "unbound".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
         request

@@ -17,7 +17,6 @@ use crate::kv::v2::{
     ManagedCapabilityRuntimeV2, RetainedStateCapability, RetainedStateRuntimeV2,
     RetainedStateUseV2, StatelessCapabilityRuntimeV2,
 };
-use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
 
 use super::{
@@ -31,7 +30,6 @@ const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::ne
 const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(10);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
-const COMPATIBILITY_CACHE_FALLBACK_REASON: &str = "loaded_adapter_uses_model_owned_cache";
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Streaming has two independent meanings at the loaded-adapter boundary:
@@ -121,19 +119,10 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract>;
 }
 
-fn legacy_model_owned_state_publication() -> LoadedStatePublication {
-    LoadedStatePublication::LegacyV1(LoadedKvCacheCapability {
-        capability: CacheCapability::OpaqueModelOwned,
-        fallback_reason: Some(COMPATIBILITY_CACHE_FALLBACK_REASON),
-    })
-}
-
-/// Additive loaded-state publication during the ABI migration. v1 remains an
-/// explicit compatibility value; v2 is validated as a complete semantic
-/// contract and is never converted to an opaque v1 fallback.
+/// Loaded-state publication normalized into an immutable ABI-v2 runtime before
+/// the model becomes ready.
 #[derive(Debug, Clone)]
 pub(crate) enum LoadedStatePublication {
-    LegacyV1(LoadedKvCacheCapability),
     V2(CapabilityStateDescriptorV2),
     ManagedV2 {
         contract: InferenceStateContract,
@@ -154,7 +143,6 @@ pub(crate) enum LoadedStatePublication {
 impl LoadedStatePublication {
     fn validate(&self, stages: &[StageDescriptor]) -> Result<()> {
         match self {
-            Self::LegacyV1(cache) => cache.validate(),
             Self::V2(descriptor) => descriptor.validate_against_stages(stages),
             Self::ManagedV2 { contract, physical } => {
                 contract.validate()?;
@@ -194,27 +182,6 @@ impl LoadedStatePublication {
                 }
                 Ok(())
             }
-        }
-    }
-
-    fn legacy_binding(&self) -> Result<CapabilityStateBinding> {
-        match self {
-            Self::LegacyV1(cache) => Ok(CapabilityStateBinding::LegacyV1(cache.capability.clone())),
-            Self::V2(_) | Self::ManagedV2 { .. } | Self::PhysicalV2 { .. } => {
-                Err(Error::ModelLoadError(
-                    "state ABI v2 requires an immutable load-sealed runtime binding".to_string(),
-                ))
-            }
-        }
-    }
-
-    fn fingerprint(&self, stages: &[StageDescriptor]) -> Result<Option<[u8; 32]>> {
-        match self {
-            Self::LegacyV1(_) => Ok(None),
-            Self::V2(descriptor) => Ok(Some(descriptor.fingerprint(stages)?)),
-            Self::ManagedV2 { .. } | Self::PhysicalV2 { .. } => Err(Error::ModelLoadError(
-                "managed v2 publication must be normalized into a sealed descriptor".to_string(),
-            )),
         }
     }
 }
@@ -287,23 +254,16 @@ impl LoadedCapabilityDescriptor {
                     &stage_graphs,
                 )?)
             }
-            None if execution.metadata().capability == CapabilityKind::RealtimeAsr
-                && execution.metadata().model_variant.family()
-                    == crate::catalog::ModelFamily::NemotronAsr =>
-            {
-                return Err(Error::ModelLoadError(
-                    "Nemotron realtime ASR requires a load-sealed physical tensor runtime".into(),
-                ));
+            None => {
+                return Err(Error::ModelLoadError(format!(
+                    "loaded model {} capability {:?} requires an explicit load-sealed ABI-v2 state publication",
+                    execution.metadata().model_variant,
+                    execution.metadata().capability,
+                )));
             }
-            None => legacy_model_owned_state_publication(),
         };
         let mut v2_runtimes = HashMap::new();
         let state = match state {
-            LoadedStatePublication::LegacyV1(cache) => {
-                let state = LoadedStatePublication::LegacyV1(cache);
-                state.validate(&contracts[0].stages)?;
-                state
-            }
             LoadedStatePublication::V2(descriptor) => {
                 if !descriptor.is_stateless() {
                     return Err(Error::ModelLoadError(
@@ -546,11 +506,7 @@ impl LoadedCapabilityDescriptor {
         let contract = self.contract(streaming)?;
         self.state.validate(&contract.stages)?;
         let execution = contract.adapter_binding()?;
-        let (state, state_fingerprint) = match &self.state {
-            LoadedStatePublication::LegacyV1(_) => (
-                self.state.legacy_binding()?,
-                self.state.fingerprint(&contract.stages)?,
-            ),
+        let state = match &self.state {
             LoadedStatePublication::V2(_) => {
                 let graph = stage_graph_fingerprint(&contract.stages)?;
                 let runtime = self.v2_runtimes.get(&graph).ok_or_else(|| {
@@ -560,10 +516,7 @@ impl LoadedCapabilityDescriptor {
                     )
                 })?;
                 runtime.validate_against(contract.execution_profile.backend, &execution)?;
-                (
-                    CapabilityStateBinding::V2(runtime.clone()),
-                    Some(runtime.state_fingerprint),
-                )
+                runtime.clone()
             }
             LoadedStatePublication::ManagedV2 { .. }
             | LoadedStatePublication::PhysicalV2 { .. } => {
@@ -572,11 +525,7 @@ impl LoadedCapabilityDescriptor {
                 ));
             }
         };
-        Ok(LoadedCapabilityBinding {
-            execution,
-            state,
-            state_fingerprint,
-        })
+        Ok(LoadedCapabilityBinding { execution, state })
     }
 }
 
@@ -616,14 +565,7 @@ fn validate_retained_state_use(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoadedCapabilityBinding {
     pub(crate) execution: ExecutionAdapterBinding,
-    pub(crate) state: CapabilityStateBinding,
-    pub(crate) state_fingerprint: Option<[u8; 32]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CapabilityStateBinding {
-    LegacyV1(CacheCapability),
-    V2(Arc<CapabilityStateRuntimeV2>),
+    pub(crate) state: Arc<CapabilityStateRuntimeV2>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1682,15 +1624,8 @@ impl LoadedModelBundle {
 mod tests {
     use super::*;
     use crate::engine::{EngineCore, EngineCoreConfig};
+    use crate::kv::CacheCapability;
     use crate::runtime::adapters::ExecutionTargetKind;
-
-    fn legacy_model_owned_capability() -> CacheCapability {
-        let LoadedStatePublication::LegacyV1(loaded) = legacy_model_owned_state_publication()
-        else {
-            unreachable!("legacy helper must remain a v1 publication")
-        };
-        loaded.capability
-    }
 
     #[test]
     fn managed_qwen_publication_seals_a_physical_v2_runtime() {
@@ -1728,9 +1663,7 @@ mod tests {
             .capability_binding_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
             .unwrap();
         assert_eq!(binding.execution.model_instance_id, model_instance);
-        let CapabilityStateBinding::V2(runtime) = binding.state else {
-            panic!("expected managed v2 runtime");
-        };
+        let runtime = binding.state;
         assert!(runtime.managed_kv_runtime().is_some());
         let inactive = CapabilityStateRuntimeV2::managed(
             ManagedCapabilityRuntimeV2::seal(
@@ -1765,13 +1698,8 @@ mod tests {
         request.bind_model_instance(model_instance).unwrap();
         request.bind_execution_adapter(binding.execution).unwrap();
         request
-            .bind_v2_state_runtime(
-                runtime,
-                binding.state_fingerprint.expect("state fingerprint"),
-                BackendKind::Cpu,
-            )
+            .bind_v2_state_runtime(runtime.clone(), runtime.state_fingerprint, BackendKind::Cpu)
             .unwrap();
-        assert_eq!(request.cache_capability(), &CacheCapability::None);
         assert!(request.v2_state_runtime().is_some());
     }
 
@@ -1811,9 +1739,7 @@ mod tests {
         let binding = bundle
             .capability_binding_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
             .unwrap();
-        let CapabilityStateBinding::V2(runtime) = binding.state else {
-            panic!("expected managed v2 runtime");
-        };
+        let runtime = binding.state;
         drop(physical);
 
         assert!(core
@@ -1860,9 +1786,7 @@ mod tests {
         let offline = bundle
             .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
             .unwrap();
-        let CapabilityStateBinding::V2(offline) = offline.state else {
-            panic!("expected offline v2 runtime");
-        };
+        let offline = offline.state;
         assert!(offline.managed_kv_runtime().is_none());
 
         let streaming = bundle
@@ -1871,9 +1795,7 @@ mod tests {
                 StreamingRequirements::native(true),
             )
             .unwrap();
-        let CapabilityStateBinding::V2(streaming) = streaming.state else {
-            panic!("expected streaming v2 runtime");
-        };
+        let streaming = streaming.state;
         assert!(streaming.managed_kv_runtime().is_some());
         assert_eq!(
             bundle
@@ -1886,57 +1808,19 @@ mod tests {
     }
 
     #[test]
-    fn exact_native_qwen3_cpu_descriptor_seals_execution_and_managed_cache_truth() {
+    fn stateful_qwen_capability_fails_closed_without_physical_publication() {
         let registry = RuntimeAdapterRegistry::built_in();
-        let managed = CacheCapability::Managed(crate::kv::test_contract());
-        let state_publications = HashMap::from([(
-            CapabilityKind::Chat,
-            LoadedStatePublication::LegacyV1(LoadedKvCacheCapability {
-                capability: managed.clone(),
-                fallback_reason: None,
-            }),
-        )]);
-        let exact = LoadedModelBundle::bind_with_state_publications(
-            &registry,
-            ExecutionGroupId::new(3),
-            ModelInstanceId::new(9),
-            ModelVariant::Qwen306B,
-            BackendKind::Cpu,
-            state_publications,
-        )
-        .unwrap();
-        let binding = exact
-            .capability_binding_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
-            .unwrap();
-        assert_eq!(binding.execution.model_instance_id, ModelInstanceId::new(9));
-        assert_eq!(binding.execution.capability_id, "chat");
-        assert_eq!(binding.state, CapabilityStateBinding::LegacyV1(managed));
-
-        let catalog_only = LoadedModelBundle::bind(
+        let error = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(10),
             ModelVariant::Qwen306B,
             BackendKind::Cpu,
         )
-        .unwrap();
-        assert_eq!(
-            catalog_only
-                .capability_binding_for_streaming(
-                    CapabilityKind::Chat,
-                    StreamingRequirements::NONE,
-                )
-                .unwrap(),
-            LoadedCapabilityBinding {
-                execution: catalog_only
-                    .contract(CapabilityKind::Chat, false)
-                    .unwrap()
-                    .adapter_binding()
-                    .unwrap(),
-                state: CapabilityStateBinding::LegacyV1(legacy_model_owned_capability()),
-                state_fingerprint: None,
-            }
-        );
+        .expect_err("stateful chat must not seal without physical state");
+        assert!(error
+            .to_string()
+            .contains("requires an explicit load-sealed ABI-v2 state publication"));
     }
 
     #[test]
@@ -1977,9 +1861,7 @@ mod tests {
         let binding = bundle
             .capability_binding_for_streaming(capability, StreamingRequirements::NONE)
             .unwrap();
-        let CapabilityStateBinding::V2(runtime) = binding.state else {
-            panic!("expected stateless v2 runtime");
-        };
+        let runtime = binding.state;
         assert_eq!(runtime.descriptor, descriptor);
         runtime
             .validate_against(BackendKind::Cpu, &binding.execution)
@@ -2020,7 +1902,10 @@ mod tests {
         let transport = bundle
             .capability_binding_for_streaming(capability, StreamingRequirements::transport_only())
             .unwrap();
-        assert_eq!(offline.state_fingerprint, transport.state_fingerprint);
+        assert_eq!(
+            offline.state.state_fingerprint,
+            transport.state.state_fingerprint
+        );
     }
 
     #[test]
@@ -2037,7 +1922,7 @@ mod tests {
         .expect_err("Nemotron realtime must fail closed without physical publication");
         assert!(error
             .to_string()
-            .contains("load-sealed physical tensor runtime"));
+            .contains("requires an explicit load-sealed ABI-v2 state publication"));
     }
 
     #[test]
@@ -2071,7 +1956,7 @@ mod tests {
     #[test]
     fn managed_v2_publication_requires_a_physical_runtime_before_ready() {
         let registry = RuntimeAdapterRegistry::built_in();
-        let compatibility = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(12),
@@ -2079,24 +1964,22 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
-        let stages = compatibility
-            .contract(CapabilityKind::Chat, false)
+        let stages = draft
+            .execution_contracts(CapabilityKind::Chat)
             .unwrap()
+            .remove(0)
             .stages;
         let descriptor = CapabilityStateDescriptorV2::managed_for_stages_test(
             crate::kv::v2::test_contract(),
             &stages,
         );
 
-        let error = LoadedModelBundle::bind_with_state_publications(
-            &registry,
-            ExecutionGroupId::new(3),
-            ModelInstanceId::new(12),
-            ModelVariant::Qwen306B,
-            BackendKind::Cpu,
-            HashMap::from([(CapabilityKind::Chat, LoadedStatePublication::V2(descriptor))]),
-        )
-        .expect_err("managed v2 metadata alone must not publish Ready");
+        let error = draft
+            .seal(HashMap::from([(
+                CapabilityKind::Chat,
+                LoadedStatePublication::V2(descriptor),
+            )]))
+            .expect_err("managed v2 metadata alone must not publish Ready");
         assert!(error.to_string().contains("requires physical backing"));
     }
 
@@ -2104,7 +1987,7 @@ mod tests {
     fn stateless_v2_rejects_execution_that_declares_model_owned_cache() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Qwen3508BGguf;
-        let compatibility = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(3),
             ModelInstanceId::new(13),
@@ -2112,21 +1995,19 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
-        let stages = compatibility
-            .contract_for_streaming(CapabilityKind::Chat, StreamingRequirements::NONE)
+        let stages = draft
+            .execution_contracts(CapabilityKind::Chat)
             .unwrap()
+            .remove(0)
             .stages;
         let descriptor = CapabilityStateDescriptorV2::stateless_for_stages_test(&stages);
 
-        let error = LoadedModelBundle::bind_with_state_publications(
-            &registry,
-            ExecutionGroupId::new(3),
-            ModelInstanceId::new(13),
-            variant,
-            BackendKind::Cpu,
-            HashMap::from([(CapabilityKind::Chat, LoadedStatePublication::V2(descriptor))]),
-        )
-        .expect_err("stateless v2 must not relabel an opaque sequence cache");
+        let error = draft
+            .seal(HashMap::from([(
+                CapabilityKind::Chat,
+                LoadedStatePublication::V2(descriptor),
+            )]))
+            .expect_err("stateless v2 must not relabel a retained sequence cache");
         assert!(
             error
                 .to_string()
@@ -2136,50 +2017,32 @@ mod tests {
     }
 
     #[test]
-    fn cache_truth_is_scoped_to_one_capability_descriptor() {
+    fn sealed_state_runtime_is_scoped_to_one_capability_descriptor() {
         let registry = RuntimeAdapterRegistry::built_in();
-        let managed = CacheCapability::Managed(crate::kv::test_contract());
-        let state_publications = HashMap::from([(
-            CapabilityKind::Tts,
-            LoadedStatePublication::LegacyV1(LoadedKvCacheCapability {
-                capability: managed.clone(),
-                fallback_reason: None,
-            }),
-        )]);
-        let bundle = LoadedModelBundle::bind_with_state_publications(
+        let bundle = LoadedModelBundle::bind(
             &registry,
             ExecutionGroupId::new(4),
             ModelInstanceId::new(11),
-            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            ModelVariant::Lfm25Audio15BGguf,
             BackendKind::Cpu,
-            state_publications,
         )
         .unwrap();
 
+        let asr = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+            .unwrap();
         let tts = bundle
             .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
             .unwrap();
-        assert_eq!(tts.state, CapabilityStateBinding::LegacyV1(managed));
-        assert_eq!(
-            bundle
-                .capability_binding_for_streaming(
-                    CapabilityKind::StreamingTts,
-                    StreamingRequirements::NONE,
-                )
-                .unwrap()
-                .state,
-            CapabilityStateBinding::LegacyV1(legacy_model_owned_capability())
-        );
+        assert_ne!(asr.execution.capability_id, tts.execution.capability_id);
+        assert_ne!(asr.state.id, tts.state.id);
     }
 
     #[test]
     fn cache_truth_for_an_unregistered_capability_is_rejected() {
         let state_publications = HashMap::from([(
             CapabilityKind::Asr,
-            LoadedStatePublication::LegacyV1(LoadedKvCacheCapability {
-                capability: CacheCapability::Managed(crate::kv::test_contract()),
-                fallback_reason: None,
-            }),
+            LoadedStatePublication::V2(CapabilityStateDescriptorV2::stateless_for_test()),
         )]);
 
         let error = LoadedModelBundle::bind_with_state_publications(
@@ -2272,113 +2135,27 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_model_capability_binds_to_an_exact_width_one_contract() {
+    fn every_supported_model_capability_authors_an_exact_width_one_contract() {
         let registry = RuntimeAdapterRegistry::built_in();
 
         for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
             let instance = ModelInstanceId::new(index as u64 + 1);
-            if variant.family() == crate::catalog::ModelFamily::NemotronAsr {
-                let draft = LoadedModelBundleDraft::build(
-                    &registry,
-                    ExecutionGroupId::new(7),
-                    instance,
-                    variant,
-                    BackendKind::Cpu,
-                )
-                .unwrap_or_else(|error| {
-                    panic!("failed to build physical-state draft for {variant}: {error}")
-                });
-                let metadata = registry.capabilities_for(variant);
-                assert_eq!(draft.capabilities.len(), metadata.len(), "{variant}");
-                for metadata in metadata {
-                    let contracts = draft
-                        .execution_contracts(metadata.capability)
-                        .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
-                    for contract in contracts {
-                        assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
-                        assert_eq!(contract.model_instance_id, instance);
-                        assert_eq!(contract.metadata, metadata);
-                        assert!(contract
-                            .stages
-                            .iter()
-                            .all(|stage| stage.max_batch_size == 1));
-                        assert_eq!(contract.execution_profile.max_batch_size, 1);
-                        assert!(contract.execution_profile.resolved_from_loaded_model);
-                    }
-                }
-                continue;
-            }
-            let bundle = LoadedModelBundle::bind(
+            let draft = LoadedModelBundleDraft::build(
                 &registry,
                 ExecutionGroupId::new(7),
                 instance,
                 variant,
                 BackendKind::Cpu,
             )
-            .unwrap_or_else(|error| panic!("failed to bind {variant}: {error}"));
+            .unwrap_or_else(|error| panic!("failed to build {variant}: {error}"));
             let metadata = registry.capabilities_for(variant);
 
-            assert_eq!(bundle.adapter_count(), metadata.len(), "{variant}");
-            assert_eq!(bundle.model_instance_id(), instance);
+            assert_eq!(draft.capabilities.len(), metadata.len(), "{variant}");
             for metadata in metadata {
-                let binding = bundle
-                    .capability_binding_for_streaming(
-                        metadata.capability,
-                        StreamingRequirements::NONE,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("failed to bind capability for {variant}: {error}")
-                    });
-                let contract = bundle
-                    .contract(metadata.capability, false)
+                let execution = draft.capabilities.get(&metadata.capability).unwrap();
+                let contract = execution
+                    .contract(StreamingRequirements::NONE)
                     .unwrap_or_else(|error| panic!("failed to contract {variant}: {error}"));
-                let execution_contracts = loaded_execution_contracts(
-                    bundle
-                        .require_capability(metadata.capability)
-                        .unwrap()
-                        .execution
-                        .as_ref(),
-                )
-                .unwrap();
-                let all_graphs_cacheless = execution_contracts
-                    .iter()
-                    .all(|contract| contract.execution_profile.cache_mode == CacheMode::None);
-                let all_graphs_zero_workspace = execution_contracts
-                    .iter()
-                    .flat_map(|contract| contract.stages.iter())
-                    .all(|stage| stage.max_workspace_bytes == 0);
-                if all_graphs_cacheless
-                    && all_graphs_zero_workspace
-                    && metadata.state_requirement == InferenceStateRequirement::Stateless
-                {
-                    assert!(
-                        matches!(binding.state, CapabilityStateBinding::V2(_)),
-                        "explicitly stateless zero-workspace capability remained legacy for {variant}"
-                    );
-                }
-                if metadata.state_requirement.requires_invocation()
-                    && !matches!(binding.state, CapabilityStateBinding::LegacyV1(_))
-                {
-                    panic!(
-                        "invocation capability was published without physical workspace for {variant}"
-                    );
-                }
-                if metadata.state_requirement.requires_retained()
-                    && all_graphs_cacheless
-                    && !matches!(binding.state, CapabilityStateBinding::LegacyV1(_))
-                {
-                    panic!("retained capability was mislabeled cacheless for {variant}");
-                }
-                match &binding.state {
-                    CapabilityStateBinding::V2(runtime) => {
-                        assert_eq!(contract.execution_profile.cache_mode, CacheMode::None);
-                        assert!(runtime.descriptor.is_stateless(), "{variant}");
-                        assert!(binding.state_fingerprint.is_some(), "{variant}");
-                    }
-                    CapabilityStateBinding::LegacyV1(capability)
-                        if capability == &legacy_model_owned_capability() => {}
-                    state => panic!("unexpected state binding {state:?} for {variant}"),
-                }
                 assert_eq!(contract.execution_group_id, ExecutionGroupId::new(7));
                 assert_eq!(contract.model_instance_id, instance);
                 assert_eq!(contract.metadata, metadata);
@@ -2402,24 +2179,15 @@ mod tests {
                     .all(|stage| stage.max_batch_size == 1));
                 assert_eq!(contract.execution_profile.max_batch_size, 1);
                 assert!(contract.execution_profile.resolved_from_loaded_model);
-                assert_eq!(binding.execution.model_variant, variant);
-                assert_eq!(binding.execution.model_instance_id, instance);
-                assert_eq!(
-                    binding.execution.capability_id,
-                    metadata.capability.as_str()
-                );
 
-                let transport = bundle
-                    .contract_for_streaming(
-                        metadata.capability,
-                        StreamingRequirements::transport_only(),
-                    )
+                let transport = execution
+                    .contract(StreamingRequirements::transport_only())
                     .unwrap_or_else(|error| {
                         panic!("failed transport-only contract for {variant}: {error}")
                     });
                 assert_eq!(transport.metadata, metadata);
 
-                let native_streaming = bundle.contract(metadata.capability, true);
+                let native_streaming = execution.contract(StreamingRequirements::native(true));
                 if metadata.streaming_mode == StreamingMode::None {
                     assert!(
                         native_streaming.is_err(),
@@ -2568,7 +2336,7 @@ mod tests {
 
     #[test]
     fn sequence_chat_remains_quantum_committed_when_streaming() {
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             ExecutionGroupId::new(7),
             ModelInstanceId::new(1),
@@ -2577,7 +2345,12 @@ mod tests {
         )
         .unwrap();
 
-        let streaming = bundle.contract(CapabilityKind::Chat, true).unwrap();
+        let streaming = draft
+            .capabilities
+            .get(&CapabilityKind::Chat)
+            .unwrap()
+            .contract(StreamingRequirements::native(true))
+            .unwrap();
         assert_eq!(streaming.execution_profile.mode, ExecutionMode::Sequence);
         assert!(streaming
             .stages
@@ -2668,7 +2441,7 @@ mod tests {
                 model_variant: variant,
             }));
         registry.validate_loaded_adapter_factories().unwrap();
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(1),
             ModelInstanceId::new(2),
@@ -2676,7 +2449,12 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
-        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = draft
+            .capabilities
+            .get(&CapabilityKind::Tts)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
 
         assert_eq!(contract.adapter_abi_revision, STATIC_TENSOR_ADAPTER_ABI);
         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::Static);
@@ -2731,7 +2509,7 @@ mod tests {
     fn qwen_tts_factory_binds_every_capability_to_physical_sequence_stages() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(1),
             ModelInstanceId::new(2),
@@ -2740,7 +2518,8 @@ mod tests {
         )
         .unwrap();
 
-        let physical = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let tts = draft.capabilities.get(&CapabilityKind::Tts).unwrap();
+        let physical = tts.contract(StreamingRequirements::NONE).unwrap();
         assert_eq!(physical.adapter_abi_revision, AdapterAbiRevision::new(3));
         assert_eq!(physical.execution_profile.mode, ExecutionMode::Sequence);
         assert_eq!(
@@ -2763,7 +2542,7 @@ mod tests {
             crate::models::architectures::qwen3::tts::QWEN3_TTS_PREDICTOR_STAGE_WORKSPACE_BYTES
         );
 
-        let streaming = bundle.contract(CapabilityKind::Tts, true).unwrap();
+        let streaming = tts.contract(StreamingRequirements::native(true)).unwrap();
         assert_eq!(streaming.adapter_abi_revision, AdapterAbiRevision::new(3));
         assert_eq!(
             streaming.execution_profile.prefill_batch,
@@ -2772,8 +2551,11 @@ mod tests {
         assert_eq!(streaming.execution_profile.max_batch_size, 1);
         assert_eq!(streaming.stages[0].batch_mode, NativeBatchMode::None);
 
-        let streaming_capability = bundle
-            .contract(CapabilityKind::StreamingTts, false)
+        let streaming_capability = draft
+            .capabilities
+            .get(&CapabilityKind::StreamingTts)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
             .unwrap();
         assert_eq!(
             streaming_capability.adapter_abi_revision,
@@ -2789,7 +2571,7 @@ mod tests {
     fn qwen_tts_physical_sequence_is_enabled_on_cpu_by_default() {
         let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(4, 1).unwrap();
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(1),
             ModelInstanceId::new(2),
@@ -2798,7 +2580,12 @@ mod tests {
         )
         .unwrap();
 
-        let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let contract = draft
+            .capabilities
+            .get(&CapabilityKind::Tts)
+            .unwrap()
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
         assert_eq!(contract.adapter_abi_revision, AdapterAbiRevision::new(3));
         assert_eq!(contract.execution_profile.max_batch_size, 1);
         assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
@@ -2812,7 +2599,7 @@ mod tests {
     fn qwen_chat_native_factory_publishes_scalar_prefill_and_ragged_decode() {
         let variant = ModelVariant::Qwen306B;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &registry,
             ExecutionGroupId::new(1),
             ModelInstanceId::new(2),
@@ -2821,7 +2608,12 @@ mod tests {
         )
         .unwrap();
 
-        let contract = bundle.contract(CapabilityKind::Chat, true).unwrap();
+        let contract = draft
+            .capabilities
+            .get(&CapabilityKind::Chat)
+            .unwrap()
+            .contract(StreamingRequirements::native(true))
+            .unwrap();
         assert_eq!(contract.adapter_abi_revision, CONTINUOUS_TENSOR_ADAPTER_ABI);
         assert_eq!(contract.execution_profile.mode, ExecutionMode::Sequence);
         assert_eq!(

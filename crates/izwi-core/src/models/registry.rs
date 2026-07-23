@@ -549,18 +549,7 @@ impl KvCacheContractProvider for NativeAsrModel {
             | Self::Nemotron(_)
             | Self::WhisperTurbo(_)
             | Self::VibeVoice(_)
-            | Self::GraniteSpeech(_) => Ok(CacheCapability::None),
-        }
-    }
-
-    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
-        match self {
-            Self::Qwen3(model) => model.kv_cache_fallback_reason(),
-            Self::Parakeet(_)
-            | Self::Nemotron(_)
-            | Self::WhisperTurbo(_)
-            | Self::VibeVoice(_)
-            | Self::GraniteSpeech(_) => None,
+            | Self::GraniteSpeech(_) => Ok(CacheCapability::Stateless),
         }
     }
 }
@@ -1815,15 +1804,7 @@ impl KvCacheContractProvider for NativeChatModel {
         match self {
             Self::Qwen3(model) => model.kv_cache_contract(),
             Self::Qwen35(model) => model.kv_cache_contract(),
-            Self::Gemma3(_) | Self::Lfm2(_) => Ok(CacheCapability::None),
-        }
-    }
-
-    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
-        match self {
-            Self::Qwen3(model) => model.kv_cache_fallback_reason(),
-            Self::Qwen35(model) => model.kv_cache_fallback_reason(),
-            Self::Gemma3(_) | Self::Lfm2(_) => None,
+            Self::Gemma3(_) | Self::Lfm2(_) => Ok(CacheCapability::Stateless),
         }
     }
 }

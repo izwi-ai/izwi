@@ -18,9 +18,9 @@ pub use batch::{CacheBlockRef, KvDecodeBatchMetadata, KvSequenceBlockTable, KvSl
 pub use contract::{
     AttentionSemantics, CacheCapability, CacheDomainId, CacheTokenAxis, KeyEncoding,
     KvCacheContract, KvCacheContractProvider, KvContractAbi, KvDomainSpec, KvPrefixSemantics,
-    KvStorageDType, KvStorageRequest, LoadedKvCacheCapability, ModelStateDomainSpec,
-    ModelStateKind, ModelStateLayerSpec, PageTokenConstraint, PagedAttentionDomainSpec,
-    PagedAttentionLayerSpec, PositionSemantics, CURRENT_KV_CONTRACT_ABI,
+    KvStorageDType, KvStorageRequest, ModelStateDomainSpec, ModelStateKind, ModelStateLayerSpec,
+    PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PositionSemantics,
+    CURRENT_KV_CONTRACT_ABI,
 };
 pub use residency::{KvResidencyError, KvResidencyState, KvStorageTier, KvTransferId};
 pub use resolved::{
@@ -38,8 +38,8 @@ pub mod v1 {
         KvDecodeBatchMetadata, KvDomainSpec, KvGroupId, KvLayerBinding, KvPhysicalLayout,
         KvPlanFingerprint, KvPlanId, KvPrefixSemantics, KvResidencyError, KvResidencyState,
         KvSequenceBlockTable, KvSlotRef, KvStorageDType, KvStorageFormat, KvStorageRequest,
-        KvStorageTier, KvTransferId, LoadedKvCacheCapability, ModelStateDomainSpec, ModelStateKind,
-        ModelStateLayerSpec, PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionKernel,
+        KvStorageTier, KvTransferId, ModelStateDomainSpec, ModelStateKind, ModelStateLayerSpec,
+        PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionKernel,
         PagedAttentionLayerSpec, PositionSemantics, ResolvedKvGroup, ResolvedKvGroupKind,
         ResolvedKvPlan, CURRENT_KV_CONTRACT_ABI,
     };

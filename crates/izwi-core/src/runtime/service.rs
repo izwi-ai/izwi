@@ -45,8 +45,8 @@ use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    CapabilityKind, CapabilityStateBinding, ExecutionTargetKind, LoadedCapabilityBinding,
-    LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
+    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+    LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::broker::{
@@ -805,34 +805,16 @@ fn bind_request_to_residency(
     } else {
         StreamingRequirements::native(model_streaming_required)
     };
-    let LoadedCapabilityBinding {
-        execution,
-        state,
-        state_fingerprint,
-    } = bundle.capability_binding_for_streaming(
+    let LoadedCapabilityBinding { execution, state } = bundle.capability_binding_for_streaming(
         CapabilityKind::for_engine_task(request.task_type),
         streaming,
     )?;
     request.bind_execution_adapter(execution)?;
-    match state {
-        CapabilityStateBinding::LegacyV1(cache) => {
-            if state_fingerprint.is_some() {
-                return Err(Error::InferenceError(
-                    "legacy capability carried a v2 state fingerprint".to_string(),
-                ));
-            }
-            request.bind_cache_capability(cache)?
-        }
-        CapabilityStateBinding::V2(runtime) => request.bind_v2_state_runtime(
-            runtime,
-            state_fingerprint.ok_or_else(|| {
-                Error::InferenceError(
-                    "v2 capability is missing its sealed state fingerprint".to_string(),
-                )
-            })?,
-            bundle.backend_kind(),
-        )?,
-    }
+    request.bind_v2_state_runtime(
+        state.clone(),
+        state.state_fingerprint,
+        bundle.backend_kind(),
+    )?;
     Ok(())
 }
 
@@ -888,9 +870,9 @@ fn loaded_contract_for_residency(
         capability,
         StreamingRequirements::native(streaming_required),
     )?;
-    if let CapabilityStateBinding::V2(runtime) = state_binding.state {
-        runtime.validate_against(backend_kind, &state_binding.execution)?;
-    }
+    state_binding
+        .state
+        .validate_against(backend_kind, &state_binding.execution)?;
     Ok(contract)
 }
 
@@ -922,9 +904,9 @@ fn loaded_binding_for_residency(
             "loaded capability state binding does not match its execution contract".into(),
         ));
     }
-    if let CapabilityStateBinding::V2(runtime) = &binding.state {
-        runtime.validate_against(backend_kind, &binding.execution)?;
-    }
+    binding
+        .state
+        .validate_against(backend_kind, &binding.execution)?;
     Ok((contract, binding))
 }
 
@@ -3120,10 +3102,6 @@ mod tests {
             .expect("matching residency");
         assert_eq!(request.model_instance_id(), Some(instance));
         assert!(request.execution_adapter_binding().is_some());
-        assert_eq!(
-            request.cache_capability(),
-            &crate::kv::CacheCapability::None
-        );
         assert!(request.v2_state_runtime().is_some());
 
         let mut wrong = EngineCoreRequest::tts("wrong").with_model_variant(ModelVariant::Qwen306B);
@@ -3137,43 +3115,30 @@ mod tests {
     }
 
     #[test]
-    fn residency_binding_uses_one_descriptor_for_execution_and_cache_truth() {
+    fn residency_binding_uses_one_descriptor_for_execution_and_state_truth() {
         let residency = crate::model::ModelResidency::default();
         let instance = crate::engine::ModelInstanceId::new(19);
-        let variant = ModelVariant::Qwen306B;
+        let variant = ModelVariant::Kokoro82M;
         let lease = residency.acquire_instance_lease(variant, instance);
-        let managed = crate::kv::CacheCapability::Managed(crate::kv::test_contract());
-        let state_publications = HashMap::from([(
-            CapabilityKind::Chat,
-            crate::runtime::adapters::LoadedStatePublication::LegacyV1(
-                crate::kv::LoadedKvCacheCapability {
-                    capability: managed.clone(),
-                    fallback_reason: None,
-                },
-            ),
-        )]);
-        let bundle = LoadedModelBundle::bind_with_state_publications(
+        let bundle = LoadedModelBundle::bind(
             &RuntimeAdapterRegistry::built_in(),
             crate::engine::ExecutionGroupId::new(3),
             instance,
             variant,
             BackendKind::Cpu,
-            state_publications,
         )
         .expect("loaded bundle");
-        let mut request = EngineCoreRequest::chat(Vec::new()).with_model_variant(variant);
+        let mut request = EngineCoreRequest::tts("state").with_model_variant(variant);
 
         bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
             .expect("matching loaded capability descriptor");
 
-        assert_eq!(
-            request
-                .execution_adapter_binding()
-                .expect("execution binding")
-                .model_instance_id,
-            instance
-        );
-        assert_eq!(request.cache_capability(), &managed);
+        let execution = request
+            .execution_adapter_binding()
+            .expect("execution binding");
+        let state = request.v2_state_runtime().expect("state binding");
+        assert_eq!(execution.model_instance_id, instance);
+        state.validate_against(BackendKind::Cpu, execution).unwrap();
     }
 
     #[test]
@@ -3233,8 +3198,6 @@ mod tests {
         )
         .expect("v2 loaded bundle");
         let mut request = EngineCoreRequest::tts("stateless").with_model_variant(variant);
-        let legacy_cache = request.cache_capability().clone();
-
         bind_request_to_residency(&mut request, Some(&lease), Some(&bundle), false)
             .expect("matching v2 loaded capability descriptor");
 
@@ -3244,11 +3207,6 @@ mod tests {
             Some(descriptor.fingerprint(&offline).unwrap())
         );
         assert!(request.v2_state_runtime().is_some());
-        assert_eq!(
-            request.cache_capability(),
-            &crate::kv::CacheCapability::None
-        );
-        assert!(request.bind_cache_capability(legacy_cache).is_err());
         let direct = loaded_contract_for_residency(
             &lease,
             Some(&bundle),

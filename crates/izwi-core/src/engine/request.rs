@@ -783,12 +783,8 @@ pub struct EngineCoreRequest {
     /// Exact loaded capability adapter selected by the runtime. Direct engine
     /// callers without a lifecycle bundle remain on compatibility dispatch.
     pub(super) execution_adapter_binding: Option<super::ExecutionAdapterBinding>,
-    /// Cache truth published by the exact loaded adapter. The core resolves a
-    /// managed contract into backend-owned arenas before scheduler execution.
-    pub(super) cache_capability: crate::kv::CacheCapability,
-    /// Additive ABI-v2 state truth. This is mutually exclusive with a managed
-    /// v1 cache contract and must be resolved by the v2 lifecycle before the
-    /// request can enter scheduler execution.
+    /// ABI-v2 state truth resolved by the lifecycle before the request can
+    /// enter scheduler execution.
     pub(super) v2_state_descriptor: Option<crate::kv::v2::CapabilityStateDescriptorV2>,
     pub(super) v2_state_fingerprint: Option<[u8; 32]>,
     /// Exact load-sealed runtime proof for stateless/zero-workspace ABI-v2
@@ -2173,7 +2169,6 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
-            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
             v2_state_runtime: None,
@@ -2226,7 +2221,6 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
-            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
             v2_state_runtime: None,
@@ -2279,7 +2273,6 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
-            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
             v2_state_runtime: None,
@@ -2329,7 +2322,6 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
-            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
             v2_state_runtime: None,
@@ -2380,7 +2372,6 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
-            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
             v2_state_runtime: None,
@@ -2431,7 +2422,6 @@ impl EngineCoreRequest {
             model_variant: None,
             model_instance_id: None,
             execution_adapter_binding: None,
-            cache_capability: crate::kv::CacheCapability::OpaqueModelOwned,
             v2_state_descriptor: None,
             v2_state_fingerprint: None,
             v2_state_runtime: None,
@@ -2529,41 +2519,11 @@ impl EngineCoreRequest {
         self.execution_adapter_binding.as_ref()
     }
 
-    pub(crate) fn bind_cache_capability(
-        &mut self,
-        capability: crate::kv::CacheCapability,
-    ) -> Result<()> {
-        capability.validate()?;
-        if self.v2_state_descriptor.is_some() {
-            return Err(Error::InvalidInput(
-                "engine request cannot bind a v1 cache capability after state ABI v2".to_string(),
-            ));
-        }
-        if self.cache_capability != crate::kv::CacheCapability::OpaqueModelOwned
-            && self.cache_capability != capability
-        {
-            return Err(Error::InvalidInput(
-                "engine request is already bound to a different cache contract".to_string(),
-            ));
-        }
-        self.cache_capability = capability;
-        Ok(())
-    }
-
-    pub(crate) fn cache_capability(&self) -> &crate::kv::CacheCapability {
-        &self.cache_capability
-    }
-
     pub(crate) fn bind_v2_state_descriptor(
         &mut self,
         descriptor: crate::kv::v2::CapabilityStateDescriptorV2,
         fingerprint: [u8; 32],
     ) -> Result<()> {
-        if self.cache_capability != crate::kv::CacheCapability::OpaqueModelOwned {
-            return Err(Error::InvalidInput(
-                "engine request cannot bind state ABI v2 over a v1 managed cache".to_string(),
-            ));
-        }
         if self
             .v2_state_descriptor
             .as_ref()
@@ -2631,7 +2591,6 @@ impl EngineCoreRequest {
             return Ok(());
         }
         self.bind_v2_state_descriptor(runtime.descriptor.clone(), fingerprint)?;
-        self.cache_capability = crate::kv::CacheCapability::None;
         self.v2_state_runtime = Some(runtime);
         Ok(())
     }

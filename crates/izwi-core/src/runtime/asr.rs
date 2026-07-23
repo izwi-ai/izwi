@@ -22,9 +22,7 @@ use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
-use crate::runtime::adapters::{
-    CapabilityKind, CapabilityStateBinding, ExecutionTargetKind, LoadedExecutionContract,
-};
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, LoadedExecutionContract};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
@@ -970,20 +968,14 @@ impl RuntimeService {
                 ExecutionTargetKind::RealtimeRunner,
             )
             .await?;
-        let physical_runtime = match state_binding.state {
-            CapabilityStateBinding::V2(runtime) => {
-                runtime.retained_tensor_state_runtime().ok_or_else(|| {
-                    Error::ModelLoadError(
-                        "realtime ASR did not bind its retained tensor runtime".into(),
-                    )
-                })?
-            }
-            CapabilityStateBinding::LegacyV1(_) => {
-                return Err(Error::ModelLoadError(
-                    "realtime ASR cannot execute through legacy model-owned state".into(),
-                ));
-            }
-        };
+        let physical_runtime = state_binding
+            .state
+            .retained_tensor_state_runtime()
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "realtime ASR did not bind its retained tensor runtime".into(),
+                )
+            })?;
         let model =
             self.model_registry.get_asr(variant).await.ok_or_else(|| {
                 Error::ModelNotFound(format!("ASR model {variant} is not loaded"))

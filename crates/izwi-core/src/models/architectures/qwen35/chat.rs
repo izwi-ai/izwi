@@ -434,10 +434,6 @@ impl KvCacheContractProvider for Qwen35ChatModel {
             self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
         ))
     }
-
-    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
-        None
-    }
 }
 
 impl Qwen35ChatModel {

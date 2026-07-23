@@ -336,22 +336,19 @@ impl ModelLifecycleController {
             // an already-selected execution adapter.
             let mut state_publications = HashMap::new();
             if let Some(loaded) = self.model_registry.get_chat(variant).await {
-                let loaded_cache = loaded.loaded_kv_cache_capability()?;
-                if matches!(
-                    &loaded_cache.capability,
-                    crate::kv::CacheCapability::Managed(_)
-                ) && !managed_kv_backend_compiled(backend)
-                {
-                    return Err(Error::ModelLoadError(format!(
-                        "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
-                    )));
-                }
-                let physical = self
-                    .core_engine
-                    .load_managed_model_cache(model_instance_id, &loaded_cache.capability)
-                    .await?;
-                let publication = match &loaded_cache.capability {
+                let loaded_cache = loaded.kv_cache_contract()?;
+                loaded_cache.validate()?;
+                let publication = match &loaded_cache {
                     crate::kv::CacheCapability::Managed(contract) => {
+                        if !managed_kv_backend_compiled(backend) {
+                            return Err(Error::ModelLoadError(format!(
+                                "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
+                            )));
+                        }
+                        let physical = self
+                            .core_engine
+                            .load_managed_model_cache(model_instance_id, &loaded_cache)
+                            .await?;
                         Some(LoadedStatePublication::ManagedV2 {
                             contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
                             physical: physical.ok_or_else(|| {
@@ -362,10 +359,7 @@ impl ModelLifecycleController {
                             })?,
                         })
                     }
-                    crate::kv::CacheCapability::None => None,
-                    crate::kv::CacheCapability::OpaqueModelOwned => {
-                        Some(LoadedStatePublication::LegacyV1(loaded_cache))
-                    }
+                    crate::kv::CacheCapability::Stateless => None,
                 };
                 if let Some(publication) = publication {
                     state_publications.insert(CapabilityKind::Chat, publication);
@@ -377,9 +371,10 @@ impl ModelLifecycleController {
                 .is_ok()
             {
                 if let Some(loaded) = self.model_registry.get_asr(variant).await {
-                    let loaded_cache = loaded.loaded_kv_cache_capability()?;
+                    let loaded_cache = loaded.kv_cache_contract()?;
+                    loaded_cache.validate()?;
                     if let crate::kv::CacheCapability::Managed(contract) =
-                        &loaded_cache.capability
+                        &loaded_cache
                     {
                         if !managed_kv_backend_compiled(backend) {
                             return Err(Error::ModelLoadError(format!(
@@ -388,7 +383,7 @@ impl ModelLifecycleController {
                         }
                         let physical = self
                             .core_engine
-                            .load_managed_model_cache(model_instance_id, &loaded_cache.capability)
+                            .load_managed_model_cache(model_instance_id, &loaded_cache)
                             .await?
                             .ok_or_else(|| {
                                 Error::ModelLoadError(

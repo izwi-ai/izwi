@@ -213,13 +213,7 @@ impl KvCacheContractProvider for Qwen3ChatModel {
                 "native Qwen3 attention geometry is unsupported by the physical runtime"
                     .to_string(),
             )),
-            Qwen3ChatBackend::Gguf { .. } => Ok(CacheCapability::None),
-        }
-    }
-
-    fn kv_cache_fallback_reason(&self) -> Option<&'static str> {
-        match &self.backend {
-            Qwen3ChatBackend::Native { .. } | Qwen3ChatBackend::Gguf { .. } => None,
+            Qwen3ChatBackend::Gguf { .. } => Ok(CacheCapability::Stateless),
         }
     }
 }
