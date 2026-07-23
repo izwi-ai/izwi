@@ -116,7 +116,7 @@ fn legacy_inference_state_surface_does_not_expand_during_migration() {
     // Keeping the inventory in a compiled integration test prevents a new
     // model from quietly adding another model-owned cache while v2 is landing.
     const LEGACY_SYMBOL_LIMITS: &[(&str, usize)] = &[
-        ("OpaqueModelOwned", 34),
+        ("OpaqueModelOwned", 0),
         ("KvDomainSpec::ModelState", 9),
         ("Qwen3ManagedCache", 33),
         ("Qwen3Cache", 63),

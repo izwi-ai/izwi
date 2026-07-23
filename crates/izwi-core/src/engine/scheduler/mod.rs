@@ -2571,34 +2571,28 @@ mod tests {
     }
 
     #[test]
-    fn opaque_and_cacheless_sequences_schedule_without_block_projection() {
-        for (suffix, cache_mode) in [
-            ("opaque", CacheMode::OpaqueModelOwned),
-            ("cacheless", CacheMode::None),
-        ] {
-            let mut scheduler = Scheduler::new(SchedulerConfig {
-                max_batch_size: 1,
-                max_tokens_per_step: 8,
-                enable_adaptive_batching: false,
-                ..Default::default()
-            });
-            let request_id = format!("{suffix}-capability-cache");
-            let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
-            assert!(scheduler.add_request(&request));
-            let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
-            let session = SessionKey::new(request_id.clone(), epoch);
-            let mut profile =
-                ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
-            profile.cache_mode = cache_mode;
-            assert!(scheduler.update_execution_profile(&session, &profile));
+    fn cacheless_sequences_schedule_without_block_projection() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let request_id = "cacheless-capability-cache".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+        let session = SessionKey::new(request_id.clone(), epoch);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        assert!(scheduler.update_execution_profile(&session, &profile));
 
-            let prefill = scheduler.schedule();
-            assert_eq!(prefill.prefill_requests.len(), 1);
-            scheduler.update_after_step(&request_id, 1, 0, 1.0);
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, 1, 0, 1.0);
 
-            let decode = scheduler.schedule();
-            assert_eq!(decode.decode_requests.len(), 1);
-        }
+        let decode = scheduler.schedule();
+        assert_eq!(decode.decode_requests.len(), 1);
     }
 
     #[test]

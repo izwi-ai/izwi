@@ -739,7 +739,6 @@ impl Default for OutcomeProvenance {
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
     None,
-    OpaqueModelOwned,
     ExternalPaged,
 }
 
@@ -2960,7 +2959,7 @@ mod tests {
         profile.prefill = PrefillMode::Full;
         profile.incremental_decode = true;
         profile.decode_batch = NativeBatchMode::Static;
-        profile.cache_mode = CacheMode::OpaqueModelOwned;
+        profile.cache_mode = CacheMode::None;
         profile.max_batch_size = 4;
 
         let capabilities = profile.capabilities();

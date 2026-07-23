@@ -3132,10 +3132,9 @@ mod tests {
                 ExecutionMode::Sequence,
             );
             profile.prefill = PrefillMode::Full;
-            // This fixture exercises executor-owned cache cleanup and exact
-            // session quarantine. ExternalPaged is reserved for requests
-            // carrying an installed managed arena runtime.
-            profile.cache_mode = super::super::execution::CacheMode::OpaqueModelOwned;
+            // This synthetic executor stands in for an external physical
+            // runtime whose exact-session cleanup must be confirmed.
+            profile.cache_mode = super::super::execution::CacheMode::ExternalPaged;
             profile.cache_release_safe = true;
             profile.prefix_reuse_safe = true;
             profile.resolved_from_loaded_model = true;
