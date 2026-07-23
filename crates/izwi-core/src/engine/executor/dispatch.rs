@@ -265,11 +265,6 @@ impl NativeExecutor {
         scheduled: &[ScheduledRequest],
         rows: Option<&[ReadyQuantum]>,
     ) -> Result<Vec<ExecutorStepResult>> {
-        // Reserve model-owned cache growth before any tensor state can be
-        // allocated. The lease remains attached to the exact session until
-        // finish, abort, failure cleanup, or recompute preemption.
-        self.reserve_scheduled_cache(requests, scheduled)?;
-        self.prepare_scheduled_cache(scheduled)?;
         let (outputs, dispatch) = if self.can_parallelize_requests(scheduled.len()) {
             (
                 self.execute_requests_parallel(requests, scheduled, rows)?,
@@ -308,8 +303,6 @@ impl NativeExecutor {
         scheduled: &[ScheduledRequest],
         rows: Option<&[ReadyQuantum]>,
     ) -> Result<Vec<ExecutorStepResult>> {
-        self.reserve_scheduled_cache(requests, scheduled)?;
-        self.prepare_scheduled_cache(scheduled)?;
         let managed_caches = scheduled
             .iter()
             .map(|scheduled| {
@@ -375,38 +368,30 @@ impl NativeExecutor {
                         scheduled,
                         ModelSessionResult::atomic(ExecutorOutput::error(
                             scheduled.request_id.clone(),
-                            "Scheduled request not found during cache reconciliation",
+                            "Scheduled request not found during execution finalization",
                         )),
                     )
                     .with_dispatch(dispatch);
                 };
-                let reconciled = self
-                    .reconcile_scheduled_cache(request, scheduled, &output.output)
-                    .and_then(|observed| {
-                        request
-                            .take_staged_stream_outputs()
-                            .map(|staged| (observed, staged))
-                    });
-                let mut result = match reconciled {
-                    Ok((observed, staged)) => ExecutorStepResult::from_session(
+                let staged = request.take_staged_stream_outputs();
+                let mut result = match staged {
+                    Ok(staged) => ExecutorStepResult::from_session(
                         scheduled,
                         output.with_staged_stream_outputs(staged),
                     )
                     .with_dispatch(dispatch)
-                    .with_observed_resources(observed),
+                    .with_observed_resources(crate::engine::ResourceVector::zero()),
                     Err(err) => {
-                        let release =
-                            ModelExecutor::cleanup_session(self, &scheduled.session_key());
-                        let observed = super::cache_observation_after_release(release);
+                        let _ = ModelExecutor::cleanup_session(self, &scheduled.session_key());
                         ExecutorStepResult::from_session(
                             scheduled,
                             ModelSessionResult::atomic(ExecutorOutput::error(
                                 scheduled.request_id.clone(),
-                                format!("physical cache reconciliation failed: {err}"),
+                                format!("staged stream publication failed: {err}"),
                             )),
                         )
                         .with_dispatch(dispatch)
-                        .with_observed_resources(observed)
+                        .with_observed_resources(crate::engine::ResourceVector::zero())
                     }
                 };
                 if result.output.error.is_none()

@@ -44,10 +44,7 @@ use super::execution::{
 };
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
-use super::resources::{
-    BatchWorkspaceLease, ReservationClass, ReservationOwner, ResourceAmount, ResourceAuthority,
-    ResourceLease, ResourceVector,
-};
+use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
 use super::scheduler::ScheduledRequest;
 use super::types::AudioOutput;
 use crate::backends::{
@@ -58,7 +55,7 @@ use crate::error::{Error, Result};
 use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat, ResolvedKvGroupKind};
 use crate::model::ModelVariant;
 pub(super) use crate::models::architectures::qwen3::core::Qwen3ManagedCache as ManagedQwenCache;
-use crate::models::architectures::qwen3::tts::{Qwen3TtsModel, TtsSessionCacheRequest};
+use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
@@ -398,7 +395,7 @@ pub struct WorkerConfig {
     pub kv_page_size: usize,
     /// Optional shared model registry for loaded runtime models.
     pub model_registry: Option<Arc<ModelRegistry>>,
-    /// Shared physical resource authority used for model-owned cache lifetime.
+    /// Shared physical resource authority used for bounded executor workspaces.
     pub resource_authority: Option<Arc<ResourceAuthority>>,
     /// Maximum width of a model-native tensor batch on this backend.
     pub max_tensor_batch_size: usize,
@@ -765,8 +762,8 @@ pub struct ExecutorStepResult {
     pub safe_point: bool,
     pub dispatch: BatchDispatch,
     pub provenance: OutcomeProvenance,
-    /// Physical model-owned cache retained after this safe point. Unknown is
-    /// reported explicitly when a backend/model cannot observe all storage.
+    /// Executor-owned resources retained after this safe point. Persistent
+    /// inference state is reported by its lifecycle-owned physical manager.
     pub observed_resources: ResourceVector,
     pub output: ExecutorOutput,
     pub staged_stream_outputs: Vec<StreamingOutput>,
@@ -1048,12 +1045,6 @@ impl CacheReleaseReport {
     }
 }
 
-#[derive(Debug, Default)]
-struct CacheResourceReservation {
-    reserved_bytes: u64,
-    lease: Option<ResourceLease>,
-}
-
 pub struct NativeExecutor {
     config: WorkerConfig,
     initialized: bool,
@@ -1061,7 +1052,6 @@ pub struct NativeExecutor {
     chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
     asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
     qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
-    cache_resource_leases: Mutex<HashMap<SessionKey, CacheResourceReservation>>,
 }
 
 impl NativeExecutor {
@@ -1074,7 +1064,6 @@ impl NativeExecutor {
             chat_decode_states: Mutex::new(HashMap::new()),
             asr_decode_states: Mutex::new(HashMap::new()),
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
-            cache_resource_leases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1147,303 +1136,6 @@ impl NativeExecutor {
             }
             _ => run_catching_panic(),
         }
-    }
-
-    fn reserve_scheduled_cache(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<()> {
-        let Some(authority) = self.config.resource_authority.as_ref() else {
-            return Ok(());
-        };
-
-        for item in scheduled {
-            let Some(request) = requests
-                .iter()
-                .copied()
-                .find(|request| request.id == item.request_id)
-            else {
-                continue;
-            };
-            let Some(profile) = self.execution_profile(request) else {
-                continue;
-            };
-            if profile.cache_mode != CacheMode::OpaqueModelOwned
-                || !profile.resolved_from_loaded_model
-            {
-                continue;
-            }
-            let session = item.session_key();
-            self.reserve_exact_session_cache(authority, &session, || {
-                self.authorized_session_cache_bytes(request)
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Restore every scheduled model-owned cache lease to a pending claim
-    /// before model code can replace, release, or fail while mutating its
-    /// physical decode state. Successful non-terminal execution reconciles the
-    /// new positive observation afterwards.
-    fn prepare_scheduled_cache(&self, scheduled: &[ScheduledRequest]) -> Result<()> {
-        if self.config.resource_authority.is_none() {
-            return Ok(());
-        }
-        let reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        let zero = cache_resource_vector(self.config.backend, 0);
-        for item in scheduled {
-            let session = item.session_key();
-            let Some(reservation) = reservations.get(&session) else {
-                continue;
-            };
-            let lease = reservation.lease.as_ref().ok_or_else(|| {
-                Error::InferenceError("cache allocation has no physical resource lease".to_string())
-            })?;
-            lease.prepare_materialized_release(zero)?;
-        }
-        Ok(())
-    }
-
-    fn reserve_exact_session_cache(
-        &self,
-        authority: &Arc<ResourceAuthority>,
-        session: &SessionKey,
-        authorize: impl FnOnce() -> Result<u64>,
-    ) -> Result<()> {
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        if reservations.contains_key(session) {
-            return Ok(());
-        }
-
-        // Authorization is pure, but it remains under the exact-session map
-        // lock so concurrent executor entry cannot repeat it or double-reserve.
-        // Later decode steps reuse this lease until exact-session cleanup.
-        let authorized_bytes = authorize()?;
-        let owner = ReservationOwner::new(
-            ReservationClass::Cache,
-            format!("{}:{}", session.request_id, session.epoch),
-        );
-        let resources = cache_resource_vector(self.config.backend, authorized_bytes);
-        let lease = match self.config.backend {
-            BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources)?,
-            BackendKind::Cuda => authority.reserve(owner, resources)?,
-        };
-        reservations.insert(
-            session.clone(),
-            CacheResourceReservation {
-                reserved_bytes: authorized_bytes,
-                lease: Some(lease),
-            },
-        );
-        Ok(())
-    }
-
-    fn authorized_session_cache_bytes(&self, request: &EngineCoreRequest) -> Result<u64> {
-        let variant = request.model_variant.ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "Request {} is missing model variant for cache authorization",
-                request.id
-            ))
-        })?;
-        match request.task_type {
-            super::types::TaskType::Chat => {
-                let prompt_tokens = request.prompt_tokens.len();
-                request
-                    .prepared_chat_model_for_executor()?
-                    .session_cache_reservation_bytes(
-                        prompt_tokens,
-                        request.params.max_tokens.max(1),
-                    )
-            }
-            super::types::TaskType::ASR => {
-                let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
-                model.session_cache_reservation_bytes(
-                    request.asr_language_for_execution(),
-                    request.asr_prompt_for_execution(),
-                    request.params.max_tokens.max(1),
-                )
-            }
-            super::types::TaskType::TTS => {
-                let params = Self::to_tts_params(request);
-                let text = request
-                    .text
-                    .as_deref()
-                    .ok_or_else(|| Error::InvalidInput("TTS request missing text".to_string()))?;
-                let reference = Self::reference_from_request(request)?;
-                let (model, _model_lease) = self.qwen_model_for_request(request)?;
-                model.session_cache_reservation_bytes(TtsSessionCacheRequest {
-                    text,
-                    reference: reference.as_ref(),
-                    language: request.language.as_deref(),
-                    instruct: request.voice_description.as_deref(),
-                    uses_preset_speaker: !model.available_speakers().is_empty(),
-                    max_frames: params.max_frames,
-                })
-            }
-            super::types::TaskType::SpeechToSpeech => Err(Error::InvalidInput(
-                "Speech-to-speech does not expose model-owned session cache authorization"
-                    .to_string(),
-            )),
-        }
-    }
-
-    fn observed_session_cache_bytes(
-        &self,
-        request: &EngineCoreRequest,
-        scheduled: &ScheduledRequest,
-        output: &ExecutorOutput,
-    ) -> Option<u64> {
-        if output.finished || output.error.is_some() {
-            return Some(0);
-        }
-        let session = scheduled.session_key();
-        match request.task_type {
-            super::types::TaskType::Chat => self
-                .chat_decode_states
-                .lock()
-                .ok()?
-                .get(&session)?
-                .state
-                .session_cache_bytes(),
-            super::types::TaskType::ASR => self
-                .asr_decode_states
-                .lock()
-                .ok()?
-                .get(&session)?
-                .state
-                .session_cache_bytes(),
-            super::types::TaskType::TTS => self
-                .qwen_tts_decode_states
-                .lock()
-                .ok()?
-                .get(&session)?
-                .state
-                .session_cache_bytes(),
-            super::types::TaskType::SpeechToSpeech => None,
-        }
-    }
-
-    fn reconcile_scheduled_cache(
-        &self,
-        request: &EngineCoreRequest,
-        scheduled: &ScheduledRequest,
-        output: &ExecutorOutput,
-    ) -> Result<ResourceVector> {
-        // Every scheduled cache lease was restored to pending before dispatch.
-        // A terminal or failed operation must therefore remain pending until
-        // cleanup drops the exact physical state and its lease; never turn its
-        // zero observation into a post-operation materialization transition.
-        if output.finished || output.error.is_some() {
-            return Ok(cache_observation(0));
-        }
-        let Some(profile) = self.execution_profile(request) else {
-            return Ok(ResourceVector::zero());
-        };
-        if profile.cache_mode != CacheMode::OpaqueModelOwned || !profile.resolved_from_loaded_model
-        {
-            return Ok(ResourceVector::zero());
-        }
-        let observed_bytes = require_known_cache_bytes(
-            self.observed_session_cache_bytes(request, scheduled, output),
-            scheduled,
-        )?;
-        let observation = cache_observation(observed_bytes);
-        if self.config.resource_authority.is_none() {
-            return Ok(observation);
-        }
-
-        let session = scheduled.session_key();
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        let reservation = reservations.get_mut(&session).ok_or_else(|| {
-            Error::InferenceError("cache allocation has no exact-session reservation".to_string())
-        })?;
-        if observed_bytes > 0 {
-            if observed_bytes > reservation.reserved_bytes {
-                if matches!(self.config.backend, BackendKind::Cpu | BackendKind::Metal) {
-                    // CPU and unified-memory Metal use advisory capacity. Candle
-                    // can reuse a larger pooled allocation than the requested
-                    // power-of-two bucket, so grow the tracked lease to the
-                    // exact observed backing rather than failing inference
-                    // after the allocation already exists.
-                    reservation
-                        .lease
-                        .as_mut()
-                        .ok_or_else(|| {
-                            Error::InferenceError(
-                                "cache allocation has no physical resource lease".to_string(),
-                            )
-                        })?
-                        .resize(cache_resource_vector(self.config.backend, observed_bytes))?;
-                    reservation.reserved_bytes = observed_bytes;
-                } else {
-                    return Err(Error::InferenceError(format!(
-                        "materialized session cache uses {observed_bytes} bytes, exceeding its {}-byte authorization for request {} epoch {}",
-                        reservation.reserved_bytes, session.request_id, session.epoch
-                    )));
-                }
-            }
-            reservation
-                .lease
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::InferenceError(
-                        "cache allocation has no physical resource lease".to_string(),
-                    )
-                })?
-                .record_materialized_usage(cache_resource_vector(
-                    self.config.backend,
-                    observed_bytes,
-                ))?;
-        }
-        Ok(observation)
-    }
-}
-
-fn cache_resource_vector(backend: BackendKind, bytes: u64) -> ResourceVector {
-    let mut resources = ResourceVector::zero();
-    match backend {
-        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
-        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
-        BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
-    }
-    resources
-}
-
-fn cache_observation(bytes: u64) -> ResourceVector {
-    ResourceVector {
-        kv_bytes: ResourceAmount::Known(bytes),
-        ..ResourceVector::zero()
-    }
-}
-
-fn cache_observation_after_release(report: CacheReleaseReport) -> ResourceVector {
-    if report.confirmed {
-        cache_observation(0)
-    } else {
-        unknown_cache_observation()
-    }
-}
-
-fn require_known_cache_bytes(observed: Option<u64>, scheduled: &ScheduledRequest) -> Result<u64> {
-    observed.ok_or_else(|| {
-        Error::InferenceError(format!(
-            "loaded model did not report cache bytes for session {}:{}",
-            scheduled.request_id, scheduled.sequence_id
-        ))
-    })
-}
-
-fn unknown_cache_observation() -> ResourceVector {
-    ResourceVector {
-        kv_bytes: ResourceAmount::Unknown,
-        ..ResourceVector::zero()
     }
 }
 
@@ -1548,10 +1240,6 @@ impl ModelExecutor for NativeExecutor {
             profile.mode = ExecutionMode::Sequence;
             profile.prefill = PrefillMode::Full;
             profile.incremental_decode = true;
-            profile.cache_mode = CacheMode::OpaqueModelOwned;
-            // These adapters keep all mutable decode state inside the exact
-            // SessionKey maps below. Removing the entry drops every tensor
-            // reference and a fresh prefill can reconstruct it from input.
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
         }
@@ -1752,82 +1440,43 @@ impl ModelExecutor for NativeExecutor {
         let mut tts = self.qwen_tts_decode_states.lock().map_err(|_| {
             Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
         })?;
-        let mut reservations = self.cache_resource_leases.lock().map_err(|_| {
-            Error::InferenceError("cache resource reservation mutex poisoned".to_string())
-        })?;
-        let zero = cache_resource_vector(self.config.backend, 0);
-        for reservation in reservations.values() {
-            let lease = reservation.lease.as_ref().ok_or_else(|| {
-                Error::InferenceError("cache allocation has no physical resource lease".to_string())
-            })?;
-            lease.prepare_materialized_release(zero)?;
-        }
         chat.clear();
         asr.clear();
         tts.clear();
-        reservations.clear();
-        drop((chat, asr, tts, reservations));
+        drop((chat, asr, tts));
         self.initialized = false;
         self.loaded_tts_model = None;
         Ok(())
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let (Ok(mut chat), Ok(mut asr), Ok(mut tts), Ok(mut reservations)) = (
+        let (Ok(mut chat), Ok(mut asr), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
             self.qwen_tts_decode_states.lock(),
-            self.cache_resource_leases.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
         };
-        let zero = cache_resource_vector(self.config.backend, 0);
-        for (session, reservation) in reservations.iter() {
-            if session.request_id != request_id {
-                continue;
-            }
-            let Some(lease) = reservation.lease.as_ref() else {
-                return CacheReleaseReport::unconfirmed();
-            };
-            if lease.prepare_materialized_release(zero).is_err() {
-                return CacheReleaseReport::unconfirmed();
-            }
-        }
 
         let mut released = 0usize;
         released = released.saturating_add(retain_other_sessions_locked(&mut chat, request_id));
         released = released.saturating_add(retain_other_sessions_locked(&mut asr, request_id));
         released = released.saturating_add(retain_other_sessions_locked(&mut tts, request_id));
-        released =
-            released.saturating_add(retain_other_sessions_locked(&mut reservations, request_id));
         CacheReleaseReport::confirmed(released)
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
-        let (Ok(mut chat), Ok(mut asr), Ok(mut tts), Ok(mut reservations)) = (
+        let (Ok(mut chat), Ok(mut asr), Ok(mut tts)) = (
             self.chat_decode_states.lock(),
             self.asr_decode_states.lock(),
             self.qwen_tts_decode_states.lock(),
-            self.cache_resource_leases.lock(),
         ) else {
             return CacheReleaseReport::unconfirmed();
         };
-        if let Some(reservation) = reservations.get(session) {
-            let Some(lease) = reservation.lease.as_ref() else {
-                return CacheReleaseReport::unconfirmed();
-            };
-            if lease
-                .prepare_materialized_release(cache_resource_vector(self.config.backend, 0))
-                .is_err()
-            {
-                return CacheReleaseReport::unconfirmed();
-            }
-        }
 
         let released = usize::from(chat.remove(session).is_some())
             .saturating_add(usize::from(asr.remove(session).is_some()))
-            .saturating_add(usize::from(tts.remove(session).is_some()))
-            .saturating_add(usize::from(reservations.remove(session).is_some()));
+            .saturating_add(usize::from(tts.remove(session).is_some()));
         CacheReleaseReport::confirmed(released)
     }
 
@@ -1973,10 +1622,11 @@ fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
 mod tests {
     use super::*;
     use crate::engine::request::StreamStagingBuffer;
-    use crate::engine::{CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot};
+    use crate::engine::{
+        CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ResourceAmount,
+    };
     use crate::model::ModelVariant;
     use base64::Engine;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
     struct FixedCapacityProvider {
@@ -1991,96 +1641,6 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
-    }
-
-    #[derive(Debug)]
-    struct MutableCacheCapacityProvider {
-        capacity: ResourceVector,
-        available: std::sync::Mutex<ResourceVector>,
-    }
-
-    impl MutableCacheCapacityProvider {
-        fn new(capacity: ResourceVector, available: ResourceVector) -> Self {
-            Self {
-                capacity,
-                available: std::sync::Mutex::new(available),
-            }
-        }
-
-        fn set_available(&self, available: ResourceVector) {
-            *self
-                .available
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = available;
-        }
-    }
-
-    impl PhysicalCapacityProvider for MutableCacheCapacityProvider {
-        fn snapshot(&self) -> PhysicalCapacitySnapshot {
-            PhysicalCapacitySnapshot {
-                capacity: self.capacity,
-                available: *self
-                    .available
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()),
-                source: CapacitySource::Test,
-            }
-        }
-    }
-
-    fn materialized_cache_fixture(
-        backend: BackendKind,
-        request_id: &str,
-    ) -> (
-        NativeExecutor,
-        Arc<ResourceAuthority>,
-        Arc<MutableCacheCapacityProvider>,
-        EngineCoreRequest,
-        ScheduledRequest,
-    ) {
-        let capacity = cache_resource_vector(backend, 200);
-        let live_headroom = cache_resource_vector(backend, 100);
-        let provider = Arc::new(MutableCacheCapacityProvider::new(capacity, live_headroom));
-        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
-        let lease = authority
-            .reserve(
-                ReservationOwner::new(ReservationClass::Cache, format!("{request_id}:7")),
-                cache_resource_vector(backend, 100),
-            )
-            .unwrap();
-        provider.set_available(cache_resource_vector(backend, 0));
-        lease
-            .record_materialized_usage(cache_resource_vector(backend, 100))
-            .unwrap();
-
-        let mut config = WorkerConfig::default();
-        config.backend = backend;
-        config.resource_authority = Some(authority.clone());
-        let executor = NativeExecutor::new(config);
-        let session = SessionKey::new(request_id.to_string(), 7);
-        executor.cache_resource_leases.lock().unwrap().insert(
-            session,
-            CacheResourceReservation {
-                reserved_bytes: 100,
-                lease: Some(lease),
-            },
-        );
-        let mut request = EngineCoreRequest::tts("cache transition");
-        request.id = request_id.to_string();
-        let scheduled = ScheduledRequest {
-            plan_id: 7,
-            request_id: request_id.to_string(),
-            sequence_id: 7,
-            num_tokens: 1,
-            is_prefill: false,
-            num_computed_tokens: 1,
-            work: crate::engine::WorkUnit::SequenceStep {
-                phase: crate::engine::SequencePhase::Decode,
-                input: crate::engine::InputRange { start: 0, end: 1 },
-                max_output_steps: 1,
-            },
-        };
-        (executor, authority, provider, request, scheduled)
     }
 
     #[test]
@@ -2217,262 +1777,6 @@ mod tests {
             drop(workspace);
             assert_eq!(authority.snapshot().reservations, 0);
         }
-    }
-
-    #[test]
-    fn exact_session_cleanup_releases_backend_cache_lease_once() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let capacity = cache_resource_vector(backend, 4096);
-            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-                capacity,
-            })));
-            let lease = authority
-                .reserve(
-                    ReservationOwner::new(ReservationClass::Cache, "session:7"),
-                    cache_resource_vector(backend, 1024),
-                )
-                .expect("cache lease");
-            let executor = NativeExecutor::new(WorkerConfig::default());
-            let session = SessionKey::new("session".to_string(), 7);
-            executor
-                .cache_resource_leases
-                .lock()
-                .expect("cache lease map")
-                .insert(
-                    session.clone(),
-                    CacheResourceReservation {
-                        reserved_bytes: 1024,
-                        lease: Some(lease),
-                    },
-                );
-            assert_eq!(authority.snapshot().reservations, 1);
-
-            let stale = SessionKey::new("session".to_string(), 6);
-            let stale_report = executor.cleanup_session(&stale);
-            assert!(stale_report.confirmed);
-            assert_eq!(stale_report.released_sessions, 0);
-            assert_eq!(authority.snapshot().reservations, 1);
-
-            let report = executor.cleanup_session(&session);
-            assert!(report.confirmed);
-            assert_eq!(report.released_sessions, 1);
-            assert_eq!(authority.snapshot().reservations, 0);
-            assert_eq!(executor.cleanup_session(&session).released_sessions, 0);
-        }
-    }
-
-    #[test]
-    fn terminal_incremental_cache_stays_pending_until_exact_cleanup() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let (executor, authority, provider, request, scheduled) =
-                materialized_cache_fixture(backend, "terminal-cache");
-            executor
-                .prepare_scheduled_cache(std::slice::from_ref(&scheduled))
-                .unwrap();
-
-            let observed = executor
-                .reconcile_scheduled_cache(
-                    &request,
-                    &scheduled,
-                    &ExecutorOutput::terminal(request.id.clone()),
-                )
-                .unwrap();
-            assert_eq!(observed, cache_observation(0));
-
-            // The model's terminal path has released its physical cache. The
-            // old lease still owns the same bytes as pending authorization, so
-            // another admission cannot spend that newly visible headroom.
-            provider.set_available(cache_resource_vector(backend, 100));
-            assert!(matches!(
-                authority.reserve(
-                    ReservationOwner::new(ReservationClass::Request, "terminal-racer"),
-                    cache_resource_vector(backend, 50),
-                ),
-                Err(Error::Overloaded(_))
-            ));
-
-            let report = executor.cleanup_session(&scheduled.session_key());
-            assert!(report.confirmed);
-            assert_eq!(authority.snapshot().reservations, 0);
-            let replacement = authority
-                .reserve(
-                    ReservationOwner::new(ReservationClass::Request, "terminal-replacement"),
-                    cache_resource_vector(backend, 50),
-                )
-                .unwrap();
-            drop(replacement);
-        }
-    }
-
-    #[test]
-    fn model_error_cache_cleanup_cannot_double_spend_materialized_release() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let (executor, authority, provider, request, scheduled) =
-                materialized_cache_fixture(backend, "error-cache");
-            executor
-                .prepare_scheduled_cache(std::slice::from_ref(&scheduled))
-                .unwrap();
-
-            let observed = executor
-                .reconcile_scheduled_cache(
-                    &request,
-                    &scheduled,
-                    &ExecutorOutput::error(request.id.clone(), "model failed"),
-                )
-                .unwrap();
-            assert_eq!(observed, cache_observation(0));
-
-            provider.set_available(cache_resource_vector(backend, 100));
-            assert!(matches!(
-                authority.reserve(
-                    ReservationOwner::new(ReservationClass::Request, "error-racer"),
-                    cache_resource_vector(backend, 50),
-                ),
-                Err(Error::Overloaded(_))
-            ));
-
-            let report = executor.cleanup_request(&request.id);
-            assert!(report.confirmed);
-            assert_eq!(authority.snapshot().reservations, 0);
-        }
-    }
-
-    #[test]
-    fn cache_authorization_runs_once_per_exact_session_on_every_backend() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let capacity = cache_resource_vector(backend, 4096);
-            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-                capacity,
-            })));
-            let mut config = WorkerConfig::default();
-            config.backend = backend;
-            let executor = NativeExecutor::new(config);
-            let session = SessionKey::new("session".to_string(), 7);
-            let authorizations = AtomicUsize::new(0);
-
-            executor
-                .reserve_exact_session_cache(&authority, &session, || {
-                    authorizations.fetch_add(1, Ordering::Relaxed);
-                    Ok(1024)
-                })
-                .unwrap();
-            executor
-                .reserve_exact_session_cache(&authority, &session, || {
-                    authorizations.fetch_add(1, Ordering::Relaxed);
-                    Err(Error::InferenceError(
-                        "existing exact session must not be reauthorized".to_string(),
-                    ))
-                })
-                .unwrap();
-
-            assert_eq!(authorizations.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                authority.snapshot().reserved,
-                cache_resource_vector(backend, 1024)
-            );
-            assert_eq!(
-                executor
-                    .cache_resource_leases
-                    .lock()
-                    .unwrap()
-                    .get(&session)
-                    .unwrap()
-                    .reserved_bytes,
-                1024
-            );
-
-            let next_epoch = SessionKey::new("session".to_string(), 8);
-            executor
-                .reserve_exact_session_cache(&authority, &next_epoch, || {
-                    authorizations.fetch_add(1, Ordering::Relaxed);
-                    Ok(1024)
-                })
-                .unwrap();
-            assert_eq!(authorizations.load(Ordering::Relaxed), 2);
-        }
-    }
-
-    #[test]
-    fn cpu_and_metal_cache_authorization_is_advisory_while_cuda_is_guarded() {
-        for backend in [BackendKind::Cpu, BackendKind::Metal] {
-            let capacity = cache_resource_vector(backend, 8);
-            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-                capacity,
-            })));
-            let mut config = WorkerConfig::default();
-            config.backend = backend;
-            let executor = NativeExecutor::new(config);
-            let session = SessionKey::new(format!("{backend:?}"), 1);
-
-            executor
-                .reserve_exact_session_cache(&authority, &session, || Ok(16))
-                .expect("advisory unified-memory cache claim");
-            assert_eq!(
-                authority.snapshot().reserved,
-                cache_resource_vector(backend, 16)
-            );
-        }
-
-        let backend = BackendKind::Cuda;
-        let capacity = cache_resource_vector(backend, 8);
-        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-            capacity,
-        })));
-        let mut config = WorkerConfig::default();
-        config.backend = backend;
-        let executor = NativeExecutor::new(config);
-        let session = SessionKey::new("cuda".to_string(), 1);
-        assert!(matches!(
-            executor.reserve_exact_session_cache(&authority, &session, || Ok(16)),
-            Err(Error::Overloaded(_))
-        ));
-    }
-
-    #[test]
-    fn chat_cache_authorization_requires_private_exact_preparation() {
-        let executor = NativeExecutor::new(WorkerConfig::default());
-        let request =
-            EngineCoreRequest::chat(Vec::new()).with_model_variant(ModelVariant::Qwen306B);
-
-        let error = executor
-            .authorized_session_cache_bytes(&request)
-            .expect_err("public prompt fields must not authorize physical cache");
-        assert!(error
-            .to_string()
-            .contains("missing exact model prompt preparation"));
-    }
-
-    #[test]
-    fn model_owned_cache_observation_is_required() {
-        let scheduled = ScheduledRequest {
-            plan_id: 9,
-            request_id: "cache-contract".to_string(),
-            sequence_id: 42,
-            num_tokens: 1,
-            is_prefill: false,
-            num_computed_tokens: 1,
-            work: crate::engine::WorkUnit::SequenceStep {
-                phase: crate::engine::SequencePhase::Decode,
-                input: crate::engine::InputRange { start: 0, end: 1 },
-                max_output_steps: 1,
-            },
-        };
-
-        assert_eq!(
-            require_known_cache_bytes(Some(4_096), &scheduled).unwrap(),
-            4_096
-        );
-        let error = require_known_cache_bytes(None, &scheduled).unwrap_err();
-        assert!(error.to_string().contains("cache-contract:42"));
-
-        assert_eq!(
-            cache_observation_after_release(CacheReleaseReport::confirmed(1)).kv_bytes,
-            ResourceAmount::Known(0)
-        );
-        assert_eq!(
-            cache_observation_after_release(CacheReleaseReport::unconfirmed()).kv_bytes,
-            ResourceAmount::Unknown
-        );
     }
 
     #[test]
