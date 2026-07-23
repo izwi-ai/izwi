@@ -1,17 +1,22 @@
 //! Lifecycle-owned physical inference-state allocations beyond retained KV.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, DeviceLocation};
+use serde::Serialize;
 
 use crate::backends::kv::{KvArenaConfig, KvBackendRuntime, KvLayerConfig};
-use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+use crate::backends::state::{
+    negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+    StateBackendPlanRequest, StateComponentValue, StateDomainSnapshot, TensorStateArena,
+};
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    InvocationStateCapacity, InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
-    StateDomainId, StateDomainSpec,
+    InferenceStateContract, InvocationStateCapacity, InvocationWorkspaceDomain, ResolvedStatePlan,
+    StateDType, StateDomainId, StateDomainSpec, StatePlanId, StateScope,
 };
 use crate::kv::{KvArenaId, KvGroupId, KvLayerBinding};
 
@@ -36,9 +41,154 @@ struct OwnedInvocationPool {
     resources: ResourceVector,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub(crate) struct RetainedTensorStateRuntimeIdV2 {
+    pub(crate) model_instance: ModelInstanceId,
+    pub(crate) allocation_generation: u32,
+    pub(crate) state_plan: StatePlanId,
+}
+
+/// Lifecycle-owned physical runtime for a retained contract containing only
+/// transactional tensor/append/ring/static-tensor domains.
+pub(crate) struct RetainedTensorStateRuntimeV2 {
+    id: RetainedTensorStateRuntimeIdV2,
+    state_plan: Arc<ResolvedStatePlan>,
+    arena: Arc<TensorStateArena>,
+    next_sequence: AtomicU64,
+    next_transaction: AtomicU64,
+    active_sequences: AtomicU32,
+    sequence_capacity: u32,
+    maximum_bytes: u64,
+}
+
+impl std::fmt::Debug for RetainedTensorStateRuntimeV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedTensorStateRuntimeV2")
+            .field("id", &self.id)
+            .field("sequence_capacity", &self.sequence_capacity)
+            .field("maximum_bytes", &self.maximum_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedTensorStateRuntimeV2 {
+    pub(crate) const fn id(&self) -> RetainedTensorStateRuntimeIdV2 {
+        self.id
+    }
+
+    pub(crate) fn state_plan_v2(&self) -> &ResolvedStatePlan {
+        &self.state_plan
+    }
+
+    pub(crate) const fn maximum_bytes(&self) -> u64 {
+        self.maximum_bytes
+    }
+
+    pub(crate) const fn sequence_capacity(&self) -> u32 {
+        self.sequence_capacity
+    }
+
+    pub(crate) fn register_sequence(&self) -> Result<PhysicalStateSequenceId> {
+        self.active_sequences
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.sequence_capacity).then_some(active + 1)
+            })
+            .map_err(|_| invalid("retained tensor sequence capacity is exhausted"))?;
+        let registered = (|| {
+            let sequence = PhysicalStateSequenceId::new(next_identity(&self.next_sequence)?)?;
+            self.arena.register(sequence)?;
+            Ok(sequence)
+        })();
+        if registered.is_err() {
+            self.active_sequences.fetch_sub(1, Ordering::AcqRel);
+        }
+        registered
+    }
+
+    pub(crate) fn begin_transaction(
+        &self,
+        sequence: PhysicalStateSequenceId,
+    ) -> Result<PhysicalStateTransactionId> {
+        let transaction = PhysicalStateTransactionId::new(next_identity(&self.next_transaction)?)?;
+        self.arena.begin(transaction, sequence)?;
+        Ok(transaction)
+    }
+
+    pub(crate) fn read(
+        &self,
+        sequence: PhysicalStateSequenceId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        self.arena.read(sequence, domain)
+    }
+
+    pub(crate) fn read_transaction_base(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+    ) -> Result<Option<StateDomainSnapshot>> {
+        self.arena.read_transaction_base(transaction, domain)
+    }
+
+    pub(crate) fn stage_replace(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        domain: StateDomainId,
+        expected_cursor: u64,
+        target_cursor: u64,
+        components: Vec<StateComponentValue>,
+    ) -> Result<()> {
+        self.arena.stage_replace(
+            transaction,
+            domain,
+            expected_cursor,
+            target_cursor,
+            components,
+        )
+    }
+
+    pub(crate) fn commit_transaction(
+        &self,
+        transaction: PhysicalStateTransactionId,
+        expected_cursor: u64,
+    ) -> Result<()> {
+        self.arena.commit(transaction, expected_cursor)
+    }
+
+    pub(crate) fn abort_transaction(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
+        self.arena.abort(transaction)
+    }
+
+    pub(crate) fn release_sequence(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
+        self.arena.release(sequence)?;
+        self.active_sequences
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            })
+            .map_err(|_| {
+                Error::InferenceError(
+                    "retained tensor sequence accounting underflowed after release".into(),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn close_and_validate_drained(&self) -> Result<()> {
+        self.arena.close_and_validate_drained()
+    }
+}
+
+struct OwnedRetainedTensorState {
+    runtime: Arc<RetainedTensorStateRuntimeV2>,
+    resource_lease: Option<ResourceLease>,
+    resources: ResourceVector,
+}
+
 #[derive(Default)]
 struct ModelPhysicalState {
     invocation_paged: HashMap<InvocationPhysicalKey, OwnedInvocationPool>,
+    retained_tensor: Option<OwnedRetainedTensorState>,
 }
 
 /// Worker-local owner for capability-authored invocation state. Planning and
@@ -49,6 +199,7 @@ pub(crate) struct PhysicalStateManager {
     resource_authority: Option<Arc<ResourceAuthority>>,
     next_allocation_generation: u32,
     worker_backend: BackendKind,
+    worker_device: Device,
     worker_device_location: DeviceLocation,
     worker_device_ordinal: Option<u32>,
     backend_runtime: Option<Arc<dyn KvBackendRuntime>>,
@@ -67,6 +218,7 @@ impl PhysicalStateManager {
             resource_authority,
             next_allocation_generation: 1,
             worker_backend: backend,
+            worker_device: device.clone(),
             worker_device_location: device.location(),
             worker_device_ordinal: managed_device_ordinal(&device),
             backend_runtime,
@@ -76,6 +228,121 @@ impl PhysicalStateManager {
 
     pub(crate) fn cpu(resource_authority: Option<Arc<ResourceAuthority>>) -> Self {
         Self::for_worker(resource_authority, BackendKind::Cpu, Device::Cpu)
+    }
+
+    pub(crate) fn allocate_retained_tensor(
+        &mut self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedTensorStateRuntimeV2>> {
+        contract.validate()?;
+        if sequence_capacity == 0
+            || contract.domains.is_empty()
+            || contract
+                .domains
+                .iter()
+                .any(|domain| domain.scope() != StateScope::Retained)
+            || contract.domains.iter().any(|domain| {
+                !matches!(
+                    domain,
+                    StateDomainSpec::Tensor(_)
+                        | StateDomainSpec::Append(_)
+                        | StateDomainSpec::Ring(_)
+                        | StateDomainSpec::StaticTensor(_)
+                )
+            })
+        {
+            return Err(invalid(
+                "retained tensor allocation requires non-zero sequence capacity and retained tensor, append, ring, or static-tensor domains only",
+            ));
+        }
+        if let Some(existing) = self
+            .models
+            .get(&model_instance)
+            .and_then(|model| model.retained_tensor.as_ref())
+        {
+            if existing.runtime.state_plan_v2().contract_fingerprint != contract.fingerprint()?
+                || existing.runtime.sequence_capacity() != sequence_capacity
+            {
+                return Err(invalid(
+                    "one model generation requested incompatible retained tensor allocation",
+                ));
+            }
+            return Ok(existing.runtime.clone());
+        }
+        let state_plan = Arc::new(negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )?);
+        if !state_plan.paged_attention.is_empty() || state_plan.non_paged.is_empty() {
+            return Err(invalid(
+                "retained tensor allocation resolved an invalid physical domain set",
+            ));
+        }
+        let per_sequence_bytes = state_plan
+            .non_paged
+            .iter()
+            .try_fold(0_u64, |total, domain| {
+                total
+                    .checked_add(domain.maximum_bytes())
+                    .ok_or_else(|| invalid("retained tensor byte bound overflow"))
+            })?;
+        let maximum_bytes = retained_capacity_bytes(per_sequence_bytes, sequence_capacity)?;
+        let generation = self.next_allocation_generation;
+        if generation == 0 {
+            return Err(invalid("physical retained allocation generation exhausted"));
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("physical retained allocation generation overflow"))?;
+        let resources = arena_resources(self.worker_backend, maximum_bytes);
+        let resource_lease = self
+            .resource_authority
+            .as_ref()
+            .map(|authority| {
+                reserve_retained_tensor(authority, model_instance, self.worker_backend, resources)
+            })
+            .transpose()?;
+        let arena = Arc::new(TensorStateArena::new(
+            state_plan.clone(),
+            self.worker_device.clone(),
+        )?);
+        let runtime = Arc::new(RetainedTensorStateRuntimeV2 {
+            id: RetainedTensorStateRuntimeIdV2 {
+                model_instance,
+                allocation_generation: generation,
+                state_plan: state_plan.id,
+            },
+            state_plan,
+            arena,
+            next_sequence: AtomicU64::new(1),
+            next_transaction: AtomicU64::new(1),
+            active_sequences: AtomicU32::new(0),
+            sequence_capacity,
+            maximum_bytes,
+        });
+        let model = self.models.entry(model_instance).or_default();
+        if model
+            .retained_tensor
+            .replace(OwnedRetainedTensorState {
+                runtime: runtime.clone(),
+                resource_lease,
+                resources,
+            })
+            .is_some()
+        {
+            return Err(invalid(
+                "one model generation allocated retained tensor state twice",
+            ));
+        }
+        self.next_allocation_generation = next_generation;
+        Ok(runtime)
     }
 
     pub(crate) fn allocate_invocation_paged(
@@ -136,6 +403,15 @@ impl PhysicalStateManager {
             .bytes_per_page
             .checked_mul(u64::from(capacity_pages))
             .ok_or_else(|| invalid("invocation paged arena byte size overflow"))?;
+        let generation = self.next_allocation_generation;
+        if generation == 0 {
+            return Err(invalid(
+                "physical invocation allocation generation exhausted",
+            ));
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("physical invocation allocation generation overflow"))?;
         let resources = arena_resources(self.worker_backend, physical_bytes);
         let resource_lease = self
             .resource_authority
@@ -150,12 +426,6 @@ impl PhysicalStateManager {
                 )
             })
             .transpose()?;
-        let generation = self.next_allocation_generation;
-        if generation == 0 {
-            return Err(invalid(
-                "physical invocation allocation generation exhausted",
-            ));
-        }
         let arena_id = KvArenaId {
             model_instance,
             backend: self.worker_backend,
@@ -209,9 +479,7 @@ impl PhysicalStateManager {
                     resources,
                 },
             );
-        self.next_allocation_generation = generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("physical invocation allocation generation overflow"))?;
+        self.next_allocation_generation = next_generation;
         Ok(handle)
     }
 
@@ -247,14 +515,35 @@ impl PhysicalStateManager {
         let Some(model) = self.models.get(&model_instance) else {
             return Ok(false);
         };
+        let mut drain_error = None;
         for pool in model.invocation_paged.values() {
-            pool.owner.close_and_drain()?;
+            if let Err(error) = pool.owner.close_and_drain() {
+                drain_error.get_or_insert(error);
+            }
+        }
+        if let Some(retained) = model.retained_tensor.as_ref() {
+            if let Err(error) = retained.runtime.close_and_validate_drained() {
+                drain_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = drain_error {
+            return Err(error);
         }
         for pool in model.invocation_paged.values() {
             if let Some(lease) = pool.resource_lease.as_ref() {
                 if lease.resources() != pool.resources {
                     return Err(Error::InferenceError(
                         "invocation state resource lease changed after allocation".to_string(),
+                    ));
+                }
+                lease.prepare_materialized_release(ResourceVector::zero())?;
+            }
+        }
+        if let Some(retained) = model.retained_tensor.as_ref() {
+            if let Some(lease) = retained.resource_lease.as_ref() {
+                if lease.resources() != retained.resources {
+                    return Err(Error::InferenceError(
+                        "retained tensor resource lease changed after allocation".to_string(),
                     ));
                 }
                 lease.prepare_materialized_release(ResourceVector::zero())?;
@@ -272,6 +561,20 @@ impl PhysicalStateManager {
     fn model_count(&self) -> usize {
         self.models.len()
     }
+}
+
+fn next_identity(counter: &AtomicU64) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| invalid("physical state identity space exhausted"))
+}
+
+fn retained_capacity_bytes(per_sequence_bytes: u64, sequence_capacity: u32) -> Result<u64> {
+    per_sequence_bytes
+        .checked_mul(u64::from(sequence_capacity))
+        .ok_or_else(|| invalid("retained tensor sequence capacity byte bound overflow"))
 }
 
 fn validate_key(key: InvocationPhysicalKey) -> Result<()> {
@@ -374,6 +677,22 @@ fn reserve_arena(
     }
 }
 
+fn reserve_retained_tensor(
+    authority: &Arc<ResourceAuthority>,
+    model_instance: ModelInstanceId,
+    backend: BackendKind,
+    resources: ResourceVector,
+) -> Result<ResourceLease> {
+    let owner = ReservationOwner::new(
+        ReservationClass::Model,
+        format!("retained-tensor-state:{}:{backend:?}", model_instance.get()),
+    );
+    match backend {
+        BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources),
+        BackendKind::Cuda => authority.reserve(owner, resources),
+    }
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidInput(message.into())
 }
@@ -383,9 +702,12 @@ mod tests {
     use super::*;
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::kv::v2::{
-        test_contract, CheckpointPolicy, InvocationStateCapacity, PlacementPolicy, PrefixPolicy,
-        StateScope, WorkspaceFormula,
+        test_contract, BoundedShape, CheckpointPolicy, InvocationStateCapacity, PlacementPolicy,
+        PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId,
+        StateDomainHeader, StateGroupId, StateGroupSpec, TensorComponentSpec, TensorRole,
+        TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
     };
+    use candle_core::Tensor;
 
     fn invocation_plan() -> (ResolvedStatePlan, InvocationWorkspaceDomain) {
         let mut contract = test_contract();
@@ -434,6 +756,41 @@ mod tests {
         }
     }
 
+    fn retained_tensor_contract(maximum_elements: u64) -> InferenceStateContract {
+        InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: StateDomainId::new(1),
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: PlacementPolicy::BackendLocal,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::RuntimeBounded {
+                                min: 1,
+                                max: maximum_elements,
+                            },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            })],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            }],
+        }
+    }
+
     #[test]
     fn allocator_uses_exact_page_rounding_and_slot_multiplicity() {
         let (plan, domain) = invocation_plan();
@@ -477,5 +834,107 @@ mod tests {
         assert_ne!(replacement.id(), handle.id());
         assert!(handle.lease().is_err());
         manager.unload_model(model).unwrap();
+    }
+
+    #[test]
+    fn unload_closes_every_physical_owner_before_reporting_backpressure() {
+        let (plan, domain) = invocation_plan();
+        let model = ModelInstanceId::new(45);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let first = manager
+            .allocate_invocation_paged(model, key(), &plan, &domain, 1)
+            .unwrap();
+        let mut second_key = key();
+        second_key.adapter_instance = AdapterInstanceId::new(4);
+        let second = manager
+            .allocate_invocation_paged(model, second_key, &plan, &domain, 1)
+            .unwrap();
+        let retained = manager
+            .allocate_retained_tensor(model, &retained_tensor_contract(8), 1)
+            .unwrap();
+        let invocation_lease = first.lease().unwrap();
+        let sequence = retained.register_sequence().unwrap();
+
+        assert!(manager.unload_model(model).is_err());
+        assert!(first.lease().is_err());
+        assert!(second.lease().is_err());
+        assert!(retained.register_sequence().is_err());
+
+        drop(invocation_lease);
+        retained.release_sequence(sequence).unwrap();
+        assert!(manager.unload_model(model).unwrap());
+    }
+
+    #[test]
+    fn retained_tensor_runtime_reuses_exact_contract_and_exposes_transactions() {
+        let model = ModelInstanceId::new(43);
+        let contract = retained_tensor_contract(8);
+        let mut manager = PhysicalStateManager::cpu(None);
+        let runtime = manager
+            .allocate_retained_tensor(model, &contract, 2)
+            .unwrap();
+        let reused = manager
+            .allocate_retained_tensor(model, &contract, 2)
+            .unwrap();
+        assert!(Arc::ptr_eq(&runtime, &reused));
+        assert!(runtime.state_plan_v2().paged_attention.is_empty());
+        assert_eq!(runtime.state_plan_v2().non_paged.len(), 1);
+        assert_eq!(runtime.sequence_capacity(), 2);
+        assert!(runtime.maximum_bytes() >= 2 * 8 * 4);
+        assert!(manager
+            .allocate_retained_tensor(model, &retained_tensor_contract(4), 2)
+            .is_err());
+        assert!(manager
+            .allocate_retained_tensor(model, &contract, 1)
+            .is_err());
+
+        let sequence = runtime.register_sequence().unwrap();
+        let second_sequence = runtime.register_sequence().unwrap();
+        assert!(runtime.register_sequence().is_err());
+        let transaction = runtime.begin_transaction(sequence).unwrap();
+        runtime
+            .stage_replace(
+                transaction,
+                StateDomainId::new(1),
+                0,
+                1,
+                vec![crate::backends::state::StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Tensor::from_slice(&[1.0_f32, 2.0], 2, &Device::Cpu).unwrap(),
+                }],
+            )
+            .unwrap();
+        runtime.commit_transaction(transaction, 1).unwrap();
+        assert_eq!(
+            runtime
+                .read(sequence, StateDomainId::new(1))
+                .unwrap()
+                .unwrap()
+                .cursor,
+            1
+        );
+
+        assert!(manager.unload_model(model).is_err());
+        assert!(runtime.register_sequence().is_err());
+        runtime.release_sequence(sequence).unwrap();
+        runtime.release_sequence(second_sequence).unwrap();
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn retained_tensor_capacity_bytes_reject_overflow() {
+        assert!(retained_capacity_bytes(u64::MAX, 2).is_err());
+        assert_eq!(retained_capacity_bytes(32, 3).unwrap(), 96);
+    }
+
+    #[test]
+    fn retained_tensor_generation_overflow_does_not_publish_an_owner() {
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager.next_allocation_generation = u32::MAX;
+        assert!(manager
+            .allocate_retained_tensor(ModelInstanceId::new(44), &retained_tensor_contract(8), 1,)
+            .is_err());
+        assert_eq!(manager.model_count(), 0);
     }
 }

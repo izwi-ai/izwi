@@ -2739,6 +2739,16 @@ impl EngineCore {
         )
     }
 
+    pub(crate) fn load_retained_tensor_state(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        sequence_capacity: u32,
+    ) -> Result<Arc<super::RetainedTensorStateRuntimeV2>> {
+        self.physical_state
+            .allocate_retained_tensor(model_instance, contract, sequence_capacity)
+    }
+
     pub(crate) fn resolve_and_load_invocation_paged_workspace(
         &mut self,
         model_instance: super::ModelInstanceId,

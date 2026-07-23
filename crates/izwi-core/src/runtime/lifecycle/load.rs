@@ -9,13 +9,13 @@ use tracing::info;
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::engine::{
-    ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
+    CacheMode, ReservationClass, ReservationOwner, ResourceAmount, ResourceLease, ResourceVector,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
     InvocationPagedWorkspaceRuntimeV2, InvocationWorkspaceDomain, InvocationWorkspaceSet,
-    StateDomainSpec,
+    RetainedStateUseV2, StateDomainSpec,
 };
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
@@ -513,11 +513,39 @@ impl ModelLifecycleController {
                             }
                         }
                     }
+                    let retained_uses = contracts
+                        .iter()
+                        .map(|contract| {
+                            let graph = stage_graph_fingerprint(&contract.stages)?;
+                            let retained_use = match contract.execution_profile.cache_mode {
+                                CacheMode::ExternalPaged
+                                    if contract.execution_profile.cache_namespace.is_some()
+                                        && contract.execution_profile.kv_dtype != "none" =>
+                                {
+                                    RetainedStateUseV2::ExternalPaged
+                                }
+                                CacheMode::None
+                                    if contract.execution_profile.cache_namespace.is_none()
+                                        && contract.execution_profile.kv_dtype == "none" =>
+                                {
+                                    RetainedStateUseV2::Inactive
+                                }
+                                _ => {
+                                    return Err(Error::ModelLoadError(
+                                        "Qwen3 TTS retained-state graph has an incompatible cache profile"
+                                            .to_string(),
+                                    ));
+                                }
+                            };
+                            Ok((graph, retained_use))
+                        })
+                        .collect::<Result<HashMap<_, _>>>()?;
                     state_publications.insert(
                         capability,
                         LoadedStatePublication::PhysicalV2 {
                             descriptor: physical_spec.descriptor,
-                            retained: Some(retained),
+                            retained: Some(retained.into()),
+                            retained_uses,
                             invocation_paged: InvocationPagedWorkspaceRuntimeV2::new(
                                 invocation_bindings,
                             )?,

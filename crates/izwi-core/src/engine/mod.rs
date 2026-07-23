@@ -51,6 +51,9 @@ pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
     ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
 };
+#[cfg(test)]
+pub(crate) use cache::physical::PhysicalStateManager;
+pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub use config::EngineCoreConfig;
 pub use core::EngineCore;
@@ -1455,6 +1458,20 @@ impl Engine {
             plan,
             domain,
             slot_count,
+        )
+    }
+
+    pub(crate) async fn load_retained_tensor_state(
+        &self,
+        model_instance: ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        sequence_capacity: u32,
+    ) -> Result<Arc<RetainedTensorStateRuntimeV2>> {
+        let _step = self.step_gate.lock().await;
+        self.core.write().await.load_retained_tensor_state(
+            model_instance,
+            contract,
+            sequence_capacity,
         )
     }
 

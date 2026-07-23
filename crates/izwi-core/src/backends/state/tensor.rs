@@ -64,6 +64,7 @@ struct StagedTransaction {
 
 #[derive(Default)]
 struct ArenaState {
+    closed: bool,
     sequences: HashMap<PhysicalStateSequenceId, SequenceState>,
     transactions: HashMap<PhysicalStateTransactionId, StagedTransaction>,
 }
@@ -122,6 +123,9 @@ impl TensorStateArena {
 
     pub(crate) fn register(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
         let mut state = self.lock()?;
+        if state.closed {
+            return Err(invalid("physical state arena is closed"));
+        }
         if state.sequences.contains_key(&sequence) {
             return Err(invalid("physical state sequence is already registered"));
         }
@@ -135,8 +139,20 @@ impl TensorStateArena {
         sequence: PhysicalStateSequenceId,
     ) -> Result<()> {
         let mut state = self.lock()?;
+        if state.closed {
+            return Err(invalid("physical state arena is closed"));
+        }
         if state.transactions.contains_key(&transaction) {
             return Err(invalid("physical state transaction id is already active"));
+        }
+        if state
+            .transactions
+            .values()
+            .any(|active| active.sequence == sequence)
+        {
+            return Err(invalid(
+                "physical state sequence already has an active transaction",
+            ));
         }
         let live = state
             .sequences
@@ -290,6 +306,20 @@ impl TensorStateArena {
     pub(crate) fn validate_release(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
         let state = self.lock()?;
         validate_sequence_release(&state, sequence)
+    }
+
+    /// Prevent new sequences/transactions and prove all existing users have
+    /// released their state. A failed drain remains closed so unload can retry
+    /// after the active owners finish without admitting new work.
+    pub(crate) fn close_and_validate_drained(&self) -> Result<()> {
+        let mut state = self.lock()?;
+        state.closed = true;
+        if !state.transactions.is_empty() || !state.sequences.is_empty() {
+            return Err(invalid(
+                "physical state arena still has active sequences or transactions",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_components(
@@ -564,5 +594,45 @@ mod tests {
         arena.abort(transaction).unwrap();
         arena.validate_release(sequence).unwrap();
         arena.release(sequence).unwrap();
+    }
+
+    #[test]
+    fn one_sequence_cannot_fork_concurrent_transactions() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        arena
+            .begin(PhysicalStateTransactionId::new(1).unwrap(), sequence)
+            .unwrap();
+        assert!(arena
+            .begin(PhysicalStateTransactionId::new(2).unwrap(), sequence)
+            .is_err());
+        arena
+            .abort(PhysicalStateTransactionId::new(1).unwrap())
+            .unwrap();
+        arena
+            .begin(PhysicalStateTransactionId::new(2).unwrap(), sequence)
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_drain_closes_admission_and_can_be_retried_after_release() {
+        let arena = arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        arena.begin(transaction, sequence).unwrap();
+
+        assert!(arena.close_and_validate_drained().is_err());
+        assert!(arena
+            .register(PhysicalStateSequenceId::new(2).unwrap())
+            .is_err());
+        assert!(arena
+            .begin(PhysicalStateTransactionId::new(2).unwrap(), sequence)
+            .is_err());
+
+        arena.abort(transaction).unwrap();
+        arena.release(sequence).unwrap();
+        arena.close_and_validate_drained().unwrap();
     }
 }

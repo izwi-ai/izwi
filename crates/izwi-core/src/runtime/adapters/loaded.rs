@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,8 +14,8 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CapabilityStateRuntimeV2,
     InferenceStateContract, InvocationCapabilityRuntimeV2, InvocationPagedWorkspaceRuntimeV2,
-    ManagedCapabilityRuntimeV2, RetainedStateCapability, RetainedStateUseV2,
-    StatelessCapabilityRuntimeV2,
+    ManagedCapabilityRuntimeV2, RetainedStateCapability, RetainedStateRuntimeV2,
+    RetainedStateUseV2, StatelessCapabilityRuntimeV2,
 };
 use crate::kv::{CacheCapability, LoadedKvCacheCapability};
 use crate::model::ModelVariant;
@@ -142,7 +142,10 @@ pub(crate) enum LoadedStatePublication {
     /// backing allocated before capability sealing.
     PhysicalV2 {
         descriptor: CapabilityStateDescriptorV2,
-        retained: Option<Arc<ManagedKvModelRuntime>>,
+        retained: Option<RetainedStateRuntimeV2>,
+        /// Exact stage-graph activation is declared independently from the
+        /// KV-specific execution profile fields.
+        retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
         invocation_paged: InvocationPagedWorkspaceRuntimeV2,
     },
 }
@@ -415,12 +418,31 @@ impl LoadedCapabilityDescriptor {
             LoadedStatePublication::PhysicalV2 {
                 descriptor,
                 retained,
+                retained_uses,
                 invocation_paged,
             } => {
                 if execution.metadata().state_requirement.requires_retained() != retained.is_some()
                 {
                     return Err(Error::ModelLoadError(
                         "physical retained backing does not match the capability lifetime declaration"
+                            .to_string(),
+                    ));
+                }
+                let expected_graphs = contracts
+                    .iter()
+                    .map(|contract| stage_graph_fingerprint(&contract.stages))
+                    .collect::<Result<HashSet<_>>>()?;
+                let declared_graphs = retained_uses.keys().copied().collect::<HashSet<_>>();
+                if retained.is_some() {
+                    if declared_graphs != expected_graphs {
+                        return Err(Error::ModelLoadError(
+                            "physical retained-state use must be declared for every exact stage graph"
+                                .to_string(),
+                        ));
+                    }
+                } else if !declared_graphs.is_empty() {
+                    return Err(Error::ModelLoadError(
+                        "invocation-only physical state cannot declare retained-state use"
                             .to_string(),
                     ));
                 }
@@ -437,26 +459,19 @@ impl LoadedCapabilityDescriptor {
                     }
                     let binding = contract.adapter_binding()?;
                     let (graph, runtime) = if let Some(retained) = retained.as_ref() {
-                        let retained_state_use = match contract.execution_profile.cache_mode {
-                            CacheMode::ExternalPaged
-                                if contract.execution_profile.cache_namespace.is_some()
-                                    && contract.execution_profile.kv_dtype != "none" =>
-                            {
-                                RetainedStateUseV2::ExternalPaged
-                            }
-                            CacheMode::None
-                                if contract.execution_profile.cache_namespace.is_none()
-                                    && contract.execution_profile.kv_dtype == "none" =>
-                            {
-                                RetainedStateUseV2::Inactive
-                            }
-                            _ => {
-                                return Err(Error::ModelLoadError(
-                                    "physical state ABI v2 requires each retained graph to declare either external paged state or no retained state"
+                        let graph = stage_graph_fingerprint(&contract.stages)?;
+                        let retained_state_use =
+                            retained_uses.get(&graph).copied().ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "physical retained-state use is missing an exact stage graph"
                                         .to_string(),
-                                ));
-                            }
-                        };
+                                )
+                            })?;
+                        validate_retained_state_use(
+                            retained,
+                            retained_state_use,
+                            &contract.execution_profile,
+                        )?;
                         let managed = ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
                             backend_kind,
                             &binding,
@@ -554,6 +569,38 @@ impl LoadedCapabilityDescriptor {
             state_fingerprint,
         })
     }
+}
+
+fn validate_retained_state_use(
+    retained: &RetainedStateRuntimeV2,
+    retained_state_use: RetainedStateUseV2,
+    profile: &ExecutionProfile,
+) -> Result<()> {
+    let cacheless = profile.cache_mode == CacheMode::None
+        && profile.cache_namespace.is_none()
+        && profile.kv_dtype == "none";
+    let external_paged = profile.cache_mode == CacheMode::ExternalPaged
+        && profile.cache_namespace.is_some()
+        && profile.kv_dtype != "none";
+    let valid = if retained.is_tensor_only() {
+        cacheless
+            && matches!(
+                retained_state_use,
+                RetainedStateUseV2::ExternalTensor | RetainedStateUseV2::Inactive
+            )
+    } else {
+        matches!(
+            retained_state_use,
+            RetainedStateUseV2::ExternalPaged if external_paged
+        ) || matches!(retained_state_use, RetainedStateUseV2::Inactive if cacheless)
+    };
+    if !valid {
+        return Err(Error::ModelLoadError(
+            "retained-state use does not match its physical backing and exact execution profile"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Request-ready projection of one sealed loaded capability descriptor.

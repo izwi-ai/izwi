@@ -10,7 +10,9 @@ use crate::engine::{
     ModelInstanceId,
 };
 use crate::engine::{InvocationPagedKvLease, InvocationPagedKvPoolHandle, InvocationPagedKvPoolId};
-use crate::engine::{ManagedKvModelRuntime, StageId};
+use crate::engine::{
+    ManagedKvModelRuntime, RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2, StageId,
+};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 
@@ -32,6 +34,103 @@ const MANAGED_RUNTIME_FINGERPRINT_DOMAIN: &[u8] = b"izwi.inference-state.managed
 pub(crate) enum RetainedStateUseV2 {
     Inactive,
     ExternalPaged,
+    ExternalTensor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RetainedStateRuntimeV2 {
+    Paged(Arc<ManagedKvModelRuntime>),
+    Tensor(Arc<RetainedTensorStateRuntimeV2>),
+}
+
+impl From<Arc<ManagedKvModelRuntime>> for RetainedStateRuntimeV2 {
+    fn from(runtime: Arc<ManagedKvModelRuntime>) -> Self {
+        Self::Paged(runtime)
+    }
+}
+
+impl From<Arc<RetainedTensorStateRuntimeV2>> for RetainedStateRuntimeV2 {
+    fn from(runtime: Arc<RetainedTensorStateRuntimeV2>) -> Self {
+        Self::Tensor(runtime)
+    }
+}
+
+impl RetainedStateRuntimeV2 {
+    pub(crate) fn model_instance(&self) -> ModelInstanceId {
+        match self {
+            Self::Paged(runtime) => runtime.plan().model_instance,
+            Self::Tensor(runtime) => runtime.id().model_instance,
+        }
+    }
+
+    pub(crate) fn state_plan_v2(&self) -> &ResolvedStatePlan {
+        match self {
+            Self::Paged(runtime) => runtime.state_plan_v2(),
+            Self::Tensor(runtime) => runtime.state_plan_v2(),
+        }
+    }
+
+    pub(crate) const fn is_tensor_only(&self) -> bool {
+        matches!(self, Self::Tensor(_))
+    }
+
+    fn downgrade(&self) -> WeakRetainedStateRuntimeV2 {
+        match self {
+            Self::Paged(runtime) => WeakRetainedStateRuntimeV2::Paged(Arc::downgrade(runtime)),
+            Self::Tensor(runtime) => WeakRetainedStateRuntimeV2::Tensor(Arc::downgrade(runtime)),
+        }
+    }
+
+    fn identity(&self) -> RetainedStateRuntimeIdentityV2 {
+        match self {
+            Self::Paged(runtime) => RetainedStateRuntimeIdentityV2::Paged {
+                plan: runtime.plan().id,
+            },
+            Self::Tensor(runtime) => RetainedStateRuntimeIdentityV2::Tensor {
+                runtime: runtime.id(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum WeakRetainedStateRuntimeV2 {
+    Paged(Weak<ManagedKvModelRuntime>),
+    Tensor(Weak<RetainedTensorStateRuntimeV2>),
+}
+
+impl WeakRetainedStateRuntimeV2 {
+    fn upgrade(&self) -> Option<RetainedStateRuntimeV2> {
+        match self {
+            Self::Paged(runtime) => runtime.upgrade().map(RetainedStateRuntimeV2::Paged),
+            Self::Tensor(runtime) => runtime.upgrade().map(RetainedStateRuntimeV2::Tensor),
+        }
+    }
+}
+
+fn retained_use_matches(
+    retained_state_use: RetainedStateUseV2,
+    runtime: &RetainedStateRuntimeV2,
+) -> bool {
+    match retained_state_use {
+        RetainedStateUseV2::Inactive => true,
+        RetainedStateUseV2::ExternalPaged => {
+            matches!(runtime, RetainedStateRuntimeV2::Paged(_))
+        }
+        RetainedStateUseV2::ExternalTensor => {
+            matches!(runtime, RetainedStateRuntimeV2::Tensor(_))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum RetainedStateRuntimeIdentityV2 {
+    Paged {
+        plan: crate::kv::KvPlanId,
+    },
+    Tensor {
+        runtime: RetainedTensorStateRuntimeIdV2,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -302,9 +401,30 @@ impl CapabilityStateRuntimeV2 {
             CapabilityStateRuntimeBackingV2::Managed(runtime)
                 if runtime.retained_state_use == RetainedStateUseV2::ExternalPaged =>
             {
-                runtime.physical.upgrade()
+                match runtime.retained.upgrade()? {
+                    RetainedStateRuntimeV2::Paged(physical) => Some(physical),
+                    RetainedStateRuntimeV2::Tensor(_) => None,
+                }
             }
             CapabilityStateRuntimeBackingV2::Managed(_) => None,
+        }
+    }
+
+    pub(crate) fn retained_tensor_state_runtime(
+        &self,
+    ) -> Option<Arc<RetainedTensorStateRuntimeV2>> {
+        match &self.backing {
+            CapabilityStateRuntimeBackingV2::Managed(runtime)
+                if runtime.retained_state_use == RetainedStateUseV2::ExternalTensor =>
+            {
+                match runtime.retained.upgrade()? {
+                    RetainedStateRuntimeV2::Tensor(physical) => Some(physical),
+                    RetainedStateRuntimeV2::Paged(_) => None,
+                }
+            }
+            CapabilityStateRuntimeBackingV2::Stateless(_)
+            | CapabilityStateRuntimeBackingV2::Invocation(_)
+            | CapabilityStateRuntimeBackingV2::Managed(_) => None,
         }
     }
 
@@ -377,7 +497,7 @@ impl CapabilityStateRuntimeV2 {
 }
 
 /// Load-sealed proof that one exact capability owns a backend-resolved state
-/// plan and the already allocated physical paged arena implementing it.
+/// plan and the already allocated physical retained arena implementing it.
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedCapabilityRuntimeV2 {
     pub(crate) id: [u8; 32],
@@ -386,12 +506,12 @@ pub(crate) struct ManagedCapabilityRuntimeV2 {
     pub(crate) state_fingerprint: [u8; 32],
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) state_plan: Arc<ResolvedStatePlan>,
-    physical_plan: crate::kv::KvPlanId,
+    retained_identity: RetainedStateRuntimeIdentityV2,
     retained_state_use: RetainedStateUseV2,
     /// The lifecycle manager is the physical owner. A sealed adapter proves
     /// the exact generation without pinning that generation through unload;
     /// admitted requests upgrade this weak handle while holding residency.
-    physical: Weak<ManagedKvModelRuntime>,
+    retained: WeakRetainedStateRuntimeV2,
     invocation_paged: InvocationPagedWorkspaceRuntimeV2,
 }
 
@@ -417,18 +537,19 @@ impl ManagedCapabilityRuntimeV2 {
         backend: BackendKind,
         execution: &ExecutionAdapterBinding,
         descriptor: CapabilityStateDescriptorV2,
-        physical: Arc<ManagedKvModelRuntime>,
+        physical: impl Into<RetainedStateRuntimeV2>,
         retained_state_use: RetainedStateUseV2,
         invocation_paged: InvocationPagedWorkspaceRuntimeV2,
     ) -> Result<Self> {
         execution.validate()?;
         descriptor.validate_against_stages(&execution.stages)?;
+        let physical = physical.into();
         let RetainedStateCapability::Managed { contract } = &descriptor.retained else {
             return Err(invalid(
                 "managed state ABI v2 runtime requires retained physical state",
             ));
         };
-        if execution.model_instance_id != physical.plan().model_instance {
+        if execution.model_instance_id != physical.model_instance() {
             return Err(invalid(
                 "managed state ABI v2 runtime targets a different model instance",
             ));
@@ -453,9 +574,9 @@ impl ManagedCapabilityRuntimeV2 {
             state_fingerprint,
             descriptor,
             state_plan,
-            physical_plan: physical.plan().id,
+            retained_identity: physical.identity(),
             retained_state_use,
-            physical: Arc::downgrade(&physical),
+            retained: physical.downgrade(),
             invocation_paged,
         };
         runtime.id = runtime.compute_id()?;
@@ -478,14 +599,15 @@ impl ManagedCapabilityRuntimeV2 {
         let registry =
             StateBackendRegistry::new(self.state_plan.backend, self.state_plan.device_ordinal)?;
         self.state_plan.validate_against(contract, &registry)?;
-        let physical = self.physical.upgrade().ok_or_else(|| {
+        let physical = self.retained.upgrade().ok_or_else(|| {
             invalid("managed state ABI v2 runtime refers to an unloaded physical generation")
         })?;
         if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
             || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
             || self.state_plan.id != physical.state_plan_v2().id
-            || self.physical_plan != physical.plan().id
-            || execution.model_instance_id != physical.plan().model_instance
+            || self.retained_identity != physical.identity()
+            || execution.model_instance_id != physical.model_instance()
+            || !retained_use_matches(self.retained_state_use, &physical)
             || self.id != self.compute_id()?
         {
             return Err(invalid(
@@ -502,7 +624,7 @@ impl ManagedCapabilityRuntimeV2 {
             stage_graph_fingerprint: [u8; 32],
             state_fingerprint: [u8; 32],
             state_plan: super::StatePlanId,
-            physical_plan: crate::kv::KvPlanId,
+            retained_identity: RetainedStateRuntimeIdentityV2,
             retained_state_use: RetainedStateUseV2,
             invocation_paged: Vec<(InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolId)>,
         }
@@ -511,7 +633,7 @@ impl ManagedCapabilityRuntimeV2 {
             stage_graph_fingerprint: self.stage_graph_fingerprint,
             state_fingerprint: self.state_fingerprint,
             state_plan: self.state_plan.id,
-            physical_plan: self.physical_plan,
+            retained_identity: self.retained_identity,
             retained_state_use: self.retained_state_use,
             invocation_paged: self
                 .invocation_paged
@@ -692,13 +814,16 @@ mod tests {
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::engine::{
         EngineCore, EngineCoreConfig, ExecutionMode, ExecutionProfile, InvocationPagedKvPoolOwner,
-        NativeBatchMode, StageDescriptor, StageId,
+        NativeBatchMode, PhysicalStateManager, StageDescriptor, StageId,
     };
     use crate::kv::v2::{test_contract, upgrade_kv_contract_v1};
     use crate::kv::v2::{
-        CheckpointPolicy, InvocationStageWorkspace, InvocationStateCapacity,
-        InvocationWorkspaceProfile, PlacementPolicy, PrefixPolicy, StateDType, StateDomainSpec,
-        StateGroupId, StateGroupSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+        BoundedShape, CheckpointPolicy, InferenceStateContract, InvocationStageWorkspace,
+        InvocationStateCapacity, InvocationWorkspaceProfile, PlacementPolicy, PrefixPolicy,
+        ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType,
+        StateDomainHeader, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
+        TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
+        CURRENT_INFERENCE_STATE_ABI,
     };
     use crate::kv::{CacheCapability, KvArenaId, KvGroupId, KvLayerBinding};
 
@@ -720,6 +845,38 @@ mod tests {
             model_variant: variant,
             capability_id: "tts".to_string(),
             stages: Arc::from([stage]),
+        }
+    }
+
+    fn tensor_contract() -> InferenceStateContract {
+        InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: StateDomainId::new(1),
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: PlacementPolicy::BackendLocal,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::RuntimeBounded { min: 1, max: 8 },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            })],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: false,
+            }],
         }
     }
 
@@ -895,6 +1052,61 @@ mod tests {
         Arc::make_mut(&mut changed.stages)[0].name = "tts.changed".to_string();
         assert!(runtime
             .validate_against(BackendKind::Cpu, &changed)
+            .is_err());
+    }
+
+    #[test]
+    fn tensor_only_retained_runtime_seals_and_invalidates_on_unload() {
+        let binding = binding();
+        let contract = tensor_contract();
+        let descriptor = CapabilityStateDescriptorV2::managed_for_stage_graphs(
+            contract.clone(),
+            &[binding.stages.as_ref()],
+        )
+        .unwrap();
+        let mut physical = PhysicalStateManager::cpu(None);
+        let retained = physical
+            .allocate_retained_tensor(binding.model_instance_id, &contract, 1)
+            .unwrap();
+
+        assert!(ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
+            BackendKind::Cpu,
+            &binding,
+            descriptor.clone(),
+            retained.clone(),
+            RetainedStateUseV2::ExternalPaged,
+            InvocationPagedWorkspaceRuntimeV2::default(),
+        )
+        .is_err());
+
+        let runtime = CapabilityStateRuntimeV2::managed(
+            ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
+                BackendKind::Cpu,
+                &binding,
+                descriptor,
+                retained.clone(),
+                RetainedStateUseV2::ExternalTensor,
+                InvocationPagedWorkspaceRuntimeV2::default(),
+            )
+            .unwrap(),
+        );
+        assert!(runtime.managed_kv_runtime().is_none());
+        assert_eq!(
+            runtime
+                .retained_tensor_state_runtime()
+                .expect("tensor-only retained backing")
+                .id(),
+            retained.id()
+        );
+        runtime
+            .validate_against(BackendKind::Cpu, &binding)
+            .unwrap();
+
+        drop(retained);
+        assert!(physical.unload_model(binding.model_instance_id).unwrap());
+        assert!(runtime.retained_tensor_state_runtime().is_none());
+        assert!(runtime
+            .validate_against(BackendKind::Cpu, &binding)
             .is_err());
     }
 

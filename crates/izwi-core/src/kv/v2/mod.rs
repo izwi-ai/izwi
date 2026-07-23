@@ -74,8 +74,8 @@ pub(crate) use resolved_domains::{
 pub(crate) use runtime::{
     CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, InvocationCapabilityRuntimeV2,
     InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
-    InvocationPagedWorkspaceRuntimeV2, ManagedCapabilityRuntimeV2, RetainedStateUseV2,
-    StatelessCapabilityRuntimeV2,
+    InvocationPagedWorkspaceRuntimeV2, ManagedCapabilityRuntimeV2, RetainedStateRuntimeV2,
+    RetainedStateUseV2, StatelessCapabilityRuntimeV2,
 };
 #[allow(unused_imports)]
 pub(crate) use scratch::{
