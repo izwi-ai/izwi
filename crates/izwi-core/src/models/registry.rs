@@ -40,7 +40,8 @@ use crate::models::architectures::lfm25_audio::{
 };
 use crate::models::architectures::nemotron::asr::{
     NemotronAsrDecodeStep, NemotronAsrModel, NemotronAsrTranscriptionOutput,
-    NemotronRealtimePhysicalStateSpec, NemotronRealtimeResourceReservation, NemotronStreamingState,
+    NemotronOfflinePhysicalStateSpec, NemotronRealtimePhysicalStateSpec,
+    NemotronRealtimeResourceReservation, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
@@ -792,10 +793,93 @@ impl NativeAsrModel {
                     .typed_mut::<InvocationTensorLease>()?;
                 self.transcribe_parakeet_with_details_physical(audio, sample_rate, language, state)
             }
-            Self::Nemotron(_) => Err(Error::InferenceError(
-                "Nemotron offline ASR does not yet author physical invocation state".to_string(),
+            Self::Nemotron(_) => {
+                let (predictor, acoustic) = leases.lease_exact_kind_pair_mut(
+                    InvocationStateBackingKindV2::Tensor,
+                    InvocationStateBackingKindV2::StaticTensor,
+                )?;
+                self.transcribe_nemotron_with_details_and_prompt_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    predictor.typed_mut::<InvocationTensorLease>()?,
+                    acoustic.typed_mut::<InvocationTensorLease>()?,
+                )
+            }
+        }
+    }
+
+    pub(crate) fn nemotron_offline_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<NemotronOfflinePhysicalStateSpec> {
+        match self {
+            Self::Nemotron(model) => model.offline_physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Nemotron ASR model cannot author offline Nemotron physical state".to_string(),
             )),
         }
+    }
+
+    pub(crate) fn transcribe_nemotron_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        predictor: &mut InvocationTensorLease,
+        acoustic: &mut InvocationTensorLease,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::Nemotron(model) = self else {
+            return Err(Error::InferenceError(
+                "Nemotron offline physical state was routed to a different model".to_string(),
+            ));
+        };
+        let NemotronAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            predictor,
+            acoustic,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transcribe_nemotron_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        predictor: &mut InvocationTensorLease,
+        acoustic: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::Nemotron(model) = self else {
+            return Err(Error::InferenceError(
+                "Nemotron offline physical state was routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            predictor,
+            acoustic,
+            on_delta,
+        )
     }
 
     pub(crate) fn parakeet_physical_state_spec(

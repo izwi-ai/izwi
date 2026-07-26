@@ -4,6 +4,7 @@ pub mod config;
 mod metal_kernels;
 pub mod nemo;
 mod network;
+mod physical;
 
 use std::fs;
 use std::path::Path;
@@ -12,13 +13,13 @@ use std::time::{Duration, Instant};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::backends::state::{PhysicalStateTransactionId, StateComponentValue};
 use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
-use crate::engine::RetainedTensorStateRuntimeV2;
-use crate::engine::StageDescriptor;
+use crate::engine::{InvocationTensorLease, RetainedTensorStateRuntimeV2, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     AppendStateDomainSpec, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
@@ -38,6 +39,7 @@ use network::{
     NemotronRealtimeStateShape, NemotronRnntStreamState, NemotronStreamingEncoderState,
     NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
+pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
 
 const SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_STRIP_LANG_TAGS: bool = true;
@@ -107,6 +109,12 @@ pub struct NemotronAsrModel {
     runtime_plan: NemotronRuntimePlan,
     device_profile: DeviceProfile,
     dtype_selection: DTypeSelection,
+}
+
+struct NemotronOfflinePhysicalState<'a> {
+    predictor: &'a mut InvocationTensorLease,
+    acoustic: &'a mut InvocationTensorLease,
+    source_identity: [u8; 32],
 }
 
 enum NemotronDecoder {
@@ -1482,7 +1490,41 @@ impl NemotronDecodeRequest {
     }
 }
 
+fn nemotron_offline_source_identity(
+    audio: &[f32],
+    sample_rate: u32,
+    request: &NemotronDecodeRequest,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"izwi.nemotron.offline-acoustic.v2\0");
+    hasher.update(sample_rate.to_le_bytes());
+    hasher.update((audio.len() as u64).to_le_bytes());
+    hasher.update(request.prompt.target_lang.as_bytes());
+    if let Some(prompt) = request.prompt.context_prompt.as_deref() {
+        hasher.update(prompt.as_bytes());
+    }
+    for sample in audio {
+        hasher.update(sample.to_bits().to_le_bytes());
+    }
+    let mut identity: [u8; 32] = hasher.finalize().into();
+    if identity.iter().all(|byte| *byte == 0) {
+        identity[0] = 1;
+    }
+    identity
+}
+
 impl NemotronAsrModel {
+    pub(crate) fn offline_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<NemotronOfflinePhysicalStateSpec> {
+        physical::nemotron_offline_physical_state_spec(
+            self.network.realtime_state_shape(),
+            state_dtype(self.network.dtype())?,
+            stage_graphs,
+        )
+    }
+
     pub(crate) fn realtime_physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -1709,7 +1751,7 @@ impl NemotronAsrModel {
         language: Option<&str>,
     ) -> Result<String> {
         let request = self.prepare_decode_request(audio, sample_rate, language, None)?;
-        let output = self.decode_offline_final(audio, &request)?;
+        let output = self.decode_offline_final(audio, &request, None)?;
         Ok(output.text)
     }
 
@@ -1732,7 +1774,32 @@ impl NemotronAsrModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
-        let output = self.decode_offline(audio, &request, on_delta)?;
+        let output = self.decode_offline(audio, &request, None, on_delta)?;
+        Ok(output.text)
+    }
+
+    pub(crate) fn transcribe_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        predictor: &mut InvocationTensorLease,
+        acoustic: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
+        let source_identity = nemotron_offline_source_identity(audio, sample_rate, &request);
+        let output = self.decode_offline(
+            audio,
+            &request,
+            Some(NemotronOfflinePhysicalState {
+                predictor,
+                acoustic,
+                source_identity,
+            }),
+            on_delta,
+        )?;
         Ok(output.text)
     }
 
@@ -1744,7 +1811,29 @@ impl NemotronAsrModel {
         prompt: Option<&str>,
     ) -> Result<NemotronAsrTranscriptionOutput> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
-        self.decode_offline_final(audio, &request)
+        self.decode_offline_final(audio, &request, None)
+    }
+
+    pub(crate) fn transcribe_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        predictor: &mut InvocationTensorLease,
+        acoustic: &mut InvocationTensorLease,
+    ) -> Result<NemotronAsrTranscriptionOutput> {
+        let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
+        let source_identity = nemotron_offline_source_identity(audio, sample_rate, &request);
+        self.decode_offline_final(
+            audio,
+            &request,
+            Some(NemotronOfflinePhysicalState {
+                predictor,
+                acoustic,
+                source_identity,
+            }),
+        )
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
@@ -2149,6 +2238,7 @@ impl NemotronAsrModel {
         &self,
         audio: &[f32],
         request: &NemotronDecodeRequest,
+        physical: Option<NemotronOfflinePhysicalState<'_>>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NemotronAsrTranscriptionOutput> {
         let mut timings = NemotronStageTimings::default();
@@ -2182,9 +2272,19 @@ impl NemotronAsrModel {
                 timings.text_assembly += text_start.elapsed();
             };
             let decode_start = Instant::now();
-            let decoded = self
-                .network
-                .decode_rnnt_greedy(&encoded, encoded_len, &mut on_token)?;
+            let decoded = match physical {
+                Some(physical) => self.network.decode_rnnt_greedy_physical(
+                    &encoded,
+                    encoded_len,
+                    physical.source_identity,
+                    physical.predictor,
+                    physical.acoustic,
+                    &mut on_token,
+                )?,
+                None => self
+                    .network
+                    .decode_rnnt_greedy(&encoded, encoded_len, &mut on_token)?,
+            };
             timings.rnnt_decode = decode_start.elapsed();
             decoded
         };
@@ -2209,6 +2309,7 @@ impl NemotronAsrModel {
         &self,
         audio: &[f32],
         request: &NemotronDecodeRequest,
+        physical: Option<NemotronOfflinePhysicalState<'_>>,
     ) -> Result<NemotronAsrTranscriptionOutput> {
         let mut timings = NemotronStageTimings::default();
         let resample_start = Instant::now();
@@ -2229,9 +2330,19 @@ impl NemotronAsrModel {
 
         let mut no_op = |_token_id: usize| {};
         let decode_start = Instant::now();
-        let decoded = self
-            .network
-            .decode_rnnt_greedy(&encoded, encoded_len, &mut no_op)?;
+        let decoded = match physical {
+            Some(physical) => self.network.decode_rnnt_greedy_physical(
+                &encoded,
+                encoded_len,
+                physical.source_identity,
+                physical.predictor,
+                physical.acoustic,
+                &mut no_op,
+            )?,
+            None => self
+                .network
+                .decode_rnnt_greedy(&encoded, encoded_len, &mut no_op)?,
+        };
         timings.rnnt_decode = decode_start.elapsed();
 
         let text_start = Instant::now();

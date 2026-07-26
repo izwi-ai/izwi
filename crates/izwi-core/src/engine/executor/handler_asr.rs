@@ -98,6 +98,34 @@ fn with_single_invocation_tensor<T>(
     Ok(output)
 }
 
+fn with_nemotron_offline_state<T>(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    run: impl FnOnce(
+        &mut crate::engine::InvocationTensorLease,
+        &mut crate::engine::InvocationTensorLease,
+    ) -> Result<T>,
+) -> Result<T> {
+    let mut leases = super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
+    let output = {
+        let (predictor, acoustic) = leases.lease_exact_kind_pair_mut(
+            crate::kv::v2::InvocationStateBackingKindV2::Tensor,
+            crate::kv::v2::InvocationStateBackingKindV2::StaticTensor,
+        )?;
+        run(
+            predictor.typed_mut::<crate::engine::InvocationTensorLease>()?,
+            acoustic.typed_mut::<crate::engine::InvocationTensorLease>()?,
+        )?
+    };
+    let completions = leases.release()?;
+    if completions.len() != 2 {
+        return Err(Error::InferenceError(
+            "Nemotron offline state returned an incomplete completion set".to_string(),
+        ));
+    }
+    Ok(output)
+}
+
 impl NativeExecutor {
     pub(super) fn transcribe_request(
         &self,
@@ -160,7 +188,9 @@ impl NativeExecutor {
                     (model, Some(lease))
                 };
 
-                if model.supports_incremental_decode() {
+                if model.supports_incremental_decode()
+                    && !matches!(family, ModelFamily::NemotronAsr)
+                {
                     let mut initial_media_decode_ms = None;
                     let mut active_state = if let Some(mut state) = active_state {
                         if let Some(cache) = managed_cache.take() {
@@ -593,6 +623,20 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
+                            ModelFamily::NemotronAsr => with_nemotron_offline_state(
+                                request,
+                                scheduled,
+                                |predictor, acoustic| {
+                                    model.transcribe_nemotron_with_details_and_prompt_physical(
+                                        chunk_audio,
+                                        sr,
+                                        language,
+                                        asr_prompt,
+                                        predictor,
+                                        acoustic,
+                                    )
+                                },
+                            )?,
                             _ => model.transcribe_with_details_prompt_prefix_and_options(
                                 chunk_audio,
                                 sr,
@@ -713,6 +757,21 @@ impl NativeExecutor {
                                 )
                             })?
                         }
+                        ModelFamily::NemotronAsr => with_nemotron_offline_state(
+                            request,
+                            scheduled,
+                            |predictor, acoustic| {
+                                model.transcribe_nemotron_with_callback_and_prompt_physical(
+                                    &samples,
+                                    sample_rate,
+                                    language,
+                                    asr_prompt,
+                                    predictor,
+                                    acoustic,
+                                    &mut emit,
+                                )
+                            },
+                        )?,
                         _ => model.transcribe_with_callback_and_prompt_and_options(
                             &samples,
                             sample_rate,
@@ -790,6 +849,18 @@ impl NativeExecutor {
                             sample_rate,
                             language,
                             state,
+                        )
+                    })?
+                }
+                ModelFamily::NemotronAsr => {
+                    with_nemotron_offline_state(request, scheduled, |predictor, acoustic| {
+                        model.transcribe_nemotron_with_details_and_prompt_physical(
+                            &samples,
+                            sample_rate,
+                            language,
+                            asr_prompt,
+                            predictor,
+                            acoustic,
                         )
                     })?
                 }

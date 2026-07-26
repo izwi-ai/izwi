@@ -69,6 +69,7 @@ enum LoadedAsrStatePublicationRoute {
     VibeVoice,
     Whisper,
     Parakeet,
+    NemotronOffline,
     LegacyCache,
 }
 
@@ -78,6 +79,7 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::VibeVoiceAsr => LoadedAsrStatePublicationRoute::VibeVoice,
         crate::catalog::ModelFamily::WhisperAsr => LoadedAsrStatePublicationRoute::Whisper,
         crate::catalog::ModelFamily::ParakeetAsr => LoadedAsrStatePublicationRoute::Parakeet,
+        crate::catalog::ModelFamily::NemotronAsr => LoadedAsrStatePublicationRoute::NemotronOffline,
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
 }
@@ -870,6 +872,27 @@ impl ModelLifecycleController {
                             )
                             .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);
+                    } else if publication_route
+                        == LoadedAsrStatePublicationRoute::NemotronOffline
+                    {
+                        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                        let stage_graphs = contracts
+                            .iter()
+                            .map(|contract| contract.stages.as_ref())
+                            .collect::<Vec<_>>();
+                        let physical_spec =
+                            loaded.nemotron_offline_physical_state_spec(&stage_graphs)?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                &physical_spec.invocation,
+                                None,
+                                HashMap::new(),
+                            )
+                            .await?;
+                        state_publications.insert(CapabilityKind::Asr, publication);
                     } else if let crate::kv::CacheCapability::Managed(contract) = &loaded_cache {
                         return Err(Error::ModelLoadError(format!(
                             "loaded non-Qwen ASR model {variant} still publishes legacy managed state with {} domains",
@@ -1471,6 +1494,10 @@ mod tests {
         assert_eq!(
             loaded_asr_state_publication_route(ModelVariant::ParakeetTdt06BV3),
             LoadedAsrStatePublicationRoute::Parakeet
+        );
+        assert_eq!(
+            loaded_asr_state_publication_route(ModelVariant::Nemotron35AsrStreaming06B),
+            LoadedAsrStatePublicationRoute::NemotronOffline
         );
     }
 

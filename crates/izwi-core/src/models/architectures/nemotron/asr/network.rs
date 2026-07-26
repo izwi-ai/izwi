@@ -13,7 +13,14 @@ use rustfft::{Fft, FftPlanner};
 use serde_json::json;
 
 use super::config::NemotronConfigInventory;
+use super::physical::{NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN, NEMOTRON_OFFLINE_PREDICTOR_DOMAIN};
+use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
+use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
+    StateComponentId, StateUpdateKind,
+};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::mlx;
 
@@ -559,14 +566,13 @@ impl NemotronNetwork {
                 token_ids.push(label);
                 on_token(label);
                 symbols_this_frame = symbols_this_frame.saturating_add(1);
+                predictor_out =
+                    self.predictor
+                        .step(label, &mut predictor_state, encoded.device())?;
                 if symbols_this_frame >= self.max_symbols_per_frame {
                     guard_exits = guard_exits.saturating_add(1);
                     break;
                 }
-
-                predictor_out =
-                    self.predictor
-                        .step(label, &mut predictor_state, encoded.device())?;
             }
         }
 
@@ -583,6 +589,159 @@ impl NemotronNetwork {
             },
             token_ids,
         })
+    }
+
+    pub(super) fn decode_rnnt_greedy_physical(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        source_identity: [u8; 32],
+        predictor_state: &mut InvocationTensorLease,
+        acoustic_state: &mut InvocationTensorLease,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<NemotronDecodedTokens> {
+        if predictor_state.domain() != NEMOTRON_OFFLINE_PREDICTOR_DOMAIN
+            || acoustic_state.domain() != NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN
+        {
+            return Err(Error::InferenceError(
+                "Nemotron offline decoder received foreign physical state".into(),
+            ));
+        }
+        if encoded_len == 0 {
+            return Ok(NemotronDecodedTokens {
+                stats: NemotronDecodeStats {
+                    max_symbols_per_frame: self.max_symbols_per_frame,
+                    ..Default::default()
+                },
+                token_ids: Vec::new(),
+            });
+        }
+        let encoded = encoded.i((0, ..encoded_len, ..))?;
+        let encoded_projection = self.joint.project_encoder(&encoded)?.unsqueeze(0)?;
+        install_offline_acoustic_state(
+            acoustic_state,
+            source_identity,
+            &encoded_projection,
+            encoded_len,
+        )?;
+        let acoustic = acoustic_state.read_snapshot()?;
+        let encoded_projection = acoustic
+            .components
+            .first()
+            .filter(|value| value.component == StateComponentId::new(1))
+            .ok_or_else(|| {
+                Error::InferenceError(
+                    "Nemotron offline acoustic snapshot is incomplete".to_string(),
+                )
+            })?
+            .tensor
+            .i((0, ..encoded_len, ..))?;
+
+        let mut predictor = self.predictor.initial_state(1, encoded.device())?;
+        let predictor_out =
+            self.predictor
+                .step(self.blank_idx, &mut predictor, encoded.device())?;
+        let mut predictor_projection = self.joint.project_predictor(&predictor_out)?;
+        commit_offline_predictor_state(
+            predictor_state,
+            &predictor,
+            &predictor_out,
+            &predictor_projection,
+        )?;
+
+        let mut token_ids = Vec::new();
+        let mut blank_frames = 0usize;
+        let mut guard_exits = 0usize;
+        let mut joint_steps = 0usize;
+        let mut host_argmax_reads = 0usize;
+        let mut device_argmax_reads = 0usize;
+        let max_output_tokens = encoded_len
+            .checked_mul(self.max_symbols_per_frame)
+            .ok_or_else(|| {
+                Error::InvalidInput("Nemotron offline output token bound overflowed".into())
+            })?;
+
+        for t in 0..encoded_len {
+            let enc_t = encoded_projection.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?;
+            let mut symbols_this_frame = 0usize;
+            loop {
+                let logits = self
+                    .joint
+                    .joint_from_projections(&enc_t, &predictor_projection)?
+                    .squeeze(0)?
+                    .squeeze(0)?
+                    .squeeze(0)?;
+                joint_steps = joint_steps.saturating_add(1);
+                if argmax_uses_device(&logits) {
+                    device_argmax_reads = device_argmax_reads.saturating_add(1);
+                } else {
+                    host_argmax_reads = host_argmax_reads.saturating_add(1);
+                }
+                let label = argmax_1d(&logits)?;
+                if label == self.blank_idx {
+                    blank_frames = blank_frames.saturating_add(1);
+                    break;
+                }
+                if label > self.blank_idx || token_ids.len() >= max_output_tokens {
+                    return Err(Error::InferenceError(format!(
+                        "Nemotron offline RNNT emitted invalid or over-limit label {label}"
+                    )));
+                }
+
+                token_ids.push(label);
+                on_token(label);
+                symbols_this_frame = symbols_this_frame.saturating_add(1);
+                predictor_projection =
+                    self.step_offline_predictor_physical(label, predictor_state, encoded.device())?;
+                if symbols_this_frame >= self.max_symbols_per_frame {
+                    guard_exits = guard_exits.saturating_add(1);
+                    break;
+                }
+            }
+        }
+        Ok(NemotronDecodedTokens {
+            stats: NemotronDecodeStats {
+                encoded_frames: encoded_len,
+                emitted_tokens: token_ids.len(),
+                blank_frames,
+                guard_exits,
+                joint_steps,
+                host_argmax_reads,
+                device_argmax_reads,
+                max_symbols_per_frame: self.max_symbols_per_frame,
+            },
+            token_ids,
+        })
+    }
+
+    fn step_offline_predictor_physical(
+        &self,
+        label: usize,
+        state: &mut InvocationTensorLease,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let snapshot = state.read_snapshot()?;
+        if snapshot.components.len() != 6
+            || snapshot
+                .components
+                .iter()
+                .enumerate()
+                .any(|(index, value)| value.component != StateComponentId::new((index + 1) as u32))
+        {
+            return Err(Error::InferenceError(
+                "Nemotron offline predictor snapshot is incomplete".into(),
+            ));
+        }
+        let mut predictor = PredictorState {
+            h0: Some(snapshot.components[0].tensor.clone()),
+            c0: Some(snapshot.components[1].tensor.clone()),
+            h1: Some(snapshot.components[2].tensor.clone()),
+            c1: Some(snapshot.components[3].tensor.clone()),
+        };
+        let output = self.predictor.step(label, &mut predictor, device)?;
+        let projection = self.joint.project_predictor(&output)?;
+        commit_offline_predictor_state(state, &predictor, &output, &projection)?;
+        Ok(projection)
     }
 
     pub(super) fn start_rnnt_stream(
@@ -691,11 +850,6 @@ impl NemotronNetwork {
                 state.token_ids.push(label);
                 on_token(label);
                 symbols_this_frame = symbols_this_frame.saturating_add(1);
-                if symbols_this_frame >= self.max_symbols_per_frame {
-                    state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
-                    break;
-                }
-
                 state.predictor_out = Some(self.predictor.step(
                     label,
                     &mut state.predictor_state,
@@ -710,6 +864,10 @@ impl NemotronNetwork {
                                 .expect("assigned immediately above"),
                         )?,
                     );
+                }
+                if symbols_this_frame >= self.max_symbols_per_frame {
+                    state.stats.guard_exits = state.stats.guard_exits.saturating_add(1);
+                    break;
                 }
             }
         }
@@ -776,15 +934,14 @@ impl NemotronNetwork {
                 token_ids.push(label);
                 on_token(label);
                 symbols_this_frame = symbols_this_frame.saturating_add(1);
-                if symbols_this_frame >= self.max_symbols_per_frame {
-                    guard_exits = guard_exits.saturating_add(1);
-                    break;
-                }
-
                 predictor_out =
                     self.predictor
                         .step(label, &mut predictor_state, encoded.device())?;
                 predictor_projection = self.joint.project_predictor(&predictor_out)?;
+                if symbols_this_frame >= self.max_symbols_per_frame {
+                    guard_exits = guard_exits.saturating_add(1);
+                    break;
+                }
             }
         }
 
@@ -2481,6 +2638,139 @@ impl Predictor {
 
         Ok(state.h1.as_ref().expect("assigned above").unsqueeze(1)?)
     }
+}
+
+fn install_offline_acoustic_state(
+    lease: &mut InvocationTensorLease,
+    source_identity: [u8; 32],
+    projection: &Tensor,
+    encoded_len: usize,
+) -> Result<()> {
+    if source_identity.iter().all(|byte| *byte == 0) || lease.arena()?.absolute_cursor() != 0 {
+        return Err(Error::InferenceError(
+            "Nemotron offline acoustic state requires a fresh non-zero source".into(),
+        ));
+    }
+    let encoded_len_u64 = u64::try_from(encoded_len)
+        .map_err(|_| Error::InferenceError("Nemotron encoded length exceeds u64".into()))?;
+    let component = StateComponentId::new(1);
+    let declared = vec![ComponentShapeInstantiation {
+        component,
+        dimensions: vec![
+            ShapeDimensionValue {
+                axis: ShapeAxis::Batch,
+                units: 1,
+            },
+            ShapeDimensionValue {
+                axis: ShapeAxis::Sequence,
+                units: encoded_len_u64,
+            },
+            ShapeDimensionValue {
+                axis: ShapeAxis::Hidden,
+                units: JOINT_HIDDEN as u64,
+            },
+        ],
+    }];
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain: NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN,
+            expected_cursor: 0,
+            target_cursor: encoded_len_u64,
+            update: StateUpdateKind::StaticInitialize {
+                source_identity,
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::StaticInitialize {
+            source_identity,
+            components: vec![InvocationTensorComponentValue {
+                component,
+                tensor: projection.clone(),
+            }],
+        },
+    )
+}
+
+fn commit_offline_predictor_state(
+    lease: &mut InvocationTensorLease,
+    state: &PredictorState,
+    output: &Tensor,
+    projection: &Tensor,
+) -> Result<()> {
+    let expected_cursor = lease.arena()?.absolute_cursor();
+    let target_cursor = expected_cursor
+        .checked_add(1)
+        .ok_or_else(|| Error::InferenceError("Nemotron predictor cursor overflow".into()))?;
+    let required = |value: &Option<Tensor>, name: &str| {
+        value.clone().ok_or_else(|| {
+            Error::InferenceError(format!("Nemotron predictor {name} is not hydrated"))
+        })
+    };
+    let tensors = [
+        required(&state.h0, "h0")?,
+        required(&state.c0, "c0")?,
+        required(&state.h1, "h1")?,
+        required(&state.c1, "c1")?,
+        output.clone(),
+        projection.clone(),
+    ];
+    let components = tensors
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| InvocationTensorComponentValue {
+            component: StateComponentId::new((index + 1) as u32),
+            tensor,
+        })
+        .collect::<Vec<_>>();
+    let declared = components
+        .iter()
+        .enumerate()
+        .map(|(index, value)| ComponentShapeInstantiation {
+            component: value.component,
+            dimensions: if index < 4 {
+                vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: PRED_HIDDEN as u64,
+                    },
+                ]
+            } else {
+                vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Sequence,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: if index == 4 {
+                            PRED_HIDDEN as u64
+                        } else {
+                            JOINT_HIDDEN as u64
+                        },
+                    },
+                ]
+            },
+        })
+        .collect();
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain: NEMOTRON_OFFLINE_PREDICTOR_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::TensorReplace {
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::TensorReplace { components },
+    )
 }
 
 struct LstmCell {

@@ -441,6 +441,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     ModelFamily::VibeVoiceAsr
                     | ModelFamily::WhisperAsr
                     | ModelFamily::ParakeetAsr
+                    | ModelFamily::NemotronAsr
                     | ModelFamily::Voxtral
                     | ModelFamily::GraniteSpeechAsr
                     | ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
@@ -773,6 +774,13 @@ mod tests {
             registry
                 .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
                 .expect("parakeet asr adapter")
+                .state_requirement,
+            InferenceStateRequirement::Invocation
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::Nemotron35AsrStreaming06B)
+                .expect("nemotron offline asr adapter")
                 .state_requirement,
             InferenceStateRequirement::Invocation
         );
