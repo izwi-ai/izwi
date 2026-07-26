@@ -13,7 +13,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, CapabilityStateRuntimeV2,
-    InferenceStateContract, InvocationCapabilityRuntimeV2, InvocationPagedWorkspaceRuntimeV2,
+    InferenceStateContract, InvocationCapabilityRuntimeV2, InvocationWorkspaceRuntimeV2,
     ManagedCapabilityRuntimeV2, RetainedStateCapability, RetainedStateRuntimeV2,
     RetainedStateUseV2, StatelessCapabilityRuntimeV2,
 };
@@ -136,7 +136,7 @@ pub(crate) enum LoadedStatePublication {
         /// Exact stage-graph activation is declared independently from the
         /// KV-specific execution profile fields.
         retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
-        invocation_paged: InvocationPagedWorkspaceRuntimeV2,
+        invocation_workspace: InvocationWorkspaceRuntimeV2,
     },
 }
 
@@ -394,7 +394,7 @@ impl LoadedCapabilityDescriptor {
                 descriptor,
                 retained,
                 retained_uses,
-                invocation_paged,
+                invocation_workspace,
             } => {
                 if execution.metadata().state_requirement.requires_retained() != retained.is_some()
                 {
@@ -455,13 +455,13 @@ impl LoadedCapabilityDescriptor {
                             retained_state_use,
                             &contract.execution_profile,
                         )?;
-                        let managed = ManagedCapabilityRuntimeV2::seal_with_invocation_paged(
+                        let managed = ManagedCapabilityRuntimeV2::seal_with_invocation_workspace(
                             backend_kind,
                             &binding,
                             descriptor.clone(),
                             retained.clone(),
                             retained_state_use,
-                            invocation_paged.clone(),
+                            invocation_workspace.clone(),
                         )?;
                         (
                             managed.stage_graph_fingerprint,
@@ -477,12 +477,13 @@ impl LoadedCapabilityDescriptor {
                                     .to_string(),
                             ));
                         }
-                        let invocation = InvocationCapabilityRuntimeV2::seal(
-                            backend_kind,
-                            &binding,
-                            descriptor.clone(),
-                            invocation_paged.clone(),
-                        )?;
+                        let invocation =
+                            InvocationCapabilityRuntimeV2::seal_with_invocation_workspace(
+                                backend_kind,
+                                &binding,
+                                descriptor.clone(),
+                                invocation_workspace.clone(),
+                            )?;
                         (
                             invocation.stage_graph_fingerprint,
                             Arc::new(CapabilityStateRuntimeV2::invocation(invocation)),

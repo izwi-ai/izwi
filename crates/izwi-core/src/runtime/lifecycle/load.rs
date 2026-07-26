@@ -17,8 +17,8 @@ use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
     InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
     InvocationPagedWorkspaceRuntimeV2, InvocationStateCapacity, InvocationWorkspaceDomain,
-    InvocationWorkspaceSet, RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2,
-    StateDomainId, StateDomainSpec, StateScope,
+    InvocationWorkspaceRuntimeV2, InvocationWorkspaceSet, RetainedStateCapability,
+    RetainedStateRuntimeV2, RetainedStateUseV2, StateDomainId, StateDomainSpec, StateScope,
 };
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
@@ -394,7 +394,9 @@ impl ModelLifecycleController {
             descriptor,
             retained,
             retained_uses,
-            invocation_paged: InvocationPagedWorkspaceRuntimeV2::new(bindings)?,
+            invocation_workspace: InvocationWorkspaceRuntimeV2::from(
+                InvocationPagedWorkspaceRuntimeV2::new(bindings)?,
+            ),
         })
     }
 
@@ -831,7 +833,7 @@ impl ModelLifecycleController {
                         descriptor: physical_spec.descriptor,
                         retained: Some(retained.into()),
                         retained_uses,
-                        invocation_paged: InvocationPagedWorkspaceRuntimeV2::default(),
+                        invocation_workspace: InvocationWorkspaceRuntimeV2::default(),
                     },
                 );
             }
