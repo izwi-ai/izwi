@@ -559,7 +559,7 @@ impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Stateless,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -810,6 +810,16 @@ mod tests {
                 .expect("sortformer diarization adapter")
                 .execution_target,
             ExecutionTargetKind::PipelineRunner
+        );
+        assert_eq!(
+            registry
+                .require(
+                    CapabilityKind::Diarization,
+                    ModelVariant::DiarStreamingSortformer4SpkV21
+                )
+                .expect("sortformer diarization adapter")
+                .state_requirement,
+            InferenceStateRequirement::Invocation
         );
         assert_eq!(
             registry

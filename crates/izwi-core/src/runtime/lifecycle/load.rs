@@ -945,6 +945,35 @@ impl ModelLifecycleController {
                     },
                 );
             }
+            if variant.family() == crate::catalog::ModelFamily::SortformerDiarization {
+                let model = self
+                    .model_registry
+                    .get_diarization(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded Sortformer model {variant} is missing from the registry"
+                        ))
+                    })?;
+                let contracts =
+                    bundle_draft.execution_contracts(CapabilityKind::Diarization)?;
+                let stage_graphs = contracts
+                    .iter()
+                    .map(|contract| contract.stages.as_ref())
+                    .collect::<Vec<_>>();
+                let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                let publication = self
+                    .load_invocation_workspace_publication(
+                        model_instance_id,
+                        &contracts,
+                        physical_spec.descriptor,
+                        &physical_spec.invocation,
+                        None,
+                        HashMap::new(),
+                    )
+                    .await?;
+                state_publications.insert(CapabilityKind::Diarization, publication);
+            }
             if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
                 if !managed_kv_backend_compiled(backend) {
                     return Err(Error::ModelLoadError(format!(

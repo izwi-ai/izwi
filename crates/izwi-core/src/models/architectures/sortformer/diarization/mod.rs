@@ -1,4 +1,5 @@
 mod nemo;
+mod physical;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -13,13 +14,20 @@ use izwi_vad::{speech_mask_for_frames_f32, VadRegionConfig};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
+use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
 use crate::backends::{DeviceKind, DeviceProfile};
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
+    StateComponentId, StateUpdateKind,
+};
 use crate::model::ModelVariant;
 use crate::models::shared::weights::mlx;
 use crate::runtime::{DiarizationConfig, DiarizationResult, DiarizationSegment};
 
 use nemo::{ensure_sortformer_artifacts, SortformerArtifacts};
+pub(crate) use physical::SortformerPhysicalStateSpec;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MAX_SUPPORTED_SPEAKERS: usize = 4;
@@ -409,6 +417,220 @@ impl SortformerStreamingState {
     }
 }
 
+fn commit_sortformer_streaming_state(
+    lease: &mut InvocationTensorLease,
+    cfg: SortformerStreamingConfig,
+    state: &SortformerStreamingState,
+    device: &Device,
+) -> Result<()> {
+    if cfg.fifo_len == 0
+        || state.spkcache.len() > cfg.spkcache_len
+        || state.fifo.len() > cfg.fifo_len
+        || state
+            .spkcache_preds
+            .as_ref()
+            .is_some_and(|preds| preds.len() != state.spkcache.len())
+        || state.fifo_preds.len() != state.fifo.len()
+        || state.mean_sil_emb.len() != cfg.fc_d_model
+    {
+        return Err(Error::InferenceError(
+            "Sortformer streaming state exceeds its physical geometry".into(),
+        ));
+    }
+    let expected_cursor = lease.arena()?.absolute_cursor();
+    let target_cursor = expected_cursor
+        .checked_add(1)
+        .ok_or_else(|| Error::InferenceError("Sortformer state cursor overflow".into()))?;
+    let speaker_embeddings =
+        padded_embedding_tensor(&state.spkcache, cfg.spkcache_len, cfg.fc_d_model, device)?;
+    let speaker_predictions = padded_prediction_tensor(
+        state.spkcache_preds.as_deref().unwrap_or_default(),
+        cfg.spkcache_len,
+        device,
+    )?;
+    let fifo_embeddings =
+        padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, device)?;
+    let fifo_predictions = padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, device)?;
+    let silence_mean = Tensor::from_vec(state.mean_sil_emb.clone(), cfg.fc_d_model, device)?;
+    let control = Tensor::from_vec(
+        vec![
+            state.spkcache.len() as f32,
+            state.fifo.len() as f32,
+            f32::from(state.spkcache_preds.is_some()),
+            state.n_sil_frames as f32,
+        ],
+        4,
+        device,
+    )?;
+    let tensors = [
+        speaker_embeddings,
+        speaker_predictions,
+        fifo_embeddings,
+        fifo_predictions,
+        silence_mean,
+        control,
+    ];
+    let shapes = [
+        vec![
+            (ShapeAxis::Frames, cfg.spkcache_len as u64),
+            (ShapeAxis::Hidden, cfg.fc_d_model as u64),
+        ],
+        vec![
+            (ShapeAxis::Frames, cfg.spkcache_len as u64),
+            (
+                ShapeAxis::Custom("speakers".into()),
+                MAX_SUPPORTED_SPEAKERS as u64,
+            ),
+        ],
+        vec![
+            (ShapeAxis::Frames, cfg.fifo_len as u64),
+            (ShapeAxis::Hidden, cfg.fc_d_model as u64),
+        ],
+        vec![
+            (ShapeAxis::Frames, cfg.fifo_len as u64),
+            (
+                ShapeAxis::Custom("speakers".into()),
+                MAX_SUPPORTED_SPEAKERS as u64,
+            ),
+        ],
+        vec![(ShapeAxis::Hidden, cfg.fc_d_model as u64)],
+        vec![(ShapeAxis::Custom("control".into()), 4)],
+    ];
+    let components = tensors
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| InvocationTensorComponentValue {
+            component: StateComponentId::new((index + 1) as u32),
+            tensor,
+        })
+        .collect::<Vec<_>>();
+    let declared = shapes
+        .into_iter()
+        .enumerate()
+        .map(|(index, dimensions)| ComponentShapeInstantiation {
+            component: StateComponentId::new((index + 1) as u32),
+            dimensions: dimensions
+                .into_iter()
+                .map(|(axis, units)| ShapeDimensionValue { axis, units })
+                .collect(),
+        })
+        .collect();
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain: physical::SORTFORMER_STREAMING_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::TensorReplace {
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::TensorReplace { components },
+    )
+}
+
+fn hydrate_sortformer_streaming_state(
+    lease: &InvocationTensorLease,
+    cfg: SortformerStreamingConfig,
+) -> Result<SortformerStreamingState> {
+    let snapshot = lease.read_snapshot()?;
+    if snapshot.components.len() != 6
+        || snapshot
+            .components
+            .iter()
+            .enumerate()
+            .any(|(index, value)| value.component != StateComponentId::new((index + 1) as u32))
+    {
+        return Err(Error::InferenceError(
+            "Sortformer physical snapshot has non-canonical components".into(),
+        ));
+    }
+    let control = snapshot.components[5].tensor.to_vec1::<f32>()?;
+    if control.len() != 4 {
+        return Err(Error::InferenceError(
+            "Sortformer physical control state is incomplete".into(),
+        ));
+    }
+    let exact_count = |value: f32, capacity: usize, name: &str| -> Result<usize> {
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > capacity as f32 {
+            return Err(Error::InferenceError(format!(
+                "Sortformer physical {name} is outside its bound"
+            )));
+        }
+        Ok(value as usize)
+    };
+    let speaker_len = exact_count(control[0], cfg.spkcache_len, "speaker-cache length")?;
+    let fifo_len = exact_count(control[1], cfg.fifo_len, "FIFO length")?;
+    let has_speaker_preds = match control[2] {
+        0.0 => false,
+        1.0 => true,
+        _ => {
+            return Err(Error::InferenceError(
+                "Sortformer physical prediction flag is invalid".into(),
+            ))
+        }
+    };
+    let n_sil_frames = exact_count(control[3], 16_777_216, "silence-frame count")?;
+    let speaker_rows = snapshot.components[0].tensor.to_vec2::<f32>()?;
+    let speaker_pred_rows = snapshot.components[1].tensor.to_vec2::<f32>()?;
+    let fifo_rows = snapshot.components[2].tensor.to_vec2::<f32>()?;
+    let fifo_pred_rows = snapshot.components[3].tensor.to_vec2::<f32>()?;
+    let prediction_rows = |rows: Vec<Vec<f32>>, count: usize| -> Result<Vec<[f32; 4]>> {
+        rows.into_iter()
+            .take(count)
+            .map(|row| {
+                row.try_into().map_err(|row: Vec<f32>| {
+                    Error::InferenceError(format!(
+                        "Sortformer physical prediction row has width {}",
+                        row.len()
+                    ))
+                })
+            })
+            .collect()
+    };
+    Ok(SortformerStreamingState {
+        spkcache: speaker_rows.into_iter().take(speaker_len).collect(),
+        spkcache_preds: has_speaker_preds
+            .then(|| prediction_rows(speaker_pred_rows, speaker_len))
+            .transpose()?,
+        fifo: fifo_rows.into_iter().take(fifo_len).collect(),
+        fifo_preds: prediction_rows(fifo_pred_rows, fifo_len)?,
+        mean_sil_emb: snapshot.components[4].tensor.to_vec1::<f32>()?,
+        n_sil_frames,
+    })
+}
+
+fn padded_embedding_tensor(
+    rows: &[Vec<f32>],
+    capacity: usize,
+    hidden: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut flat = vec![0.0_f32; capacity.saturating_mul(hidden)];
+    for (index, row) in rows.iter().enumerate() {
+        if row.len() != hidden {
+            return Err(Error::InferenceError(format!(
+                "Sortformer embedding row has width {}; expected {hidden}",
+                row.len()
+            )));
+        }
+        flat[index * hidden..(index + 1) * hidden].copy_from_slice(row);
+    }
+    Tensor::from_vec(flat, (capacity, hidden), device).map_err(Error::from)
+}
+
+fn padded_prediction_tensor(
+    rows: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    capacity: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut flat = vec![0.0_f32; capacity.saturating_mul(MAX_SUPPORTED_SPEAKERS)];
+    for (index, row) in rows.iter().enumerate() {
+        flat[index * MAX_SUPPORTED_SPEAKERS..(index + 1) * MAX_SUPPORTED_SPEAKERS]
+            .copy_from_slice(row);
+    }
+    Tensor::from_vec(flat, (capacity, MAX_SUPPORTED_SPEAKERS), device).map_err(Error::from)
+}
+
 #[derive(Debug, Clone)]
 struct SortformerCacheCandidate {
     flat_index: usize,
@@ -426,6 +648,18 @@ pub struct SortformerDiarizerModel {
 }
 
 impl SortformerDiarizerModel {
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<SortformerPhysicalStateSpec> {
+        let cfg = self.model.streaming.ok_or_else(|| {
+            Error::ModelLoadError(
+                "Sortformer physical state requires the bounded streaming profile".into(),
+            )
+        })?;
+        physical::sortformer_physical_state_spec(cfg, stage_graphs)
+    }
+
     pub fn load(
         model_dir: &Path,
         variant: ModelVariant,
@@ -547,6 +781,39 @@ impl SortformerDiarizerModel {
         audio: &[f32],
         sample_rate: u32,
         config: &DiarizationConfig,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, None, observer)
+    }
+
+    pub(crate) fn diarize_with_workspace_observer_physical<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        state: &mut InvocationTensorLease,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        if state.domain() != physical::SORTFORMER_STREAMING_STATE_DOMAIN {
+            return Err(Error::InferenceError(
+                "Sortformer received a foreign physical streaming domain".into(),
+            ));
+        }
+        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, Some(state), observer)
+    }
+
+    fn diarize_with_workspace_observer_impl<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        physical_state: Option<&mut InvocationTensorLease>,
         mut observer: F,
     ) -> Result<DiarizationResult>
     where
@@ -578,8 +845,12 @@ impl SortformerDiarizerModel {
         let workspace_estimate = self.model.workspace_estimate(samples.len())?;
         let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
 
-        let (speaker_probs, frame_stride_samples) =
-            self.model.infer_speaker_probabilities(samples)?;
+        let (speaker_probs, frame_stride_samples) = match physical_state {
+            Some(state) => self
+                .model
+                .infer_speaker_probabilities_physical(samples, state)?,
+            None => self.model.infer_speaker_probabilities(samples)?,
+        };
         if speaker_probs.is_empty() {
             let result = DiarizationResult {
                 segments: Vec::new(),
@@ -1008,9 +1279,41 @@ impl SortformerInferenceModel {
                 "offline Sortformer reached the bounded production path".to_string(),
             )
         })?;
-        let out =
-            self.infer_speaker_probabilities_streaming(samples, feature_frames, streaming_cfg)?;
+        let out = self.infer_speaker_probabilities_streaming(
+            samples,
+            feature_frames,
+            streaming_cfg,
+            None,
+        )?;
 
+        Ok((out, self.encoder.frame_stride_samples()))
+    }
+
+    fn infer_speaker_probabilities_physical(
+        &self,
+        samples: &[f32],
+        state: &mut InvocationTensorLease,
+    ) -> Result<(Vec<[f32; MAX_SUPPORTED_SPEAKERS]>, usize)> {
+        let feature_frames = self.preprocessor.feature_frame_count(samples.len());
+        if feature_frames == 0 {
+            return Ok((Vec::new(), self.encoder.frame_stride_samples()));
+        }
+        let streaming_cfg = self.streaming.ok_or_else(|| {
+            Error::InferenceError(
+                "Sortformer physical state requires the bounded streaming path".into(),
+            )
+        })?;
+        if state.arena()?.absolute_cursor() != 0 {
+            return Err(Error::InferenceError(
+                "Sortformer invocation state was not reset before inference".into(),
+            ));
+        }
+        let out = self.infer_speaker_probabilities_streaming(
+            samples,
+            feature_frames,
+            streaming_cfg,
+            Some(state),
+        )?;
         Ok((out, self.encoder.frame_stride_samples()))
     }
 
@@ -1032,6 +1335,7 @@ impl SortformerInferenceModel {
         samples: &[f32],
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
+        mut physical_state: Option<&mut InvocationTensorLease>,
     ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         let mut total_preds = Vec::new();
@@ -1077,7 +1381,12 @@ impl SortformerInferenceModel {
                 pre_encoded_right_offset(plan.right_offset, cfg.subsampling_factor),
                 cfg,
             )?;
-            state = updated_state;
+            state = if let Some(lease) = physical_state.as_deref_mut() {
+                commit_sortformer_streaming_state(lease, cfg, &updated_state, &self.device)?;
+                hydrate_sortformer_streaming_state(lease, cfg)?
+            } else {
+                updated_state
+            };
             total_preds.extend(chunk_preds);
         }
 

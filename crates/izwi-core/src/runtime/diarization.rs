@@ -336,8 +336,8 @@ impl RuntimeService {
         variant: ModelVariant,
         config: DiarizationConfig,
     ) -> Result<DiarizationResult> {
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Diarization,
@@ -368,19 +368,26 @@ impl RuntimeService {
         let expected_workspace = workspace;
         let observation_job = job.clone();
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::PipelineStage {
                     name: "diarization.infer".to_string(),
                     ordinal: 0,
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
-                    model.diarize_with_workspace_observer(
+                    let state = leases
+                        .lease_exact_kind_mut(
+                            crate::kv::v2::InvocationStateBackingKindV2::Tensor,
+                        )?
+                        .typed_mut::<crate::engine::InvocationTensorLease>()?;
+                    model.diarize_with_workspace_observer_physical(
                         &audio.samples,
                         audio.sample_rate,
                         &config,
+                        state,
                         move |event| match event {
                             SortformerWorkspaceEvent::Materialized { workspace } => {
                                 if workspace != expected_workspace {

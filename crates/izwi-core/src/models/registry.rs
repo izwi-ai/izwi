@@ -59,7 +59,8 @@ use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
 };
 use crate::models::architectures::sortformer::diarization::{
-    SortformerDiarizerModel, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
+    SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerWorkspaceEstimate,
+    SortformerWorkspaceEvent,
 };
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrGenerationOptions, VibeVoiceAsrModel, VibeVoiceAsrTranscriptionOutput,
@@ -2333,6 +2334,15 @@ impl NativeAudioChatModel {
 }
 
 impl NativeDiarizationModel {
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<SortformerPhysicalStateSpec> {
+        match self {
+            Self::Sortformer(model) => model.physical_state_spec(stage_graphs),
+        }
+    }
+
     pub fn diarize(
         &self,
         audio: &[f32],
@@ -2367,6 +2377,28 @@ impl NativeDiarizationModel {
             Self::Sortformer(model) => {
                 model.diarize_with_workspace_observer(audio, sample_rate, config, observer)
             }
+        }
+    }
+
+    pub(crate) fn diarize_with_workspace_observer_physical<F>(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        config: &DiarizationConfig,
+        state: &mut InvocationTensorLease,
+        observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        match self {
+            Self::Sortformer(model) => model.diarize_with_workspace_observer_physical(
+                audio,
+                sample_rate,
+                config,
+                state,
+                observer,
+            ),
         }
     }
 }
