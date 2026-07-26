@@ -1434,7 +1434,7 @@ mod tests {
         );
         assert_eq!(
             managed_kv_backend_compiled(BackendKind::Cuda),
-            cfg!(feature = "flash-attn")
+            cfg!(feature = "cuda")
         );
     }
 

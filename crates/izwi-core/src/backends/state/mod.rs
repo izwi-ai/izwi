@@ -33,7 +33,7 @@ pub(crate) use tensor::{
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    align_bytes, AppendStateOperationSet, AttentionPattern, CapacityStrategy, GroupResourceQuery,
+    align_bytes, AppendStateOperationSet, CapacityStrategy, GroupResourceQuery,
     InferenceStateContract, NonPagedStateOperationQuery, NonPagedStateOperationRegistry,
     OperationAbi, PagedAttentionDomainSpec, PagedAttentionOperationQuery, PlacementPolicy,
     RegisteredOperationId, ResolvedAppendStatePlan, ResolvedCapacityDomain,
@@ -140,8 +140,8 @@ impl StateBackendRegistry {
             },
             BackendKind::Cuda => PagedOperationAvailability {
                 write: cfg!(feature = "cuda"),
-                prefill: cfg!(feature = "flash-attn"),
-                decode: cfg!(feature = "flash-attn"),
+                prefill: cfg!(feature = "cuda"),
+                decode: cfg!(feature = "cuda"),
             },
         }
     }
@@ -150,7 +150,7 @@ impl StateBackendRegistry {
         match self.backend {
             BackendKind::Cpu => true,
             BackendKind::Metal => cfg!(feature = "metal"),
-            BackendKind::Cuda => cfg!(feature = "flash-attn"),
+            BackendKind::Cuda => cfg!(feature = "cuda"),
         }
     }
 
@@ -702,10 +702,7 @@ fn select_page_tokens(
     semantic: &PagedAttentionDomainSpec,
     request: &StateBackendPlanRequest,
 ) -> Result<u32> {
-    let backend_accepts = |value: u32| {
-        semantic.page_size.accepts(value)
-            && (request.backend != BackendKind::Cuda || value % 32 == 0)
-    };
+    let backend_accepts = |value: u32| semantic.page_size.accepts(value);
     if let Some(value) = request
         .page_tokens_hint
         .filter(|value| backend_accepts(*value))
@@ -765,7 +762,9 @@ const fn dtype_is_supported(backend: BackendKind, dtype: StateDType) -> bool {
     match backend {
         BackendKind::Cpu => matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::Bf16),
         BackendKind::Metal => matches!(dtype, StateDType::F32 | StateDType::F16),
-        BackendKind::Cuda => matches!(dtype, StateDType::F16 | StateDType::Bf16),
+        BackendKind::Cuda => {
+            matches!(dtype, StateDType::F32 | StateDType::F16 | StateDType::Bf16)
+        }
     }
 }
 
@@ -785,21 +784,12 @@ fn validate_layer_matrix(
                 )));
             }
             BackendKind::Cuda
-                if layer.key_head_dim != layer.value_head_dim
-                    || layer.key_head_dim > 512
-                    || layer.key_head_dim % 8 != 0 =>
+                if layer.key_head_dim != layer.value_head_dim || layer.key_head_dim > 512 =>
             {
                 return Err(invalid(format!(
-                    "CUDA paged attention requires equal K/V dimensions, multiples of 8, at most 512 at layer {}",
+                    "CUDA paged attention requires equal K/V dimensions at most 512 at layer {}",
                     layer.model_layer
                 )));
-            }
-            BackendKind::Cuda
-                if matches!(layer.pattern, AttentionPattern::SlidingWindow { .. }) =>
-            {
-                return Err(invalid(
-                    "CUDA paged attention cannot consume the non-zero first-page offsets required by sliding windows",
-                ));
             }
             BackendKind::Metal | BackendKind::Cuda => {}
         }
@@ -866,9 +856,10 @@ mod tests {
     use super::*;
     use crate::engine::ModelInstanceId;
     use crate::kv::v2::{
-        test_contract, GroupCapacityRequest, GroupResourceQuery, ResolvedCapacityDomain,
-        StateResourceRegistry, StateResourceVector, StateRuntimeAllocationPlan, WorkspaceContract,
-        WorkspaceDimensionBound, WorkspacePlacement, WorkspaceResourceQuery,
+        test_contract, AttentionPattern, GroupCapacityRequest, GroupResourceQuery,
+        ResolvedCapacityDomain, StateResourceRegistry, StateResourceVector,
+        StateRuntimeAllocationPlan, WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement,
+        WorkspaceResourceQuery,
     };
 
     fn request(backend: BackendKind) -> StateBackendPlanRequest {
@@ -947,14 +938,14 @@ mod tests {
 
         let cuda = resolve_paged_policy(spec, &request(BackendKind::Cuda)).unwrap();
         assert_eq!(cuda.storage.dtype(), StateDType::F16);
-        assert_eq!(cuda.page_tokens, 32);
+        assert_eq!(cuda.page_tokens, 16);
 
         let mut incompatible = spec.clone();
         incompatible.layers[0].value_head_dim = 72;
         assert!(resolve_paged_policy(&incompatible, &request(BackendKind::Cuda)).is_err());
         incompatible = spec.clone();
         incompatible.layers[0].pattern = AttentionPattern::SlidingWindow { window_tokens: 128 };
-        assert!(resolve_paged_policy(&incompatible, &request(BackendKind::Cuda)).is_err());
+        assert!(resolve_paged_policy(&incompatible, &request(BackendKind::Cuda)).is_ok());
         incompatible = spec.clone();
         incompatible.header.placement = PlacementPolicy::Host;
         assert!(resolve_paged_policy(&incompatible, &request(BackendKind::Metal)).is_err());
@@ -975,9 +966,9 @@ mod tests {
         let cuda = StateBackendRegistry::new(BackendKind::Cuda, Some(0)).unwrap();
         let cuda_operations = cuda.paged_operation_availability();
         assert_eq!(cuda_operations.write, cfg!(feature = "cuda"));
-        assert_eq!(cuda_operations.decode, cfg!(feature = "flash-attn"));
-        assert_eq!(cuda_operations.prefill, cfg!(feature = "flash-attn"));
-        assert_eq!(cuda_operations.complete(), cfg!(feature = "flash-attn"));
+        assert_eq!(cuda_operations.decode, cfg!(feature = "cuda"));
+        assert_eq!(cuda_operations.prefill, cfg!(feature = "cuda"));
+        assert_eq!(cuda_operations.complete(), cfg!(feature = "cuda"));
     }
 
     #[test]

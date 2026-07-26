@@ -17,7 +17,7 @@ use super::prefix::{
     StagedPrefixCommit,
 };
 use super::telemetry::{ManagedKvTelemetry, ManagedKvTelemetrySnapshot};
-#[cfg(feature = "flash-attn")]
+#[cfg(feature = "cuda")]
 use crate::backends::kv::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
 use crate::backends::kv::MetalKvBackendRuntime;
@@ -1233,19 +1233,19 @@ pub(super) fn managed_backend_runtime(
             if !device.is_cuda() {
                 return wrong_device();
             }
-            #[cfg(feature = "flash-attn")]
+            #[cfg(feature = "cuda")]
             {
                 match CudaKvBackendRuntime::new(device.clone()) {
                     Ok(runtime) => (Some(Arc::new(runtime)), None),
                     Err(error) => (None, Some(error.to_string())),
                 }
             }
-            #[cfg(not(feature = "flash-attn"))]
+            #[cfg(not(feature = "cuda"))]
             {
                 (
                     None,
                     Some(
-                        "managed CUDA KV requires the flash-attn feature and direct paged attention"
+                        "managed CUDA KV requires the cuda feature and direct paged attention"
                             .to_string(),
                     ),
                 )

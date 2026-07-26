@@ -260,6 +260,82 @@ pub fn try_tiled_deltanet_recurrence(
     Some((Tensor::cat(&output_refs, 1).ok()?, state))
 }
 
+pub fn paged_decode_attention(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: Vec<u32>,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    softmax_scale: f32,
+) -> candle_core::Result<Tensor> {
+    if !queries.device().is_cuda()
+        || queries.device().location() != keys.device().location()
+        || queries.device().location() != values.device().location()
+        || queries.dtype() != keys.dtype()
+        || queries.dtype() != values.dtype()
+        || !matches!(queries.dtype(), DType::F32 | DType::F16 | DType::BF16)
+    {
+        candle_core::bail!(
+            "CUDA paged decode requires matching F32/F16/BF16 tensors on one CUDA device"
+        )
+    }
+    if queries.dims() != [batch, query_heads, key_dim]
+        || keys.dims().len() != 4
+        || values.dims().len() != 4
+        || keys.dims()[1..] != [page_tokens, kv_heads, key_dim]
+        || values.dims()[0] != keys.dims()[0]
+        || values.dims()[1..] != [page_tokens, kv_heads, value_dim]
+        || batch == 0
+        || query_heads == 0
+        || kv_heads == 0
+        || query_heads % kv_heads != 0
+        || key_dim == 0
+        || key_dim > 512
+        || value_dim == 0
+        || value_dim > 512
+        || page_tokens == 0
+        || max_blocks == 0
+        || !softmax_scale.is_finite()
+        || softmax_scale <= 0.0
+    {
+        candle_core::bail!("CUDA paged decode received invalid tensor or attention geometry")
+    }
+    let expected_metadata = batch
+        .checked_mul(2_usize.checked_add(max_blocks).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?;
+    if metadata.len() != expected_metadata {
+        candle_core::bail!(
+            "CUDA paged decode metadata has {} entries, expected {expected_metadata}",
+            metadata.len()
+        )
+    }
+    queries.contiguous()?.apply_op3_no_bwd(
+        &keys.contiguous()?,
+        &values.contiguous()?,
+        &CudaPagedDecodeOp {
+            metadata,
+            batch,
+            query_heads,
+            kv_heads,
+            page_tokens,
+            max_blocks,
+            key_dim,
+            value_dim,
+            softmax_scale,
+        },
+    )
+}
+
 fn cuda_tensor_supported(tensor: &Tensor) -> bool {
     cuda_kernels_compiled() && tensor.device().is_cuda()
 }
@@ -414,7 +490,7 @@ impl CustomOp3 for CudaCausalConvSequenceOp {
         let function = device.get_or_load_custom_func(
             "qwen35_causal_conv_sequence_f32",
             "izwi_qwen35_causal_conv_sequence",
-            qwen35_cuda_ptx::QWEN35,
+            cuda_ptx::QWEN35,
         )?;
         let config = LaunchConfig::for_num_elems(total_elements as u32);
         let mut builder = function.builder();
@@ -508,7 +584,7 @@ impl CustomOp3 for CudaGatedDeltaSequenceOp {
         let function = device.get_or_load_custom_func(
             "qwen35_gated_delta_sequence_f32",
             "izwi_qwen35_gated_delta_sequence",
-            qwen35_cuda_ptx::QWEN35,
+            cuda_ptx::QWEN35,
         )?;
         let block_size = self.value_dim.next_power_of_two().clamp(32, 256) as u32;
         let config = LaunchConfig {
@@ -542,8 +618,151 @@ impl CustomOp3 for CudaGatedDeltaSequenceOp {
     }
 }
 
+struct CudaPagedDecodeOp {
+    metadata: Vec<u32>,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    softmax_scale: f32,
+}
+
+impl CustomOp3 for CudaPagedDecodeOp {
+    fn name(&self) -> &'static str {
+        "physical-paged-decode"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _queries: &CpuStorage,
+        _queries_layout: &Layout,
+        _keys: &CpuStorage,
+        _keys_layout: &Layout,
+        _values: &CpuStorage,
+        _values_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("physical CUDA paged decode has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        queries: &candle_core::CudaStorage,
+        queries_layout: &Layout,
+        keys: &candle_core::CudaStorage,
+        keys_layout: &Layout,
+        values: &candle_core::CudaStorage,
+        values_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        let device = queries.device();
+        let metadata = device.clone_htod(&self.metadata)?;
+        let output_elements = self
+            .batch
+            .checked_mul(self.query_heads)
+            .and_then(|value| value.checked_mul(self.value_dim))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("CUDA paged decode output overflow".to_string())
+            })?;
+        if output_elements > i32::MAX as usize {
+            candle_core::bail!("CUDA paged decode output is too large")
+        }
+        let blocks = self
+            .batch
+            .checked_mul(self.query_heads)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("CUDA paged decode grid overflow".to_string())
+            })?;
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+        };
+
+        macro_rules! launch {
+            ($variant:ident, $ty:ty, $function_name:literal) => {{
+                let CudaStorageSlice::$variant(query_slice) = &queries.slice else {
+                    candle_core::bail!("CUDA paged decode query storage dtype mismatch")
+                };
+                let CudaStorageSlice::$variant(key_slice) = &keys.slice else {
+                    candle_core::bail!("CUDA paged decode key storage dtype mismatch")
+                };
+                let CudaStorageSlice::$variant(value_slice) = &values.slice else {
+                    candle_core::bail!("CUDA paged decode value storage dtype mismatch")
+                };
+                let Some((query_start, query_end)) = queries_layout.contiguous_offsets() else {
+                    candle_core::bail!("CUDA paged decode queries must be contiguous")
+                };
+                let Some((key_start, key_end)) = keys_layout.contiguous_offsets() else {
+                    candle_core::bail!("CUDA paged decode keys must be contiguous")
+                };
+                let Some((value_start, value_end)) = values_layout.contiguous_offsets() else {
+                    candle_core::bail!("CUDA paged decode values must be contiguous")
+                };
+                let query_view = query_slice.slice(query_start..query_end);
+                let key_view = key_slice.slice(key_start..key_end);
+                let value_view = value_slice.slice(value_start..value_end);
+                // SAFETY: the custom kernel writes every output element before
+                // the returned storage is observed.
+                let output = unsafe { device.alloc::<$ty>(output_elements)? };
+                let function = device.get_or_load_custom_func(
+                    $function_name,
+                    "izwi_physical_state",
+                    cuda_ptx::PHYSICAL_STATE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&query_view);
+                builder.arg(&key_view);
+                builder.arg(&value_view);
+                builder.arg(&metadata);
+                builder.arg(&output);
+                candle_core::builder_arg!(
+                    builder,
+                    self.batch as i32,
+                    self.query_heads as i32,
+                    self.kv_heads as i32,
+                    self.page_tokens as i32,
+                    self.max_blocks as i32,
+                    self.key_dim as i32,
+                    self.value_dim as i32,
+                    self.softmax_scale
+                );
+                // SAFETY: argument types, tensor bounds, and launch dimensions
+                // match the selected CUDA kernel signature.
+                unsafe { builder.launch(config) }.w()?;
+                candle_core::CudaStorage {
+                    slice: CudaStorageSlice::$variant(output),
+                    device: device.clone(),
+                }
+            }};
+        }
+
+        let output = match &queries.slice {
+            CudaStorageSlice::F32(_) => launch!(F32, f32, "physical_paged_decode_f32"),
+            CudaStorageSlice::F16(_) => {
+                launch!(F16, half::f16, "physical_paged_decode_f16")
+            }
+            CudaStorageSlice::BF16(_) => {
+                launch!(BF16, half::bf16, "physical_paged_decode_bf16")
+            }
+            _ => candle_core::bail!("CUDA paged decode requires F32/F16/BF16 storage"),
+        };
+        Ok((
+            output,
+            Shape::from_dims(&[self.batch, self.query_heads, self.value_dim]),
+        ))
+    }
+}
+
 #[cfg(feature = "cuda")]
-mod qwen35_cuda_ptx {
+mod cuda_ptx {
     include!(concat!(env!("OUT_DIR"), "/qwen35_ptx.rs"));
 }
 

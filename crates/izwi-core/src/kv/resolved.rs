@@ -479,7 +479,7 @@ impl KvStorageFormat {
 #[serde(rename_all = "snake_case")]
 pub enum PagedAttentionKernel {
     PortableReference,
-    CudaFlashAttention,
+    CudaPaged,
     MetalPaged,
 }
 
@@ -487,7 +487,7 @@ impl PagedAttentionKernel {
     const fn supports_backend(self, backend: BackendKind) -> bool {
         match self {
             Self::PortableReference => true,
-            Self::CudaFlashAttention => matches!(backend, BackendKind::Cuda),
+            Self::CudaPaged => matches!(backend, BackendKind::Cuda),
             Self::MetalPaged => matches!(backend, BackendKind::Metal),
         }
     }

@@ -23,7 +23,7 @@ use crate::kv::{
 };
 use crate::{Error, Result};
 
-#[cfg(feature = "flash-attn")]
+#[cfg(feature = "cuda")]
 pub use accelerator::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
 pub use accelerator::MetalKvBackendRuntime;
@@ -41,7 +41,7 @@ pub const fn managed_kv_backend_compiled(backend: BackendKind) -> bool {
     match backend {
         BackendKind::Cpu => true,
         BackendKind::Metal => cfg!(feature = "metal"),
-        BackendKind::Cuda => cfg!(feature = "flash-attn"),
+        BackendKind::Cuda => cfg!(feature = "cuda"),
     }
 }
 

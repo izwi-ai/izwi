@@ -49,21 +49,24 @@ pub fn negotiate_kv_plan(
             PagedAttentionKernel::PortableReference,
         ),
         BackendKind::Cuda => {
-            #[cfg(feature = "flash-attn")]
+            #[cfg(feature = "cuda")]
             {
                 negotiate_dense_paged_plan(
                     contract,
                     request,
-                    select_cuda_flash_dtype,
-                    select_cuda_flash_page_tokens,
-                    PagedAttentionKernel::CudaFlashAttention,
+                    select_cuda_dtype,
+                    |spec, hint| {
+                        Ok(hint
+                            .filter(|value| spec.page_tokens.accepts(*value))
+                            .unwrap_or(spec.page_tokens.preferred))
+                    },
+                    PagedAttentionKernel::CudaPaged,
                 )
             }
-            #[cfg(not(feature = "flash-attn"))]
+            #[cfg(not(feature = "cuda"))]
             {
                 Err(Error::InvalidInput(
-                    "managed CUDA KV requires the flash-attn feature for direct paged attention"
-                        .into(),
+                    "managed CUDA KV requires the cuda feature for direct paged attention".into(),
                 ))
             }
         }
@@ -146,13 +149,12 @@ fn negotiate_dense_paged_plan(
                 let mut bytes_per_page = 0_u64;
                 let mut layers = Vec::with_capacity(spec.layers.len());
                 for (physical_layer, layer) in spec.layers.iter().enumerate() {
-                    if kernel == PagedAttentionKernel::CudaFlashAttention
+                    if kernel == PagedAttentionKernel::CudaPaged
                         && (layer.key_head_dim != layer.value_head_dim
-                            || layer.key_head_dim > 512
-                            || layer.key_head_dim % 8 != 0)
+                            || layer.key_head_dim > 512)
                     {
                         return Err(Error::InvalidInput(format!(
-                            "CUDA paged flash attention requires equal K/V head dimensions that are multiples of 8 and at most 512; layer {} has K={} V={}",
+                            "CUDA paged attention requires equal K/V head dimensions at most 512; layer {} has K={} V={}",
                             layer.model_layer, layer.key_head_dim, layer.value_head_dim
                         )));
                     }
@@ -212,12 +214,16 @@ fn negotiate_dense_paged_plan(
     )
 }
 
-#[cfg(feature = "flash-attn")]
-fn select_cuda_flash_dtype(
+#[cfg(feature = "cuda")]
+fn select_cuda_dtype(
     accepted: &[KvStorageDType],
     hint: Option<KvStorageDType>,
 ) -> Result<KvStorageDType> {
-    const SUPPORTED: [KvStorageDType; 2] = [KvStorageDType::F16, KvStorageDType::Bf16];
+    const SUPPORTED: [KvStorageDType; 3] = [
+        KvStorageDType::F32,
+        KvStorageDType::F16,
+        KvStorageDType::Bf16,
+    ];
     if let Some(dtype) = hint.filter(|dtype| accepted.contains(dtype) && SUPPORTED.contains(dtype))
     {
         return Ok(dtype);
@@ -227,50 +233,8 @@ fn select_cuda_flash_dtype(
         .copied()
         .find(|dtype| SUPPORTED.contains(dtype))
         .ok_or_else(|| {
-            Error::InvalidInput(
-                "CUDA paged flash attention found no compatible F16/BF16 KV dtype".into(),
-            )
+            Error::InvalidInput("CUDA paged attention found no compatible KV dtype".into())
         })
-}
-
-#[cfg(feature = "flash-attn")]
-fn select_cuda_flash_page_tokens(
-    spec: &crate::kv::PagedAttentionDomainSpec,
-    hint: Option<u32>,
-) -> Result<u32> {
-    let accepts = |value: u32| spec.page_tokens.accepts(value) && value % 32 == 0;
-    if let Some(value) = hint.filter(|value| accepts(*value)) {
-        return Ok(value);
-    }
-    if accepts(spec.page_tokens.preferred) {
-        return Ok(spec.page_tokens.preferred);
-    }
-
-    let step = lcm(spec.page_tokens.multiple_of, 32).ok_or_else(geometry_overflow)?;
-    let first = spec
-        .page_tokens
-        .min
-        .div_ceil(step)
-        .checked_mul(step)
-        .ok_or_else(geometry_overflow)?;
-    if first <= spec.page_tokens.max {
-        Ok(first)
-    } else {
-        Err(Error::InvalidInput(
-            "CUDA paged flash attention requires a page size divisible by 32".into(),
-        ))
-    }
-}
-
-#[cfg(feature = "flash-attn")]
-fn lcm(left: u32, right: u32) -> Option<u32> {
-    fn gcd(mut left: u32, mut right: u32) -> u32 {
-        while right != 0 {
-            (left, right) = (right, left % right);
-        }
-        left
-    }
-    left.checked_div(gcd(left, right))?.checked_mul(right)
 }
 
 fn select_cpu_dtype(
@@ -415,9 +379,9 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "flash-attn"))]
+    #[cfg(not(feature = "cuda"))]
     #[test]
-    fn cuda_negotiation_fails_closed_without_paged_flash_attention() {
+    fn cuda_negotiation_fails_closed_without_cuda_runtime() {
         let error = negotiate_kv_plan(
             &test_contract(),
             &KvBackendPlanRequest {
@@ -431,14 +395,12 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("requires the flash-attn feature"));
+        assert!(error.to_string().contains("requires the cuda feature"));
     }
 
-    #[cfg(feature = "flash-attn")]
+    #[cfg(feature = "cuda")]
     #[test]
-    fn cuda_flash_negotiation_selects_only_supported_geometry() {
+    fn cuda_native_negotiation_accepts_model_page_and_dtype_geometry() {
         let plan = negotiate_kv_plan(
             &test_contract(),
             &KvBackendPlanRequest {
@@ -452,11 +414,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(plan.groups[0].page_tokens, 32);
-        assert_eq!(
-            plan.groups[0].kernel,
-            PagedAttentionKernel::CudaFlashAttention
-        );
+        assert_eq!(plan.groups[0].page_tokens, 16);
+        assert_eq!(plan.groups[0].kernel, PagedAttentionKernel::CudaPaged);
         assert_eq!(
             plan.groups[0].storage,
             KvStorageFormat::Dense {
