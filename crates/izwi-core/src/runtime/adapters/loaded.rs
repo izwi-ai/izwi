@@ -615,14 +615,11 @@ fn is_nemotron_realtime(metadata: AdapterMetadata) -> bool {
         && metadata.model_variant.family() == crate::catalog::ModelFamily::NemotronAsr
 }
 
-fn is_continuous_qwen_chat(metadata: AdapterMetadata) -> bool {
+fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
     metadata.capability == CapabilityKind::Chat
         && matches!(
-            metadata.model_variant,
-            ModelVariant::Qwen306B
-                | ModelVariant::Qwen306B4Bit
-                | ModelVariant::Qwen317B
-                | ModelVariant::Qwen317B4Bit
+            metadata.model_variant.family(),
+            crate::catalog::ModelFamily::Qwen3Chat | crate::catalog::ModelFamily::Gemma3Chat
         )
 }
 
@@ -687,11 +684,11 @@ impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ContinuousQwenChatAdapterFactory;
+struct ContinuousPhysicalChatAdapterFactory;
 
-impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
+impl LoadedExecutionAdapterFactory for ContinuousPhysicalChatAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.qwen_chat.tensor_continuous"
+        "builtin.physical_chat.tensor_continuous"
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
@@ -699,7 +696,7 @@ impl LoadedExecutionAdapterFactory for ContinuousQwenChatAdapterFactory {
     }
 
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_continuous_qwen_chat(metadata)
+        is_continuous_physical_chat(metadata)
     }
 
     fn create(
@@ -733,7 +730,7 @@ impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
     fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
         !is_physical_qwen_tts(metadata)
             && !is_nemotron_realtime(metadata)
-            && !is_continuous_qwen_chat(metadata)
+            && !is_continuous_physical_chat(metadata)
     }
 
     fn create(
@@ -755,7 +752,7 @@ pub(super) fn built_in_loaded_adapter_factories() -> Vec<Arc<dyn LoadedExecution
     vec![
         Arc::new(PhysicalQwenTtsAdapterFactory),
         Arc::new(NemotronRealtimeAdapterFactory),
-        Arc::new(ContinuousQwenChatAdapterFactory),
+        Arc::new(ContinuousPhysicalChatAdapterFactory),
         Arc::new(ScalarExecutionAdapterFactory),
     ]
 }
@@ -2134,7 +2131,7 @@ mod tests {
             metadata.model_variant != self.excluded_model_variant
                 && !is_physical_qwen_tts(metadata)
                 && !is_nemotron_realtime(metadata)
-                && !is_continuous_qwen_chat(metadata)
+                && !is_continuous_physical_chat(metadata)
         }
 
         fn create(
@@ -2266,11 +2263,11 @@ mod tests {
             &registry,
             ExecutionGroupId::new(9),
             ModelInstanceId::new(999),
-            ModelVariant::Gemma31BIt,
+            ModelVariant::Kokoro82M,
             BackendKind::Metal,
         )
         .unwrap();
-        let contract = metal.contract(CapabilityKind::Chat, false).unwrap();
+        let contract = metal.contract(CapabilityKind::Tts, false).unwrap();
         assert_eq!(contract.execution_profile.max_batch_size, 1);
         assert_eq!(
             contract.execution_profile.concurrency,
@@ -2318,7 +2315,7 @@ mod tests {
 
     #[test]
     fn offline_asr_transport_progress_does_not_require_native_streaming() {
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             ExecutionGroupId::new(7),
             ModelInstanceId::new(1),
@@ -2326,10 +2323,12 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
-
-        assert!(bundle.contract(CapabilityKind::Asr, true).is_err());
-        let transport = bundle
-            .contract_for_streaming(CapabilityKind::Asr, StreamingRequirements::transport_only())
+        let execution = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
+        assert!(execution
+            .contract(StreamingRequirements::native(true))
+            .is_err());
+        let transport = execution
+            .contract(StreamingRequirements::transport_only())
             .expect("offline ASR must expose atomic executor progress");
         assert_eq!(transport.metadata.streaming_mode, StreamingMode::None);
         assert_eq!(transport.execution_profile.mode, ExecutionMode::Atomic);

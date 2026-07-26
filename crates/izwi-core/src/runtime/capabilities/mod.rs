@@ -175,7 +175,7 @@ mod tests {
             (ModelVariant::Qwen306BGguf, ExecutionMode::Sequence),
             (ModelVariant::Qwen354BGguf, ExecutionMode::Sequence),
             (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Atomic),
-            (ModelVariant::Gemma34BIt, ExecutionMode::Atomic),
+            (ModelVariant::Gemma34BIt, ExecutionMode::Sequence),
         ] {
             let plan = registry
                 .plan(CapabilityExecutionRequest::new(

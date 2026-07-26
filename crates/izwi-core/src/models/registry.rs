@@ -23,7 +23,9 @@ use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2}
 use crate::kv::{CacheCapability, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
-use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
+use crate::models::architectures::gemma3::chat::{
+    ChatDecodeState as Gemma3ChatDecodeState, Gemma3ChatModel,
+};
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
     GraniteSpeechPhysicalStateSpec, GraniteSpeechTask,
@@ -2415,7 +2417,8 @@ impl KvCacheContractProvider for NativeChatModel {
         match self {
             Self::Qwen3(model) => model.kv_cache_contract(),
             Self::Qwen35(model) => model.kv_cache_contract(),
-            Self::Gemma3(_) | Self::Lfm2(_) => Ok(CacheCapability::Stateless),
+            Self::Gemma3(model) => model.kv_cache_contract(),
+            Self::Lfm2(_) => Ok(CacheCapability::Stateless),
         }
     }
 }
@@ -2579,6 +2582,7 @@ impl Deref for QwenTtsModelLease {
 pub enum NativeChatDecodeState {
     Qwen3(Qwen3ChatDecodeState),
     Qwen35(Qwen35ChatDecodeState),
+    Gemma3(Gemma3ChatDecodeState),
 }
 
 impl NativeChatDecodeState {
@@ -2589,6 +2593,7 @@ impl NativeChatDecodeState {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
             Self::Qwen35(state) => state.install_physical_reservation(cache),
+            Self::Gemma3(state) => state.install_physical_reservation(cache),
         }
     }
 
@@ -2596,6 +2601,7 @@ impl NativeChatDecodeState {
         match self {
             Self::Qwen3(state) => state.uses_managed_kv(),
             Self::Qwen35(state) => state.uses_physical_kv(),
+            Self::Gemma3(_) => true,
         }
     }
 
@@ -2605,6 +2611,7 @@ impl NativeChatDecodeState {
         match self {
             Self::Qwen3(state) => state.take_managed_write_completions(),
             Self::Qwen35(state) => state.take_physical_write_completions(),
+            Self::Gemma3(state) => state.take_physical_write_completions(),
         }
     }
 
@@ -2613,6 +2620,9 @@ impl NativeChatDecodeState {
             Self::Qwen35(state) => state.bind_tensor_sequence(sequence),
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "tensor-state reservation was routed to a dense Qwen3 model".into(),
+            )),
+            Self::Gemma3(_) => Err(Error::InvalidInput(
+                "tensor-state reservation was routed to a Gemma3 model".into(),
             )),
         }
     }
@@ -2626,6 +2636,9 @@ impl NativeChatDecodeState {
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "tensor-state arena was routed to a dense Qwen3 model".into(),
             )),
+            Self::Gemma3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a Gemma3 model".into(),
+            )),
         }
     }
 
@@ -2638,6 +2651,9 @@ impl NativeChatDecodeState {
             Self::Qwen35(state) => state.stage_tensor_state(arena, transaction),
             Self::Qwen3(_) => Err(Error::InvalidInput(
                 "tensor-state arena was routed to a dense Qwen3 model".into(),
+            )),
+            Self::Gemma3(_) => Err(Error::InvalidInput(
+                "tensor-state arena was routed to a Gemma3 model".into(),
             )),
         }
     }
@@ -2795,7 +2811,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_incremental_decode(),
             Self::Qwen35(model) => model.supports_incremental_decode(),
-            Self::Gemma3(_) => false,
+            Self::Gemma3(model) => model.supports_incremental_decode(),
             Self::Lfm2(model) => model.supports_incremental_decode(),
         }
     }
@@ -2803,14 +2819,16 @@ impl NativeChatModel {
     pub fn supports_continuous_decode_batch(&self) -> bool {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
-            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => false,
+            Self::Gemma3(model) => model.supports_continuous_decode_batch(),
+            Self::Qwen35(_) | Self::Lfm2(_) => false,
         }
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
-            Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
+            Self::Gemma3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Qwen35(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
                 "loaded chat model has no continuous decode workspace contract".to_string(),
             )),
         }
@@ -2866,6 +2884,24 @@ impl NativeChatModel {
             )),
             _ => Err(Error::InvalidInput(
                 "managed Qwen3.5 state was routed to another model family".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_gemma3_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Gemma3(model) => Ok(NativeChatDecodeState::Gemma3(model.start_decode_managed(
+                messages,
+                max_new_tokens,
+                cache,
+            )?)),
+            _ => Err(Error::InvalidInput(
+                "managed Gemma3 state was routed to another model family".into(),
             )),
         }
     }
@@ -2929,6 +2965,15 @@ impl NativeChatModel {
                     finished: step.finished,
                 })
             }
+            (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
+                let step = model.decode_step(state)?;
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    finished: step.finished,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "Chat decode state does not match loaded chat model".to_string(),
             )),
@@ -2939,23 +2984,7 @@ impl NativeChatModel {
         &self,
         states: &mut [&mut NativeChatDecodeState],
     ) -> Result<Vec<NativeChatDecodeStep>> {
-        let Self::Qwen3(model) = self else {
-            return Err(Error::InvalidInput(
-                "Loaded chat model has no continuous tensor decode adapter".to_string(),
-            ));
-        };
-        let mut qwen_states = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
-            match &mut **state {
-                NativeChatDecodeState::Qwen3(state) => qwen_states.push(state),
-                NativeChatDecodeState::Qwen35(_) => {
-                    return Err(Error::InvalidInput(
-                        "Qwen3 continuous batch received a Qwen3.5 decode state".to_string(),
-                    ))
-                }
-            }
-        }
-        model.decode_step_batch(&mut qwen_states).map(|steps| {
+        let convert = |steps: Vec<crate::models::architectures::qwen3::chat::ChatDecodeStep>| {
             steps
                 .into_iter()
                 .map(|step| NativeChatDecodeStep {
@@ -2965,7 +2994,50 @@ impl NativeChatModel {
                     finished: step.finished,
                 })
                 .collect()
-        })
+        };
+        match self {
+            Self::Qwen3(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen3(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(convert)
+            }
+            Self::Gemma3(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Gemma3(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Gemma3 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeChatDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::Qwen35(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
+                "Loaded chat model has no continuous tensor decode adapter".to_string(),
+            )),
+        }
     }
 }
 

@@ -319,6 +319,11 @@ impl NativeExecutor {
                         )
                     })?
                 }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_gemma3_decode_state_managed(messages, max_new_tokens, cache)
+                    })?
+                }
                 Some(cache) => Self::run_blocking(|| {
                     model.start_qwen3_decode_state_managed(messages, max_new_tokens, cache)
                 })?,

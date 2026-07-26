@@ -4,19 +4,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
+use candle_transformers::models::gemma3::Config as Gemma3Config;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
 use crate::model::ModelVariant;
-use crate::models::shared::attention::flash::should_enable_flash_attention_v2;
+use crate::models::architectures::gemma3::core::Gemma3PhysicalModel;
+use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::tokenizer::Tokenizer;
@@ -25,6 +29,54 @@ use crate::tokenizer::Tokenizer;
 pub struct ChatGenerationOutput {
     pub text: String,
     pub tokens_generated: usize,
+}
+
+pub struct ChatDecodeState {
+    cache: PhysicalPagedKvCache,
+    unconsumed_logits: Option<Tensor>,
+    position: usize,
+    pending_token: Option<u32>,
+    generated_ids: Vec<u32>,
+    assembled: String,
+    stagnant_steps: usize,
+    max_new_tokens: usize,
+    finished: bool,
+}
+
+impl ChatDecodeState {
+    pub(crate) fn install_physical_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        if self.cache.arena().id() != cache.arena().id()
+            || self.cache.arena().config().group != cache.arena().config().group
+        {
+            return Err(Error::InferenceError(
+                "a Gemma session cannot switch physical KV authority".into(),
+            ));
+        }
+        if cache.context_len() != self.position {
+            return Err(Error::InferenceError(format!(
+                "physical Gemma reservation starts at {}, but decode state is at {}",
+                cache.context_len(),
+                self.position
+            )));
+        }
+        self.cache = cache;
+        Ok(())
+    }
+
+    pub(crate) fn take_physical_write_completions(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
+        self.cache.take_completed_writes()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatDecodeStep {
+    pub delta: String,
+    pub text: String,
+    pub tokens_generated: usize,
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -313,8 +365,21 @@ fn select_gemma3_dense_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DT
 pub struct Gemma3ChatModel {
     variant: ModelVariant,
     device: DeviceProfile,
+    compute_dtype: DType,
     tokenizer: GemmaTokenizer,
-    text_model: Mutex<Gemma3Model>,
+    text_model: Gemma3PhysicalModel,
+}
+
+impl KvCacheContractProvider for Gemma3ChatModel {
+    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+        Ok(CacheCapability::Managed(
+            self.text_model.managed_kv_cache_contract(
+                CacheDomainId::new(0),
+                self.compute_dtype,
+                default_kv_page_size(),
+            )?,
+        ))
+    }
 }
 
 impl Gemma3ChatModel {
@@ -443,21 +508,20 @@ impl Gemma3ChatModel {
             vb_base
         };
 
-        let use_flash_attn = should_enable_flash_attention_v2(&device.device);
-        let text_model = Gemma3Model::new(use_flash_attn, &config, vb).map_err(Error::from)?;
+        let text_model = Gemma3PhysicalModel::load(config, vb)?;
 
         info!(
-            "Loaded Gemma chat model {} on {:?} (flash_attn={})",
+            "Loaded physical Gemma chat model {} on {:?}",
             variant.dir_name(),
-            device.kind,
-            use_flash_attn
+            device.kind
         );
 
         Ok(Self {
             variant,
             device,
+            compute_dtype: dtype,
             tokenizer,
-            text_model: Mutex::new(text_model),
+            text_model,
         })
     }
 
@@ -472,79 +536,176 @@ impl Gemma3ChatModel {
 
     pub fn generate_with_callback(
         &self,
+        _messages: &[ChatMessage],
+        _max_new_tokens: usize,
+        _on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatGenerationOutput> {
+        Err(Error::InvalidInput(
+            "Gemma generation requires scheduler-owned physical state".into(),
+        ))
+    }
+
+    pub fn start_decode_managed(
+        &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<ChatGenerationOutput> {
+        mut cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
         let prompt_ids = self.build_prompt(messages)?;
         if prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
                 "Gemma prompt produced no tokens".to_string(),
             ));
         }
-        let mut input_ids = Tensor::from_vec(vec![prompt_ids[0]], (1, 1), &self.device.device)?;
-        let mut seqlen_offset = 0usize;
-
-        let mut generated_ids = Vec::new();
-        let mut assembled = String::new();
-        let mut stagnant_steps = 0usize;
-
-        let mut model = self
-            .text_model
-            .lock()
-            .map_err(|_| Error::InferenceError("Gemma model mutex poisoned".to_string()))?;
-        model.clear_kv_cache();
-
-        // Keep prefill token-by-token to avoid known Candle slice_set issues
-        // with some Metal execution paths on Gemma.
-        for &token in prompt_ids.iter().skip(1) {
-            model
-                .forward(&input_ids, seqlen_offset)
-                .map_err(Error::from)?;
-            seqlen_offset += 1;
-            input_ids = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
+        let reused_prefix = cache.context_len();
+        if reused_prefix >= prompt_ids.len() {
+            return Err(Error::InvalidInput(
+                "Gemma physical prefill must retain at least one private prompt token".into(),
+            ));
         }
-
-        for _ in 0..max_new_tokens {
-            let logits = model
-                .forward(&input_ids, seqlen_offset)
-                .map_err(Error::from)?;
-            let next = select_next_token(&logits, self.tokenizer.vocab_size)?;
-
-            if next == self.tokenizer.specials.end_of_turn
-                || next == self.tokenizer.specials.eos
-                || next == self.tokenizer.specials.start_of_turn
-                || self.tokenizer.specials.bos.is_some_and(|bos| next == bos)
-            {
-                break;
-            }
-
-            generated_ids.push(next);
-
-            let decoded = self.tokenizer.decode_text(&generated_ids)?;
-            let delta = text_delta(&assembled, &decoded);
-            for ch in delta.chars() {
-                let mut buf = [0u8; 4];
-                on_delta(ch.encode_utf8(&mut buf));
-            }
-            if decoded == assembled {
-                stagnant_steps += 1;
-                if stagnant_steps >= 4 {
-                    break;
-                }
-            } else {
-                stagnant_steps = 0;
-                assembled = decoded;
-            }
-
-            seqlen_offset += 1;
-            input_ids = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
+        let mut logits = None;
+        for (offset, token) in prompt_ids[reused_prefix..].iter().copied().enumerate() {
+            let position = reused_prefix + offset;
+            let input = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
+            logits = Some(
+                self.text_model
+                    .forward_physical(&input, position, &mut cache)?,
+            );
         }
-
-        Ok(ChatGenerationOutput {
-            text: assembled.trim().to_string(),
-            tokens_generated: generated_ids.len(),
+        Ok(ChatDecodeState {
+            cache,
+            unconsumed_logits: logits,
+            position: prompt_ids.len(),
+            pending_token: None,
+            generated_ids: Vec::new(),
+            assembled: String::new(),
+            stagnant_steps: 0,
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
         })
+    }
+
+    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.finished || state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+            return Ok(state.step(String::new()));
+        }
+        if let Some(token) = state.pending_token.take() {
+            let input = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
+            state.unconsumed_logits = Some(self.text_model.forward_physical(
+                &input,
+                state.position,
+                &mut state.cache,
+            )?);
+            state.position += 1;
+        }
+        let logits = state.unconsumed_logits.take().ok_or_else(|| {
+            Error::InferenceError("Gemma decode quantum has no unconsumed logits".into())
+        })?;
+        let next = select_next_token(&logits, self.tokenizer.vocab_size)?;
+        self.apply_sample(state, next)
+    }
+
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<Vec<ChatDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        if states.iter().any(|state| {
+            state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+                || state.unconsumed_logits.is_some()
+        }) {
+            return Err(Error::InvalidInput(
+                "Gemma continuous batch contains an unready decode state".into(),
+            ));
+        }
+        let tokens = states
+            .iter_mut()
+            .map(|state| {
+                state.pending_token.take().ok_or_else(|| {
+                    Error::InferenceError(
+                        "Gemma continuous decode state has no scheduled token".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let positions = states
+            .iter()
+            .map(|state| state.position)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_vec(tokens, (states.len(), 1), &self.device.device)?;
+        let mut caches = states
+            .iter_mut()
+            .map(|state| &mut state.cache)
+            .collect::<Vec<_>>();
+        let logits =
+            self.text_model
+                .forward_physical_decode_batch(&input, &positions, &mut caches)?;
+        for state in states.iter_mut() {
+            state.position += 1;
+        }
+        let mut steps = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
+            let next = select_next_token(&logits.i(row)?, self.tokenizer.vocab_size)?;
+            steps.push(self.apply_sample(state, next)?);
+        }
+        Ok(steps)
+    }
+
+    fn apply_sample(&self, state: &mut ChatDecodeState, next: u32) -> Result<ChatDecodeStep> {
+        if next == self.tokenizer.specials.end_of_turn
+            || next == self.tokenizer.specials.eos
+            || next == self.tokenizer.specials.start_of_turn
+            || self.tokenizer.specials.bos.is_some_and(|bos| next == bos)
+        {
+            state.finished = true;
+            return Ok(state.step(String::new()));
+        }
+        state.generated_ids.push(next);
+        state.pending_token = Some(next);
+        let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
+        let delta = text_delta(&state.assembled, &decoded);
+        if decoded == state.assembled {
+            state.stagnant_steps += 1;
+            if state.stagnant_steps >= 4 {
+                state.finished = true;
+            }
+        } else {
+            state.stagnant_steps = 0;
+            state.assembled = decoded;
+        }
+        if state.generated_ids.len() >= state.max_new_tokens {
+            state.finished = true;
+        }
+        Ok(state.step(delta))
+    }
+
+    pub fn supports_incremental_decode(&self) -> bool {
+        true
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        u64::try_from(self.text_model.hidden_size())
+            .ok()
+            .and_then(|hidden| {
+                hidden.checked_mul(u64::try_from(self.compute_dtype.size_in_bytes()).ok()?)
+            })
+            .ok_or_else(|| Error::Overloaded("Gemma decode workspace estimate overflow".into()))
+    }
+
+    pub fn runtime_device_kind(&self) -> String {
+        format!("{:?}", self.device.kind).to_ascii_lowercase()
+    }
+
+    pub fn runtime_compute_dtype(&self) -> Option<String> {
+        Some(format!("{:?}", self.compute_dtype).to_ascii_lowercase())
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -622,6 +783,17 @@ impl Gemma3ChatModel {
 
     pub fn variant(&self) -> ModelVariant {
         self.variant
+    }
+}
+
+impl ChatDecodeState {
+    fn step(&self, delta: String) -> ChatDecodeStep {
+        ChatDecodeStep {
+            delta,
+            text: self.assembled.trim().to_string(),
+            tokens_generated: self.generated_ids.len(),
+            finished: self.finished,
+        }
     }
 }
 

@@ -1237,7 +1237,8 @@ impl ModelExecutor for NativeExecutor {
                     .map(|model| match model.as_ref() {
                         NativeChatModel::Qwen3(model) => model.supports_incremental_decode(),
                         NativeChatModel::Qwen35(model) => model.supports_incremental_decode(),
-                        NativeChatModel::Gemma3(_) | NativeChatModel::Lfm2(_) => false,
+                        NativeChatModel::Gemma3(model) => model.supports_incremental_decode(),
+                        NativeChatModel::Lfm2(_) => false,
                     })
             }
             super::types::TaskType::ASR => request

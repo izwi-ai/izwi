@@ -274,6 +274,24 @@ impl PhysicalPagedKvCache {
         self.sequence_table_from(self.window_start, context_len)
     }
 
+    pub(crate) fn sequence_table_with_window(
+        &self,
+        context_len: usize,
+        window_tokens: usize,
+    ) -> Result<KvSequenceBlockTable> {
+        if window_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "physical paged sliding window cannot be zero".into(),
+            ));
+        }
+        self.sequence_table_from(
+            context_len
+                .saturating_sub(window_tokens)
+                .max(self.window_start),
+            context_len,
+        )
+    }
+
     fn sequence_table_from(
         &self,
         visible_start: usize,
@@ -470,6 +488,65 @@ impl PhysicalPagedKvCache {
             PagedKvPrefillArgs {
                 queries,
                 rows: &prepared.prefill,
+                softmax_scale,
+            },
+        )
+    }
+
+    /// One-token append with a layer-specific visible window. The block table
+    /// and write slot remain absolute; only the attention view is narrowed.
+    pub(crate) fn write_and_attend_with_window(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        queries: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+        softmax_scale: f32,
+        window_tokens: usize,
+    ) -> Result<Tensor> {
+        if prepared.token_count != 1
+            || queries.dim(0)? != 1
+            || keys.dim(0)? != 1
+            || values.dim(0)? != 1
+            || prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
+            || prepared.start_pos != self.context_len
+            || prepared.slots.len() != 1
+        {
+            return Err(Error::InvalidInput(
+                "layer-specific physical window received a stale or incompatible one-token step"
+                    .into(),
+            ));
+        }
+        let table = self
+            .sequence_table_with_window(prepared.start_pos + prepared.token_count, window_tokens)?;
+        let binding = self.layer_binding(layer_idx)?;
+        let completion = self.arena.write_slots(
+            binding,
+            KvWriteArgs {
+                keys,
+                values,
+                slots: prepared.slots.as_ref(),
+            },
+        )?;
+        if completion.arena() != self.arena.id()
+            || completion.layer() != binding
+            || completion.slots() != 1
+        {
+            return Err(Error::InferenceError(
+                "physical paged windowed write returned a mismatched backend completion".into(),
+            ));
+        }
+        completion.wait()?;
+        prepared.completions.collect(completion)?;
+        self.arena.paged_decode(
+            binding,
+            PagedKvDecodeArgs {
+                queries,
+                batch: &KvDecodeBatchMetadata {
+                    sequences: vec![table],
+                },
                 softmax_scale,
             },
         )

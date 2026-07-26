@@ -344,7 +344,7 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
 fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
     if matches!(
         model_variant.family(),
-        ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat
+        ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat | ModelFamily::Gemma3Chat
     ) {
         SequenceExecutionMode::Always
     } else {
@@ -703,6 +703,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            gemma_chat.state_requirement,
+            InferenceStateRequirement::Retained
+        );
         assert_eq!(qwen_tts.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
             qwen_asr.sequence_execution,
@@ -712,7 +717,6 @@ mod tests {
             qwen_asr.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
         );
-        assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
         assert_eq!(lfm_chat.sequence_execution, SequenceExecutionMode::None);
         assert_eq!(
             lfm_chat.state_requirement,
@@ -743,12 +747,14 @@ mod tests {
 
     #[test]
     fn native_continuous_factories_publish_supported_variants_on_every_backend() {
-        let variant = ModelVariant::Qwen306B;
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
 
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let variants = registry.continuous_tensor_batch_variants(backend);
-            assert!(variants.contains(&variant));
+            assert!(variants.contains(&ModelVariant::Qwen306B));
+            assert!(variants.contains(&ModelVariant::Qwen306BGguf));
+            assert!(variants.contains(&ModelVariant::Gemma31BIt));
+            assert!(variants.contains(&ModelVariant::Gemma34BIt));
             assert!(!variants.contains(&ModelVariant::Qwen3508BGguf));
         }
     }
