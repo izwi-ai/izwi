@@ -75,7 +75,12 @@ pub(crate) use runtime::{
     CapabilityRuntimeIdentityV2, CapabilityStateRuntimeV2, InvocationCapabilityRuntimeV2,
     InvocationPagedDomainCompletionV2, InvocationPagedLeaseSetV2,
     InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
-    InvocationPagedWorkspaceRuntimeV2, ManagedCapabilityRuntimeV2, RetainedStateRuntimeV2,
+    InvocationPagedWorkspaceRuntimeV2, InvocationStateBackingKindV2,
+    InvocationWorkspaceBackingIdentityV2, InvocationWorkspaceBackingV2,
+    InvocationWorkspaceBindingV2, InvocationWorkspaceDomainCompletionV2, InvocationWorkspaceKeyV2,
+    InvocationWorkspaceLeaseSetV2, InvocationWorkspaceLeaseV2,
+    InvocationWorkspacePhysicalCompletionV2, InvocationWorkspacePhysicalLeaseV2,
+    InvocationWorkspaceRuntimeV2, ManagedCapabilityRuntimeV2, RetainedStateRuntimeV2,
     RetainedStateUseV2, StatelessCapabilityRuntimeV2,
 };
 #[allow(unused_imports)]
