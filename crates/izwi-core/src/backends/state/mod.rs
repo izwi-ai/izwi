@@ -9,6 +9,7 @@
 //! remain fail-closed.
 
 mod invocation;
+mod static_attention;
 mod tensor;
 
 #[allow(unused_imports)]
@@ -16,6 +17,11 @@ pub(crate) use invocation::{
     InvocationTensorArena, InvocationTensorChronologicalSegment, InvocationTensorComponentSlice,
     InvocationTensorComponentValue, InvocationTensorDomainKind, InvocationTensorSnapshot,
     InvocationTensorStepValues, InvocationTensorUpdateV2,
+};
+#[allow(unused_imports)]
+pub(crate) use static_attention::{
+    InvocationStaticAttentionArena, StaticAttentionLayerValue, StaticAttentionMetadata,
+    StaticAttentionRaggedRow,
 };
 #[allow(unused_imports)]
 pub(crate) use tensor::{
@@ -590,11 +596,10 @@ fn non_paged_plan_is_supported(
         return false;
     }
     match (resolved, semantic) {
-        // Static attention needs a direct K/V install+attend arena. A generic
-        // tensor replacement cell is not sufficient operation attestation.
-        (ResolvedNonPagedDomainPlan::StaticAttention(_), StateDomainSpec::StaticAttention(_)) => {
-            false
-        }
+        (
+            ResolvedNonPagedDomainPlan::StaticAttention(plan),
+            StateDomainSpec::StaticAttention(spec),
+        ) => static_attention::static_plan_is_supported(plan, spec, backend),
         (ResolvedNonPagedDomainPlan::StaticTensor(plan), StateDomainSpec::StaticTensor(_)) => {
             plan.operations == static_tensor_operations()
         }
