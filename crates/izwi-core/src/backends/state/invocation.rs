@@ -52,6 +52,17 @@ pub(crate) struct InvocationTensorStepValues {
     pub(crate) components: Vec<InvocationTensorComponentValue>,
 }
 
+/// One component of a uniform multi-step sequence update.
+///
+/// The leading tensor dimension is the authenticated step count. Remaining
+/// dimensions are the component's semantic per-step shape. Ring arenas retain
+/// only the physical tail that fits their fixed capacity.
+#[derive(Debug, Clone)]
+pub(crate) struct InvocationTensorBulkComponentValue {
+    pub(crate) component: StateComponentId,
+    pub(crate) tensor: Tensor,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum InvocationTensorUpdateV2 {
     StaticInitialize {
@@ -66,6 +77,9 @@ pub(crate) enum InvocationTensorUpdateV2 {
     },
     RingAdvance {
         steps: Vec<InvocationTensorStepValues>,
+    },
+    RingAdvanceBulk {
+        components: Vec<InvocationTensorBulkComponentValue>,
     },
     Reset,
     NoOp,
@@ -359,6 +373,21 @@ impl InvocationTensorArena {
                 self.validate_declared_steps(*declared_steps, declared, &steps)?;
                 self.ring_advance(intent.expected_cursor, intent.target_cursor, &steps)
             }
+            (
+                StateUpdateKind::RingAdvance {
+                    steps: declared_steps,
+                    components_per_step: declared,
+                },
+                InvocationTensorUpdateV2::RingAdvanceBulk { components },
+            ) if self.kind == InvocationTensorDomainKind::Ring => {
+                self.validate_declared_bulk(*declared_steps, declared, &components)?;
+                self.ring_advance_bulk(
+                    intent.expected_cursor,
+                    intent.target_cursor,
+                    *declared_steps,
+                    &components,
+                )
+            }
             (StateUpdateKind::Reset, InvocationTensorUpdateV2::Reset)
                 if matches!(
                     self.kind,
@@ -604,6 +633,71 @@ impl InvocationTensorArena {
         Ok(())
     }
 
+    fn ring_advance_bulk(
+        &mut self,
+        expected_cursor: u64,
+        target_cursor: u64,
+        declared_steps: u64,
+        values: &[InvocationTensorBulkComponentValue],
+    ) -> Result<()> {
+        self.require_clean()?;
+        if self.kind != InvocationTensorDomainKind::Ring {
+            return Err(invalid(
+                "bulk ring advance requires a ring invocation domain",
+            ));
+        }
+        self.validate_cursor_advance_u64(expected_cursor, target_cursor, declared_steps)?;
+        let capacity = u64::try_from(self.capacity_steps)
+            .map_err(|_| invalid("ring invocation capacity exceeds u64"))?;
+        let retained = declared_steps.min(capacity);
+        let first_retained_source = declared_steps
+            .checked_sub(retained)
+            .ok_or_else(|| invalid("bulk ring retained source underflow"))?;
+        let first_retained_cursor = target_cursor
+            .checked_sub(retained)
+            .ok_or_else(|| invalid("bulk ring retained cursor underflow"))?;
+        let retained_usize = usize::try_from(retained)
+            .map_err(|_| invalid("bulk ring retained length exceeds usize"))?;
+        let new_valid_length = self
+            .valid_length
+            .checked_add(usize::try_from(declared_steps).unwrap_or(self.capacity_steps))
+            .unwrap_or(self.capacity_steps)
+            .min(self.capacity_steps);
+
+        self.dirty = true;
+        for offset in 0..retained_usize {
+            let offset_u64 = u64::try_from(offset).expect("retained bulk ring offset fits u64");
+            let source_step = usize::try_from(first_retained_source + offset_u64)
+                .map_err(|_| invalid("bulk ring source index exceeds usize"))?;
+            let absolute = first_retained_cursor + offset_u64;
+            let physical = usize::try_from(absolute % capacity)
+                .expect("ring modulo capacity always fits usize");
+            for (component, value) in self.components.iter().zip(values) {
+                let source = value.tensor.get(source_step)?;
+                write_logical_value(component, &source, Some(physical))?;
+            }
+        }
+        self.device.synchronize()?;
+        let logical_shapes = values
+            .iter()
+            .map(|value| value.tensor.dims()[1..].to_vec())
+            .collect::<Vec<_>>();
+        for offset in 0..retained_usize {
+            let offset_u64 = u64::try_from(offset).expect("retained bulk ring offset fits u64");
+            let absolute = first_retained_cursor + offset_u64;
+            let physical = usize::try_from(absolute % capacity)
+                .expect("ring modulo capacity always fits usize");
+            for (component, logical_shape) in self.components.iter_mut().zip(&logical_shapes) {
+                component.logical_shapes[physical] = Some(logical_shape.clone());
+            }
+        }
+        self.absolute_cursor = target_cursor;
+        self.valid_length = new_valid_length;
+        self.initialized = true;
+        self.dirty = false;
+        Ok(())
+    }
+
     fn chronological_segments(&self) -> Result<Vec<InvocationTensorChronologicalSegment>> {
         self.require_clean()?;
         if !matches!(
@@ -689,6 +783,17 @@ impl InvocationTensorArena {
         target_cursor: u64,
         step_count: usize,
     ) -> Result<()> {
+        let step_count = u64::try_from(step_count)
+            .map_err(|_| invalid("sequence invocation step count exceeds u64"))?;
+        self.validate_cursor_advance_u64(expected_cursor, target_cursor, step_count)
+    }
+
+    fn validate_cursor_advance_u64(
+        &self,
+        expected_cursor: u64,
+        target_cursor: u64,
+        step_count: u64,
+    ) -> Result<()> {
         if expected_cursor != self.absolute_cursor {
             return Err(invalid("sequence invocation cursor is stale"));
         }
@@ -697,8 +802,6 @@ impl InvocationTensorArena {
                 "sequence invocation update requires a non-empty cursor advance",
             ));
         }
-        let step_count = u64::try_from(step_count)
-            .map_err(|_| invalid("sequence invocation step count exceeds u64"))?;
         let required_target = expected_cursor
             .checked_add(step_count)
             .ok_or_else(|| invalid("sequence invocation cursor overflow"))?;
@@ -858,6 +961,61 @@ impl InvocationTensorArena {
         }
         for step in steps {
             self.validate_declared_values(declared, &step.components)?;
+        }
+        Ok(())
+    }
+
+    fn validate_declared_bulk(
+        &self,
+        declared_steps: u64,
+        declared: &[ComponentShapeInstantiation],
+        values: &[InvocationTensorBulkComponentValue],
+    ) -> Result<()> {
+        if declared_steps == 0
+            || declared.len() != self.components.len()
+            || values.len() != self.components.len()
+        {
+            return Err(invalid(
+                "bulk ring update must declare every component and at least one step",
+            ));
+        }
+        for ((declared, component), value) in declared.iter().zip(&self.components).zip(values) {
+            if declared.component != component.semantic.id
+                || value.component != component.semantic.id
+                || declared.dimensions.len() != component.semantic.shape.dimensions.len()
+                || value.tensor.rank() != declared.dimensions.len() + 1
+                || u64::try_from(value.tensor.dims()[0])
+                    .map_err(|_| invalid("bulk ring step dimension exceeds u64"))?
+                    != declared_steps
+                || value.tensor.device().location() != self.device.location()
+                || value.tensor.dtype() != component.storage.dtype()
+                || !value.tensor.is_contiguous()
+                || self
+                    .components
+                    .iter()
+                    .any(|backing| shares_storage(&value.tensor, backing.storage.as_tensor()))
+            {
+                return Err(invalid(
+                    "bulk ring component has incompatible identity, steps, storage, or layout",
+                ));
+            }
+            for ((declared, semantic), actual) in declared
+                .dimensions
+                .iter()
+                .zip(&component.semantic.shape.dimensions)
+                .zip(&value.tensor.dims()[1..])
+            {
+                let actual = u64::try_from(*actual)
+                    .map_err(|_| invalid("bulk ring dimension exceeds u64"))?;
+                if declared.axis != semantic.axis
+                    || declared.units != actual
+                    || !semantic.extent.accepts(actual)
+                {
+                    return Err(invalid(
+                        "bulk ring component shape does not match its authenticated intent",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1647,6 +1805,138 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap(),
             vec![7.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn authenticated_bulk_ring_advance_writes_only_the_physical_tail() {
+        let mut arena = arena(StateDomainSpec::Ring(RingStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![fixed_component(2)],
+            capacity_steps: 3,
+        }));
+        let intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 5,
+            update: StateUpdateKind::RingAdvance {
+                steps: 5,
+                components_per_step: vec![declared_component(2)],
+            },
+        };
+        let update = InvocationTensorUpdateV2::RingAdvanceBulk {
+            components: vec![InvocationTensorBulkComponentValue {
+                component: StateComponentId::new(1),
+                tensor: Tensor::from_slice(
+                    &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+                    (5, 2),
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            }],
+        };
+
+        arena.apply_intent(&intent, update).unwrap();
+
+        assert_eq!(arena.absolute_cursor(), 5);
+        assert_eq!(arena.valid_length(), 3);
+        assert_eq!(
+            arena
+                .backing(StateComponentId::new(1))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![7.0, 8.0], vec![9.0, 10.0], vec![5.0, 6.0]]
+        );
+        let segments = arena.read_chronological_segments().unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .flat_map(|segment| segment.components[0].tensor.to_vec2::<f32>().unwrap())
+                .collect::<Vec<_>>(),
+            vec![vec![5.0, 6.0], vec![7.0, 8.0], vec![9.0, 10.0]]
+        );
+    }
+
+    #[test]
+    fn bulk_ring_mismatch_fails_before_mutating_the_arena() {
+        let mut arena = arena(StateDomainSpec::Ring(RingStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![fixed_component(2)],
+            capacity_steps: 3,
+        }));
+        let intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 4,
+            update: StateUpdateKind::RingAdvance {
+                steps: 4,
+                components_per_step: vec![declared_component(2)],
+            },
+        };
+        let update = InvocationTensorUpdateV2::RingAdvanceBulk {
+            components: vec![InvocationTensorBulkComponentValue {
+                component: StateComponentId::new(1),
+                tensor: Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+            }],
+        };
+
+        assert!(arena.apply_intent(&intent, update).is_err());
+        assert_eq!(arena.absolute_cursor(), 0);
+        assert_eq!(arena.valid_length(), 0);
+        assert!(!arena.is_dirty());
+        assert_eq!(
+            arena
+                .backing(StateComponentId::new(1))
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![0.0; 2]; 3]
+        );
+    }
+
+    #[test]
+    fn bulk_ring_rejects_truncated_semantic_rank_before_mutation() {
+        let mut arena = arena(StateDomainSpec::Ring(RingStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![bounded_matrix_component(2, 3)],
+            capacity_steps: 3,
+        }));
+        let intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 4,
+            update: StateUpdateKind::RingAdvance {
+                steps: 4,
+                components_per_step: vec![ComponentShapeInstantiation {
+                    component: StateComponentId::new(1),
+                    dimensions: vec![ShapeDimensionValue {
+                        axis: ShapeAxis::Sequence,
+                        units: 2,
+                    }],
+                }],
+            },
+        };
+        let update = InvocationTensorUpdateV2::RingAdvanceBulk {
+            components: vec![InvocationTensorBulkComponentValue {
+                component: StateComponentId::new(1),
+                tensor: Tensor::zeros((4, 2), DType::F32, &Device::Cpu).unwrap(),
+            }],
+        };
+
+        assert!(arena.apply_intent(&intent, update).is_err());
+        assert_eq!(arena.absolute_cursor(), 0);
+        assert_eq!(arena.valid_length(), 0);
+        assert!(!arena.is_dirty());
+        assert_eq!(
+            arena
+                .backing(StateComponentId::new(1))
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![0.0; 18]
         );
     }
 
