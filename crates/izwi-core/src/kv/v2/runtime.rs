@@ -852,6 +852,41 @@ impl InvocationWorkspaceLeaseSetV2 {
             .ok_or_else(|| invalid("atomic invocation lease set does not contain the domain"))
     }
 
+    pub(crate) fn lease_pair_mut(
+        &mut self,
+        first: StateDomainId,
+        second: StateDomainId,
+    ) -> Result<(
+        &mut InvocationWorkspaceLeaseV2,
+        &mut InvocationWorkspaceLeaseV2,
+    )> {
+        if first == second {
+            return Err(invalid(
+                "atomic invocation lease pair requires distinct domains",
+            ));
+        }
+        let first_index = self
+            .leases
+            .iter()
+            .position(|(domain, _)| *domain == first)
+            .ok_or_else(|| {
+                invalid("atomic invocation lease set does not contain the first domain")
+            })?;
+        let second_index = self
+            .leases
+            .iter()
+            .position(|(domain, _)| *domain == second)
+            .ok_or_else(|| {
+                invalid("atomic invocation lease set does not contain the second domain")
+            })?;
+        if first_index < second_index {
+            let (before_second, from_second) = self.leases.split_at_mut(second_index);
+            return Ok((&mut before_second[first_index].1, &mut from_second[0].1));
+        }
+        let (before_first, from_first) = self.leases.split_at_mut(first_index);
+        Ok((&mut from_first[0].1, &mut before_first[second_index].1))
+    }
+
     /// Release every domain even if one completion fails authentication. A
     /// failed set never exposes a partial collection of completions.
     pub(crate) fn release(mut self) -> Result<Vec<InvocationWorkspaceDomainCompletionV2>> {
@@ -3008,6 +3043,40 @@ mod tests {
         assert!(typed
             .iter()
             .all(|backing| backing.state.releases.load(Ordering::Acquire) == 1));
+    }
+
+    #[test]
+    fn invocation_workspace_lease_set_borrows_distinct_domain_pairs_in_requested_order() {
+        let (runtime, _descriptor, _paged_owner, _typed, execution) =
+            all_domain_invocation_fixture(None);
+        let graph = stage_graph_fingerprint(&execution.stages).unwrap();
+        let stage = execution.stages[0].id;
+        let mut leases = runtime
+            .lease_set(
+                graph,
+                stage,
+                &[StateDomainId::new(1), StateDomainId::new(2)],
+            )
+            .unwrap();
+
+        let (typed, paged) = leases
+            .lease_pair_mut(StateDomainId::new(2), StateDomainId::new(1))
+            .unwrap();
+        assert_eq!(typed.kind(), InvocationStateBackingKindV2::StaticAttention);
+        assert_eq!(paged.kind(), InvocationStateBackingKindV2::PagedAttention);
+        assert!(typed.typed_mut::<TestInvocationPhysicalLease>().is_ok());
+        assert_eq!(paged.paged_cache_mut().unwrap().context_len(), 0);
+
+        assert!(leases
+            .lease_pair_mut(StateDomainId::new(1), StateDomainId::new(1))
+            .is_err());
+        assert!(leases
+            .lease_pair_mut(StateDomainId::new(99), StateDomainId::new(1))
+            .is_err());
+        assert!(leases
+            .lease_pair_mut(StateDomainId::new(1), StateDomainId::new(99))
+            .is_err());
+        assert_eq!(leases.release().unwrap().len(), 2);
     }
 
     #[test]
