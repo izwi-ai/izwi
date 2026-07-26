@@ -33,8 +33,8 @@ use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
 use crate::models::architectures::lfm2::physical::Lfm2PhysicalStateSpec;
 use crate::models::architectures::lfm25_audio::{
     physical::{
-        Lfm25AudioPhysicalStateSpec, Lfm25AudioStateMode, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
-        LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+        Lfm25AudioPhysicalStateSpec, Lfm25AudioStateMode, LFM25_DEPTHFORMER_STATE_DOMAIN,
+        LFM25_MAIN_ATTENTION_STATE_DOMAIN, LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
     },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
@@ -1960,9 +1960,10 @@ impl NativeAudioChatModel {
     ) -> Result<NativeAudioChatGeneration> {
         match self {
             Self::Lfm25Audio(model) => {
-                let (attention, shortconv) = leases.lease_pair_mut(
+                let (attention, shortconv, depthformer) = leases.lease_triplet_mut(
                     LFM25_MAIN_ATTENTION_STATE_DOMAIN,
                     LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                    LFM25_DEPTHFORMER_STATE_DOMAIN,
                 )?;
                 let output = model.generate_sequential_with_config_and_callback_physical(
                     messages,
@@ -1970,6 +1971,7 @@ impl NativeAudioChatModel {
                     &Lfm25AudioGenerationConfig::default(),
                     attention.paged_cache_mut()?,
                     shortconv.typed_mut::<InvocationTensorLease>()?,
+                    depthformer.paged_cache_mut()?,
                     on_text_delta,
                 )?;
                 Ok(NativeAudioChatGeneration {
@@ -2001,9 +2003,10 @@ impl NativeAudioChatModel {
     ) -> Result<NativeAudioChatGeneration> {
         match self {
             Self::Lfm25Audio(model) => {
-                let (attention, shortconv) = leases.lease_pair_mut(
+                let (attention, shortconv, depthformer) = leases.lease_triplet_mut(
                     LFM25_MAIN_ATTENTION_STATE_DOMAIN,
                     LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                    LFM25_DEPTHFORMER_STATE_DOMAIN,
                 )?;
                 let output = model.generate_interleaved_with_config_and_callback_physical(
                     history_messages,
@@ -2015,6 +2018,7 @@ impl NativeAudioChatModel {
                     stream_config,
                     attention.paged_cache_mut()?,
                     shortconv.typed_mut::<InvocationTensorLease>()?,
+                    depthformer.paged_cache_mut()?,
                     on_text_delta,
                     on_audio_samples,
                 )?;

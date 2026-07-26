@@ -529,6 +529,7 @@ impl Lfm25AudioModel {
         generation_config: &Lfm25AudioGenerationConfig,
         cache: &mut PhysicalPagedKvCache,
         shortconv: &mut InvocationTensorLease,
+        depthformer_cache: &mut PhysicalPagedKvCache,
         on_text_delta: &mut dyn FnMut(&str),
     ) -> Result<Lfm25AudioGenerationOutput> {
         let total_started = Instant::now();
@@ -637,6 +638,7 @@ impl Lfm25AudioModel {
                             &last_hidden,
                             &generation_config.audio,
                             &mut rng,
+                            depthformer_cache,
                         )?;
                     profile.audio_head_ms += elapsed_ms(audio_head_started);
                     profile.audio_head_depth_linear_ms += audio_head_profile.depth_linear_ms;
@@ -708,6 +710,7 @@ impl Lfm25AudioModel {
                             &last_hidden,
                             &generation_config.audio,
                             &mut rng,
+                            depthformer_cache,
                         )?;
                     profile.audio_head_ms += elapsed_ms(audio_head_started);
                     profile.audio_head_depth_linear_ms += audio_head_profile.depth_linear_ms;
@@ -894,6 +897,7 @@ impl Lfm25AudioModel {
         stream_config: &Lfm25AudioStreamConfig,
         cache: &mut PhysicalPagedKvCache,
         shortconv: &mut InvocationTensorLease,
+        depthformer_cache: &mut PhysicalPagedKvCache,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<Lfm25AudioGenerationOutput> {
@@ -995,6 +999,7 @@ impl Lfm25AudioModel {
                             &last_hidden,
                             &generation_config.audio,
                             &mut rng,
+                            depthformer_cache,
                         )?;
                         tokens_generated += 1;
                         let is_end =

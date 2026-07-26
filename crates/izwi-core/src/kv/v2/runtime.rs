@@ -908,6 +908,53 @@ impl InvocationWorkspaceLeaseSetV2 {
         Ok((&mut from_first[0].1, &mut before_first[second_index].1))
     }
 
+    pub(crate) fn lease_triplet_mut(
+        &mut self,
+        first: StateDomainId,
+        second: StateDomainId,
+        third: StateDomainId,
+    ) -> Result<(
+        &mut InvocationWorkspaceLeaseV2,
+        &mut InvocationWorkspaceLeaseV2,
+        &mut InvocationWorkspaceLeaseV2,
+    )> {
+        if first == second || first == third || second == third {
+            return Err(invalid(
+                "atomic invocation lease triplet requires distinct domains",
+            ));
+        }
+        let index_for = |domain| {
+            self.leases
+                .iter()
+                .position(|(candidate, _)| *candidate == domain)
+                .ok_or_else(|| {
+                    invalid("atomic invocation lease set does not contain a requested domain")
+                })
+        };
+        let mut ordered = [
+            (index_for(first)?, 0_u8),
+            (index_for(second)?, 1_u8),
+            (index_for(third)?, 2_u8),
+        ];
+        ordered.sort_unstable_by_key(|(index, _)| *index);
+        let [(low_index, low_order), (middle_index, middle_order), (high_index, high_order)] =
+            ordered;
+        let (before_middle, from_middle) = self.leases.split_at_mut(middle_index);
+        let low = &mut before_middle[low_index].1;
+        let (middle_entry, after_middle) = from_middle.split_at_mut(1);
+        let middle = &mut middle_entry[0].1;
+        let high = &mut after_middle[high_index - middle_index - 1].1;
+        match (low_order, middle_order, high_order) {
+            (0, 1, 2) => Ok((low, middle, high)),
+            (0, 2, 1) => Ok((low, high, middle)),
+            (1, 0, 2) => Ok((middle, low, high)),
+            (1, 2, 0) => Ok((high, low, middle)),
+            (2, 0, 1) => Ok((middle, high, low)),
+            (2, 1, 0) => Ok((high, middle, low)),
+            _ => unreachable!("three distinct domain indices have one total ordering"),
+        }
+    }
+
     /// Borrow an exact two-domain mixed workspace by physical backing kind.
     /// This keeps model adapters independent of authored domain ordering while
     /// rejecting missing, duplicate, or silently extra state.
@@ -3157,6 +3204,57 @@ mod tests {
             .lease_pair_mut(StateDomainId::new(1), StateDomainId::new(99))
             .is_err());
         assert_eq!(leases.release().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn invocation_workspace_lease_set_borrows_distinct_domain_triplets_in_requested_order() {
+        let (runtime, _descriptor, _paged_owner, _typed, execution) =
+            all_domain_invocation_fixture(None);
+        let graph = stage_graph_fingerprint(&execution.stages).unwrap();
+        let stage = execution.stages[0].id;
+        let mut leases = runtime
+            .lease_set(
+                graph,
+                stage,
+                &[
+                    StateDomainId::new(1),
+                    StateDomainId::new(2),
+                    StateDomainId::new(3),
+                ],
+            )
+            .unwrap();
+
+        let (tensor, paged, static_attention) = leases
+            .lease_triplet_mut(
+                StateDomainId::new(3),
+                StateDomainId::new(1),
+                StateDomainId::new(2),
+            )
+            .unwrap();
+        assert_eq!(tensor.kind(), InvocationStateBackingKindV2::Tensor);
+        assert_eq!(paged.kind(), InvocationStateBackingKindV2::PagedAttention);
+        assert_eq!(
+            static_attention.kind(),
+            InvocationStateBackingKindV2::StaticAttention
+        );
+        assert!(tensor.typed_mut::<TestInvocationPhysicalLease>().is_ok());
+        assert_eq!(paged.paged_cache_mut().unwrap().context_len(), 0);
+
+        assert!(leases
+            .lease_triplet_mut(
+                StateDomainId::new(1),
+                StateDomainId::new(1),
+                StateDomainId::new(2),
+            )
+            .is_err());
+        assert!(leases
+            .lease_triplet_mut(
+                StateDomainId::new(1),
+                StateDomainId::new(2),
+                StateDomainId::new(99),
+            )
+            .is_err());
+        assert_eq!(leases.release().unwrap().len(), 3);
     }
 
     #[test]

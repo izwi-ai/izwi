@@ -5,21 +5,15 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 
-use candle_transformers::utils::repeat_kv as candle_repeat_kv;
-
 use crate::error::{Error, Result};
 use crate::kernels::{
-    try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rms_norm,
-    try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
+    try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_rope_pair_bshd,
+    try_fused_silu_mul_with_status,
 };
-use crate::models::shared::telemetry::{
-    record_decode_attention_path, record_fused_attention_attempt, record_fused_attention_fallback,
-    record_fused_attention_success, record_rope_kernel, AttentionFallbackReason,
-    DecodeAttentionPath,
-};
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
 
-use super::cache::DenseKvCache;
 use super::config::Lfm25AudioDecoderConfig;
 use super::sampling::{
     greedy_token_tensor_from_logits, sample_from_logits, Lfm25SamplingConfig, SimpleRng,
@@ -173,8 +167,9 @@ impl Lfm25AudioHead {
         hidden: &Tensor,
         config: &Lfm25SamplingConfig,
         rng: &mut SimpleRng,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<Vec<u32>> {
-        self.sample_audio_frame_with_profile(hidden, config, rng)
+        self.sample_audio_frame_with_profile(hidden, config, rng, cache)
             .map(|(samples, _profile)| samples)
     }
 
@@ -183,9 +178,10 @@ impl Lfm25AudioHead {
         hidden: &Tensor,
         config: &Lfm25SamplingConfig,
         rng: &mut SimpleRng,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<(Vec<u32>, Lfm25AudioHeadProfile)> {
         let (frame, mut profile) =
-            self.sample_audio_frame_embedded_with_profile(hidden, config, rng)?;
+            self.sample_audio_frame_embedded_with_profile(hidden, config, rng, cache)?;
         let materialize_started = Instant::now();
         let materialized = materialize_codebook_samples_with_profile(&frame.samples)?;
         profile.materialize_ms = elapsed_ms(materialize_started);
@@ -199,6 +195,7 @@ impl Lfm25AudioHead {
         hidden: &Tensor,
         config: &Lfm25SamplingConfig,
         rng: &mut SimpleRng,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<(Lfm25SampledAudioFrame, Lfm25AudioHeadProfile)> {
         let mut profile = Lfm25AudioHeadProfile::default();
         let hidden = ensure_rank3(hidden)?;
@@ -215,7 +212,7 @@ impl Lfm25AudioHead {
 
         let cache_setup_started = Instant::now();
         let mut next_embed = Tensor::zeros(self.depthformer_dim, hidden.dtype(), hidden.device())?;
-        let mut caches = self.depthformer.empty_cache();
+        cache.reset_invocation()?;
         let mut samples = Vec::with_capacity(self.codebooks);
         profile.cache_setup_ms = elapsed_ms(cache_setup_started);
 
@@ -226,7 +223,7 @@ impl Lfm25AudioHead {
             profile.codebook_input_ms += elapsed_ms(codebook_input_started);
 
             let depthformer_started = Instant::now();
-            let out = self.depthformer.forward_cached(&cur, &mut caches)?;
+            let out = self.depthformer.forward_physical(&cur, cache)?;
             profile.depthformer_ms += elapsed_ms(depthformer_started);
 
             let sample_started = Instant::now();
@@ -409,7 +406,7 @@ impl Lfm25AudioHead {
 
 struct Depthformer {
     layers: Vec<DepthformerBlock>,
-    cache_initial_capacity: usize,
+    dim: usize,
 }
 
 impl Depthformer {
@@ -425,21 +422,31 @@ impl Depthformer {
         }
         Ok(Self {
             layers,
-            cache_initial_capacity: cfg.codebooks.max(1),
+            dim: cfg.depthformer_dim,
         })
     }
 
-    fn empty_cache(&self) -> Vec<DenseKvCache> {
-        (0..self.layers.len())
-            .map(|_| DenseKvCache::new(self.cache_initial_capacity))
-            .collect()
-    }
-
-    fn forward_cached(&self, x: &Tensor, caches: &mut [DenseKvCache]) -> Result<Tensor> {
-        let mut hidden = x.clone();
-        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward_cached(&hidden, cache)?;
+    fn forward_physical(&self, x: &Tensor, cache: &mut PhysicalPagedKvCache) -> Result<Tensor> {
+        let (batch, seq_len, hidden) = x.dims3()?;
+        if batch != 1
+            || hidden != self.dim
+            || seq_len != 1
+            || cache.context_len() >= cache.capacity_tokens()
+        {
+            return Err(Error::InvalidInput(
+                "Depthformer input does not match its physical invocation state".into(),
+            ));
         }
+        let head_dim = self.dim / DEPTHFORMER_HEADS;
+        cache.validate_model(self.layers.len(), DEPTHFORMER_KV_HEADS, head_dim)?;
+        let index_pos = cache.context_len();
+        let mut prepared = cache.prepare_append(index_pos, seq_len)?;
+        let mut hidden = x.clone();
+        for (physical_layer, layer) in self.layers.iter().enumerate() {
+            hidden =
+                layer.forward_physical(&hidden, index_pos, physical_layer, cache, &mut prepared)?;
+        }
+        cache.commit_prepared(prepared)?;
         Ok(hidden)
     }
 }
@@ -481,8 +488,21 @@ impl DepthformerBlock {
         })
     }
 
-    fn forward_cached(&self, x: &Tensor, cache: &mut DenseKvCache) -> Result<Tensor> {
-        let hidden = self.attn.forward(&self.attn_norm.forward(x)?, cache)?;
+    fn forward_physical(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        physical_layer: usize,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+    ) -> Result<Tensor> {
+        let hidden = self.attn.forward_physical(
+            &self.attn_norm.forward(x)?,
+            index_pos,
+            physical_layer,
+            cache,
+            prepared,
+        )?;
         let hidden = hidden.broadcast_add(x)?;
         let ffn = self.mlp.forward(&self.ffn_norm.forward(&hidden)?)?;
         hidden.broadcast_add(&ffn).map_err(Error::from)
@@ -621,7 +641,14 @@ impl DepthAttention {
         })
     }
 
-    fn forward(&self, hidden: &Tensor, cache: &mut DenseKvCache) -> Result<Tensor> {
+    fn forward_physical(
+        &self,
+        hidden: &Tensor,
+        index_pos: usize,
+        physical_layer: usize,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+    ) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden.dims3()?;
         let head_dim = hidden_size / DEPTHFORMER_HEADS;
         let kv_hidden = DEPTHFORMER_KV_HEADS * head_dim;
@@ -679,7 +706,6 @@ impl DepthAttention {
             (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?)
         };
 
-        let index_pos = cache.len();
         let (q, k) = if let Some((q, k)) =
             try_apply_rotary_emb_pair_bshd(&q, &k, &self.cos_sin, index_pos)?
         {
@@ -696,56 +722,18 @@ impl DepthAttention {
             )
         };
 
-        let super::cache::DenseKvCacheView {
-            current_k: all_k,
-            current_v: all_v,
-            full_k: cache_full_k,
-            full_v: cache_full_v,
-            valid_len: cache_valid_len,
-        } = cache.append(&k, &v)?;
-
-        if batch == 1 && seq_len == 1 && q.device().is_metal() {
-            record_fused_attention_attempt();
-            if let Some(out) = try_fused_decode_gqa_attention_with_kv_len(
-                &q.contiguous()?,
-                &cache_full_k,
-                &cache_full_v,
-                DEPTHFORMER_HEADS,
-                DEPTHFORMER_KV_HEADS,
-                head_dim,
-                cache_valid_len,
-                (1.0f64 / (head_dim as f64).sqrt()) as f32,
-            ) {
-                record_fused_attention_success();
-                let out = out
-                    .transpose(1, 2)?
-                    .reshape((batch, seq_len, hidden_size))?;
-                return self.o_proj.forward(&out);
-            }
-            record_fused_attention_fallback(AttentionFallbackReason::UnsupportedBackend);
-        }
-
-        // GQA repeat_kv directly on [b, h, s, d] layout
-        let (key, value) = if DEPTHFORMER_HEADS != DEPTHFORMER_KV_HEADS {
-            let repeats = DEPTHFORMER_HEADS / DEPTHFORMER_KV_HEADS;
-            (
-                candle_repeat_kv(all_k, repeats)?,
-                candle_repeat_kv(all_v, repeats)?,
-            )
-        } else {
-            (all_k, all_v)
-        };
-        if seq_len == 1 {
-            record_decode_attention_path(DecodeAttentionPath::Dense);
-        }
-        let scores = (q.matmul(&key.transpose(2, 3)?.contiguous()?)?
-            / ((hidden_size / DEPTHFORMER_HEADS) as f64).sqrt())?;
-        let scores = causal_mask(scores, index_pos)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = probs.matmul(&value)?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((batch, seq_len, hidden_size))?;
+        let queries = q.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let keys = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let values = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let out = cache.write_and_attend(
+            physical_layer,
+            prepared,
+            &queries,
+            &keys,
+            &values,
+            (1.0f64 / (head_dim as f64).sqrt()) as f32,
+        )?;
+        let out = out.reshape((batch, seq_len, hidden_size))?;
         self.o_proj.forward(&out)
     }
 }
@@ -1064,24 +1052,6 @@ fn try_apply_rotary_emb_pair_bshd(
         return Ok(Some((q, k)));
     }
     Ok(None)
-}
-
-fn causal_mask(scores: Tensor, index_pos: usize) -> Result<Tensor> {
-    let (_batch, _heads, query_len, key_len) = scores.dims4()?;
-    if query_len == 1 {
-        return Ok(scores);
-    }
-
-    let mask: Vec<u8> = (0..query_len)
-        .flat_map(|i| {
-            let global_i = index_pos + i;
-            (0..key_len).map(move |j| u8::from(j > global_i))
-        })
-        .collect();
-    let mask = Tensor::from_slice(&mask, (1, 1, query_len, key_len), scores.device())?;
-    let neg_inf = Tensor::new(f32::NEG_INFINITY, scores.device())?;
-    let masked = mask.where_cond(&neg_inf.broadcast_as(scores.shape().dims())?, &scores)?;
-    Ok(masked)
 }
 
 fn ensure_rank3(hidden: &Tensor) -> Result<Tensor> {
