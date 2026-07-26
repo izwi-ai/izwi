@@ -953,9 +953,13 @@ impl QuantizedLfm2Backbone {
             }
             None => cache.prepare_append(index_pos, seq_len)?,
         };
-        let intent = self
-            .state_layout
-            .ring_step_intent(index_pos, batch, hidden, seq_len)?;
+        let intent = self.state_layout.ring_step_intent(
+            shortconv.domain(),
+            index_pos,
+            batch,
+            hidden,
+            seq_len,
+        )?;
         let output = shortconv.with_ring_depthwise_conv(&intent, |transaction| {
             let mut hidden_states = input_embeds.clone();
             for layer in self.layers.iter_mut() {

@@ -81,6 +81,7 @@ impl Lfm2StateLayout {
 
     pub(crate) fn ring_step_intent(
         &self,
+        domain: StateDomainId,
         expected_cursor: usize,
         batch: usize,
         hidden: usize,
@@ -98,7 +99,7 @@ impl Lfm2StateLayout {
         let hidden = u64::try_from(hidden)
             .map_err(|_| Error::InvalidInput("LFM2 ring hidden width exceeds u64".into()))?;
         Ok(DomainStepIntent {
-            domain: LFM2_SHORTCONV_STATE_DOMAIN,
+            domain,
             expected_cursor,
             target_cursor,
             update: StateUpdateKind::RingAdvance {
@@ -457,8 +458,9 @@ mod tests {
                 (4, StateComponentId::new(3)),
             ]
         );
-        let intent = layout.ring_step_intent(7, 1, 16, 2).unwrap();
-        assert_eq!(intent.domain, LFM2_SHORTCONV_STATE_DOMAIN);
+        let ring_domain = StateDomainId::new(9);
+        let intent = layout.ring_step_intent(ring_domain, 7, 1, 16, 2).unwrap();
+        assert_eq!(intent.domain, ring_domain);
         assert_eq!(intent.expected_cursor, 7);
         assert_eq!(intent.target_cursor, 9);
         let StateUpdateKind::RingAdvance {

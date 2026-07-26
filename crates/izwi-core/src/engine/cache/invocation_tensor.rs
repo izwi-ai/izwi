@@ -585,6 +585,10 @@ impl<A: InvocationSlotArena> InvocationSlotLease<A> {
         self.slot
     }
 
+    pub(crate) const fn domain(&self) -> StateDomainId {
+        self.slot.pool.domain
+    }
+
     pub(crate) fn arena(&self) -> Result<std::sync::MutexGuard<'_, A>> {
         self.require_leased()?;
         lock_arena(self.inner.as_ref(), self.slot.slot)
