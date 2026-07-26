@@ -7,5 +7,6 @@ pub mod attention;
 pub mod chat;
 pub mod config;
 pub mod memory;
+pub(crate) mod state;
 pub mod telemetry;
 pub mod weights;

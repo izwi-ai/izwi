@@ -1,6 +1,7 @@
 mod decode;
 pub(crate) mod metal_kernels;
 mod nemo;
+mod physical;
 mod preprocessor;
 
 use std::path::Path;
@@ -13,14 +14,21 @@ use candle_nn::{
     ModuleT, VarBuilder,
 };
 
+use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
 use crate::backends::DeviceProfile;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
+    StateComponentId, StateUpdateKind,
+};
 use crate::model::ModelVariant;
 use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
 
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
+pub(crate) use physical::ParakeetPhysicalStateSpec;
 use preprocessor::ParakeetPreprocessor;
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -101,6 +109,13 @@ impl ParakeetDecoder {
 }
 
 impl ParakeetAsrModel {
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<ParakeetPhysicalStateSpec> {
+        physical::parakeet_physical_state_spec(stage_graphs)
+    }
+
     pub fn load(
         model_dir: &Path,
         variant: ModelVariant,
@@ -186,6 +201,23 @@ impl ParakeetAsrModel {
         self.transcribe_with_callback_internal(audio, sample_rate, language, &mut no_op)
     }
 
+    pub(crate) fn transcribe_with_details_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: &mut InvocationTensorLease,
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        let mut no_op = |_delta: &str| {};
+        self.transcribe_with_callback_internal_physical(
+            audio,
+            sample_rate,
+            language,
+            predictor_state,
+            &mut no_op,
+        )
+    }
+
     pub fn transcribe_with_callback(
         &self,
         audio: &[f32],
@@ -198,11 +230,63 @@ impl ParakeetAsrModel {
             .text)
     }
 
+    pub(crate) fn transcribe_with_callback_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        Ok(self
+            .transcribe_with_callback_internal_physical(
+                audio,
+                sample_rate,
+                language,
+                predictor_state,
+                on_delta,
+            )?
+            .text)
+    }
+
     fn transcribe_with_callback_internal(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        self.transcribe_with_callback_internal_impl(audio, sample_rate, language, None, on_delta)
+    }
+
+    fn transcribe_with_callback_internal_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ParakeetAsrTranscriptionOutput> {
+        if predictor_state.domain() != physical::PARAKEET_PREDICTOR_STATE_DOMAIN {
+            return Err(Error::InferenceError(
+                "Parakeet ASR received a foreign physical predictor domain".into(),
+            ));
+        }
+        self.transcribe_with_callback_internal_impl(
+            audio,
+            sample_rate,
+            language,
+            Some(predictor_state),
+            on_delta,
+        )
+    }
+
+    fn transcribe_with_callback_internal_impl(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        predictor_state: Option<&mut InvocationTensorLease>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ParakeetAsrTranscriptionOutput> {
         if audio.is_empty() {
@@ -246,15 +330,27 @@ impl ParakeetAsrModel {
         };
 
         let decode_started = Instant::now();
-        self.network.decode_tdt_greedy(
-            &encoded,
-            encoded_len,
-            self.blank_idx,
-            self.num_durations,
-            self.max_symbols,
-            &mut decode_counters,
-            &mut on_token,
-        )?;
+        match predictor_state {
+            Some(state) => self.network.decode_tdt_greedy_physical(
+                &encoded,
+                encoded_len,
+                self.blank_idx,
+                self.num_durations,
+                self.max_symbols,
+                &mut decode_counters,
+                state,
+                &mut on_token,
+            )?,
+            None => self.network.decode_tdt_greedy(
+                &encoded,
+                encoded_len,
+                self.blank_idx,
+                self.num_durations,
+                self.max_symbols,
+                &mut decode_counters,
+                &mut on_token,
+            )?,
+        }
         timings.tdt_decode_ms = elapsed_ms(decode_started);
 
         if assembled.is_empty() {
@@ -472,10 +568,70 @@ impl ParakeetNetwork {
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
 
         let mut predictor_state = self.predictor.initial_state(1, encoded.device())?;
-        let mut predictor_out =
+        let predictor_out =
             self.predictor
                 .step(blank_idx, &mut predictor_state, encoded.device())?;
+        self.decode_tdt_greedy_loop(
+            &encoded,
+            encoded_len,
+            blank_idx,
+            num_durations,
+            max_symbols,
+            counters,
+            predictor_out,
+            |label| {
+                self.predictor
+                    .step(label, &mut predictor_state, encoded.device())
+            },
+            on_token,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tdt_greedy_physical(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        blank_idx: usize,
+        num_durations: usize,
+        max_symbols: usize,
+        counters: &mut ParakeetDecodeCounters,
+        predictor_state: &mut InvocationTensorLease,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<()> {
+        let encoded = encoded.i((0, ..encoded_len, ..))?;
+        let predictor_out =
+            self.predictor
+                .initialize_physical(blank_idx, predictor_state, encoded.device())?;
+        self.decode_tdt_greedy_loop(
+            &encoded,
+            encoded_len,
+            blank_idx,
+            num_durations,
+            max_symbols,
+            counters,
+            predictor_out,
+            |label| {
+                self.predictor
+                    .step_physical(label, predictor_state, encoded.device())
+            },
+            on_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tdt_greedy_loop(
+        &self,
+        encoded: &Tensor,
+        encoded_len: usize,
+        blank_idx: usize,
+        num_durations: usize,
+        max_symbols: usize,
+        counters: &mut ParakeetDecodeCounters,
+        mut predictor_out: Tensor,
+        mut predictor_step: impl FnMut(usize) -> Result<Tensor>,
+        on_token: &mut dyn FnMut(usize),
+    ) -> Result<()> {
         let mut t = 0usize;
         let mut last_emit_t = usize::MAX;
         let mut emit_count_at_t = 0usize;
@@ -555,9 +711,7 @@ impl ParakeetNetwork {
             }
 
             on_token(label);
-            predictor_out = self
-                .predictor
-                .step(label, &mut predictor_state, encoded.device())?;
+            predictor_out = predictor_step(label)?;
         }
 
         Ok(())
@@ -1054,6 +1208,127 @@ impl Predictor {
 
         Ok(state.h1.unsqueeze(1)?) // [B=1, U=1, H]
     }
+
+    fn initialize_physical(
+        &self,
+        label: usize,
+        lease: &mut InvocationTensorLease,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let cursor = lease.arena()?.absolute_cursor();
+        if cursor != 0 {
+            return Err(Error::InferenceError(
+                "Parakeet predictor invocation state was not reset before decode".into(),
+            ));
+        }
+        let mut state = self.initial_state(1, device)?;
+        let output = self.step(label, &mut state, device)?;
+        commit_parakeet_predictor_state(lease, cursor, &state, &output)?;
+        Ok(output)
+    }
+
+    fn step_physical(
+        &self,
+        label: usize,
+        lease: &mut InvocationTensorLease,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let snapshot = lease.read_snapshot()?;
+        if snapshot.components.len() != 5
+            || snapshot
+                .components
+                .iter()
+                .enumerate()
+                .any(|(index, value)| value.component != StateComponentId::new((index + 1) as u32))
+        {
+            return Err(Error::InferenceError(
+                "Parakeet physical predictor snapshot has non-canonical components".into(),
+            ));
+        }
+        let mut state = PredictorState {
+            h0: snapshot.components[0].tensor.clone(),
+            c0: snapshot.components[1].tensor.clone(),
+            h1: snapshot.components[2].tensor.clone(),
+            c1: snapshot.components[3].tensor.clone(),
+        };
+        let output = self.step(label, &mut state, device)?;
+        commit_parakeet_predictor_state(lease, snapshot.absolute_cursor, &state, &output)?;
+        Ok(output)
+    }
+}
+
+fn commit_parakeet_predictor_state(
+    lease: &mut InvocationTensorLease,
+    expected_cursor: u64,
+    state: &PredictorState,
+    output: &Tensor,
+) -> Result<()> {
+    let target_cursor = expected_cursor
+        .checked_add(1)
+        .ok_or_else(|| Error::InferenceError("Parakeet predictor cursor overflow".into()))?;
+    let tensors = [
+        state.h0.clone(),
+        state.c0.clone(),
+        state.h1.clone(),
+        state.c1.clone(),
+        output.clone(),
+    ];
+    let components = tensors
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor)| InvocationTensorComponentValue {
+            component: StateComponentId::new((index + 1) as u32),
+            tensor,
+        })
+        .collect::<Vec<_>>();
+    let declared = components
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let dimensions = if index < 4 {
+                vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: PRED_HIDDEN as u64,
+                    },
+                ]
+            } else {
+                vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Sequence,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: PRED_HIDDEN as u64,
+                    },
+                ]
+            };
+            ComponentShapeInstantiation {
+                component: value.component,
+                dimensions,
+            }
+        })
+        .collect();
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain: physical::PARAKEET_PREDICTOR_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::TensorReplace {
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::TensorReplace { components },
+    )
 }
 
 struct LstmCell {

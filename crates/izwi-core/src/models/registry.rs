@@ -43,7 +43,7 @@ use crate::models::architectures::nemotron::asr::{
     NemotronRealtimePhysicalStateSpec, NemotronRealtimeResourceReservation, NemotronStreamingState,
 };
 use crate::models::architectures::parakeet::asr::{
-    ParakeetAsrModel, ParakeetAsrTranscriptionOutput,
+    ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeState as Qwen3AsrDecodeState, AsrDecodeStep as Qwen3AsrDecodeStep,
@@ -786,10 +786,68 @@ impl NativeAsrModel {
                     cache,
                 )
             }
-            Self::Parakeet(_) | Self::Nemotron(_) => Err(Error::InferenceError(
-                "ASR model does not author physical invocation transcription state".to_string(),
+            Self::Parakeet(_) => {
+                let state = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::Tensor)?
+                    .typed_mut::<InvocationTensorLease>()?;
+                self.transcribe_parakeet_with_details_physical(audio, sample_rate, language, state)
+            }
+            Self::Nemotron(_) => Err(Error::InferenceError(
+                "Nemotron offline ASR does not yet author physical invocation state".to_string(),
             )),
         }
+    }
+
+    pub(crate) fn parakeet_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<ParakeetPhysicalStateSpec> {
+        match self {
+            Self::Parakeet(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Parakeet ASR model cannot author Parakeet physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_parakeet_with_details_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        state: &mut InvocationTensorLease,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::Parakeet(model) = self else {
+            return Err(Error::InferenceError(
+                "Parakeet physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        let ParakeetAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_physical(audio, sample_rate, language, state)?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_parakeet_with_callback_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        state: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::Parakeet(model) = self else {
+            return Err(Error::InferenceError(
+                "Parakeet physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_physical(audio, sample_rate, language, state, on_delta)
     }
 
     pub(crate) fn whisper_physical_state_spec(

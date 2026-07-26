@@ -440,6 +440,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     ModelFamily::Qwen3Asr => InferenceStateRequirement::RetainedAndInvocation,
                     ModelFamily::VibeVoiceAsr
                     | ModelFamily::WhisperAsr
+                    | ModelFamily::ParakeetAsr
                     | ModelFamily::Voxtral
                     | ModelFamily::GraniteSpeechAsr
                     | ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
@@ -766,6 +767,13 @@ mod tests {
         assert_eq!(whisper.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(
             whisper.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
+                .expect("parakeet asr adapter")
+                .state_requirement,
             InferenceStateRequirement::Invocation
         );
         assert_eq!(

@@ -68,6 +68,7 @@ enum LoadedAsrStatePublicationRoute {
     Qwen3,
     VibeVoice,
     Whisper,
+    Parakeet,
     LegacyCache,
 }
 
@@ -76,6 +77,7 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::Qwen3Asr => LoadedAsrStatePublicationRoute::Qwen3,
         crate::catalog::ModelFamily::VibeVoiceAsr => LoadedAsrStatePublicationRoute::VibeVoice,
         crate::catalog::ModelFamily::WhisperAsr => LoadedAsrStatePublicationRoute::Whisper,
+        crate::catalog::ModelFamily::ParakeetAsr => LoadedAsrStatePublicationRoute::Parakeet,
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
 }
@@ -850,6 +852,24 @@ impl ModelLifecycleController {
                             )
                             .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);
+                    } else if publication_route == LoadedAsrStatePublicationRoute::Parakeet {
+                        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                        let stage_graphs = contracts
+                            .iter()
+                            .map(|contract| contract.stages.as_ref())
+                            .collect::<Vec<_>>();
+                        let physical_spec = loaded.parakeet_physical_state_spec(&stage_graphs)?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                &physical_spec.invocation,
+                                None,
+                                HashMap::new(),
+                            )
+                            .await?;
+                        state_publications.insert(CapabilityKind::Asr, publication);
                     } else if let crate::kv::CacheCapability::Managed(contract) = &loaded_cache {
                         return Err(Error::ModelLoadError(format!(
                             "loaded non-Qwen ASR model {variant} still publishes legacy managed state with {} domains",
@@ -1450,7 +1470,7 @@ mod tests {
         );
         assert_eq!(
             loaded_asr_state_publication_route(ModelVariant::ParakeetTdt06BV3),
-            LoadedAsrStatePublicationRoute::LegacyCache
+            LoadedAsrStatePublicationRoute::Parakeet
         );
     }
 

@@ -78,6 +78,26 @@ fn with_vibevoice_invocation_state<T>(
     Ok(output)
 }
 
+fn with_single_invocation_tensor<T>(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    run: impl FnOnce(&mut crate::engine::InvocationTensorLease) -> Result<T>,
+) -> Result<T> {
+    let mut leases = super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
+    let output = {
+        let tensor =
+            leases.lease_exact_kind_mut(crate::kv::v2::InvocationStateBackingKindV2::Tensor)?;
+        run(tensor.typed_mut::<crate::engine::InvocationTensorLease>()?)?
+    };
+    let completions = leases.release()?;
+    if completions.len() != 1 {
+        return Err(Error::InferenceError(
+            "atomic ASR tensor state returned an incomplete completion set".to_string(),
+        ));
+    }
+    Ok(output)
+}
+
 impl NativeExecutor {
     pub(super) fn transcribe_request(
         &self,
@@ -563,6 +583,16 @@ impl NativeExecutor {
                                     )
                                 },
                             )?,
+                            ModelFamily::ParakeetAsr => {
+                                with_single_invocation_tensor(request, scheduled, |state| {
+                                    model.transcribe_parakeet_with_details_physical(
+                                        chunk_audio,
+                                        sr,
+                                        language,
+                                        state,
+                                    )
+                                })?
+                            }
                             _ => model.transcribe_with_details_prompt_prefix_and_options(
                                 chunk_audio,
                                 sr,
@@ -672,6 +702,17 @@ impl NativeExecutor {
                                 )
                             },
                         )?,
+                        ModelFamily::ParakeetAsr => {
+                            with_single_invocation_tensor(request, scheduled, |state| {
+                                model.transcribe_parakeet_with_callback_physical(
+                                    &samples,
+                                    sample_rate,
+                                    language,
+                                    state,
+                                    &mut emit,
+                                )
+                            })?
+                        }
                         _ => model.transcribe_with_callback_and_prompt_and_options(
                             &samples,
                             sample_rate,
@@ -739,6 +780,16 @@ impl NativeExecutor {
                             asr_prompt,
                             self_kv,
                             cross_kv,
+                        )
+                    })?
+                }
+                ModelFamily::ParakeetAsr => {
+                    with_single_invocation_tensor(request, scheduled, |state| {
+                        model.transcribe_parakeet_with_details_physical(
+                            &samples,
+                            sample_rate,
+                            language,
+                            state,
                         )
                     })?
                 }
