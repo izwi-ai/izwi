@@ -437,9 +437,9 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 },
                 state_requirement: match model_variant.family() {
                     ModelFamily::Qwen3Asr => InferenceStateRequirement::RetainedAndInvocation,
-                    ModelFamily::VibeVoiceAsr | ModelFamily::Voxtral => {
-                        InferenceStateRequirement::Invocation
-                    }
+                    ModelFamily::VibeVoiceAsr
+                    | ModelFamily::Voxtral
+                    | ModelFamily::GraniteSpeechAsr => InferenceStateRequirement::Invocation,
                     _ => InferenceStateRequirement::Stateless,
                 },
             })
@@ -460,7 +460,7 @@ impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
                 streaming_mode: StreamingMode::None,
                 execution_target: ExecutionTargetKind::PipelineRunner,
                 sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Stateless,
+                state_requirement: InferenceStateRequirement::Invocation,
             })
     }
 }
@@ -869,11 +869,19 @@ mod tests {
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::None);
         assert_eq!(
-            registry
-                .require(CapabilityKind::SpeakerAttributedAsr, variant)
-                .expect("granite speaker-attributed ASR adapter")
-                .execution_target,
+            adapter.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
+        let attributed = registry
+            .require(CapabilityKind::SpeakerAttributedAsr, variant)
+            .expect("granite speaker-attributed ASR adapter");
+        assert_eq!(
+            attributed.execution_target,
             ExecutionTargetKind::PipelineRunner
+        );
+        assert_eq!(
+            attributed.state_requirement,
+            InferenceStateRequirement::Invocation
         );
         assert!(registry
             .require(CapabilityKind::Diarization, variant)

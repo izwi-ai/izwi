@@ -673,5 +673,15 @@ mod tests {
             .retained_state,
             Stateless
         );
+        for capability in [
+            ConformanceCapability::Asr,
+            ConformanceCapability::SpeakerAttributedAsr,
+        ] {
+            assert_eq!(
+                manifest_case(&manifest, ModelVariant::GraniteSpeech412BPlus, capability,)
+                    .workspace,
+                InvocationStateRequired
+            );
+        }
     }
 }

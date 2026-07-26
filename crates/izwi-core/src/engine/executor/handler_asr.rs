@@ -494,6 +494,19 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
+                            ModelFamily::GraniteSpeechAsr => {
+                                with_single_invocation_cache(request, scheduled, |cache| {
+                                    model.transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
+                                        chunk_audio,
+                                        sr,
+                                        language,
+                                        asr_prompt,
+                                        prefix_text,
+                                        chunk_generation_options.clone(),
+                                        cache,
+                                    )
+                                })?
+                            }
                             _ => model.transcribe_with_details_prompt_prefix_and_options(
                                 chunk_audio,
                                 sr,
@@ -513,6 +526,8 @@ impl NativeExecutor {
                                 prefix_text,
                                 &chunk_generation_options,
                                 details,
+                                request,
+                                scheduled,
                             )?;
                         }
                         Ok(AsrChunkTranscription {
@@ -557,28 +572,43 @@ impl NativeExecutor {
                             }
                         }
                     };
-                    let text = if matches!(family, ModelFamily::VibeVoiceAsr) {
-                        with_single_invocation_cache(request, scheduled, |cache| {
-                            model
-                                .transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
-                                    &samples,
-                                    sample_rate,
-                                    language,
-                                    asr_prompt,
-                                    segment_generation_options.clone(),
-                                    cache,
-                                    &mut emit,
-                                )
-                        })?
-                    } else {
-                        model.transcribe_with_callback_and_prompt_and_options(
+                    let text = match family {
+                        ModelFamily::VibeVoiceAsr => {
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model
+                                    .transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
+                                        &samples,
+                                        sample_rate,
+                                        language,
+                                        asr_prompt,
+                                        segment_generation_options.clone(),
+                                        cache,
+                                        &mut emit,
+                                    )
+                            })?
+                        }
+                        ModelFamily::GraniteSpeechAsr => {
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model
+                                    .transcribe_granite_speech_with_callback_and_prompt_and_options_physical(
+                                        &samples,
+                                        sample_rate,
+                                        language,
+                                        asr_prompt,
+                                        segment_generation_options.clone(),
+                                        cache,
+                                        &mut emit,
+                                    )
+                            })?
+                        }
+                        _ => model.transcribe_with_callback_and_prompt_and_options(
                             &samples,
                             sample_rate,
                             language,
                             asr_prompt,
                             segment_generation_options.clone(),
                             &mut emit,
-                        )?
+                        )?,
                     };
                     if let Some(err) = stream_err {
                         return Err(err);
@@ -614,6 +644,19 @@ impl NativeExecutor {
                             segment_generation_options.clone(),
                             cache,
                         )
+                    })?
+                }
+                ModelFamily::GraniteSpeechAsr => {
+                    with_single_invocation_cache(request, scheduled, |cache| {
+                        model
+                            .transcribe_granite_speech_with_details_and_prompt_and_options_physical(
+                                &samples,
+                                sample_rate,
+                                language,
+                                asr_prompt,
+                                segment_generation_options.clone(),
+                                cache,
+                            )
                     })?
                 }
                 _ => model.transcribe_with_details_and_prompt_and_options(
@@ -725,6 +768,8 @@ impl NativeExecutor {
         prefix_text: Option<&str>,
         base_options: &NativeAsrGenerationOptions,
         mut details: crate::models::registry::NativeAsrTranscription,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
     ) -> Result<crate::models::registry::NativeAsrTranscription> {
         let Some(original_loop) =
             granite_chunk_loop_signal(&details.text, details.diagnostics.as_ref())
@@ -757,14 +802,17 @@ impl NativeExecutor {
 
         let mut retry_options = base_options.clone();
         retry_options.max_new_tokens = retry_max_tokens;
-        let mut retry = model.transcribe_with_details_prompt_prefix_and_options(
-            chunk_audio,
-            sample_rate,
-            language,
-            asr_prompt,
-            prefix_text,
-            retry_options,
-        )?;
+        let mut retry = with_single_invocation_cache(request, scheduled, |cache| {
+            model.transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
+                chunk_audio,
+                sample_rate,
+                language,
+                asr_prompt,
+                prefix_text,
+                retry_options,
+                cache,
+            )
+        })?;
         let retry_loop = granite_chunk_loop_signal(&retry.text, retry.diagnostics.as_ref());
         let retry_trim = retry_loop
             .as_ref()

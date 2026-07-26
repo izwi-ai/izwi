@@ -622,10 +622,49 @@ impl ModelLifecycleController {
                     state_publications.insert(CapabilityKind::Chat, publication);
                 }
             }
+            if variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr {
+                if !managed_kv_backend_compiled(backend) {
+                    return Err(Error::ModelLoadError(format!(
+                        "loaded model {variant} requires physical Granite Speech invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                    )));
+                }
+                let model = self.model_registry.get_asr(variant).await.ok_or_else(|| {
+                    Error::ModelLoadError(format!(
+                        "loaded Granite Speech model {variant} is missing from the registry"
+                    ))
+                })?;
+                for capability in [
+                    CapabilityKind::Asr,
+                    CapabilityKind::SpeakerAttributedAsr,
+                ] {
+                    if self.adapter_registry.require(capability, variant).is_err() {
+                        continue;
+                    }
+                    let contracts = bundle_draft.execution_contracts(capability)?;
+                    let stage_graphs = contracts
+                        .iter()
+                        .map(|contract| contract.stages.as_ref())
+                        .collect::<Vec<_>>();
+                    let physical_spec =
+                        model.granite_speech_physical_state_spec(&stage_graphs)?;
+                    let publication = self
+                        .load_invocation_paged_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            &physical_spec.invocation,
+                            None,
+                            HashMap::new(),
+                        )
+                        .await?;
+                    state_publications.insert(capability, publication);
+                }
+            }
             if self
                 .adapter_registry
                 .require(CapabilityKind::Asr, variant)
                 .is_ok()
+                && variant.family() != crate::catalog::ModelFamily::GraniteSpeechAsr
             {
                 if variant.family() == crate::catalog::ModelFamily::Voxtral {
                     if !managed_kv_backend_compiled(backend) {

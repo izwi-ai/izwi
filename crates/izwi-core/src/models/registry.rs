@@ -22,7 +22,7 @@ use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::Gemma3ChatModel;
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
-    GraniteSpeechTask,
+    GraniteSpeechPhysicalStateSpec, GraniteSpeechTask,
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
@@ -62,6 +62,7 @@ use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
 };
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
@@ -713,6 +714,149 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    pub(crate) fn granite_speech_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<GraniteSpeechPhysicalStateSpec> {
+        match self {
+            Self::GraniteSpeech(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Granite ASR model cannot author Granite Speech physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_granite_speech_with_details_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            granite_speech_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_prefix_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            prefix_text,
+            granite_speech_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn transcribe_granite_speech_with_callback_and_prompt_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        model
+            .transcribe_with_callback_and_prompt_and_options_physical(
+                audio,
+                sample_rate,
+                language,
+                prompt,
+                granite_speech_asr_options(options),
+                cache,
+                on_delta,
+            )
+            .map(|output| output.text)
+    }
+
+    pub(crate) fn transcribe_granite_speech_task_and_options_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        task: GraniteSpeechTask,
+        prefix_text: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::GraniteSpeech(model) = self else {
+            return Err(Error::InferenceError(
+                "Granite Speech physical ASR pages were routed to a different model".to_string(),
+            ));
+        };
+        let GraniteSpeechAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_task_prefix_and_options_physical(
+            audio,
+            sample_rate,
+            language,
+            task,
+            prefix_text,
+            granite_speech_asr_options(options),
+            cache,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
     pub(crate) fn vibevoice_physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],

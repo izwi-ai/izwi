@@ -22,7 +22,9 @@ use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
 };
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, LoadedExecutionContract};
+use crate::runtime::adapters::{
+    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
@@ -2533,8 +2535,8 @@ impl RuntimeService {
             owned_audio.retained_bytes(),
             language_bytes,
         ])?)?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 &job,
                 variant,
                 CapabilityKind::SpeakerAttributedAsr,
@@ -2588,14 +2590,15 @@ impl RuntimeService {
             let observation_job = job.clone();
             let transcription =
                 self.coordinator
-                    .run_loaded_blocking_stage(
+                    .run_loaded_blocking_stage_with_invocation_paged(
                         &job,
                         execution_contract,
+                        state_binding,
                         WorkUnit::PipelineStage {
                             name: "asr.speaker_attributed.decode".to_string(),
                             ordinal: 0,
                         },
-                        move || {
+                        move |leases| {
                             let _residency_lease = residency_lease;
                             observation_job.record_materialized_usage(
                                 decoded_audio_observation(retained_input_bytes, samples.len())?,
@@ -2607,6 +2610,7 @@ impl RuntimeService {
                                 task_language.as_deref(),
                                 None,
                                 max_new_tokens,
+                                granite_saa_single_invocation_cache(leases)?,
                             )
                         },
                     )
@@ -2627,6 +2631,7 @@ impl RuntimeService {
             &job,
             model,
             execution_contract,
+            state_binding,
             samples,
             sample_rate,
             language_owned.as_deref(),
@@ -3202,6 +3207,7 @@ async fn granite_saa_long_form_transcribe<P>(
     job: &JobLease,
     model: Arc<NativeAsrModel>,
     execution_contract: LoadedExecutionContract,
+    state_binding: LoadedCapabilityBinding,
     samples: Arc<[f32]>,
     sample_rate: u32,
     language: Option<&str>,
@@ -3266,6 +3272,7 @@ where
         let task_model = model.clone();
         let task_samples = samples.clone();
         let observation_job = job.clone();
+        let task_state_binding = state_binding.clone();
         let language_owned = language.map(ToOwned::to_owned);
         let prefix_mode = GraniteSaaPrefixMode::from_env();
         let prefix_text = granite_saa_chunk_prefix_text(&assembler, prefix_mode);
@@ -3290,14 +3297,15 @@ where
         );
         let chunk_started = Instant::now();
         let (returned_lease, transcription) = coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract.clone(),
+                task_state_binding,
                 WorkUnit::PipelineStage {
                     name: "asr.speaker_attributed.chunk".to_string(),
                     ordinal: idx,
                 },
-                move || {
+                move |leases| {
                     let chunk_audio = task_samples[chunk_start..chunk_end].to_vec();
                     observation_job.record_materialized_usage(
                         decoded_audio_with_scratch_observation(
@@ -3313,6 +3321,7 @@ where
                         language_owned.as_deref(),
                         prefix_text.as_deref(),
                         max_new_tokens,
+                        granite_saa_single_invocation_cache(leases)?,
                     );
                     let steady_usage =
                         decoded_audio_observation(retained_input_bytes, task_samples.len())?;
@@ -3383,8 +3392,9 @@ fn granite_saa_transcribe_chunk(
     language: Option<&str>,
     prefix_text: Option<&str>,
     max_new_tokens: usize,
+    cache: &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
 ) -> Result<NativeAsrTranscription> {
-    model.transcribe_with_granite_speech_task_and_options(
+    model.transcribe_granite_speech_task_and_options_physical(
         audio,
         sample_rate,
         language,
@@ -3394,7 +3404,21 @@ fn granite_saa_transcribe_chunk(
             max_new_tokens,
             ..NativeAsrGenerationOptions::default()
         },
+        cache,
     )
+}
+
+fn granite_saa_single_invocation_cache(
+    leases: &mut crate::kv::v2::InvocationPagedLeaseSetV2,
+) -> Result<&mut crate::models::shared::attention::physical::PhysicalPagedKvCache> {
+    let domains = leases.domains().collect::<Vec<_>>();
+    let [domain] = domains.as_slice() else {
+        return Err(Error::InferenceError(format!(
+            "Granite speaker-attributed ASR requires one invocation KV domain, found {}",
+            domains.len()
+        )));
+    };
+    leases.cache_mut(*domain)
 }
 
 fn granite_saa_processing_progress(chunks: &[AudioChunk], sample_rate: u32) -> AsrProgress {
