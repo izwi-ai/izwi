@@ -579,6 +579,14 @@ pub(crate) struct InvocationWorkspaceBindingV2 {
     pub(crate) backing: Arc<dyn InvocationWorkspaceBackingV2>,
 }
 
+/// Keep the concrete paged wrapper private to the runtime while allowing the
+/// physical manager to publish the generic workspace contract.
+pub(crate) fn invocation_paged_workspace_backing_v2(
+    pool: InvocationPagedKvPoolHandle,
+) -> Arc<dyn InvocationWorkspaceBackingV2> {
+    Arc::new(InvocationPagedWorkspaceBackingV2 { pool })
+}
+
 #[derive(Debug, Clone)]
 struct InvocationPagedWorkspaceBackingV2 {
     pool: InvocationPagedKvPoolHandle,

@@ -2718,30 +2718,6 @@ impl EngineCore {
         )
     }
 
-    pub(crate) fn load_invocation_paged_workspace(
-        &mut self,
-        model_instance: super::ModelInstanceId,
-        adapter_instance: super::AdapterInstanceId,
-        stage_graph: [u8; 32],
-        stage: super::StageId,
-        plan: &crate::kv::v2::ResolvedStatePlan,
-        domain: &crate::kv::v2::InvocationWorkspaceDomain,
-        slot_count: u32,
-    ) -> Result<super::InvocationPagedKvPoolHandle> {
-        self.physical_state.allocate_invocation_paged(
-            model_instance,
-            InvocationPhysicalKey {
-                adapter_instance,
-                stage_graph,
-                stage,
-                domain: domain.id(),
-            },
-            plan,
-            domain,
-            slot_count,
-        )
-    }
-
     pub(crate) fn load_retained_tensor_state(
         &mut self,
         model_instance: super::ModelInstanceId,
@@ -2752,7 +2728,7 @@ impl EngineCore {
             .allocate_retained_tensor(model_instance, contract, sequence_capacity)
     }
 
-    pub(crate) fn resolve_and_load_invocation_paged_workspace(
+    pub(crate) fn resolve_and_load_invocation_workspace(
         &mut self,
         model_instance: super::ModelInstanceId,
         adapter_instance: super::AdapterInstanceId,
@@ -2761,19 +2737,20 @@ impl EngineCore {
         contract: &crate::kv::v2::InferenceStateContract,
         domain: &crate::kv::v2::InvocationWorkspaceDomain,
         slot_count: u32,
-    ) -> Result<super::InvocationPagedKvPoolHandle> {
-        self.physical_state.resolve_and_allocate_invocation_paged(
-            model_instance,
-            InvocationPhysicalKey {
-                adapter_instance,
-                stage_graph,
-                stage,
-                domain: domain.id(),
-            },
-            contract,
-            domain,
-            slot_count,
-        )
+    ) -> Result<Arc<dyn crate::kv::v2::InvocationWorkspaceBackingV2>> {
+        self.physical_state
+            .resolve_and_allocate_invocation_workspace(
+                model_instance,
+                InvocationPhysicalKey {
+                    adapter_instance,
+                    stage_graph,
+                    stage,
+                    domain: domain.id(),
+                },
+                contract,
+                domain,
+                slot_count,
+            )
     }
 
     /// Retire physical managed-KV state for one exact loaded-model instance.

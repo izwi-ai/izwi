@@ -1458,28 +1458,6 @@ impl Engine {
         )
     }
 
-    pub(crate) async fn load_invocation_paged_workspace(
-        &self,
-        model_instance: ModelInstanceId,
-        adapter_instance: AdapterInstanceId,
-        stage_graph: [u8; 32],
-        stage: StageId,
-        plan: &crate::kv::v2::ResolvedStatePlan,
-        domain: &crate::kv::v2::InvocationWorkspaceDomain,
-        slot_count: u32,
-    ) -> Result<InvocationPagedKvPoolHandle> {
-        let _step = self.step_gate.lock().await;
-        self.core.write().await.load_invocation_paged_workspace(
-            model_instance,
-            adapter_instance,
-            stage_graph,
-            stage,
-            plan,
-            domain,
-            slot_count,
-        )
-    }
-
     pub(crate) async fn load_retained_tensor_state(
         &self,
         model_instance: ModelInstanceId,
@@ -1494,7 +1472,7 @@ impl Engine {
         )
     }
 
-    pub(crate) async fn resolve_and_load_invocation_paged_workspace(
+    pub(crate) async fn resolve_and_load_invocation_workspace(
         &self,
         model_instance: ModelInstanceId,
         adapter_instance: AdapterInstanceId,
@@ -1503,12 +1481,12 @@ impl Engine {
         contract: &crate::kv::v2::InferenceStateContract,
         domain: &crate::kv::v2::InvocationWorkspaceDomain,
         slot_count: u32,
-    ) -> Result<InvocationPagedKvPoolHandle> {
+    ) -> Result<Arc<dyn crate::kv::v2::InvocationWorkspaceBackingV2>> {
         let _step = self.step_gate.lock().await;
         self.core
             .write()
             .await
-            .resolve_and_load_invocation_paged_workspace(
+            .resolve_and_load_invocation_workspace(
                 model_instance,
                 adapter_instance,
                 stage_graph,

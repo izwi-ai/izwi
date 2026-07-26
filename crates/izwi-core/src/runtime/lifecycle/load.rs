@@ -15,10 +15,10 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
-    InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceRuntimeV2, InvocationStateCapacity,
-    InvocationWorkspaceDomain, InvocationWorkspaceKeyV2, InvocationWorkspaceRuntimeV2,
-    InvocationWorkspaceSet, RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2,
-    StateDomainId, StateDomainSpec, StateScope,
+    InvocationStateCapacity, InvocationWorkspaceBindingV2, InvocationWorkspaceDomain,
+    InvocationWorkspaceKeyV2, InvocationWorkspaceRuntimeV2, InvocationWorkspaceSet,
+    RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2, StateDomainId,
+    StateDomainSpec, StateScope,
 };
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
@@ -357,7 +357,7 @@ fn plan_invocation_allocations(
 }
 
 impl ModelLifecycleController {
-    async fn load_invocation_paged_publication(
+    async fn load_invocation_workspace_publication(
         &self,
         model_instance_id: crate::engine::ModelInstanceId,
         executions: &[LoadedExecutionContract],
@@ -376,9 +376,9 @@ impl ModelLifecycleController {
             plan_invocation_allocations(&descriptor, invocation_contract, executions)?;
         let mut bindings = Vec::with_capacity(allocations.len());
         for allocation in allocations {
-            let pool = self
+            let backing = self
                 .core_engine
-                .resolve_and_load_invocation_paged_workspace(
+                .resolve_and_load_invocation_workspace(
                     model_instance_id,
                     allocation.adapter_instance,
                     allocation.key.stage_graph,
@@ -388,18 +388,16 @@ impl ModelLifecycleController {
                     allocation.slot_count,
                 )
                 .await?;
-            bindings.push(InvocationPagedWorkspaceBindingV2 {
+            bindings.push(InvocationWorkspaceBindingV2 {
                 key: allocation.key,
-                pool,
+                backing,
             });
         }
         Ok(LoadedStatePublication::PhysicalV2 {
             descriptor,
             retained,
             retained_uses,
-            invocation_workspace: InvocationWorkspaceRuntimeV2::from(
-                InvocationPagedWorkspaceRuntimeV2::new(bindings)?,
-            ),
+            invocation_workspace: InvocationWorkspaceRuntimeV2::new(bindings)?,
         })
     }
 
@@ -653,7 +651,7 @@ impl ModelLifecycleController {
                     let physical_spec =
                         model.granite_speech_physical_state_spec(&stage_graphs)?;
                     let publication = self
-                        .load_invocation_paged_publication(
+                        .load_invocation_workspace_publication(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
@@ -689,7 +687,7 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     let physical_spec = loaded.physical_state_spec(&stage_graphs)?;
                     let publication = self
-                        .load_invocation_paged_publication(
+                        .load_invocation_workspace_publication(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
@@ -750,7 +748,7 @@ impl ModelLifecycleController {
                             })
                             .collect::<Result<HashMap<_, _>>>()?;
                         let publication = self
-                            .load_invocation_paged_publication(
+                            .load_invocation_workspace_publication(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
@@ -778,7 +776,7 @@ impl ModelLifecycleController {
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.vibevoice_physical_state_spec(&stage_graphs)?;
                         let publication = self
-                            .load_invocation_paged_publication(
+                            .load_invocation_workspace_publication(
                                 model_instance_id,
                                 &contracts,
                                 physical_spec.descriptor,
@@ -901,7 +899,7 @@ impl ModelLifecycleController {
                         })
                         .collect::<Result<HashMap<_, _>>>()?;
                     let publication = self
-                        .load_invocation_paged_publication(
+                        .load_invocation_workspace_publication(
                             model_instance_id,
                             &contracts,
                             physical_spec.descriptor,
@@ -935,7 +933,7 @@ impl ModelLifecycleController {
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
                 let publication = self
-                    .load_invocation_paged_publication(
+                    .load_invocation_workspace_publication(
                         model_instance_id,
                         &contracts,
                         physical_spec.descriptor,
@@ -968,7 +966,7 @@ impl ModelLifecycleController {
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
                 let publication = self
-                    .load_invocation_paged_publication(
+                    .load_invocation_workspace_publication(
                         model_instance_id,
                         &contracts,
                         physical_spec.descriptor,
@@ -1001,7 +999,7 @@ impl ModelLifecycleController {
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
                 let publication = self
-                    .load_invocation_paged_publication(
+                    .load_invocation_workspace_publication(
                         model_instance_id,
                         &contracts,
                         physical_spec.descriptor,
