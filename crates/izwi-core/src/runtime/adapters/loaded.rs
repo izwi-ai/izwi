@@ -1552,9 +1552,9 @@ impl LoadedModelBundle {
         )
     }
 
-    /// Bind adapter metadata and exact loaded-model cache truth into one sealed
-    /// descriptor per capability. Missing declarations retain the current
-    /// opaque compatibility behavior during model migration.
+    /// Bind adapter metadata and exact loaded-model state truth into one sealed
+    /// descriptor per capability. Only capabilities explicitly classified as
+    /// stateless may omit a physical state publication.
     pub(crate) fn bind_with_state_publications(
         registry: &RuntimeAdapterRegistry,
         execution_group_id: ExecutionGroupId,
@@ -2213,6 +2213,52 @@ mod tests {
                     native_streaming.unwrap_or_else(|error| {
                         panic!("failed native-streaming contract for {variant}: {error}")
                     });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_stateful_capability_fails_closed_without_physical_publication() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let backends = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+
+        for backend in backends {
+            for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+                let draft = LoadedModelBundleDraft::build(
+                    &registry,
+                    ExecutionGroupId::new(11),
+                    ModelInstanceId::new(index as u64 + 1),
+                    variant,
+                    backend,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("failed to build {variant} for {backend:?}: {error}")
+                });
+
+                for execution in draft.capabilities.values() {
+                    let metadata = execution.metadata();
+                    let sealed = LoadedCapabilityDescriptor::new(execution.clone(), None, backend);
+                    if metadata.state_requirement == InferenceStateRequirement::Stateless {
+                        sealed.unwrap_or_else(|error| {
+                            panic!(
+                                "stateless {variant} {:?} failed to seal for {backend:?}: {error}",
+                                metadata.capability
+                            )
+                        });
+                    } else {
+                        let error = sealed.expect_err(&format!(
+                            "stateful {variant} {:?} sealed without physical state for {backend:?}",
+                            metadata.capability
+                        ));
+                        assert!(
+                            error.to_string().contains(
+                                "requires an explicit load-sealed ABI-v2 state publication"
+                            ),
+                            "unexpected fail-closed error for {variant} {:?} on {backend:?}: {error}",
+                            metadata.capability
+                        );
+                    }
                 }
             }
         }

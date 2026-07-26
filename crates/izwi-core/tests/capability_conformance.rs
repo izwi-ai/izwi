@@ -161,6 +161,56 @@ fn legacy_inference_state_surface_does_not_expand_during_migration() {
 }
 
 #[test]
+fn legacy_model_owned_state_symbols_are_confined_to_test_references() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source_root = manifest_dir.join("src");
+    let qwen_reference = source_root.join("models/architectures/qwen3/core.rs");
+    let paged_reference = source_root.join("models/shared/attention/paged.rs");
+    let mut violations = Vec::new();
+
+    collect_rs_files(&source_root, &mut |path| {
+        let Ok(source) = fs::read_to_string(path) else {
+            return;
+        };
+        for symbol in [
+            "OpaqueModelOwned",
+            "upgrade_kv_contract_v1",
+            "CURRENT_KV_CONTRACT_ABI",
+            "KvCacheContract",
+            "DenseKvCache",
+            "Qwen35DenseKvCache",
+        ] {
+            if source.contains(symbol) {
+                violations.push(format!("{} contains `{symbol}`", path.display()));
+            }
+        }
+        if path != qwen_reference && source.contains("Qwen3Cache") {
+            violations.push(format!(
+                "{} contains model-owned `Qwen3Cache` outside its test reference",
+                path.display()
+            ));
+        }
+        if path != qwen_reference
+            && path != paged_reference
+            && ["append_to_pages", "materialize_pages"]
+                .iter()
+                .any(|symbol| source.contains(symbol))
+        {
+            violations.push(format!(
+                "{} contains a materializing legacy page helper",
+                path.display()
+            ));
+        }
+    });
+
+    assert!(
+        violations.is_empty(),
+        "production inference state must use the sole physical ABI-v2 architecture:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn qwen_model_owned_cache_and_materializing_pages_are_test_only() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let qwen_core = fs::read_to_string(manifest_dir.join("src/models/architectures/qwen3/core.rs"))

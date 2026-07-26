@@ -120,6 +120,71 @@ impl InferenceStateRequirement {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FamilyInferenceStatePolicy {
+    tts: InferenceStateRequirement,
+    streaming_tts: InferenceStateRequirement,
+    asr: InferenceStateRequirement,
+    chat: InferenceStateRequirement,
+}
+
+impl FamilyInferenceStatePolicy {
+    const STATELESS: Self = Self {
+        tts: InferenceStateRequirement::Stateless,
+        streaming_tts: InferenceStateRequirement::Stateless,
+        asr: InferenceStateRequirement::Stateless,
+        chat: InferenceStateRequirement::Stateless,
+    };
+}
+
+/// Exhaustive family-level inference-state truth.
+///
+/// Keeping this match exhaustive is intentional: adding a model family must
+/// include an explicit state-lifetime decision before its adapters can compile.
+const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceStatePolicy {
+    use InferenceStateRequirement::{Invocation, Retained, RetainedAndInvocation};
+    use ModelFamily::*;
+
+    match family {
+        Qwen3Tts => FamilyInferenceStatePolicy {
+            tts: RetainedAndInvocation,
+            streaming_tts: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        KokoroTts => FamilyInferenceStatePolicy::STATELESS,
+        VoxtralTts | VibeVoiceTts | FishS2Tts => FamilyInferenceStatePolicy {
+            tts: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        ParakeetAsr | WhisperAsr | VibeVoiceAsr | NemotronAsr | GraniteSpeechAsr | Voxtral => {
+            FamilyInferenceStatePolicy {
+                asr: Invocation,
+                ..FamilyInferenceStatePolicy::STATELESS
+            }
+        }
+        Qwen3Asr => FamilyInferenceStatePolicy {
+            asr: RetainedAndInvocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        Qwen3Chat | Qwen35Chat | Gemma3Chat => FamilyInferenceStatePolicy {
+            chat: Retained,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        Lfm2Chat => FamilyInferenceStatePolicy {
+            chat: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        Lfm25Audio => FamilyInferenceStatePolicy {
+            tts: Invocation,
+            asr: Invocation,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
+        SortformerDiarization | Qwen3ForcedAligner | Tokenizer => {
+            FamilyInferenceStatePolicy::STATELESS
+        }
+    }
+}
+
 impl SequenceExecutionMode {
     const fn enabled(self, streaming_required: bool) -> bool {
         match self {
@@ -369,14 +434,7 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: match model_variant.family() {
-                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::VibeVoiceTts
-                | ModelFamily::VoxtralTts
-                | ModelFamily::FishS2Tts
-                | ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
-                _ => InferenceStateRequirement::Stateless,
-            },
+            state_requirement: family_inference_state_policy(model_variant.family()).tts,
         })
     }
 }
@@ -398,11 +456,7 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: match model_variant.family() {
-                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
-                _ => InferenceStateRequirement::Stateless,
-            },
+            state_requirement: family_inference_state_policy(model_variant.family()).streaming_tts,
         })
     }
 }
@@ -431,17 +485,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 } else {
                     SequenceExecutionMode::None
                 },
-                state_requirement: match model_variant.family() {
-                    ModelFamily::Qwen3Asr => InferenceStateRequirement::RetainedAndInvocation,
-                    ModelFamily::VibeVoiceAsr
-                    | ModelFamily::WhisperAsr
-                    | ModelFamily::ParakeetAsr
-                    | ModelFamily::NemotronAsr
-                    | ModelFamily::Voxtral
-                    | ModelFamily::GraniteSpeechAsr
-                    | ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
-                    _ => InferenceStateRequirement::Stateless,
-                },
+                state_requirement: family_inference_state_policy(model_variant.family()).asr,
             })
     }
 }
@@ -494,14 +538,7 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: chat_sequence_execution(model_variant),
-            state_requirement: match (
-                model_variant.family(),
-                chat_sequence_execution(model_variant),
-            ) {
-                (ModelFamily::Lfm2Chat, _) => InferenceStateRequirement::Invocation,
-                (_, SequenceExecutionMode::Always) => InferenceStateRequirement::Retained,
-                _ => InferenceStateRequirement::Stateless,
-            },
+            state_requirement: family_inference_state_policy(model_variant.family()).chat,
         })
     }
 }
