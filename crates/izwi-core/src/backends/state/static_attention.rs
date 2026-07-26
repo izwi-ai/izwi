@@ -50,6 +50,15 @@ struct StaticAttentionLayerBacking {
     values: Var,
 }
 
+#[derive(Debug)]
+struct PendingStaticAttentionInstall {
+    source_identity: [u8; 32],
+    target_cursor: u64,
+    memory_tokens: usize,
+    written_layers: Vec<bool>,
+    failed: bool,
+}
+
 /// One invocation-exclusive fixed arena for one StaticAttention workspace slot.
 ///
 /// Pool ownership and lease generations live above this type. Mutation takes
@@ -69,6 +78,7 @@ pub(crate) struct InvocationStaticAttentionArena {
     absolute_cursor: u64,
     initialized: bool,
     dirty: bool,
+    pending_install: Option<PendingStaticAttentionInstall>,
 }
 
 impl InvocationStaticAttentionArena {
@@ -219,6 +229,7 @@ impl InvocationStaticAttentionArena {
             absolute_cursor: 0,
             initialized: false,
             dirty: false,
+            pending_install: None,
         })
     }
 
@@ -279,29 +290,151 @@ impl InvocationStaticAttentionArena {
         intent: &DomainStepIntent,
         layers: Vec<StaticAttentionLayerValue>,
     ) -> Result<()> {
-        let StateUpdateKind::StaticInitialize {
-            source_identity,
-            components,
-        } = &intent.update
-        else {
-            return Err(invalid(
-                "static-attention installation requires a StaticInitialize intent",
-            ));
-        };
+        let pending = self.validate_begin_install(intent)?;
         let memory_tokens = self.validate_install_values(&layers)?;
-        if intent.domain != self.domain
-            || intent.expected_cursor != 0
-            || intent.target_cursor
-                != u64::try_from(memory_tokens)
-                    .map_err(|_| invalid("static-attention memory length exceeds u64"))?
-            || source_identity.iter().all(|byte| *byte == 0)
-            || !components.is_empty()
-        {
+        if pending.memory_tokens != memory_tokens {
             return Err(invalid(
                 "static-attention installation does not match its authenticated intent",
             ));
         }
-        self.install(*source_identity, layers)
+        self.begin_install(intent)?;
+        for layer in layers {
+            self.install_layer(layer)?;
+        }
+        self.commit_install()
+    }
+
+    pub(crate) fn begin_install(&mut self, intent: &DomainStepIntent) -> Result<()> {
+        let pending = self.validate_begin_install(intent)?;
+        self.dirty = true;
+        self.pending_install = Some(pending);
+        Ok(())
+    }
+
+    pub(crate) fn install_layer(&mut self, value: StaticAttentionLayerValue) -> Result<()> {
+        self.install_layer_with_sync(value, |device| device.synchronize().map_err(Error::from))
+    }
+
+    fn install_layer_with_sync<F>(
+        &mut self,
+        value: StaticAttentionLayerValue,
+        mut synchronize: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Device) -> Result<()>,
+    {
+        let result = (|| {
+            let pending = self.pending_install.as_ref().ok_or_else(|| {
+                invalid("static-attention layer write has no authenticated pending install")
+            })?;
+            if pending.failed {
+                return Err(invalid(
+                    "static-attention pending install failed and must be reset",
+                ));
+            }
+            let index = self
+                .layers
+                .binary_search_by_key(&value.model_layer, |layer| layer.semantic.model_layer)
+                .map_err(|_| {
+                    invalid("static-attention layer write references an unknown model layer")
+                })?;
+            if pending.written_layers[index] {
+                return Err(invalid(
+                    "static-attention pending install repeats one model layer",
+                ));
+            }
+            let backing = &self.layers[index];
+            let key_tokens = validate_install_tensor(
+                &value.keys,
+                &self.device,
+                backing.keys.dtype(),
+                backing.semantic.kv_heads,
+                backing.semantic.key_head_dim,
+                "key",
+            )?;
+            let value_tokens = validate_install_tensor(
+                &value.values,
+                &self.device,
+                backing.values.dtype(),
+                backing.semantic.kv_heads,
+                backing.semantic.value_head_dim,
+                "value",
+            )?;
+            if key_tokens != pending.memory_tokens || value_tokens != pending.memory_tokens {
+                return Err(invalid(
+                    "static-attention layer write does not match the authenticated memory length",
+                ));
+            }
+            if self.layers.iter().any(|candidate| {
+                shares_storage(&value.keys, candidate.keys.as_tensor())
+                    || shares_storage(&value.keys, candidate.values.as_tensor())
+                    || shares_storage(&value.values, candidate.keys.as_tensor())
+                    || shares_storage(&value.values, candidate.values.as_tensor())
+            }) {
+                return Err(invalid(
+                    "static-attention layer write source aliases arena storage",
+                ));
+            }
+            Ok(index)
+        })();
+        let index = match result {
+            Ok(index) => index,
+            Err(error) => {
+                self.mark_pending_failed();
+                return Err(error);
+            }
+        };
+        let copy = (|| -> Result<()> {
+            let backing = &mut self.layers[index];
+            backing.keys.zero_set().map_err(Error::from)?;
+            backing.values.zero_set().map_err(Error::from)?;
+            backing
+                .keys
+                .slice_set(&value.keys, 0, 0)
+                .map_err(Error::from)?;
+            backing
+                .values
+                .slice_set(&value.values, 0, 0)
+                .map_err(Error::from)?;
+            Ok(())
+        })();
+        if let Err(error) = copy {
+            self.mark_pending_failed();
+            return Err(error);
+        }
+        if let Err(error) = synchronize(&self.device) {
+            self.mark_pending_failed();
+            return Err(error);
+        }
+        self.pending_install
+            .as_mut()
+            .expect("pending install was validated before its layer copy")
+            .written_layers[index] = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_install(&mut self) -> Result<()> {
+        let pending = self.pending_install.as_ref().ok_or_else(|| {
+            invalid("static-attention commit has no authenticated pending install")
+        })?;
+        if pending.failed || pending.written_layers.iter().any(|written| !written) {
+            return Err(invalid(
+                "static-attention commit requires every layer exactly once",
+            ));
+        }
+        if let Err(error) = self.device.synchronize() {
+            self.mark_pending_failed();
+            return Err(error.into());
+        }
+        let pending = self
+            .pending_install
+            .take()
+            .expect("pending install was validated before its commit");
+        self.source_identity = Some(pending.source_identity);
+        self.absolute_cursor = pending.target_cursor;
+        self.initialized = true;
+        self.dirty = false;
+        Ok(())
     }
 
     /// Attend noncausally over the installed memory without expanding GQA KV
@@ -357,11 +490,17 @@ impl InvocationStaticAttentionArena {
         self.source_identity = None;
         self.absolute_cursor = 0;
         self.initialized = false;
+        self.pending_install = None;
         self.dirty = false;
         Ok(())
     }
 
     pub(crate) fn prepare_completion(&mut self) -> Result<()> {
+        if self.pending_install.is_some() {
+            return Err(invalid(
+                "static-attention pending install must commit or reset before completion",
+            ));
+        }
         self.require_clean()?;
         if let Err(error) = self.device.synchronize() {
             self.dirty = true;
@@ -380,9 +519,9 @@ impl InvocationStaticAttentionArena {
         F: FnMut(usize) -> Result<()>,
     {
         self.require_clean()?;
-        if self.initialized {
+        if self.initialized || self.pending_install.is_some() {
             return Err(invalid(
-                "static-attention memory is already initialized; reset before reinstall",
+                "static-attention memory is already initialized or pending; reset before reinstall",
             ));
         }
         if source_identity.iter().all(|byte| *byte == 0) {
@@ -391,27 +530,73 @@ impl InvocationStaticAttentionArena {
             ));
         }
         let memory_tokens = self.validate_install_values(&layers)?;
-        self.dirty = true;
-        for (index, (backing, value)) in self.layers.iter().zip(&layers).enumerate() {
-            backing.keys.zero_set()?;
-            backing.values.zero_set()?;
-            backing
-                .keys
-                .slice_set(&value.keys, 0, 0)
-                .map_err(Error::from)?;
-            backing
-                .values
-                .slice_set(&value.values, 0, 0)
-                .map_err(Error::from)?;
-            after_layer_copy(index)?;
+        let intent = DomainStepIntent {
+            domain: self.domain,
+            expected_cursor: 0,
+            target_cursor: u64::try_from(memory_tokens)
+                .map_err(|_| invalid("static-attention memory length exceeds u64"))?,
+            update: StateUpdateKind::StaticInitialize {
+                source_identity,
+                components: vec![],
+            },
+        };
+        self.begin_install(&intent)?;
+        for (index, layer) in layers.into_iter().enumerate() {
+            self.install_layer(layer)?;
+            if let Err(error) = after_layer_copy(index) {
+                self.mark_pending_failed();
+                return Err(error);
+            }
         }
-        self.device.synchronize()?;
-        self.source_identity = Some(source_identity);
-        self.absolute_cursor = u64::try_from(memory_tokens)
-            .map_err(|_| invalid("static-attention memory length exceeds u64"))?;
-        self.initialized = true;
-        self.dirty = false;
-        Ok(())
+        self.commit_install()
+    }
+
+    fn validate_begin_install(
+        &self,
+        intent: &DomainStepIntent,
+    ) -> Result<PendingStaticAttentionInstall> {
+        self.require_clean()?;
+        if self.initialized || self.pending_install.is_some() {
+            return Err(invalid(
+                "static-attention memory is already initialized or pending; reset before reinstall",
+            ));
+        }
+        let StateUpdateKind::StaticInitialize {
+            source_identity,
+            components,
+        } = &intent.update
+        else {
+            return Err(invalid(
+                "static-attention installation requires a StaticInitialize intent",
+            ));
+        };
+        let memory_tokens = usize::try_from(intent.target_cursor)
+            .map_err(|_| invalid("static-attention target cursor exceeds usize"))?;
+        if intent.domain != self.domain
+            || intent.expected_cursor != 0
+            || memory_tokens == 0
+            || memory_tokens > self.max_memory_tokens
+            || source_identity.iter().all(|byte| *byte == 0)
+            || !components.is_empty()
+        {
+            return Err(invalid(
+                "static-attention installation does not match its authenticated intent",
+            ));
+        }
+        Ok(PendingStaticAttentionInstall {
+            source_identity: *source_identity,
+            target_cursor: intent.target_cursor,
+            memory_tokens,
+            written_layers: vec![false; self.layers.len()],
+            failed: false,
+        })
+    }
+
+    fn mark_pending_failed(&mut self) {
+        if let Some(pending) = self.pending_install.as_mut() {
+            self.dirty = true;
+            pending.failed = true;
+        }
     }
 
     fn validate_install_values(&self, values: &[StaticAttentionLayerValue]) -> Result<usize> {
@@ -1120,6 +1305,18 @@ mod tests {
         }
     }
 
+    fn install_intent(target_cursor: u64) -> DomainStepIntent {
+        DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor,
+            update: StateUpdateKind::StaticInitialize {
+                source_identity: [8; 32],
+                components: vec![],
+            },
+        }
+    }
+
     fn dense_reference(
         queries: &[f32],
         keys: &[f32],
@@ -1166,6 +1363,124 @@ mod tests {
                 "value {index}: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn staged_install_writes_one_layer_at_a_time_and_publishes_only_on_commit() {
+        let mut arena = arena(vec![layer(0, 4, 2), layer(3, 4, 2)], 3);
+        arena.begin_install(&install_intent(2)).unwrap();
+        assert!(arena.metadata().is_err());
+        arena
+            .install_layer(values(
+                0,
+                &[1.0, 0.0, 0.0, 1.0, 0.5, 0.5, -0.5, 0.5],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                2,
+                2,
+            ))
+            .unwrap();
+        arena
+            .install_layer(values(
+                3,
+                &[0.0, 1.0, 1.0, 0.0, 0.25, 0.75, 0.75, 0.25],
+                &[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+                2,
+                2,
+            ))
+            .unwrap();
+        assert!(arena.metadata().is_err());
+        arena.commit_install().unwrap();
+        assert_eq!(
+            arena.metadata().unwrap(),
+            Some(StaticAttentionMetadata {
+                source_identity: [8; 32],
+                absolute_cursor: 2,
+            })
+        );
+        let queries = Tensor::from_slice(
+            &[1.0_f32, 0.0, 0.5, 0.5, 0.0, 1.0, -0.5, 0.5],
+            (1, 4, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(
+            arena
+                .attend(
+                    0,
+                    &queries,
+                    &[StaticAttentionRaggedRow {
+                        query_start: 0,
+                        query_len: 1,
+                    }],
+                    1.0,
+                )
+                .unwrap()
+                .dims(),
+            &[1, 4, 2]
+        );
+    }
+
+    #[test]
+    fn staged_install_failures_block_completion_until_reset() {
+        let mut arena = arena(vec![layer(0, 2, 2), layer(3, 2, 2)], 3);
+        let first = values(0, &[1.0; 8], &[2.0; 8], 2, 2);
+        arena.begin_install(&install_intent(2)).unwrap();
+        arena.install_layer(first.clone()).unwrap();
+        assert!(arena.install_layer(first).is_err());
+        assert!(arena.commit_install().is_err());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+        assert_eq!(arena.metadata().unwrap(), None);
+
+        arena.begin_install(&install_intent(2)).unwrap();
+        arena
+            .install_layer(values(0, &[1.0; 8], &[2.0; 8], 2, 2))
+            .unwrap();
+        assert!(arena.commit_install().is_err());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+
+        arena.begin_install(&install_intent(2)).unwrap();
+        assert!(arena
+            .install_layer(values(0, &[1.0; 4], &[2.0; 4], 1, 2))
+            .is_err());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+
+        arena.begin_install(&install_intent(2)).unwrap();
+        let error = arena
+            .install_layer_with_sync(values(0, &[1.0; 8], &[2.0; 8], 2, 2), |_| {
+                Err(invalid("injected per-layer synchronization failure"))
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected per-layer synchronization failure"));
+        assert!(arena.is_dirty());
+        let pending = arena.pending_install.as_ref().unwrap();
+        assert!(pending.failed);
+        assert!(!pending.written_layers[0]);
+        assert!(arena.commit_install().is_err());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+        assert!(arena.pending_install.is_none());
+
+        arena.begin_install(&install_intent(2)).unwrap();
+        assert!(arena
+            .install_layer(values(99, &[1.0; 8], &[2.0; 8], 2, 2))
+            .is_err());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+        arena
+            .install(
+                [9; 32],
+                vec![
+                    values(0, &[1.0; 8], &[2.0; 8], 2, 2),
+                    values(3, &[3.0; 8], &[4.0; 8], 2, 2),
+                ],
+            )
+            .unwrap();
+        assert_eq!(arena.metadata().unwrap().unwrap().absolute_cursor, 2);
     }
 
     #[test]

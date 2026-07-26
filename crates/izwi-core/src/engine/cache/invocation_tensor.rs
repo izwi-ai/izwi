@@ -646,6 +646,18 @@ impl InvocationSlotLease<InvocationTensorArena> {
 }
 
 impl InvocationSlotLease<InvocationStaticAttentionArena> {
+    pub(crate) fn begin_install(&mut self, intent: &DomainStepIntent) -> Result<()> {
+        self.arena_mut()?.begin_install(intent)
+    }
+
+    pub(crate) fn install_layer(&mut self, layer: StaticAttentionLayerValue) -> Result<()> {
+        self.arena_mut()?.install_layer(layer)
+    }
+
+    pub(crate) fn commit_install(&mut self) -> Result<()> {
+        self.arena_mut()?.commit_install()
+    }
+
     pub(crate) fn install(
         &mut self,
         intent: &DomainStepIntent,
@@ -1400,10 +1412,6 @@ mod tests {
         assert_eq!(owner.maximum_bytes(), per_slot_bytes * 2);
         let backing = owner.backing();
         let mut physical = backing.lease().unwrap();
-        let lease = physical
-            .as_any_mut()
-            .downcast_mut::<InvocationStaticAttentionLease>()
-            .unwrap();
         let mismatched = DomainStepIntent {
             domain: StateDomainId::new(1),
             expected_cursor: 0,
@@ -1413,16 +1421,30 @@ mod tests {
                 components: vec![],
             },
         };
-        assert!(lease
-            .install(&mismatched, static_attention_values(2))
-            .is_err());
-        assert_eq!(lease.metadata().unwrap(), None);
-
         let intent = DomainStepIntent {
             target_cursor: 2,
-            ..mismatched
+            ..mismatched.clone()
         };
-        lease.install(&intent, static_attention_values(2)).unwrap();
+        {
+            let lease = physical
+                .as_any_mut()
+                .downcast_mut::<InvocationStaticAttentionLease>()
+                .unwrap();
+            assert!(lease
+                .install(&mismatched, static_attention_values(2))
+                .is_err());
+            assert_eq!(lease.metadata().unwrap(), None);
+            lease.begin_install(&intent).unwrap();
+            for layer in static_attention_values(2) {
+                lease.install_layer(layer).unwrap();
+            }
+        }
+        assert!(physical.complete().is_err());
+        let lease = physical
+            .as_any_mut()
+            .downcast_mut::<InvocationStaticAttentionLease>()
+            .unwrap();
+        lease.commit_install().unwrap();
         assert_eq!(
             lease.metadata().unwrap(),
             Some(StaticAttentionMetadata {
