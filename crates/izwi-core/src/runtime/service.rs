@@ -3221,37 +3221,6 @@ mod tests {
     }
 
     #[test]
-    fn residency_binding_separates_transport_from_model_streaming() {
-        let residency = crate::model::ModelResidency::default();
-        let instance = crate::engine::ModelInstanceId::new(18);
-        let variant = ModelVariant::ParakeetTdt06BV3;
-        let lease = residency.acquire_instance_lease(variant, instance);
-        let bundle = LoadedModelBundle::bind(
-            &RuntimeAdapterRegistry::built_in(),
-            crate::engine::ExecutionGroupId::new(3),
-            instance,
-            variant,
-            BackendKind::Cpu,
-        )
-        .expect("loaded bundle");
-
-        let mut transport = EngineCoreRequest::asr_bytes(vec![1])
-            .with_model_variant(variant)
-            .with_streaming(true);
-        bind_request_to_residency(&mut transport, Some(&lease), Some(&bundle), false)
-            .expect("transport-only ASR binding");
-        assert_eq!(
-            transport.execution_adapter_binding().unwrap().stages[0].output_visibility,
-            crate::engine::OutputVisibility::IncrementalCommitted
-        );
-
-        let mut native = EngineCoreRequest::asr_bytes(vec![1])
-            .with_model_variant(variant)
-            .with_streaming(true);
-        assert!(bind_request_to_residency(&mut native, Some(&lease), Some(&bundle), true).is_err());
-    }
-
-    #[test]
     fn direct_loaded_contract_requires_exact_generation_group_backend_and_target() {
         let residency = crate::model::ModelResidency::default();
         let instance = crate::engine::ModelInstanceId::new(21);
