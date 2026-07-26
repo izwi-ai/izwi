@@ -1,8 +1,10 @@
-//! Load-owned generational pools for invocation-scoped typed tensor state.
+//! Reusable load-owned generational pools for invocation-scoped state.
 //!
 //! Every slot owns one load-time allocated arena. Request admission only
 //! reserves, scrubs, and fences an existing slot; it never allocates backing
-//! tensors. Completion receipts are one-use pool-state capabilities.
+//! storage. Completion receipts are one-use pool-state capabilities. The
+//! tensor aliases preserve the original API while other physical arenas reuse
+//! the same lifecycle machinery.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,11 +28,62 @@ use crate::kv::v2::{
     StateDomainId, StatePlanId,
 };
 
-const RECEIPT_DOMAIN: &[u8] = b"izwi.invocation-tensor-receipt.v1\0";
+const RECEIPT_DOMAIN: &[u8] = b"izwi.invocation-slot-pool-receipt.v2\0";
 static NEXT_POOL_INSTANCE_NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// Crate-sealed arena surface consumed by the reusable invocation slot pool.
+/// Model-facing state operations remain inherent methods on each concrete
+/// arena and its specialized lease.
+pub(crate) mod slot_arena_sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) trait InvocationSlotArena:
+    slot_arena_sealed::Sealed + std::fmt::Debug + Send + 'static
+{
+    fn plan(&self) -> &ResolvedStatePlan;
+
+    fn workspace_domain(&self) -> &InvocationWorkspaceDomain;
+
+    fn domain(&self) -> StateDomainId;
+
+    fn backing_kind(&self) -> InvocationStateBackingKindV2;
+
+    fn maximum_bytes(&self) -> u64;
+
+    fn reset_for_reuse(&mut self) -> Result<()>;
+}
+
+impl slot_arena_sealed::Sealed for InvocationTensorArena {}
+
+impl InvocationSlotArena for InvocationTensorArena {
+    fn plan(&self) -> &ResolvedStatePlan {
+        InvocationTensorArena::plan(self)
+    }
+
+    fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
+        InvocationTensorArena::workspace_domain(self)
+    }
+
+    fn domain(&self) -> StateDomainId {
+        InvocationTensorArena::domain(self)
+    }
+
+    fn backing_kind(&self) -> InvocationStateBackingKindV2 {
+        backing_kind(InvocationTensorArena::kind(self))
+    }
+
+    fn maximum_bytes(&self) -> u64 {
+        InvocationTensorArena::maximum_bytes(self)
+    }
+
+    fn reset_for_reuse(&mut self) -> Result<()> {
+        InvocationTensorArena::reset_for_reuse(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub(crate) struct InvocationTensorPoolId {
+pub(crate) struct InvocationSlotPoolId {
     pub(crate) plan: StatePlanId,
     pub(crate) model_instance: ModelInstanceId,
     pub(crate) backend: BackendKind,
@@ -39,7 +92,9 @@ pub(crate) struct InvocationTensorPoolId {
     pub(crate) allocation_generation: u32,
 }
 
-impl InvocationTensorPoolId {
+pub(crate) type InvocationTensorPoolId = InvocationSlotPoolId;
+
+impl InvocationSlotPoolId {
     const fn backing_identity(self) -> InvocationWorkspaceBackingIdentityV2 {
         InvocationWorkspaceBackingIdentityV2::Typed {
             kind: self.kind,
@@ -52,39 +107,56 @@ impl InvocationTensorPoolId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub(crate) struct InvocationTensorSlotRef {
-    pub(crate) pool: InvocationTensorPoolId,
+pub(crate) struct InvocationSlotRef {
+    pub(crate) pool: InvocationSlotPoolId,
     pub(crate) slot: u32,
     pub(crate) slot_generation: u32,
     pub(crate) nonce: u64,
 }
 
+pub(crate) type InvocationTensorSlotRef = InvocationSlotRef;
+
 #[derive(Debug)]
-pub(crate) struct InvocationTensorPoolOwner {
-    inner: Arc<InvocationTensorPoolInner>,
+pub(crate) struct InvocationSlotPoolOwner<A: InvocationSlotArena> {
+    inner: Arc<InvocationSlotPoolInner<A>>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct InvocationTensorPoolHandle {
-    id: InvocationTensorPoolId,
+pub(crate) type InvocationTensorPoolOwner = InvocationSlotPoolOwner<InvocationTensorArena>;
+
+#[derive(Debug)]
+pub(crate) struct InvocationSlotPoolHandle<A: InvocationSlotArena> {
+    id: InvocationSlotPoolId,
     workspace_domain: InvocationWorkspaceDomain,
     maximum_bytes: u64,
-    inner: Weak<InvocationTensorPoolInner>,
+    inner: Weak<InvocationSlotPoolInner<A>>,
 }
 
-struct InvocationTensorPoolInner {
-    id: InvocationTensorPoolId,
+pub(crate) type InvocationTensorPoolHandle = InvocationSlotPoolHandle<InvocationTensorArena>;
+
+impl<A: InvocationSlotArena> Clone for InvocationSlotPoolHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            workspace_domain: self.workspace_domain.clone(),
+            maximum_bytes: self.maximum_bytes,
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+struct InvocationSlotPoolInner<A: InvocationSlotArena> {
+    id: InvocationSlotPoolId,
     instance_nonce: u64,
     workspace_domain: InvocationWorkspaceDomain,
     maximum_bytes: u64,
-    arenas: Vec<Mutex<InvocationTensorArena>>,
-    state: Mutex<InvocationTensorPoolState>,
+    arenas: Vec<Mutex<A>>,
+    state: Mutex<InvocationSlotPoolState>,
 }
 
-impl std::fmt::Debug for InvocationTensorPoolInner {
+impl<A: InvocationSlotArena> std::fmt::Debug for InvocationSlotPoolInner<A> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("InvocationTensorPoolInner")
+            .debug_struct("InvocationSlotPoolInner")
             .field("id", &self.id)
             .field("maximum_bytes", &self.maximum_bytes)
             .field("slot_count", &self.arenas.len())
@@ -93,16 +165,16 @@ impl std::fmt::Debug for InvocationTensorPoolInner {
 }
 
 #[derive(Debug)]
-struct InvocationTensorPoolState {
-    lifecycle: InvocationTensorPoolLifecycle,
+struct InvocationSlotPoolState {
+    lifecycle: InvocationSlotPoolLifecycle,
     owner_alive: bool,
     next_nonce: u64,
     drain_cursor: usize,
-    slots: Vec<InvocationTensorSlotState>,
+    slots: Vec<InvocationSlotState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvocationTensorPoolLifecycle {
+enum InvocationSlotPoolLifecycle {
     Accepting,
     Draining,
     DrainInFlight,
@@ -110,7 +182,7 @@ enum InvocationTensorPoolLifecycle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvocationTensorSlotState {
+enum InvocationSlotState {
     Vacant {
         generation: u32,
     },
@@ -129,7 +201,7 @@ enum InvocationTensorSlotState {
     },
 }
 
-impl InvocationTensorSlotState {
+impl InvocationSlotState {
     const fn generation(self) -> u32 {
         match self {
             Self::Vacant { generation }
@@ -144,7 +216,7 @@ impl InvocationTensorSlotState {
     }
 }
 
-impl InvocationTensorPoolOwner {
+impl InvocationSlotPoolOwner<InvocationTensorArena> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         contract: &InferenceStateContract,
@@ -164,39 +236,67 @@ impl InvocationTensorPoolOwner {
             .map_err(|_| invalid("invocation tensor pool slot count exceeds usize"))?;
         let mut arenas = Vec::with_capacity(slot_count_usize);
         for _ in 0..slot_count_usize {
-            arenas.push(Mutex::new(InvocationTensorArena::new(
+            arenas.push(InvocationTensorArena::new(
                 contract,
                 plan.clone(),
                 workspace_domain.clone(),
                 device.clone(),
-            )?));
+            )?);
         }
+        Self::from_arenas(
+            plan.as_ref(),
+            workspace_domain,
+            model_instance,
+            allocation_generation,
+            arenas,
+        )
+    }
+}
+
+impl<A: InvocationSlotArena> InvocationSlotPoolOwner<A> {
+    pub(crate) fn from_arenas(
+        plan: &ResolvedStatePlan,
+        workspace_domain: InvocationWorkspaceDomain,
+        model_instance: ModelInstanceId,
+        allocation_generation: u32,
+        arenas: Vec<A>,
+    ) -> Result<Self> {
+        if model_instance.get() == 0 || arenas.is_empty() || allocation_generation == 0 {
+            return Err(invalid(
+                "invocation slot pool requires non-zero model, slot, and allocation identities",
+            ));
+        }
+        let slot_count = u32::try_from(arenas.len())
+            .map_err(|_| invalid("invocation slot count exceeds u32"))?;
         let first = arenas
             .first()
-            .ok_or_else(|| invalid("invocation tensor pool has no physical arena"))?
-            .lock()
-            .map_err(|_| invalid("invocation tensor arena lock is poisoned"))?;
+            .ok_or_else(|| invalid("invocation slot pool has no physical arena"))?;
         let per_slot_bytes = first.maximum_bytes();
+        if per_slot_bytes == 0 {
+            return Err(invalid(
+                "invocation slot pool requires non-zero per-slot bytes",
+            ));
+        }
         let domain = first.domain();
-        let kind = backing_kind(first.kind());
-        drop(first);
+        let kind = first.backing_kind();
         let maximum_bytes = per_slot_bytes
             .checked_mul(u64::from(slot_count))
-            .ok_or_else(|| invalid("invocation tensor pool byte accounting overflow"))?;
+            .ok_or_else(|| invalid("invocation slot pool byte accounting overflow"))?;
         for arena in &arenas {
-            let arena = arena
-                .lock()
-                .map_err(|_| invalid("invocation tensor arena lock is poisoned"))?;
-            if arena.domain() != domain
-                || backing_kind(arena.kind()) != kind
+            if arena.plan() != plan
+                || arena.domain() != domain
+                || arena.backing_kind() != kind
+                || arena.workspace_domain() != &workspace_domain
                 || arena.maximum_bytes() != per_slot_bytes
             {
                 return Err(invalid(
-                    "invocation tensor pool slots do not share exact physical geometry",
+                    "invocation slot pool arenas do not share the exact plan, physical geometry, and workspace",
                 ));
             }
         }
-        let id = InvocationTensorPoolId {
+        let slot_count = usize::try_from(slot_count)
+            .map_err(|_| invalid("invocation slot count exceeds usize"))?;
+        let id = InvocationSlotPoolId {
             plan: plan.id,
             model_instance,
             backend: plan.backend,
@@ -208,29 +308,26 @@ impl InvocationTensorPoolOwner {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |nonce| {
                 nonce.checked_add(1)
             })
-            .map_err(|_| invalid("invocation tensor pool instance nonce exhausted"))?;
+            .map_err(|_| invalid("invocation slot pool instance nonce exhausted"))?;
         Ok(Self {
-            inner: Arc::new(InvocationTensorPoolInner {
+            inner: Arc::new(InvocationSlotPoolInner {
                 id,
                 instance_nonce,
                 workspace_domain,
                 maximum_bytes,
-                arenas,
-                state: Mutex::new(InvocationTensorPoolState {
-                    lifecycle: InvocationTensorPoolLifecycle::Accepting,
+                arenas: arenas.into_iter().map(Mutex::new).collect(),
+                state: Mutex::new(InvocationSlotPoolState {
+                    lifecycle: InvocationSlotPoolLifecycle::Accepting,
                     owner_alive: true,
                     next_nonce: 0,
                     drain_cursor: 0,
-                    slots: vec![
-                        InvocationTensorSlotState::Vacant { generation: 0 };
-                        slot_count_usize
-                    ],
+                    slots: vec![InvocationSlotState::Vacant { generation: 0 }; slot_count],
                 }),
             }),
         })
     }
 
-    pub(crate) fn id(&self) -> InvocationTensorPoolId {
+    pub(crate) fn id(&self) -> InvocationSlotPoolId {
         self.inner.id
     }
 
@@ -242,8 +339,8 @@ impl InvocationTensorPoolOwner {
         self.inner.maximum_bytes
     }
 
-    pub(crate) fn handle(&self) -> InvocationTensorPoolHandle {
-        InvocationTensorPoolHandle {
+    pub(crate) fn handle(&self) -> InvocationSlotPoolHandle<A> {
+        InvocationSlotPoolHandle {
             id: self.inner.id,
             workspace_domain: self.inner.workspace_domain.clone(),
             maximum_bytes: self.inner.maximum_bytes,
@@ -255,7 +352,7 @@ impl InvocationTensorPoolOwner {
         Arc::new(self.handle())
     }
 
-    pub(crate) fn lease(&self) -> Result<InvocationTensorLease> {
+    pub(crate) fn lease(&self) -> Result<InvocationSlotLease<A>> {
         lease_from_inner(self.inner.clone())
     }
 
@@ -268,18 +365,18 @@ impl InvocationTensorPoolOwner {
         self.inner
             .state
             .lock()
-            .map(|state| state.lifecycle == InvocationTensorPoolLifecycle::Drained)
+            .map(|state| state.lifecycle == InvocationSlotPoolLifecycle::Drained)
             .unwrap_or(false)
     }
 }
 
-impl Drop for InvocationTensorPoolOwner {
+impl<A: InvocationSlotArena> Drop for InvocationSlotPoolOwner<A> {
     fn drop(&mut self) {
         let should_drain = {
             let mut state = lifecycle_state(self.inner.as_ref());
             state.owner_alive = false;
-            if state.lifecycle == InvocationTensorPoolLifecycle::Accepting {
-                state.lifecycle = InvocationTensorPoolLifecycle::Draining;
+            if state.lifecycle == InvocationSlotPoolLifecycle::Accepting {
+                state.lifecycle = InvocationSlotPoolLifecycle::Draining;
             }
             begin_drain_if_idle(&mut state)
         };
@@ -289,8 +386,8 @@ impl Drop for InvocationTensorPoolOwner {
     }
 }
 
-impl InvocationTensorPoolHandle {
-    pub(crate) const fn id(&self) -> InvocationTensorPoolId {
+impl<A: InvocationSlotArena> InvocationSlotPoolHandle<A> {
+    pub(crate) const fn id(&self) -> InvocationSlotPoolId {
         self.id
     }
 
@@ -304,26 +401,24 @@ impl InvocationTensorPoolHandle {
 
     pub(crate) fn validate_live(&self) -> Result<()> {
         let inner = self.inner.upgrade().ok_or_else(|| {
-            invalid("invocation tensor pool refers to a retired physical generation")
+            invalid("invocation slot pool refers to a retired physical generation")
         })?;
         let state = inner
             .state
             .lock()
-            .map_err(|_| invalid("invocation tensor pool state is poisoned"))?;
-        if !state.owner_alive || state.lifecycle != InvocationTensorPoolLifecycle::Accepting {
-            return Err(invalid(
-                "invocation tensor pool is not accepting new leases",
-            ));
+            .map_err(|_| invalid("invocation slot pool state is poisoned"))?;
+        if !state.owner_alive || state.lifecycle != InvocationSlotPoolLifecycle::Accepting {
+            return Err(invalid("invocation slot pool is not accepting new leases"));
         }
         Ok(())
     }
 
-    pub(crate) fn lease(&self) -> Result<InvocationTensorLease> {
+    pub(crate) fn lease(&self) -> Result<InvocationSlotLease<A>> {
         self.validate_live()?;
         let inner = self
             .inner
             .upgrade()
-            .ok_or_else(|| invalid("invocation tensor pool retired during admission"))?;
+            .ok_or_else(|| invalid("invocation slot pool retired during admission"))?;
         lease_from_inner(inner)
     }
 
@@ -332,7 +427,7 @@ impl InvocationTensorPoolHandle {
     }
 }
 
-impl InvocationWorkspaceBackingV2 for InvocationTensorPoolHandle {
+impl<A: InvocationSlotArena> InvocationWorkspaceBackingV2 for InvocationSlotPoolHandle<A> {
     fn identity(&self) -> InvocationWorkspaceBackingIdentityV2 {
         self.id.backing_identity()
     }
@@ -342,11 +437,11 @@ impl InvocationWorkspaceBackingV2 for InvocationTensorPoolHandle {
     }
 
     fn validate_live(&self) -> Result<()> {
-        InvocationTensorPoolHandle::validate_live(self)
+        InvocationSlotPoolHandle::validate_live(self)
     }
 
     fn lease(&self) -> Result<Box<dyn InvocationWorkspacePhysicalLeaseV2>> {
-        Ok(Box::new(InvocationTensorPoolHandle::lease(self)?))
+        Ok(Box::new(InvocationSlotPoolHandle::lease(self)?))
     }
 
     fn authenticate_completion(
@@ -359,74 +454,65 @@ impl InvocationWorkspaceBackingV2 for InvocationTensorPoolHandle {
         } = completion
         else {
             return Err(invalid(
-                "invocation tensor completion has a non-typed physical kind",
+                "invocation slot completion has a non-typed physical kind",
             ));
         };
         if *backing != self.id.backing_identity() {
             return Err(invalid(
-                "invocation tensor completion belongs to another backing",
+                "invocation slot completion belongs to another backing",
             ));
         }
-        let inner = self.inner.upgrade().ok_or_else(|| {
-            invalid("invocation tensor completion refers to a retired generation")
-        })?;
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| invalid("invocation slot completion refers to a retired generation"))?;
         authenticate_receipt(inner.as_ref(), *authentication)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvocationTensorLeasePhase {
+enum InvocationSlotLeasePhase {
     Leased,
     Completing { receipt: [u8; 32] },
     Released,
 }
 
-pub(crate) struct InvocationTensorLease {
-    inner: Arc<InvocationTensorPoolInner>,
-    slot: InvocationTensorSlotRef,
-    phase: InvocationTensorLeasePhase,
+pub(crate) struct InvocationSlotLease<A: InvocationSlotArena> {
+    inner: Arc<InvocationSlotPoolInner<A>>,
+    slot: InvocationSlotRef,
+    phase: InvocationSlotLeasePhase,
 }
 
-impl std::fmt::Debug for InvocationTensorLease {
+pub(crate) type InvocationTensorLease = InvocationSlotLease<InvocationTensorArena>;
+
+impl<A: InvocationSlotArena> std::fmt::Debug for InvocationSlotLease<A> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("InvocationTensorLease")
+            .debug_struct("InvocationSlotLease")
             .field("slot", &self.slot)
             .field("phase", &self.phase)
             .finish_non_exhaustive()
     }
 }
 
-impl InvocationTensorLease {
-    pub(crate) const fn slot(&self) -> InvocationTensorSlotRef {
+impl<A: InvocationSlotArena> InvocationSlotLease<A> {
+    pub(crate) const fn slot(&self) -> InvocationSlotRef {
         self.slot
     }
 
-    pub(crate) fn apply_intent(
-        &mut self,
-        intent: &DomainStepIntent,
-        update: InvocationTensorUpdateV2,
-    ) -> Result<()> {
+    pub(crate) fn arena(&self) -> Result<std::sync::MutexGuard<'_, A>> {
         self.require_leased()?;
-        let mut arena = lock_arena(self.inner.as_ref(), self.slot.slot)?;
-        arena.apply_intent(intent, update)
+        lock_arena(self.inner.as_ref(), self.slot.slot)
     }
 
-    pub(crate) fn read_snapshot(&self) -> Result<InvocationTensorSnapshot> {
+    pub(crate) fn arena_mut(&mut self) -> Result<std::sync::MutexGuard<'_, A>> {
         self.require_leased()?;
-        lock_arena(self.inner.as_ref(), self.slot.slot)?.read_snapshot()
-    }
-
-    pub(crate) fn read_chronological_segments(
-        &self,
-    ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
-        self.require_leased()?;
-        lock_arena(self.inner.as_ref(), self.slot.slot)?.read_chronological_segments()
+        lock_arena(self.inner.as_ref(), self.slot.slot)
     }
 
     fn require_leased(&self) -> Result<()> {
-        if self.phase != InvocationTensorLeasePhase::Leased {
-            return Err(invalid("invocation tensor lease is no longer model-facing"));
+        if self.phase != InvocationSlotLeasePhase::Leased {
+            return Err(invalid("invocation slot lease is no longer model-facing"));
         }
         Ok(())
     }
@@ -434,7 +520,7 @@ impl InvocationTensorLease {
     fn begin_completion(&mut self) -> Result<InvocationWorkspacePhysicalCompletionV2> {
         self.require_leased()?;
         let receipt = transition_to_completing(self.inner.as_ref(), self.slot)?;
-        self.phase = InvocationTensorLeasePhase::Completing { receipt };
+        self.phase = InvocationSlotLeasePhase::Completing { receipt };
         Ok(InvocationWorkspacePhysicalCompletionV2::Typed {
             backing: self.inner.id.backing_identity(),
             authentication: receipt,
@@ -442,15 +528,36 @@ impl InvocationTensorLease {
     }
 
     fn abort_once(&mut self) {
-        if self.phase == InvocationTensorLeasePhase::Released {
+        if self.phase == InvocationSlotLeasePhase::Released {
             return;
         }
         release_slot(self.inner.as_ref(), self.slot);
-        self.phase = InvocationTensorLeasePhase::Released;
+        self.phase = InvocationSlotLeasePhase::Released;
     }
 }
 
-impl InvocationWorkspacePhysicalLeaseV2 for InvocationTensorLease {
+impl InvocationSlotLease<InvocationTensorArena> {
+    pub(crate) fn apply_intent(
+        &mut self,
+        intent: &DomainStepIntent,
+        update: InvocationTensorUpdateV2,
+    ) -> Result<()> {
+        let mut arena = self.arena_mut()?;
+        arena.apply_intent(intent, update)
+    }
+
+    pub(crate) fn read_snapshot(&self) -> Result<InvocationTensorSnapshot> {
+        self.arena()?.read_snapshot()
+    }
+
+    pub(crate) fn read_chronological_segments(
+        &self,
+    ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
+        self.arena()?.read_chronological_segments()
+    }
+}
+
+impl<A: InvocationSlotArena> InvocationWorkspacePhysicalLeaseV2 for InvocationSlotLease<A> {
     fn backing_identity(&self) -> InvocationWorkspaceBackingIdentityV2 {
         self.inner.id.backing_identity()
     }
@@ -476,37 +583,37 @@ impl InvocationWorkspacePhysicalLeaseV2 for InvocationTensorLease {
     }
 }
 
-impl Drop for InvocationTensorLease {
+impl<A: InvocationSlotArena> Drop for InvocationSlotLease<A> {
     fn drop(&mut self) {
         self.abort_once();
     }
 }
 
-fn lease_from_inner(inner: Arc<InvocationTensorPoolInner>) -> Result<InvocationTensorLease> {
+fn lease_from_inner<A: InvocationSlotArena>(
+    inner: Arc<InvocationSlotPoolInner<A>>,
+) -> Result<InvocationSlotLease<A>> {
     let slot = begin_lease(inner.as_ref())?;
     let mut reservation = PreparingSlotGuard::new(inner.clone(), slot);
     reset_arena_for_reuse(inner.as_ref(), slot.slot)?;
     if !transition_to_leased(inner.as_ref(), slot) {
-        return Err(invalid(
-            "invocation tensor slot lost its preparing generation",
-        ));
+        return Err(invalid("invocation slot lost its preparing generation"));
     }
     reservation.disarm();
-    Ok(InvocationTensorLease {
+    Ok(InvocationSlotLease {
         inner,
         slot,
-        phase: InvocationTensorLeasePhase::Leased,
+        phase: InvocationSlotLeasePhase::Leased,
     })
 }
 
-struct PreparingSlotGuard {
-    inner: Arc<InvocationTensorPoolInner>,
-    slot: InvocationTensorSlotRef,
+struct PreparingSlotGuard<A: InvocationSlotArena> {
+    inner: Arc<InvocationSlotPoolInner<A>>,
+    slot: InvocationSlotRef,
     armed: bool,
 }
 
-impl PreparingSlotGuard {
-    fn new(inner: Arc<InvocationTensorPoolInner>, slot: InvocationTensorSlotRef) -> Self {
+impl<A: InvocationSlotArena> PreparingSlotGuard<A> {
+    fn new(inner: Arc<InvocationSlotPoolInner<A>>, slot: InvocationSlotRef) -> Self {
         Self {
             inner,
             slot,
@@ -519,7 +626,7 @@ impl PreparingSlotGuard {
     }
 }
 
-impl Drop for PreparingSlotGuard {
+impl<A: InvocationSlotArena> Drop for PreparingSlotGuard<A> {
     fn drop(&mut self) {
         if self.armed {
             release_slot(self.inner.as_ref(), self.slot);
@@ -527,41 +634,44 @@ impl Drop for PreparingSlotGuard {
     }
 }
 
-fn begin_lease(inner: &InvocationTensorPoolInner) -> Result<InvocationTensorSlotRef> {
+fn begin_lease<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+) -> Result<InvocationSlotRef> {
     let mut state = inner
         .state
         .lock()
-        .map_err(|_| invalid("invocation tensor pool state is poisoned"))?;
-    if !state.owner_alive || state.lifecycle != InvocationTensorPoolLifecycle::Accepting {
-        return Err(invalid("invocation tensor pool is closed for admission"));
+        .map_err(|_| invalid("invocation slot pool state is poisoned"))?;
+    if !state.owner_alive || state.lifecycle != InvocationSlotPoolLifecycle::Accepting {
+        return Err(invalid("invocation slot pool is closed for admission"));
     }
     let slot_index = state
         .slots
         .iter()
         .position(|slot| slot.is_vacant())
-        .ok_or_else(|| {
-            Error::Backpressure("invocation tensor pool has no free slot".to_string())
-        })?;
+        .ok_or_else(|| Error::Backpressure("invocation slot pool has no free slot".to_string()))?;
     let generation = state.slots[slot_index]
         .generation()
         .checked_add(1)
-        .ok_or_else(|| invalid("invocation tensor slot generation exhausted"))?;
+        .ok_or_else(|| invalid("invocation slot generation exhausted"))?;
     state.next_nonce = state
         .next_nonce
         .checked_add(1)
-        .ok_or_else(|| invalid("invocation tensor lease nonce exhausted"))?;
+        .ok_or_else(|| invalid("invocation slot lease nonce exhausted"))?;
     let nonce = state.next_nonce;
-    state.slots[slot_index] = InvocationTensorSlotState::Preparing { generation, nonce };
-    Ok(InvocationTensorSlotRef {
+    state.slots[slot_index] = InvocationSlotState::Preparing { generation, nonce };
+    Ok(InvocationSlotRef {
         pool: inner.id,
         slot: u32::try_from(slot_index)
-            .map_err(|_| invalid("invocation tensor slot index exceeds u32"))?,
+            .map_err(|_| invalid("invocation slot index exceeds u32"))?,
         slot_generation: generation,
         nonce,
     })
 }
 
-fn transition_to_leased(inner: &InvocationTensorPoolInner, slot: InvocationTensorSlotRef) -> bool {
+fn transition_to_leased<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    slot: InvocationSlotRef,
+) -> bool {
     if slot.pool != inner.id {
         return false;
     }
@@ -572,47 +682,47 @@ fn transition_to_leased(inner: &InvocationTensorPoolInner, slot: InvocationTenso
         return false;
     };
     if *current
-        != (InvocationTensorSlotState::Preparing {
+        != (InvocationSlotState::Preparing {
             generation: slot.slot_generation,
             nonce: slot.nonce,
         })
     {
         return false;
     }
-    *current = InvocationTensorSlotState::Leased {
+    *current = InvocationSlotState::Leased {
         generation: slot.slot_generation,
         nonce: slot.nonce,
     };
     true
 }
 
-fn transition_to_completing(
-    inner: &InvocationTensorPoolInner,
-    slot: InvocationTensorSlotRef,
+fn transition_to_completing<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    slot: InvocationSlotRef,
 ) -> Result<[u8; 32]> {
     if slot.pool != inner.id {
-        return Err(invalid("invocation tensor lease belongs to another pool"));
+        return Err(invalid("invocation slot lease belongs to another pool"));
     }
     let receipt = receipt_for(inner, slot)?;
     let mut state = inner
         .state
         .lock()
-        .map_err(|_| invalid("invocation tensor pool state is poisoned"))?;
+        .map_err(|_| invalid("invocation slot pool state is poisoned"))?;
     let current = state
         .slots
         .get_mut(slot.slot as usize)
-        .ok_or_else(|| invalid("invocation tensor slot index is out of bounds"))?;
+        .ok_or_else(|| invalid("invocation slot index is out of bounds"))?;
     if *current
-        != (InvocationTensorSlotState::Leased {
+        != (InvocationSlotState::Leased {
             generation: slot.slot_generation,
             nonce: slot.nonce,
         })
     {
         return Err(invalid(
-            "invocation tensor lease generation is no longer active",
+            "invocation slot lease generation is no longer active",
         ));
     }
-    *current = InvocationTensorSlotState::Completing {
+    *current = InvocationSlotState::Completing {
         generation: slot.slot_generation,
         nonce: slot.nonce,
         receipt,
@@ -620,29 +730,35 @@ fn transition_to_completing(
     Ok(receipt)
 }
 
-fn authenticate_receipt(inner: &InvocationTensorPoolInner, receipt: [u8; 32]) -> Result<()> {
+fn authenticate_receipt<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    receipt: [u8; 32],
+) -> Result<()> {
     let mut state = inner
         .state
         .lock()
-        .map_err(|_| invalid("invocation tensor pool state is poisoned"))?;
+        .map_err(|_| invalid("invocation slot pool state is poisoned"))?;
     let (slot_index, generation) = state
         .slots
         .iter()
         .enumerate()
         .find_map(|(index, slot)| match *slot {
-            InvocationTensorSlotState::Completing {
+            InvocationSlotState::Completing {
                 generation,
                 receipt: candidate,
                 ..
             } if candidate == receipt => Some((index, generation)),
             _ => None,
         })
-        .ok_or_else(|| invalid("invocation tensor completion receipt is stale or foreign"))?;
-    state.slots[slot_index] = InvocationTensorSlotState::Vacant { generation };
+        .ok_or_else(|| invalid("invocation slot completion receipt is stale or foreign"))?;
+    state.slots[slot_index] = InvocationSlotState::Vacant { generation };
     Ok(())
 }
 
-fn release_slot(inner: &InvocationTensorPoolInner, slot: InvocationTensorSlotRef) {
+fn release_slot<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    slot: InvocationSlotRef,
+) {
     if slot.pool != inner.id {
         return;
     }
@@ -653,16 +769,16 @@ fn release_slot(inner: &InvocationTensorPoolInner, slot: InvocationTensorSlotRef
         };
         let matches_generation = matches!(
             *current,
-            InvocationTensorSlotState::Preparing { generation, nonce }
-                | InvocationTensorSlotState::Leased { generation, nonce }
-                | InvocationTensorSlotState::Completing {
+            InvocationSlotState::Preparing { generation, nonce }
+                | InvocationSlotState::Leased { generation, nonce }
+                | InvocationSlotState::Completing {
                     generation,
                     nonce,
                     ..
                 } if generation == slot.slot_generation && nonce == slot.nonce
         );
         if matches_generation {
-            *current = InvocationTensorSlotState::Vacant {
+            *current = InvocationSlotState::Vacant {
                 generation: slot.slot_generation,
             };
         }
@@ -673,35 +789,35 @@ fn release_slot(inner: &InvocationTensorPoolInner, slot: InvocationTensorSlotRef
     }
 }
 
-fn begin_drain_if_idle(state: &mut InvocationTensorPoolState) -> bool {
-    if state.lifecycle == InvocationTensorPoolLifecycle::Draining
+fn begin_drain_if_idle(state: &mut InvocationSlotPoolState) -> bool {
+    if state.lifecycle == InvocationSlotPoolLifecycle::Draining
         && state.slots.iter().all(|slot| slot.is_vacant())
     {
-        state.lifecycle = InvocationTensorPoolLifecycle::DrainInFlight;
+        state.lifecycle = InvocationSlotPoolLifecycle::DrainInFlight;
         true
     } else {
         false
     }
 }
 
-fn close_and_drain(inner: &InvocationTensorPoolInner) -> Result<()> {
+fn close_and_drain<A: InvocationSlotArena>(inner: &InvocationSlotPoolInner<A>) -> Result<()> {
     let should_drain = {
         let mut state = lifecycle_state(inner);
         match state.lifecycle {
-            InvocationTensorPoolLifecycle::Drained => return Ok(()),
-            InvocationTensorPoolLifecycle::DrainInFlight => {
+            InvocationSlotPoolLifecycle::Drained => return Ok(()),
+            InvocationSlotPoolLifecycle::DrainInFlight => {
                 return Err(Error::Backpressure(
-                    "invocation tensor pool drain is already in flight".to_string(),
+                    "invocation slot pool drain is already in flight".to_string(),
                 ));
             }
-            InvocationTensorPoolLifecycle::Accepting => {
-                state.lifecycle = InvocationTensorPoolLifecycle::Draining;
+            InvocationSlotPoolLifecycle::Accepting => {
+                state.lifecycle = InvocationSlotPoolLifecycle::Draining;
             }
-            InvocationTensorPoolLifecycle::Draining => {}
+            InvocationSlotPoolLifecycle::Draining => {}
         }
         if !begin_drain_if_idle(&mut state) {
             return Err(Error::Backpressure(
-                "invocation tensor pool still has active or completing leases".to_string(),
+                "invocation slot pool still has active or completing leases".to_string(),
             ));
         }
         true
@@ -710,7 +826,7 @@ fn close_and_drain(inner: &InvocationTensorPoolInner) -> Result<()> {
     finish_drain(inner)
 }
 
-fn finish_drain(inner: &InvocationTensorPoolInner) -> Result<()> {
+fn finish_drain<A: InvocationSlotArena>(inner: &InvocationSlotPoolInner<A>) -> Result<()> {
     loop {
         let next = {
             let state = lifecycle_state(inner);
@@ -722,11 +838,11 @@ fn finish_drain(inner: &InvocationTensorPoolInner) -> Result<()> {
         };
         let Some(index) = next else {
             let mut state = lifecycle_state(inner);
-            state.lifecycle = InvocationTensorPoolLifecycle::Drained;
+            state.lifecycle = InvocationSlotPoolLifecycle::Drained;
             return Ok(());
         };
         let result = u32::try_from(index)
-            .map_err(|_| invalid("invocation tensor drain index exceeds u32"))
+            .map_err(|_| invalid("invocation slot drain index exceeds u32"))
             .and_then(|slot| reset_arena_for_reuse(inner, slot));
         let mut state = lifecycle_state(inner);
         match result {
@@ -736,30 +852,33 @@ fn finish_drain(inner: &InvocationTensorPoolInner) -> Result<()> {
                 }
             }
             Err(error) => {
-                state.lifecycle = InvocationTensorPoolLifecycle::Draining;
+                state.lifecycle = InvocationSlotPoolLifecycle::Draining;
                 return Err(error);
             }
         }
     }
 }
 
-fn lock_arena(
-    inner: &InvocationTensorPoolInner,
+fn lock_arena<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
     slot: u32,
-) -> Result<std::sync::MutexGuard<'_, InvocationTensorArena>> {
+) -> Result<std::sync::MutexGuard<'_, A>> {
     inner
         .arenas
         .get(slot as usize)
-        .ok_or_else(|| invalid("invocation tensor slot index is out of bounds"))?
+        .ok_or_else(|| invalid("invocation slot index is out of bounds"))?
         .lock()
-        .map_err(|_| invalid("invocation tensor arena lock is poisoned"))
+        .map_err(|_| invalid("invocation slot arena lock is poisoned"))
 }
 
-fn reset_arena_for_reuse(inner: &InvocationTensorPoolInner, slot: u32) -> Result<()> {
+fn reset_arena_for_reuse<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    slot: u32,
+) -> Result<()> {
     let mutex = inner
         .arenas
         .get(slot as usize)
-        .ok_or_else(|| invalid("invocation tensor slot index is out of bounds"))?;
+        .ok_or_else(|| invalid("invocation slot index is out of bounds"))?;
     match mutex.lock() {
         Ok(mut arena) => arena.reset_for_reuse(),
         Err(poisoned) => {
@@ -774,9 +893,9 @@ fn reset_arena_for_reuse(inner: &InvocationTensorPoolInner, slot: u32) -> Result
     }
 }
 
-fn lifecycle_state(
-    inner: &InvocationTensorPoolInner,
-) -> std::sync::MutexGuard<'_, InvocationTensorPoolState> {
+fn lifecycle_state<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+) -> std::sync::MutexGuard<'_, InvocationSlotPoolState> {
     match inner.state.lock() {
         Ok(state) => state,
         Err(poisoned) => {
@@ -787,15 +906,12 @@ fn lifecycle_state(
     }
 }
 
-fn receipt_for(
-    inner: &InvocationTensorPoolInner,
-    slot: InvocationTensorSlotRef,
+fn receipt_for<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    slot: InvocationSlotRef,
 ) -> Result<[u8; 32]> {
-    let encoded = serde_json::to_vec(&slot).map_err(|error| {
-        invalid(format!(
-            "failed to encode invocation tensor receipt: {error}"
-        ))
-    })?;
+    let encoded = serde_json::to_vec(&slot)
+        .map_err(|error| invalid(format!("failed to encode invocation slot receipt: {error}")))?;
     let mut hasher = Sha256::new();
     hasher.update(RECEIPT_DOMAIN);
     hasher.update(inner.instance_nonce.to_le_bytes());
@@ -819,6 +935,7 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use candle_core::Tensor;
 
@@ -834,6 +951,43 @@ mod tests {
         StateUpdateKind, TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
         CURRENT_INFERENCE_STATE_ABI,
     };
+
+    #[derive(Debug)]
+    struct TestSlotArena {
+        plan: Arc<ResolvedStatePlan>,
+        workspace: InvocationWorkspaceDomain,
+        resets: Arc<AtomicUsize>,
+        maximum_bytes: u64,
+    }
+
+    impl slot_arena_sealed::Sealed for TestSlotArena {}
+
+    impl InvocationSlotArena for TestSlotArena {
+        fn plan(&self) -> &ResolvedStatePlan {
+            &self.plan
+        }
+
+        fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
+            &self.workspace
+        }
+
+        fn domain(&self) -> StateDomainId {
+            self.workspace.id()
+        }
+
+        fn backing_kind(&self) -> InvocationStateBackingKindV2 {
+            InvocationStateBackingKindV2::Tensor
+        }
+
+        fn maximum_bytes(&self) -> u64 {
+            self.maximum_bytes
+        }
+
+        fn reset_for_reuse(&mut self) -> Result<()> {
+            self.resets.fetch_add(1, AtomicOrdering::AcqRel);
+            Ok(())
+        }
+    }
 
     fn component(max: u64) -> TensorComponentSpec {
         TensorComponentSpec {
@@ -1007,6 +1161,96 @@ mod tests {
             held.components[0].tensor.to_vec1::<f32>().unwrap(),
             vec![1.0, 2.0]
         );
+    }
+
+    #[test]
+    fn generic_slot_pool_reuses_lifecycle_receipts_and_arena_reset_contract() {
+        let contract = contract(tensor_state(1, 4));
+        let (plan, workspace) = plan_and_workspace(&contract, StateDomainId::new(1));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let owner = InvocationSlotPoolOwner::from_arenas(
+            plan.as_ref(),
+            workspace.clone(),
+            ModelInstanceId::new(10),
+            21,
+            vec![
+                TestSlotArena {
+                    plan: plan.clone(),
+                    workspace: workspace.clone(),
+                    resets: resets.clone(),
+                    maximum_bytes: 64,
+                },
+                TestSlotArena {
+                    plan: plan.clone(),
+                    workspace,
+                    resets: resets.clone(),
+                    maximum_bytes: 64,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(owner.maximum_bytes(), 128);
+
+        let backing = owner.backing();
+        let mut first = backing.lease().unwrap();
+        assert!(first
+            .as_any()
+            .downcast_ref::<InvocationSlotLease<TestSlotArena>>()
+            .is_some());
+        let completion = first.complete().unwrap();
+        backing.authenticate_completion(&completion).unwrap();
+        assert_eq!(resets.load(AtomicOrdering::Acquire), 1);
+
+        let second = owner.lease().unwrap();
+        assert!(second.slot().slot_generation >= 1);
+        drop(second);
+        owner.close_and_drain().unwrap();
+        assert_eq!(resets.load(AtomicOrdering::Acquire), 4);
+    }
+
+    #[test]
+    fn generic_slot_pool_rejects_foreign_plan_and_zero_byte_arenas() {
+        let base_contract = contract(tensor_state(1, 4));
+        let (plan, workspace) = plan_and_workspace(&base_contract, StateDomainId::new(1));
+        let foreign_contract = contract(tensor_state(1, 8));
+        let (foreign_plan, _) = plan_and_workspace(&foreign_contract, StateDomainId::new(1));
+        assert_ne!(plan.as_ref(), foreign_plan.as_ref());
+        let resets = Arc::new(AtomicUsize::new(0));
+
+        assert!(InvocationSlotPoolOwner::from_arenas(
+            plan.as_ref(),
+            workspace.clone(),
+            ModelInstanceId::new(11),
+            22,
+            vec![
+                TestSlotArena {
+                    plan: plan.clone(),
+                    workspace: workspace.clone(),
+                    resets: resets.clone(),
+                    maximum_bytes: 64,
+                },
+                TestSlotArena {
+                    plan: foreign_plan,
+                    workspace: workspace.clone(),
+                    resets: resets.clone(),
+                    maximum_bytes: 64,
+                },
+            ],
+        )
+        .is_err());
+        assert!(InvocationSlotPoolOwner::from_arenas(
+            plan.as_ref(),
+            workspace.clone(),
+            ModelInstanceId::new(11),
+            23,
+            vec![TestSlotArena {
+                plan: plan.clone(),
+                workspace,
+                resets,
+                maximum_bytes: 0,
+            }],
+        )
+        .is_err());
     }
 
     #[test]
