@@ -203,7 +203,6 @@ fn should_prepend_default_system(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lfm2PromptStylePolicy {
-    Auto,
     Standard,
     Aggressive,
 }
@@ -211,7 +210,6 @@ enum Lfm2PromptStylePolicy {
 impl Lfm2PromptStylePolicy {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
             Self::Standard => "standard",
             Self::Aggressive => "aggressive",
         }
@@ -220,9 +218,8 @@ impl Lfm2PromptStylePolicy {
 
 fn parse_lfm2_prompt_style_policy(raw: Option<&str>) -> Lfm2PromptStylePolicy {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("standard" | "safe" | "chat") => Lfm2PromptStylePolicy::Standard,
         Some("aggressive" | "compact" | "lean") => Lfm2PromptStylePolicy::Aggressive,
-        _ => Lfm2PromptStylePolicy::Auto,
+        _ => Lfm2PromptStylePolicy::Standard,
     }
 }
 
@@ -253,7 +250,7 @@ fn should_use_aggressive_single_turn_prompt(
     if !single_user_turn {
         return false;
     }
-    !matches!(style_policy, Lfm2PromptStylePolicy::Standard)
+    matches!(style_policy, Lfm2PromptStylePolicy::Aggressive)
 }
 
 impl PromptScaffoldTokens {
@@ -874,14 +871,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_prompt_style_policy_defaults_to_auto_for_unknown_values() {
+    fn parse_prompt_style_policy_defaults_to_standard_for_unknown_values() {
         assert_eq!(
             parse_lfm2_prompt_style_policy(None),
-            Lfm2PromptStylePolicy::Auto
+            Lfm2PromptStylePolicy::Standard
         );
         assert_eq!(
             parse_lfm2_prompt_style_policy(Some("unsupported")),
-            Lfm2PromptStylePolicy::Auto
+            Lfm2PromptStylePolicy::Standard
         );
         assert_eq!(
             parse_lfm2_prompt_style_policy(Some("standard")),
@@ -899,15 +896,15 @@ mod tests {
             role: ChatRole::User,
             content: "hello".to_string(),
         }];
-        assert!(should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            false,
-            Lfm2PromptStylePolicy::Auto
-        ));
         assert!(!should_use_aggressive_single_turn_prompt(
             &single_user_turn,
             false,
             Lfm2PromptStylePolicy::Standard
+        ));
+        assert!(should_use_aggressive_single_turn_prompt(
+            &single_user_turn,
+            false,
+            Lfm2PromptStylePolicy::Aggressive
         ));
         assert!(!should_use_aggressive_single_turn_prompt(
             &single_user_turn,
