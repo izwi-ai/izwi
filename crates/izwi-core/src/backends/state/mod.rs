@@ -14,10 +14,10 @@ mod tensor;
 
 #[allow(unused_imports)]
 pub(crate) use invocation::{
-    InvocationTensorArena, InvocationTensorBulkComponentValue,
-    InvocationTensorChronologicalSegment, InvocationTensorComponentSlice,
-    InvocationTensorComponentValue, InvocationTensorDomainKind, InvocationTensorSnapshot,
-    InvocationTensorStepValues, InvocationTensorUpdateV2,
+    InvocationRingDepthwiseConvTransaction, InvocationTensorArena,
+    InvocationTensorBulkComponentValue, InvocationTensorChronologicalSegment,
+    InvocationTensorComponentSlice, InvocationTensorComponentValue, InvocationTensorDomainKind,
+    InvocationTensorSnapshot, InvocationTensorStepValues, InvocationTensorUpdateV2,
 };
 #[allow(unused_imports)]
 pub(crate) use static_attention::{

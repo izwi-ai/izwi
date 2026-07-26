@@ -7,9 +7,11 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, DeviceLocation, Tensor, Var};
+use candle_nn::{Conv1d, Conv1dConfig, Module};
 
 use crate::backends::backend_kind_for_device;
 use crate::error::{Error, Result};
+use crate::kernels::try_lfm_shortconv_sequence3;
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, InferenceStateContract, InvocationStateCapacity,
     InvocationWorkspaceDomain, ResolvedNonPagedDomainPlan, ResolvedStatePlan, StateComponentId,
@@ -128,6 +130,19 @@ pub(crate) struct InvocationTensorArena {
     valid_length: usize,
     initialized: bool,
     dirty: bool,
+}
+
+/// A sealed all-component ShortConv step over one physical ring domain.
+///
+/// Model code can consume the convolution result but never receives a tensor
+/// alias to arena backing. Every component is staged from model activations
+/// and the physical ring advances exactly once, after all layers succeed.
+pub(crate) struct InvocationRingDepthwiseConvTransaction<'a> {
+    arena: &'a mut InvocationTensorArena,
+    intent: DomainStepIntent,
+    declared_steps: u64,
+    declared: Vec<ComponentShapeInstantiation>,
+    updates: Vec<Option<InvocationTensorBulkComponentValue>>,
 }
 
 impl InvocationTensorArena {
@@ -407,6 +422,67 @@ impl InvocationTensorArena {
                 "invocation tensor update does not exactly match its authenticated intent",
             )),
         }
+    }
+
+    pub(crate) fn begin_ring_depthwise_conv(
+        &mut self,
+        intent: &DomainStepIntent,
+    ) -> Result<InvocationRingDepthwiseConvTransaction<'_>> {
+        self.require_clean()?;
+        if self.kind != InvocationTensorDomainKind::Ring {
+            return Err(invalid(
+                "physical depthwise convolution requires ring state",
+            ));
+        }
+        if intent.domain != self.domain || intent.expected_cursor != self.absolute_cursor {
+            return Err(invalid(
+                "physical depthwise convolution has a foreign domain or stale cursor",
+            ));
+        }
+        let StateUpdateKind::RingAdvance {
+            steps,
+            components_per_step,
+        } = &intent.update
+        else {
+            return Err(invalid(
+                "physical depthwise convolution requires a ring-advance intent",
+            ));
+        };
+        self.validate_cursor_advance_u64(intent.expected_cursor, intent.target_cursor, *steps)?;
+        if components_per_step.len() != self.components.len() {
+            return Err(invalid(
+                "physical depthwise convolution must declare every ring component",
+            ));
+        }
+        for (declared, component) in components_per_step.iter().zip(&self.components) {
+            if declared.component != component.semantic.id
+                || declared.dimensions.len() != component.semantic.shape.dimensions.len()
+            {
+                return Err(invalid(
+                    "physical depthwise convolution component identity or rank mismatch",
+                ));
+            }
+            for (declared_dimension, semantic_dimension) in declared
+                .dimensions
+                .iter()
+                .zip(&component.semantic.shape.dimensions)
+            {
+                if declared_dimension.axis != semantic_dimension.axis
+                    || !semantic_dimension.extent.accepts(declared_dimension.units)
+                {
+                    return Err(invalid(
+                        "physical depthwise convolution component shape is outside its contract",
+                    ));
+                }
+            }
+        }
+        Ok(InvocationRingDepthwiseConvTransaction {
+            arena: self,
+            intent: intent.clone(),
+            declared_steps: *steps,
+            declared: components_per_step.clone(),
+            updates: vec![None; components_per_step.len()],
+        })
     }
 
     pub(crate) fn read_snapshot(&self) -> Result<InvocationTensorSnapshot> {
@@ -746,6 +822,56 @@ impl InvocationTensorArena {
             .collect()
     }
 
+    fn ring_component_step_view(
+        &self,
+        component_id: StateComponentId,
+        absolute: u64,
+        logical_shape: &[usize],
+    ) -> Result<Tensor> {
+        self.require_clean()?;
+        if self.kind != InvocationTensorDomainKind::Ring {
+            return Err(invalid(
+                "physical depthwise convolution view requires ring state",
+            ));
+        }
+        if !self.initialized || self.valid_length == 0 {
+            return Err(invalid(
+                "physical depthwise convolution ring is not initialized",
+            ));
+        }
+        let component_index = self
+            .components
+            .iter()
+            .position(|component| component.semantic.id == component_id)
+            .ok_or_else(|| invalid("physical depthwise convolution component is absent"))?;
+        let valid = u64::try_from(self.valid_length)
+            .map_err(|_| invalid("physical depthwise convolution history exceeds u64"))?;
+        let oldest = self
+            .absolute_cursor
+            .checked_sub(valid)
+            .ok_or_else(|| invalid("physical depthwise convolution history underflow"))?;
+        if absolute < oldest || absolute >= self.absolute_cursor {
+            return Err(invalid(
+                "physical depthwise convolution view is outside retained history",
+            ));
+        }
+        let capacity = u64::try_from(self.capacity_steps)
+            .map_err(|_| invalid("physical depthwise convolution capacity exceeds u64"))?;
+        let physical = usize::try_from(absolute % capacity)
+            .map_err(|_| invalid("physical depthwise convolution slot exceeds usize"))?;
+        let stored_shape = self.components[component_index].logical_shapes[physical]
+            .as_deref()
+            .ok_or_else(|| invalid("physical depthwise convolution slot shape is absent"))?;
+        if stored_shape != logical_shape {
+            return Err(invalid(
+                "physical depthwise convolution history shape changed across steps",
+            ));
+        }
+        logical_step_view(&self.components[component_index], physical, 1, stored_shape)?
+            .get(0)
+            .map_err(Error::from)
+    }
+
     fn reset(&mut self) -> Result<()> {
         for component in &mut self.components {
             if let Err(error) = component.storage.zero_set() {
@@ -1037,6 +1163,203 @@ impl InvocationTensorArena {
         for (component, value) in self.components.iter_mut().zip(&step.components) {
             component.logical_shapes[physical] = Some(value.tensor.dims().to_vec());
         }
+    }
+}
+
+impl InvocationRingDepthwiseConvTransaction<'_> {
+    /// Apply one causal depthwise convolution component.
+    ///
+    /// `input` is `[batch, hidden, steps]`, `weight` is
+    /// `[hidden, ring_capacity]`, and the returned tensor preserves the input
+    /// shape. The model input is retained only as the pending ring update;
+    /// retained history is consumed through backing-storage views while the
+    /// transaction holds the arena lock, and no arena-backed tensor is returned.
+    pub(crate) fn apply(
+        &mut self,
+        component_id: StateComponentId,
+        input: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Tensor> {
+        let component_index = self
+            .arena
+            .components
+            .iter()
+            .position(|component| component.semantic.id == component_id)
+            .ok_or_else(|| invalid("physical depthwise convolution component is absent"))?;
+        if self.updates[component_index].is_some() {
+            return Err(invalid(
+                "physical depthwise convolution component was applied more than once",
+            ));
+        }
+        let declared = &self.declared[component_index];
+        if declared.dimensions.len() != 2
+            || declared.dimensions[0].axis != crate::kv::v2::ShapeAxis::Batch
+            || declared.dimensions[1].axis != crate::kv::v2::ShapeAxis::Hidden
+        {
+            return Err(invalid(
+                "physical depthwise convolution requires [batch, hidden] ring components",
+            ));
+        }
+        let (batch, hidden, steps) = input.dims3()?;
+        let (weight_hidden, kernel) = weight.dims2()?;
+        if u64::try_from(steps)
+            .map_err(|_| invalid("physical depthwise convolution steps exceed u64"))?
+            != self.declared_steps
+            || u64::try_from(batch)
+                .map_err(|_| invalid("physical depthwise convolution batch exceeds u64"))?
+                != declared.dimensions[0].units
+            || u64::try_from(hidden)
+                .map_err(|_| invalid("physical depthwise convolution width exceeds u64"))?
+                != declared.dimensions[1].units
+            || weight_hidden != hidden
+            || kernel != self.arena.capacity_steps
+            || kernel == 0
+        {
+            return Err(invalid(
+                "physical depthwise convolution input, weight, or ring geometry mismatch",
+            ));
+        }
+        let component = self.arena.component(component_id)?;
+        if !self.arena.device.same_device(input.device())
+            || !self.arena.device.same_device(weight.device())
+            || input.dtype() != component.storage.dtype()
+            || weight.dtype() != component.storage.dtype()
+        {
+            return Err(invalid(
+                "physical depthwise convolution tensors do not match arena storage",
+            ));
+        }
+
+        let input = input.contiguous()?;
+        let output = if self.intent.expected_cursor == 0 {
+            if kernel == 3 {
+                try_lfm_shortconv_sequence3(&input, weight)
+            } else {
+                None
+            }
+        } else {
+            Some(self.direct_ring_convolution(
+                component_id,
+                &input,
+                weight,
+                batch,
+                hidden,
+                steps,
+                kernel,
+            )?)
+        };
+        let output = match output {
+            Some(output) => output,
+            None => {
+                let conv = Conv1d::new(
+                    weight.reshape((hidden, 1, kernel))?.contiguous()?,
+                    None,
+                    Conv1dConfig {
+                        padding: kernel.saturating_sub(1),
+                        groups: hidden,
+                        ..Default::default()
+                    },
+                );
+                conv.forward(&input)?.narrow(2, 0, steps)?
+            }
+        }
+        .contiguous()?;
+
+        let update = input.permute((2, 0, 1))?.contiguous()?;
+        self.updates[component_index] = Some(InvocationTensorBulkComponentValue {
+            component: component_id,
+            tensor: update,
+        });
+        Ok(output)
+    }
+
+    fn direct_ring_convolution(
+        &self,
+        component_id: StateComponentId,
+        input: &Tensor,
+        weight: &Tensor,
+        batch: usize,
+        hidden: usize,
+        steps: usize,
+        kernel: usize,
+    ) -> Result<Tensor> {
+        let expected = self.intent.expected_cursor;
+        let valid = u64::try_from(self.arena.valid_length)
+            .map_err(|_| invalid("physical depthwise convolution history exceeds u64"))?;
+        let oldest = expected
+            .checked_sub(valid)
+            .ok_or_else(|| invalid("physical depthwise convolution history underflow"))?;
+        let kernel_i128 = i128::try_from(kernel)
+            .map_err(|_| invalid("physical depthwise convolution kernel exceeds i128"))?;
+        let expected_i128 = i128::from(expected);
+        let mut outputs = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let step_i128 = i128::try_from(step)
+                .map_err(|_| invalid("physical depthwise convolution step exceeds i128"))?;
+            let window_start = expected_i128 + step_i128 + 1 - kernel_i128;
+            let mut output = None::<Tensor>;
+            for tap in 0..kernel {
+                let tap_i128 = i128::try_from(tap)
+                    .map_err(|_| invalid("physical depthwise convolution tap exceeds i128"))?;
+                let source_absolute = window_start + tap_i128;
+                if source_absolute < 0 {
+                    continue;
+                }
+                let source_absolute = u64::try_from(source_absolute)
+                    .map_err(|_| invalid("physical depthwise convolution cursor exceeds u64"))?;
+                let source = if source_absolute < expected {
+                    if source_absolute < oldest {
+                        continue;
+                    }
+                    self.arena
+                        .ring_component_step_view(component_id, source_absolute, &[batch, hidden])?
+                        .unsqueeze(2)?
+                } else {
+                    let input_step = usize::try_from(source_absolute - expected)
+                        .map_err(|_| invalid("physical depthwise input step exceeds usize"))?;
+                    if input_step > step {
+                        return Err(invalid(
+                            "physical depthwise convolution attempted to read a future step",
+                        ));
+                    }
+                    input.narrow(2, input_step, 1)?
+                };
+                let tap_weight = weight.narrow(1, tap, 1)?.reshape((1, hidden, 1))?;
+                let contribution = source.broadcast_mul(&tap_weight)?;
+                output = Some(match output {
+                    Some(current) => (&current + &contribution)?,
+                    None => contribution,
+                });
+            }
+            outputs.push(output.ok_or_else(|| {
+                invalid("physical depthwise convolution produced no current-step contribution")
+            })?);
+        }
+        match outputs.as_slice() {
+            [single] => Ok(single.clone()),
+            _ => Tensor::cat(&outputs, 2).map_err(Error::from),
+        }
+    }
+
+    /// Publish all layer inputs into the physical ring in one authenticated
+    /// cursor advance. An incomplete transaction is discarded without
+    /// changing physical state.
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let updates = self
+            .updates
+            .drain(..)
+            .map(|update| {
+                update.ok_or_else(|| {
+                    invalid("physical depthwise convolution transaction omitted a ring component")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.arena.apply_intent(
+            &self.intent,
+            InvocationTensorUpdateV2::RingAdvanceBulk {
+                components: updates,
+            },
+        )
     }
 }
 
@@ -1423,6 +1746,42 @@ mod tests {
                 axis: ShapeAxis::Hidden,
                 units,
             }],
+        }
+    }
+
+    fn shortconv_component(id: u32, hidden: u64) -> TensorComponentSpec {
+        TensorComponentSpec {
+            id: StateComponentId::new(id),
+            role: TensorRole::ConvolutionState,
+            shape: BoundedShape {
+                dimensions: vec![
+                    ShapeDimension {
+                        axis: ShapeAxis::Batch,
+                        extent: ShapeExtent::Fixed { value: 1 },
+                    },
+                    ShapeDimension {
+                        axis: ShapeAxis::Hidden,
+                        extent: ShapeExtent::Fixed { value: hidden },
+                    },
+                ],
+            },
+            accepted_dtypes: vec![StateDType::F32],
+        }
+    }
+
+    fn shortconv_declared(id: u32, hidden: u64) -> ComponentShapeInstantiation {
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(id),
+            dimensions: vec![
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Batch,
+                    units: 1,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Hidden,
+                    units: hidden,
+                },
+            ],
         }
     }
 
@@ -1856,6 +2215,248 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![5.0, 6.0], vec![7.0, 8.0], vec![9.0, 10.0]]
         );
+    }
+
+    #[test]
+    fn sealed_depthwise_conv_transaction_matches_causal_reference_and_commits_atomically() {
+        let mut arena = arena(StateDomainSpec::Ring(RingStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![shortconv_component(1, 2), shortconv_component(2, 2)],
+            capacity_steps: 3,
+        }));
+        let prefill_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 4,
+            update: StateUpdateKind::RingAdvance {
+                steps: 4,
+                components_per_step: vec![shortconv_declared(1, 2), shortconv_declared(2, 2)],
+            },
+        };
+        let input_one = Tensor::from_slice(
+            &[1.0f32, 2.0, 3.0, 4.0, 0.5, 1.0, 1.5, 2.0],
+            (1, 2, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let input_two = Tensor::from_slice(
+            &[2.0f32, 1.0, 0.0, -1.0, 1.0, 1.5, 2.0, 2.5],
+            (1, 2, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let weight =
+            Tensor::from_slice(&[0.1f32, 0.2, 0.3, -0.5, 0.25, 0.75], (2, 3), &Device::Cpu)
+                .unwrap();
+
+        {
+            let mut incomplete = arena.begin_ring_depthwise_conv(&prefill_intent).unwrap();
+            incomplete
+                .apply(StateComponentId::new(1), &input_one, &weight)
+                .unwrap();
+            assert!(incomplete.commit().is_err());
+        }
+        assert_eq!(arena.absolute_cursor(), 0);
+        assert_eq!(arena.valid_length(), 0);
+        assert!(!arena.is_dirty());
+
+        let (prefill_one, prefill_two) = {
+            let mut transaction = arena.begin_ring_depthwise_conv(&prefill_intent).unwrap();
+            let first = transaction
+                .apply(StateComponentId::new(1), &input_one, &weight)
+                .unwrap();
+            assert!(transaction
+                .apply(StateComponentId::new(1), &input_one, &weight)
+                .is_err());
+            let second = transaction
+                .apply(StateComponentId::new(2), &input_two, &weight)
+                .unwrap();
+            transaction.commit().unwrap();
+            (first, second)
+        };
+        assert_eq!(
+            prefill_one.to_vec3::<f32>().unwrap(),
+            causal_depthwise_reference(&input_one, &weight, None)
+        );
+        assert_eq!(
+            prefill_two.to_vec3::<f32>().unwrap(),
+            causal_depthwise_reference(&input_two, &weight, None)
+        );
+        assert_eq!(arena.absolute_cursor(), 4);
+        assert_eq!(arena.valid_length(), 3);
+        assert_ne!(
+            prefill_one.id(),
+            arena.backing(StateComponentId::new(1)).unwrap().id()
+        );
+
+        let decode_input = Tensor::from_slice(&[5.0f32, 2.5], (1, 2, 1), &Device::Cpu).unwrap();
+        let history = input_one.narrow(2, 1, 3).unwrap();
+        let decode_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 4,
+            target_cursor: 5,
+            update: StateUpdateKind::RingAdvance {
+                steps: 1,
+                components_per_step: vec![shortconv_declared(1, 2), shortconv_declared(2, 2)],
+            },
+        };
+        let decode_output = {
+            let mut transaction = arena.begin_ring_depthwise_conv(&decode_intent).unwrap();
+            let output = transaction
+                .apply(StateComponentId::new(1), &decode_input, &weight)
+                .unwrap();
+            transaction
+                .apply(StateComponentId::new(2), &decode_input, &weight)
+                .unwrap();
+            transaction.commit().unwrap();
+            output
+        };
+        assert_eq!(
+            decode_output.to_vec3::<f32>().unwrap(),
+            causal_depthwise_reference(&decode_input, &weight, Some(&history))
+        );
+        assert_eq!(arena.absolute_cursor(), 5);
+        assert_eq!(arena.valid_length(), 3);
+
+        let continuation =
+            Tensor::from_slice(&[6.0f32, 7.0, 3.0, 3.5], (1, 2, 2), &Device::Cpu).unwrap();
+        let continuation_history =
+            Tensor::from_slice(&[3.0f32, 4.0, 5.0, 1.5, 2.0, 2.5], (1, 2, 3), &Device::Cpu)
+                .unwrap();
+        let continuation_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 5,
+            target_cursor: 7,
+            update: StateUpdateKind::RingAdvance {
+                steps: 2,
+                components_per_step: vec![shortconv_declared(1, 2), shortconv_declared(2, 2)],
+            },
+        };
+        let continuation_output = {
+            let mut transaction = arena
+                .begin_ring_depthwise_conv(&continuation_intent)
+                .unwrap();
+            let output = transaction
+                .apply(StateComponentId::new(1), &continuation, &weight)
+                .unwrap();
+            transaction
+                .apply(StateComponentId::new(2), &continuation, &weight)
+                .unwrap();
+            transaction.commit().unwrap();
+            output
+        };
+        assert_eq!(
+            continuation_output.to_vec3::<f32>().unwrap(),
+            causal_depthwise_reference(&continuation, &weight, Some(&continuation_history))
+        );
+        assert_eq!(arena.absolute_cursor(), 7);
+        assert_eq!(arena.valid_length(), 3);
+    }
+
+    fn causal_depthwise_reference(
+        input: &Tensor,
+        weight: &Tensor,
+        history: Option<&Tensor>,
+    ) -> Vec<Vec<Vec<f32>>> {
+        let input = input.to_vec3::<f32>().unwrap();
+        let weight = weight.to_vec2::<f32>().unwrap();
+        let batch = input.len();
+        let hidden = input[0].len();
+        let steps = input[0][0].len();
+        let kernel = weight[0].len();
+        let prior = history
+            .map(|history| history.to_vec3::<f32>().unwrap())
+            .unwrap_or_else(|| vec![vec![vec![0.0; kernel]; hidden]; batch]);
+        let mut output = vec![vec![vec![0.0; steps]; hidden]; batch];
+        for batch_index in 0..batch {
+            for hidden_index in 0..hidden {
+                let mut state = prior[batch_index][hidden_index].clone();
+                if state.len() < kernel {
+                    let mut padded = vec![0.0; kernel - state.len()];
+                    padded.extend(state);
+                    state = padded;
+                }
+                for step in 0..steps {
+                    state.remove(0);
+                    state.push(input[batch_index][hidden_index][step]);
+                    output[batch_index][hidden_index][step] = state
+                        .iter()
+                        .zip(&weight[hidden_index])
+                        .map(|(state, weight)| state * weight)
+                        .sum();
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn sealed_depthwise_conv_handles_partial_history_and_non_fused_kernels() {
+        let mut arena = arena(StateDomainSpec::Ring(RingStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![shortconv_component(1, 2)],
+            capacity_steps: 4,
+        }));
+        let weight = Tensor::from_slice(
+            &[0.1f32, 0.2, 0.3, 0.4, -0.5, 0.25, 0.75, 0.1],
+            (2, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let first = Tensor::from_slice(&[1.0f32, 2.0], (1, 2, 1), &Device::Cpu).unwrap();
+        let first_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 1,
+            update: StateUpdateKind::RingAdvance {
+                steps: 1,
+                components_per_step: vec![shortconv_declared(1, 2)],
+            },
+        };
+        let first_output = {
+            let mut transaction = arena.begin_ring_depthwise_conv(&first_intent).unwrap();
+            let output = transaction
+                .apply(StateComponentId::new(1), &first, &weight)
+                .unwrap();
+            transaction.commit().unwrap();
+            output
+        };
+        assert_eq!(
+            first_output.to_vec3::<f32>().unwrap(),
+            causal_depthwise_reference(&first, &weight, None)
+        );
+
+        let second = Tensor::from_slice(&[2.0f32, 3.0], (1, 2, 1), &Device::Cpu).unwrap();
+        let second_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 1,
+            target_cursor: 2,
+            update: StateUpdateKind::RingAdvance {
+                steps: 1,
+                components_per_step: vec![shortconv_declared(1, 2)],
+            },
+        };
+        let second_output = {
+            let mut transaction = arena.begin_ring_depthwise_conv(&second_intent).unwrap();
+            assert!(transaction
+                .apply(
+                    StateComponentId::new(1),
+                    &second,
+                    &weight.to_dtype(DType::F64).unwrap(),
+                )
+                .is_err());
+            let output = transaction
+                .apply(StateComponentId::new(1), &second, &weight)
+                .unwrap();
+            transaction.commit().unwrap();
+            output
+        };
+        assert_eq!(
+            second_output.to_vec3::<f32>().unwrap(),
+            causal_depthwise_reference(&second, &weight, Some(&first))
+        );
+        assert_eq!(arena.absolute_cursor(), 2);
+        assert_eq!(arena.valid_length(), 2);
     }
 
     #[test]

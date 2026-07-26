@@ -15,9 +15,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::backends::state::{
-    InvocationStaticAttentionArena, InvocationTensorArena, InvocationTensorChronologicalSegment,
-    InvocationTensorDomainKind, InvocationTensorSnapshot, InvocationTensorUpdateV2,
-    StaticAttentionLayerValue, StaticAttentionMetadata, StaticAttentionRaggedRow,
+    InvocationRingDepthwiseConvTransaction, InvocationStaticAttentionArena, InvocationTensorArena,
+    InvocationTensorChronologicalSegment, InvocationTensorDomainKind, InvocationTensorSnapshot,
+    InvocationTensorUpdateV2, StaticAttentionLayerValue, StaticAttentionMetadata,
+    StaticAttentionRaggedRow,
 };
 use crate::backends::BackendKind;
 use crate::engine::ModelInstanceId;
@@ -643,6 +644,18 @@ impl InvocationSlotLease<InvocationTensorArena> {
     ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
         self.arena()?.read_chronological_segments()
     }
+
+    pub(crate) fn with_ring_depthwise_conv<T>(
+        &mut self,
+        intent: &DomainStepIntent,
+        run: impl FnOnce(&mut InvocationRingDepthwiseConvTransaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut arena = self.arena_mut()?;
+        let mut transaction = arena.begin_ring_depthwise_conv(intent)?;
+        let output = run(&mut transaction)?;
+        transaction.commit()?;
+        Ok(output)
+    }
 }
 
 impl InvocationSlotLease<InvocationStaticAttentionArena> {
@@ -1106,11 +1119,12 @@ mod tests {
     };
     use crate::kv::v2::{
         test_contract, BoundedShape, CheckpointPolicy, ComponentShapeInstantiation,
-        InferenceStateContract, InvocationStateCapacity, PlacementPolicy, PrefixPolicy, ShapeAxis,
-        ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock, StateComponentId, StateDType,
-        StateDomainHeader, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
-        StateUpdateKind, StaticAttentionDomainSpec, StaticAttentionLayerSpec, TensorComponentSpec,
-        TensorRole, TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+        InferenceStateContract, InvocationStateCapacity, PlacementPolicy, PrefixPolicy,
+        RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent,
+        StateClock, StateComponentId, StateDType, StateDomainHeader, StateDomainSpec, StateGroupId,
+        StateGroupSpec, StateScope, StateUpdateKind, StaticAttentionDomainSpec,
+        StaticAttentionLayerSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+        WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
     };
 
     #[derive(Debug)]
@@ -1233,6 +1247,37 @@ mod tests {
         })
     }
 
+    fn shortconv_ring_state(id: u32) -> StateDomainSpec {
+        StateDomainSpec::Ring(RingStateDomainSpec {
+            header: StateDomainHeader {
+                id: StateDomainId::new(id),
+                scope: StateScope::Invocation,
+                clock: StateClock::DecoderTokens,
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::None,
+            },
+            components_per_step: vec![TensorComponentSpec {
+                id: StateComponentId::new(1),
+                role: TensorRole::ConvolutionState,
+                shape: BoundedShape {
+                    dimensions: vec![
+                        ShapeDimension {
+                            axis: ShapeAxis::Batch,
+                            extent: ShapeExtent::Fixed { value: 1 },
+                        },
+                        ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: 2 },
+                        },
+                    ],
+                },
+                accepted_dtypes: vec![StateDType::F32],
+            }],
+            capacity_steps: 3,
+        })
+    }
+
     fn static_attention_values(memory_tokens: usize) -> Vec<StaticAttentionLayerValue> {
         let elements = memory_tokens * 2 * 2;
         let keys = (0..elements)
@@ -1327,6 +1372,21 @@ mod tests {
         .unwrap()
     }
 
+    fn shortconv_owner() -> InvocationTensorPoolOwner {
+        let contract = contract(shortconv_ring_state(1));
+        let (plan, workspace) = plan_and_workspace(&contract, StateDomainId::new(1));
+        InvocationTensorPoolOwner::new(
+            &contract,
+            plan,
+            workspace,
+            Device::Cpu,
+            ModelInstanceId::new(8),
+            1,
+            1,
+        )
+        .unwrap()
+    }
+
     fn declared(units: u64) -> ComponentShapeInstantiation {
         ComponentShapeInstantiation {
             component: StateComponentId::new(1),
@@ -1359,6 +1419,71 @@ mod tests {
         InvocationTensorUpdateV2::TensorReplace {
             components: vec![value(values)],
         }
+    }
+
+    #[test]
+    fn lease_scopes_the_complete_depthwise_transaction_under_one_arena_lock() {
+        let owner = shortconv_owner();
+        let mut lease = owner.lease().unwrap();
+        let intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 2,
+            update: StateUpdateKind::RingAdvance {
+                steps: 2,
+                components_per_step: vec![ComponentShapeInstantiation {
+                    component: StateComponentId::new(1),
+                    dimensions: vec![
+                        ShapeDimensionValue {
+                            axis: ShapeAxis::Batch,
+                            units: 1,
+                        },
+                        ShapeDimensionValue {
+                            axis: ShapeAxis::Hidden,
+                            units: 2,
+                        },
+                    ],
+                }],
+            },
+        };
+        let input = Tensor::from_slice(&[1.0f32, 2.0, 0.5, 1.0], (1, 2, 2), &Device::Cpu).unwrap();
+        let weight =
+            Tensor::from_slice(&[0.1f32, 0.2, 0.3, -0.5, 0.25, 0.75], (2, 3), &Device::Cpu)
+                .unwrap();
+        let output = lease
+            .with_ring_depthwise_conv(&intent, |transaction| {
+                transaction.apply(StateComponentId::new(1), &input, &weight)
+            })
+            .unwrap();
+        assert_eq!(output.dims(), [1, 2, 2]);
+        assert_eq!(lease.arena().unwrap().absolute_cursor(), 2);
+
+        let rejected: Result<()> = lease.with_ring_depthwise_conv(
+            &DomainStepIntent {
+                domain: StateDomainId::new(1),
+                expected_cursor: 2,
+                target_cursor: 3,
+                update: StateUpdateKind::RingAdvance {
+                    steps: 1,
+                    components_per_step: vec![ComponentShapeInstantiation {
+                        component: StateComponentId::new(1),
+                        dimensions: vec![
+                            ShapeDimensionValue {
+                                axis: ShapeAxis::Batch,
+                                units: 1,
+                            },
+                            ShapeDimensionValue {
+                                axis: ShapeAxis::Hidden,
+                                units: 2,
+                            },
+                        ],
+                    }],
+                },
+            },
+            |_transaction| Err(Error::InferenceError("injected model failure".into())),
+        );
+        assert!(rejected.is_err());
+        assert_eq!(lease.arena().unwrap().absolute_cursor(), 2);
     }
 
     #[test]
