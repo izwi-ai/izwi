@@ -851,6 +851,59 @@ kernel void izwi_lfm_shortconv_sequence3_f32(
     }
     output[gid] = value;
 }
+
+kernel void izwi_lfm_shortconv_ring_f32(
+    device const float* ring [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batch [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& steps [[buffer(6)]],
+    constant uint& capacity [[buffer(7)]],
+    constant ulong& expected_cursor [[buffer(8)]],
+    constant ulong& valid_length [[buffer(9)]],
+    constant uint& output_elements [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= output_elements) {
+        return;
+    }
+    const uint step = gid % steps;
+    const uint hidden_idx = (gid / steps) % hidden;
+    const uint batch_idx = gid / (steps * hidden);
+    const long window_start =
+        long(expected_cursor) + long(step) + 1 - long(capacity);
+    const ulong oldest = expected_cursor - valid_length;
+    float value = 0.0f;
+    for (uint tap = 0; tap < capacity; ++tap) {
+        const long source = window_start + long(tap);
+        if (source < 0) {
+            continue;
+        }
+        const ulong absolute_source = ulong(source);
+        float source_value;
+        if (absolute_source < expected_cursor) {
+            if (absolute_source < oldest) {
+                continue;
+            }
+            const ulong physical = absolute_source % ulong(capacity);
+            source_value =
+                ring[(physical * ulong(batch) + ulong(batch_idx)) *
+                     ulong(hidden) + ulong(hidden_idx)];
+        } else {
+            const ulong input_step = absolute_source - expected_cursor;
+            if (input_step > ulong(step)) {
+                continue;
+            }
+            source_value =
+                input[(batch_idx * hidden + hidden_idx) * steps +
+                      uint(input_step)];
+        }
+        value += source_value * weight[hidden_idx * capacity + tap];
+    }
+    output[gid] = value;
+}
 "#;
 
 #[cfg(feature = "metal")]
@@ -1517,6 +1570,17 @@ struct LfmShortConvSequence3Op {
     batch_size: usize,
     hidden_size: usize,
     seq_len: usize,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy)]
+struct LfmShortConvRingOp {
+    batch_size: usize,
+    hidden_size: usize,
+    steps: usize,
+    capacity: usize,
+    expected_cursor: u64,
+    valid_length: u64,
 }
 
 #[cfg(feature = "metal")]
@@ -2264,6 +2328,165 @@ fn lfm_shortconv_sequence3_pipeline(device: &MetalDevice) -> CandleResult<Comput
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?
         .insert(registry_id, pipeline.clone());
 
+    Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+impl CustomOp3 for LfmShortConvRingOp {
+    fn name(&self) -> &'static str {
+        "izwi-lfm-shortconv-ring-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _ring: &CpuStorage,
+        _ring_layout: &Layout,
+        _input: &CpuStorage,
+        _input_layout: &Layout,
+        _weight: &CpuStorage,
+        _weight_layout: &Layout,
+    ) -> CandleResult<(CpuStorage, Shape)> {
+        bail!("izwi-lfm-shortconv-ring-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        ring_storage: &MetalStorage,
+        ring_layout: &Layout,
+        input_storage: &MetalStorage,
+        input_layout: &Layout,
+        weight_storage: &MetalStorage,
+        weight_layout: &Layout,
+    ) -> CandleResult<(MetalStorage, Shape)> {
+        if ring_storage.dtype() != DType::F32
+            || input_storage.dtype() != DType::F32
+            || weight_storage.dtype() != DType::F32
+        {
+            bail!("izwi-lfm-shortconv-ring-metal only supports F32 tensors")
+        }
+        if !ring_layout.is_contiguous()
+            || !input_layout.is_contiguous()
+            || !weight_layout.is_contiguous()
+        {
+            bail!("izwi-lfm-shortconv-ring-metal requires contiguous tensors")
+        }
+        if self.batch_size == 0
+            || self.hidden_size == 0
+            || self.steps == 0
+            || self.capacity == 0
+            || self.valid_length > self.capacity as u64
+            || self.valid_length > self.expected_cursor
+        {
+            bail!("izwi-lfm-shortconv-ring-metal received invalid geometry")
+        }
+        let elem_count = self
+            .batch_size
+            .checked_mul(self.hidden_size)
+            .and_then(|value| value.checked_mul(self.steps))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("izwi-lfm-shortconv-ring-metal output overflow".to_string())
+            })?;
+        if ring_layout.shape().elem_count()
+            != self
+                .capacity
+                .saturating_mul(self.batch_size)
+                .saturating_mul(self.hidden_size)
+            || input_layout.shape().elem_count() != elem_count
+            || weight_layout.shape().elem_count() != self.hidden_size.saturating_mul(self.capacity)
+        {
+            bail!("izwi-lfm-shortconv-ring-metal input shape mismatch")
+        }
+        if [
+            self.batch_size,
+            self.hidden_size,
+            self.steps,
+            self.capacity,
+            elem_count,
+        ]
+        .into_iter()
+        .any(|value| value > u32::MAX as usize)
+        {
+            bail!("izwi-lfm-shortconv-ring-metal tensor is too large")
+        }
+
+        let device = ring_storage.device().clone();
+        let output = device.new_buffer(elem_count, DType::F32, "izwi-lfm-shortconv-ring")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-lfm-shortconv-ring");
+        let pipeline = lfm_shortconv_ring_pipeline(device.metal_device())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(
+            0,
+            Some(ring_storage.buffer()),
+            ring_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            1,
+            Some(input_storage.buffer()),
+            input_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(weight_storage.buffer()),
+            weight_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&output), 0);
+        encoder.set_bytes(4, &(self.batch_size as u32));
+        encoder.set_bytes(5, &(self.hidden_size as u32));
+        encoder.set_bytes(6, &(self.steps as u32));
+        encoder.set_bytes(7, &(self.capacity as u32));
+        encoder.set_bytes(8, &self.expected_cursor);
+        encoder.set_bytes(9, &self.valid_length);
+        encoder.set_bytes(10, &(elem_count as u32));
+
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: elem_count,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: threads_per_threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+        drop(encoder);
+
+        Ok((
+            MetalStorage::new(output, device, elem_count, DType::F32),
+            Shape::from((self.batch_size, self.hidden_size, self.steps)),
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn lfm_shortconv_ring_pipeline(device: &MetalDevice) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&registry_id)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function("izwi_lfm_shortconv_ring_f32", None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(registry_id, pipeline.clone());
     Ok(pipeline)
 }
 
@@ -3311,6 +3534,69 @@ pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor>
     None
 }
 
+pub fn try_lfm_shortconv_ring_sequence(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    expected_cursor: u64,
+    valid_length: u64,
+) -> Option<Tensor> {
+    #[cfg(not(feature = "metal"))]
+    let _ = (ring, input, weight, expected_cursor, valid_length);
+
+    if !use_fused_kernels() {
+        return None;
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        let (capacity, batch_size, hidden_size) = ring.dims3().ok()?;
+        let (input_batch, input_hidden, steps) = input.dims3().ok()?;
+        let (weight_hidden, weight_capacity) = weight.dims2().ok()?;
+        if capacity == 0
+            || batch_size == 0
+            || hidden_size == 0
+            || steps == 0
+            || input_batch != batch_size
+            || input_hidden != hidden_size
+            || weight_hidden != hidden_size
+            || weight_capacity != capacity
+            || valid_length > capacity as u64
+            || valid_length > expected_cursor
+            || !ring.device().is_metal()
+            || !input.device().is_metal()
+            || !weight.device().is_metal()
+            || !ring.device().same_device(input.device())
+            || !ring.device().same_device(weight.device())
+            || ring.dtype() != DType::F32
+            || input.dtype() != DType::F32
+            || weight.dtype() != DType::F32
+            || !ring.is_contiguous()
+            || !input.is_contiguous()
+            || !weight.is_contiguous()
+        {
+            return None;
+        }
+        return ring
+            .apply_op3_no_bwd(
+                input,
+                weight,
+                &LfmShortConvRingOp {
+                    batch_size,
+                    hidden_size,
+                    steps,
+                    capacity,
+                    expected_cursor,
+                    valid_length,
+                },
+            )
+            .ok();
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Run Qwen3.5's stateful causal depthwise-convolution sequence path in one
 /// Metal dispatch. Inputs use token-major `[1, sequence, channels]` layout;
 /// history is `[channels, kernel_size - 1]` in oldest-to-newest order.
@@ -4312,6 +4598,42 @@ mod tests {
             assert!(
                 (actual - expected).abs() <= 1e-5,
                 "shortconv sequence mismatch at {idx}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_lfm_shortconv_consumes_wrapped_physical_ring() {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return;
+        };
+        let ring = Tensor::from_vec(
+            vec![
+                12.0f32, 22.0, // physical slot 0 = absolute step 3
+                10.0, 20.0, // physical slot 1 = absolute step 1
+                11.0, 21.0, // physical slot 2 = absolute step 2
+            ],
+            (3, 1, 2),
+            &device,
+        )
+        .unwrap();
+        let input = Tensor::from_vec(vec![13.0f32, 14.0, 23.0, 24.0], (1, 2, 2), &device).unwrap();
+        let weight =
+            Tensor::from_vec(vec![1.0f32, 10.0, 100.0, -1.0, 0.5, 2.0], (2, 3), &device).unwrap();
+        let output = try_lfm_shortconv_ring_sequence(&ring, &input, &weight, 4, 3)
+            .expect("physical ShortConv ring kernel should run on Metal");
+        let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected = vec![
+            11.0 + 12.0 * 10.0 + 13.0 * 100.0,
+            12.0 + 13.0 * 10.0 + 14.0 * 100.0,
+            -21.0 + 22.0 * 0.5 + 23.0 * 2.0,
+            -22.0 + 23.0 * 0.5 + 24.0 * 2.0,
+        ];
+        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "physical ShortConv mismatch at {index}: {actual} != {expected}"
             );
         }
     }

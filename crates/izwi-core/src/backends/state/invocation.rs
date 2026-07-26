@@ -11,7 +11,7 @@ use candle_nn::{Conv1d, Conv1dConfig, Module};
 
 use crate::backends::backend_kind_for_device;
 use crate::error::{Error, Result};
-use crate::kernels::try_lfm_shortconv_sequence3;
+use crate::kernels::{try_lfm_shortconv_ring_sequence, try_lfm_shortconv_sequence3};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, InferenceStateContract, InvocationStateCapacity,
     InvocationWorkspaceDomain, ResolvedNonPagedDomainPlan, ResolvedStatePlan, StateComponentId,
@@ -1231,12 +1231,22 @@ impl InvocationRingDepthwiseConvTransaction<'_> {
         }
 
         let input = input.contiguous()?;
-        let output = if self.intent.expected_cursor == 0 {
-            if kernel == 3 {
-                try_lfm_shortconv_sequence3(&input, weight)
-            } else {
-                None
-            }
+        let physical_ring = component.storage.as_tensor().clone();
+        let output = try_lfm_shortconv_ring_sequence(
+            &physical_ring,
+            &input,
+            weight,
+            self.intent.expected_cursor,
+            u64::try_from(self.arena.valid_length)
+                .map_err(|_| invalid("physical depthwise convolution history exceeds u64"))?,
+        )
+        .or_else(|| {
+            (self.intent.expected_cursor == 0 && kernel == 3)
+                .then(|| try_lfm_shortconv_sequence3(&input, weight))
+                .flatten()
+        });
+        let output = if self.intent.expected_cursor == 0 || output.is_some() {
+            output
         } else {
             Some(self.direct_ring_convolution(
                 component_id,

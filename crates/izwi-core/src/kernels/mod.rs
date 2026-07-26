@@ -268,6 +268,40 @@ pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor>
     None
 }
 
+pub fn try_lfm_shortconv_ring_sequence(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    expected_cursor: u64,
+    valid_length: u64,
+) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(ring.device()) {
+        return None;
+    }
+
+    if ring.device().is_cuda() {
+        return cuda::try_lfm_shortconv_ring_sequence(
+            ring,
+            input,
+            weight,
+            expected_cursor,
+            valid_length,
+        );
+    }
+
+    if ring.device().is_metal() {
+        return metal::try_lfm_shortconv_ring_sequence(
+            ring,
+            input,
+            weight,
+            expected_cursor,
+            valid_length,
+        );
+    }
+
+    None
+}
+
 pub fn try_qwen35_causal_conv_sequence(
     input: &Tensor,
     weight: &Tensor,

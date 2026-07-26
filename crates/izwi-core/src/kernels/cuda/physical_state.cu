@@ -210,3 +210,57 @@ extern "C" __global__ void physical_paged_decode_bf16(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
       page_tokens, max_blocks, key_dim, value_dim, softmax_scale);
 }
+
+// Consume a physical circular ShortConv ring directly. The ring layout is
+// [capacity, batch, hidden], while input/output use [batch, hidden, steps].
+extern "C" __global__ void physical_ring_shortconv_f32(
+    const float* __restrict__ ring,
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int batch,
+    int hidden,
+    int steps,
+    int capacity,
+    unsigned long long expected_cursor,
+    unsigned long long valid_length,
+    int output_elements) {
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= output_elements) {
+    return;
+  }
+  const int step = gid % steps;
+  const int hidden_idx = (gid / steps) % hidden;
+  const int batch_idx = gid / (steps * hidden);
+  const long long window_start =
+      static_cast<long long>(expected_cursor) + step + 1 - capacity;
+  const unsigned long long oldest = expected_cursor - valid_length;
+  float value = 0.0f;
+  for (int tap = 0; tap < capacity; ++tap) {
+    const long long source = window_start + tap;
+    if (source < 0) {
+      continue;
+    }
+    float source_value;
+    const unsigned long long absolute_source =
+        static_cast<unsigned long long>(source);
+    if (absolute_source < expected_cursor) {
+      if (absolute_source < oldest) {
+        continue;
+      }
+      const unsigned long long physical = absolute_source % capacity;
+      source_value =
+          ring[(physical * batch + batch_idx) * hidden + hidden_idx];
+    } else {
+      const unsigned long long input_step =
+          absolute_source - expected_cursor;
+      if (input_step > static_cast<unsigned long long>(step)) {
+        continue;
+      }
+      source_value =
+          input[(batch_idx * hidden + hidden_idx) * steps + input_step];
+    }
+    value += source_value * weight[hidden_idx * capacity + tap];
+  }
+  output[gid] = value;
+}

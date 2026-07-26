@@ -336,6 +336,53 @@ pub fn paged_decode_attention(
     )
 }
 
+pub fn try_lfm_shortconv_ring_sequence(
+    ring: &Tensor,
+    input: &Tensor,
+    weight: &Tensor,
+    expected_cursor: u64,
+    valid_length: u64,
+) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(ring, input)
+        || !cuda_tensor_pair_supported(ring, weight)
+        || ring.dtype() != DType::F32
+        || !ring.layout().is_contiguous()
+        || !input.layout().is_contiguous()
+        || !weight.layout().is_contiguous()
+    {
+        return None;
+    }
+    let (capacity, batch, hidden) = ring.dims3().ok()?;
+    let (input_batch, input_hidden, steps) = input.dims3().ok()?;
+    let (weight_hidden, weight_capacity) = weight.dims2().ok()?;
+    if capacity == 0
+        || batch == 0
+        || hidden == 0
+        || steps == 0
+        || input_batch != batch
+        || input_hidden != hidden
+        || weight_hidden != hidden
+        || weight_capacity != capacity
+        || valid_length > capacity as u64
+        || valid_length > expected_cursor
+    {
+        return None;
+    }
+    ring.apply_op3_no_bwd(
+        input,
+        weight,
+        &CudaPhysicalRingShortConvOp {
+            batch,
+            hidden,
+            steps,
+            capacity,
+            expected_cursor,
+            valid_length,
+        },
+    )
+    .ok()
+}
+
 fn cuda_tensor_supported(tensor: &Tensor) -> bool {
     cuda_kernels_compiled() && tensor.device().is_cuda()
 }
@@ -630,6 +677,112 @@ struct CudaPagedDecodeOp {
     softmax_scale: f32,
 }
 
+struct CudaPhysicalRingShortConvOp {
+    batch: usize,
+    hidden: usize,
+    steps: usize,
+    capacity: usize,
+    expected_cursor: u64,
+    valid_length: u64,
+}
+
+impl CustomOp3 for CudaPhysicalRingShortConvOp {
+    fn name(&self) -> &'static str {
+        "physical-ring-shortconv"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _ring: &CpuStorage,
+        _ring_layout: &Layout,
+        _input: &CpuStorage,
+        _input_layout: &Layout,
+        _weight: &CpuStorage,
+        _weight_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("physical CUDA ring ShortConv has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        ring: &candle_core::CudaStorage,
+        ring_layout: &Layout,
+        input: &candle_core::CudaStorage,
+        input_layout: &Layout,
+        weight: &candle_core::CudaStorage,
+        weight_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        fn contiguous_f32<'a>(
+            storage: &'a CudaStorageSlice,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
+        {
+            let CudaStorageSlice::F32(slice) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(slice.slice(start..end))
+        }
+
+        let device = ring.device();
+        let ring = contiguous_f32(&ring.slice, ring_layout, "physical ShortConv ring")?;
+        let input = contiguous_f32(&input.slice, input_layout, "physical ShortConv input")?;
+        let weight = contiguous_f32(&weight.slice, weight_layout, "physical ShortConv weight")?;
+        let output_elements = self
+            .batch
+            .checked_mul(self.hidden)
+            .and_then(|value| value.checked_mul(self.steps))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("physical CUDA ShortConv output overflow".to_string())
+            })?;
+        let output_elements_i32 = i32::try_from(output_elements).map_err(|_| {
+            candle_core::Error::Msg("physical CUDA ShortConv output is too large".to_string())
+        })?;
+        // SAFETY: the custom kernel writes every output element before the
+        // returned storage is observed.
+        let output = unsafe { device.alloc::<f32>(output_elements)? };
+        let function = device.get_or_load_custom_func(
+            "physical_ring_shortconv_f32",
+            "izwi_physical_state",
+            cuda_ptx::PHYSICAL_STATE,
+        )?;
+        let config = LaunchConfig::for_num_elems(output_elements as u32);
+        let mut builder = function.builder();
+        builder.arg(&ring);
+        builder.arg(&input);
+        builder.arg(&weight);
+        builder.arg(&output);
+        candle_core::builder_arg!(
+            builder,
+            self.batch as i32,
+            self.hidden as i32,
+            self.steps as i32,
+            self.capacity as i32,
+            self.expected_cursor,
+            self.valid_length,
+            output_elements_i32
+        );
+        // SAFETY: argument types and element bounds match the CUDA kernel
+        // signature and the validated physical-ring geometry.
+        unsafe { builder.launch(config) }.w()?;
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            Shape::from_dims(&[self.batch, self.hidden, self.steps]),
+        ))
+    }
+}
+
 impl CustomOp3 for CudaPagedDecodeOp {
     fn name(&self) -> &'static str {
         "physical-paged-decode"
@@ -788,5 +941,43 @@ mod tests {
         assert!(try_fused_l2_norm(&lhs, 1e-6).is_none());
         assert!(try_fused_rms_norm(&lhs, &rhs, 1e-6).is_none());
         assert!(try_fused_gated_rms_norm(&lhs, &rhs, &rhs, 1e-6).is_none());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_lfm_shortconv_consumes_wrapped_physical_ring() {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            return;
+        };
+        let ring = Tensor::from_vec(
+            vec![
+                12.0f32, 22.0, // physical slot 0 = absolute step 3
+                10.0, 20.0, // physical slot 1 = absolute step 1
+                11.0, 21.0, // physical slot 2 = absolute step 2
+            ],
+            (3, 1, 2),
+            &device,
+        )
+        .unwrap();
+        let input = Tensor::from_vec(vec![13.0f32, 14.0, 23.0, 24.0], (1, 2, 2), &device).unwrap();
+        let weight =
+            Tensor::from_vec(vec![1.0f32, 10.0, 100.0, -1.0, 0.5, 2.0], (2, 3), &device).unwrap();
+        let output = try_lfm_shortconv_ring_sequence(&ring, &input, &weight, 4, 3)
+            .expect("physical ShortConv ring kernel should run on CUDA")
+            .to_device(&candle_core::Device::Cpu)
+            .unwrap();
+        let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected = vec![
+            11.0 + 12.0 * 10.0 + 13.0 * 100.0,
+            12.0 + 13.0 * 10.0 + 14.0 * 100.0,
+            -21.0 + 22.0 * 0.5 + 23.0 * 2.0,
+            -22.0 + 23.0 * 0.5 + 24.0 * 2.0,
+        ];
+        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "physical ShortConv mismatch at {index}: {actual} != {expected}"
+            );
+        }
     }
 }
