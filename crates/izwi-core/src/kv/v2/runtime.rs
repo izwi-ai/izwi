@@ -268,7 +268,6 @@ impl InvocationPagedWorkspaceRuntimeV2 {
         let mut pools = HashMap::with_capacity(bindings.len());
         for binding in bindings {
             if binding.key.stage_graph.iter().all(|byte| *byte == 0)
-                || binding.key.stage.get() == 0
                 || binding.key.domain.get() == 0
                 || binding.pool.id().domain != binding.key.domain
             {
@@ -985,7 +984,6 @@ impl InvocationWorkspaceRuntimeV2 {
                         invalid("scratch invocation workspace cannot publish a physical backing")
                     })?;
             if binding.key.stage_graph.iter().all(|byte| *byte == 0)
-                || binding.key.stage.get() == 0
                 || binding.key.domain.get() == 0
                 || binding.backing.workspace_domain().id() != binding.key.domain
                 || !binding.backing.identity().validates_kind(authored_kind)
@@ -2681,6 +2679,31 @@ mod tests {
             .expect("complete descriptor-authored lease set");
         assert_eq!(leases.domains().collect::<Vec<_>>(), vec![domain]);
         leases.release().unwrap();
+    }
+
+    #[test]
+    fn invocation_runtime_bindings_accept_the_canonical_scalar_stage_zero() {
+        let typed = HostileInvocationBacking::new(HostileInvocationBehavior::AuthenticationFailure);
+        InvocationWorkspaceRuntimeV2::new(vec![InvocationWorkspaceBindingV2 {
+            key: InvocationWorkspaceKeyV2 {
+                stage_graph: [0x71; 32],
+                stage: StageId::new(0),
+                domain: StateDomainId::new(70),
+            },
+            backing: typed,
+        }])
+        .unwrap();
+
+        let (paged, _) = invocation_pool(ModelInstanceId::new(38));
+        InvocationPagedWorkspaceRuntimeV2::new(vec![InvocationPagedWorkspaceBindingV2 {
+            key: InvocationPagedWorkspaceKeyV2 {
+                stage_graph: [0x72; 32],
+                stage: StageId::new(0),
+                domain: StateDomainId::new(1),
+            },
+            pool: paged.handle(),
+        }])
+        .unwrap();
     }
 
     #[test]

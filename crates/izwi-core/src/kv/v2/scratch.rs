@@ -27,7 +27,6 @@ impl ScratchWorkspaceOwner {
     fn validate(self) -> Result<()> {
         if self.capability_runtime.iter().all(|byte| *byte == 0)
             || self.stage_graph.iter().all(|byte| *byte == 0)
-            || self.stage.get() == 0
         {
             return Err(invalid(
                 "scratch workspace owner has an incomplete identity",
@@ -443,6 +442,13 @@ mod tests {
             stage_graph: [2; 32],
             stage: StageId::new(3),
         }
+    }
+
+    #[test]
+    fn scratch_owner_accepts_the_canonical_scalar_stage_zero() {
+        let mut scalar = owner();
+        scalar.stage = StageId::new(0);
+        ResolvedScratchWorkspace::resolve(scalar, BackendKind::Cpu, None, &scratch(false)).unwrap();
     }
 
     fn scratch(zero_on_release: bool) -> InvocationWorkspaceDomain {
