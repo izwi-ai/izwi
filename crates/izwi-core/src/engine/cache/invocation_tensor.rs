@@ -645,6 +645,12 @@ impl InvocationSlotLease<InvocationTensorArena> {
         self.arena()?.read_chronological_segments()
     }
 
+    /// Reuse this invocation-exclusive backing for a new nested logical
+    /// sequence without releasing its authenticated pool slot.
+    pub(crate) fn reset_invocation(&mut self) -> Result<()> {
+        self.arena_mut()?.reset_for_reuse()
+    }
+
     pub(crate) fn with_ring_depthwise_conv<T>(
         &mut self,
         intent: &DomainStepIntent,
@@ -1516,6 +1522,30 @@ mod tests {
         assert_eq!(
             held.components[0].tensor.to_vec1::<f32>().unwrap(),
             vec![1.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn active_tensor_lease_resets_between_nested_logical_sequences() {
+        let owner = owner(1, 12);
+        let mut lease = owner.lease().unwrap();
+        lease
+            .apply_intent(&replace_intent(0, 1, 2), replace_update(&[1.0, 2.0]))
+            .unwrap();
+        assert_eq!(lease.arena().unwrap().absolute_cursor(), 1);
+
+        lease.reset_invocation().unwrap();
+        assert_eq!(lease.arena().unwrap().absolute_cursor(), 0);
+        assert!(lease.read_snapshot().is_err());
+        lease
+            .apply_intent(&replace_intent(0, 1, 1), replace_update(&[9.0]))
+            .unwrap();
+        assert_eq!(
+            lease.read_snapshot().unwrap().components[0]
+                .tensor
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![9.0]
         );
     }
 
