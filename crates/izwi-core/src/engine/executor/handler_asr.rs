@@ -62,6 +62,22 @@ fn with_whisper_invocation_state<T>(
     Ok(output)
 }
 
+fn with_vibevoice_invocation_state<T>(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    run: impl FnOnce(&mut crate::kv::v2::InvocationWorkspaceLeaseSetV2) -> Result<T>,
+) -> Result<T> {
+    let mut leases = super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
+    let output = run(&mut leases)?;
+    let completions = leases.release()?;
+    if completions.len() != 3 {
+        return Err(Error::InferenceError(
+            "VibeVoice ASR physical state returned an incomplete completion set".to_string(),
+        ));
+    }
+    Ok(output)
+}
+
 impl NativeExecutor {
     pub(super) fn transcribe_request(
         &self,
@@ -509,14 +525,14 @@ impl NativeExecutor {
                                 })?
                             }
                             ModelFamily::VibeVoiceAsr => {
-                                with_single_invocation_cache(request, scheduled, |cache| {
+                                with_vibevoice_invocation_state(request, scheduled, |leases| {
                                     model.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
                                         chunk_audio,
                                         sr,
                                         language,
                                         asr_prompt,
                                         chunk_generation_options.clone(),
-                                        cache,
+                                        leases,
                                     )
                                 })?
                             }
@@ -614,7 +630,7 @@ impl NativeExecutor {
                     };
                     let text = match family {
                         ModelFamily::VibeVoiceAsr => {
-                            with_single_invocation_cache(request, scheduled, |cache| {
+                            with_vibevoice_invocation_state(request, scheduled, |leases| {
                                 model
                                     .transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
                                         &samples,
@@ -622,7 +638,7 @@ impl NativeExecutor {
                                         language,
                                         asr_prompt,
                                         segment_generation_options.clone(),
-                                        cache,
+                                        leases,
                                         &mut emit,
                                     )
                             })?
@@ -690,14 +706,14 @@ impl NativeExecutor {
                     })?
                 }
                 ModelFamily::VibeVoiceAsr => {
-                    with_single_invocation_cache(request, scheduled, |cache| {
+                    with_vibevoice_invocation_state(request, scheduled, |leases| {
                         model.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
                             &samples,
                             sample_rate,
                             language,
                             asr_prompt,
                             segment_generation_options.clone(),
-                            cache,
+                            leases,
                         )
                     })?
                 }

@@ -10,8 +10,11 @@ use tracing::info;
 
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
-use crate::engine::StageDescriptor;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2, StateClock, StateGroupId,
+};
 use crate::kv::CacheDomainId;
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Model, Qwen3WeightLayout};
@@ -22,13 +25,12 @@ use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::prompt::VibeVoicePromptTokenizer;
 use crate::models::architectures::vibevoice::tokenizer::{
     VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerEncoderOutput,
-    VibeVoiceTokenizerStreamingCache,
 };
 use crate::models::architectures::vibevoice::{
     vibevoice_invocation_contract, vibevoice_physical_state_spec, VibeVoicePhysicalStateSpec,
+    VibeVoiceTokenizerStateDomain, VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
-use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
@@ -184,11 +186,26 @@ impl VibeVoiceAsrModel {
         &self,
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<VibeVoicePhysicalStateSpec> {
+        let tokenizer_domains = [
+            VibeVoiceTokenizerStateDomain::new(
+                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                StateGroupId::new(2),
+                StateClock::AudioSamples,
+                self.acoustic_tokenizer.encoder_state_geometry(),
+            )?,
+            VibeVoiceTokenizerStateDomain::new(
+                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+                StateGroupId::new(2),
+                StateClock::AudioSamples,
+                self.semantic_tokenizer.encoder_state_geometry(),
+            )?,
+        ];
         let contract = vibevoice_invocation_contract(
             &self.language_model,
             self.dtype,
             default_kv_page_size(),
             &[CacheDomainId::new(0)],
+            &tokenizer_domains,
         )?;
         let max_context_tokens = self
             .config
@@ -272,7 +289,7 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: VibeVoiceAsrGenerationOptions,
-        cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         Ok(self
@@ -282,7 +299,7 @@ impl VibeVoiceAsrModel {
                 language,
                 prompt,
                 options,
-                cache,
+                leases,
                 on_delta,
             )?
             .text)
@@ -295,7 +312,7 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: VibeVoiceAsrGenerationOptions,
-        cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
     ) -> Result<VibeVoiceAsrTranscriptionOutput> {
         let mut no_op = |_delta: &str| {};
         self.transcribe_internal(
@@ -304,7 +321,7 @@ impl VibeVoiceAsrModel {
             language,
             prompt,
             options,
-            cache,
+            leases,
             &mut no_op,
         )
     }
@@ -320,12 +337,33 @@ impl VibeVoiceAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: VibeVoiceAsrGenerationOptions,
-        physical_cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<VibeVoiceAsrTranscriptionOutput> {
         if audio.is_empty() {
             return Err(Error::InvalidInput(
                 "VibeVoice-ASR audio input cannot be empty".to_string(),
+            ));
+        }
+        let domains = leases.domains().collect::<Vec<_>>();
+        if domains
+            != vec![
+                crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODER_DOMAIN,
+                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+            ]
+            || leases
+                .lease(crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODER_DOMAIN)?
+                .kind()
+                != InvocationStateBackingKindV2::PagedAttention
+            || leases.lease(VIBEVOICE_ASR_ACOUSTIC_DOMAIN)?.kind()
+                != InvocationStateBackingKindV2::Tensor
+            || leases.lease(VIBEVOICE_ASR_SEMANTIC_DOMAIN)?.kind()
+                != InvocationStateBackingKindV2::Tensor
+        {
+            return Err(Error::InferenceError(
+                "VibeVoice ASR requires exact decoder pages and acoustic/semantic tensor state"
+                    .into(),
             ));
         }
         let total_started = Instant::now();
@@ -350,7 +388,18 @@ impl VibeVoiceAsrModel {
         let speech = Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
             .to_dtype(self.dtype)?;
         let audio_encode_started = Instant::now();
-        let (speech_features, encode_stats) = self.encode_speech(&speech)?;
+        let (speech_features, encode_stats) = {
+            let (acoustic, semantic) = leases
+                .lease_pair_mut(VIBEVOICE_ASR_ACOUSTIC_DOMAIN, VIBEVOICE_ASR_SEMANTIC_DOMAIN)?;
+            self.encode_speech(
+                &speech,
+                acoustic.typed_mut::<InvocationTensorLease>()?,
+                semantic.typed_mut::<InvocationTensorLease>()?,
+            )?
+        };
+        let physical_cache = leases
+            .lease_mut(crate::models::architectures::vibevoice::VIBEVOICE_ASR_DECODER_DOMAIN)?
+            .paged_cache_mut()?;
         let audio_encode_ms = elapsed_ms(audio_encode_started);
         let acoustic_frames = speech_features.dim(1)?;
         if acoustic_frames != expected_acoustic_frames {
@@ -511,7 +560,12 @@ impl VibeVoiceAsrModel {
         })
     }
 
-    fn encode_speech(&self, speech: &Tensor) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {
+    fn encode_speech(
+        &self,
+        speech: &Tensor,
+        acoustic_state: &mut InvocationTensorLease,
+        semantic_state: &mut InvocationTensorLease,
+    ) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {
         let total_samples = speech.dim(2)?;
         let chunk_samples = tokenizer_streaming_chunk_samples(
             self.preprocessor.target_sample_rate(),
@@ -521,7 +575,12 @@ impl VibeVoiceAsrModel {
             && self.config.acoustic_tokenizer_config.causal
             && self.config.semantic_tokenizer_config.causal;
         if can_stream {
-            return self.encode_speech_streaming(speech, chunk_samples);
+            return self.encode_speech_streaming(
+                speech,
+                chunk_samples,
+                acoustic_state,
+                semantic_state,
+            );
         }
 
         Ok((
@@ -549,26 +608,35 @@ impl VibeVoiceAsrModel {
         &self,
         speech: &Tensor,
         chunk_samples: usize,
+        acoustic_state: &mut InvocationTensorLease,
+        semantic_state: &mut InvocationTensorLease,
     ) -> Result<(Tensor, VibeVoiceAsrEncodeStats)> {
         let total_samples = speech.dim(2)?;
         let ranges = tokenizer_chunk_ranges(total_samples, chunk_samples);
-        let mut acoustic_cache = VibeVoiceTokenizerStreamingCache::new();
-        let mut semantic_cache = VibeVoiceTokenizerStreamingCache::new();
         let mut acoustic_means = Vec::with_capacity(ranges.len());
         let mut semantic_means = Vec::with_capacity(ranges.len());
         let mut acoustic_std = None;
 
         for (start, len) in &ranges {
             let chunk = speech.narrow(2, *start, *len)?;
-            let acoustic = self
-                .acoustic_tokenizer
-                .encode_streaming(&chunk, &mut acoustic_cache)?;
+            let advance = u64::try_from(*len).map_err(|_| {
+                Error::InferenceError("VibeVoice ASR chunk length exceeds u64".into())
+            })?;
+            let acoustic = self.acoustic_tokenizer.encode_streaming_physical(
+                &chunk,
+                VIBEVOICE_ASR_ACOUSTIC_DOMAIN,
+                advance,
+                acoustic_state,
+            )?;
             acoustic_std = acoustic_std.or(acoustic.std);
             acoustic_means.push(acoustic.mean);
 
-            let semantic = self
-                .semantic_tokenizer
-                .encode_streaming(&chunk, &mut semantic_cache)?;
+            let semantic = self.semantic_tokenizer.encode_streaming_physical(
+                &chunk,
+                VIBEVOICE_ASR_SEMANTIC_DOMAIN,
+                advance,
+                semantic_state,
+            )?;
             semantic_means.push(semantic.mean);
         }
 

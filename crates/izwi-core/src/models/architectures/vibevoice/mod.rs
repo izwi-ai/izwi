@@ -1,5 +1,7 @@
 //! Native VibeVoice model components.
 
+use std::collections::BTreeMap;
+
 use candle_core::DType;
 
 use crate::engine::StageDescriptor;
@@ -8,11 +10,14 @@ use crate::kv::v2::{
     stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
     InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
     InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, StateDType,
-    StateDomainSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, ShapeAxis,
+    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
+    StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec,
+    TensorRole, TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::{CacheDomainId, KvCacheContract};
 use crate::models::architectures::qwen3::core::Qwen3Model;
+use crate::models::architectures::vibevoice::tokenizer::VibeVoiceTokenizerStateComponentGeometry;
 
 pub mod asr;
 pub mod config;
@@ -22,10 +27,55 @@ pub mod prompt;
 pub mod tokenizer;
 pub mod tts;
 
+pub(crate) const VIBEVOICE_ASR_DECODER_DOMAIN: StateDomainId = StateDomainId::new(1);
+pub(crate) const VIBEVOICE_ASR_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(2);
+pub(crate) const VIBEVOICE_ASR_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::new(3);
+pub(crate) const VIBEVOICE_TTS_POSITIVE_DOMAIN: StateDomainId = StateDomainId::new(1);
+pub(crate) const VIBEVOICE_TTS_NEGATIVE_DOMAIN: StateDomainId = StateDomainId::new(2);
+pub(crate) const VIBEVOICE_TTS_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(3);
+pub(crate) const VIBEVOICE_TTS_SEMANTIC_DOMAIN: StateDomainId = StateDomainId::new(4);
+
 #[derive(Debug, Clone)]
 pub(crate) struct VibeVoicePhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: InferenceStateContract,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VibeVoiceTokenizerStateDomain {
+    domain: StateDomainId,
+    group: StateGroupId,
+    clock: StateClock,
+    components: Vec<VibeVoiceTokenizerStateComponentGeometry>,
+}
+
+impl VibeVoiceTokenizerStateDomain {
+    pub(crate) fn new(
+        domain: StateDomainId,
+        group: StateGroupId,
+        clock: StateClock,
+        components: Vec<VibeVoiceTokenizerStateComponentGeometry>,
+    ) -> Result<Self> {
+        if domain.get() == 0 || group.get() == 0 || components.is_empty() {
+            return Err(Error::ModelLoadError(
+                "VibeVoice tokenizer state requires non-zero identities and components".into(),
+            ));
+        }
+        if components
+            .iter()
+            .any(|component| component.channels == 0 || component.frames == 0)
+        {
+            return Err(Error::ModelLoadError(
+                "VibeVoice tokenizer state has zero-sized convolution geometry".into(),
+            ));
+        }
+        Ok(Self {
+            domain,
+            group,
+            clock,
+            components,
+        })
+    }
 }
 
 pub(crate) fn vibevoice_invocation_contract(
@@ -33,6 +83,7 @@ pub(crate) fn vibevoice_invocation_contract(
     dtype: DType,
     preferred_page_tokens: usize,
     domains: &[CacheDomainId],
+    tokenizer_domains: &[VibeVoiceTokenizerStateDomain],
 ) -> Result<InferenceStateContract> {
     if domains.is_empty() {
         return Err(Error::ModelLoadError(
@@ -48,11 +99,13 @@ pub(crate) fn vibevoice_invocation_contract(
         abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
         domains: legacy_domains,
     };
-    vibevoice_invocation_contract_from_legacy(&legacy)
+    vibevoice_invocation_contract_from_legacy(&legacy, dtype, tokenizer_domains)
 }
 
 fn vibevoice_invocation_contract_from_legacy(
     legacy: &KvCacheContract,
+    dtype: DType,
+    tokenizer_domains: &[VibeVoiceTokenizerStateDomain],
 ) -> Result<InferenceStateContract> {
     legacy.validate()?;
     let mut contract = upgrade_kv_contract_v1(legacy)?;
@@ -69,8 +122,121 @@ fn vibevoice_invocation_contract_from_legacy(
     for group in &mut contract.groups {
         group.prefix_shareable = false;
     }
+    append_tokenizer_state_domains(&mut contract, dtype, tokenizer_domains)?;
     contract.validate()?;
     Ok(contract)
+}
+
+fn append_tokenizer_state_domains(
+    contract: &mut InferenceStateContract,
+    dtype: DType,
+    tokenizer_domains: &[VibeVoiceTokenizerStateDomain],
+) -> Result<()> {
+    if tokenizer_domains.is_empty() {
+        return Ok(());
+    }
+    let state_dtype = vibevoice_state_dtype(dtype)?;
+    let mut grouped = BTreeMap::<StateGroupId, Vec<StateDomainId>>::new();
+    for authored in tokenizer_domains {
+        if contract
+            .domains
+            .iter()
+            .any(|domain| domain.id() == authored.domain)
+        {
+            return Err(Error::ModelLoadError(format!(
+                "VibeVoice tokenizer domain {} collides with decoder state",
+                authored.domain.get()
+            )));
+        }
+        let components = authored
+            .components
+            .iter()
+            .enumerate()
+            .map(|(index, geometry)| {
+                let id = u32::try_from(index + 1).map_err(|_| {
+                    Error::ModelLoadError("VibeVoice tokenizer component count exceeds u32".into())
+                })?;
+                Ok(TensorComponentSpec {
+                    id: StateComponentId::new(id),
+                    role: TensorRole::ConvolutionState,
+                    shape: crate::kv::v2::BoundedShape {
+                        dimensions: vec![
+                            ShapeDimension {
+                                axis: ShapeAxis::Batch,
+                                extent: ShapeExtent::Fixed { value: 1 },
+                            },
+                            ShapeDimension {
+                                axis: ShapeAxis::Channels,
+                                extent: ShapeExtent::Fixed {
+                                    value: u64::try_from(geometry.channels).map_err(|_| {
+                                        Error::ModelLoadError(
+                                            "VibeVoice tokenizer channels exceed u64".into(),
+                                        )
+                                    })?,
+                                },
+                            },
+                            ShapeDimension {
+                                axis: ShapeAxis::Frames,
+                                extent: ShapeExtent::Fixed {
+                                    value: u64::try_from(geometry.frames).map_err(|_| {
+                                        Error::ModelLoadError(
+                                            "VibeVoice tokenizer frames exceed u64".into(),
+                                        )
+                                    })?,
+                                },
+                            },
+                        ],
+                    },
+                    accepted_dtypes: vec![state_dtype],
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: authored.domain,
+                    scope: StateScope::Invocation,
+                    clock: authored.clock.clone(),
+                    placement: PlacementPolicy::BackendLocal,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::None,
+                },
+                components,
+            }));
+        grouped
+            .entry(authored.group)
+            .or_default()
+            .push(authored.domain);
+    }
+    contract.domains.sort_unstable_by_key(StateDomainSpec::id);
+    for (group, mut domains) in grouped {
+        if contract.groups.iter().any(|existing| existing.id == group) {
+            return Err(Error::ModelLoadError(format!(
+                "VibeVoice tokenizer group {} collides with decoder state",
+                group.get()
+            )));
+        }
+        domains.sort_unstable();
+        contract.groups.push(StateGroupSpec {
+            id: group,
+            domains,
+            prefix_shareable: false,
+        });
+    }
+    contract.groups.sort_unstable_by_key(|group| group.id);
+    Ok(())
+}
+
+fn vibevoice_state_dtype(dtype: DType) -> Result<StateDType> {
+    match dtype {
+        DType::F32 => Ok(StateDType::F32),
+        DType::F16 => Ok(StateDType::F16),
+        DType::BF16 => Ok(StateDType::Bf16),
+        other => Err(Error::ModelLoadError(format!(
+            "VibeVoice tokenizer state requires F32, F16, or BF16, got {other:?}"
+        ))),
+    }
 }
 
 pub(crate) fn vibevoice_invocation_descriptor(
@@ -102,15 +268,31 @@ pub(crate) fn vibevoice_invocation_descriptor(
                 .iter()
                 .cloned()
                 .map(|state| {
+                    let (fixed_bytes, capacity) = match &state {
+                        StateDomainSpec::PagedAttention(_) => (
+                            vibevoice_paged_invocation_bytes(&state, max_tokens)?,
+                            InvocationStateCapacity::PagedTokens { max_tokens },
+                        ),
+                        StateDomainSpec::Tensor(_) => (
+                            vibevoice_tensor_invocation_bytes(&state)?,
+                            InvocationStateCapacity::SemanticBounded,
+                        ),
+                        _ => {
+                            return Err(Error::ModelLoadError(
+                                "VibeVoice invocation workspace contains an unsupported state kind"
+                                    .into(),
+                            ));
+                        }
+                    };
                     Ok(InvocationWorkspaceDomain::State {
                         placement: state.header().placement,
                         formula: WorkspaceFormula {
-                            fixed_bytes: vibevoice_paged_invocation_bytes(&state, max_tokens)?,
+                            fixed_bytes,
                             dimensions: vec![],
                             terms: vec![],
                         },
                         state,
-                        capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+                        capacity,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -212,6 +394,38 @@ fn vibevoice_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) ->
         .ok_or_else(|| Error::ModelLoadError("VibeVoice invocation byte bound overflow".into()))
 }
 
+fn vibevoice_tensor_invocation_bytes(state: &StateDomainSpec) -> Result<u64> {
+    let StateDomainSpec::Tensor(spec) = state else {
+        return Err(Error::ModelLoadError(
+            "VibeVoice invocation workspace is not tensor state".into(),
+        ));
+    };
+    spec.components.iter().try_fold(0_u64, |total, component| {
+        let elements = component.shape.maximum_elements()?;
+        let element_bytes = component
+            .accepted_dtypes
+            .first()
+            .map(|dtype| match dtype {
+                StateDType::F32 => Ok(4_u64),
+                StateDType::F16 | StateDType::Bf16 => Ok(2_u64),
+                StateDType::I8 | StateDType::Q4 => Err(Error::ModelLoadError(
+                    "VibeVoice tokenizer state requires a dense dtype".into(),
+                )),
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice tokenizer state has no dtype".into())
+            })?;
+        total
+            .checked_add(elements.checked_mul(element_bytes).ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice tokenizer component bytes overflow".into())
+            })?)
+            .ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice tokenizer domain bytes overflow".into())
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -250,7 +464,7 @@ mod tests {
         }
     }
 
-    fn invocation_contract(domain_count: u32) -> InferenceStateContract {
+    fn legacy_contract(domain_count: u32, dtype: DType) -> KvCacheContract {
         let domains = (0..domain_count)
             .map(|domain| {
                 qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
@@ -262,7 +476,7 @@ mod tests {
                     key_head_dim: 8,
                     value_head_dim: 8,
                     sliding_window: None,
-                    storage_dtype: DType::F32,
+                    storage_dtype: dtype,
                     preferred_page_tokens: 16,
                     prefix_semantics: KvPrefixSemantics::CommittedFullPages {
                         positions: PositionSemantics::Absolute,
@@ -272,10 +486,41 @@ mod tests {
             })
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        vibevoice_invocation_contract_from_legacy(&KvCacheContract {
+        KvCacheContract {
             abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
             domains,
-        })
+        }
+    }
+
+    fn invocation_contract(domain_count: u32) -> InferenceStateContract {
+        vibevoice_invocation_contract_from_legacy(
+            &legacy_contract(domain_count, DType::F32),
+            DType::F32,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn tokenizer_domain(
+        domain: u32,
+        group: u32,
+        clock: StateClock,
+        geometry: &[(usize, usize)],
+    ) -> VibeVoiceTokenizerStateDomain {
+        VibeVoiceTokenizerStateDomain::new(
+            StateDomainId::new(domain),
+            StateGroupId::new(group),
+            clock,
+            geometry
+                .iter()
+                .map(
+                    |(channels, frames)| VibeVoiceTokenizerStateComponentGeometry {
+                        channels: *channels,
+                        frames: *frames,
+                    },
+                )
+                .collect(),
+        )
         .unwrap()
     }
 
@@ -345,5 +590,133 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn asr_descriptor_couples_loaded_acoustic_and_semantic_tensor_state() {
+        let tokenizer = [
+            tokenizer_domain(2, 2, StateClock::AudioSamples, &[(2, 3), (4, 5)]),
+            tokenizer_domain(3, 2, StateClock::AudioSamples, &[(6, 7)]),
+        ];
+        let contract = vibevoice_invocation_contract_from_legacy(
+            &legacy_contract(1, DType::F32),
+            DType::F32,
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(
+            contract
+                .groups
+                .iter()
+                .map(|group| (group.id, group.domains.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (StateGroupId::new(1), vec![StateDomainId::new(1)]),
+                (
+                    StateGroupId::new(2),
+                    vec![StateDomainId::new(2), StateDomainId::new(3)]
+                ),
+            ]
+        );
+        assert!(matches!(
+            &contract.domains[1],
+            StateDomainSpec::Tensor(spec)
+                if spec.components.len() == 2
+                    && spec.components[0].id == StateComponentId::new(1)
+                    && spec.components[1].id == StateComponentId::new(2)
+                    && spec.header.clock == StateClock::AudioSamples
+        ));
+
+        let execution = stage();
+        let descriptor = vibevoice_invocation_descriptor(&[&[execution]], &contract, 4096).unwrap();
+        let InvocationWorkspaceSet::Bounded { profiles } = descriptor.invocation else {
+            panic!("ASR complete invocation state must be bounded");
+        };
+        let workspace = &profiles[0].stages[0];
+        assert_eq!(workspace.domains.len(), 3);
+        assert!(matches!(
+            &workspace.domains[1],
+            InvocationWorkspaceDomain::State {
+                capacity: InvocationStateCapacity::SemanticBounded,
+                formula: WorkspaceFormula {
+                    fixed_bytes: 104,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &workspace.domains[2],
+            InvocationWorkspaceDomain::State {
+                capacity: InvocationStateCapacity::SemanticBounded,
+                formula: WorkspaceFormula {
+                    fixed_bytes: 168,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tts_descriptor_keeps_cfg_pages_isolated_and_couples_tokenizer_state() {
+        let tokenizer = [
+            tokenizer_domain(3, 3, StateClock::CodecFrames, &[(2, 3)]),
+            tokenizer_domain(4, 3, StateClock::CodecFrames, &[(4, 5)]),
+        ];
+        let contract = vibevoice_invocation_contract_from_legacy(
+            &legacy_contract(2, DType::F32),
+            DType::F32,
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(
+            contract
+                .groups
+                .iter()
+                .map(|group| (group.id, group.domains.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (StateGroupId::new(1), vec![StateDomainId::new(1)]),
+                (StateGroupId::new(2), vec![StateDomainId::new(2)]),
+                (
+                    StateGroupId::new(3),
+                    vec![StateDomainId::new(3), StateDomainId::new(4)]
+                ),
+            ]
+        );
+        assert!(contract.domains[2..].iter().all(|domain| matches!(
+            domain,
+            StateDomainSpec::Tensor(spec) if spec.header.clock == StateClock::CodecFrames
+        )));
+
+        let execution = stage();
+        let descriptor = vibevoice_invocation_descriptor(&[&[execution]], &contract, 8192).unwrap();
+        let InvocationWorkspaceSet::Bounded { profiles } = descriptor.invocation else {
+            panic!("TTS complete invocation state must be bounded");
+        };
+        let workspace = &profiles[0].stages[0];
+        assert_eq!(workspace.groups, contract.groups);
+        assert_eq!(workspace.domains.len(), 4);
+    }
+
+    #[test]
+    fn tokenizer_tensor_bytes_follow_the_exact_loaded_dtype() {
+        let tokenizer = [tokenizer_domain(
+            2,
+            2,
+            StateClock::CodecFrames,
+            &[(2, 3), (4, 5)],
+        )];
+        let contract = vibevoice_invocation_contract_from_legacy(
+            &legacy_contract(1, DType::F16),
+            DType::F16,
+            &tokenizer,
+        )
+        .unwrap();
+        assert_eq!(
+            vibevoice_tensor_invocation_bytes(&contract.domains[1]).unwrap(),
+            52
+        );
     }
 }

@@ -10,8 +10,11 @@ use tracing::{debug, info, warn};
 
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelVariant};
-use crate::engine::StageDescriptor;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2, StateClock, StateGroupId,
+};
 use crate::kv::CacheDomainId;
 use crate::models::architectures::qwen3::core::{Qwen3Model, Qwen3WeightLayout};
 use crate::models::architectures::vibevoice::config::{
@@ -25,17 +28,17 @@ use crate::models::architectures::vibevoice::prompt::{
     VibeVoicePromptTokenizer, VibeVoiceSpecialTokens,
 };
 use crate::models::architectures::vibevoice::tokenizer::{
-    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer, VibeVoiceTokenizerStreamingCache,
+    VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer,
 };
 use crate::models::architectures::vibevoice::{
     vibevoice_invocation_contract, vibevoice_physical_state_spec, VibeVoicePhysicalStateSpec,
+    VibeVoiceTokenizerStateDomain, VIBEVOICE_TTS_ACOUSTIC_DOMAIN, VIBEVOICE_TTS_SEMANTIC_DOMAIN,
 };
 use crate::models::shared::attention::flash::{
     cuda_flash_attention_head_dim_supported, flash_attention_compiled, flash_attention_requested,
     should_enable_flash_attention_v2,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
-use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::telemetry::{
     snapshot as kernel_telemetry_snapshot, KernelPathTelemetrySnapshot,
 };
@@ -308,11 +311,26 @@ impl VibeVoiceTtsModel {
         &self,
         stage_graphs: &[&[StageDescriptor]],
     ) -> Result<VibeVoicePhysicalStateSpec> {
+        let tokenizer_domains = [
+            VibeVoiceTokenizerStateDomain::new(
+                VIBEVOICE_TTS_ACOUSTIC_DOMAIN,
+                StateGroupId::new(3),
+                StateClock::CodecFrames,
+                self.acoustic_tokenizer.decoder_state_geometry(),
+            )?,
+            VibeVoiceTokenizerStateDomain::new(
+                VIBEVOICE_TTS_SEMANTIC_DOMAIN,
+                StateGroupId::new(3),
+                StateClock::CodecFrames,
+                self.semantic_tokenizer.encoder_state_geometry(),
+            )?,
+        ];
         let contract = vibevoice_invocation_contract(
             &self.language_model,
             self.dtype,
             default_kv_page_size(),
             &[CacheDomainId::new(0), CacheDomainId::new(1)],
+            &tokenizer_domains,
         )?;
         let max_context_tokens = self
             .config
@@ -386,17 +404,9 @@ impl VibeVoiceTtsModel {
         reference: &VibeVoiceSpeakerReference,
         speaker: Option<&str>,
         params: VibeVoiceTtsGenerationParams,
-        positive_cache: &mut PhysicalPagedKvCache,
-        negative_cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
     ) -> Result<VibeVoiceTtsOutput> {
-        self.generate_with_reference_internal(
-            text,
-            reference,
-            speaker,
-            params,
-            positive_cache,
-            negative_cache,
-        )
+        self.generate_with_reference_internal(text, reference, speaker, params, leases)
     }
 
     fn generate_with_reference_internal(
@@ -405,8 +415,7 @@ impl VibeVoiceTtsModel {
         reference: &VibeVoiceSpeakerReference,
         speaker: Option<&str>,
         params: VibeVoiceTtsGenerationParams,
-        positive_cache: &mut PhysicalPagedKvCache,
-        negative_cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
     ) -> Result<VibeVoiceTtsOutput> {
         if text.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -421,6 +430,32 @@ impl VibeVoiceTtsModel {
         if reference.audio_samples.is_empty() {
             return Err(Error::InvalidInput(
                 "VibeVoice TTS reference_audio cannot be empty".to_string(),
+            ));
+        }
+        let domains = leases.domains().collect::<Vec<_>>();
+        if domains
+            != vec![
+                crate::models::architectures::vibevoice::VIBEVOICE_TTS_POSITIVE_DOMAIN,
+                crate::models::architectures::vibevoice::VIBEVOICE_TTS_NEGATIVE_DOMAIN,
+                VIBEVOICE_TTS_ACOUSTIC_DOMAIN,
+                VIBEVOICE_TTS_SEMANTIC_DOMAIN,
+            ]
+            || leases
+                .lease(crate::models::architectures::vibevoice::VIBEVOICE_TTS_POSITIVE_DOMAIN)?
+                .kind()
+                != InvocationStateBackingKindV2::PagedAttention
+            || leases
+                .lease(crate::models::architectures::vibevoice::VIBEVOICE_TTS_NEGATIVE_DOMAIN)?
+                .kind()
+                != InvocationStateBackingKindV2::PagedAttention
+            || leases.lease(VIBEVOICE_TTS_ACOUSTIC_DOMAIN)?.kind()
+                != InvocationStateBackingKindV2::Tensor
+            || leases.lease(VIBEVOICE_TTS_SEMANTIC_DOMAIN)?.kind()
+                != InvocationStateBackingKindV2::Tensor
+        {
+            return Err(Error::InvalidInput(
+                "VibeVoice TTS requires exact positive/negative pages and acoustic/semantic tensor state"
+                    .into(),
             ));
         }
 
@@ -453,36 +488,44 @@ impl VibeVoiceTtsModel {
         profile.prompt_embed_ms = elapsed_ms(started);
 
         let max_frames = params.max_frames.max(1);
-        if positive_cache.context_len() != 0
-            || negative_cache.context_len() != 0
-            || positive_cache.arena().id() == negative_cache.arena().id()
-        {
-            return Err(Error::InvalidInput(
-                "VibeVoice TTS requires empty, domain-isolated positive and negative invocation caches"
-                    .into(),
-            ));
-        }
-        let started = Instant::now();
-        let prefill_hidden = self.language_model.forward_managed_hidden_with_embeds(
-            &input_embeds,
-            0,
-            positive_cache,
-            None,
-        )?;
-        profile.positive_prefill_ms = elapsed_ms(started);
+        let (prefill_hidden, negative_hidden) = {
+            let (positive, negative) = leases.lease_pair_mut(
+                crate::models::architectures::vibevoice::VIBEVOICE_TTS_POSITIVE_DOMAIN,
+                crate::models::architectures::vibevoice::VIBEVOICE_TTS_NEGATIVE_DOMAIN,
+            )?;
+            let positive_cache = positive.paged_cache_mut()?;
+            let negative_cache = negative.paged_cache_mut()?;
+            if positive_cache.context_len() != 0
+                || negative_cache.context_len() != 0
+                || positive_cache.arena().id() == negative_cache.arena().id()
+            {
+                return Err(Error::InvalidInput(
+                    "VibeVoice TTS requires empty, domain-isolated decoder pages".into(),
+                ));
+            }
+            let started = Instant::now();
+            let prefill_hidden = self.language_model.forward_managed_hidden_with_embeds(
+                &input_embeds,
+                0,
+                positive_cache,
+                None,
+            )?;
+            profile.positive_prefill_ms = elapsed_ms(started);
+            let negative_id = vibevoice_tts_negative_prefill_token(self.tokenizer.specials());
+            let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
+            let started = Instant::now();
+            let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
+                &self.language_model.embeddings(&negative_ids)?,
+                0,
+                negative_cache,
+                None,
+            )?;
+            profile.negative_prefill_ms = elapsed_ms(started);
+            (prefill_hidden, negative_hidden)
+        };
         let mut pos = prompt.input_ids.len();
         let mut last_hidden = last_sequence_hidden(&prefill_hidden, "VibeVoice TTS prefill")?;
 
-        let negative_id = vibevoice_tts_negative_prefill_token(self.tokenizer.specials());
-        let negative_ids = Tensor::from_vec(vec![negative_id], (1, 1), &self.device.device)?;
-        let started = Instant::now();
-        let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
-            &self.language_model.embeddings(&negative_ids)?,
-            0,
-            negative_cache,
-            None,
-        )?;
-        profile.negative_prefill_ms = elapsed_ms(started);
         let mut negative_pos = 1usize;
         let mut negative_last_hidden =
             last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative prefill")?;
@@ -501,8 +544,6 @@ impl VibeVoiceTtsModel {
             self.device.kind,
         )?;
         profile.diffusion_steps = diffusion_plan.steps.len();
-        let mut feedback_acoustic_cache = VibeVoiceTokenizerStreamingCache::new();
-        let mut feedback_semantic_cache = VibeVoiceTokenizerStreamingCache::new();
         let mut scaled_latents = Vec::with_capacity(max_frames);
         for frame_idx in 0..max_frames {
             if frame_idx >= MIN_FRAMES_BEFORE_STOP {
@@ -531,36 +572,53 @@ impl VibeVoiceTtsModel {
             )?;
             profile.diffusion_sample_ms += elapsed_ms(started);
             let latent_frame = latent.unsqueeze(1)?;
-            let feedback = self.generated_speech_embed(
-                &latent_frame,
-                &reference.normalization,
-                &mut feedback_acoustic_cache,
-                &mut feedback_semantic_cache,
-            )?;
+            let feedback = {
+                let (acoustic, semantic) = leases
+                    .lease_pair_mut(VIBEVOICE_TTS_ACOUSTIC_DOMAIN, VIBEVOICE_TTS_SEMANTIC_DOMAIN)?;
+                if acoustic.kind() != InvocationStateBackingKindV2::Tensor
+                    || semantic.kind() != InvocationStateBackingKindV2::Tensor
+                {
+                    return Err(Error::InferenceError(
+                        "VibeVoice TTS tokenizer domains require tensor backing".into(),
+                    ));
+                }
+                self.generated_speech_embed(
+                    &latent_frame,
+                    &reference.normalization,
+                    acoustic.typed_mut::<InvocationTensorLease>()?,
+                    semantic.typed_mut::<InvocationTensorLease>()?,
+                )?
+            };
             profile.feedback_acoustic_decode_ms += feedback.acoustic_decode_ms;
             profile.feedback_semantic_encode_ms += feedback.semantic_encode_ms;
             profile.feedback_connector_ms += feedback.connector_ms;
             scaled_latents.push(latent_frame);
 
-            let started = Instant::now();
-            let hidden = self.language_model.forward_managed_hidden_with_embeds(
-                &feedback.embed,
-                pos,
-                positive_cache,
-                None,
-            )?;
-            profile.positive_decode_ms += elapsed_ms(started);
+            let (hidden, negative_hidden) = {
+                let (positive, negative) = leases.lease_pair_mut(
+                    crate::models::architectures::vibevoice::VIBEVOICE_TTS_POSITIVE_DOMAIN,
+                    crate::models::architectures::vibevoice::VIBEVOICE_TTS_NEGATIVE_DOMAIN,
+                )?;
+                let started = Instant::now();
+                let hidden = self.language_model.forward_managed_hidden_with_embeds(
+                    &feedback.embed,
+                    pos,
+                    positive.paged_cache_mut()?,
+                    None,
+                )?;
+                profile.positive_decode_ms += elapsed_ms(started);
+                let started = Instant::now();
+                let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
+                    &feedback.embed,
+                    negative_pos,
+                    negative.paged_cache_mut()?,
+                    None,
+                )?;
+                profile.negative_decode_ms += elapsed_ms(started);
+                (hidden, negative_hidden)
+            };
             pos += 1;
             last_hidden = last_sequence_hidden(&hidden, "VibeVoice TTS generated frame")?;
-
-            let started = Instant::now();
-            let negative_hidden = self.language_model.forward_managed_hidden_with_embeds(
-                &feedback.embed,
-                negative_pos,
-                negative_cache,
-                None,
-            )?;
-            profile.negative_decode_ms += elapsed_ms(started);
             negative_pos += 1;
             negative_last_hidden =
                 last_sequence_hidden(&negative_hidden, "VibeVoice TTS negative frame")?;
@@ -652,8 +710,8 @@ impl VibeVoiceTtsModel {
         &self,
         scaled_latent_frame: &Tensor,
         normalization: &LatentNormalization,
-        acoustic_cache: &mut VibeVoiceTokenizerStreamingCache,
-        semantic_cache: &mut VibeVoiceTokenizerStreamingCache,
+        acoustic_state: &mut InvocationTensorLease,
+        semantic_state: &mut InvocationTensorLease,
     ) -> Result<GeneratedSpeechFeedback> {
         let started = Instant::now();
         let acoustic_embed = self.acoustic_connector.forward(scaled_latent_frame)?;
@@ -664,14 +722,22 @@ impl VibeVoiceTtsModel {
             &normalization.scale,
         )?;
         let started = Instant::now();
-        let audio_chunk = self
-            .acoustic_tokenizer
-            .decode_streaming(&unscaled_frame, acoustic_cache)?;
+        let audio_chunk = self.acoustic_tokenizer.decode_streaming_physical(
+            &unscaled_frame,
+            VIBEVOICE_TTS_ACOUSTIC_DOMAIN,
+            1,
+            acoustic_state,
+        )?;
         let acoustic_decode_ms = elapsed_ms(started);
         let started = Instant::now();
         let semantic = self
             .semantic_tokenizer
-            .encode_streaming(&audio_chunk, semantic_cache)?
+            .encode_streaming_physical(
+                &audio_chunk,
+                VIBEVOICE_TTS_SEMANTIC_DOMAIN,
+                1,
+                semantic_state,
+            )?
             .mode();
         let semantic_encode_ms = elapsed_ms(started);
         let started = Instant::now();

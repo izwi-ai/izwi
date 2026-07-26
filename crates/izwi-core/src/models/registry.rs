@@ -758,19 +758,15 @@ impl NativeAsrModel {
                     cross_kv,
                 )
             }
-            Self::VibeVoice(_) => {
-                let cache = leases
-                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
-                    .paged_cache_mut()?;
-                self.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
+            Self::VibeVoice(_) => self
+                .transcribe_vibevoice_with_details_and_prompt_and_options_physical(
                     audio,
                     sample_rate,
                     language,
                     prompt,
                     options,
-                    cache,
-                )
-            }
+                    leases,
+                ),
             Self::GraniteSpeech(_) => {
                 let cache = leases
                     .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
@@ -1024,7 +1020,7 @@ impl NativeAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: NativeAsrGenerationOptions,
-        cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
     ) -> Result<NativeAsrTranscription> {
         let Self::VibeVoice(model) = self else {
             return Err(Error::InferenceError(
@@ -1041,7 +1037,7 @@ impl NativeAsrModel {
             language,
             prompt,
             vibevoice_asr_options(options),
-            cache,
+            leases,
         )?;
         Ok(NativeAsrTranscription {
             text,
@@ -1057,7 +1053,7 @@ impl NativeAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: NativeAsrGenerationOptions,
-        cache: &mut PhysicalPagedKvCache,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let Self::VibeVoice(model) = self else {
@@ -1071,7 +1067,7 @@ impl NativeAsrModel {
             language,
             prompt,
             vibevoice_asr_options(options),
-            cache,
+            leases,
             on_delta,
         )
     }

@@ -6,13 +6,27 @@ use candle_nn::{
     RmsNorm, VarBuilder,
 };
 
+use crate::backends::state::{
+    InvocationTensorComponentSlice, InvocationTensorComponentValue, InvocationTensorUpdateV2,
+};
+use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kv::v2::{
+    ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
+    StateComponentId, StateDomainId, StateUpdateKind,
+};
 use crate::models::architectures::vibevoice::config::VibeVoiceTokenizerConfig;
 use crate::models::shared::weights::mlx;
 
 pub struct VibeVoiceTokenizerEncoderOutput {
     pub mean: Tensor,
     pub std: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VibeVoiceTokenizerStateComponentGeometry {
+    pub(crate) channels: usize,
+    pub(crate) frames: usize,
 }
 
 impl VibeVoiceTokenizerEncoderOutput {
@@ -22,13 +36,13 @@ impl VibeVoiceTokenizerEncoderOutput {
 }
 
 #[derive(Default)]
-pub struct VibeVoiceTokenizerStreamingCache {
+struct TokenizerStreamingState {
     encoder: Option<TokenizerEncoderStreamingCache>,
     decoder: Option<TokenizerDecoderStreamingCache>,
 }
 
-impl VibeVoiceTokenizerStreamingCache {
-    pub fn new() -> Self {
+impl TokenizerStreamingState {
+    fn new() -> Self {
         Self::default()
     }
 
@@ -114,10 +128,18 @@ impl VibeVoiceAcousticTokenizer {
         })
     }
 
-    pub fn encode_streaming(
+    pub(crate) fn encoder_state_geometry(&self) -> Vec<VibeVoiceTokenizerStateComponentGeometry> {
+        self.encoder.streaming_state_geometry()
+    }
+
+    pub(crate) fn decoder_state_geometry(&self) -> Vec<VibeVoiceTokenizerStateComponentGeometry> {
+        self.decoder.streaming_state_geometry()
+    }
+
+    fn encode_streaming(
         &self,
         audio: &Tensor,
-        cache: &mut VibeVoiceTokenizerStreamingCache,
+        cache: &mut TokenizerStreamingState,
     ) -> Result<VibeVoiceTokenizerEncoderOutput> {
         let latents = self
             .encoder
@@ -126,6 +148,31 @@ impl VibeVoiceAcousticTokenizer {
             mean: latents.transpose(1, 2)?,
             std: Some(self.fix_std),
         })
+    }
+
+    pub(crate) fn encode_streaming_physical(
+        &self,
+        audio: &Tensor,
+        domain: StateDomainId,
+        advance_samples: u64,
+        lease: &mut InvocationTensorLease,
+    ) -> Result<VibeVoiceTokenizerEncoderOutput> {
+        let mut cache = TokenizerStreamingState::new();
+        let expected_cursor = hydrate_encoder_cache(lease, &self.encoder, &mut cache)?;
+        let output = self.encode_streaming(audio, &mut cache)?;
+        commit_encoder_cache(
+            lease,
+            domain,
+            expected_cursor,
+            advance_samples,
+            &self.encoder,
+            cache.encoder.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice acoustic encoder did not initialize physical state".into(),
+                )
+            })?,
+        )?;
+        Ok(output)
     }
 
     pub fn sample(&self, output: &VibeVoiceTokenizerEncoderOutput) -> Result<Tensor> {
@@ -151,10 +198,10 @@ impl VibeVoiceAcousticTokenizer {
         self.decoder.forward(&latents)
     }
 
-    pub fn decode_streaming(
+    fn decode_streaming(
         &self,
         latents: &Tensor,
-        cache: &mut VibeVoiceTokenizerStreamingCache,
+        cache: &mut TokenizerStreamingState,
     ) -> Result<Tensor> {
         let latents = if latents.dim(1)? == self.vae_dim {
             latents.clone()
@@ -163,6 +210,31 @@ impl VibeVoiceAcousticTokenizer {
         };
         self.decoder
             .forward_streaming(&latents, cache.decoder_mut(&self.decoder))
+    }
+
+    pub(crate) fn decode_streaming_physical(
+        &self,
+        latents: &Tensor,
+        domain: StateDomainId,
+        advance_frames: u64,
+        lease: &mut InvocationTensorLease,
+    ) -> Result<Tensor> {
+        let mut cache = TokenizerStreamingState::new();
+        let expected_cursor = hydrate_decoder_cache(lease, &self.decoder, &mut cache)?;
+        let output = self.decode_streaming(latents, &mut cache)?;
+        commit_decoder_cache(
+            lease,
+            domain,
+            expected_cursor,
+            advance_frames,
+            &self.decoder,
+            cache.decoder.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice acoustic decoder did not initialize physical state".into(),
+                )
+            })?,
+        )?;
+        Ok(output)
     }
 }
 
@@ -204,10 +276,14 @@ impl VibeVoiceSemanticTokenizer {
         })
     }
 
-    pub fn encode_streaming(
+    pub(crate) fn encoder_state_geometry(&self) -> Vec<VibeVoiceTokenizerStateComponentGeometry> {
+        self.encoder.streaming_state_geometry()
+    }
+
+    fn encode_streaming(
         &self,
         audio: &Tensor,
-        cache: &mut VibeVoiceTokenizerStreamingCache,
+        cache: &mut TokenizerStreamingState,
     ) -> Result<VibeVoiceTokenizerEncoderOutput> {
         let latents = self
             .encoder
@@ -216,6 +292,31 @@ impl VibeVoiceSemanticTokenizer {
             mean: latents.transpose(1, 2)?,
             std: None,
         })
+    }
+
+    pub(crate) fn encode_streaming_physical(
+        &self,
+        audio: &Tensor,
+        domain: StateDomainId,
+        advance: u64,
+        lease: &mut InvocationTensorLease,
+    ) -> Result<VibeVoiceTokenizerEncoderOutput> {
+        let mut cache = TokenizerStreamingState::new();
+        let expected_cursor = hydrate_encoder_cache(lease, &self.encoder, &mut cache)?;
+        let output = self.encode_streaming(audio, &mut cache)?;
+        commit_encoder_cache(
+            lease,
+            domain,
+            expected_cursor,
+            advance,
+            &self.encoder,
+            cache.encoder.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice semantic encoder did not initialize physical state".into(),
+                )
+            })?,
+        )?;
+        Ok(output)
     }
 }
 
@@ -239,6 +340,23 @@ struct TokenizerStackConfig {
     trim_right_ratio: f32,
 }
 
+impl TokenizerStackConfig {
+    fn validate_topology(&self, stack: &str) -> Result<()> {
+        let expected_depths =
+            self.ratios.len().checked_add(1).ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice tokenizer topology overflow".into())
+            })?;
+        if self.depths.len() != expected_depths {
+            return Err(Error::ModelLoadError(format!(
+                "VibeVoice tokenizer {stack} requires depths.len() == ratios.len() + 1, got {} depths and {} ratios",
+                self.depths.len(),
+                self.ratios.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 struct TokenizerEncoder {
     downsample_layers: Vec<SConv1d>,
     stages: Vec<Vec<Block1D>>,
@@ -248,6 +366,7 @@ struct TokenizerEncoder {
 
 impl TokenizerEncoder {
     fn load(config: TokenizerStackConfig, vb: VarBuilder) -> Result<Self> {
+        config.validate_topology("encoder")?;
         validate_constant_padding(&config.pad_mode)?;
         let mut ratios = config.ratios.clone();
         ratios.reverse();
@@ -381,6 +500,61 @@ impl TokenizerEncoder {
             head: self.head.streaming_cache(),
         }
     }
+
+    fn streaming_state_geometry(&self) -> Vec<VibeVoiceTokenizerStateComponentGeometry> {
+        let mut geometry = Vec::new();
+        for (downsample, stage) in self.downsample_layers.iter().zip(&self.stages) {
+            downsample.push_streaming_state_geometry(&mut geometry);
+            for block in stage {
+                block.push_streaming_state_geometry(&mut geometry);
+            }
+        }
+        self.head.push_streaming_state_geometry(&mut geometry);
+        geometry
+    }
+
+    fn hydrate_streaming_state(
+        &self,
+        cache: &mut TokenizerEncoderStreamingCache,
+        components: &[InvocationTensorComponentSlice],
+    ) -> Result<()> {
+        let mut cursor = PhysicalComponentCursor::new(components);
+        for ((downsample, downsample_cache), (stage, stage_cache)) in self
+            .downsample_layers
+            .iter()
+            .zip(&mut cache.downsample_layers)
+            .zip(self.stages.iter().zip(&mut cache.stages))
+        {
+            downsample.hydrate_streaming_state(downsample_cache, &mut cursor)?;
+            for (block, block_cache) in stage.iter().zip(stage_cache) {
+                block.hydrate_streaming_state(block_cache, &mut cursor)?;
+            }
+        }
+        self.head
+            .hydrate_streaming_state(&mut cache.head, &mut cursor)?;
+        cursor.finish()
+    }
+
+    fn collect_streaming_state(
+        &self,
+        cache: &TokenizerEncoderStreamingCache,
+    ) -> Result<Vec<Tensor>> {
+        let mut components = Vec::new();
+        for ((downsample, downsample_cache), (stage, stage_cache)) in self
+            .downsample_layers
+            .iter()
+            .zip(&cache.downsample_layers)
+            .zip(self.stages.iter().zip(&cache.stages))
+        {
+            downsample.collect_streaming_state(downsample_cache, &mut components)?;
+            for (block, block_cache) in stage.iter().zip(stage_cache) {
+                block.collect_streaming_state(block_cache, &mut components)?;
+            }
+        }
+        self.head
+            .collect_streaming_state(&cache.head, &mut components)?;
+        Ok(components)
+    }
 }
 
 struct TokenizerDecoder {
@@ -392,6 +566,7 @@ struct TokenizerDecoder {
 
 impl TokenizerDecoder {
     fn load(config: TokenizerStackConfig, vb: VarBuilder) -> Result<Self> {
+        config.validate_topology("decoder")?;
         validate_constant_padding(&config.pad_mode)?;
         let mut upsample_layers = Vec::with_capacity(config.ratios.len() + 1);
         let top_dim = config.n_filters * (1usize << config.depths.len().saturating_sub(1));
@@ -524,6 +699,61 @@ impl TokenizerDecoder {
             head: self.head.streaming_cache(),
         }
     }
+
+    fn streaming_state_geometry(&self) -> Vec<VibeVoiceTokenizerStateComponentGeometry> {
+        let mut geometry = Vec::new();
+        for (upsample, stage) in self.upsample_layers.iter().zip(&self.stages) {
+            upsample.push_streaming_state_geometry(&mut geometry);
+            for block in stage {
+                block.push_streaming_state_geometry(&mut geometry);
+            }
+        }
+        self.head.push_streaming_state_geometry(&mut geometry);
+        geometry
+    }
+
+    fn hydrate_streaming_state(
+        &self,
+        cache: &mut TokenizerDecoderStreamingCache,
+        components: &[InvocationTensorComponentSlice],
+    ) -> Result<()> {
+        let mut cursor = PhysicalComponentCursor::new(components);
+        for ((upsample, upsample_cache), (stage, stage_cache)) in self
+            .upsample_layers
+            .iter()
+            .zip(&mut cache.upsample_layers)
+            .zip(self.stages.iter().zip(&mut cache.stages))
+        {
+            upsample.hydrate_streaming_state(upsample_cache, &mut cursor)?;
+            for (block, block_cache) in stage.iter().zip(stage_cache) {
+                block.hydrate_streaming_state(block_cache, &mut cursor)?;
+            }
+        }
+        self.head
+            .hydrate_streaming_state(&mut cache.head, &mut cursor)?;
+        cursor.finish()
+    }
+
+    fn collect_streaming_state(
+        &self,
+        cache: &TokenizerDecoderStreamingCache,
+    ) -> Result<Vec<Tensor>> {
+        let mut components = Vec::new();
+        for ((upsample, upsample_cache), (stage, stage_cache)) in self
+            .upsample_layers
+            .iter()
+            .zip(&cache.upsample_layers)
+            .zip(self.stages.iter().zip(&cache.stages))
+        {
+            upsample.collect_streaming_state(upsample_cache, &mut components)?;
+            for (block, block_cache) in stage.iter().zip(stage_cache) {
+                block.collect_streaming_state(block_cache, &mut components)?;
+            }
+        }
+        self.head
+            .collect_streaming_state(&cache.head, &mut components)?;
+        Ok(components)
+    }
 }
 
 enum UpsampleLayer {
@@ -563,6 +793,52 @@ impl UpsampleLayer {
             Self::Transposed(layer) => {
                 UpsampleLayerStreamingCache::Transposed(layer.streaming_cache())
             }
+        }
+    }
+
+    fn push_streaming_state_geometry(
+        &self,
+        geometry: &mut Vec<VibeVoiceTokenizerStateComponentGeometry>,
+    ) {
+        match self {
+            Self::Conv(layer) => layer.push_streaming_state_geometry(geometry),
+            Self::Transposed(layer) => layer.push_streaming_state_geometry(geometry),
+        }
+    }
+
+    fn hydrate_streaming_state(
+        &self,
+        cache: &mut UpsampleLayerStreamingCache,
+        cursor: &mut PhysicalComponentCursor<'_>,
+    ) -> Result<()> {
+        match (self, cache) {
+            (Self::Conv(layer), UpsampleLayerStreamingCache::Conv(cache)) => {
+                layer.hydrate_streaming_state(cache, cursor)
+            }
+            (Self::Transposed(layer), UpsampleLayerStreamingCache::Transposed(cache)) => {
+                layer.hydrate_streaming_state(cache, cursor)
+            }
+            _ => Err(Error::InferenceError(
+                "VibeVoice tokenizer physical decoder state layer type mismatch".into(),
+            )),
+        }
+    }
+
+    fn collect_streaming_state(
+        &self,
+        cache: &UpsampleLayerStreamingCache,
+        components: &mut Vec<Tensor>,
+    ) -> Result<()> {
+        match (self, cache) {
+            (Self::Conv(layer), UpsampleLayerStreamingCache::Conv(cache)) => {
+                layer.collect_streaming_state(cache, components)
+            }
+            (Self::Transposed(layer), UpsampleLayerStreamingCache::Transposed(cache)) => {
+                layer.collect_streaming_state(cache, components)
+            }
+            _ => Err(Error::InferenceError(
+                "VibeVoice tokenizer physical decoder state layer type mismatch".into(),
+            )),
         }
     }
 }
@@ -664,10 +940,34 @@ impl Block1D {
             mixer: self.mixer.streaming_cache(),
         }
     }
+
+    fn push_streaming_state_geometry(
+        &self,
+        geometry: &mut Vec<VibeVoiceTokenizerStateComponentGeometry>,
+    ) {
+        self.mixer.push_streaming_state_geometry(geometry);
+    }
+
+    fn hydrate_streaming_state(
+        &self,
+        cache: &mut Block1DStreamingCache,
+        cursor: &mut PhysicalComponentCursor<'_>,
+    ) -> Result<()> {
+        self.mixer.hydrate_streaming_state(&mut cache.mixer, cursor)
+    }
+
+    fn collect_streaming_state(
+        &self,
+        cache: &Block1DStreamingCache,
+        components: &mut Vec<Tensor>,
+    ) -> Result<()> {
+        self.mixer.collect_streaming_state(&cache.mixer, components)
+    }
 }
 
 struct SConv1d {
     conv: Conv1d,
+    input_channels: usize,
     causal_padding: usize,
     right_padding: usize,
 }
@@ -707,6 +1007,7 @@ impl SConv1d {
         };
         Ok(Self {
             conv,
+            input_channels: in_channels,
             causal_padding,
             right_padding,
         })
@@ -748,10 +1049,60 @@ impl SConv1d {
     fn streaming_cache(&self) -> SConv1dStreamingCache {
         SConv1dStreamingCache::default()
     }
+
+    fn push_streaming_state_geometry(
+        &self,
+        geometry: &mut Vec<VibeVoiceTokenizerStateComponentGeometry>,
+    ) {
+        if self.causal_padding > 0 {
+            geometry.push(VibeVoiceTokenizerStateComponentGeometry {
+                channels: self.input_channels,
+                frames: self.causal_padding,
+            });
+        }
+    }
+
+    fn hydrate_streaming_state(
+        &self,
+        cache: &mut SConv1dStreamingCache,
+        cursor: &mut PhysicalComponentCursor<'_>,
+    ) -> Result<()> {
+        cache.prefix = if self.causal_padding == 0 {
+            None
+        } else {
+            Some(cursor.next(VibeVoiceTokenizerStateComponentGeometry {
+                channels: self.input_channels,
+                frames: self.causal_padding,
+            })?)
+        };
+        Ok(())
+    }
+
+    fn collect_streaming_state(
+        &self,
+        cache: &SConv1dStreamingCache,
+        components: &mut Vec<Tensor>,
+    ) -> Result<()> {
+        if self.causal_padding > 0 {
+            components.push(
+                cache
+                    .prefix
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "VibeVoice tokenizer physical prefix was not initialized".into(),
+                        )
+                    })?
+                    .contiguous()?,
+            );
+        }
+        Ok(())
+    }
 }
 
 struct SConvTranspose1d {
     conv: ConvTranspose1d,
+    output_channels: usize,
     left_trim: usize,
     right_trim: usize,
 }
@@ -790,6 +1141,7 @@ impl SConvTranspose1d {
         };
         Ok(Self {
             conv,
+            output_channels: out_channels,
             left_trim,
             right_trim,
         })
@@ -831,6 +1183,55 @@ impl SConvTranspose1d {
 
     fn streaming_cache(&self) -> SConvTranspose1dStreamingCache {
         SConvTranspose1dStreamingCache::default()
+    }
+
+    fn push_streaming_state_geometry(
+        &self,
+        geometry: &mut Vec<VibeVoiceTokenizerStateComponentGeometry>,
+    ) {
+        if self.right_trim > 0 {
+            geometry.push(VibeVoiceTokenizerStateComponentGeometry {
+                channels: self.output_channels,
+                frames: self.right_trim,
+            });
+        }
+    }
+
+    fn hydrate_streaming_state(
+        &self,
+        cache: &mut SConvTranspose1dStreamingCache,
+        cursor: &mut PhysicalComponentCursor<'_>,
+    ) -> Result<()> {
+        cache.tail = if self.right_trim == 0 {
+            None
+        } else {
+            Some(cursor.next(VibeVoiceTokenizerStateComponentGeometry {
+                channels: self.output_channels,
+                frames: self.right_trim,
+            })?)
+        };
+        Ok(())
+    }
+
+    fn collect_streaming_state(
+        &self,
+        cache: &SConvTranspose1dStreamingCache,
+        components: &mut Vec<Tensor>,
+    ) -> Result<()> {
+        if self.right_trim > 0 {
+            components.push(
+                cache
+                    .tail
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "VibeVoice tokenizer physical overlap tail was not initialized".into(),
+                        )
+                    })?
+                    .contiguous()?,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -885,6 +1286,192 @@ impl SConv1dStreamingCache {
 #[derive(Default)]
 struct SConvTranspose1dStreamingCache {
     tail: Option<Tensor>,
+}
+
+struct PhysicalComponentCursor<'a> {
+    components: &'a [InvocationTensorComponentSlice],
+    index: usize,
+}
+
+impl<'a> PhysicalComponentCursor<'a> {
+    fn new(components: &'a [InvocationTensorComponentSlice]) -> Self {
+        Self {
+            components,
+            index: 0,
+        }
+    }
+
+    fn next(&mut self, geometry: VibeVoiceTokenizerStateComponentGeometry) -> Result<Tensor> {
+        let expected_id = StateComponentId::new(u32::try_from(self.index + 1).map_err(|_| {
+            Error::InferenceError("VibeVoice tokenizer physical component count exceeds u32".into())
+        })?);
+        let component = self.components.get(self.index).ok_or_else(|| {
+            Error::InferenceError(
+                "VibeVoice tokenizer physical snapshot is missing a component".into(),
+            )
+        })?;
+        if component.component != expected_id
+            || component.tensor.dims() != [1, geometry.channels, geometry.frames]
+        {
+            return Err(Error::InferenceError(format!(
+                "VibeVoice tokenizer physical component {} has shape {:?}, expected [1, {}, {}]",
+                component.component.get(),
+                component.tensor.dims(),
+                geometry.channels,
+                geometry.frames
+            )));
+        }
+        self.index += 1;
+        Ok(component.tensor.clone())
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.index != self.components.len() {
+            return Err(Error::InferenceError(format!(
+                "VibeVoice tokenizer physical snapshot has {} unused components",
+                self.components.len() - self.index
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn hydrate_encoder_cache(
+    lease: &InvocationTensorLease,
+    encoder: &TokenizerEncoder,
+    cache: &mut TokenizerStreamingState,
+) -> Result<u64> {
+    let expected_cursor = lease.arena()?.absolute_cursor();
+    if expected_cursor == 0 {
+        return Ok(0);
+    }
+    let snapshot = lease.read_snapshot()?;
+    if snapshot.absolute_cursor != expected_cursor || snapshot.valid_length != 1 {
+        return Err(Error::InferenceError(
+            "VibeVoice tokenizer encoder snapshot has stale cursor metadata".into(),
+        ));
+    }
+    encoder.hydrate_streaming_state(cache.encoder_mut(encoder), &snapshot.components)?;
+    Ok(expected_cursor)
+}
+
+fn hydrate_decoder_cache(
+    lease: &InvocationTensorLease,
+    decoder: &TokenizerDecoder,
+    cache: &mut TokenizerStreamingState,
+) -> Result<u64> {
+    let expected_cursor = lease.arena()?.absolute_cursor();
+    if expected_cursor == 0 {
+        return Ok(0);
+    }
+    let snapshot = lease.read_snapshot()?;
+    if snapshot.absolute_cursor != expected_cursor || snapshot.valid_length != 1 {
+        return Err(Error::InferenceError(
+            "VibeVoice tokenizer decoder snapshot has stale cursor metadata".into(),
+        ));
+    }
+    decoder.hydrate_streaming_state(cache.decoder_mut(decoder), &snapshot.components)?;
+    Ok(expected_cursor)
+}
+
+fn commit_encoder_cache(
+    lease: &mut InvocationTensorLease,
+    domain: StateDomainId,
+    expected_cursor: u64,
+    advance: u64,
+    encoder: &TokenizerEncoder,
+    cache: &TokenizerEncoderStreamingCache,
+) -> Result<()> {
+    commit_streaming_cache(
+        lease,
+        domain,
+        expected_cursor,
+        advance,
+        encoder.collect_streaming_state(cache),
+    )
+}
+
+fn commit_decoder_cache(
+    lease: &mut InvocationTensorLease,
+    domain: StateDomainId,
+    expected_cursor: u64,
+    advance: u64,
+    decoder: &TokenizerDecoder,
+    cache: &TokenizerDecoderStreamingCache,
+) -> Result<()> {
+    commit_streaming_cache(
+        lease,
+        domain,
+        expected_cursor,
+        advance,
+        decoder.collect_streaming_state(cache),
+    )
+}
+
+fn commit_streaming_cache(
+    lease: &mut InvocationTensorLease,
+    domain: StateDomainId,
+    expected_cursor: u64,
+    advance: u64,
+    components: Result<Vec<Tensor>>,
+) -> Result<()> {
+    let components = components?;
+    if advance == 0 || components.is_empty() {
+        return Err(Error::InferenceError(
+            "VibeVoice tokenizer physical update requires state and a non-zero advance".into(),
+        ));
+    }
+    let target_cursor = expected_cursor
+        .checked_add(advance)
+        .ok_or_else(|| Error::InferenceError("VibeVoice tokenizer cursor overflow".into()))?;
+    let mut declared = Vec::with_capacity(components.len());
+    let mut values = Vec::with_capacity(components.len());
+    for (index, tensor) in components.into_iter().enumerate() {
+        let [batch, channels, frames] = tensor.dims() else {
+            return Err(Error::InferenceError(format!(
+                "VibeVoice tokenizer physical component has non-convolution shape {:?}",
+                tensor.dims()
+            )));
+        };
+        let component = StateComponentId::new(u32::try_from(index + 1).map_err(|_| {
+            Error::InferenceError("VibeVoice tokenizer component count exceeds u32".into())
+        })?);
+        declared.push(ComponentShapeInstantiation {
+            component,
+            dimensions: vec![
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Batch,
+                    units: u64::try_from(*batch).map_err(|_| {
+                        Error::InferenceError("VibeVoice tokenizer batch exceeds u64".into())
+                    })?,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Channels,
+                    units: u64::try_from(*channels).map_err(|_| {
+                        Error::InferenceError("VibeVoice tokenizer channels exceed u64".into())
+                    })?,
+                },
+                ShapeDimensionValue {
+                    axis: ShapeAxis::Frames,
+                    units: u64::try_from(*frames).map_err(|_| {
+                        Error::InferenceError("VibeVoice tokenizer frames exceed u64".into())
+                    })?,
+                },
+            ],
+        });
+        values.push(InvocationTensorComponentValue { component, tensor });
+    }
+    lease.apply_intent(
+        &DomainStepIntent {
+            domain,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::TensorReplace {
+                components: declared,
+            },
+        },
+        InvocationTensorUpdateV2::TensorReplace { components: values },
+    )
 }
 
 fn add_transposed_overlap(y: Tensor, tail: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
@@ -975,9 +1562,42 @@ fn _dtype_name(dtype: DType) -> &'static str {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use candle_core::Device;
     use candle_nn::VarBuilder;
+
+    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+    use crate::backends::BackendKind;
+    use crate::engine::{InvocationTensorPoolOwner, ModelInstanceId};
+    use crate::kv::v2::{
+        BoundedShape, CheckpointPolicy, InferenceStateContract, InvocationStateCapacity,
+        InvocationWorkspaceDomain, PlacementPolicy, PrefixPolicy, ShapeDimension, ShapeExtent,
+        StateClock, StateDType, StateDomainHeader, StateDomainSpec, StateGroupId, StateGroupSpec,
+        StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
+        CURRENT_INFERENCE_STATE_ABI,
+    };
+
+    fn test_stack_config(ratios: Vec<usize>, depths: Vec<usize>) -> TokenizerStackConfig {
+        TokenizerStackConfig {
+            dimension: 1,
+            channels: 1,
+            n_filters: 1,
+            ratios,
+            depths,
+            causal: true,
+            kernel_size: 3,
+            last_kernel_size: 3,
+            layernorm: "RMSNorm".to_string(),
+            layernorm_eps: 1e-5,
+            disable_last_norm: false,
+            mixer_layer: "depthwise_conv".to_string(),
+            layer_scale_init_value: 0.0,
+            conv_bias: true,
+            pad_mode: "constant".to_string(),
+            trim_right_ratio: 1.0,
+        }
+    }
 
     #[test]
     fn semantic_encode_shape_matches_continuous_latent_contract() {
@@ -986,6 +1606,17 @@ mod tests {
             std: None,
         };
         assert_eq!(output.mode().dims(), &[1, 3, 128]);
+    }
+
+    #[test]
+    fn tokenizer_topology_requires_one_more_depth_stage_than_ratio() {
+        assert!(test_stack_config(vec![2, 4], vec![1, 1, 1])
+            .validate_topology("test")
+            .is_ok());
+        let err = test_stack_config(vec![2, 4], vec![1, 1])
+            .validate_topology("test")
+            .unwrap_err();
+        assert!(err.to_string().contains("depths.len() == ratios.len() + 1"));
     }
 
     #[test]
@@ -1002,6 +1633,15 @@ mod tests {
         );
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
         let layer = SConv1d::load(1, 1, 4, 2, 1, 1, true, true, vb).unwrap();
+        let mut geometry = Vec::new();
+        layer.push_streaming_state_geometry(&mut geometry);
+        assert_eq!(
+            geometry,
+            vec![VibeVoiceTokenizerStateComponentGeometry {
+                channels: 1,
+                frames: 2,
+            }]
+        );
         let x = Tensor::from_vec(
             (0..12).map(|value| value as f32 / 10.0).collect::<Vec<_>>(),
             (1, 1, 12),
@@ -1035,6 +1675,15 @@ mod tests {
         );
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
         let layer = SConvTranspose1d::load(1, 1, 4, 2, true, 1.0, vb).unwrap();
+        let mut geometry = Vec::new();
+        layer.push_streaming_state_geometry(&mut geometry);
+        assert_eq!(
+            geometry,
+            vec![VibeVoiceTokenizerStateComponentGeometry {
+                channels: 1,
+                frames: 2,
+            }]
+        );
         let x = Tensor::from_vec(vec![0.5f32, -1.0, 0.25, 0.75, -0.5], (1, 1, 5), &device).unwrap();
 
         let full = layer.forward(&x).unwrap();
@@ -1051,6 +1700,305 @@ mod tests {
         let streamed = Tensor::cat(&streamed_chunks, 2).unwrap();
 
         assert_tensor_close(&streamed, &full, 1e-6);
+    }
+
+    #[test]
+    fn physical_encoder_and_decoder_state_round_trip_across_steps() {
+        let encoder = tiny_encoder();
+        let encoder_domain = StateDomainId::new(1);
+        let encoder_owner = tensor_owner(
+            encoder_domain,
+            &encoder.streaming_state_geometry(),
+            StateClock::AudioSamples,
+        );
+        let mut encoder_lease = encoder_owner.lease().unwrap();
+        let encoder_input = Tensor::from_vec(
+            (0..8).map(|value| value as f32 / 10.0).collect::<Vec<_>>(),
+            (1, 1, 8),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut local_encoder = encoder.streaming_cache();
+        for (step, offset) in [0usize, 4].into_iter().enumerate() {
+            let chunk = encoder_input.narrow(2, offset, 4).unwrap();
+            let expected = encoder
+                .forward_streaming(&chunk, &mut local_encoder)
+                .unwrap();
+            let mut physical = TokenizerStreamingState::new();
+            let cursor = hydrate_encoder_cache(&encoder_lease, &encoder, &mut physical).unwrap();
+            assert_eq!(cursor, (step * 4) as u64);
+            let actual = encoder
+                .forward_streaming(&chunk, physical.encoder_mut(&encoder))
+                .unwrap();
+            commit_encoder_cache(
+                &mut encoder_lease,
+                encoder_domain,
+                cursor,
+                4,
+                &encoder,
+                physical.encoder.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_tensor_close(&actual, &expected, 1e-6);
+        }
+        assert_eq!(encoder_lease.arena().unwrap().absolute_cursor(), 8);
+        let mut hydrated_encoder = TokenizerStreamingState::new();
+        hydrate_encoder_cache(&encoder_lease, &encoder, &mut hydrated_encoder).unwrap();
+        assert!(commit_encoder_cache(
+            &mut encoder_lease,
+            StateDomainId::new(9),
+            8,
+            4,
+            &encoder,
+            hydrated_encoder.encoder.as_ref().unwrap(),
+        )
+        .is_err());
+        assert!(commit_encoder_cache(
+            &mut encoder_lease,
+            encoder_domain,
+            7,
+            4,
+            &encoder,
+            hydrated_encoder.encoder.as_ref().unwrap(),
+        )
+        .is_err());
+        assert_eq!(encoder_lease.arena().unwrap().absolute_cursor(), 8);
+
+        let decoder = tiny_decoder();
+        let decoder_domain = StateDomainId::new(2);
+        let decoder_owner = tensor_owner(
+            decoder_domain,
+            &decoder.streaming_state_geometry(),
+            StateClock::CodecFrames,
+        );
+        let mut decoder_lease = decoder_owner.lease().unwrap();
+        let decoder_input = Tensor::from_vec(vec![0.5f32, -1.0], (1, 1, 2), &Device::Cpu).unwrap();
+        let mut local_decoder = decoder.streaming_cache();
+        for offset in [0usize, 1] {
+            let frame = decoder_input.narrow(2, offset, 1).unwrap();
+            let expected = decoder
+                .forward_streaming(&frame, &mut local_decoder)
+                .unwrap();
+            let mut physical = TokenizerStreamingState::new();
+            let cursor = hydrate_decoder_cache(&decoder_lease, &decoder, &mut physical).unwrap();
+            let actual = decoder
+                .forward_streaming(&frame, physical.decoder_mut(&decoder))
+                .unwrap();
+            commit_decoder_cache(
+                &mut decoder_lease,
+                decoder_domain,
+                cursor,
+                1,
+                &decoder,
+                physical.decoder.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_tensor_close(&actual, &expected, 1e-6);
+        }
+        assert_eq!(decoder_lease.arena().unwrap().absolute_cursor(), 2);
+    }
+
+    #[test]
+    fn physical_component_order_and_shapes_fail_closed() {
+        let geometry = VibeVoiceTokenizerStateComponentGeometry {
+            channels: 1,
+            frames: 2,
+        };
+        let tensor = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let exact = InvocationTensorComponentSlice {
+            component: StateComponentId::new(1),
+            tensor: tensor.clone(),
+        };
+
+        let mut missing = PhysicalComponentCursor::new(&[]);
+        assert!(missing.next(geometry).is_err());
+
+        let wrong_id = [InvocationTensorComponentSlice {
+            component: StateComponentId::new(2),
+            tensor: tensor.clone(),
+        }];
+        assert!(PhysicalComponentCursor::new(&wrong_id)
+            .next(geometry)
+            .is_err());
+
+        let wrong_shape = [InvocationTensorComponentSlice {
+            component: StateComponentId::new(1),
+            tensor: Tensor::zeros((1, 2, 1), DType::F32, &Device::Cpu).unwrap(),
+        }];
+        assert!(PhysicalComponentCursor::new(&wrong_shape)
+            .next(geometry)
+            .is_err());
+
+        let extra = [
+            exact.clone(),
+            InvocationTensorComponentSlice {
+                component: StateComponentId::new(2),
+                tensor,
+            },
+        ];
+        let mut cursor = PhysicalComponentCursor::new(&extra);
+        cursor.next(geometry).unwrap();
+        assert!(cursor.finish().is_err());
+    }
+
+    fn tiny_encoder() -> TokenizerEncoder {
+        TokenizerEncoder {
+            downsample_layers: vec![test_sconv1d(&[0.25, -0.5, 0.75], 0.1)],
+            stages: vec![vec![]],
+            norm: ConvNorm::Identity,
+            head: test_sconv1d(&[-0.2, 0.4, 0.6], -0.05),
+        }
+    }
+
+    fn tiny_decoder() -> TokenizerDecoder {
+        TokenizerDecoder {
+            upsample_layers: vec![
+                UpsampleLayer::Conv(test_sconv1d(&[0.3, -0.1, 0.8], 0.2)),
+                UpsampleLayer::Transposed(test_sconvtranspose(&[0.2, -0.4, 0.6, 0.8], 0.3)),
+            ],
+            stages: vec![vec![], vec![]],
+            norm: ConvNorm::Identity,
+            head: test_sconv1d(&[0.5, 0.25, -0.4], -0.1),
+        }
+    }
+
+    fn test_sconv1d(weight: &[f32], bias: f32) -> SConv1d {
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "conv.conv.weight".to_string(),
+            Tensor::from_slice(weight, (1, 1, weight.len()), &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "conv.conv.bias".to_string(),
+            Tensor::from_slice(&[bias], 1, &Device::Cpu).unwrap(),
+        );
+        SConv1d::load(
+            1,
+            1,
+            weight.len(),
+            1,
+            1,
+            1,
+            true,
+            true,
+            VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu),
+        )
+        .unwrap()
+    }
+
+    fn test_sconvtranspose(weight: &[f32], bias: f32) -> SConvTranspose1d {
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "convtr.convtr.weight".to_string(),
+            Tensor::from_slice(weight, (1, 1, weight.len()), &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "convtr.convtr.bias".to_string(),
+            Tensor::from_slice(&[bias], 1, &Device::Cpu).unwrap(),
+        );
+        SConvTranspose1d::load(
+            1,
+            1,
+            weight.len(),
+            2,
+            true,
+            1.0,
+            VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu),
+        )
+        .unwrap()
+    }
+
+    fn tensor_owner(
+        domain: StateDomainId,
+        geometry: &[VibeVoiceTokenizerStateComponentGeometry],
+        clock: StateClock,
+    ) -> InvocationTensorPoolOwner {
+        let components = geometry
+            .iter()
+            .enumerate()
+            .map(|(index, geometry)| TensorComponentSpec {
+                id: StateComponentId::new(u32::try_from(index + 1).unwrap()),
+                role: TensorRole::ConvolutionState,
+                shape: BoundedShape {
+                    dimensions: vec![
+                        ShapeDimension {
+                            axis: ShapeAxis::Batch,
+                            extent: ShapeExtent::Fixed { value: 1 },
+                        },
+                        ShapeDimension {
+                            axis: ShapeAxis::Channels,
+                            extent: ShapeExtent::Fixed {
+                                value: geometry.channels as u64,
+                            },
+                        },
+                        ShapeDimension {
+                            axis: ShapeAxis::Frames,
+                            extent: ShapeExtent::Fixed {
+                                value: geometry.frames as u64,
+                            },
+                        },
+                    ],
+                },
+                accepted_dtypes: vec![StateDType::F32],
+            })
+            .collect::<Vec<_>>();
+        let state = StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: StateDomainHeader {
+                id: domain,
+                scope: StateScope::Invocation,
+                clock,
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::None,
+            },
+            components,
+        });
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![state.clone()],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(domain.get()),
+                domains: vec![domain],
+                prefix_shareable: false,
+            }],
+        };
+        let plan = Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: None,
+                },
+            )
+            .unwrap(),
+        );
+        let fixed_bytes = plan
+            .non_paged
+            .iter()
+            .find(|resolved| resolved.domain() == domain)
+            .unwrap()
+            .maximum_bytes();
+        InvocationTensorPoolOwner::new(
+            &contract,
+            plan,
+            InvocationWorkspaceDomain::State {
+                state,
+                capacity: InvocationStateCapacity::SemanticBounded,
+                placement: PlacementPolicy::BackendLocal,
+                formula: WorkspaceFormula {
+                    fixed_bytes,
+                    dimensions: vec![],
+                    terms: vec![],
+                },
+            },
+            Device::Cpu,
+            ModelInstanceId::new(99),
+            1,
+            domain.get(),
+        )
+        .unwrap()
     }
 
     fn assert_tensor_close(actual: &Tensor, expected: &Tensor, epsilon: f32) {

@@ -732,7 +732,7 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
         self.coordinator
-            .run_loaded_blocking_stage_with_invocation_paged(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 job,
                 execution_contract,
                 state_binding,
@@ -753,22 +753,12 @@ impl RuntimeService {
                         model.default_diffusion_steps(),
                     );
                     let started = Instant::now();
-                    let domains = leases.domains().collect::<Vec<_>>();
-                    let [positive_domain, negative_domain] = domains.as_slice() else {
-                        return Err(Error::InferenceError(format!(
-                            "VibeVoice TTS requires two invocation KV domains, found {}",
-                            domains.len()
-                        )));
-                    };
-                    let (positive_cache, negative_cache) =
-                        leases.cache_pair_mut(*positive_domain, *negative_domain)?;
                     let output = model.generate_with_reference_physical(
                         &text,
                         &reference,
                         requested_speaker,
                         params,
-                        positive_cache,
-                        negative_cache,
+                        leases,
                     )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
