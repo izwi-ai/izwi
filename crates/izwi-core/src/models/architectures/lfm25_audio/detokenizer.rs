@@ -138,12 +138,11 @@ impl Lfm25AudioDetokenizer {
         profile.upsample_ms = elapsed_ms(upsample_started);
 
         let projected = {
-            let mut guard = self.backbone.lock().map_err(|_| {
+            let guard = self.backbone.lock().map_err(|_| {
                 Error::InferenceError("LFM2.5 Audio detokenizer mutex poisoned".to_string())
             })?;
-            guard.reset_state();
             let backbone_started = Instant::now();
-            let hidden = guard.forward_embeds(&upsampled, 0)?;
+            let hidden = guard.forward_embeds_stateless(&upsampled)?;
             profile.backbone_forward_ms = elapsed_ms(backbone_started);
             let projection_started = Instant::now();
             let projected = guard.project_hidden(&hidden)?;
@@ -183,12 +182,11 @@ impl Lfm25AudioDetokenizer {
         profile.upsample_ms = elapsed_ms(upsample_started);
 
         let projected = {
-            let mut guard = self.backbone.lock().map_err(|_| {
+            let guard = self.backbone.lock().map_err(|_| {
                 Error::InferenceError("LFM2.5 Audio detokenizer mutex poisoned".to_string())
             })?;
-            guard.reset_state();
             let backbone_started = Instant::now();
-            let hidden = guard.forward_embeds(&upsampled, 0)?;
+            let hidden = guard.forward_embeds_stateless(&upsampled)?;
             profile.backbone_forward_ms = elapsed_ms(backbone_started);
             let projection_started = Instant::now();
             let projected = guard.project_hidden(&hidden)?;

@@ -2,7 +2,6 @@
 
 mod audio_output;
 mod bundle;
-pub(crate) mod cache;
 mod config;
 mod conformer;
 mod detokenizer;
