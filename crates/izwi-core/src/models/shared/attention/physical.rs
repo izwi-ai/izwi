@@ -260,17 +260,44 @@ impl PhysicalPagedKvCache {
     }
 
     pub(crate) fn sequence_table(&self, context_len: usize) -> Result<KvSequenceBlockTable> {
-        if context_len <= self.window_start || context_len > self.capacity_tokens() {
+        self.sequence_table_from(self.window_start, context_len)
+    }
+
+    fn sequence_table_from(
+        &self,
+        visible_start: usize,
+        context_len: usize,
+    ) -> Result<KvSequenceBlockTable> {
+        if visible_start < self.window_start
+            || context_len <= visible_start
+            || context_len > self.capacity_tokens()
+        {
             return Err(Error::InvalidInput(format!(
                 "physical paged decode context {context_len} is outside cache capacity"
             )));
         }
         let page_tokens = self.arena.config().page_tokens as usize;
-        let first_page_offset = self.window_start % page_tokens;
-        let visible_tokens = context_len - self.window_start;
+        let allocated_first_page = self.window_start / page_tokens;
+        let visible_first_page = visible_start / page_tokens;
+        let first_block = visible_first_page
+            .checked_sub(allocated_first_page)
+            .ok_or_else(|| {
+                Error::InvalidInput("physical visible window precedes its allocation".into())
+            })?;
+        let first_page_offset = visible_start % page_tokens;
+        let visible_tokens = context_len - visible_start;
         let required_pages = (first_page_offset + visible_tokens).div_ceil(page_tokens);
+        let end_block = first_block
+            .checked_add(required_pages)
+            .ok_or_else(|| Error::InvalidInput("physical visible page range overflow".into()))?;
         Ok(KvSequenceBlockTable {
-            blocks: self.blocks[..required_pages].to_vec(),
+            blocks: self
+                .blocks
+                .get(first_block..end_block)
+                .ok_or_else(|| {
+                    Error::InvalidInput("physical visible window exceeds its block table".into())
+                })?
+                .to_vec(),
             first_page_offset: u32::try_from(first_page_offset).map_err(|_| {
                 Error::InvalidInput("physical first-page offset exceeds u32".into())
             })?,
@@ -292,6 +319,42 @@ impl PhysicalPagedKvCache {
         start_pos: usize,
         token_count: usize,
     ) -> Result<PreparedPhysicalPagedStep> {
+        self.prepare_append_visible(start_pos, token_count, self.window_start)
+    }
+
+    /// Prepare an exact one-token sliding-window append without changing the
+    /// cache allocation or write coordinates. The returned attention table
+    /// begins at `end_pos - window_tokens` while the new K/V still lands in
+    /// its absolute physical slot.
+    pub(crate) fn prepare_append_with_window(
+        &self,
+        start_pos: usize,
+        token_count: usize,
+        window_tokens: usize,
+    ) -> Result<PreparedPhysicalPagedStep> {
+        if window_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "physical paged sliding window cannot be zero".into(),
+            ));
+        }
+        if token_count != 1 {
+            return Err(Error::InvalidInput(
+                "physical paged sliding-window append currently requires one token".into(),
+            ));
+        }
+        let end_pos = start_pos
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
+        let visible_start = end_pos.saturating_sub(window_tokens).max(self.window_start);
+        self.prepare_append_visible(start_pos, token_count, visible_start)
+    }
+
+    fn prepare_append_visible(
+        &self,
+        start_pos: usize,
+        token_count: usize,
+        visible_start: usize,
+    ) -> Result<PreparedPhysicalPagedStep> {
         if token_count == 0 {
             return Err(Error::InvalidInput(
                 "physical paged append cannot prepare zero tokens".into(),
@@ -303,7 +366,7 @@ impl PhysicalPagedKvCache {
         let slots = self
             .arena
             .lower_slots(&self.slots_for_append(start_pos, token_count)?)?;
-        let table = self.sequence_table(end_pos)?;
+        let table = self.sequence_table_from(visible_start, end_pos)?;
         let query_len = u32::try_from(token_count)
             .map_err(|_| Error::InvalidInput("physical paged query length exceeds u32".into()))?;
         let completions =
@@ -535,5 +598,57 @@ mod tests {
         assert_eq!(cache.context_len(), 0);
         assert_eq!(cache.window_start(), 0);
         assert!(cache.commit_prepared(prepared).is_err());
+    }
+
+    #[test]
+    fn one_token_sliding_append_reads_only_its_exact_visible_pages() {
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(10),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let binding = KvLayerBinding {
+            model_layer: 2,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 4,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 2,
+                    key_head_dim: 4,
+                    value_head_dim: 4,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..4)
+            .map(|index| CacheBlockRef {
+                arena: arena_id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect::<Vec<_>>();
+        let cache = PhysicalPagedKvCache::new(arena, vec![binding], blocks.clone(), 9).unwrap();
+
+        let prepared = cache.prepare_append_with_window(9, 1, 4).unwrap();
+        let table = &prepared.decode.sequences[0];
+        assert_eq!(table.blocks, blocks[1..3]);
+        assert_eq!(table.first_page_offset, 2);
+        assert_eq!(table.context_len, 4);
+        assert_eq!(prepared.prefill[0].blocks, blocks[1..3]);
+        assert_eq!(prepared.slots.logical_slots()[0].block, blocks[2]);
+        assert_eq!(prepared.slots.logical_slots()[0].offset, 1);
+
+        assert!(cache.prepare_append_with_window(9, 2, 4).is_err());
+        assert!(cache.prepare_append_with_window(9, 1, 0).is_err());
     }
 }
