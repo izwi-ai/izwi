@@ -1,14 +1,20 @@
 //! Whisper model shim adapted from Candle's implementation so generated
-//! positional/mask tensors follow the active Izwi model dtype.
+//! positional tensors follow the active Izwi model dtype and decoder attention
+//! consumes lifecycle-owned physical state.
 
-use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_nn::{
-    embedding, kv_cache::KvCache, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder,
-};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
 use candle_transformers::models::whisper::Config;
 use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear};
 
+use crate::backends::state::{StaticAttentionLayerValue, StaticAttentionRaggedRow};
+use crate::engine::InvocationStaticAttentionLease;
+use crate::error::{Error, Result};
+use crate::kv::v2::{DomainStepIntent, StateUpdateKind};
 use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+
+use super::physical::WHISPER_CROSS_STATE_DOMAIN;
 
 fn conv1d(
     in_channels: usize,
@@ -32,17 +38,8 @@ fn to_add_dtype(tensor: Tensor, dtype: DType) -> Result<Tensor> {
     if tensor.dtype() == dtype {
         Ok(tensor)
     } else {
-        tensor.to_dtype(dtype)
+        Ok(tensor.to_dtype(dtype)?)
     }
-}
-
-fn can_skip_attention_mask_for_fused_attention(
-    masked: bool,
-    query_pos: usize,
-    q_len: usize,
-    kv_len: usize,
-) -> bool {
-    !masked || (q_len == 1 && kv_len == query_pos + 1)
 }
 
 fn whisper_metal_sdpa_enabled() -> bool {
@@ -60,91 +57,65 @@ fn whisper_metal_sdpa_env_value_enabled(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
+enum AttentionProjections {
+    SelfQkv(Linear),
+    Cross {
+        query: Linear,
+        key: Linear,
+        value: Linear,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct MultiHeadAttention {
-    query: Linear,
-    key: Linear,
-    value: Linear,
-    self_qkv: Option<Linear>,
+    projections: AttentionProjections,
     out: Linear,
     n_head: usize,
     span: tracing::Span,
     softmax_span: tracing::Span,
     matmul_span: tracing::Span,
-    self_kv_cache: Option<KvCache>,
-    cross_kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl MultiHeadAttention {
-    fn load(
-        n_state: usize,
-        n_head: usize,
-        self_cache_len: Option<usize>,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn load_self(n_state: usize, n_head: usize, vb: VarBuilder) -> Result<Self> {
+        let span = tracing::span!(tracing::Level::TRACE, "multi-head-attn");
+        let softmax_span = tracing::span!(tracing::Level::TRACE, "multi-head-attn-softmax");
+        let matmul_span = tracing::span!(tracing::Level::TRACE, "multi-head-attn-matmul");
+        let projections = AttentionProjections::SelfQkv(Self::load_self_qkv(n_state, &vb)?);
+        let out = linear(n_state, n_state, vb.pp("out_proj"))?;
+        Ok(Self {
+            projections,
+            out,
+            n_head,
+            span,
+            softmax_span,
+            matmul_span,
+        })
+    }
+
+    fn load_cross(n_state: usize, n_head: usize, vb: VarBuilder) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "multi-head-attn");
         let softmax_span = tracing::span!(tracing::Level::TRACE, "multi-head-attn-softmax");
         let matmul_span = tracing::span!(tracing::Level::TRACE, "multi-head-attn-matmul");
         let query = linear(n_state, n_state, vb.pp("q_proj"))?;
         let value = linear(n_state, n_state, vb.pp("v_proj"))?;
         let key = linear_no_bias(n_state, n_state, vb.pp("k_proj"))?;
-        let self_qkv = Some(Self::load_self_qkv(n_state, &vb)?);
+        let projections = AttentionProjections::Cross { query, key, value };
         let out = linear(n_state, n_state, vb.pp("out_proj"))?;
-        let self_kv_cache = self_cache_len.map(|max_seq_len| KvCache::new(2, max_seq_len));
         Ok(Self {
-            query,
-            key,
-            value,
-            self_qkv,
+            projections,
             out,
             n_head,
             span,
             softmax_span,
             matmul_span,
-            self_kv_cache,
-            cross_kv_cache: None,
         })
     }
 
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        xa: Option<&Tensor>,
-        mask: Option<&Tensor>,
-        flush_cache: bool,
-        query_pos: usize,
-    ) -> Result<Tensor> {
+    fn forward_dense_self_attention(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (q, k, v, query_pos) = match xa {
-            None => {
-                let (q, k, v) = self.project_self_attention_qkv(x)?;
-                if let Some(cache) = self.self_kv_cache.as_mut() {
-                    if flush_cache {
-                        cache.reset();
-                    }
-                    let query_pos = cache.current_seq_len();
-                    let (k, v) = cache.append(&k, &v)?;
-                    (q, k, v, query_pos)
-                } else {
-                    (q, k, v, query_pos)
-                }
-            }
-            Some(xa) => {
-                let q = self.reshape_head(&self.query.forward(x)?)?;
-                if flush_cache {
-                    self.cross_kv_cache = None;
-                }
-                if let Some((k, v)) = &self.cross_kv_cache {
-                    (q, k.clone(), v.clone(), 0)
-                } else {
-                    let k = self.reshape_head(&self.key.forward(xa)?)?.contiguous()?;
-                    let v = self.reshape_head(&self.value.forward(xa)?)?.contiguous()?;
-                    self.cross_kv_cache = Some((k.clone(), v.clone()));
-                    (q, k, v, 0)
-                }
-            }
-        };
-        let q_len = q.dim(2)?;
-        let wv = self.qkv_attention(&q, &k, &v, mask, query_pos, q_len)?;
+        let (q, k, v) = self.project_self_attention_qkv_head_major(x)?;
+        let wv = self.dense_attention(&q, &k, &v)?;
         let out = self.out.forward(&wv)?;
         Ok(out)
     }
@@ -161,52 +132,81 @@ impl MultiHeadAttention {
         Ok(Linear::from_weights(weight, Some(bias)))
     }
 
-    fn project_self_attention_qkv(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        if let Some(self_qkv) = &self.self_qkv {
-            let qkv = self_qkv.forward(x)?;
-            let chunks = qkv.chunk(3, D::Minus1)?;
-            let q = self.reshape_head(&chunks[0])?;
-            let k = self.reshape_head(&chunks[1])?.contiguous()?;
-            let v = self.reshape_head(&chunks[2])?.contiguous()?;
-            Ok((q, k, v))
-        } else {
-            let q = self.reshape_head(&self.query.forward(x)?)?;
-            let k = self.reshape_head(&self.key.forward(x)?)?.contiguous()?;
-            let v = self.reshape_head(&self.value.forward(x)?)?.contiguous()?;
-            Ok((q, k, v))
-        }
-    }
-
-    fn reshape_head(&self, x: &Tensor) -> Result<Tensor> {
-        let (n_batch, n_ctx, n_state) = x.dims3()?;
-        let target_dims = &[n_batch, n_ctx, self.n_head, n_state / self.n_head];
-        x.reshape(target_dims)?.transpose(1, 2)
-    }
-
-    fn qkv_attention(
+    fn project_self_attention_qkv_head_major(
         &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        mask: Option<&Tensor>,
-        query_pos: usize,
-        q_len: usize,
-    ) -> Result<Tensor> {
+        x: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let AttentionProjections::SelfQkv(self_qkv) = &self.projections else {
+            return Err(Error::InferenceError(
+                "Whisper cross-attention projections were used for self attention".into(),
+            ));
+        };
+        let qkv = self_qkv.forward(x)?;
+        let chunks = qkv.chunk(3, D::Minus1)?;
+        let q = reshape_head_major(&chunks[0], self.n_head)?;
+        let k = reshape_head_major(&chunks[1], self.n_head)?.contiguous()?;
+        let v = reshape_head_major(&chunks[2], self.n_head)?.contiguous()?;
+        Ok((q, k, v))
+    }
+
+    fn project_self_attention_qkv_token_major(
+        &self,
+        x: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let AttentionProjections::SelfQkv(self_qkv) = &self.projections else {
+            return Err(Error::InferenceError(
+                "Whisper cross-attention projections were used for self attention".into(),
+            ));
+        };
+        let qkv = self_qkv.forward(x)?;
+        let chunks = qkv.chunk(3, D::Minus1)?;
+        Ok((
+            reshape_token_major(&chunks[0], self.n_head)?,
+            reshape_token_major(&chunks[1], self.n_head)?,
+            reshape_token_major(&chunks[2], self.n_head)?,
+        ))
+    }
+
+    fn project_cross_attention_query(&self, x: &Tensor) -> Result<Tensor> {
+        let AttentionProjections::Cross { query, .. } = &self.projections else {
+            return Err(Error::InferenceError(
+                "Whisper self-attention projections were used for cross attention".into(),
+            ));
+        };
+        reshape_token_major(&query.forward(x)?, self.n_head)
+    }
+
+    fn project_cross_attention_memory(
+        &self,
+        model_layer: u32,
+        audio_features: &Tensor,
+    ) -> Result<StaticAttentionLayerValue> {
+        let AttentionProjections::Cross { key, value, .. } = &self.projections else {
+            return Err(Error::InferenceError(
+                "Whisper self-attention projections were used for cross attention".into(),
+            ));
+        };
+        Ok(StaticAttentionLayerValue {
+            model_layer,
+            keys: reshape_token_major(&key.forward(audio_features)?, self.n_head)?,
+            values: reshape_token_major(&value.forward(audio_features)?, self.n_head)?,
+        })
+    }
+
+    fn project_output_token_major(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(self.out.forward(&flatten_token_major(x)?)?)
+    }
+
+    fn dense_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         let (_, _, _, head_dim) = q.dims4()?;
-        let kv_len = k.dim(2)?;
         let scale = (head_dim as f64).powf(-0.25);
 
-        let can_skip_mask =
-            can_skip_attention_mask_for_fused_attention(mask.is_some(), query_pos, q_len, kv_len);
-        let can_try_fused = if can_skip_mask {
-            q.device().is_cuda() || (q.device().is_metal() && whisper_metal_sdpa_enabled())
-        } else {
-            false
-        };
+        let can_try_fused =
+            q.device().is_cuda() || (q.device().is_metal() && whisper_metal_sdpa_enabled());
         if can_try_fused {
             match try_fused_self_attention(&q, &k, &v, None, head_dim, false) {
                 Ok(Some(wv)) => {
-                    return wv.transpose(1, 2)?.flatten_from(2);
+                    return Ok(wv.transpose(1, 2)?.flatten_from(2)?);
                 }
                 Ok(None) | Err(_) => {}
             }
@@ -214,14 +214,10 @@ impl MultiHeadAttention {
 
         let q = (q * scale)?;
         let k = (k.transpose(2, 3)? * scale)?;
-        let mut qk = {
+        let qk = {
             let _enter = self.matmul_span.enter();
             q.matmul(&k)?
         };
-        if let Some(mask) = mask {
-            let mask = attention_mask_window(mask, query_pos, q_len, kv_len, qk.dtype())?;
-            qk = qk.broadcast_add(&mask)?
-        }
         let w = {
             let _enter = self.softmax_span.enter();
             candle_nn::ops::softmax_last_dim(&qk)?
@@ -234,13 +230,43 @@ impl MultiHeadAttention {
         .flatten_from(2)?;
         Ok(wv)
     }
+}
 
-    fn reset_kv_cache(&mut self) {
-        if let Some(cache) = self.self_kv_cache.as_mut() {
-            cache.reset();
-        }
-        self.cross_kv_cache = None;
+fn reshape_head_major(x: &Tensor, n_head: usize) -> Result<Tensor> {
+    let (n_batch, n_ctx, n_state) = x.dims3()?;
+    if n_head == 0 || n_state % n_head != 0 {
+        return Err(Error::InvalidInput(
+            "Whisper attention hidden size is not divisible by its head count".into(),
+        ));
     }
+    x.reshape((n_batch, n_ctx, n_head, n_state / n_head))?
+        .transpose(1, 2)
+        .map_err(Error::from)
+}
+
+fn reshape_token_major(x: &Tensor, n_head: usize) -> Result<Tensor> {
+    let (n_batch, n_ctx, n_state) = x.dims3()?;
+    if n_batch != 1 {
+        return Err(Error::InvalidInput(format!(
+            "Whisper physical attention requires batch size 1, got {n_batch}"
+        )));
+    }
+    if n_head == 0 || n_state % n_head != 0 {
+        return Err(Error::InvalidInput(
+            "Whisper attention hidden size is not divisible by its head count".into(),
+        ));
+    }
+    x.reshape((n_ctx, n_head, n_state / n_head))?
+        .contiguous()
+        .map_err(Error::from)
+}
+
+fn flatten_token_major(x: &Tensor) -> Result<Tensor> {
+    let (n_ctx, n_head, head_dim) = x.dims3()?;
+    let n_state = n_head
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::InvalidInput("Whisper attention width overflow".into()))?;
+    x.reshape((1, n_ctx, n_state)).map_err(Error::from)
 }
 
 #[derive(Debug, Clone)]
@@ -255,19 +281,13 @@ struct ResidualAttentionBlock {
 }
 
 impl ResidualAttentionBlock {
-    fn load(
-        n_state: usize,
-        n_head: usize,
-        ca: bool,
-        self_cache_len: Option<usize>,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn load(n_state: usize, n_head: usize, ca: bool, vb: VarBuilder) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "residual-attn");
-        let attn = MultiHeadAttention::load(n_state, n_head, self_cache_len, vb.pp("self_attn"))?;
+        let attn = MultiHeadAttention::load_self(n_state, n_head, vb.pp("self_attn"))?;
         let attn_ln = layer_norm(n_state, vb.pp("self_attn_layer_norm"))?;
         let cross_attn = if ca {
             let cross_attn =
-                MultiHeadAttention::load(n_state, n_head, None, vb.pp("encoder_attn"))?;
+                MultiHeadAttention::load_cross(n_state, n_head, vb.pp("encoder_attn"))?;
             let cross_attn_ln = layer_norm(n_state, vb.pp("encoder_attn_layer_norm"))?;
             Some((cross_attn, cross_attn_ln))
         } else {
@@ -288,40 +308,76 @@ impl ResidualAttentionBlock {
         })
     }
 
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        xa: Option<&Tensor>,
-        mask: Option<&Tensor>,
-        flush_kv_cache: bool,
-        position_offset: usize,
-    ) -> Result<Tensor> {
+    fn forward_encoder(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let attn = self.attn.forward(
-            &self.attn_ln.forward(x)?,
-            None,
-            mask,
-            flush_kv_cache,
-            position_offset,
-        )?;
-        let mut x = (x + attn)?;
-        if let Some((attn, ln)) = &mut self.cross_attn {
-            x = (&x + attn.forward(&ln.forward(&x)?, xa, None, flush_kv_cache, 0)?)?;
-        }
+        let attn = self
+            .attn
+            .forward_dense_self_attention(&self.attn_ln.forward(x)?)?;
+        let x = (x + attn)?;
         let mlp = self.mlp_linear2.forward(
             &self
                 .mlp_linear1
                 .forward(&self.mlp_ln.forward(&x)?)?
                 .gelu()?,
         )?;
-        x + mlp
+        Ok((x + mlp)?)
     }
 
-    fn reset_kv_cache(&mut self) {
-        self.attn.reset_kv_cache();
-        if let Some((attn, _)) = &mut self.cross_attn {
-            attn.reset_kv_cache();
-        }
+    fn project_cross_attention_memory(
+        &self,
+        model_layer: u32,
+        audio_features: &Tensor,
+    ) -> Result<StaticAttentionLayerValue> {
+        let (cross_attn, _) = self.cross_attn.as_ref().ok_or_else(|| {
+            Error::InvalidInput("Whisper decoder layer has no cross-attention projection".into())
+        })?;
+        cross_attn.project_cross_attention_memory(model_layer, audio_features)
+    }
+
+    fn forward_decoder_physical(
+        &self,
+        model_layer: usize,
+        x: &Tensor,
+        self_kv: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        cross_kv: &InvocationStaticAttentionLease,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let self_input = self.attn_ln.forward(x)?;
+        let (q, k, v) = self
+            .attn
+            .project_self_attention_qkv_token_major(&self_input)?;
+        let head_dim = q.dim(2)?;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let attended = self_kv.write_and_attend(model_layer, prepared, &q, &k, &v, scale)?;
+        let mut x = (x + self.attn.project_output_token_major(&attended)?)?;
+
+        let (cross_attn, cross_ln) = self.cross_attn.as_ref().ok_or_else(|| {
+            Error::InvalidInput("Whisper decoder layer has no cross attention".into())
+        })?;
+        let cross_query = cross_attn.project_cross_attention_query(&cross_ln.forward(&x)?)?;
+        let query_len = u32::try_from(cross_query.dim(0)?)
+            .map_err(|_| Error::InvalidInput("Whisper query length exceeds u32".into()))?;
+        let model_layer = u32::try_from(model_layer)
+            .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
+        let cross_attended = cross_kv.attend(
+            model_layer,
+            &cross_query,
+            &[StaticAttentionRaggedRow {
+                query_start: 0,
+                query_len,
+            }],
+            scale,
+        )?;
+        x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
+
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward(&x)?)?
+                .gelu()?,
+        )?;
+        Ok((x + mlp)?)
     }
 }
 
@@ -380,13 +436,7 @@ impl AudioEncoder {
         let positional_embedding = sinusoids(n_ctx, n_state, vb.device(), vb.dtype())?;
         let blocks = (0..cfg.encoder_layers)
             .map(|i| {
-                ResidualAttentionBlock::load(
-                    n_state,
-                    n_head,
-                    false,
-                    None,
-                    vb.pp(format!("layers.{i}")),
-                )
+                ResidualAttentionBlock::load(n_state, n_head, false, vb.pp(format!("layers.{i}")))
             })
             .collect::<Result<Vec<_>>>()?;
         let ln_post = layer_norm(n_state, vb.pp("layer_norm"))?;
@@ -402,7 +452,7 @@ impl AudioEncoder {
         })
     }
 
-    pub fn forward(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let x = {
             let _enter = self.conv1_span.enter();
@@ -417,8 +467,8 @@ impl AudioEncoder {
         let positional_embedding = self.positional_embedding.narrow(0, 0, seq_len)?;
         let positional_embedding = to_add_dtype(positional_embedding, x.dtype())?;
         let mut x = x.broadcast_add(&positional_embedding)?;
-        for block in self.blocks.iter_mut() {
-            x = block.forward(&x, None, None, flush_kv_cache, 0)?
+        for block in &self.blocks {
+            x = block.forward_encoder(&x)?
         }
         let x = self.ln_post.forward(&x)?;
         Ok(x)
@@ -431,7 +481,7 @@ pub struct TextDecoder {
     positional_embedding: Tensor,
     blocks: Vec<ResidualAttentionBlock>,
     ln: LayerNorm,
-    mask: Tensor,
+    n_head: usize,
     span: tracing::Span,
     span_final: tracing::Span,
 }
@@ -447,55 +497,115 @@ impl TextDecoder {
         let positional_embedding = vb.get((n_ctx, n_state), "embed_positions.weight")?;
         let blocks = (0..cfg.decoder_layers)
             .map(|i| {
-                ResidualAttentionBlock::load(
-                    n_state,
-                    n_head,
-                    true,
-                    Some(n_ctx),
-                    vb.pp(format!("layers.{i}")),
-                )
+                ResidualAttentionBlock::load(n_state, n_head, true, vb.pp(format!("layers.{i}")))
             })
             .collect::<Result<Vec<_>>>()?;
         let ln = layer_norm(n_state, vb.pp("layer_norm"))?;
-        let mask = causal_attention_mask(n_ctx, vb.dtype(), vb.device())?;
         Ok(Self {
             token_embedding,
             positional_embedding,
             blocks,
             ln,
-            mask,
+            n_head,
             span,
             span_final,
         })
     }
 
-    pub fn forward(&mut self, x: &Tensor, xa: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
-        self.forward_at(x, xa, 0, flush_kv_cache)
-    }
-
-    pub fn forward_at(
-        &mut self,
-        x: &Tensor,
-        xa: &Tensor,
-        position_offset: usize,
-        flush_kv_cache: bool,
-    ) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        let last = x.dim(D::Minus1)?;
-        let token_embedding = self.token_embedding.forward(x)?;
-        let positional_embedding = self.positional_embedding.narrow(0, position_offset, last)?;
-        let positional_embedding = to_add_dtype(positional_embedding, token_embedding.dtype())?;
-        let mut x = token_embedding.broadcast_add(&positional_embedding)?;
-        for block in self.blocks.iter_mut() {
-            x = block.forward(
-                &x,
-                Some(xa),
-                Some(&self.mask),
-                flush_kv_cache,
-                position_offset,
+    pub(crate) fn install_cross_attention_memory(
+        &self,
+        audio_features: &Tensor,
+        source_identity: [u8; 32],
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<()> {
+        let (batch, memory_tokens, _) = audio_features.dims3()?;
+        if batch != 1 || memory_tokens == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Whisper cross attention requires one non-empty encoder row, got batch {batch} and {memory_tokens} tokens"
+            )));
+        }
+        let target_cursor = u64::try_from(memory_tokens)
+            .map_err(|_| Error::InvalidInput("Whisper encoder length exceeds u64".into()))?;
+        let intent = DomainStepIntent {
+            domain: WHISPER_CROSS_STATE_DOMAIN,
+            expected_cursor: 0,
+            target_cursor,
+            update: StateUpdateKind::StaticInitialize {
+                source_identity,
+                components: Vec::new(),
+            },
+        };
+        cross_kv.begin_install(&intent)?;
+        for (model_layer, block) in self.blocks.iter().enumerate() {
+            let model_layer = u32::try_from(model_layer)
+                .map_err(|_| Error::InvalidInput("Whisper layer index exceeds u32".into()))?;
+            cross_kv.install_layer(
+                block.project_cross_attention_memory(model_layer, audio_features)?,
             )?;
         }
-        self.ln.forward(&x)
+        cross_kv.commit_install()
+    }
+
+    pub(crate) fn forward_physical_at(
+        &self,
+        tokens: &Tensor,
+        position_offset: usize,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (batch, token_count) = tokens.dims2()?;
+        if batch != 1 || token_count == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Whisper physical decoder requires one non-empty token row, got batch {batch} and {token_count} tokens"
+            )));
+        }
+        if position_offset != self_kv.context_len() {
+            return Err(Error::InvalidInput(format!(
+                "Whisper decoder position {position_offset} does not match physical cache cursor {}",
+                self_kv.context_len()
+            )));
+        }
+        let hidden_size = self.token_embedding.embeddings().dim(1)?;
+        if self.n_head == 0 || hidden_size % self.n_head != 0 {
+            return Err(Error::InvalidInput(
+                "Whisper decoder hidden size is not divisible by its head count".into(),
+            ));
+        }
+        self_kv.validate_model(self.blocks.len(), self.n_head, hidden_size / self.n_head)?;
+        if cross_kv.metadata()?.is_none() {
+            return Err(Error::InvalidInput(
+                "Whisper cross-attention memory is not installed".into(),
+            ));
+        }
+
+        let position_end = position_offset
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("Whisper decoder position overflow".into()))?;
+        if position_end > self.positional_embedding.dim(0)? {
+            return Err(Error::InvalidInput(format!(
+                "Whisper decoder position {position_end} exceeds its positional capacity"
+            )));
+        }
+        let token_embedding = self.token_embedding.forward(tokens)?;
+        let positional_embedding =
+            self.positional_embedding
+                .narrow(0, position_offset, token_count)?;
+        let positional_embedding = to_add_dtype(positional_embedding, token_embedding.dtype())?;
+        let mut x = token_embedding.broadcast_add(&positional_embedding)?;
+        let mut prepared = self_kv.prepare_append(position_offset, token_count)?;
+        for (model_layer, block) in self.blocks.iter().enumerate() {
+            x = block.forward_decoder_physical(
+                model_layer,
+                &x,
+                self_kv,
+                &mut prepared,
+                cross_kv,
+            )?;
+        }
+        let x = self.ln.forward(&x)?;
+        self_kv.commit_prepared(prepared)?;
+        Ok(x)
     }
 
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
@@ -507,31 +617,6 @@ impl TextDecoder {
         };
         Ok(logits)
     }
-
-    pub fn reset_kv_cache(&mut self) {
-        for block in self.blocks.iter_mut() {
-            block.reset_kv_cache();
-        }
-    }
-}
-
-fn causal_attention_mask(n_ctx: usize, dtype: DType, device: &Device) -> Result<Tensor> {
-    let mask: Vec<_> = (0..n_ctx)
-        .flat_map(|i| (0..n_ctx).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
-        .collect();
-    let mask = Tensor::from_vec(mask, (n_ctx, n_ctx), device)?;
-    to_add_dtype(mask, dtype)
-}
-
-fn attention_mask_window(
-    mask: &Tensor,
-    query_pos: usize,
-    q_len: usize,
-    kv_len: usize,
-    dtype: DType,
-) -> Result<Tensor> {
-    let mask = mask.i((query_pos..query_pos + q_len, 0..kv_len))?;
-    to_add_dtype(mask, dtype)
 }
 
 #[derive(Debug, Clone)]
@@ -551,21 +636,13 @@ impl Whisper {
             config,
         })
     }
-
-    pub fn reset_kv_cache(&mut self) {
-        self.encoder
-            .blocks
-            .iter_mut()
-            .for_each(|b| b.reset_kv_cache());
-        self.decoder.reset_kv_cache();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_mask_window, can_skip_attention_mask_for_fused_attention, causal_attention_mask,
-        sinusoids, whisper_metal_sdpa_env_value_enabled,
+        flatten_token_major, reshape_head_major, reshape_token_major, sinusoids,
+        whisper_metal_sdpa_env_value_enabled,
     };
     use candle_core::{DType, Device, Tensor};
 
@@ -582,35 +659,44 @@ mod tests {
     }
 
     #[test]
-    fn decoder_mask_uses_requested_dtype() {
+    fn attention_reshape_helpers_preserve_token_and_head_order() {
         let device = Device::Cpu;
-        let mask = causal_attention_mask(4, DType::F16, &device).expect("mask");
-        assert_eq!(mask.dtype(), DType::F16);
+        let input = Tensor::from_vec(
+            (0..24).map(|value| value as f32).collect::<Vec<_>>(),
+            (1, 3, 8),
+            &device,
+        )
+        .expect("input");
+        let token_major = reshape_token_major(&input, 2).expect("token-major");
+        assert_eq!(token_major.dims(), &[3, 2, 4]);
+        let flattened = flatten_token_major(&token_major).expect("flattened");
+        assert_eq!(flattened.dims(), input.dims());
+        assert_eq!(
+            flattened.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            input.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
 
-        let scores = Tensor::zeros((1, 2, 4, 4), DType::F16, &device).expect("scores");
-        scores.broadcast_add(&mask).expect("same-dtype mask add");
+        let head_major = reshape_head_major(&input, 2).expect("head-major");
+        assert_eq!(head_major.dims(), &[1, 2, 3, 4]);
+        let head_major_values = head_major
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((1, 3, 8))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            head_major_values,
+            input.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     #[test]
-    fn decoder_mask_window_uses_absolute_query_position() {
-        let device = Device::Cpu;
-        let mask = causal_attention_mask(4, DType::F32, &device).expect("mask");
-        let window = attention_mask_window(&mask, 2, 1, 4, DType::F32).expect("offset mask window");
-        let rows = window.to_vec2::<f32>().expect("mask rows");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], 0.0);
-        assert_eq!(rows[0][1], 0.0);
-        assert_eq!(rows[0][2], 0.0);
-        assert!(rows[0][3].is_infinite() && rows[0][3].is_sign_negative());
-    }
-
-    #[test]
-    fn incremental_single_token_mask_can_be_skipped_for_flash_attention() {
-        assert!(can_skip_attention_mask_for_fused_attention(false, 0, 8, 8));
-        assert!(can_skip_attention_mask_for_fused_attention(true, 4, 1, 5));
-        assert!(!can_skip_attention_mask_for_fused_attention(true, 0, 4, 4));
-        assert!(!can_skip_attention_mask_for_fused_attention(true, 4, 1, 6));
+    fn token_major_reshape_rejects_non_scalar_batch() {
+        let input = Tensor::zeros((2, 3, 8), DType::F32, &Device::Cpu).expect("input");
+        assert!(reshape_token_major(&input, 2).is_err());
     }
 
     #[test]

@@ -21,8 +21,9 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3ManagedCache, Qwen3Model};
+use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3Model};
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::tokenizer::Tokenizer;
@@ -34,7 +35,7 @@ pub struct ChatGenerationOutput {
 }
 
 pub struct ChatDecodeState {
-    cache: Qwen3ManagedCache,
+    cache: PhysicalPagedKvCache,
     /// Model output that has not yet been sampled by the current executor
     /// quantum. The first decode step consumes prefill output in the same
     /// invocation; later quanta compute and consume their output locally.
@@ -59,7 +60,10 @@ impl ChatDecodeState {
         self.cache.take_completed_writes()
     }
 
-    pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
         let current = &self.cache;
         if current.arena().id() != cache.arena().id()
             || current.arena().config().group != cache.arena().config().group
@@ -362,7 +366,7 @@ impl Qwen3ChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        mut cache: Qwen3ManagedCache,
+        mut cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let text_model = match &self.backend {
             Qwen3ChatBackend::Native { text_model } => text_model,

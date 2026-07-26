@@ -36,12 +36,13 @@ use crate::kv::{
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     qwen3_runtime_profile_delta, qwen3_runtime_profile_snapshot, qwen3_runtime_profiling_enabled,
-    Qwen3Config, Qwen3ManagedCache, Qwen3Model, Qwen3RuntimeProfileSnapshot, RopeScalingConfig,
+    Qwen3Config, Qwen3Model, Qwen3RuntimeProfileSnapshot, RopeScalingConfig,
 };
 use crate::models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
@@ -287,7 +288,7 @@ impl KvCacheContractProvider for Qwen3AsrModel {
 }
 
 pub struct AsrDecodeState {
-    cache: Option<Qwen3ManagedCache>,
+    cache: Option<PhysicalPagedKvCache>,
     /// Model output awaiting sampling inside the current executor quantum.
     /// This slot is always empty before an incremental state is yielded.
     unconsumed_output: Option<Tensor>,
@@ -310,7 +311,7 @@ pub struct AsrDecodeState {
 }
 
 enum AsrForwardCache<'a> {
-    Managed(&'a mut Qwen3ManagedCache),
+    Managed(&'a mut PhysicalPagedKvCache),
     None,
 }
 
@@ -324,7 +325,7 @@ impl AsrDecodeState {
     ) -> Vec<Arc<crate::backends::kv::KvWriteBatchCompletion>> {
         self.cache
             .as_mut()
-            .map(Qwen3ManagedCache::take_completed_writes)
+            .map(PhysicalPagedKvCache::take_completed_writes)
             .unwrap_or_default()
     }
 
@@ -332,7 +333,10 @@ impl AsrDecodeState {
         self.pos
     }
 
-    pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
         let Some(current) = &self.cache else {
             return Err(Error::InferenceError(
                 "an invocation-scoped Qwen3 ASR decode cannot switch to retained KV".to_string(),
@@ -777,7 +781,7 @@ impl Qwen3AsrModel {
 
     fn execution_diagnostics_for_physical(
         &self,
-        cache: &Qwen3ManagedCache,
+        cache: &PhysicalPagedKvCache,
     ) -> Qwen3AsrExecutionDiagnostics {
         self.execution_diagnostics_with_cache_geometry(
             cache.arena().config().page_tokens as usize,
@@ -953,7 +957,7 @@ impl Qwen3AsrModel {
         sample_rate: u32,
         language: Option<&str>,
         system_prompt: Option<&str>,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<AsrTranscriptionOutput> {
         self.transcribe_impl_physical(audio, sample_rate, language, system_prompt, None, cache)
     }
@@ -965,7 +969,7 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<String> {
         Ok(self
             .transcribe_impl_physical(
@@ -986,7 +990,7 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
         on_delta: Option<&mut dyn FnMut(&str)>,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<AsrTranscriptionOutput> {
         if cache.context_len() != 0 {
             return Err(Error::InvalidInput(
@@ -1010,7 +1014,7 @@ impl Qwen3AsrModel {
         state: &mut AsrDecodeState,
         language: Option<&str>,
         mut on_delta: Option<&mut dyn FnMut(&str)>,
-        mut invocation_cache: Option<&mut Qwen3ManagedCache>,
+        mut invocation_cache: Option<&mut PhysicalPagedKvCache>,
     ) -> Result<AsrTranscriptionOutput> {
         let decode_started = Instant::now();
         loop {
@@ -1060,7 +1064,7 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
         max_new_tokens: usize,
-        cache: Qwen3ManagedCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<AsrDecodeState> {
         if cache.context_len() != 0 {
             return Err(Error::InvalidInput(
@@ -1085,8 +1089,8 @@ impl Qwen3AsrModel {
         language: Option<&str>,
         system_prompt: Option<&str>,
         max_new_tokens: usize,
-        managed_cache: Option<Qwen3ManagedCache>,
-        mut invocation_cache: Option<&mut Qwen3ManagedCache>,
+        managed_cache: Option<PhysicalPagedKvCache>,
+        mut invocation_cache: Option<&mut PhysicalPagedKvCache>,
     ) -> Result<AsrDecodeState> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -1288,7 +1292,7 @@ impl Qwen3AsrModel {
         &self,
         state: &mut AsrDecodeState,
         emit_delta: bool,
-        mut invocation_cache: Option<&mut Qwen3ManagedCache>,
+        mut invocation_cache: Option<&mut PhysicalPagedKvCache>,
     ) -> Result<AsrDecodeStep> {
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;

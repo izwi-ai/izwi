@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor};
@@ -21,15 +20,19 @@ use flate2::Compression;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
+use crate::engine::{InvocationStaticAttentionLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::tokenizer::Tokenizer;
 
 use super::model::Whisper as LocalWhisper;
+use super::physical::WhisperPhysicalStateSpec;
 
 const SAMPLE_RATE: u32 = whisper::SAMPLE_RATE as u32;
 const DEFAULT_MAX_NEW_TOKENS: usize = 448;
@@ -147,7 +150,6 @@ struct WhisperRuntimeTuning {
     max_new_tokens_cap: usize,
     decode_budget_buffer_tokens: usize,
     default_language: Option<String>,
-    reuse_detected_language: bool,
     trim_silence: bool,
     silence_trim_threshold_scale: f32,
     silence_trim_min_abs: f32,
@@ -179,8 +181,6 @@ impl WhisperRuntimeTuning {
             decode_budget_buffer_tokens: env_usize("IZWI_WHISPER_MAX_NEW_TOKENS_BUFFER")
                 .unwrap_or(DEFAULT_ADAPTIVE_BUDGET_BUFFER_TOKENS),
             default_language: env_nonempty_string("IZWI_WHISPER_DEFAULT_LANGUAGE"),
-            reuse_detected_language: env_bool("IZWI_WHISPER_REUSE_DETECTED_LANGUAGE")
-                .unwrap_or(true),
             trim_silence: env_bool("IZWI_WHISPER_TRIM_SILENCE").unwrap_or(true),
             silence_trim_threshold_scale: env_f32("IZWI_WHISPER_SILENCE_TRIM_THRESHOLD_SCALE")
                 .unwrap_or(DEFAULT_SILENCE_TRIM_THRESHOLD_SCALE),
@@ -240,41 +240,37 @@ impl WhisperModel {
             .map_err(Error::from)
     }
 
-    fn reset_kv_cache(&mut self) {
+    fn encoder_forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model.reset_kv_cache(),
+            Self::Local(model) => model.encoder.forward(x).map_err(Error::from),
         }
     }
 
-    fn encoder_forward(&mut self, x: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
+    fn install_cross_attention_memory(
+        &self,
+        audio_features: &Tensor,
+        source_identity: [u8; 32],
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<()> {
         match self {
             Self::Local(model) => model
-                .encoder
-                .forward(x, flush_kv_cache)
+                .decoder
+                .install_cross_attention_memory(audio_features, source_identity, cross_kv)
                 .map_err(Error::from),
         }
     }
 
-    fn decoder_forward(
-        &mut self,
+    fn decoder_forward_physical_at(
+        &self,
         x: &Tensor,
-        audio_features: &Tensor,
-        flush_kv_cache: bool,
-    ) -> Result<Tensor> {
-        self.decoder_forward_at(x, audio_features, 0, flush_kv_cache)
-    }
-
-    fn decoder_forward_at(
-        &mut self,
-        x: &Tensor,
-        audio_features: &Tensor,
         position_offset: usize,
-        flush_kv_cache: bool,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<Tensor> {
         match self {
             Self::Local(model) => model
                 .decoder
-                .forward_at(x, audio_features, position_offset, flush_kv_cache)
+                .forward_physical_at(x, position_offset, self_kv, cross_kv)
                 .map_err(Error::from),
         }
     }
@@ -315,10 +311,31 @@ fn whisper_impl_name(cuda_dtype_shim: bool) -> &'static str {
     }
 }
 
+fn physical_state_required() -> Error {
+    Error::InferenceError(
+        "Whisper ASR requires lifecycle-owned physical invocation state".to_string(),
+    )
+}
+
+fn whisper_cross_source_identity(audio: &[f32], sample_rate: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"izwi-whisper-cross-attention-v2");
+    hasher.update(sample_rate.to_le_bytes());
+    hasher.update((audio.len() as u64).to_le_bytes());
+    for sample in audio {
+        hasher.update(sample.to_bits().to_le_bytes());
+    }
+    let mut identity: [u8; 32] = hasher.finalize().into();
+    if identity.iter().all(|byte| *byte == 0) {
+        identity[0] = 1;
+    }
+    identity
+}
+
 pub struct WhisperTurboAsrModel {
     device: DeviceProfile,
     model_dtype: DType,
-    whisper: Mutex<WhisperModel>,
+    whisper: WhisperModel,
     config: WhisperConfig,
     generation: WhisperGenerationConfig,
     tokenizer: Tokenizer,
@@ -333,7 +350,6 @@ pub struct WhisperTurboAsrModel {
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
     cuda_dtype_shim: bool,
-    cached_detected_language: Mutex<Option<(u32, String)>>,
 }
 
 impl WhisperTurboAsrModel {
@@ -440,7 +456,7 @@ impl WhisperTurboAsrModel {
         Ok(Self {
             device,
             model_dtype,
-            whisper: Mutex::new(whisper),
+            whisper,
             config,
             generation,
             tokenizer,
@@ -455,7 +471,6 @@ impl WhisperTurboAsrModel {
             token_id_to_language_code,
             runtime_tuning,
             cuda_dtype_shim: use_cuda_dtype_shim,
-            cached_detected_language: Mutex::new(None),
         })
     }
 
@@ -470,15 +485,12 @@ impl WhisperTurboAsrModel {
 
     pub fn transcribe_with_prompt(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        initial_prompt: Option<&str>,
+        _audio: &[f32],
+        _sample_rate: u32,
+        _language: Option<&str>,
+        _initial_prompt: Option<&str>,
     ) -> Result<String> {
-        let mut no_op = |_delta: &str| {};
-        Ok(self
-            .transcribe_impl(audio, sample_rate, language, initial_prompt, &mut no_op)?
-            .text)
+        Err(physical_state_required())
     }
 
     pub fn transcribe_with_details(
@@ -492,13 +504,12 @@ impl WhisperTurboAsrModel {
 
     pub fn transcribe_with_details_and_prompt(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        initial_prompt: Option<&str>,
+        _audio: &[f32],
+        _sample_rate: u32,
+        _language: Option<&str>,
+        _initial_prompt: Option<&str>,
     ) -> Result<AsrTranscriptionOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_impl(audio, sample_rate, language, initial_prompt, &mut no_op)
+        Err(physical_state_required())
     }
 
     pub fn transcribe_with_callback(
@@ -513,17 +524,69 @@ impl WhisperTurboAsrModel {
 
     pub fn transcribe_with_callback_and_prompt(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        initial_prompt: Option<&str>,
-        on_delta: &mut dyn FnMut(&str),
+        _audio: &[f32],
+        _sample_rate: u32,
+        _language: Option<&str>,
+        _initial_prompt: Option<&str>,
+        _on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        self.transcribe_streaming(audio, sample_rate, language, initial_prompt, on_delta)
+        Err(physical_state_required())
     }
 
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         Some(MAX_AUDIO_SECONDS_HINT)
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<WhisperPhysicalStateSpec> {
+        super::physical::whisper_physical_state_spec(
+            &self.config,
+            self.model_dtype,
+            self.device.kind.into(),
+            stage_graphs,
+        )
+    }
+
+    pub(crate) fn transcribe_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<AsrTranscriptionOutput> {
+        self.transcribe_impl(
+            audio,
+            sample_rate,
+            language,
+            initial_prompt,
+            self_kv,
+            cross_kv,
+        )
+    }
+
+    pub(crate) fn transcribe_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        initial_prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        self.transcribe_streaming(
+            audio,
+            sample_rate,
+            language,
+            initial_prompt,
+            self_kv,
+            cross_kv,
+            on_delta,
+        )
     }
 
     fn transcribe_impl(
@@ -532,7 +595,8 @@ impl WhisperTurboAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         initial_prompt: Option<&str>,
-        _on_delta: &mut dyn FnMut(&str),
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
     ) -> Result<AsrTranscriptionOutput> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
@@ -543,20 +607,20 @@ impl WhisperTurboAsrModel {
         let mel_started = Instant::now();
         let mel = self.prepare_mel(trimmed_audio, sample_rate)?;
         let mel_prepare_ms = mel_started.elapsed().as_secs_f64() * 1000.0;
-        let mut whisper = self
-            .whisper
-            .lock()
-            .map_err(|_| Error::InferenceError("Whisper model mutex poisoned".to_string()))?;
 
-        whisper.reset_kv_cache();
         self.synchronize_profile_device()?;
         let encoder_started = Instant::now();
-        let audio_features = whisper.encoder_forward(&mel, true)?;
+        let audio_features = self.whisper.encoder_forward(&mel)?;
+        self.whisper.install_cross_attention_memory(
+            &audio_features,
+            whisper_cross_source_identity(trimmed_audio, sample_rate),
+            cross_kv,
+        )?;
         self.synchronize_profile_device()?;
         let encoder_forward_ms = elapsed_ms(encoder_started);
 
         let language_resolution =
-            self.resolve_request_language(&mut whisper, &audio_features, language)?;
+            self.resolve_request_language(&self.whisper, language, self_kv, cross_kv)?;
         let resolved_language = language_resolution.resolved.clone();
         let language_hint_used = language_resolution.hint_used;
         let language_detect_ms = language_resolution.detect_ms;
@@ -600,11 +664,12 @@ impl WhisperTurboAsrModel {
         for (idx, temperature) in temperatures.iter().copied().enumerate() {
             attempted_temperatures.push(temperature);
             let attempt = self.decode_attempt(
-                &mut whisper,
-                &audio_features,
+                &self.whisper,
                 &prompt,
                 max_steps,
                 temperature,
+                self_kv,
+                cross_kv,
             )?;
             let no_speech_skip =
                 should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold);
@@ -712,7 +777,6 @@ impl WhisperTurboAsrModel {
             "language_resolution": {
                 "strategy": language_resolution.strategy,
                 "default_language": self.runtime_tuning.default_language,
-                "reuse_detected_language": self.runtime_tuning.reuse_detected_language,
             },
             "prompt": {
                 "initial_prompt_requested": prompt_diagnostics.initial_prompt_requested,
@@ -779,6 +843,8 @@ impl WhisperTurboAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         initial_prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         if audio.is_empty() {
@@ -787,16 +853,15 @@ impl WhisperTurboAsrModel {
 
         let trimmed_audio = self.trimmed_audio_slice(audio, sample_rate);
         let mel = self.prepare_mel(trimmed_audio, sample_rate)?;
-        let mut whisper = self
-            .whisper
-            .lock()
-            .map_err(|_| Error::InferenceError("Whisper model mutex poisoned".to_string()))?;
-
-        whisper.reset_kv_cache();
-        let audio_features = whisper.encoder_forward(&mel, true)?;
+        let audio_features = self.whisper.encoder_forward(&mel)?;
+        self.whisper.install_cross_attention_memory(
+            &audio_features,
+            whisper_cross_source_identity(trimmed_audio, sample_rate),
+            cross_kv,
+        )?;
 
         let language_resolution =
-            self.resolve_request_language(&mut whisper, &audio_features, language)?;
+            self.resolve_request_language(&self.whisper, language, self_kv, cross_kv)?;
         let resolved_language = language_resolution.resolved;
 
         let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
@@ -829,11 +894,12 @@ impl WhisperTurboAsrModel {
 
         let first_temperature = temperatures.first().copied().unwrap_or(0.0);
         let first_attempt = self.decode_attempt_streaming(
-            &mut whisper,
-            &audio_features,
+            &self.whisper,
             &prompt,
             max_steps,
             first_temperature,
+            self_kv,
+            cross_kv,
             on_delta,
         )?;
 
@@ -855,11 +921,12 @@ impl WhisperTurboAsrModel {
 
         for (idx, temperature) in temperatures.iter().copied().enumerate().skip(1) {
             let attempt = self.decode_attempt(
-                &mut whisper,
-                &audio_features,
+                &self.whisper,
                 &prompt,
                 max_steps,
                 temperature,
+                self_kv,
+                cross_kv,
             )?;
 
             if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
@@ -1076,15 +1143,17 @@ impl WhisperTurboAsrModel {
 
     fn detect_language_token(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<Option<(u32, String)>> {
         if self.language_token_ids.is_empty() {
             return Ok(None);
         }
 
+        self_kv.reset_invocation()?;
         let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
-        let ys = whisper.decoder_forward(&tokens, audio_features, true)?;
+        let ys = whisper.decoder_forward_physical_at(&tokens, 0, self_kv, cross_kv)?;
         let logits = whisper.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
         if let Some(language) = self.detect_language_token_on_cuda(&logits)? {
             return Ok(Some(language));
@@ -1188,15 +1257,13 @@ impl WhisperTurboAsrModel {
 
     fn resolve_request_language(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
         language: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<WhisperLanguageResolution> {
         if let Some(language) = language {
             let resolved = self.resolve_language_token(language)?;
-            if let Some((token, code)) = resolved.as_ref() {
-                self.update_cached_language(*token, code.clone());
-            }
             return Ok(WhisperLanguageResolution {
                 resolved,
                 hint_used: true,
@@ -1207,9 +1274,6 @@ impl WhisperTurboAsrModel {
 
         if let Some(default_language) = self.runtime_tuning.default_language.as_deref() {
             let resolved = self.resolve_language_token(default_language)?;
-            if let Some((token, code)) = resolved.as_ref() {
-                self.update_cached_language(*token, code.clone());
-            }
             return Ok(WhisperLanguageResolution {
                 resolved,
                 hint_used: false,
@@ -1218,47 +1282,17 @@ impl WhisperTurboAsrModel {
             });
         }
 
-        if self.runtime_tuning.reuse_detected_language {
-            if let Some(cached) = self.cached_language() {
-                return Ok(WhisperLanguageResolution {
-                    resolved: Some(cached),
-                    hint_used: false,
-                    detect_ms: 0.0,
-                    strategy: "cached",
-                });
-            }
-        }
-
         self.synchronize_profile_device()?;
         let detect_started = Instant::now();
-        let resolved = self.detect_language_token(whisper, audio_features)?;
+        let resolved = self.detect_language_token(whisper, self_kv, cross_kv)?;
         self.synchronize_profile_device()?;
         let detect_ms = elapsed_ms(detect_started);
-        if let Some((token, code)) = resolved.as_ref() {
-            self.update_cached_language(*token, code.clone());
-        }
         Ok(WhisperLanguageResolution {
             resolved,
             hint_used: false,
             detect_ms,
             strategy: "detected",
         })
-    }
-
-    fn cached_language(&self) -> Option<(u32, String)> {
-        self.cached_detected_language
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
-    }
-
-    fn update_cached_language(&self, token: u32, code: String) {
-        if !self.runtime_tuning.reuse_detected_language {
-            return;
-        }
-        if let Ok(mut guard) = self.cached_detected_language.lock() {
-            *guard = Some((token, code));
-        }
     }
 
     fn trimmed_audio_slice<'a>(&self, audio: &'a [f32], sample_rate: u32) -> &'a [f32] {
@@ -1467,12 +1501,14 @@ fn pad_or_trim_mel_frames(mel_spec: &mut Vec<Vec<f32>>, n_mels: usize, target_fr
 impl WhisperTurboAsrModel {
     fn decode_attempt(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
         prompt_prefix: &[u32],
         max_steps: usize,
         temperature: f32,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<WhisperDecodeAttempt> {
+        self_kv.reset_invocation()?;
         let mut rng = rand::thread_rng();
         let deterministic = temperature <= 0.0;
         let mut prompt = prompt_prefix.to_vec();
@@ -1490,13 +1526,13 @@ impl WhisperTurboAsrModel {
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
             let mut single_token = [0u32; 1];
-            let (input_tokens, position_offset, flush_cache) = if step_idx == 0 {
-                (prompt.as_slice(), 0, true)
+            let (input_tokens, position_offset) = if step_idx == 0 {
+                (prompt.as_slice(), 0)
             } else {
                 single_token[0] = *prompt.last().ok_or_else(|| {
                     Error::InferenceError("Whisper decode prompt is empty".to_string())
                 })?;
-                (&single_token[..], prompt.len().saturating_sub(1), false)
+                (&single_token[..], prompt.len().saturating_sub(1))
             };
             self.synchronize_profile_device()?;
             let step_started = if profile_enabled {
@@ -1515,21 +1551,21 @@ impl WhisperTurboAsrModel {
             };
             let ys = if profile_enabled {
                 let started = Instant::now();
-                let ys = whisper.decoder_forward_at(
+                let ys = whisper.decoder_forward_physical_at(
                     &tokens_t,
-                    audio_features,
                     position_offset,
-                    flush_cache,
+                    self_kv,
+                    cross_kv,
                 )?;
                 self.synchronize_profile_device()?;
                 profile.decoder_forward_ms += elapsed_ms(started);
                 ys
             } else {
-                whisper.decoder_forward_at(
+                whisper.decoder_forward_physical_at(
                     &tokens_t,
-                    audio_features,
                     position_offset,
-                    flush_cache,
+                    self_kv,
+                    cross_kv,
                 )?
             };
             let (_, seq_len, _) = ys.dims3()?;
@@ -1621,13 +1657,15 @@ impl WhisperTurboAsrModel {
 
     fn decode_attempt_streaming(
         &self,
-        whisper: &mut WhisperModel,
-        audio_features: &Tensor,
+        whisper: &WhisperModel,
         prompt_prefix: &[u32],
         max_steps: usize,
         temperature: f32,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &InvocationStaticAttentionLease,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<WhisperDecodeAttempt> {
+        self_kv.reset_invocation()?;
         let mut rng = rand::thread_rng();
         let deterministic = temperature <= 0.0;
         let mut prompt = prompt_prefix.to_vec();
@@ -1645,20 +1683,20 @@ impl WhisperTurboAsrModel {
         for step_idx in 0..max_steps {
             decode_steps = decode_steps.saturating_add(1);
             let mut single_token = [0u32; 1];
-            let (input_tokens, position_offset, flush_cache) = if step_idx == 0 {
-                (prompt.as_slice(), 0, true)
+            let (input_tokens, position_offset) = if step_idx == 0 {
+                (prompt.as_slice(), 0)
             } else {
                 single_token[0] = *prompt.last().ok_or_else(|| {
                     Error::InferenceError("Whisper decode prompt is empty".to_string())
                 })?;
-                (&single_token[..], prompt.len().saturating_sub(1), false)
+                (&single_token[..], prompt.len().saturating_sub(1))
             };
             let tokens_t = Tensor::new(input_tokens, &self.device.device)?.unsqueeze(0)?;
-            let ys = whisper.decoder_forward_at(
+            let ys = whisper.decoder_forward_physical_at(
                 &tokens_t,
-                audio_features,
                 position_offset,
-                flush_cache,
+                self_kv,
+                cross_kv,
             )?;
             let (_, seq_len, _) = ys.dims3()?;
             let logits = whisper
@@ -2516,14 +2554,36 @@ mod tests {
         has_low_word_diversity, logits_to_log_probs, logits_to_log_probs_in_place,
         pad_or_trim_mel_frames, probability_for_token_from_logits, scaled_logsumexp,
         tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
-        use_cuda_whisper_dtype_shim, whisper_decode_profile_diagnostics,
-        whisper_device_diagnostics, whisper_impl_name, WhisperDecodeAttempt, WhisperDecodeProfile,
-        WhisperSpecialTokens,
+        use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
+        whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
+        WhisperDecodeAttempt, WhisperDecodeProfile, WhisperSpecialTokens,
     };
 
     #[test]
     fn whisper_dtype_shim_is_cuda_only() {
         assert!(!use_cuda_whisper_dtype_shim(&candle_core::Device::Cpu));
+    }
+
+    #[test]
+    fn cross_attention_source_identity_authenticates_audio_and_rate() {
+        let audio = [0.0, -0.25, 0.5, 1.0];
+        let identity = whisper_cross_source_identity(&audio, 16_000);
+        assert_ne!(identity, [0; 32]);
+        assert_eq!(
+            identity,
+            whisper_cross_source_identity(&audio, 16_000),
+            "the same encoder source must have a stable identity"
+        );
+        assert_ne!(
+            identity,
+            whisper_cross_source_identity(&audio, 48_000),
+            "sample rate is part of the encoder source"
+        );
+        assert_ne!(
+            identity,
+            whisper_cross_source_identity(&[0.0, -0.25, 0.5, 0.75], 16_000),
+            "sample bits are part of the encoder source"
+        );
     }
 
     #[test]

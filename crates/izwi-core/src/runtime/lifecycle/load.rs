@@ -64,6 +64,23 @@ fn residency_budget_has_capacity(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadedAsrStatePublicationRoute {
+    Qwen3,
+    VibeVoice,
+    Whisper,
+    LegacyCache,
+}
+
+fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePublicationRoute {
+    match variant.family() {
+        crate::catalog::ModelFamily::Qwen3Asr => LoadedAsrStatePublicationRoute::Qwen3,
+        crate::catalog::ModelFamily::VibeVoiceAsr => LoadedAsrStatePublicationRoute::VibeVoice,
+        crate::catalog::ModelFamily::WhisperAsr => LoadedAsrStatePublicationRoute::Whisper,
+        _ => LoadedAsrStatePublicationRoute::LegacyCache,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ModelResourcePlan {
     /// Maximum simultaneous memory authorized before physical instantiation.
     load_authorization: ResourceVector,
@@ -700,7 +717,8 @@ impl ModelLifecycleController {
                 } else if let Some(loaded) = self.model_registry.get_asr(variant).await {
                     let loaded_cache = loaded.kv_cache_contract()?;
                     loaded_cache.validate()?;
-                    if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
+                    let publication_route = loaded_asr_state_publication_route(variant);
+                    if publication_route == LoadedAsrStatePublicationRoute::Qwen3 {
                         if !managed_kv_backend_compiled(backend) {
                             return Err(Error::ModelLoadError(format!(
                                 "loaded model {variant} requires physical ASR state, but the {backend:?} build has no direct paged-attention runtime"
@@ -761,9 +779,7 @@ impl ModelLifecycleController {
                             CapabilityKind::Asr,
                             publication,
                         );
-                    } else if variant.family()
-                        == crate::catalog::ModelFamily::VibeVoiceAsr
-                    {
+                    } else if publication_route == LoadedAsrStatePublicationRoute::VibeVoice {
                         if !managed_kv_backend_compiled(backend) {
                             return Err(Error::ModelLoadError(format!(
                                 "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
@@ -775,6 +791,29 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.vibevoice_physical_state_spec(&stage_graphs)?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                &physical_spec.invocation,
+                                None,
+                                HashMap::new(),
+                            )
+                            .await?;
+                        state_publications.insert(CapabilityKind::Asr, publication);
+                    } else if publication_route == LoadedAsrStatePublicationRoute::Whisper {
+                        if !managed_kv_backend_compiled(backend) {
+                            return Err(Error::ModelLoadError(format!(
+                                "loaded model {variant} requires physical Whisper ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                            )));
+                        }
+                        let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                        let stage_graphs = contracts
+                            .iter()
+                            .map(|contract| contract.stages.as_ref())
+                            .collect::<Vec<_>>();
+                        let physical_spec = loaded.whisper_physical_state_spec(&stage_graphs)?;
                         let publication = self
                             .load_invocation_workspace_publication(
                                 model_instance_id,
@@ -1150,9 +1189,9 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        model_load_capacity_is_guarded, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, residency_budget_has_capacity, select_lru_eviction_candidate,
-        ModelMemoryEstimate,
+        loaded_asr_state_publication_route, model_load_capacity_is_guarded, model_memory_estimate,
+        model_resource_plan, plan_invocation_allocations, residency_budget_has_capacity,
+        select_lru_eviction_candidate, LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1326,6 +1365,22 @@ mod tests {
         assert_eq!(
             managed_kv_backend_compiled(BackendKind::Cuda),
             cfg!(feature = "flash-attn")
+        );
+    }
+
+    #[test]
+    fn whisper_asr_selects_physical_invocation_publication() {
+        assert_eq!(
+            loaded_asr_state_publication_route(ModelVariant::WhisperLargeV3Turbo),
+            LoadedAsrStatePublicationRoute::Whisper
+        );
+        assert_eq!(
+            loaded_asr_state_publication_route(ModelVariant::VibeVoiceAsr),
+            LoadedAsrStatePublicationRoute::VibeVoice
+        );
+        assert_eq!(
+            loaded_asr_state_publication_route(ModelVariant::ParakeetTdt06BV3),
+            LoadedAsrStatePublicationRoute::LegacyCache
         );
     }
 

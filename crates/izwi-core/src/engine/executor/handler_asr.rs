@@ -10,9 +10,8 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
-use super::{
-    ExecutorOutput, ExecutorPhaseTiming, ManagedQwenCache, ModelSessionResult, NativeExecutor,
-};
+use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
 const GRANITE_ASR_PREFIX_REPLAY_WORDS: usize = 0;
@@ -36,6 +35,33 @@ fn with_single_invocation_cache<T>(
     Ok(output)
 }
 
+fn with_whisper_invocation_state<T>(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    run: impl FnOnce(
+        &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
+        &mut crate::engine::InvocationStaticAttentionLease,
+    ) -> Result<T>,
+) -> Result<T> {
+    let mut leases = super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
+    let output = {
+        let (paged, cross) = leases.lease_exact_kind_pair_mut(
+            crate::kv::v2::InvocationStateBackingKindV2::PagedAttention,
+            crate::kv::v2::InvocationStateBackingKindV2::StaticAttention,
+        )?;
+        let cache = paged.paged_cache_mut()?;
+        let cross = cross.typed_mut::<crate::engine::InvocationStaticAttentionLease>()?;
+        run(cache, cross)?
+    };
+    let completions = leases.release()?;
+    if completions.len() != 2 {
+        return Err(Error::InferenceError(
+            "Whisper ASR physical state returned an incomplete completion set".to_string(),
+        ));
+    }
+    Ok(output)
+}
+
 impl NativeExecutor {
     pub(super) fn transcribe_request(
         &self,
@@ -49,7 +75,7 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-        mut managed_cache: Option<ManagedQwenCache>,
+        mut managed_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ModelSessionResult> {
         if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
             return Err(Error::InferenceError(
@@ -507,6 +533,20 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
+                            ModelFamily::WhisperAsr => with_whisper_invocation_state(
+                                request,
+                                scheduled,
+                                |self_kv, cross_kv| {
+                                    model.transcribe_whisper_with_details_and_prompt_physical(
+                                        chunk_audio,
+                                        sr,
+                                        language,
+                                        asr_prompt,
+                                        self_kv,
+                                        cross_kv,
+                                    )
+                                },
+                            )?,
                             _ => model.transcribe_with_details_prompt_prefix_and_options(
                                 chunk_audio,
                                 sr,
@@ -601,6 +641,21 @@ impl NativeExecutor {
                                     )
                             })?
                         }
+                        ModelFamily::WhisperAsr => with_whisper_invocation_state(
+                            request,
+                            scheduled,
+                            |self_kv, cross_kv| {
+                                model.transcribe_whisper_with_callback_and_prompt_physical(
+                                    &samples,
+                                    sample_rate,
+                                    language,
+                                    asr_prompt,
+                                    self_kv,
+                                    cross_kv,
+                                    &mut emit,
+                                )
+                            },
+                        )?,
                         _ => model.transcribe_with_callback_and_prompt_and_options(
                             &samples,
                             sample_rate,
@@ -657,6 +712,18 @@ impl NativeExecutor {
                                 segment_generation_options.clone(),
                                 cache,
                             )
+                    })?
+                }
+                ModelFamily::WhisperAsr => {
+                    with_whisper_invocation_state(request, scheduled, |self_kv, cross_kv| {
+                        model.transcribe_whisper_with_details_and_prompt_physical(
+                            &samples,
+                            sample_rate,
+                            language,
+                            asr_prompt,
+                            self_kv,
+                            cross_kv,
+                        )
                     })?
                 }
                 _ => model.transcribe_with_details_and_prompt_and_options(

@@ -33,7 +33,7 @@ use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
-use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
@@ -187,7 +187,6 @@ pub(crate) fn qwen3_decoder_cache_domain(
     })
 }
 
-pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as Qwen3ManagedCache;
 pub struct Qwen3Cache {
     k_pages: Vec<Vec<KvPage>>,
     v_pages: Vec<Vec<KvPage>>,
@@ -1887,7 +1886,7 @@ impl Qwen3Attention {
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: &Qwen3ManagedCache,
+        cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
@@ -1930,7 +1929,7 @@ impl Qwen3Attention {
         &self,
         x: &Tensor,
         start_positions: &[usize],
-        caches: &[&Qwen3ManagedCache],
+        caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
@@ -2254,7 +2253,7 @@ impl Qwen3Layer {
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: &Qwen3ManagedCache,
+        cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
@@ -2277,7 +2276,7 @@ impl Qwen3Layer {
         &self,
         x: &Tensor,
         start_positions: &[usize],
-        caches: &[&Qwen3ManagedCache],
+        caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
@@ -2575,7 +2574,7 @@ impl Qwen3Model {
         &self,
         input_ids: &Tensor,
         start_pos: usize,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
         let (batch_size, sequence_len) = input_ids.dims2()?;
         if batch_size != 1 || sequence_len == 0 {
@@ -2598,7 +2597,7 @@ impl Qwen3Model {
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (hidden, prepared) =
@@ -2618,7 +2617,7 @@ impl Qwen3Model {
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (hidden, prepared) =
@@ -2631,7 +2630,7 @@ impl Qwen3Model {
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        cache: &Qwen3ManagedCache,
+        cache: &PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
     ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
         let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
@@ -2677,7 +2676,7 @@ impl Qwen3Model {
         &self,
         input_ids: &Tensor,
         start_positions: &[usize],
-        caches: &mut [&mut Qwen3ManagedCache],
+        caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
         let (batch_size, sequence_len) = input_ids.dims2()?;
         if sequence_len != 1
@@ -2730,7 +2729,7 @@ impl Qwen3Model {
             let cache_refs = caches
                 .iter()
                 .map(|cache| &**cache)
-                .collect::<Vec<&Qwen3ManagedCache>>();
+                .collect::<Vec<&PhysicalPagedKvCache>>();
             x = layer.forward_managed_decode_batch(
                 &x,
                 start_positions,
@@ -3301,7 +3300,7 @@ mod tests {
         arena: Arc<dyn KvArena>,
         bindings: Vec<KvLayerBinding>,
         first_page: u32,
-    ) -> Qwen3ManagedCache {
+    ) -> PhysicalPagedKvCache {
         let blocks = (first_page..first_page + 4)
             .map(|index| CacheBlockRef {
                 arena: arena.id(),
@@ -3310,7 +3309,7 @@ mod tests {
                 slot_generation: 1,
             })
             .collect();
-        Qwen3ManagedCache::new(arena, bindings, blocks, 0).unwrap()
+        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
     }
 
     #[test]
@@ -3531,7 +3530,7 @@ mod tests {
         model.forward_managed(&prefix, 0, &mut publisher).unwrap();
         assert_eq!(publisher.context_len(), 4);
 
-        let mut reused = Qwen3ManagedCache::new(
+        let mut reused = PhysicalPagedKvCache::new(
             arena,
             bindings,
             publisher.blocks.clone(),

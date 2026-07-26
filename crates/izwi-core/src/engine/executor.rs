@@ -54,7 +54,6 @@ use crate::backends::{
 use crate::error::{Error, Result};
 use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat, ResolvedKvGroupKind};
 use crate::model::ModelVariant;
-pub(super) use crate::models::architectures::qwen3::core::Qwen3ManagedCache as ManagedQwenCache;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -65,7 +64,7 @@ fn qwen3_managed_cache_for_row(
     request: &EngineCoreRequest,
     scheduled: &ScheduledRequest,
     reservation: &super::ManagedCacheReservation,
-) -> Result<ManagedQwenCache> {
+) -> Result<PhysicalPagedKvCache> {
     let runtime = request.managed_cache_runtime().ok_or_else(|| {
         Error::InferenceError("managed Qwen3 row has no model runtime".to_string())
     })?;

@@ -14,8 +14,11 @@ use tracing::info;
 use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
-use crate::engine::{RetainedTensorStateRuntimeV2, StageDescriptor};
+use crate::engine::{
+    InvocationStaticAttentionLease, RetainedTensorStateRuntimeV2, StageDescriptor,
+};
 use crate::error::{Error, Result};
+use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
 use crate::kv::{CacheCapability, KvCacheContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
@@ -44,7 +47,6 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
 };
-use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
@@ -62,6 +64,7 @@ use crate::models::architectures::voxtral::tts::VoxtralTtsModel;
 use crate::models::architectures::whisper::asr::{
     AsrTranscriptionOutput as WhisperAsrTranscriptionOutput, WhisperTurboAsrModel,
 };
+use crate::models::architectures::whisper::WhisperPhysicalStateSpec;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
@@ -600,7 +603,7 @@ impl NativeAsrDecodeState {
 
     pub(crate) fn install_qwen3_managed_reservation(
         &mut self,
-        cache: Qwen3ManagedCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
@@ -714,6 +717,151 @@ fn granite_speech_asr_options(
 }
 
 impl NativeAsrModel {
+    /// Execute an atomic ASR operation through its complete lifecycle-owned
+    /// invocation workspace. This is the model-adapter boundary used by direct
+    /// runtime pipelines; callers never select or omit physical domains.
+    pub(crate) fn transcribe_with_details_and_prompt_and_options_from_invocation_workspace(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::Qwen3(_) => {
+                let cache = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
+                    .paged_cache_mut()?;
+                self.transcribe_qwen3_with_details_and_prompt_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    cache,
+                )
+            }
+            Self::WhisperTurbo(_) => {
+                let (self_attention, cross_attention) = leases.lease_exact_kind_pair_mut(
+                    InvocationStateBackingKindV2::PagedAttention,
+                    InvocationStateBackingKindV2::StaticAttention,
+                )?;
+                let self_kv = self_attention.paged_cache_mut()?;
+                let cross_kv = cross_attention.typed_mut::<InvocationStaticAttentionLease>()?;
+                self.transcribe_whisper_with_details_and_prompt_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    self_kv,
+                    cross_kv,
+                )
+            }
+            Self::VibeVoice(_) => {
+                let cache = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
+                    .paged_cache_mut()?;
+                self.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    options,
+                    cache,
+                )
+            }
+            Self::GraniteSpeech(_) => {
+                let cache = leases
+                    .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)?
+                    .paged_cache_mut()?;
+                self.transcribe_granite_speech_with_details_and_prompt_and_options_physical(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    options,
+                    cache,
+                )
+            }
+            Self::Parakeet(_) | Self::Nemotron(_) => Err(Error::InferenceError(
+                "ASR model does not author physical invocation transcription state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn whisper_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<WhisperPhysicalStateSpec> {
+        match self {
+            Self::WhisperTurbo(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::ModelLoadError(
+                "non-Whisper ASR model cannot author Whisper physical state".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn transcribe_whisper_with_details_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+    ) -> Result<NativeAsrTranscription> {
+        let Self::WhisperTurbo(model) = self else {
+            return Err(Error::InferenceError(
+                "Whisper physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        let WhisperAsrTranscriptionOutput {
+            text,
+            language,
+            diagnostics,
+        } = model.transcribe_with_details_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            self_kv,
+            cross_kv,
+        )?;
+        Ok(NativeAsrTranscription {
+            text,
+            language,
+            diagnostics,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transcribe_whisper_with_callback_and_prompt_physical(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        self_kv: &mut PhysicalPagedKvCache,
+        cross_kv: &mut InvocationStaticAttentionLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let Self::WhisperTurbo(model) = self else {
+            return Err(Error::InferenceError(
+                "Whisper physical ASR state was routed to a different model".to_string(),
+            ));
+        };
+        model.transcribe_with_callback_and_prompt_physical(
+            audio,
+            sample_rate,
+            language,
+            prompt,
+            self_kv,
+            cross_kv,
+            on_delta,
+        )
+    }
+
     pub(crate) fn granite_speech_physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -876,7 +1024,7 @@ impl NativeAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: NativeAsrGenerationOptions,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<NativeAsrTranscription> {
         let Self::VibeVoice(model) = self else {
             return Err(Error::InferenceError(
@@ -909,7 +1057,7 @@ impl NativeAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         options: NativeAsrGenerationOptions,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let Self::VibeVoice(model) = self else {
@@ -946,7 +1094,7 @@ impl NativeAsrModel {
         sample_rate: u32,
         language: Option<&str>,
         prompt: Option<&str>,
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<NativeAsrTranscription> {
         let Self::Qwen3(model) = self else {
             return Err(Error::InferenceError(
@@ -978,7 +1126,7 @@ impl NativeAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         on_delta: &mut dyn FnMut(&str),
-        cache: &mut Qwen3ManagedCache,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<String> {
         let Self::Qwen3(model) = self else {
             return Err(Error::InferenceError(
@@ -1657,7 +1805,7 @@ impl NativeAsrModel {
         language: Option<&str>,
         prompt: Option<&str>,
         max_new_tokens: usize,
-        cache: Qwen3ManagedCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<NativeAsrDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
@@ -2231,7 +2379,10 @@ pub enum NativeChatDecodeState {
 }
 
 impl NativeChatDecodeState {
-    pub(crate) fn install_managed_reservation(&mut self, cache: Qwen3ManagedCache) -> Result<()> {
+    pub(crate) fn install_managed_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
         match self {
             Self::Qwen3(state) => state.install_managed_reservation(cache),
             Self::Qwen35(state) => state.install_physical_reservation(cache),
@@ -2448,7 +2599,7 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
-        cache: Qwen3ManagedCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(model.start_decode_managed(
@@ -2468,7 +2619,7 @@ impl NativeChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen35PreparedPrompt>,
-        cache: Qwen3ManagedCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen35(model) => Ok(NativeChatDecodeState::Qwen35(

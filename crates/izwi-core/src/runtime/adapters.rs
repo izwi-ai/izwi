@@ -438,6 +438,7 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 state_requirement: match model_variant.family() {
                     ModelFamily::Qwen3Asr => InferenceStateRequirement::RetainedAndInvocation,
                     ModelFamily::VibeVoiceAsr
+                    | ModelFamily::WhisperAsr
                     | ModelFamily::Voxtral
                     | ModelFamily::GraniteSpeechAsr => InferenceStateRequirement::Invocation,
                     _ => InferenceStateRequirement::Stateless,
@@ -748,12 +749,13 @@ mod tests {
     fn built_in_registry_resolves_non_tts_capabilities() {
         let registry = RuntimeAdapterRegistry::built_in();
 
+        let whisper = registry
+            .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
+            .expect("whisper asr adapter");
+        assert_eq!(whisper.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(
-            registry
-                .require(CapabilityKind::Asr, ModelVariant::WhisperLargeV3Turbo)
-                .expect("whisper asr adapter")
-                .execution_target,
-            ExecutionTargetKind::TokenEngine
+            whisper.state_requirement,
+            InferenceStateRequirement::Invocation
         );
         assert_eq!(
             registry

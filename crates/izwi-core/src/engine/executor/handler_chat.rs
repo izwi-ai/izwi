@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::Qwen3ManagedCache;
 use crate::models::registry::NativeChatModel;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
 
@@ -93,7 +93,7 @@ impl NativeExecutor {
         &self,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
-        mut managed_cache: Option<Qwen3ManagedCache>,
+        mut managed_cache: Option<PhysicalPagedKvCache>,
         tensor_reservation: Option<crate::engine::ManagedTensorStateReservation>,
     ) -> Result<ModelSessionResult> {
         if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
@@ -412,7 +412,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-        managed_caches: Vec<Option<Qwen3ManagedCache>>,
+        managed_caches: Vec<Option<PhysicalPagedKvCache>>,
     ) -> Result<Vec<ModelSessionResult>> {
         if scheduled.is_empty()
             || scheduled

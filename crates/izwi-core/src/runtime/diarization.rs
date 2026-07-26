@@ -8,9 +8,10 @@ use crate::error::{Error, Result};
 use crate::models::architectures::sortformer::diarization::{
     production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
-use crate::models::registry::NativeAsrModel;
+use crate::models::architectures::voxtral::realtime::VoxtralRealtimeModel;
+use crate::models::registry::{NativeAsrGenerationOptions, NativeAsrModel, NativeAsrTranscription};
 use crate::models::shared::chat::{ChatMessage, ChatRole};
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, InferenceStateRequirement};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes, validate_base64_audio_retained_size, MAX_AUDIO_SOURCE_BYTES,
 };
@@ -180,6 +181,85 @@ struct TranscribedChunk {
     range: AudioChunk,
     text: String,
     language: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiarizationAsrRegistryRoute {
+    Native,
+    Voxtral,
+}
+
+fn diarization_asr_registry_route(variant: ModelVariant) -> DiarizationAsrRegistryRoute {
+    if variant.family() == crate::catalog::ModelFamily::Voxtral {
+        DiarizationAsrRegistryRoute::Voxtral
+    } else {
+        DiarizationAsrRegistryRoute::Native
+    }
+}
+
+#[derive(Clone)]
+enum DiarizationAsrModel {
+    Native(Arc<NativeAsrModel>),
+    Voxtral(Arc<VoxtralRealtimeModel>),
+}
+
+impl DiarizationAsrModel {
+    fn max_audio_seconds_hint(&self) -> Option<f32> {
+        match self {
+            Self::Native(model) => model.max_audio_seconds_hint(),
+            Self::Voxtral(_) => None,
+        }
+    }
+
+    fn transcribe_with_details(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::Native(model) => model.transcribe_with_details(audio, sample_rate, language),
+            Self::Voxtral(_) => Err(Error::InferenceError(
+                "Voxtral ASR requires lifecycle-owned physical invocation state".to_string(),
+            )),
+        }
+    }
+
+    fn transcribe_from_invocation_workspace(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        options: NativeAsrGenerationOptions,
+        leases: &mut crate::kv::v2::InvocationWorkspaceLeaseSetV2,
+    ) -> Result<NativeAsrTranscription> {
+        match self {
+            Self::Native(model) => model
+                .transcribe_with_details_and_prompt_and_options_from_invocation_workspace(
+                    audio,
+                    sample_rate,
+                    language,
+                    prompt,
+                    options,
+                    leases,
+                ),
+            Self::Voxtral(model) => {
+                let cache = leases
+                    .lease_exact_kind_mut(
+                        crate::kv::v2::InvocationStateBackingKindV2::PagedAttention,
+                    )?
+                    .paged_cache_mut()?;
+                let output =
+                    model.transcribe_with_details_physical(audio, sample_rate, language, cache)?;
+                Ok(NativeAsrTranscription {
+                    text: output.text,
+                    language: output.language,
+                    diagnostics: output.diagnostics,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -578,8 +658,8 @@ impl RuntimeService {
             .adapter_registry
             .require(CapabilityKind::Asr, asr_variant)?
             .execution_target;
-        let (asr_lease, asr_contract) = self
-            .load_capability_for_job(
+        let (asr_lease, asr_contract, asr_state) = self
+            .load_capability_with_state_for_job(
                 &pipeline_job,
                 asr_variant,
                 CapabilityKind::Asr,
@@ -587,11 +667,20 @@ impl RuntimeService {
                 asr_target,
             )
             .await?;
-        let asr_model = self
-            .model_registry
-            .get_asr(asr_variant)
-            .await
-            .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?;
+        let asr_model = match diarization_asr_registry_route(asr_variant) {
+            DiarizationAsrRegistryRoute::Voxtral => DiarizationAsrModel::Voxtral(
+                self.model_registry
+                    .get_voxtral(asr_variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
+            ),
+            DiarizationAsrRegistryRoute::Native => DiarizationAsrModel::Native(
+                self.model_registry
+                    .get_asr(asr_variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
+            ),
+        };
 
         let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
             runtime_request.aligner_model_id.as_deref(),
@@ -635,28 +724,105 @@ impl RuntimeService {
             aligner_limit,
             aligner_model.is_some(),
         );
+        let invocation_asr = matches!(
+            asr_contract.metadata.state_requirement,
+            InferenceStateRequirement::Invocation
+                | InferenceStateRequirement::RetainedAndInvocation
+        );
+        let _asr_lease = asr_lease;
 
         let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
             let audio_for_task = audio.clone();
-            let transcription = self
-                .coordinator
-                .run_loaded_blocking_stage(
-                    &pipeline_job,
-                    asr_contract,
-                    WorkUnit::AtomicJob {
-                        kind: "diarization.transcribe".to_string(),
-                    },
-                    move || {
-                        let _asr_lease = asr_lease;
-                        asr_model.transcribe_with_details(
-                            &audio_for_task.samples,
-                            PIPELINE_SAMPLE_RATE,
-                            None,
-                        )
-                    },
-                )
-                .await?;
+            let transcription = if invocation_asr {
+                self.coordinator
+                    .run_loaded_blocking_stage_with_invocation_workspace(
+                        &pipeline_job,
+                        asr_contract,
+                        asr_state,
+                        WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe".to_string(),
+                        },
+                        move |leases| {
+                            asr_model.transcribe_from_invocation_workspace(
+                                &audio_for_task.samples,
+                                PIPELINE_SAMPLE_RATE,
+                                None,
+                                None,
+                                NativeAsrGenerationOptions::default(),
+                                leases,
+                            )
+                        },
+                    )
+                    .await?
+            } else {
+                self.coordinator
+                    .run_loaded_blocking_stage(
+                        &pipeline_job,
+                        asr_contract,
+                        WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe".to_string(),
+                        },
+                        move || {
+                            asr_model.transcribe_with_details(
+                                &audio_for_task.samples,
+                                PIPELINE_SAMPLE_RATE,
+                                None,
+                            )
+                        },
+                    )
+                    .await?
+            };
             (transcription.text, Vec::new(), transcription.language)
+        } else if invocation_asr {
+            let cfg = pipeline_chunk_config();
+            let chunk_limit =
+                combined_chunk_limit(asr_model.max_audio_seconds_hint(), aligner_limit);
+            let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
+            if chunks.is_empty() {
+                return Err(Error::InvalidInput(
+                    "ASR chunk planner produced no chunks".to_string(),
+                ));
+            }
+            let mut assembler = TranscriptAssembler::new(cfg);
+            let mut transcribed = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.samples.len()
+                {
+                    continue;
+                }
+                let model = asr_model.clone();
+                let chunk_audio = audio.clone();
+                let chunk_start = chunk.start_sample;
+                let chunk_end = chunk.end_sample;
+                let transcription = self
+                    .coordinator
+                    .run_loaded_blocking_stage_with_invocation_workspace(
+                        &pipeline_job,
+                        asr_contract.clone(),
+                        asr_state.clone(),
+                        WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe_chunks".to_string(),
+                        },
+                        move |leases| {
+                            model.transcribe_from_invocation_workspace(
+                                &chunk_audio.samples[chunk_start..chunk_end],
+                                PIPELINE_SAMPLE_RATE,
+                                None,
+                                None,
+                                NativeAsrGenerationOptions::default(),
+                                leases,
+                            )
+                        },
+                    )
+                    .await?;
+                assembler.push_chunk_text(&transcription.text);
+                transcribed.push(TranscribedChunk {
+                    range: chunk,
+                    text: transcription.text,
+                    language: transcription.language,
+                });
+            }
+            (assembler.finish().trim().to_string(), transcribed, None)
         } else {
             let audio_for_task = audio.clone();
             let (text, chunks) = self
@@ -668,7 +834,6 @@ impl RuntimeService {
                         kind: "diarization.transcribe_chunks".to_string(),
                     },
                     move || {
-                        let _asr_lease = asr_lease;
                         transcribe_audio_chunks(asr_model, &audio_for_task, None, aligner_limit)
                     },
                 )
@@ -934,7 +1099,7 @@ fn should_use_single_pass_diarization_asr(
 }
 
 fn transcribe_audio_chunks(
-    model: Arc<NativeAsrModel>,
+    model: DiarizationAsrModel,
     audio: &PipelineAudio,
     language: Option<&str>,
     aligner_limit: Option<f32>,
@@ -2156,6 +2321,22 @@ fn secs_to_ms(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diarization_resolves_voxtral_through_its_loaded_asr_registry() {
+        assert_eq!(
+            diarization_asr_registry_route(ModelVariant::VoxtralMini4BRealtime2602),
+            DiarizationAsrRegistryRoute::Voxtral
+        );
+        assert_eq!(
+            diarization_asr_registry_route(ModelVariant::WhisperLargeV3Turbo),
+            DiarizationAsrRegistryRoute::Native
+        );
+        assert_eq!(
+            diarization_asr_registry_route(ModelVariant::ParakeetTdt06BV3),
+            DiarizationAsrRegistryRoute::Native
+        );
+    }
 
     async fn admitted_diarization_copy_job(
         runtime: &RuntimeService,
