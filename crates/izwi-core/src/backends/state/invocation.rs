@@ -11,7 +11,7 @@ use candle_nn::{Conv1d, Conv1dConfig, Module};
 
 use crate::backends::backend_kind_for_device;
 use crate::error::{Error, Result};
-use crate::kernels::{try_lfm_shortconv_ring_sequence, try_lfm_shortconv_sequence3};
+use crate::kernels::try_lfm_shortconv_ring_sequence;
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, InferenceStateContract, InvocationStateCapacity,
     InvocationWorkspaceDomain, ResolvedNonPagedDomainPlan, ResolvedStatePlan, StateComponentId,
@@ -1239,15 +1239,16 @@ impl InvocationRingDepthwiseConvTransaction<'_> {
             self.intent.expected_cursor,
             u64::try_from(self.arena.valid_length)
                 .map_err(|_| invalid("physical depthwise convolution history exceeds u64"))?,
-        )
-        .or_else(|| {
-            (self.intent.expected_cursor == 0 && kernel == 3)
-                .then(|| try_lfm_shortconv_sequence3(&input, weight))
-                .flatten()
-        });
-        let output = if self.intent.expected_cursor == 0 || output.is_some() {
+        );
+        if physical_ring_kernel_required(&self.arena.device) && output.is_none() {
+            return Err(Error::InferenceError(format!(
+                "the {:?} physical ShortConv ring kernel is unavailable; accelerator inference cannot fall back to a second state path",
+                backend_kind_for_device(&self.arena.device)
+            )));
+        }
+        let output = if output.is_some() {
             output
-        } else {
+        } else if self.intent.expected_cursor > 0 {
             Some(self.direct_ring_convolution(
                 component_id,
                 &input,
@@ -1257,6 +1258,8 @@ impl InvocationRingDepthwiseConvTransaction<'_> {
                 steps,
                 kernel,
             )?)
+        } else {
+            None
         };
         let output = match output {
             Some(output) => output,
@@ -1371,6 +1374,10 @@ impl InvocationRingDepthwiseConvTransaction<'_> {
             },
         )
     }
+}
+
+fn physical_ring_kernel_required(device: &Device) -> bool {
+    device.is_metal() || device.is_cuda()
 }
 
 fn domain_components<'a>(
