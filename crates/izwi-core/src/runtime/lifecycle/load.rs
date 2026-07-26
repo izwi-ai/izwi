@@ -15,10 +15,10 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
-    InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceKeyV2,
-    InvocationPagedWorkspaceRuntimeV2, InvocationStateCapacity, InvocationWorkspaceDomain,
-    InvocationWorkspaceRuntimeV2, InvocationWorkspaceSet, RetainedStateCapability,
-    RetainedStateRuntimeV2, RetainedStateUseV2, StateDomainId, StateDomainSpec, StateScope,
+    InvocationPagedWorkspaceBindingV2, InvocationPagedWorkspaceRuntimeV2, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceKeyV2, InvocationWorkspaceRuntimeV2,
+    InvocationWorkspaceSet, RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2,
+    StateDomainId, StateDomainSpec, StateScope,
 };
 use crate::kv::KvCacheContractProvider;
 use crate::model::ModelVariant;
@@ -144,9 +144,9 @@ fn model_load_capacity_is_guarded(backend: BackendKind) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct InvocationPagedAllocationV2 {
+struct InvocationAllocationV2 {
     adapter_instance: AdapterInstanceId,
-    key: InvocationPagedWorkspaceKeyV2,
+    key: InvocationWorkspaceKeyV2,
     domain: InvocationWorkspaceDomain,
     slot_count: u32,
 }
@@ -191,11 +191,11 @@ fn validate_physical_publication_backing(
 /// Resolve one capability-authored invocation descriptor into exact physical
 /// allocations. This is deliberately model-neutral: graph, stage, domain, and
 /// concurrency identities all come from the sealed execution/state contracts.
-fn plan_invocation_paged_allocations(
+fn plan_invocation_allocations(
     descriptor: &CapabilityStateDescriptorV2,
     invocation_contract: &InferenceStateContract,
     executions: &[LoadedExecutionContract],
-) -> Result<Vec<InvocationPagedAllocationV2>> {
+) -> Result<Vec<InvocationAllocationV2>> {
     if executions.is_empty() {
         return Err(invalid_invocation_publication(
             "physical invocation publication has no execution stage graphs",
@@ -208,11 +208,6 @@ fn plan_invocation_paged_allocations(
         if domain.scope() != StateScope::Invocation {
             return Err(invalid_invocation_publication(
                 "physical invocation contract contains retained state",
-            ));
-        }
-        if !matches!(domain, StateDomainSpec::PagedAttention(_)) {
-            return Err(invalid_invocation_publication(
-                "physical invocation contract contains state without a paged allocator",
             ));
         }
         if contract_domains.insert(domain.id(), domain).is_some() {
@@ -291,15 +286,23 @@ fn plan_invocation_paged_allocations(
                     // has no persistent typed backing to allocate here.
                     continue;
                 };
-                if !matches!(
+                let capacity_matches = matches!(
                     (state, capacity),
                     (
                         StateDomainSpec::PagedAttention(_),
                         InvocationStateCapacity::PagedTokens { .. }
+                    ) | (
+                        StateDomainSpec::StaticAttention(_)
+                            | StateDomainSpec::Tensor(_)
+                            | StateDomainSpec::Append(_)
+                            | StateDomainSpec::Ring(_)
+                            | StateDomainSpec::StaticTensor(_),
+                        InvocationStateCapacity::SemanticBounded
                     )
-                ) {
+                );
+                if !capacity_matches {
                     return Err(invalid_invocation_publication(
-                        "physical invocation descriptor contains typed state without a paged allocator",
+                        "physical invocation descriptor uses a capacity incompatible with its state domain",
                     ));
                 }
                 match mapped_domains.entry(state.id()) {
@@ -314,7 +317,7 @@ fn plan_invocation_paged_allocations(
                         ));
                     }
                 }
-                let key = InvocationPagedWorkspaceKeyV2 {
+                let key = InvocationWorkspaceKeyV2 {
                     stage_graph: profile.stage_graph_fingerprint,
                     stage: workspace.stage,
                     domain: state.id(),
@@ -324,7 +327,7 @@ fn plan_invocation_paged_allocations(
                         "physical invocation publication repeats a graph/stage/domain mapping",
                     ));
                 }
-                allocations.push(InvocationPagedAllocationV2 {
+                allocations.push(InvocationAllocationV2 {
                     adapter_instance: execution.adapter_instance_id,
                     key,
                     domain: domain.clone(),
@@ -347,7 +350,7 @@ fn plan_invocation_paged_allocations(
     }
     if allocations.is_empty() {
         return Err(invalid_invocation_publication(
-            "physical invocation publication has no paged token domains",
+            "physical invocation publication has no typed state domains",
         ));
     }
     Ok(allocations)
@@ -370,7 +373,7 @@ impl ModelLifecycleController {
             &retained_uses,
         )?;
         let allocations =
-            plan_invocation_paged_allocations(&descriptor, invocation_contract, executions)?;
+            plan_invocation_allocations(&descriptor, invocation_contract, executions)?;
         let mut bindings = Vec::with_capacity(allocations.len());
         for allocation in allocations {
             let pool = self
@@ -1117,8 +1120,8 @@ impl RuntimeService {
 mod tests {
     use super::{
         model_load_capacity_is_guarded, model_memory_estimate, model_resource_plan,
-        plan_invocation_paged_allocations, residency_budget_has_capacity,
-        select_lru_eviction_candidate, ModelMemoryEstimate,
+        plan_invocation_allocations, residency_budget_has_capacity, select_lru_eviction_candidate,
+        ModelMemoryEstimate,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1132,11 +1135,13 @@ mod tests {
     };
     use crate::error::Error;
     use crate::kv::v2::{
-        stage_graph_fingerprint, test_contract, CapabilityStateDescriptorV2, CheckpointPolicy,
-        InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+        stage_graph_fingerprint, test_contract, BoundedShape, CapabilityStateDescriptorV2,
+        CheckpointPolicy, InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
         InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet,
-        PrefixPolicy, RetainedStateCapability, StateDType, StateDomainId, StateDomainSpec,
-        StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+        PrefixPolicy, RetainedStateCapability, ShapeAxis, ShapeDimension, ShapeExtent,
+        StateComponentId, StateDType, StateDomainId, StateDomainSpec, StateScope,
+        StaticTensorDomainSpec, TensorComponentSpec, TensorRole, WorkspaceFormula,
+        CURRENT_INFERENCE_STATE_ABI,
     };
     use crate::model::ModelVariant;
     use crate::runtime::adapters::{
@@ -1219,7 +1224,11 @@ mod tests {
             .iter()
             .map(|state| InvocationWorkspaceDomain::State {
                 state: state.clone(),
-                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 16 },
+                capacity: if matches!(state, StateDomainSpec::PagedAttention(_)) {
+                    InvocationStateCapacity::PagedTokens { max_tokens: 16 }
+                } else {
+                    InvocationStateCapacity::SemanticBounded
+                },
                 placement: state.header().placement,
                 formula: WorkspaceFormula {
                     fixed_bytes: 1024 * 1024,
@@ -1245,6 +1254,37 @@ mod tests {
         }
     }
 
+    fn mixed_invocation_contract() -> crate::kv::v2::InferenceStateContract {
+        let mut contract = invocation_contract(1);
+        let mut header = contract.domains[0].header().clone();
+        header.id = StateDomainId::new(2);
+        contract
+            .domains
+            .push(StateDomainSpec::StaticTensor(StaticTensorDomainSpec {
+                header,
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::EncoderMemory,
+                    shape: BoundedShape {
+                        dimensions: vec![
+                            ShapeDimension {
+                                axis: ShapeAxis::Sequence,
+                                extent: ShapeExtent::RuntimeBounded { min: 1, max: 16 },
+                            },
+                            ShapeDimension {
+                                axis: ShapeAxis::Hidden,
+                                extent: ShapeExtent::Fixed { value: 8 },
+                            },
+                        ],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            }));
+        contract.groups[0].domains.push(StateDomainId::new(2));
+        contract.validate().unwrap();
+        contract
+    }
+
     #[test]
     fn managed_capability_cache_truth_tracks_compiled_direct_kernels() {
         assert!(managed_kv_backend_compiled(BackendKind::Cpu));
@@ -1265,7 +1305,7 @@ mod tests {
         let descriptor = invocation_descriptor(&execution, &contract, InvocationLeaseScope::PerRow);
 
         let allocations =
-            plan_invocation_paged_allocations(&descriptor, &contract, &[execution]).unwrap();
+            plan_invocation_allocations(&descriptor, &contract, &[execution]).unwrap();
         assert_eq!(allocations.len(), 2);
         assert!(allocations
             .iter()
@@ -1280,6 +1320,36 @@ mod tests {
     }
 
     #[test]
+    fn generic_invocation_planner_accepts_mixed_paged_and_semantic_domains() {
+        let execution = invocation_execution(2);
+        let contract = mixed_invocation_contract();
+        let descriptor = invocation_descriptor(&execution, &contract, InvocationLeaseScope::PerRow);
+
+        let allocations =
+            plan_invocation_allocations(&descriptor, &contract, &[execution]).unwrap();
+        assert_eq!(allocations.len(), 2);
+        assert!(allocations
+            .iter()
+            .all(|allocation| allocation.slot_count == 2));
+        assert!(matches!(
+            allocations[0].domain,
+            InvocationWorkspaceDomain::State {
+                state: StateDomainSpec::PagedAttention(_),
+                capacity: InvocationStateCapacity::PagedTokens { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            allocations[1].domain,
+            InvocationWorkspaceDomain::State {
+                state: StateDomainSpec::StaticTensor(_),
+                capacity: InvocationStateCapacity::SemanticBounded,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn generic_invocation_planner_rejects_missing_extra_and_foreign_graph_mappings() {
         let execution = invocation_execution(1);
         let contract = invocation_contract(2);
@@ -1290,12 +1360,10 @@ mod tests {
         missing_contract.domains.pop();
         missing_contract.groups[0].domains.pop();
         missing_contract.validate().unwrap();
-        assert!(plan_invocation_paged_allocations(
-            &descriptor,
-            &missing_contract,
-            &[execution.clone()]
-        )
-        .is_err());
+        assert!(
+            plan_invocation_allocations(&descriptor, &missing_contract, &[execution.clone()])
+                .is_err()
+        );
 
         let mut missing_descriptor = descriptor.clone();
         let InvocationWorkspaceSet::Bounded { profiles } = &mut missing_descriptor.invocation
@@ -1304,15 +1372,13 @@ mod tests {
         };
         profiles[0].stages[0].domains.pop();
         profiles[0].stages[0].groups[0].domains.pop();
-        assert!(plan_invocation_paged_allocations(
-            &missing_descriptor,
-            &contract,
-            &[execution.clone()]
-        )
-        .is_err());
+        assert!(
+            plan_invocation_allocations(&missing_descriptor, &contract, &[execution.clone()])
+                .is_err()
+        );
 
         let foreign_execution = invocation_execution(2);
-        assert!(plan_invocation_paged_allocations(
+        assert!(plan_invocation_allocations(
             &descriptor,
             &contract,
             &[execution, foreign_execution]
