@@ -7,7 +7,7 @@ mod config;
 mod conformer;
 mod detokenizer;
 mod model;
-mod physical;
+pub(crate) mod physical;
 mod preprocessor;
 mod sampling;
 mod tokenizer;

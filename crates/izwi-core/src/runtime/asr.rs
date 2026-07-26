@@ -1251,8 +1251,8 @@ impl RuntimeService {
             audio_input.retained_bytes(),
         ])?)?;
 
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 &job,
                 variant,
                 CapabilityKind::Asr,
@@ -1269,13 +1269,14 @@ impl RuntimeService {
             })?;
         let observation_job = job.clone();
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 &job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: "asr.audio_chat".to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let retained_audio_bytes = audio_input.retained_bytes();
                     let (samples, sample_rate) = audio_input.decode()?;
@@ -1297,12 +1298,14 @@ impl RuntimeService {
                             on_delta(delta.to_string());
                         }
                     };
-                    let output = model.transcribe_with_callback_and_max_tokens(
-                        &samples,
-                        sample_rate,
-                        max_tokens,
-                        &mut delta_sink,
-                    )?;
+                    let output = model
+                        .transcribe_with_callback_and_max_tokens_from_invocation_workspace(
+                            &samples,
+                            sample_rate,
+                            max_tokens,
+                            leases,
+                            &mut delta_sink,
+                        )?;
 
                     Ok(AsrTranscription {
                         text: output.text,

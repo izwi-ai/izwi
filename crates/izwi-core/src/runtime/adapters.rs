@@ -376,9 +376,10 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             },
             state_requirement: match model_variant.family() {
                 ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::VibeVoiceTts | ModelFamily::VoxtralTts | ModelFamily::FishS2Tts => {
-                    InferenceStateRequirement::Invocation
-                }
+                ModelFamily::VibeVoiceTts
+                | ModelFamily::VoxtralTts
+                | ModelFamily::FishS2Tts
+                | ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
                 _ => InferenceStateRequirement::Stateless,
             },
         })
@@ -402,10 +403,10 @@ impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
             } else {
                 SequenceExecutionMode::None
             },
-            state_requirement: if model_variant.family() == ModelFamily::Qwen3Tts {
-                InferenceStateRequirement::RetainedAndInvocation
-            } else {
-                InferenceStateRequirement::Stateless
+            state_requirement: match model_variant.family() {
+                ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
+                ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
+                _ => InferenceStateRequirement::Stateless,
             },
         })
     }
@@ -440,7 +441,8 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                     ModelFamily::VibeVoiceAsr
                     | ModelFamily::WhisperAsr
                     | ModelFamily::Voxtral
-                    | ModelFamily::GraniteSpeechAsr => InferenceStateRequirement::Invocation,
+                    | ModelFamily::GraniteSpeechAsr
+                    | ModelFamily::Lfm25Audio => InferenceStateRequirement::Invocation,
                     _ => InferenceStateRequirement::Stateless,
                 },
             })
@@ -519,7 +521,7 @@ impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Stateless,
+            state_requirement: InferenceStateRequirement::Invocation,
         })
     }
 }
@@ -536,7 +538,7 @@ impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Stateless,
+            state_requirement: InferenceStateRequirement::Invocation,
         })
     }
 }
@@ -830,6 +832,20 @@ mod tests {
                 .execution_target,
             ExecutionTargetKind::TokenEngine
         );
+        for capability in [
+            CapabilityKind::Asr,
+            CapabilityKind::Tts,
+            CapabilityKind::AudioChat,
+            CapabilityKind::SpeechToSpeech,
+        ] {
+            assert_eq!(
+                registry
+                    .require(capability, ModelVariant::Lfm25Audio15BGguf)
+                    .expect("lfm audio capability")
+                    .state_requirement,
+                InferenceStateRequirement::Invocation
+            );
+        }
     }
 
     #[test]

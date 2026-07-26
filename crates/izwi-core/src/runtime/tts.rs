@@ -503,8 +503,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -540,19 +540,23 @@ impl RuntimeService {
             .or_else(|| request.config.options.voice.clone());
         let request_id = request.id;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_workspace(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let started = Instant::now();
-                    let output = model.generate_sequential(
-                        &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
-                        max_new_tokens,
-                    )?;
+                    let output = model
+                        .generate_sequential_with_callback_from_invocation_workspace(
+                            &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
+                            max_new_tokens,
+                            leases,
+                            &mut |_delta| {},
+                        )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
                     Ok(GenerationResult {

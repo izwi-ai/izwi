@@ -902,6 +902,51 @@ impl ModelLifecycleController {
                     },
                 );
             }
+            if variant.family() == crate::catalog::ModelFamily::Lfm25Audio {
+                if !managed_kv_backend_compiled(backend) {
+                    return Err(Error::ModelLoadError(format!(
+                        "loaded model {variant} requires physical LFM2.5 Audio invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                    )));
+                }
+                let model = self
+                    .model_registry
+                    .get_audio_chat(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded LFM2.5 Audio model {variant} is missing from the registry"
+                        ))
+                    })?;
+                for capability in [
+                    CapabilityKind::Asr,
+                    CapabilityKind::Tts,
+                    CapabilityKind::AudioChat,
+                    CapabilityKind::SpeechToSpeech,
+                ] {
+                    let contracts = bundle_draft.execution_contracts(capability)?;
+                    let stage_graphs = contracts
+                        .iter()
+                        .map(|contract| contract.stages.as_ref())
+                        .collect::<Vec<_>>();
+                    let mode = if capability == CapabilityKind::Asr {
+                        crate::models::architectures::lfm25_audio::physical::Lfm25AudioStateMode::MainOnly
+                    } else {
+                        crate::models::architectures::lfm25_audio::physical::Lfm25AudioStateMode::MainAndDepthformer
+                    };
+                    let physical_spec = model.physical_state_spec(mode, &stage_graphs)?;
+                    let publication = self
+                        .load_invocation_workspace_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            &physical_spec.invocation,
+                            None,
+                            HashMap::new(),
+                        )
+                        .await?;
+                    state_publications.insert(capability, publication);
+                }
+            }
             if variant.family() == crate::catalog::ModelFamily::Qwen3Tts {
                 let model = self
                     .model_registry

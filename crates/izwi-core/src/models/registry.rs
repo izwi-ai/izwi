@@ -32,6 +32,10 @@ use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
 use crate::models::architectures::lfm2::physical::Lfm2PhysicalStateSpec;
 use crate::models::architectures::lfm25_audio::{
+    physical::{
+        Lfm25AudioPhysicalStateSpec, Lfm25AudioStateMode, LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+        LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+    },
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
 use crate::models::architectures::nemotron::asr::{
@@ -1937,25 +1941,35 @@ fn env_positive_usize(key: &str) -> Option<usize> {
 }
 
 impl NativeAudioChatModel {
-    pub fn generate_sequential(
+    pub(crate) fn physical_state_spec(
         &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-    ) -> Result<NativeAudioChatGeneration> {
-        self.generate_sequential_with_callback(messages, max_new_tokens, &mut |_delta| {})
+        mode: Lfm25AudioStateMode,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioPhysicalStateSpec> {
+        match self {
+            Self::Lfm25Audio(model) => model.physical_state_spec(mode, stage_graphs),
+        }
     }
 
-    pub fn generate_sequential_with_callback(
+    pub(crate) fn generate_sequential_with_callback_from_invocation_workspace(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_text_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAudioChatGeneration> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.generate_sequential_with_callback(
+                let (attention, shortconv) = leases.lease_pair_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                )?;
+                let output = model.generate_sequential_with_config_and_callback_physical(
                     messages,
                     max_new_tokens,
+                    &Lfm25AudioGenerationConfig::default(),
+                    attention.paged_cache_mut()?,
+                    shortconv.typed_mut::<InvocationTensorLease>()?,
                     on_text_delta,
                 )?;
                 Ok(NativeAudioChatGeneration {
@@ -1972,7 +1986,7 @@ impl NativeAudioChatModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_interleaved_with_config_and_callback(
+    pub(crate) fn generate_interleaved_with_config_and_callback_from_invocation_workspace(
         &self,
         history_messages: &[ChatMessage],
         audio: &[f32],
@@ -1981,12 +1995,17 @@ impl NativeAudioChatModel {
         system_prompt: Option<&str>,
         generation_config: &Lfm25AudioGenerationConfig,
         stream_config: &Lfm25AudioStreamConfig,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<NativeAudioChatGeneration> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.generate_interleaved_with_config_and_callback(
+                let (attention, shortconv) = leases.lease_pair_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                )?;
+                let output = model.generate_interleaved_with_config_and_callback_physical(
                     history_messages,
                     audio,
                     sample_rate,
@@ -1994,6 +2013,8 @@ impl NativeAudioChatModel {
                     system_prompt,
                     generation_config,
                     stream_config,
+                    attention.paged_cache_mut()?,
+                    shortconv.typed_mut::<InvocationTensorLease>()?,
                     on_text_delta,
                     on_audio_samples,
                 )?;
@@ -2010,42 +2031,43 @@ impl NativeAudioChatModel {
         }
     }
 
-    pub fn transcribe(&self, audio: &[f32], sample_rate: u32) -> Result<NativeAsrTranscription> {
-        self.transcribe_long_form_with_callback(audio, sample_rate, None, &mut |_delta| {})
-    }
-
-    pub fn transcribe_with_callback(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<NativeAsrTranscription> {
-        self.transcribe_long_form_with_callback(audio, sample_rate, None, on_delta)
-    }
-
-    pub fn transcribe_with_callback_and_max_tokens(
+    pub(crate) fn transcribe_with_callback_and_max_tokens_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
         max_tokens: Option<usize>,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
-        self.transcribe_long_form_with_callback(audio, sample_rate, max_tokens, on_delta)
+        self.transcribe_long_form_with_callback_from_invocation_workspace(
+            audio,
+            sample_rate,
+            max_tokens,
+            leases,
+            on_delta,
+        )
     }
 
-    pub fn transcribe_single_pass_with_callback_and_options(
+    pub(crate) fn transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
         options: NativeAsrGenerationOptions,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
         match self {
             Self::Lfm25Audio(model) => {
-                let output = model.transcribe_to_output_with_callback(
+                let (attention, shortconv) = leases.lease_pair_mut(
+                    LFM25_MAIN_ATTENTION_STATE_DOMAIN,
+                    LFM25_MAIN_SHORTCONV_STATE_DOMAIN,
+                )?;
+                let output = model.transcribe_to_output_with_callback_physical(
                     audio,
                     sample_rate,
                     options.max_new_tokens.max(1),
+                    attention.paged_cache_mut()?,
+                    shortconv.typed_mut::<InvocationTensorLease>()?,
                     on_delta,
                 )?;
                 Ok(NativeAsrTranscription {
@@ -2057,26 +2079,29 @@ impl NativeAudioChatModel {
         }
     }
 
-    pub fn transcribe_long_form_with_callback(
+    pub(crate) fn transcribe_long_form_with_callback_from_invocation_workspace(
         &self,
         audio: &[f32],
         sample_rate: u32,
         max_tokens: Option<usize>,
+        leases: &mut InvocationWorkspaceLeaseSetV2,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<NativeAsrTranscription> {
         let duration_secs = audio_duration_secs(audio, sample_rate);
         let chunk_cfg = lfm25_audio_asr_long_form_config();
         let chunks = plan_audio_chunks(audio, sample_rate, &chunk_cfg, None);
         if chunks.len() <= 1 {
-            return self.transcribe_single_pass_with_callback_and_options(
-                audio,
-                sample_rate,
-                NativeAsrGenerationOptions {
-                    max_new_tokens: lfm25_audio_asr_single_pass_max_new_tokens(max_tokens),
-                    ..NativeAsrGenerationOptions::default()
-                },
-                on_delta,
-            );
+            return self
+                .transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
+                    audio,
+                    sample_rate,
+                    NativeAsrGenerationOptions {
+                        max_new_tokens: lfm25_audio_asr_single_pass_max_new_tokens(max_tokens),
+                        ..NativeAsrGenerationOptions::default()
+                    },
+                    leases,
+                    on_delta,
+                );
         }
 
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
@@ -2097,15 +2122,17 @@ impl NativeAudioChatModel {
             let chunk_duration_secs = audio_duration_secs(chunk_audio, sample_rate);
             let chunk_max_tokens =
                 lfm25_audio_asr_chunk_max_new_tokens(chunk_duration_secs, max_tokens);
-            let output = self.transcribe_single_pass_with_callback_and_options(
-                chunk_audio,
-                sample_rate,
-                NativeAsrGenerationOptions {
-                    max_new_tokens: chunk_max_tokens,
-                    ..NativeAsrGenerationOptions::default()
-                },
-                &mut |_delta| {},
-            )?;
+            let output = self
+                .transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
+                    chunk_audio,
+                    sample_rate,
+                    NativeAsrGenerationOptions {
+                        max_new_tokens: chunk_max_tokens,
+                        ..NativeAsrGenerationOptions::default()
+                    },
+                    leases,
+                    &mut |_delta| {},
+                )?;
             let delta = assembler.push_chunk_text(&output.text);
             if !delta.is_empty() {
                 on_delta(&delta);

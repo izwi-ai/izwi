@@ -2035,19 +2035,25 @@ mod tests {
             &registry,
             ExecutionGroupId::new(4),
             ModelInstanceId::new(11),
-            ModelVariant::Lfm25Audio15BGguf,
+            ModelVariant::Kokoro82M,
             BackendKind::Cpu,
         )
         .unwrap();
 
-        let asr = bundle
-            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
-            .unwrap();
         let tts = bundle
             .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
             .unwrap();
-        assert_ne!(asr.execution.capability_id, tts.execution.capability_id);
-        assert_ne!(asr.state.id, tts.state.id);
+        let streaming_tts = bundle
+            .capability_binding_for_streaming(
+                CapabilityKind::StreamingTts,
+                StreamingRequirements::NONE,
+            )
+            .unwrap();
+        assert_ne!(
+            tts.execution.capability_id,
+            streaming_tts.execution.capability_id
+        );
+        assert_ne!(tts.state.id, streaming_tts.state.id);
     }
 
     #[test]
@@ -2335,7 +2341,7 @@ mod tests {
 
     #[test]
     fn atomic_chunked_chat_opt_in_is_streaming_specific() {
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             ExecutionGroupId::new(7),
             ModelInstanceId::new(1),
@@ -2343,15 +2349,18 @@ mod tests {
             BackendKind::Cpu,
         )
         .unwrap();
+        let adapter = draft.capabilities.get(&CapabilityKind::Chat).unwrap();
 
-        let non_streaming = bundle.contract(CapabilityKind::Chat, false).unwrap();
+        let non_streaming = adapter.contract(StreamingRequirements::NONE).unwrap();
         assert_eq!(non_streaming.execution_profile.mode, ExecutionMode::Atomic);
         assert_eq!(
             non_streaming.stages[0].output_visibility,
             OutputVisibility::AfterQuantumCommit
         );
 
-        let streaming = bundle.contract(CapabilityKind::Chat, true).unwrap();
+        let streaming = adapter
+            .contract(StreamingRequirements::native(true))
+            .unwrap();
         assert_eq!(streaming.execution_profile.mode, ExecutionMode::Atomic);
         assert_eq!(
             streaming.stages[0].output_visibility,
@@ -2390,7 +2399,7 @@ mod tests {
             &registry,
             ExecutionGroupId::new(1),
             ModelInstanceId::new(1),
-            ModelVariant::Lfm25Audio15BGguf,
+            ModelVariant::Kokoro82M,
             BackendKind::Metal,
         )
         .expect("first bundle");
@@ -2398,29 +2407,32 @@ mod tests {
             &registry,
             ExecutionGroupId::new(1),
             ModelInstanceId::new(2),
-            ModelVariant::Lfm25Audio15BGguf,
+            ModelVariant::Kokoro82M,
             BackendKind::Metal,
         )
         .expect("second bundle");
 
-        let first_asr = first
-            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
-            .expect("first asr")
-            .execution
-            .adapter_instance_id;
         let first_tts = first
             .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
             .expect("first tts")
             .execution
             .adapter_instance_id;
-        let second_asr = second
-            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
-            .expect("second asr")
+        let first_streaming_tts = first
+            .capability_binding_for_streaming(
+                CapabilityKind::StreamingTts,
+                StreamingRequirements::NONE,
+            )
+            .expect("first streaming tts")
+            .execution
+            .adapter_instance_id;
+        let second_tts = second
+            .capability_binding_for_streaming(CapabilityKind::Tts, StreamingRequirements::NONE)
+            .expect("second tts")
             .execution
             .adapter_instance_id;
 
-        assert_ne!(first_asr, first_tts);
-        assert_ne!(first_asr, second_asr);
+        assert_ne!(first_tts, first_streaming_tts);
+        assert_ne!(first_tts, second_tts);
     }
 
     #[test]

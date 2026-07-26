@@ -6,8 +6,10 @@ use candle_core::{IndexOp, Tensor};
 use tracing::info;
 
 use crate::backends::{BackendKind, DeviceProfile};
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
 use super::audio_output::{Lfm25AudioHead, Lfm25SampledAudioFrame};
@@ -19,6 +21,9 @@ use super::config::{
 };
 use super::conformer::Lfm25AudioEncoder;
 use super::detokenizer::Lfm25AudioDetokenizer;
+use super::physical::{
+    lfm25_audio_physical_state_spec, Lfm25AudioPhysicalStateSpec, Lfm25AudioStateMode,
+};
 use super::preprocessor::Lfm25AudioPreprocessor;
 use super::sampling::{
     greedy_from_logits, greedy_token_tensor_from_logits, sample_from_logits,
@@ -28,7 +33,6 @@ use super::tokenizer::{Lfm25SpecialTokenIds, Lfm25TextTokenizer};
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
 use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
 
-const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;
 const DEFAULT_AUDIO_STREAM_HOLDBACK_FRAMES: usize = 2;
 const DEFAULT_ASR_STOP_CHECK_INTERVAL: usize = 92;
@@ -222,42 +226,21 @@ impl Lfm25AudioModel {
         &self.decoder_config
     }
 
-    pub fn transcribe(&self, audio: &[f32], sample_rate: u32) -> Result<String> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_with_callback(audio, sample_rate, &mut no_op)
-    }
-
-    pub fn transcribe_with_callback(
+    pub(crate) fn physical_state_spec(
         &self,
-        audio: &[f32],
-        sample_rate: u32,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<String> {
-        Ok(self
-            .transcribe_to_output_with_callback(
-                audio,
-                sample_rate,
-                DEFAULT_MAX_NEW_TOKENS,
-                on_delta,
-            )?
-            .text)
+        mode: Lfm25AudioStateMode,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm25AudioPhysicalStateSpec> {
+        lfm25_audio_physical_state_spec(&self.main_config, &self.decoder_config, mode, stage_graphs)
     }
 
-    pub fn transcribe_to_output(
+    pub(crate) fn transcribe_to_output_with_callback_physical(
         &self,
         audio: &[f32],
         sample_rate: u32,
         max_new_tokens: usize,
-    ) -> Result<Lfm25AudioTextOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.transcribe_to_output_with_callback(audio, sample_rate, max_new_tokens, &mut no_op)
-    }
-
-    pub fn transcribe_to_output_with_callback(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        max_new_tokens: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<Lfm25AudioTextOutput> {
         if audio.is_empty() {
@@ -297,7 +280,7 @@ impl Lfm25AudioModel {
         let main_started = Instant::now();
         let (mut output, profile) = self.with_main_backbone(|main_backbone| {
             let mut profile = Lfm25AsrProfile::default();
-            main_backbone.reset_state();
+            reset_main_state(cache, shortconv)?;
 
             let prompt_embed_started = Instant::now();
             let prefix_embeds = embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
@@ -310,7 +293,8 @@ impl Lfm25AudioModel {
             profile.prompt_concat_ms = elapsed_ms(prompt_concat_started);
 
             let prefill_started = Instant::now();
-            let hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
+            let hidden =
+                main_backbone.forward_embeds_physical(&prompt_embeds, 0, cache, shortconv)?;
             let mut logits = main_backbone.project_last_hidden(&hidden)?;
             profile.main_prefill_ms = elapsed_ms(prefill_started);
             let mut position = prompt_tokens;
@@ -347,7 +331,12 @@ impl Lfm25AudioModel {
                         profile.decode_token_tensor_ms += elapsed_ms(token_tensor_started);
 
                         let decode_forward_started = Instant::now();
-                        logits = main_backbone.forward_tokens(&next_tensor, position)?;
+                        logits = main_backbone.forward_tokens_physical(
+                            &next_tensor,
+                            position,
+                            cache,
+                            shortconv,
+                        )?;
                         profile.decode_forward_ms += elapsed_ms(decode_forward_started);
                         position += 1;
                         chunk_tokens.push(next_token);
@@ -431,7 +420,12 @@ impl Lfm25AudioModel {
                     let next_tensor = Tensor::from_vec(vec![next], (1, 1), &self.device.device)?;
                     profile.decode_token_tensor_ms += elapsed_ms(token_tensor_started);
                     let decode_forward_started = Instant::now();
-                    logits = main_backbone.forward_tokens(&next_tensor, position)?;
+                    logits = main_backbone.forward_tokens_physical(
+                        &next_tensor,
+                        position,
+                        cache,
+                        shortconv,
+                    )?;
                     profile.decode_forward_ms += elapsed_ms(decode_forward_started);
                     position += 1;
                 }
@@ -528,34 +522,13 @@ impl Lfm25AudioModel {
         Ok(output)
     }
 
-    pub fn generate_sequential(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-    ) -> Result<Lfm25AudioGenerationOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.generate_sequential_with_callback(messages, max_new_tokens, &mut no_op)
-    }
-
-    pub fn generate_sequential_with_callback(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        on_text_delta: &mut dyn FnMut(&str),
-    ) -> Result<Lfm25AudioGenerationOutput> {
-        self.generate_sequential_with_config_and_callback(
-            messages,
-            max_new_tokens,
-            &Lfm25AudioGenerationConfig::default(),
-            on_text_delta,
-        )
-    }
-
-    pub fn generate_sequential_with_config_and_callback(
+    pub(crate) fn generate_sequential_with_config_and_callback_physical(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
         generation_config: &Lfm25AudioGenerationConfig,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
         on_text_delta: &mut dyn FnMut(&str),
     ) -> Result<Lfm25AudioGenerationOutput> {
         let total_started = Instant::now();
@@ -581,14 +554,15 @@ impl Lfm25AudioModel {
         ) = self.with_main_backbone(|main_backbone| {
             let mut profile = Lfm25TtsProfile::default();
             let mut rng = SimpleRng::new(generation_config.seed);
-            main_backbone.reset_state();
+            reset_main_state(cache, shortconv)?;
 
             let prompt_embed_started = Instant::now();
             let prompt_embeds = embed_token_ids(main_backbone, &self.device.device, &prompt_ids)?;
             profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
             let prompt_tokens = prompt_embeds.dim(1)?;
             let prefill_started = Instant::now();
-            let prompt_hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
+            let prompt_hidden =
+                main_backbone.forward_embeds_physical(&prompt_embeds, 0, cache, shortconv)?;
             let mut last_hidden = last_hidden_state(&prompt_hidden)?;
             let mut logits = main_backbone.project_last_hidden(&prompt_hidden)?;
             profile.main_prefill_ms = elapsed_ms(prefill_started);
@@ -642,7 +616,12 @@ impl Lfm25AudioModel {
 
                     let text_forward_started = Instant::now();
                     let next_embed = embed_token_ids(main_backbone, &self.device.device, &[next])?;
-                    let step_hidden = main_backbone.forward_embeds(&next_embed, position)?;
+                    let step_hidden = main_backbone.forward_embeds_physical(
+                        &next_embed,
+                        position,
+                        cache,
+                        shortconv,
+                    )?;
                     position += 1;
                     last_hidden = last_hidden_state(&step_hidden)?;
                     logits = main_backbone.project_last_hidden(&step_hidden)?;
@@ -682,7 +661,12 @@ impl Lfm25AudioModel {
                     let audio_embed = frame.embedding().clone();
                     profile.audio_embed_ms += elapsed_ms(audio_embed_started);
                     let audio_forward_started = Instant::now();
-                    let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
+                    let step_hidden = main_backbone.forward_embeds_physical(
+                        &audio_embed,
+                        position,
+                        cache,
+                        shortconv,
+                    )?;
                     position += 1;
                     last_hidden = last_hidden_state(&step_hidden)?;
                     profile.audio_forward_ms += elapsed_ms(audio_forward_started);
@@ -757,7 +741,12 @@ impl Lfm25AudioModel {
                         .embed_audio_frame(&frame, &self.device.device)?;
                     profile.audio_embed_ms += elapsed_ms(audio_embed_started);
                     let audio_forward_started = Instant::now();
-                    let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
+                    let step_hidden = main_backbone.forward_embeds_physical(
+                        &audio_embed,
+                        position,
+                        cache,
+                        shortconv,
+                    )?;
                     position += 1;
                     last_hidden = last_hidden_state(&step_hidden)?;
                     profile.audio_forward_ms += elapsed_ms(audio_forward_started);
@@ -893,30 +882,8 @@ impl Lfm25AudioModel {
         })
     }
 
-    pub fn generate_interleaved(
-        &self,
-        history_messages: &[ChatMessage],
-        audio: &[f32],
-        sample_rate: u32,
-        max_new_tokens: usize,
-    ) -> Result<Lfm25AudioGenerationOutput> {
-        let mut no_text = |_delta: &str| {};
-        let mut no_audio = |_samples: &[f32]| {};
-        self.generate_interleaved_with_config_and_callback(
-            history_messages,
-            audio,
-            sample_rate,
-            max_new_tokens,
-            None,
-            &Lfm25AudioGenerationConfig::default(),
-            &Lfm25AudioStreamConfig::default(),
-            &mut no_text,
-            &mut no_audio,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_interleaved_with_config_and_callback(
+    pub(crate) fn generate_interleaved_with_config_and_callback_physical(
         &self,
         history_messages: &[ChatMessage],
         audio: &[f32],
@@ -925,6 +892,8 @@ impl Lfm25AudioModel {
         system_prompt: Option<&str>,
         generation_config: &Lfm25AudioGenerationConfig,
         stream_config: &Lfm25AudioStreamConfig,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<Lfm25AudioGenerationOutput> {
@@ -946,7 +915,7 @@ impl Lfm25AudioModel {
                 let mut rng = SimpleRng::new(generation_config.seed);
                 let mut emitted_audio_samples = 0usize;
 
-                main_backbone.reset_state();
+                reset_main_state(cache, shortconv)?;
                 let prefix_embeds =
                     embed_token_ids(main_backbone, &self.device.device, &prefix_ids)?;
                 let suffix_embeds =
@@ -954,7 +923,8 @@ impl Lfm25AudioModel {
                 let prompt_embeds =
                     Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
                 let prompt_tokens = prompt_embeds.dim(1)?;
-                let prompt_hidden = main_backbone.forward_embeds(&prompt_embeds, 0)?;
+                let prompt_hidden =
+                    main_backbone.forward_embeds_physical(&prompt_embeds, 0, cache, shortconv)?;
                 let mut last_hidden = last_hidden_state(&prompt_hidden)?;
                 let mut logits = main_backbone.project_last_hidden(&prompt_hidden)?;
                 let mut position = prompt_tokens;
@@ -1007,7 +977,12 @@ impl Lfm25AudioModel {
 
                         let next_embed =
                             embed_token_ids(main_backbone, &self.device.device, &[next])?;
-                        let step_hidden = main_backbone.forward_embeds(&next_embed, position)?;
+                        let step_hidden = main_backbone.forward_embeds_physical(
+                            &next_embed,
+                            position,
+                            cache,
+                            shortconv,
+                        )?;
                         position += 1;
                         last_hidden = last_hidden_state(&step_hidden)?;
                         logits = main_backbone.project_last_hidden(&step_hidden)?;
@@ -1040,7 +1015,12 @@ impl Lfm25AudioModel {
                         let audio_embed = self
                             .audio_head
                             .embed_audio_frame(&frame, &self.device.device)?;
-                        let step_hidden = main_backbone.forward_embeds(&audio_embed, position)?;
+                        let step_hidden = main_backbone.forward_embeds_physical(
+                            &audio_embed,
+                            position,
+                            cache,
+                            shortconv,
+                        )?;
                         position += 1;
                         last_hidden = last_hidden_state(&step_hidden)?;
                         logits = main_backbone.project_last_hidden(&step_hidden)?;
@@ -1319,6 +1299,15 @@ fn embed_token_ids(
 ) -> Result<Tensor> {
     let ids = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), device)?;
     backbone.embed_tokens(&ids)
+}
+
+fn reset_main_state(
+    cache: &mut PhysicalPagedKvCache,
+    shortconv: &mut InvocationTensorLease,
+) -> Result<()> {
+    cache.reset_invocation()?;
+    shortconv.reset_invocation()?;
+    Ok(())
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
