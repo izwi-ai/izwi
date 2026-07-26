@@ -852,6 +852,28 @@ impl InvocationWorkspaceLeaseSetV2 {
             .ok_or_else(|| invalid("atomic invocation lease set does not contain the domain"))
     }
 
+    /// Borrow the only state domain in a complete scalar workspace and verify
+    /// its physical kind. Model adapters cannot accidentally ignore a newly
+    /// authored companion domain.
+    pub(crate) fn lease_exact_kind_mut(
+        &mut self,
+        kind: InvocationStateBackingKindV2,
+    ) -> Result<&mut InvocationWorkspaceLeaseV2> {
+        let [(domain, _)] = self.leases.as_slice() else {
+            return Err(invalid(
+                "atomic invocation lease kind requires exactly one state domain",
+            ));
+        };
+        let domain = *domain;
+        let lease = self.lease_mut(domain)?;
+        if lease.kind() != kind {
+            return Err(invalid(
+                "atomic invocation lease has a different physical backing kind",
+            ));
+        }
+        Ok(lease)
+    }
+
     pub(crate) fn lease_pair_mut(
         &mut self,
         first: StateDomainId,
@@ -885,6 +907,41 @@ impl InvocationWorkspaceLeaseSetV2 {
         }
         let (before_first, from_first) = self.leases.split_at_mut(first_index);
         Ok((&mut from_first[0].1, &mut before_first[second_index].1))
+    }
+
+    /// Borrow an exact two-domain mixed workspace by physical backing kind.
+    /// This keeps model adapters independent of authored domain ordering while
+    /// rejecting missing, duplicate, or silently extra state.
+    pub(crate) fn lease_exact_kind_pair_mut(
+        &mut self,
+        first: InvocationStateBackingKindV2,
+        second: InvocationStateBackingKindV2,
+    ) -> Result<(
+        &mut InvocationWorkspaceLeaseV2,
+        &mut InvocationWorkspaceLeaseV2,
+    )> {
+        if first == second {
+            return Err(invalid(
+                "atomic invocation lease kind pair requires distinct backing kinds",
+            ));
+        }
+        if self.leases.len() != 2 {
+            return Err(invalid(
+                "atomic invocation lease kind pair requires exactly two state domains",
+            ));
+        }
+        let domain_for = |kind| {
+            self.leases
+                .iter()
+                .find(|(_, lease)| lease.kind() == kind)
+                .map(|(domain, _)| *domain)
+                .ok_or_else(|| {
+                    invalid("atomic invocation lease set is missing a requested backing kind")
+                })
+        };
+        let first_domain = domain_for(first)?;
+        let second_domain = domain_for(second)?;
+        self.lease_pair_mut(first_domain, second_domain)
     }
 
     /// Release every domain even if one completion fails authentication. A
@@ -3077,6 +3134,97 @@ mod tests {
             .lease_pair_mut(StateDomainId::new(1), StateDomainId::new(99))
             .is_err());
         assert_eq!(leases.release().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn invocation_workspace_lease_set_borrows_an_exact_mixed_kind_pair() {
+        let (runtime, _descriptor, _paged_owner, _typed, execution) =
+            all_domain_invocation_fixture(None);
+        let graph = stage_graph_fingerprint(&execution.stages).unwrap();
+        let stage = execution.stages[0].id;
+        let mut leases = runtime
+            .lease_set(
+                graph,
+                stage,
+                &[StateDomainId::new(1), StateDomainId::new(2)],
+            )
+            .unwrap();
+
+        let (paged, static_attention) = leases
+            .lease_exact_kind_pair_mut(
+                InvocationStateBackingKindV2::PagedAttention,
+                InvocationStateBackingKindV2::StaticAttention,
+            )
+            .unwrap();
+        assert_eq!(paged.kind(), InvocationStateBackingKindV2::PagedAttention);
+        assert_eq!(
+            static_attention.kind(),
+            InvocationStateBackingKindV2::StaticAttention
+        );
+        assert!(leases
+            .lease_exact_kind_pair_mut(
+                InvocationStateBackingKindV2::PagedAttention,
+                InvocationStateBackingKindV2::PagedAttention,
+            )
+            .is_err());
+        assert!(leases
+            .lease_exact_kind_pair_mut(
+                InvocationStateBackingKindV2::Tensor,
+                InvocationStateBackingKindV2::StaticAttention,
+            )
+            .is_err());
+        assert_eq!(leases.release().unwrap().len(), 2);
+
+        let mut extra = runtime
+            .lease_set(
+                graph,
+                stage,
+                &[
+                    StateDomainId::new(1),
+                    StateDomainId::new(2),
+                    StateDomainId::new(3),
+                ],
+            )
+            .unwrap();
+        assert!(extra
+            .lease_exact_kind_pair_mut(
+                InvocationStateBackingKindV2::PagedAttention,
+                InvocationStateBackingKindV2::StaticAttention,
+            )
+            .is_err());
+        assert_eq!(extra.release().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn invocation_workspace_lease_set_borrows_one_exact_kind() {
+        let (runtime, _descriptor, _paged_owner, _typed, execution) =
+            all_domain_invocation_fixture(None);
+        let graph = stage_graph_fingerprint(&execution.stages).unwrap();
+        let stage = execution.stages[0].id;
+        let mut leases = runtime
+            .lease_set(graph, stage, &[StateDomainId::new(1)])
+            .unwrap();
+        assert!(leases
+            .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)
+            .unwrap()
+            .paged_cache_mut()
+            .is_ok());
+        assert!(leases
+            .lease_exact_kind_mut(InvocationStateBackingKindV2::StaticAttention)
+            .is_err());
+        assert_eq!(leases.release().unwrap().len(), 1);
+
+        let mut multiple = runtime
+            .lease_set(
+                graph,
+                stage,
+                &[StateDomainId::new(1), StateDomainId::new(2)],
+            )
+            .unwrap();
+        assert!(multiple
+            .lease_exact_kind_mut(InvocationStateBackingKindV2::PagedAttention)
+            .is_err());
+        assert_eq!(multiple.release().unwrap().len(), 2);
     }
 
     #[test]

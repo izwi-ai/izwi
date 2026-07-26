@@ -538,7 +538,9 @@ impl InferenceCoordinator {
             .await
     }
 
-    /// Execute one non-batched model stage through an exact loaded adapter.
+    /// Execute one independently scheduled scalar row through an exact loaded
+    /// adapter. `max_batch_size` bounds concurrent rows for scalar adapters; it
+    /// does not imply that this call receives a native tensor batch.
     /// Direct, realtime, and pipeline runners use this compatibility boundary
     /// until their model stage gains a proven native tensor adapter.
     pub(crate) async fn run_loaded_blocking_stage<T, F>(
@@ -574,9 +576,9 @@ impl InferenceCoordinator {
                 "host-only adapter stage cannot enter device execution".to_string(),
             ));
         }
-        if stage.batch_mode != NativeBatchMode::None || stage.max_batch_size != 1 {
+        if stage.batch_mode != NativeBatchMode::None {
             return Err(Error::InvalidInput(
-                "runtime width-one runner cannot execute a native tensor stage".to_string(),
+                "runtime scalar runner cannot execute a native tensor stage".to_string(),
             ));
         }
 
@@ -616,10 +618,9 @@ impl InferenceCoordinator {
         let stage = binding.stage_for_work(&work)?;
         if stage.domain != ExecutionDomain::ExecutionGroup
             || stage.batch_mode != NativeBatchMode::None
-            || stage.max_batch_size != 1
         {
             return Err(Error::InvalidInput(
-                "direct invocation state requires a width-one execution-group stage".to_string(),
+                "direct invocation state requires a scalar execution-group stage".to_string(),
             ));
         }
         let stage_id = stage.id;
@@ -663,10 +664,9 @@ impl InferenceCoordinator {
         let stage = binding.stage_for_work(&work)?;
         if stage.domain != ExecutionDomain::ExecutionGroup
             || stage.batch_mode != NativeBatchMode::None
-            || stage.max_batch_size != 1
         {
             return Err(Error::InvalidInput(
-                "direct invocation paging requires a width-one execution-group stage".to_string(),
+                "direct invocation paging requires a scalar execution-group stage".to_string(),
             ));
         }
         let stage_id = stage.id;
@@ -2344,10 +2344,10 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn loaded_width_one_stage_rejects_cross_group_execution_before_model_work() {
+    async fn loaded_scalar_stage_accepts_parallel_row_capacity_and_rejects_cross_group_work() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
-        let job = coordinator.admit(job("loaded-width-one")).await.unwrap();
-        let adapters = RuntimeAdapterRegistry::built_in();
+        let job = coordinator.admit(job("loaded-scalar")).await.unwrap();
+        let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 4).unwrap();
         let bundle = LoadedModelBundle::bind(
             &adapters,
             coordinator.execution_group_id(),
@@ -2357,6 +2357,8 @@ Pages free: 10.\n";
         )
         .unwrap();
         let contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
+        assert_eq!(contract.stages[0].max_batch_size, 4);
         let calls = Arc::new(AtomicUsize::new(0));
         let task_calls = calls.clone();
 
