@@ -19,6 +19,7 @@ use crate::kv::{
 /// layer in an execution quantum.
 pub(crate) struct PreparedPhysicalPagedStep {
     arena: KvArenaId,
+    logical_generation: u32,
     start_pos: usize,
     token_count: usize,
     slots: Arc<dyn KvSlotMap>,
@@ -35,6 +36,7 @@ pub struct PhysicalPagedKvCache {
     pub(crate) blocks: Vec<CacheBlockRef>,
     window_start: usize,
     context_len: usize,
+    logical_generation: u32,
     completed_writes: Vec<Arc<KvWriteBatchCompletion>>,
 }
 
@@ -124,6 +126,7 @@ impl PhysicalPagedKvCache {
             blocks,
             window_start,
             context_len,
+            logical_generation: 1,
             completed_writes: Vec::new(),
         })
     }
@@ -307,6 +310,7 @@ impl PhysicalPagedKvCache {
             KvWriteCompletionCollector::new(self.arena.config(), slots.logical_slots())?;
         Ok(PreparedPhysicalPagedStep {
             arena: self.arena.id(),
+            logical_generation: self.logical_generation,
             start_pos,
             token_count,
             slots,
@@ -347,6 +351,7 @@ impl PhysicalPagedKvCache {
             ));
         }
         if prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
             || prepared.start_pos != self.context_len
             || prepared.token_count != token_count
             || prepared.slots.len() != token_count
@@ -397,7 +402,10 @@ impl PhysicalPagedKvCache {
     }
 
     pub(crate) fn commit_prepared(&mut self, prepared: PreparedPhysicalPagedStep) -> Result<()> {
-        if prepared.arena != self.arena.id() || prepared.start_pos != self.context_len {
+        if prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
+            || prepared.start_pos != self.context_len
+        {
             return Err(Error::InvalidInput(
                 "physical paged commit received a stale prepared step".into(),
             ));
@@ -434,6 +442,27 @@ impl PhysicalPagedKvCache {
 
     pub(crate) fn take_completed_writes(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
         std::mem::take(&mut self.completed_writes)
+    }
+
+    /// Reuse one invocation-exclusive page range for a new nested logical
+    /// sequence. Every previously committed backend write was already waited
+    /// and authenticated before it entered `completed_writes`; dropping those
+    /// receipts cannot expose unfinished device work. A monotonically
+    /// increasing generation invalidates prepared steps created before reset.
+    ///
+    /// Physical pages are not materialized or reallocated here. Subsequent
+    /// attention can address only the new logical context and overwrites each
+    /// visible slot before reading it. The owning invocation pool still zeros
+    /// and fences the complete range between independent leases.
+    pub(crate) fn reset_invocation(&mut self) -> Result<()> {
+        let logical_generation = self.logical_generation.checked_add(1).ok_or_else(|| {
+            Error::InvalidInput("physical paged reset generation overflow".into())
+        })?;
+        self.completed_writes.clear();
+        self.window_start = 0;
+        self.context_len = 0;
+        self.logical_generation = logical_generation;
+        Ok(())
     }
 }
 
@@ -486,7 +515,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let cache = PhysicalPagedKvCache::new(
+        let mut cache = PhysicalPagedKvCache::new(
             arena,
             bindings,
             vec![CacheBlockRef {
@@ -495,11 +524,16 @@ mod tests {
                 index: 0,
                 slot_generation: 1,
             }],
-            0,
+            2,
         )
         .unwrap();
 
         cache.validate_sparse_model(&[3, 7], 2, 4, 4).unwrap();
         assert!(cache.validate_sparse_model(&[3, 6], 2, 4, 4).is_err());
+        let prepared = cache.prepare_append(2, 1).unwrap();
+        cache.reset_invocation().unwrap();
+        assert_eq!(cache.context_len(), 0);
+        assert_eq!(cache.window_start(), 0);
+        assert!(cache.commit_prepared(prepared).is_err());
     }
 }
