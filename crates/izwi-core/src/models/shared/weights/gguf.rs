@@ -178,6 +178,27 @@ impl GgufLoader {
         })
     }
 
+    /// Read numeric GGUF metadata without requiring the checkpoint to encode
+    /// the value with one particular integer or floating-point width.
+    pub fn get_metadata_f64(&self, key: &str) -> Option<f64> {
+        self.metadata.get(key).and_then(|value| match value {
+            GgufValue::F64(value) => Some(*value),
+            GgufValue::F32(value) => Some(f64::from(*value)),
+            GgufValue::U64(value) => Some(*value as f64),
+            GgufValue::I64(value) => Some(*value as f64),
+            GgufValue::U32(value) => Some(f64::from(*value)),
+            GgufValue::I32(value) => Some(f64::from(*value)),
+            _ => None,
+        })
+    }
+
+    pub fn get_metadata_array_len(&self, key: &str) -> Option<usize> {
+        self.metadata.get(key).and_then(|value| match value {
+            GgufValue::Array(values) => Some(values.len()),
+            _ => None,
+        })
+    }
+
     /// Detect quantization type by examining tensor dtypes.
     fn detect_quantization_from_tensors(&self) -> Option<String> {
         let mut dtypes = std::collections::HashSet::new();

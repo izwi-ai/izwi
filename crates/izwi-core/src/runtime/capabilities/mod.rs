@@ -172,7 +172,7 @@ mod tests {
 
         for (variant, expected_mode) in [
             (ModelVariant::Qwen306B, ExecutionMode::Sequence),
-            (ModelVariant::Qwen306BGguf, ExecutionMode::Atomic),
+            (ModelVariant::Qwen306BGguf, ExecutionMode::Sequence),
             (ModelVariant::Qwen354BGguf, ExecutionMode::Sequence),
             (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Atomic),
             (ModelVariant::Gemma34BIt, ExecutionMode::Atomic),

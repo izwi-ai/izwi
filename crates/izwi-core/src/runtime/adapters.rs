@@ -342,15 +342,10 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
 }
 
 fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
-    if matches!(model_variant.family(), ModelFamily::Qwen35Chat)
-        || matches!(
-            model_variant,
-            ModelVariant::Qwen306B
-                | ModelVariant::Qwen306B4Bit
-                | ModelVariant::Qwen317B
-                | ModelVariant::Qwen317B4Bit
-        )
-    {
+    if matches!(
+        model_variant.family(),
+        ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat
+    ) {
         SequenceExecutionMode::Always
     } else {
         SequenceExecutionMode::None

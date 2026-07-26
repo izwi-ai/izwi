@@ -856,14 +856,20 @@ impl Qwen3Projection {
     }
 
     fn quantized(loader: &GgufLoader, device: &Device, name: &str) -> Result<Self> {
-        let weights = Arc::new(loader.load_qtensor(name, device)?);
+        let resolved = qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| name.to_string());
+        let weights = Arc::new(loader.load_qtensor(&resolved, device)?);
         QMatMul::from_arc(weights)
             .map(Self::Quantized)
             .map_err(Error::from)
     }
 
     fn packed_quantized(loader: &GgufLoader, device: &Device, names: &[&str]) -> Result<Self> {
-        packed_quantized_qmatmul(loader, device, names)
+        let resolved = names
+            .iter()
+            .map(|name| qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| (*name).to_string()))
+            .collect::<Vec<_>>();
+        let resolved = resolved.iter().map(String::as_str).collect::<Vec<_>>();
+        packed_quantized_qmatmul(loader, device, &resolved)
             .map(Self::Quantized)
             .map_err(Error::from)
     }
@@ -1437,11 +1443,47 @@ fn load_optional_rms_norm_from_gguf(
     name: &str,
     eps: f64,
 ) -> Result<Option<RmsNorm>> {
-    if !loader.has_tensor(name) {
+    let Some(name) = qwen3_gguf_tensor_name(loader, name) else {
         return Ok(None);
-    }
-    let weight = loader.load_tensor(name, dtype, device)?;
+    };
+    let weight = loader.load_tensor(&name, dtype, device)?;
     Ok(Some(RmsNorm::new(weight, eps)))
+}
+
+fn qwen3_gguf_tensor_name(loader: &GgufLoader, logical_name: &str) -> Option<String> {
+    if loader.has_tensor(logical_name) {
+        return Some(logical_name.to_string());
+    }
+
+    let canonical = qwen3_canonical_gguf_tensor_name(logical_name)?;
+    loader.has_tensor(&canonical).then_some(canonical)
+}
+
+fn qwen3_canonical_gguf_tensor_name(logical_name: &str) -> Option<String> {
+    match logical_name {
+        "model.embed_tokens.weight" => Some("token_embd.weight".to_string()),
+        "model.norm.weight" => Some("output_norm.weight".to_string()),
+        "lm_head.weight" => Some("output.weight".to_string()),
+        _ => {
+            let layer = logical_name.strip_prefix("model.layers.")?;
+            let (layer_index, suffix) = layer.split_once('.')?;
+            let suffix = match suffix {
+                "input_layernorm.weight" => "attn_norm.weight",
+                "post_attention_layernorm.weight" => "ffn_norm.weight",
+                "self_attn.q_proj.weight" => "attn_q.weight",
+                "self_attn.k_proj.weight" => "attn_k.weight",
+                "self_attn.v_proj.weight" => "attn_v.weight",
+                "self_attn.o_proj.weight" => "attn_output.weight",
+                "self_attn.q_norm.weight" => "attn_q_norm.weight",
+                "self_attn.k_norm.weight" => "attn_k_norm.weight",
+                "mlp.gate_proj.weight" => "ffn_gate.weight",
+                "mlp.up_proj.weight" => "ffn_up.weight",
+                "mlp.down_proj.weight" => "ffn_down.weight",
+                _ => return None,
+            };
+            Some(format!("blk.{layer_index}.{suffix}"))
+        }
+    }
 }
 
 fn qk_norm_weight(q_norm: &Option<RmsNorm>, k_norm: &Option<RmsNorm>) -> Result<Option<Tensor>> {
@@ -2182,14 +2224,23 @@ impl Qwen3Layer {
         prefix: &str,
     ) -> Result<Self> {
         let input_layernorm = RmsNorm::new(
-            loader.load_tensor(&format!("{prefix}.input_layernorm.weight"), dtype, device)?,
+            loader.load_tensor(
+                &qwen3_gguf_tensor_name(loader, &format!("{prefix}.input_layernorm.weight"))
+                    .unwrap_or_else(|| format!("{prefix}.input_layernorm.weight")),
+                dtype,
+                device,
+            )?,
             cfg.rms_norm_eps,
         );
         let self_attn =
             Qwen3Attention::load_gguf(loader, cfg, device, dtype, &format!("{prefix}.self_attn"))?;
         let post_attention_layernorm = RmsNorm::new(
             loader.load_tensor(
-                &format!("{prefix}.post_attention_layernorm.weight"),
+                &qwen3_gguf_tensor_name(
+                    loader,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )
+                .unwrap_or_else(|| format!("{prefix}.post_attention_layernorm.weight")),
                 dtype,
                 device,
             )?,
@@ -2448,16 +2499,14 @@ impl Qwen3Model {
     ) -> Result<Self> {
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
         let model_prefix = qwen3_join_prefix(prefix, "model");
+        let embed_name = qwen3_join_prefix(&model_prefix, "embed_tokens.weight");
+        let embed_name = qwen3_gguf_tensor_name(loader, &embed_name).unwrap_or(embed_name);
         let embed_tokens = Embedding::new(
-            loader.load_tensor(
-                &qwen3_join_prefix(&model_prefix, "embed_tokens.weight"),
-                dtype,
-                device,
-            )?,
+            loader.load_tensor(&embed_name, dtype, device)?,
             cfg.hidden_size,
         );
         let lm_head_name = qwen3_join_prefix(prefix, "lm_head.weight");
-        let lm_head = if loader.has_tensor(&lm_head_name) {
+        let lm_head = if qwen3_gguf_tensor_name(loader, &lm_head_name).is_some() {
             Qwen3Projection::quantized(loader, device, &lm_head_name)?
         } else {
             if lm_head_size != cfg.vocab_size {
@@ -2474,12 +2523,10 @@ impl Qwen3Model {
             let layer = Qwen3Layer::load_gguf(loader, &cfg, device, dtype, &layer_prefix)?;
             layers.push(layer);
         }
+        let norm_name = qwen3_join_prefix(&model_prefix, "norm.weight");
+        let norm_name = qwen3_gguf_tensor_name(loader, &norm_name).unwrap_or(norm_name);
         let norm = RmsNorm::new(
-            loader.load_tensor(
-                &qwen3_join_prefix(&model_prefix, "norm.weight"),
-                dtype,
-                device,
-            )?,
+            loader.load_tensor(&norm_name, dtype, device)?,
             cfg.rms_norm_eps,
         );
         let use_mrope = cfg
@@ -3125,6 +3172,49 @@ mod tests {
     use crate::kv::{KvArenaId, KvGroupId};
     use candle_nn::rotary_emb;
     use std::collections::HashMap;
+
+    #[test]
+    fn canonical_qwen3_gguf_names_cover_the_native_decoder_graph() {
+        for (logical, canonical) in [
+            ("model.embed_tokens.weight", "token_embd.weight"),
+            ("model.norm.weight", "output_norm.weight"),
+            ("lm_head.weight", "output.weight"),
+            (
+                "model.layers.7.input_layernorm.weight",
+                "blk.7.attn_norm.weight",
+            ),
+            (
+                "model.layers.7.self_attn.q_proj.weight",
+                "blk.7.attn_q.weight",
+            ),
+            (
+                "model.layers.7.self_attn.k_norm.weight",
+                "blk.7.attn_k_norm.weight",
+            ),
+            (
+                "model.layers.7.self_attn.o_proj.weight",
+                "blk.7.attn_output.weight",
+            ),
+            (
+                "model.layers.7.post_attention_layernorm.weight",
+                "blk.7.ffn_norm.weight",
+            ),
+            (
+                "model.layers.7.mlp.gate_proj.weight",
+                "blk.7.ffn_gate.weight",
+            ),
+            (
+                "model.layers.7.mlp.down_proj.weight",
+                "blk.7.ffn_down.weight",
+            ),
+        ] {
+            assert_eq!(
+                qwen3_canonical_gguf_tensor_name(logical).as_deref(),
+                Some(canonical)
+            );
+        }
+        assert!(qwen3_canonical_gguf_tensor_name("model.layers.7.unknown.weight").is_none());
+    }
 
     #[test]
     fn cache_domain_is_derived_from_loaded_qwen3_geometry() {
