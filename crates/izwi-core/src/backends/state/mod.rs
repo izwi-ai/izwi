@@ -15,7 +15,7 @@ mod tensor;
 pub(crate) use invocation::{
     InvocationTensorArena, InvocationTensorChronologicalSegment, InvocationTensorComponentSlice,
     InvocationTensorComponentValue, InvocationTensorDomainKind, InvocationTensorSnapshot,
-    InvocationTensorStepValues,
+    InvocationTensorStepValues, InvocationTensorUpdateV2,
 };
 #[allow(unused_imports)]
 pub(crate) use tensor::{

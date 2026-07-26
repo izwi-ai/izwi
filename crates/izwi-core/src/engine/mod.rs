@@ -43,6 +43,11 @@ pub(crate) use cache::invocation::{
     InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
     InvocationPagedKvPoolId, InvocationPagedKvPoolOwner, InvocationPagedKvSlotRef,
 };
+#[allow(unused_imports)]
+pub(crate) use cache::invocation_tensor::{
+    InvocationTensorLease, InvocationTensorPoolHandle, InvocationTensorPoolId,
+    InvocationTensorPoolOwner, InvocationTensorSlotRef,
+};
 
 #[cfg(test)]
 pub(crate) use cache::managed::ManagedKvCacheManager;

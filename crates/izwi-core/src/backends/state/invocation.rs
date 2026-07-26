@@ -11,9 +11,10 @@ use candle_core::{DType, Device, DeviceLocation, Tensor, Var};
 use crate::backends::backend_kind_for_device;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    InferenceStateContract, InvocationStateCapacity, InvocationWorkspaceDomain,
-    ResolvedNonPagedDomainPlan, ResolvedStatePlan, StateComponentId, StateDType, StateDomainId,
-    StateDomainSpec, StateGroupId, StateScope, StateStorageFormat, TensorComponentSpec,
+    ComponentShapeInstantiation, DomainStepIntent, InferenceStateContract, InvocationStateCapacity,
+    InvocationWorkspaceDomain, ResolvedNonPagedDomainPlan, ResolvedStatePlan, StateComponentId,
+    StateDType, StateDomainId, StateDomainSpec, StateGroupId, StateScope, StateStorageFormat,
+    StateUpdateKind, TensorComponentSpec,
 };
 
 use super::StateBackendRegistry;
@@ -49,6 +50,25 @@ pub(crate) struct InvocationTensorSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct InvocationTensorStepValues {
     pub(crate) components: Vec<InvocationTensorComponentValue>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum InvocationTensorUpdateV2 {
+    StaticInitialize {
+        source_identity: [u8; 32],
+        components: Vec<InvocationTensorComponentValue>,
+    },
+    TensorReplace {
+        components: Vec<InvocationTensorComponentValue>,
+    },
+    Append {
+        steps: Vec<InvocationTensorStepValues>,
+    },
+    RingAdvance {
+        steps: Vec<InvocationTensorStepValues>,
+    },
+    Reset,
+    NoOp,
 }
 
 #[derive(Debug, Clone)]
@@ -280,12 +300,106 @@ impl InvocationTensorArena {
         self.maximum_bytes
     }
 
-    pub(super) fn backing(&self, component: StateComponentId) -> Result<Tensor> {
+    pub(crate) fn apply_intent(
+        &mut self,
+        intent: &DomainStepIntent,
+        update: InvocationTensorUpdateV2,
+    ) -> Result<()> {
+        self.require_clean()?;
+        if intent.domain != self.domain || intent.expected_cursor != self.absolute_cursor {
+            return Err(invalid(
+                "invocation tensor intent has a foreign domain or stale cursor",
+            ));
+        }
+        match (&intent.update, update) {
+            (
+                StateUpdateKind::StaticInitialize {
+                    source_identity,
+                    components: declared,
+                },
+                InvocationTensorUpdateV2::StaticInitialize {
+                    source_identity: actual_source,
+                    components,
+                },
+            ) if self.kind == InvocationTensorDomainKind::StaticTensor => {
+                if *source_identity != actual_source {
+                    return Err(invalid(
+                        "invocation static-tensor source identity does not match its intent",
+                    ));
+                }
+                self.validate_declared_values(declared, &components)?;
+                self.install(actual_source, intent.target_cursor, &components)
+            }
+            (
+                StateUpdateKind::TensorReplace {
+                    components: declared,
+                },
+                InvocationTensorUpdateV2::TensorReplace { components },
+            ) if self.kind == InvocationTensorDomainKind::Tensor => {
+                self.validate_declared_values(declared, &components)?;
+                self.replace(intent.expected_cursor, intent.target_cursor, &components)
+            }
+            (
+                StateUpdateKind::Append {
+                    steps: declared_steps,
+                    components_per_step: declared,
+                },
+                InvocationTensorUpdateV2::Append { steps },
+            ) if self.kind == InvocationTensorDomainKind::Append => {
+                self.validate_declared_steps(*declared_steps, declared, &steps)?;
+                self.append(intent.expected_cursor, intent.target_cursor, &steps)
+            }
+            (
+                StateUpdateKind::RingAdvance {
+                    steps: declared_steps,
+                    components_per_step: declared,
+                },
+                InvocationTensorUpdateV2::RingAdvance { steps },
+            ) if self.kind == InvocationTensorDomainKind::Ring => {
+                self.validate_declared_steps(*declared_steps, declared, &steps)?;
+                self.ring_advance(intent.expected_cursor, intent.target_cursor, &steps)
+            }
+            (StateUpdateKind::Reset, InvocationTensorUpdateV2::Reset)
+                if matches!(
+                    self.kind,
+                    InvocationTensorDomainKind::Tensor
+                        | InvocationTensorDomainKind::Append
+                        | InvocationTensorDomainKind::Ring
+                ) && intent.target_cursor == 0 =>
+            {
+                self.reset()
+            }
+            (StateUpdateKind::NoOp, InvocationTensorUpdateV2::NoOp)
+                if intent.target_cursor == intent.expected_cursor =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid(
+                "invocation tensor update does not exactly match its authenticated intent",
+            )),
+        }
+    }
+
+    pub(crate) fn read_snapshot(&self) -> Result<InvocationTensorSnapshot> {
+        self.snapshot()
+    }
+
+    pub(crate) fn read_chronological_segments(
+        &self,
+    ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
+        self.chronological_segments()
+    }
+
+    pub(crate) fn reset_for_reuse(&mut self) -> Result<()> {
+        self.reset()
+    }
+
+    fn backing(&self, component: StateComponentId) -> Result<Tensor> {
         self.require_clean()?;
         Ok(self.component(component)?.storage.as_tensor().clone())
     }
 
-    pub(super) fn install(
+    fn install(
         &mut self,
         source_identity: [u8; 32],
         target_cursor: u64,
@@ -318,7 +432,7 @@ impl InvocationTensorArena {
         Ok(())
     }
 
-    pub(super) fn replace(
+    fn replace(
         &mut self,
         expected_cursor: u64,
         target_cursor: u64,
@@ -355,7 +469,7 @@ impl InvocationTensorArena {
         Ok(())
     }
 
-    pub(super) fn snapshot(&self) -> Result<InvocationTensorSnapshot> {
+    fn snapshot(&self) -> Result<InvocationTensorSnapshot> {
         self.require_clean()?;
         if !self.initialized {
             return Err(invalid("invocation tensor domain is not initialized"));
@@ -391,7 +505,7 @@ impl InvocationTensorArena {
         }
     }
 
-    pub(super) fn append(
+    fn append(
         &mut self,
         expected_cursor: u64,
         target_cursor: u64,
@@ -428,7 +542,7 @@ impl InvocationTensorArena {
         Ok(())
     }
 
-    pub(super) fn ring_advance(
+    fn ring_advance(
         &mut self,
         expected_cursor: u64,
         target_cursor: u64,
@@ -479,9 +593,7 @@ impl InvocationTensorArena {
         Ok(())
     }
 
-    pub(super) fn chronological_segments(
-        &self,
-    ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
+    fn chronological_segments(&self) -> Result<Vec<InvocationTensorChronologicalSegment>> {
         self.require_clean()?;
         if !matches!(
             self.kind,
@@ -529,7 +641,7 @@ impl InvocationTensorArena {
             .collect()
     }
 
-    pub(super) fn reset(&mut self) -> Result<()> {
+    fn reset(&mut self) -> Result<()> {
         for component in &mut self.components {
             if let Err(error) = component.storage.zero_set() {
                 self.dirty = true;
@@ -673,6 +785,68 @@ impl InvocationTensorArena {
     fn validate_steps(&self, steps: &[InvocationTensorStepValues]) -> Result<()> {
         for step in steps {
             self.validate_values(&step.components)?;
+        }
+        Ok(())
+    }
+
+    fn validate_declared_values(
+        &self,
+        declared: &[ComponentShapeInstantiation],
+        values: &[InvocationTensorComponentValue],
+    ) -> Result<()> {
+        self.validate_values(values)?;
+        if declared.len() != self.components.len() {
+            return Err(invalid(
+                "invocation tensor intent must declare every component exactly once",
+            ));
+        }
+        for ((declared, component), value) in declared.iter().zip(&self.components).zip(values) {
+            if declared.component != component.semantic.id
+                || value.component != component.semantic.id
+                || declared.dimensions.len() != component.semantic.shape.dimensions.len()
+                || value.tensor.rank() != declared.dimensions.len()
+            {
+                return Err(invalid(
+                    "invocation tensor intent component identity or rank mismatch",
+                ));
+            }
+            for ((declared, semantic), actual) in declared
+                .dimensions
+                .iter()
+                .zip(&component.semantic.shape.dimensions)
+                .zip(value.tensor.dims())
+            {
+                let actual = u64::try_from(*actual)
+                    .map_err(|_| invalid("invocation tensor dimension exceeds u64"))?;
+                if declared.axis != semantic.axis
+                    || declared.units != actual
+                    || !semantic.extent.accepts(declared.units)
+                {
+                    return Err(invalid(
+                        "invocation tensor intent axis or extent does not match its value",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_declared_steps(
+        &self,
+        declared_steps: u64,
+        declared: &[ComponentShapeInstantiation],
+        steps: &[InvocationTensorStepValues],
+    ) -> Result<()> {
+        if u64::try_from(steps.len())
+            .map_err(|_| invalid("invocation tensor update step count exceeds u64"))?
+            != declared_steps
+        {
+            return Err(invalid(
+                "invocation tensor update step count does not match its intent",
+            ));
+        }
+        for step in steps {
+            self.validate_declared_values(declared, &step.components)?;
         }
         Ok(())
     }
@@ -934,9 +1108,9 @@ mod tests {
     use crate::kv::v2::{
         test_contract, AppendStateDomainSpec, BoundedShape, CheckpointPolicy,
         InferenceStateContract, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis,
-        ShapeDimension, ShapeExtent, StateClock, StateDomainHeader, StateGroupSpec,
-        StaticTensorDomainSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
-        CURRENT_INFERENCE_STATE_ABI,
+        ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock, StateDomainHeader,
+        StateGroupSpec, StaticTensorDomainSpec, TensorRole, TensorStateDomainSpec,
+        WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
     };
 
     fn component(max: u64) -> TensorComponentSpec {
@@ -1071,6 +1245,16 @@ mod tests {
 
     fn source_identity() -> [u8; 32] {
         [7; 32]
+    }
+
+    fn declared_component(units: u64) -> ComponentShapeInstantiation {
+        ComponentShapeInstantiation {
+            component: StateComponentId::new(1),
+            dimensions: vec![ShapeDimensionValue {
+                axis: ShapeAxis::Hidden,
+                units,
+            }],
+        }
     }
 
     #[test]
@@ -1536,5 +1720,183 @@ mod tests {
             Device::Cpu,
         )
         .is_err());
+    }
+
+    #[test]
+    fn authenticated_intent_rejects_every_mismatch_before_mutation() {
+        let mut tensor = arena(StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: header(1),
+            components: vec![component(4)],
+        }));
+        let exact = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 1,
+            update: StateUpdateKind::TensorReplace {
+                components: vec![declared_component(2)],
+            },
+        };
+        let update = || InvocationTensorUpdateV2::TensorReplace {
+            components: vec![value(&[1.0, 2.0])],
+        };
+        let mut wrong_domain = exact.clone();
+        wrong_domain.domain = StateDomainId::new(2);
+        assert!(tensor.apply_intent(&wrong_domain, update()).is_err());
+        let mut wrong_cursor = exact.clone();
+        wrong_cursor.expected_cursor = 1;
+        assert!(tensor.apply_intent(&wrong_cursor, update()).is_err());
+        let mut wrong_shape = exact.clone();
+        let StateUpdateKind::TensorReplace { components } = &mut wrong_shape.update else {
+            unreachable!()
+        };
+        components[0].dimensions[0].units = 3;
+        assert!(tensor.apply_intent(&wrong_shape, update()).is_err());
+        assert!(tensor
+            .apply_intent(&exact, InvocationTensorUpdateV2::NoOp)
+            .is_err());
+        assert_eq!(tensor.absolute_cursor(), 0);
+        assert_eq!(
+            tensor
+                .backing(StateComponentId::new(1))
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![0.0; 4]
+        );
+        tensor.apply_intent(&exact, update()).unwrap();
+
+        let no_op = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 1,
+            target_cursor: 1,
+            update: StateUpdateKind::NoOp,
+        };
+        tensor
+            .apply_intent(&no_op, InvocationTensorUpdateV2::NoOp)
+            .unwrap();
+        let reset = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 1,
+            target_cursor: 0,
+            update: StateUpdateKind::Reset,
+        };
+        tensor
+            .apply_intent(&reset, InvocationTensorUpdateV2::Reset)
+            .unwrap();
+
+        let mut static_tensor = arena(StateDomainSpec::StaticTensor(StaticTensorDomainSpec {
+            header: header(1),
+            components: vec![fixed_component(2)],
+        }));
+        let static_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 2,
+            update: StateUpdateKind::StaticInitialize {
+                source_identity: source_identity(),
+                components: vec![declared_component(2)],
+            },
+        };
+        assert!(static_tensor
+            .apply_intent(
+                &static_intent,
+                InvocationTensorUpdateV2::StaticInitialize {
+                    source_identity: [8; 32],
+                    components: vec![value(&[1.0, 2.0])],
+                },
+            )
+            .is_err());
+        assert_eq!(static_tensor.absolute_cursor(), 0);
+        static_tensor
+            .apply_intent(
+                &static_intent,
+                InvocationTensorUpdateV2::StaticInitialize {
+                    source_identity: source_identity(),
+                    components: vec![value(&[1.0, 2.0])],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn authenticated_multi_step_validation_is_atomic() {
+        let mut append = arena(StateDomainSpec::Append(AppendStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![component(2)],
+            max_steps: 4,
+        }));
+        let intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 2,
+            update: StateUpdateKind::Append {
+                steps: 2,
+                components_per_step: vec![declared_component(1)],
+            },
+        };
+        assert!(append
+            .apply_intent(
+                &intent,
+                InvocationTensorUpdateV2::Append {
+                    steps: vec![step(&[1.0]), step(&[2.0, 3.0])],
+                },
+            )
+            .is_err());
+        assert_eq!(append.absolute_cursor(), 0);
+        assert!(!append.is_dirty());
+        assert_eq!(
+            append
+                .backing(StateComponentId::new(1))
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![0.0; 8]
+        );
+        append
+            .apply_intent(
+                &intent,
+                InvocationTensorUpdateV2::Append {
+                    steps: vec![step(&[1.0]), step(&[2.0])],
+                },
+            )
+            .unwrap();
+
+        let mut ring = arena(StateDomainSpec::Ring(RingStateDomainSpec {
+            header: header(1),
+            components_per_step: vec![component(1)],
+            capacity_steps: 2,
+        }));
+        let ring_intent = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 3,
+            update: StateUpdateKind::RingAdvance {
+                steps: 3,
+                components_per_step: vec![declared_component(1)],
+            },
+        };
+        ring.apply_intent(
+            &ring_intent,
+            InvocationTensorUpdateV2::RingAdvance {
+                steps: vec![step(&[1.0]), step(&[2.0]), step(&[3.0])],
+            },
+        )
+        .unwrap();
+        assert_eq!(ring.absolute_cursor(), 3);
+        assert_eq!(
+            ring.read_chronological_segments()
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment.components[0]
+                    .tensor
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            vec![2.0, 3.0]
+        );
     }
 }
