@@ -11,7 +11,6 @@ use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 
 use super::audio_output::{Lfm25AudioHead, Lfm25SampledAudioFrame};
-use super::backbone::QuantizedLfm2Backbone;
 use super::bundle::{Lfm25AudioBundle, Lfm25AudioBundleInfo};
 use super::config::{
     parse_audio_decoder_config, parse_audio_encoder_config, parse_detokenizer_config,
@@ -27,6 +26,7 @@ use super::sampling::{
 };
 use super::tokenizer::{Lfm25SpecialTokenIds, Lfm25TextTokenizer};
 use super::LFM25_AUDIO_DEFAULT_INTERLEAVED_SYSTEM_PROMPT;
+use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DEFAULT_AUDIO_STREAM_DECODE_STRIDE_FRAMES: usize = 6;

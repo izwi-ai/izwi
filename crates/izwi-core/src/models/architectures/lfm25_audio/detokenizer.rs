@@ -9,8 +9,8 @@ use rustfft::{Fft, FftPlanner};
 use crate::error::{Error, Result};
 use crate::models::shared::weights::gguf::GgufLoader;
 
-use super::backbone::QuantizedLfm2Backbone;
 use super::config::{Lfm25AudioDecoderConfig, Lfm2BackboneConfig, LFM25_AUDIO_AUDIO_VOCAB_SIZE};
+use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
 
 pub struct Lfm25AudioDetokenizer {
     fused_embedding: Embedding,

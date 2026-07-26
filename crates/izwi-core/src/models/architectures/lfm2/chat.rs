@@ -7,19 +7,21 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use candle_core::quantized::gguf_file;
 use candle_core::{DType, IndexOp, Tensor, D};
-use candle_transformers::models::quantized_lfm2::ModelWeights as QuantizedLfm2Model;
 use serde::Deserialize;
 use tracing::info;
 
+use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
-use crate::backends::{open_gguf_reader, BackendKind};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::telemetry::record_prefill_sequence_span;
+use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::Tokenizer;
+
+use super::backbone::QuantizedLfm2Backbone;
+use super::config::parse_lfm2_backbone_config;
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -353,7 +355,7 @@ pub struct Lfm2ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
     prompt_scaffold: PromptScaffoldTokens,
-    text_model: Mutex<QuantizedLfm2Model>,
+    text_model: Mutex<QuantizedLfm2Backbone>,
 }
 
 impl Lfm2ChatModel {
@@ -376,11 +378,10 @@ impl Lfm2ChatModel {
         }
 
         let tokenizer = ChatTokenizer::load(model_dir)?;
-        let mut reader = open_gguf_reader(&gguf_path, BackendKind::from(device.kind))?;
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to parse GGUF header: {e}")))?;
-        let text_model = QuantizedLfm2Model::from_gguf(content, &mut reader, &device.device)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to load LFM2 GGUF model: {e}")))?;
+        let loader =
+            GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
+        let config = parse_lfm2_backbone_config(&loader)?;
+        let text_model = QuantizedLfm2Backbone::load(&loader, config, &device.device)?;
         let prompt_scaffold = PromptScaffoldTokens::load(&tokenizer)?;
 
         info!(
@@ -480,7 +481,7 @@ impl Lfm2ChatModel {
 
             let next_tensor = Tensor::from_slice(&[next], (1, 1), &self.device.device)?;
             logits = model
-                .forward(&next_tensor, position)
+                .forward_tokens(&next_tensor, position)
                 .map_err(|e| Error::InferenceError(format!("LFM2 GGUF decode failed: {e}")))?;
             position += 1;
         }
@@ -618,7 +619,7 @@ impl Lfm2ChatModel {
 
     fn prefill_prompt(
         &self,
-        model: &mut QuantizedLfm2Model,
+        model: &mut QuantizedLfm2Backbone,
         prompt_ids: &[u32],
         exec: Lfm2PrefillExecution,
     ) -> Result<(Tensor, usize, usize)> {
@@ -634,7 +635,7 @@ impl Lfm2ChatModel {
                 let input_ids =
                     Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device.device)?;
                 let logits = model
-                    .forward(&input_ids, 0)
+                    .forward_tokens(&input_ids, 0)
                     .map_err(|e| Error::InferenceError(format!("LFM2 GGUF forward failed: {e}")))?;
                 Ok((logits, prompt_ids.len(), 1))
             }

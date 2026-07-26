@@ -1,9 +1,8 @@
 //! Native LFM2.5 Audio GGUF architecture support.
 
 mod audio_output;
-mod backbone;
 mod bundle;
-mod cache;
+pub(crate) mod cache;
 mod config;
 mod conformer;
 mod detokenizer;

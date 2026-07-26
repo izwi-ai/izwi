@@ -4,13 +4,13 @@ use candle_nn::kv_cache::KvCache;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
-pub(super) struct DenseKvCache {
+pub(crate) struct DenseKvCache {
     inner: Option<KvCache>,
     min_initial_capacity: usize,
 }
 
 #[derive(Debug)]
-pub(super) struct DenseKvCacheView {
+pub(crate) struct DenseKvCacheView {
     pub current_k: Tensor,
     pub current_v: Tensor,
     pub full_k: Tensor,

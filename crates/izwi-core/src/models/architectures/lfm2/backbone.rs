@@ -23,7 +23,8 @@ use crate::models::shared::telemetry::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
-use super::cache::DenseKvCache;
+use crate::models::architectures::lfm25_audio::cache::DenseKvCache;
+
 use super::config::Lfm2BackboneConfig;
 
 #[derive(Debug)]
@@ -274,7 +275,7 @@ impl AttentionLayer {
         if index_pos == 0 {
             self.kv_cache.reset();
         }
-        let super::cache::DenseKvCacheView {
+        let crate::models::architectures::lfm25_audio::cache::DenseKvCacheView {
             current_k: all_keys,
             current_v: all_values,
             full_k: cache_full_keys,
