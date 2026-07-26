@@ -399,6 +399,26 @@ fn validate_atomic_scalar_invocation_stage(
     Ok(())
 }
 
+/// Acquire one atomic scalar row's complete authored typed workspace in
+/// canonical domain order. This is the model-neutral path for mixed paged,
+/// recurrent, append, ring, and static state.
+pub(super) fn invocation_workspace_leases_for_atomic_scalar_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+) -> Result<crate::kv::v2::InvocationWorkspaceLeaseSetV2> {
+    let binding = request.execution_adapter_binding().ok_or_else(|| {
+        Error::InferenceError("physical invocation row has no loaded adapter binding".to_string())
+    })?;
+    let stage = binding.stage_for_work(&scheduled.work)?;
+    validate_atomic_scalar_invocation_stage(stage, &scheduled.work)?;
+    request
+        .v2_state_runtime()
+        .ok_or_else(|| {
+            Error::InferenceError("physical invocation row has no sealed runtime".to_string())
+        })?
+        .lease_complete_invocation_workspace_set(stage.id)
+}
+
 /// Acquire one atomic scalar row's complete authored paged-domain set in
 /// canonical identity order. Callers cannot omit a required domain. The
 /// returned set releases every already-acquired lease if a later domain fails,

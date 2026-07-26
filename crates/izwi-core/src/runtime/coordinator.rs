@@ -588,6 +588,54 @@ impl InferenceCoordinator {
         .await
     }
 
+    /// Execute a scalar stage with the complete typed invocation workspace
+    /// sealed into its loaded capability binding. Paged attention, recurrent,
+    /// append, ring, and static state are acquired and completed atomically.
+    pub(crate) async fn run_loaded_blocking_stage_with_invocation_workspace<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        capability: LoadedCapabilityBinding,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut crate::kv::v2::InvocationWorkspaceLeaseSetV2) -> Result<T> + Send + 'static,
+    {
+        let binding = contract.adapter_binding()?;
+        if capability.execution != binding {
+            return Err(Error::InferenceError(
+                "direct invocation state belongs to a different loaded execution adapter"
+                    .to_string(),
+            ));
+        }
+        capability
+            .state
+            .validate_against(self.backend, &capability.execution)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup
+            || stage.batch_mode != NativeBatchMode::None
+            || stage.max_batch_size != 1
+        {
+            return Err(Error::InvalidInput(
+                "direct invocation state requires a width-one execution-group stage".to_string(),
+            ));
+        }
+        let stage_id = stage.id;
+        self.run_blocking_stage_inner(job, move || {
+            let _contract = contract;
+            let _work = work;
+            let mut leases = capability
+                .state
+                .lease_complete_invocation_workspace_set(stage_id)?;
+            let output = operation(&mut leases)?;
+            let _completions = leases.release()?;
+            Ok(output)
+        })
+        .await
+    }
+
     /// Execute a scalar stage with the complete invocation-paged domain set
     /// sealed into its loaded capability binding.
     pub(crate) async fn run_loaded_blocking_stage_with_invocation_paged<T, F>(
