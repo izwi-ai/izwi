@@ -594,8 +594,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -617,13 +617,14 @@ impl RuntimeService {
         let request_id = request.id;
         let config = request.config;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let voice = config
                         .options
@@ -639,7 +640,19 @@ impl RuntimeService {
                     let params =
                         VoxtralTtsGenerationParams::from_generation_config_for_text(&config, &text);
                     let started = Instant::now();
-                    let output = model.generate_with_voice(&text, &voice, params)?;
+                    let domains = leases.domains().collect::<Vec<_>>();
+                    let [domain] = domains.as_slice() else {
+                        return Err(Error::InferenceError(format!(
+                            "Voxtral TTS requires one invocation KV domain, found {}",
+                            domains.len()
+                        )));
+                    };
+                    let output = model.generate_with_voice_physical(
+                        &text,
+                        &voice,
+                        params,
+                        leases.cache_mut(*domain)?,
+                    )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
                     let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
                         Error::InferenceError(format!(

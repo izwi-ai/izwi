@@ -372,17 +372,22 @@ fn retained_state_expectation(
             Capability::Tts | Capability::StreamingTts => Stateless,
             _ => unexpected_capability(variant, capability),
         },
-        ModelFamily::VoxtralTts | ModelFamily::VibeVoiceTts | ModelFamily::FishS2Tts => {
+        ModelFamily::VibeVoiceTts | ModelFamily::FishS2Tts => match capability {
+            Capability::Tts => Stateless,
+            _ => unexpected_capability(variant, capability),
+        },
+        ModelFamily::VoxtralTts => match capability {
+            Capability::Tts => Managed,
+            _ => unexpected_capability(variant, capability),
+        },
+        ModelFamily::ParakeetAsr | ModelFamily::WhisperAsr | ModelFamily::VibeVoiceAsr => {
             match capability {
-                Capability::Tts => Stateless,
+                Capability::Asr => Stateless,
                 _ => unexpected_capability(variant, capability),
             }
         }
-        ModelFamily::ParakeetAsr
-        | ModelFamily::WhisperAsr
-        | ModelFamily::VibeVoiceAsr
-        | ModelFamily::Voxtral => match capability {
-            Capability::Asr => Stateless,
+        ModelFamily::Voxtral => match capability {
+            Capability::Asr => Managed,
             _ => unexpected_capability(variant, capability),
         },
         ModelFamily::GraniteSpeechAsr => match capability {

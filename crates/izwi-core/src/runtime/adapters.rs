@@ -376,7 +376,9 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             },
             state_requirement: match model_variant.family() {
                 ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::VibeVoiceTts => InferenceStateRequirement::Invocation,
+                ModelFamily::VibeVoiceTts | ModelFamily::VoxtralTts => {
+                    InferenceStateRequirement::Invocation
+                }
                 _ => InferenceStateRequirement::Stateless,
             },
         })
@@ -435,7 +437,9 @@ impl ModelCapabilityAdapter for AsrCapabilityAdapter {
                 },
                 state_requirement: match model_variant.family() {
                     ModelFamily::Qwen3Asr => InferenceStateRequirement::RetainedAndInvocation,
-                    ModelFamily::VibeVoiceAsr => InferenceStateRequirement::Invocation,
+                    ModelFamily::VibeVoiceAsr | ModelFamily::Voxtral => {
+                        InferenceStateRequirement::Invocation
+                    }
                     _ => InferenceStateRequirement::Stateless,
                 },
             })
@@ -836,6 +840,13 @@ mod tests {
                 .streaming_mode,
             StreamingMode::Chunked
         );
+        assert_eq!(
+            registry
+                .require(CapabilityKind::Asr, variant)
+                .expect("voxtral asr adapter")
+                .state_requirement,
+            InferenceStateRequirement::Invocation
+        );
         assert!(registry
             .require(CapabilityKind::RealtimeAsr, variant)
             .is_err());
@@ -885,6 +896,10 @@ mod tests {
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(
+            adapter.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());

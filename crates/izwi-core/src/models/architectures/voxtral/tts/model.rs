@@ -7,12 +7,17 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
 use tracing::{info, warn};
 
-use crate::backends::{DeviceKind, DeviceProfile};
+use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
+use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::Qwen3Cache;
+use crate::kv::CacheDomainId;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
-use crate::models::shared::attention::paged::{KvCacheQuantization, DEFAULT_KV_PAGE_SIZE};
+use crate::models::architectures::voxtral::{
+    voxtral_invocation_contract, voxtral_physical_state_spec, VoxtralPhysicalStateSpec,
+};
+use crate::models::shared::attention::paged::default_kv_page_size;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 use super::acoustic::{AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT};
 use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
@@ -60,7 +65,6 @@ struct VoxtralTtsPipeline {
     codec_decoder: VoxtralCodecDecoder,
     audio_embeddings: VoxtralAudioTokenEmbeddings,
     device: Device,
-    device_kind: DeviceKind,
 }
 
 struct VoxtralAudioTokenEmbeddings {
@@ -153,7 +157,6 @@ impl VoxtralTtsModel {
             codec_decoder,
             audio_embeddings,
             device: device.device.clone(),
-            device_kind: device.kind,
         });
         Ok(model)
     }
@@ -189,11 +192,46 @@ impl VoxtralTtsModel {
         self.voices.names_by_id()
     }
 
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<VoxtralPhysicalStateSpec> {
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Voxtral TTS physical state requires the full model loader".into(),
+            )
+        })?;
+        let invocation = voxtral_invocation_contract(
+            &pipeline.language_model,
+            self.dtype_plan.language_model,
+            default_kv_page_size(),
+            &[CacheDomainId::new(0)],
+        )?;
+        let max_context_tokens = pipeline
+            .language_model
+            .physical_context_limit()
+            .ok_or_else(|| Error::ModelLoadError("Voxtral TTS has no context limit".into()))?;
+        voxtral_physical_state_spec(stage_graphs, invocation, max_context_tokens)
+    }
+
     pub fn generate_with_voice(
         &self,
         text: &str,
         voice: &str,
         params: VoxtralTtsGenerationParams,
+    ) -> Result<VoxtralTtsOutput> {
+        let _ = (text, voice, params);
+        Err(Error::InferenceError(
+            "Voxtral TTS requires a lifecycle-owned physical invocation cache".into(),
+        ))
+    }
+
+    pub(crate) fn generate_with_voice_physical(
+        &self,
+        text: &str,
+        voice: &str,
+        params: VoxtralTtsGenerationParams,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<VoxtralTtsOutput> {
         self.voices.resolve(voice)?;
         let pipeline = self.pipeline.as_ref().ok_or_else(|| {
@@ -202,7 +240,7 @@ impl VoxtralTtsModel {
                     .to_string(),
             )
         })?;
-        pipeline.generate(text, voice, params, self)
+        pipeline.generate(text, voice, params, self, cache)
     }
 }
 
@@ -213,6 +251,7 @@ impl VoxtralTtsPipeline {
         voice: &str,
         params: VoxtralTtsGenerationParams,
         model: &VoxtralTtsModel,
+        cache: &mut PhysicalPagedKvCache,
     ) -> Result<VoxtralTtsOutput> {
         if text.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -235,16 +274,26 @@ impl VoxtralTtsPipeline {
             })?;
         let prompt_duration = prompt_start.elapsed();
         let max_frames = params.max_frames.max(1);
-        let dense_decode_tokens = prompt.input_ids.len().saturating_add(max_frames);
-        let mut cache = build_voxtral_tts_decode_cache(
-            self.language_model.num_layers(),
-            self.device_kind,
-            dense_decode_tokens,
-        );
+        let required_cache_tokens = prompt
+            .input_ids
+            .len()
+            .checked_add(max_frames.saturating_sub(1))
+            .ok_or_else(|| Error::InvalidInput("Voxtral TTS cache length overflow".into()))?;
+        if cache.context_len() != 0 {
+            return Err(Error::InvalidInput(
+                "Voxtral TTS invocation cache must start empty".into(),
+            ));
+        }
+        if required_cache_tokens > cache.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral TTS needs {required_cache_tokens} cache tokens, but its invocation lease has capacity {}",
+                cache.capacity_tokens()
+            )));
+        }
         let lm_prefill_start = Instant::now();
         let prefill_hidden = self
             .language_model
-            .forward_hidden_with_embeds(&prompt_embeds, 0, Some(&mut cache), None, None)
+            .forward_managed_hidden_with_embeds(&prompt_embeds, 0, cache, None, None)
             .map_err(|err| {
                 Error::InferenceError(format!("Voxtral TTS LM prefill failed: {err}"))
             })?;
@@ -310,7 +359,7 @@ impl VoxtralTtsPipeline {
             let lm_decode_start = Instant::now();
             let hidden = self
                 .language_model
-                .forward_hidden_with_embeds(&next_embed, pos, Some(&mut cache), None, None)
+                .forward_managed_hidden_with_embeds(&next_embed, pos, cache, None, None)
                 .map_err(|err| {
                     Error::InferenceError(format!("Voxtral TTS LM decode failed: {err}"))
                 })?;
@@ -347,7 +396,7 @@ impl VoxtralTtsPipeline {
             "Voxtral TTS timings: frames={}, samples={}, dense_decode_tokens={}, tensor_feedback_frames={}, host_feedback_frames={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
             frames_generated,
             samples.len(),
-            cache.dense_decode_max_tokens(),
+            0,
             tensor_feedback_frames,
             host_feedback_frames,
             duration_ms(prompt_duration),
@@ -594,27 +643,6 @@ fn load_voxtral_tts_weights<'a>(
     }
 }
 
-fn build_voxtral_tts_decode_cache(
-    num_layers: usize,
-    device_kind: DeviceKind,
-    max_decode_tokens: usize,
-) -> Qwen3Cache {
-    Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-        num_layers,
-        DEFAULT_KV_PAGE_SIZE,
-        KvCacheQuantization::None,
-        voxtral_tts_dense_decode_max_tokens(device_kind, max_decode_tokens),
-    )
-}
-
-fn voxtral_tts_dense_decode_max_tokens(device_kind: DeviceKind, max_decode_tokens: usize) -> usize {
-    if device_kind.is_cuda() {
-        max_decode_tokens.max(1)
-    } else {
-        0
-    }
-}
-
 pub fn select_voxtral_tts_dtypes(
     device: &DeviceProfile,
     dtype_override: Option<&str>,
@@ -713,28 +741,6 @@ mod tests {
         assert_eq!(cuda_plan.language_model, DType::BF16);
         assert_eq!(cuda_plan.acoustic_transformer, DType::BF16);
         assert_eq!(cuda_plan.codec, DType::BF16);
-    }
-
-    #[test]
-    fn tts_dense_decode_cache_is_cuda_only() {
-        assert_eq!(voxtral_tts_dense_decode_max_tokens(DeviceKind::Cpu, 128), 0);
-        assert_eq!(
-            voxtral_tts_dense_decode_max_tokens(DeviceKind::Metal, 128),
-            0
-        );
-        assert_eq!(
-            voxtral_tts_dense_decode_max_tokens(DeviceKind::Cuda, 128),
-            128
-        );
-
-        let cpu_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Cpu, 128);
-        assert_eq!(cpu_cache.dense_decode_max_tokens(), 0);
-
-        let metal_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Metal, 128);
-        assert_eq!(metal_cache.dense_decode_max_tokens(), 0);
-
-        let cuda_cache = build_voxtral_tts_decode_cache(2, DeviceKind::Cuda, 128);
-        assert_eq!(cuda_cache.dense_decode_max_tokens(), 128);
     }
 
     #[test]

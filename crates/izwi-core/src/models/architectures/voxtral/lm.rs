@@ -8,15 +8,15 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
+use crate::kv::{
+    CacheDomainId, CacheTokenAxis, KvCacheContract, KvDomainSpec, KvPrefixSemantics,
+    PositionSemantics, CURRENT_KV_CONTRACT_ABI,
+};
 use crate::models::architectures::qwen3::core::{
-    build_mrope_cache, build_rope_cache, causal_mask, dense_decode_attention, repeat_kv,
-    Qwen3Cache, Qwen3Config,
+    build_mrope_cache, build_rope_cache, qwen3_decoder_cache_domain, Qwen3Config,
+    Qwen3DecoderCacheGeometry,
 };
-use crate::models::shared::attention::flash::{
-    flash_attention_requested, try_fused_self_attention, try_fused_self_attention_with_options,
-    CudaFlashAttentionOptions,
-};
-use crate::models::shared::attention::paged::paged_decode_attention;
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 
 use super::layers::linear_forward_last_dim;
 
@@ -70,7 +70,6 @@ struct VoxtralAttention {
     use_mrope: bool,
     mrope_section: Option<Vec<usize>>,
     rope_theta: f64,
-    sliding_window: Option<usize>,
 }
 
 struct VoxtralMlp {
@@ -125,47 +124,135 @@ impl VoxtralLM {
         self.layers.len()
     }
 
+    pub(crate) fn physical_context_limit(&self) -> Option<usize> {
+        self.cfg.context_length().map(|context| {
+            self.cfg
+                .sliding_window()
+                .map_or(context, |window| context.min(window))
+        })
+    }
+
+    pub(crate) fn managed_kv_cache_contract(
+        &self,
+        domain: CacheDomainId,
+        storage_dtype: DType,
+        preferred_page_tokens: usize,
+    ) -> Result<KvCacheContract> {
+        let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+            domain,
+            token_axis: CacheTokenAxis::DecoderTokens,
+            num_layers: self.cfg.num_hidden_layers,
+            num_query_heads: self.cfg.num_attention_heads,
+            num_kv_heads: self.cfg.num_key_value_heads,
+            key_head_dim: self.cfg.head_dim(),
+            value_head_dim: self.cfg.head_dim(),
+            sliding_window: self.cfg.sliding_window(),
+            storage_dtype,
+            preferred_page_tokens,
+            prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+                positions: PositionSemantics::Absolute,
+            },
+        })?;
+        let contract = KvCacheContract {
+            abi: CURRENT_KV_CONTRACT_ABI,
+            domains: vec![KvDomainSpec::PagedAttention(cache_domain)],
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.forward(input_ids).map_err(Error::from)
     }
 
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
-    ) -> Result<Tensor> {
-        let embeds = self.embeddings(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache, None, None)
-    }
-
-    pub fn forward_with_embeds(
+    pub(crate) fn forward_managed_with_embeds(
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
+        cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
         t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let hidden =
-            self.forward_hidden_with_embeds(embeds, start_pos, cache, position_ids, t_cond)?;
-        self.logits_from_hidden(&hidden)
+        let (hidden, prepared) = self.prepare_managed_hidden_with_embeds(
+            embeds,
+            start_pos,
+            cache,
+            position_ids,
+            t_cond,
+        )?;
+        let logits = self.logits_from_hidden(&hidden)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
     }
 
-    pub fn forward_hidden_with_embeds(
+    pub(crate) fn forward_managed_hidden_with_embeds(
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
         t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let (hidden, prepared) = self.prepare_managed_hidden_with_embeds(
+            embeds,
+            start_pos,
+            cache,
+            position_ids,
+            t_cond,
+        )?;
+        cache.commit_prepared(prepared)?;
+        Ok(hidden)
+    }
+
+    fn prepare_managed_hidden_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+        t_cond: Option<&Tensor>,
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
+        let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral managed embeddings expect [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                embeds.dims()
+            )));
+        }
+        let end_pos = start_pos
+            .checked_add(sequence_len)
+            .ok_or_else(|| Error::InvalidInput("Voxtral managed context length overflow".into()))?;
+        if self
+            .cfg
+            .sliding_window()
+            .is_some_and(|window| end_pos > window)
+        {
+            return Err(Error::InvalidInput(
+                "Voxtral physical paging cannot yet advance sliding-window block tables".into(),
+            ));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim(),
+        )?;
+        cache.slots_for_append(start_pos, sequence_len)?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
-            let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, position_ids, cache_ref, idx, t_cond)?;
+            x = layer.forward_managed(
+                &x,
+                start_pos,
+                position_ids,
+                cache,
+                &mut prepared,
+                idx,
+                t_cond,
+            )?;
         }
-        self.norm.forward(&x).map_err(Error::from)
+        let hidden = self.norm.forward(&x)?;
+        Ok((hidden, prepared))
     }
 
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -229,19 +316,20 @@ impl VoxtralLayer {
         })
     }
 
-    fn forward(
+    fn forward_managed(
         &self,
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
         t_cond: Option<&Tensor>,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self
             .self_attn
-            .forward(&normed, start_pos, position_ids, cache, layer_idx)
+            .forward_managed(&normed, start_pos, position_ids, cache, prepared, layer_idx)
             .map_err(|err| {
                 Error::InferenceError(format!(
                     "Voxtral LM layer {layer_idx} attention failed: {err}"
@@ -323,20 +411,25 @@ impl VoxtralAttention {
             use_mrope,
             mrope_section,
             rope_theta: cfg.rope_theta,
-            sliding_window: cfg.sliding_window(),
         })
     }
 
-    fn forward(
+    fn forward_managed(
         &self,
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
+        if bsz != 1 {
+            return Err(Error::InvalidInput(
+                "Voxtral physical paged attention expects one sequence".into(),
+            ));
+        }
 
         let mut q = linear_forward_last_dim(&self.q_proj, x)?.reshape((
             bsz,
@@ -363,133 +456,13 @@ impl VoxtralAttention {
         q = self.apply_rope(q, start_pos, position_ids)?;
         k = self.apply_rope(k, start_pos, position_ids)?;
 
-        let (k, v) = if let Some(cache) = cache {
-            cache.append(layer_idx, k.clone(), v.clone())?;
-
-            if seq_len == 1 && start_pos > 0 && self.sliding_window.is_none() {
-                if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
-                    let out = dense_decode_attention(
-                        &q,
-                        &k_heads,
-                        &v_heads,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    )?;
-                    let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return linear_forward_last_dim(&self.o_proj, &out);
-                }
-
-                if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
-                    let out = paged_decode_attention(
-                        &q,
-                        k_pages,
-                        v_pages,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    )?;
-                    let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return linear_forward_last_dim(&self.o_proj, &out);
-                }
-            }
-
-            cache.materialize(layer_idx)?
-        } else {
-            (k, v)
-        };
-        let q_heads = q.transpose(1, 2)?;
-        let k_kv_heads = k.transpose(1, 2)?;
-        let v_kv_heads = v.transpose(1, 2)?;
-
-        let total_len = k_kv_heads.dim(2)?;
-        if start_pos == 0
-            && total_len == seq_len
-            && self.sliding_window.is_none()
-            && voxtral_prefill_fused_attention_allowed(q.device().is_metal(), q.dtype())
-        {
-            if let Some(fused_out) = try_fused_self_attention(
-                &q_heads,
-                &k_kv_heads,
-                &v_kv_heads,
-                None,
-                self.head_dim,
-                true,
-            )? {
-                let out = fused_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                let out = linear_forward_last_dim(&self.o_proj, &out)?;
-                return Ok(out);
-            }
-        }
-        if start_pos == 0
-            && total_len == seq_len
-            && self.sliding_window.is_some()
-            && q_heads.device().is_cuda()
-            && flash_attention_requested()
-        {
-            let cuda_options = voxtral_sliding_cuda_flash_attention_options(self.sliding_window);
-            if let Some(fused_out) = try_fused_self_attention_with_options(
-                &q_heads,
-                &k_kv_heads,
-                &v_kv_heads,
-                None,
-                self.head_dim,
-                true,
-                cuda_options,
-            )? {
-                let out = fused_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                let out = linear_forward_last_dim(&self.o_proj, &out)?;
-                return Ok(out);
-            }
-        }
-
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
-        let q = q_heads;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-
-        let total_len = k.dim(2)?;
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale = (self.head_dim as f64).sqrt();
-        let scale_t =
-            Tensor::from_vec(vec![scale as f32], (1,), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale_t)?;
-
-        if seq_len > 1 || start_pos == 0 || self.sliding_window.is_some() {
-            let mask = voxtral_attention_mask(
-                seq_len,
-                total_len,
-                start_pos,
-                self.sliding_window,
-                att.device(),
-                att.dtype(),
-            )?;
-            att = att.broadcast_add(&mask)?;
-        }
-
-        let att = ops::softmax(&att, candle_core::D::Minus1)?;
-        let out = att.matmul(&v)?;
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-
-        let out = linear_forward_last_dim(&self.o_proj, &out)?;
-        Ok(out)
+        let q = q.squeeze(0)?;
+        let k = k.squeeze(0)?;
+        let v = v.squeeze(0)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let out = cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        linear_forward_last_dim(&self.o_proj, &out)
     }
 
     fn apply_qk_norm(
@@ -556,10 +529,6 @@ impl VoxtralAttention {
     }
 }
 
-fn voxtral_prefill_fused_attention_allowed(is_metal: bool, dtype: DType) -> bool {
-    !(is_metal && dtype == DType::F32)
-}
-
 fn apply_interleaved_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let bsz = x.dim(0)?;
     let seq_len = x.dim(1)?;
@@ -624,43 +593,6 @@ impl VoxtralAdaRmsNorm {
     }
 }
 
-fn voxtral_attention_mask(
-    seq_len: usize,
-    total_len: usize,
-    start_pos: usize,
-    sliding_window: Option<usize>,
-    device: &Device,
-    dtype: candle_core::DType,
-) -> Result<Tensor> {
-    if sliding_window.is_none() {
-        return causal_mask(seq_len, total_len, start_pos, device, dtype);
-    }
-
-    let sliding_window = sliding_window.unwrap();
-    let mut data = vec![0f32; seq_len * total_len];
-    for i in 0..seq_len {
-        let query_pos = start_pos + i;
-        let earliest = query_pos.saturating_add(1).saturating_sub(sliding_window);
-        for j in 0..total_len {
-            if j > query_pos || j < earliest {
-                data[i * total_len + j] = -1e4;
-            }
-        }
-    }
-    Tensor::from_vec(data, (1, seq_len, total_len), device)?
-        .to_dtype(dtype)
-        .map_err(Error::from)
-}
-
-fn voxtral_sliding_cuda_flash_attention_options(
-    sliding_window: Option<usize>,
-) -> CudaFlashAttentionOptions<'static> {
-    CudaFlashAttentionOptions {
-        window_size_left: sliding_window.map(|window| window.saturating_sub(1)),
-        ..CudaFlashAttentionOptions::default()
-    }
-}
-
 impl VoxtralMlp {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj =
@@ -689,8 +621,7 @@ impl VoxtralMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::shared::attention::paged::KvCacheQuantization;
-    use candle_core::{DType, D};
+    use candle_core::DType;
     use std::collections::HashMap;
 
     fn tiny_cfg() -> Qwen3Config {
@@ -859,50 +790,6 @@ mod tests {
     }
 
     #[test]
-    fn voxtral_sliding_attention_mask_limits_left_context() {
-        let device = Device::Cpu;
-        let mask = voxtral_attention_mask(5, 5, 0, Some(3), &device, DType::F32)
-            .unwrap()
-            .squeeze(0)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-
-        assert_eq!(
-            mask,
-            vec![
-                vec![0.0, -1e4, -1e4, -1e4, -1e4],
-                vec![0.0, 0.0, -1e4, -1e4, -1e4],
-                vec![0.0, 0.0, 0.0, -1e4, -1e4],
-                vec![-1e4, 0.0, 0.0, 0.0, -1e4],
-                vec![-1e4, -1e4, 0.0, 0.0, 0.0],
-            ]
-        );
-
-        let decode_mask = voxtral_attention_mask(1, 5, 4, Some(3), &device, DType::F32)
-            .unwrap()
-            .squeeze(0)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-        assert_eq!(decode_mask, vec![vec![-1e4, -1e4, 0.0, 0.0, 0.0]]);
-    }
-
-    #[test]
-    fn voxtral_sliding_flash_options_match_mask_window_width() {
-        let options = voxtral_sliding_cuda_flash_attention_options(Some(3));
-        assert_eq!(options.window_size_left, Some(2));
-        assert_eq!(options.window_size_right, None);
-        assert!(options.alibi_slopes.is_none());
-
-        let single_token = voxtral_sliding_cuda_flash_attention_options(Some(1));
-        assert_eq!(single_token.window_size_left, Some(0));
-
-        let full_context = voxtral_sliding_cuda_flash_attention_options(None);
-        assert_eq!(full_context.window_size_left, None);
-    }
-
-    #[test]
     fn voxtral_text_rope_uses_interleaved_pairs() {
         let device = Device::Cpu;
         let x = Tensor::from_vec(vec![1.0f32, 10.0, 2.0, 20.0], (1, 1, 1, 4), &device).unwrap();
@@ -920,118 +807,5 @@ mod tests {
                 2.0 * 0.2 + 20.0 * 0.25,
             ]
         );
-    }
-
-    #[test]
-    fn voxtral_metal_f32_prefill_skips_fused_attention() {
-        assert!(!voxtral_prefill_fused_attention_allowed(true, DType::F32));
-        assert!(voxtral_prefill_fused_attention_allowed(true, DType::F16));
-        assert!(voxtral_prefill_fused_attention_allowed(false, DType::F32));
-    }
-
-    #[test]
-    fn voxtral_gqa_cache_keeps_kv_heads_unexpanded_for_paged_decode() {
-        let device = Device::Cpu;
-        let batch_size = 1usize;
-        let num_heads = 8usize;
-        let num_kv_heads = 2usize;
-        let head_dim = 8usize;
-        let prefill_len = 3usize;
-
-        let mut cache =
-            Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None);
-        let k_prefill = Tensor::randn(
-            0.0f32,
-            1.0f32,
-            (batch_size, prefill_len, num_kv_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        let v_prefill = Tensor::randn(
-            0.0f32,
-            1.0f32,
-            (batch_size, prefill_len, num_kv_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        cache
-            .append(0, k_prefill.clone(), v_prefill.clone())
-            .unwrap();
-
-        let k_decode = Tensor::randn(
-            0.0f32,
-            1.0f32,
-            (batch_size, 1, num_kv_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        let v_decode = Tensor::randn(
-            0.0f32,
-            1.0f32,
-            (batch_size, 1, num_kv_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        cache.append(0, k_decode.clone(), v_decode.clone()).unwrap();
-
-        let (k_materialized, v_materialized) = cache.materialize(0).unwrap();
-        assert_eq!(
-            k_materialized.dims4().unwrap(),
-            (batch_size, prefill_len + 1, num_kv_heads, head_dim)
-        );
-        assert_eq!(
-            v_materialized.dims4().unwrap(),
-            (batch_size, prefill_len + 1, num_kv_heads, head_dim)
-        );
-
-        let q = Tensor::randn(
-            0.0f32,
-            1.0f32,
-            (batch_size, 1, num_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        let (k_pages, v_pages) = cache.pages(0).unwrap();
-        let paged = paged_decode_attention(&q, k_pages, v_pages, num_heads, num_kv_heads, head_dim)
-            .unwrap();
-
-        let total_len = prefill_len + 1;
-        let k_full = Tensor::cat(&[&k_prefill, &k_decode], 1).unwrap();
-        let v_full = Tensor::cat(&[&v_prefill, &v_decode], 1).unwrap();
-        let q_ref = q
-            .transpose(1, 2)
-            .unwrap()
-            .reshape((batch_size * num_heads, 1, head_dim))
-            .unwrap();
-        let k_ref = repeat_kv(&k_full, num_heads, num_kv_heads)
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap()
-            .reshape((batch_size * num_heads, total_len, head_dim))
-            .unwrap();
-        let v_ref = repeat_kv(&v_full, num_heads, num_kv_heads)
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap()
-            .reshape((batch_size * num_heads, total_len, head_dim))
-            .unwrap();
-        let scale = (head_dim as f64).sqrt();
-        let mut scores = q_ref.matmul(&k_ref.transpose(1, 2).unwrap()).unwrap();
-        let scale_t = Tensor::from_vec(vec![scale as f32], (1,), &device)
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap();
-        scores = scores.broadcast_div(&scale_t).unwrap();
-        let weights = ops::softmax(&scores, D::Minus1).unwrap();
-        let dense = weights
-            .matmul(&v_ref)
-            .unwrap()
-            .reshape((batch_size, num_heads, 1, head_dim))
-            .unwrap()
-            .transpose(1, 2)
-            .unwrap();
-
-        let diff = max_abs_diff(&paged, &dense);
-        assert!(diff < 1e-4, "max abs diff was {}", diff);
     }
 }

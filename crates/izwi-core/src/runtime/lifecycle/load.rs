@@ -627,7 +627,35 @@ impl ModelLifecycleController {
                 .require(CapabilityKind::Asr, variant)
                 .is_ok()
             {
-                if let Some(loaded) = self.model_registry.get_asr(variant).await {
+                if variant.family() == crate::catalog::ModelFamily::Voxtral {
+                    if !managed_kv_backend_compiled(backend) {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded model {variant} requires physical ASR invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                        )));
+                    }
+                    let loaded = self.model_registry.get_voxtral(variant).await.ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded Voxtral model {variant} is missing from the registry"
+                        ))
+                    })?;
+                    let contracts = bundle_draft.execution_contracts(CapabilityKind::Asr)?;
+                    let stage_graphs = contracts
+                        .iter()
+                        .map(|contract| contract.stages.as_ref())
+                        .collect::<Vec<_>>();
+                    let physical_spec = loaded.physical_state_spec(&stage_graphs)?;
+                    let publication = self
+                        .load_invocation_paged_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            &physical_spec.invocation,
+                            None,
+                            HashMap::new(),
+                        )
+                        .await?;
+                    state_publications.insert(CapabilityKind::Asr, publication);
+                } else if let Some(loaded) = self.model_registry.get_asr(variant).await {
                     let loaded_cache = loaded.kv_cache_contract()?;
                     loaded_cache.validate()?;
                     if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
@@ -854,6 +882,39 @@ impl ModelLifecycleController {
                     .ok_or_else(|| {
                         Error::ModelLoadError(format!(
                             "loaded VibeVoice TTS model {variant} is missing from the registry"
+                        ))
+                    })?;
+                let contracts = bundle_draft.execution_contracts(CapabilityKind::Tts)?;
+                let stage_graphs = contracts
+                    .iter()
+                    .map(|contract| contract.stages.as_ref())
+                    .collect::<Vec<_>>();
+                let physical_spec = model.physical_state_spec(&stage_graphs)?;
+                let publication = self
+                    .load_invocation_paged_publication(
+                        model_instance_id,
+                        &contracts,
+                        physical_spec.descriptor,
+                        &physical_spec.invocation,
+                        None,
+                        HashMap::new(),
+                    )
+                    .await?;
+                state_publications.insert(CapabilityKind::Tts, publication);
+            }
+            if variant.family() == crate::catalog::ModelFamily::VoxtralTts {
+                if !managed_kv_backend_compiled(backend) {
+                    return Err(Error::ModelLoadError(format!(
+                        "loaded model {variant} requires physical TTS invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                    )));
+                }
+                let model = self
+                    .model_registry
+                    .get_voxtral_tts(variant)
+                    .await
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "loaded Voxtral TTS model {variant} is missing from the registry"
                         ))
                     })?;
                 let contracts = bundle_draft.execution_contracts(CapabilityKind::Tts)?;

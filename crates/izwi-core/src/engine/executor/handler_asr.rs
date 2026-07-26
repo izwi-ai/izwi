@@ -372,12 +372,18 @@ impl NativeExecutor {
                         &chunk_plan.chunks,
                         &chunk_plan.config,
                         |chunk_audio, sr| {
-                            model
-                                .transcribe_with_details(chunk_audio, sr, language)
-                                .map(|details| AsrChunkTranscription {
-                                    text: details.text,
-                                    diagnostics: details.diagnostics,
-                                })
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model.transcribe_with_details_physical(
+                                    chunk_audio,
+                                    sr,
+                                    language,
+                                    cache,
+                                )
+                            })
+                            .map(|details| AsrChunkTranscription {
+                                text: details.text,
+                                diagnostics: details.diagnostics,
+                            })
                         },
                     )?;
                     return Ok((
@@ -405,12 +411,15 @@ impl NativeExecutor {
                                 }
                             }
                         };
-                        let text = model.transcribe_with_callback(
-                            &samples,
-                            sample_rate,
-                            language,
-                            &mut emit,
-                        )?;
+                        let text = with_single_invocation_cache(request, scheduled, |cache| {
+                            model.transcribe_with_callback_physical(
+                                &samples,
+                                sample_rate,
+                                language,
+                                &mut emit,
+                                cache,
+                            )
+                        })?;
                         if let Some(err) = stream_err {
                             return Err(err);
                         }
@@ -423,7 +432,9 @@ impl NativeExecutor {
                         return Ok((text, None));
                     }
                 }
-                let details = model.transcribe_with_details(&samples, sample_rate, language)?;
+                let details = with_single_invocation_cache(request, scheduled, |cache| {
+                    model.transcribe_with_details_physical(&samples, sample_rate, language, cache)
+                })?;
                 return Ok((details.text, details.diagnostics));
             }
 

@@ -1,6 +1,201 @@
 //! Voxtral family implementations.
 
+use candle_core::DType;
+
+use crate::engine::StageDescriptor;
+use crate::error::{Error, Result};
+use crate::kv::v2::{
+    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
+    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
+    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, StateDType,
+    StateDomainSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+};
+use crate::kv::{CacheDomainId, KvCacheContract};
+
 mod layers;
 pub mod lm;
 pub mod realtime;
 pub mod tts;
+
+use lm::VoxtralLM;
+
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralPhysicalStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) invocation: InferenceStateContract,
+}
+
+pub(crate) fn voxtral_invocation_contract(
+    model: &VoxtralLM,
+    dtype: DType,
+    preferred_page_tokens: usize,
+    domains: &[CacheDomainId],
+) -> Result<InferenceStateContract> {
+    if domains.is_empty() {
+        return Err(Error::ModelLoadError(
+            "Voxtral invocation state has no cache domains".into(),
+        ));
+    }
+    let mut legacy_domains = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let contract = model.managed_kv_cache_contract(*domain, dtype, preferred_page_tokens)?;
+        legacy_domains.extend(contract.domains);
+    }
+    let legacy = KvCacheContract {
+        abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
+        domains: legacy_domains,
+    };
+    voxtral_invocation_contract_from_legacy(&legacy)
+}
+
+fn voxtral_invocation_contract_from_legacy(
+    legacy: &KvCacheContract,
+) -> Result<InferenceStateContract> {
+    legacy.validate()?;
+    let mut contract = upgrade_kv_contract_v1(legacy)?;
+    for domain in &mut contract.domains {
+        let StateDomainSpec::PagedAttention(domain) = domain else {
+            return Err(Error::ModelLoadError(
+                "Voxtral invocation state must be paged attention".into(),
+            ));
+        };
+        domain.header.scope = StateScope::Invocation;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = CheckpointPolicy::None;
+    }
+    for group in &mut contract.groups {
+        group.prefix_shareable = false;
+    }
+    contract.validate()?;
+    Ok(contract)
+}
+
+pub(crate) fn voxtral_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    invocation: InferenceStateContract,
+    max_context_tokens: usize,
+) -> Result<VoxtralPhysicalStateSpec> {
+    if stage_graphs.is_empty() || max_context_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral invocation state requires stages and a non-zero context".into(),
+        ));
+    }
+    let max_tokens = u64::try_from(max_context_tokens)
+        .map_err(|_| Error::ModelLoadError("Voxtral context exceeds u64".into()))?;
+    let max_domain_id = invocation
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .ok_or_else(|| Error::ModelLoadError("Voxtral invocation contract is empty".into()))?;
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            let mut domains = invocation
+                .domains
+                .iter()
+                .cloned()
+                .map(|state| {
+                    Ok(InvocationWorkspaceDomain::State {
+                        placement: state.header().placement,
+                        formula: WorkspaceFormula {
+                            fixed_bytes: voxtral_paged_invocation_bytes(&state, max_tokens)?,
+                            dimensions: vec![],
+                            terms: vec![],
+                        },
+                        state,
+                        capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if stage.max_workspace_bytes > 0 {
+                let scratch_id = max_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError("Voxtral execution stage count exceeds u32".into())
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError("Voxtral scratch domain id overflow".into())
+                    })?;
+                domains.push(InvocationWorkspaceDomain::Scratch {
+                    id: crate::kv::v2::StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: stage.max_workspace_bytes,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                });
+            }
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: invocation.groups.clone(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Stateless,
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(VoxtralPhysicalStateSpec {
+        descriptor,
+        invocation,
+    })
+}
+
+fn voxtral_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+    let StateDomainSpec::PagedAttention(spec) = state else {
+        return Err(Error::ModelLoadError(
+            "Voxtral invocation workspace is not paged attention".into(),
+        ));
+    };
+    let page_tokens = u64::from(spec.page_size.preferred_tokens);
+    let rounded_tokens = max_tokens
+        .checked_add(page_tokens.saturating_sub(1))
+        .and_then(|tokens| tokens.checked_div(page_tokens))
+        .and_then(|pages| pages.checked_mul(page_tokens))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral page capacity overflow".into()))?;
+    let elements_per_token = spec.layers.iter().try_fold(0_u64, |total, layer| {
+        let layer_elements = u64::from(layer.kv_heads)
+            .checked_mul(u64::from(layer.key_head_dim) + u64::from(layer.value_head_dim))
+            .ok_or_else(|| Error::ModelLoadError("Voxtral KV geometry overflow".into()))?;
+        total
+            .checked_add(layer_elements)
+            .ok_or_else(|| Error::ModelLoadError("Voxtral KV geometry overflow".into()))
+    })?;
+    let element_bytes = spec
+        .accepted_dtypes
+        .iter()
+        .map(|dtype| match dtype {
+            StateDType::F32 => Ok(4_u64),
+            StateDType::F16 | StateDType::Bf16 => Ok(2_u64),
+            StateDType::I8 | StateDType::Q4 => Err(Error::ModelLoadError(
+                "Voxtral invocation paging requires a dense loaded KV dtype".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .min()
+        .ok_or_else(|| Error::ModelLoadError("Voxtral KV dtype set is empty".into()))?;
+    elements_per_token
+        .checked_mul(rounded_tokens)
+        .and_then(|elements| elements.checked_mul(element_bytes))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral invocation byte bound overflow".into()))
+}

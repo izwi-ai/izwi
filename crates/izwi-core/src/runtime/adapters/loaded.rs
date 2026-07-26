@@ -2258,7 +2258,7 @@ mod tests {
     #[test]
     fn voxtral_streaming_binds_to_its_exact_token_engine_adapter() {
         let variant = ModelVariant::VoxtralMini4BRealtime2602;
-        let bundle = LoadedModelBundle::bind(
+        let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             ExecutionGroupId::new(7),
             ModelInstanceId::new(1),
@@ -2267,7 +2267,14 @@ mod tests {
         )
         .unwrap();
 
-        let contract = bundle.contract(CapabilityKind::Asr, true).unwrap();
+        let contract = draft
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .into_iter()
+            .find(|contract| {
+                contract.stages[0].output_visibility == OutputVisibility::IncrementalCommitted
+            })
+            .expect("streaming Voxtral contract");
         assert_eq!(
             contract.metadata.execution_target,
             ExecutionTargetKind::TokenEngine
@@ -2278,6 +2285,12 @@ mod tests {
             contract.stages[0].output_visibility,
             OutputVisibility::IncrementalCommitted
         );
+        let error = draft
+            .seal(HashMap::new())
+            .expect_err("Voxtral must not seal without physical invocation state");
+        assert!(error
+            .to_string()
+            .contains("requires an explicit load-sealed ABI-v2 state publication"));
     }
 
     #[test]
