@@ -22,6 +22,8 @@ pub const LFM25_AUDIO_AUDIO_VOCAB_SIZE: usize = 2_049;
 pub const LFM25_AUDIO_AUDIO_END_TOKEN_ID: u32 = 2_048;
 pub const LFM25_AUDIO_INTERLEAVED_TEXT_TOKENS: usize = 6;
 pub const LFM25_AUDIO_INTERLEAVED_AUDIO_TOKENS: usize = 12;
+pub(crate) const LFM25_DEPTHFORMER_QUERY_HEADS: usize = 32;
+pub(crate) const LFM25_DEPTHFORMER_KV_HEADS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct Lfm25AudioEncoderConfig {

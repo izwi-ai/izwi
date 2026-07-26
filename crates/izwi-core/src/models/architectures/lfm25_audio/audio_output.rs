@@ -25,8 +25,10 @@ use super::sampling::{
     greedy_token_tensor_from_logits, sample_from_logits, Lfm25SamplingConfig, SimpleRng,
 };
 
-const DEPTHFORMER_HEADS: usize = 32;
-const DEPTHFORMER_KV_HEADS: usize = 8;
+use super::config::{
+    LFM25_DEPTHFORMER_KV_HEADS as DEPTHFORMER_KV_HEADS,
+    LFM25_DEPTHFORMER_QUERY_HEADS as DEPTHFORMER_HEADS,
+};
 const DEPTHFORMER_NORM_EPS: f64 = 1e-5;
 const DEPTHFORMER_ROPE_BASE: f32 = 10_000.0;
 

@@ -1,6 +1,6 @@
 //! Physical invocation-state contract for the LFM2.5 Audio capability family.
 
-use crate::engine::StageDescriptor;
+use crate::engine::{NativeBatchMode, StageDescriptor, StageProgressKind};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, CapabilityStateDescriptorV2,
@@ -12,21 +12,21 @@ use crate::kv::v2::{
     CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::lfm2::physical::{
-    invocation_header, lfm2_main_invocation_contract, paged_invocation_bytes,
-    ring_invocation_bytes, Lfm2StateIds, Lfm2StateLayout,
+    invocation_header, lfm2_main_invocation_contract, paged_f32_invocation_bytes,
+    ring_f32_invocation_bytes, Lfm2StateIds, Lfm2StateLayout,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 
-use super::config::{Lfm25AudioDecoderConfig, Lfm2BackboneConfig};
+use super::config::{
+    Lfm25AudioDecoderConfig, Lfm2BackboneConfig, LFM25_DEPTHFORMER_KV_HEADS,
+    LFM25_DEPTHFORMER_QUERY_HEADS,
+};
 
 pub(crate) const LFM25_MAIN_ATTENTION_STATE_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const LFM25_MAIN_SHORTCONV_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 pub(crate) const LFM25_DEPTHFORMER_STATE_DOMAIN: StateDomainId = StateDomainId::new(3);
 const LFM25_MAIN_STATE_GROUP: StateGroupId = StateGroupId::new(1);
 const LFM25_DEPTHFORMER_STATE_GROUP: StateGroupId = StateGroupId::new(2);
-const DEPTHFORMER_QUERY_HEADS: usize = 32;
-const DEPTHFORMER_KV_HEADS: usize = 8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lfm25AudioStateMode {
     MainOnly,
@@ -49,6 +49,23 @@ pub(crate) fn lfm25_audio_physical_state_spec(
         return Err(Error::ModelLoadError(
             "LFM2.5 Audio physical state has no execution graph".into(),
         ));
+    }
+    for stages in stage_graphs {
+        if stages.len() != 1 {
+            return Err(Error::ModelLoadError(
+                "LFM2.5 Audio invocation state requires one scalar execution stage".into(),
+            ));
+        }
+        for stage in *stages {
+            stage.validate()?;
+            if stage.progress != StageProgressKind::Atomic
+                || stage.batch_mode != NativeBatchMode::None
+            {
+                return Err(Error::ModelLoadError(
+                    "LFM2.5 Audio invocation state requires scalar atomic execution stages".into(),
+                ));
+            }
+        }
     }
     let layout = Lfm2StateLayout::from_config(main_config)?;
     let mut invocation = lfm2_main_invocation_contract(
@@ -79,7 +96,8 @@ pub(crate) fn lfm25_audio_physical_state_spec(
         .iter()
         .map(|domain| domain.id().get())
         .max()
-        .ok_or_else(|| Error::ModelLoadError("LFM2.5 Audio state contract is empty".into()))?;
+        .ok_or_else(|| Error::ModelLoadError("LFM2.5 Audio state contract is empty".into()))?
+        .max(LFM25_DEPTHFORMER_STATE_DOMAIN.get());
     let mut profiles = Vec::with_capacity(stage_graphs.len());
 
     for stages in stage_graphs {
@@ -100,12 +118,12 @@ pub(crate) fn lfm25_audio_physical_state_spec(
                                 main_tokens
                             };
                             (
-                                paged_invocation_bytes(&state, max_tokens)?,
+                                paged_f32_invocation_bytes(&state, max_tokens)?,
                                 InvocationStateCapacity::PagedTokens { max_tokens },
                             )
                         }
                         StateDomainSpec::Ring(_) => (
-                            ring_invocation_bytes(&state)?,
+                            ring_f32_invocation_bytes(&state)?,
                             InvocationStateCapacity::SemanticBounded,
                         ),
                         _ => {
@@ -181,18 +199,19 @@ fn depthformer_domain(config: &Lfm25AudioDecoderConfig) -> Result<StateDomainSpe
     if config.codebooks == 0
         || config.depthformer_layers == 0
         || config.depthformer_dim == 0
-        || config.depthformer_dim % DEPTHFORMER_QUERY_HEADS != 0
-        || DEPTHFORMER_QUERY_HEADS % DEPTHFORMER_KV_HEADS != 0
+        || config.depthformer_dim % LFM25_DEPTHFORMER_QUERY_HEADS != 0
+        || (config.depthformer_dim / LFM25_DEPTHFORMER_QUERY_HEADS) % 2 != 0
+        || LFM25_DEPTHFORMER_QUERY_HEADS % LFM25_DEPTHFORMER_KV_HEADS != 0
     {
         return Err(Error::ModelLoadError(
             "LFM2.5 Audio physical state received invalid Depthformer geometry".into(),
         ));
     }
-    let query_heads = u32::try_from(DEPTHFORMER_QUERY_HEADS)
+    let query_heads = u32::try_from(LFM25_DEPTHFORMER_QUERY_HEADS)
         .map_err(|_| Error::ModelLoadError("Depthformer query-head count exceeds u32".into()))?;
-    let kv_heads = u32::try_from(DEPTHFORMER_KV_HEADS)
+    let kv_heads = u32::try_from(LFM25_DEPTHFORMER_KV_HEADS)
         .map_err(|_| Error::ModelLoadError("Depthformer KV-head count exceeds u32".into()))?;
-    let head_dim = u32::try_from(config.depthformer_dim / DEPTHFORMER_QUERY_HEADS)
+    let head_dim = u32::try_from(config.depthformer_dim / LFM25_DEPTHFORMER_QUERY_HEADS)
         .map_err(|_| Error::ModelLoadError("Depthformer head dimension exceeds u32".into()))?;
     let layers = (0..config.depthformer_layers)
         .map(|model_layer| {
@@ -313,6 +332,17 @@ mod tests {
                 LFM25_MAIN_SHORTCONV_STATE_DOMAIN
             ]
         );
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("audio state must use bounded invocation workspaces");
+        };
+        let workspace_domains = &profiles[0].stages[0].domains;
+        assert_eq!(workspace_domains.len(), 3);
+        assert_eq!(workspace_domains[0].id(), LFM25_MAIN_ATTENTION_STATE_DOMAIN);
+        assert_eq!(workspace_domains[1].id(), LFM25_MAIN_SHORTCONV_STATE_DOMAIN);
+        assert_eq!(
+            workspace_domains[2].id(),
+            StateDomainId::new(LFM25_DEPTHFORMER_STATE_DOMAIN.get() + 1)
+        );
     }
 
     #[test]
@@ -341,6 +371,24 @@ mod tests {
             .layers
             .iter()
             .all(|layer| layer.query_heads == 32 && layer.kv_heads == 8));
+        assert!(depthformer.layers.iter().all(|layer| {
+            layer.pattern == AttentionPattern::Full
+                && layer.mask == AttentionMask::Causal
+                && layer.key_head_dim == 2
+                && layer.value_head_dim == 2
+                && layer.key_encoding == KeyEncoding::Rotary { rotary_dim: 2 }
+        }));
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("audio state must use bounded invocation workspaces");
+        };
+        let InvocationWorkspaceDomain::State { capacity, .. } = &profiles[0].stages[0].domains[2]
+        else {
+            panic!("Depthformer workspace must be state");
+        };
+        assert_eq!(
+            *capacity,
+            InvocationStateCapacity::PagedTokens { max_tokens: 8 }
+        );
     }
 
     #[test]
@@ -356,5 +404,48 @@ mod tests {
         )
         .expect_err("invalid geometry must be rejected");
         assert!(error.to_string().contains("Depthformer geometry"));
+    }
+
+    #[test]
+    fn odd_depthformer_head_dimension_fails_closed() {
+        let stage = stage();
+        let mut decoder = decoder_config();
+        decoder.depthformer_dim = 96;
+        let error = lfm25_audio_physical_state_spec(
+            &main_config(),
+            &decoder,
+            Lfm25AudioStateMode::MainAndDepthformer,
+            &[&[stage]],
+        )
+        .expect_err("odd rotary head dimension must be rejected");
+        assert!(error.to_string().contains("Depthformer geometry"));
+    }
+
+    #[test]
+    fn non_scalar_or_multi_stage_graphs_fail_closed() {
+        let mut batched = stage();
+        batched.batch_mode = NativeBatchMode::Static;
+        batched.concurrency = ConcurrencyClass::Batchable;
+        batched.max_batch_size = 2;
+        let batched_error = lfm25_audio_physical_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioStateMode::MainOnly,
+            &[&[batched]],
+        )
+        .expect_err("native batching must be rejected");
+        assert!(batched_error.to_string().contains("scalar atomic"));
+
+        let first = stage();
+        let mut second = stage();
+        second.id = StageId::new(2);
+        let multi_error = lfm25_audio_physical_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioStateMode::MainOnly,
+            &[&[first, second]],
+        )
+        .expect_err("multi-stage ownership must be rejected");
+        assert!(multi_error.to_string().contains("one scalar"));
     }
 }

@@ -174,11 +174,11 @@ pub(crate) fn lfm2_physical_state_spec(
                 .map(|state| {
                     let (fixed_bytes, capacity) = match &state {
                         StateDomainSpec::PagedAttention(_) => (
-                            paged_invocation_bytes(&state, max_tokens)?,
+                            paged_f32_invocation_bytes(&state, max_tokens)?,
                             InvocationStateCapacity::PagedTokens { max_tokens },
                         ),
                         StateDomainSpec::Ring(_) => (
-                            ring_invocation_bytes(&state)?,
+                            ring_f32_invocation_bytes(&state)?,
                             InvocationStateCapacity::SemanticBounded,
                         ),
                         _ => {
@@ -371,7 +371,7 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+pub(crate) fn paged_f32_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
     let StateDomainSpec::PagedAttention(spec) = state else {
         return Err(Error::ModelLoadError(
             "LFM2 paged byte bound received non-paged state".into(),
@@ -410,7 +410,7 @@ pub(crate) fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -
         .ok_or_else(|| Error::ModelLoadError("LFM2 paged byte bound overflow".into()))
 }
 
-pub(crate) fn ring_invocation_bytes(state: &StateDomainSpec) -> Result<u64> {
+pub(crate) fn ring_f32_invocation_bytes(state: &StateDomainSpec) -> Result<u64> {
     let StateDomainSpec::Ring(spec) = state else {
         return Err(Error::ModelLoadError(
             "LFM2 ring byte bound received non-ring state".into(),
@@ -546,7 +546,7 @@ mod tests {
             layer.pattern == AttentionPattern::SlidingWindow { window_tokens: 8 }
         }));
         assert_eq!(
-            paged_invocation_bytes(&spec.invocation.domains[0], 17).unwrap(),
+            paged_f32_invocation_bytes(&spec.invocation.domains[0], 17).unwrap(),
             32_768
         );
         let StateDomainSpec::Ring(shortconv) = &spec.invocation.domains[1] else {
