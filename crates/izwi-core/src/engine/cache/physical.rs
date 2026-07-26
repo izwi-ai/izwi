@@ -809,7 +809,6 @@ fn retained_capacity_bytes(per_sequence_bytes: u64, sequence_capacity: u32) -> R
 fn validate_key(key: InvocationPhysicalKey) -> Result<()> {
     if key.adapter_instance.get() == 0
         || key.stage_graph.iter().all(|byte| *byte == 0)
-        || key.stage.get() == 0
         || key.domain.get() == 0
     {
         return Err(invalid("physical invocation key is incomplete"));
@@ -1328,6 +1327,19 @@ mod tests {
             stage: StageId::new(2),
             domain: StateDomainId::new(1),
         }
+    }
+
+    #[test]
+    fn invocation_key_accepts_the_canonical_scalar_stage_zero() {
+        let (plan, domain) = invocation_plan();
+        let mut scalar = key();
+        scalar.stage = StageId::new(0);
+        let model = ModelInstanceId::new(40);
+        let mut manager = PhysicalStateManager::cpu(None);
+        manager
+            .allocate_invocation_paged(model, scalar, &plan, &domain, 1)
+            .unwrap();
+        assert!(manager.unload_model(model).unwrap());
     }
 
     fn retained_tensor_contract(maximum_elements: u64) -> InferenceStateContract {
