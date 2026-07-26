@@ -13,10 +13,10 @@ use candle_core::{CpuStorage, DType, Device, DeviceLocation, Layout, Storage, Te
 use crate::backends::{backend_kind_for_device, BackendKind};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    InferenceStateContract, InvocationStateCapacity, InvocationWorkspaceDomain,
+    DomainStepIntent, InferenceStateContract, InvocationStateCapacity, InvocationWorkspaceDomain,
     ResolvedNonPagedDomainPlan, ResolvedPlacement, ResolvedStatePlan, ResolvedStaticAttentionPlan,
     StateDType, StateDomainId, StateDomainSpec, StateGroupId, StateScope, StateStorageFormat,
-    StaticAttentionDomainSpec, StaticAttentionLayerSpec, TensorPhysicalLayout,
+    StateUpdateKind, StaticAttentionDomainSpec, StaticAttentionLayerSpec, TensorPhysicalLayout,
 };
 
 use super::StateBackendRegistry;
@@ -274,6 +274,36 @@ impl InvocationStaticAttentionArena {
         self.install_with_copy_barrier(source_identity, layers, |_| Ok(()))
     }
 
+    pub(crate) fn install_from_intent(
+        &mut self,
+        intent: &DomainStepIntent,
+        layers: Vec<StaticAttentionLayerValue>,
+    ) -> Result<()> {
+        let StateUpdateKind::StaticInitialize {
+            source_identity,
+            components,
+        } = &intent.update
+        else {
+            return Err(invalid(
+                "static-attention installation requires a StaticInitialize intent",
+            ));
+        };
+        let memory_tokens = self.validate_install_values(&layers)?;
+        if intent.domain != self.domain
+            || intent.expected_cursor != 0
+            || intent.target_cursor
+                != u64::try_from(memory_tokens)
+                    .map_err(|_| invalid("static-attention memory length exceeds u64"))?
+            || source_identity.iter().all(|byte| *byte == 0)
+            || !components.is_empty()
+        {
+            return Err(invalid(
+                "static-attention installation does not match its authenticated intent",
+            ));
+        }
+        self.install(*source_identity, layers)
+    }
+
     /// Attend noncausally over the installed memory without expanding GQA KV
     /// heads. Queries are flattened as `[total_queries, query_heads, key_dim]`;
     /// rows must form a canonical, non-empty partition of that first axis.
@@ -328,6 +358,15 @@ impl InvocationStaticAttentionArena {
         self.absolute_cursor = 0;
         self.initialized = false;
         self.dirty = false;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_completion(&mut self) -> Result<()> {
+        self.require_clean()?;
+        if let Err(error) = self.device.synchronize() {
+            self.dirty = true;
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -1272,6 +1311,7 @@ mod tests {
     #[test]
     fn copy_failure_is_unobservable_until_reset_recovers_the_slot() {
         let mut arena = arena(vec![layer(0, 2, 2), layer(3, 2, 2)], 2);
+        arena.prepare_completion().unwrap();
         let first = values(0, &[1.0; 8], &[2.0; 8], 2, 2);
         let second = values(3, &[3.0; 8], &[4.0; 8], 2, 2);
         let error = arena
@@ -1285,6 +1325,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("injected copy failure"));
         assert!(arena.is_dirty());
+        assert!(arena.prepare_completion().is_err());
         assert!(arena.metadata().is_err());
         let queries = Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu).unwrap();
         assert!(arena
@@ -1299,6 +1340,7 @@ mod tests {
             )
             .is_err());
         arena.reset_for_reuse().unwrap();
+        arena.prepare_completion().unwrap();
         assert!(!arena.is_dirty());
         assert_eq!(arena.metadata().unwrap(), None);
         let (keys, values) = arena.layer_backing_values(0).unwrap();

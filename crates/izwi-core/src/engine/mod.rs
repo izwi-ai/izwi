@@ -45,8 +45,8 @@ pub(crate) use cache::invocation::{
 };
 #[allow(unused_imports)]
 pub(crate) use cache::invocation_tensor::{
-    InvocationTensorLease, InvocationTensorPoolHandle, InvocationTensorPoolId,
-    InvocationTensorPoolOwner, InvocationTensorSlotRef,
+    InvocationStaticAttentionLease, InvocationTensorLease, InvocationTensorPoolHandle,
+    InvocationTensorPoolId, InvocationTensorPoolOwner, InvocationTensorSlotRef,
 };
 
 #[cfg(test)]

@@ -10,13 +10,14 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use candle_core::Device;
+use candle_core::{Device, Tensor};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::backends::state::{
-    InvocationTensorArena, InvocationTensorChronologicalSegment, InvocationTensorDomainKind,
-    InvocationTensorSnapshot, InvocationTensorUpdateV2,
+    InvocationStaticAttentionArena, InvocationTensorArena, InvocationTensorChronologicalSegment,
+    InvocationTensorDomainKind, InvocationTensorSnapshot, InvocationTensorUpdateV2,
+    StaticAttentionLayerValue, StaticAttentionMetadata, StaticAttentionRaggedRow,
 };
 use crate::backends::BackendKind;
 use crate::engine::ModelInstanceId;
@@ -88,6 +89,38 @@ impl InvocationSlotArena for InvocationTensorArena {
     }
 }
 
+impl slot_arena_sealed::Sealed for InvocationStaticAttentionArena {}
+
+impl InvocationSlotArena for InvocationStaticAttentionArena {
+    fn plan(&self) -> &ResolvedStatePlan {
+        InvocationStaticAttentionArena::plan(self)
+    }
+
+    fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
+        InvocationStaticAttentionArena::workspace_domain(self)
+    }
+
+    fn domain(&self) -> StateDomainId {
+        InvocationStaticAttentionArena::domain(self)
+    }
+
+    fn backing_kind(&self) -> InvocationStateBackingKindV2 {
+        InvocationStateBackingKindV2::StaticAttention
+    }
+
+    fn maximum_bytes(&self) -> u64 {
+        InvocationStaticAttentionArena::maximum_bytes(self)
+    }
+
+    fn reset_for_reuse(&mut self) -> Result<()> {
+        InvocationStaticAttentionArena::reset_for_reuse(self)
+    }
+
+    fn prepare_completion(&mut self) -> Result<()> {
+        InvocationStaticAttentionArena::prepare_completion(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct InvocationSlotPoolId {
     pub(crate) plan: StatePlanId,
@@ -128,6 +161,8 @@ pub(crate) struct InvocationSlotPoolOwner<A: InvocationSlotArena> {
 }
 
 pub(crate) type InvocationTensorPoolOwner = InvocationSlotPoolOwner<InvocationTensorArena>;
+pub(crate) type InvocationStaticAttentionPoolOwner =
+    InvocationSlotPoolOwner<InvocationStaticAttentionArena>;
 
 #[derive(Debug)]
 pub(crate) struct InvocationSlotPoolHandle<A: InvocationSlotArena> {
@@ -138,6 +173,8 @@ pub(crate) struct InvocationSlotPoolHandle<A: InvocationSlotArena> {
 }
 
 pub(crate) type InvocationTensorPoolHandle = InvocationSlotPoolHandle<InvocationTensorArena>;
+pub(crate) type InvocationStaticAttentionPoolHandle =
+    InvocationSlotPoolHandle<InvocationStaticAttentionArena>;
 
 impl<A: InvocationSlotArena> Clone for InvocationSlotPoolHandle<A> {
     fn clone(&self) -> Self {
@@ -244,6 +281,43 @@ impl InvocationSlotPoolOwner<InvocationTensorArena> {
         let mut arenas = Vec::with_capacity(slot_count_usize);
         for _ in 0..slot_count_usize {
             arenas.push(InvocationTensorArena::new(
+                contract,
+                plan.clone(),
+                workspace_domain.clone(),
+                device.clone(),
+            )?);
+        }
+        Self::from_arenas(
+            plan.as_ref(),
+            workspace_domain,
+            model_instance,
+            allocation_generation,
+            arenas,
+        )
+    }
+}
+
+impl InvocationSlotPoolOwner<InvocationStaticAttentionArena> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        contract: &InferenceStateContract,
+        plan: Arc<ResolvedStatePlan>,
+        workspace_domain: InvocationWorkspaceDomain,
+        device: Device,
+        model_instance: ModelInstanceId,
+        slot_count: u32,
+        allocation_generation: u32,
+    ) -> Result<Self> {
+        if model_instance.get() == 0 || slot_count == 0 || allocation_generation == 0 {
+            return Err(invalid(
+                "invocation static-attention pool requires non-zero model, slot, and allocation identities",
+            ));
+        }
+        let slot_count_usize = usize::try_from(slot_count)
+            .map_err(|_| invalid("invocation static-attention slot count exceeds usize"))?;
+        let mut arenas = Vec::with_capacity(slot_count_usize);
+        for _ in 0..slot_count_usize {
+            arenas.push(InvocationStaticAttentionArena::new(
                 contract,
                 plan.clone(),
                 workspace_domain.clone(),
@@ -492,6 +566,8 @@ pub(crate) struct InvocationSlotLease<A: InvocationSlotArena> {
 }
 
 pub(crate) type InvocationTensorLease = InvocationSlotLease<InvocationTensorArena>;
+pub(crate) type InvocationStaticAttentionLease =
+    InvocationSlotLease<InvocationStaticAttentionArena>;
 
 impl<A: InvocationSlotArena> std::fmt::Debug for InvocationSlotLease<A> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -566,6 +642,31 @@ impl InvocationSlotLease<InvocationTensorArena> {
         &self,
     ) -> Result<Vec<InvocationTensorChronologicalSegment>> {
         self.arena()?.read_chronological_segments()
+    }
+}
+
+impl InvocationSlotLease<InvocationStaticAttentionArena> {
+    pub(crate) fn install(
+        &mut self,
+        intent: &DomainStepIntent,
+        layers: Vec<StaticAttentionLayerValue>,
+    ) -> Result<()> {
+        self.arena_mut()?.install_from_intent(intent, layers)
+    }
+
+    pub(crate) fn attend(
+        &self,
+        model_layer: u32,
+        queries: &Tensor,
+        rows: &[StaticAttentionRaggedRow],
+        softmax_scale: f32,
+    ) -> Result<Tensor> {
+        self.arena()?
+            .attend(model_layer, queries, rows, softmax_scale)
+    }
+
+    pub(crate) fn metadata(&self) -> Result<Option<StaticAttentionMetadata>> {
+        self.arena()?.metadata()
     }
 }
 
@@ -996,8 +1097,8 @@ mod tests {
         InferenceStateContract, InvocationStateCapacity, PlacementPolicy, PrefixPolicy, ShapeAxis,
         ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock, StateComponentId, StateDType,
         StateDomainHeader, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
-        StateUpdateKind, TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
-        CURRENT_INFERENCE_STATE_ABI,
+        StateUpdateKind, StaticAttentionDomainSpec, StaticAttentionLayerSpec, TensorComponentSpec,
+        TensorRole, TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
     };
 
     #[derive(Debug)]
@@ -1095,6 +1196,44 @@ mod tests {
             },
             components: vec![component(max)],
         })
+    }
+
+    fn static_attention_state(id: u32, max_memory_tokens: u64) -> StateDomainSpec {
+        StateDomainSpec::StaticAttention(StaticAttentionDomainSpec {
+            header: StateDomainHeader {
+                id: StateDomainId::new(id),
+                scope: StateScope::Invocation,
+                clock: StateClock::EncoderTokens,
+                placement: PlacementPolicy::BackendLocal,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::None,
+            },
+            layers: vec![StaticAttentionLayerSpec {
+                model_layer: 0,
+                query_heads: 4,
+                kv_heads: 2,
+                key_head_dim: 2,
+                value_head_dim: 2,
+                key_encoding: crate::kv::v2::KeyEncoding::Raw,
+            }],
+            max_memory_tokens,
+            accepted_dtypes: vec![StateDType::F32],
+        })
+    }
+
+    fn static_attention_values(memory_tokens: usize) -> Vec<StaticAttentionLayerValue> {
+        let elements = memory_tokens * 2 * 2;
+        let keys = (0..elements)
+            .map(|index| (index + 1) as f32 / elements as f32)
+            .collect::<Vec<_>>();
+        let values = (0..elements)
+            .map(|index| (index + 1) as f32)
+            .collect::<Vec<_>>();
+        vec![StaticAttentionLayerValue {
+            model_layer: 0,
+            keys: Tensor::from_vec(keys, (memory_tokens, 2, 2), &Device::Cpu).unwrap(),
+            values: Tensor::from_vec(values, (memory_tokens, 2, 2), &Device::Cpu).unwrap(),
+        }]
     }
 
     fn contract(state: StateDomainSpec) -> InferenceStateContract {
@@ -1241,6 +1380,83 @@ mod tests {
             held.components[0].tensor.to_vec1::<f32>().unwrap(),
             vec![1.0, 2.0]
         );
+    }
+
+    #[test]
+    fn static_attention_pool_authenticates_install_attends_and_reuses_exact_slots() {
+        let contract = contract(static_attention_state(1, 2));
+        let (plan, workspace) = plan_and_workspace(&contract, StateDomainId::new(1));
+        let per_slot_bytes = plan.non_paged[0].maximum_bytes();
+        let owner = InvocationStaticAttentionPoolOwner::new(
+            &contract,
+            plan,
+            workspace,
+            Device::Cpu,
+            ModelInstanceId::new(15),
+            2,
+            27,
+        )
+        .unwrap();
+        assert_eq!(owner.maximum_bytes(), per_slot_bytes * 2);
+        let backing = owner.backing();
+        let mut physical = backing.lease().unwrap();
+        let lease = physical
+            .as_any_mut()
+            .downcast_mut::<InvocationStaticAttentionLease>()
+            .unwrap();
+        let mismatched = DomainStepIntent {
+            domain: StateDomainId::new(1),
+            expected_cursor: 0,
+            target_cursor: 1,
+            update: StateUpdateKind::StaticInitialize {
+                source_identity: [7; 32],
+                components: vec![],
+            },
+        };
+        assert!(lease
+            .install(&mismatched, static_attention_values(2))
+            .is_err());
+        assert_eq!(lease.metadata().unwrap(), None);
+
+        let intent = DomainStepIntent {
+            target_cursor: 2,
+            ..mismatched
+        };
+        lease.install(&intent, static_attention_values(2)).unwrap();
+        assert_eq!(
+            lease.metadata().unwrap(),
+            Some(StaticAttentionMetadata {
+                source_identity: [7; 32],
+                absolute_cursor: 2,
+            })
+        );
+        let queries = Tensor::from_slice(
+            &[1.0_f32, 0.0, 0.5, 0.5, 0.0, 1.0, -0.5, 0.5],
+            (1, 4, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let output = lease
+            .attend(
+                0,
+                &queries,
+                &[StaticAttentionRaggedRow {
+                    query_start: 0,
+                    query_len: 1,
+                }],
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(output.dims(), &[1, 4, 2]);
+
+        let completion = physical.complete().unwrap();
+        backing.authenticate_completion(&completion).unwrap();
+        assert!(backing.authenticate_completion(&completion).is_err());
+        drop(physical);
+        let reused = owner.lease().unwrap();
+        assert_eq!(reused.metadata().unwrap(), None);
+        drop(reused);
+        owner.close_and_drain().unwrap();
     }
 
     #[test]
