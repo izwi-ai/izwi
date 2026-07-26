@@ -204,7 +204,7 @@ impl VibeVoiceAsrModel {
             &self.language_model,
             self.dtype,
             default_kv_page_size(),
-            &[CacheDomainId::new(0)],
+            &[CacheDomainId::new(1)],
             &tokenizer_domains,
         )?;
         let max_context_tokens = self

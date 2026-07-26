@@ -205,7 +205,7 @@ impl VoxtralTtsModel {
             &pipeline.language_model,
             self.dtype_plan.language_model,
             default_kv_page_size(),
-            &[CacheDomainId::new(0)],
+            &[CacheDomainId::new(1)],
         )?;
         let max_context_tokens = pipeline
             .language_model

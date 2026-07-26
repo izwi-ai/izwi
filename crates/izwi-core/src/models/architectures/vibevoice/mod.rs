@@ -7,15 +7,14 @@ use candle_core::DType;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
-    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
-    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, ShapeAxis,
-    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
-    StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec,
-    TensorRole, TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy,
+    PrefixPolicy, RetainedStateCapability, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
-use crate::kv::{CacheDomainId, KvCacheContract};
 use crate::models::architectures::qwen3::core::Qwen3Model;
 use crate::models::architectures::vibevoice::tokenizer::VibeVoiceTokenizerStateComponentGeometry;
 
@@ -82,7 +81,7 @@ pub(crate) fn vibevoice_invocation_contract(
     model: &Qwen3Model,
     dtype: DType,
     preferred_page_tokens: usize,
-    domains: &[CacheDomainId],
+    domains: &[StateDomainId],
     tokenizer_domains: &[VibeVoiceTokenizerStateDomain],
 ) -> Result<InferenceStateContract> {
     if domains.is_empty() {
@@ -90,25 +89,27 @@ pub(crate) fn vibevoice_invocation_contract(
             "VibeVoice invocation state has no cache domains".into(),
         ));
     }
-    let mut legacy_domains = Vec::with_capacity(domains.len());
+    let mut state_domains = Vec::with_capacity(domains.len());
+    let mut groups = Vec::with_capacity(domains.len());
     for domain in domains {
-        let contract = model.managed_kv_cache_contract(*domain, dtype, preferred_page_tokens)?;
-        legacy_domains.extend(contract.domains);
+        let contract =
+            model.managed_inference_state_contract(*domain, dtype, preferred_page_tokens)?;
+        state_domains.extend(contract.domains);
+        groups.extend(contract.groups);
     }
-    let legacy = KvCacheContract {
-        abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
-        domains: legacy_domains,
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: state_domains,
+        groups,
     };
-    vibevoice_invocation_contract_from_legacy(&legacy, dtype, tokenizer_domains)
+    vibevoice_invocation_contract_from_state(contract, dtype, tokenizer_domains)
 }
 
-fn vibevoice_invocation_contract_from_legacy(
-    legacy: &KvCacheContract,
+fn vibevoice_invocation_contract_from_state(
+    mut contract: InferenceStateContract,
     dtype: DType,
     tokenizer_domains: &[VibeVoiceTokenizerStateDomain],
 ) -> Result<InferenceStateContract> {
-    legacy.validate()?;
-    let mut contract = upgrade_kv_contract_v1(legacy)?;
     for domain in &mut contract.domains {
         let StateDomainSpec::PagedAttention(domain) = domain else {
             return Err(Error::ModelLoadError(
@@ -435,8 +436,8 @@ mod tests {
         ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
         StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
     };
+    use crate::kv::v2::PositionSemantics;
     use crate::kv::v2::{StateDomainId, StateGroupId};
-    use crate::kv::{CacheTokenAxis, KvDomainSpec, KvPrefixSemantics, PositionSemantics};
     use crate::models::architectures::qwen3::core::{
         qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
     };
@@ -464,12 +465,13 @@ mod tests {
         }
     }
 
-    fn legacy_contract(domain_count: u32, dtype: DType) -> KvCacheContract {
-        let domains = (0..domain_count)
+    fn state_contract(domain_count: u32, dtype: DType) -> InferenceStateContract {
+        let domains = (1..=domain_count)
             .map(|domain| {
+                let id = StateDomainId::new(domain);
                 qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-                    domain: CacheDomainId::new(domain),
-                    token_axis: CacheTokenAxis::DecoderTokens,
+                    domain: id,
+                    clock: StateClock::DecoderTokens,
                     num_layers: 2,
                     num_query_heads: 4,
                     num_kv_heads: 2,
@@ -478,23 +480,31 @@ mod tests {
                     sliding_window: None,
                     storage_dtype: dtype,
                     preferred_page_tokens: 16,
-                    prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+                    prefix: PrefixPolicy::CommittedPages {
                         positions: PositionSemantics::Absolute,
                     },
                 })
-                .map(KvDomainSpec::PagedAttention)
+                .map(|domain| (id, StateDomainSpec::PagedAttention(domain)))
             })
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        KvCacheContract {
-            abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
-            domains,
+        InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: domains.iter().map(|(_, domain)| domain.clone()).collect(),
+            groups: domains
+                .iter()
+                .map(|(id, _)| StateGroupSpec {
+                    id: StateGroupId::new(id.get()),
+                    domains: vec![*id],
+                    prefix_shareable: true,
+                })
+                .collect(),
         }
     }
 
     fn invocation_contract(domain_count: u32) -> InferenceStateContract {
-        vibevoice_invocation_contract_from_legacy(
-            &legacy_contract(domain_count, DType::F32),
+        vibevoice_invocation_contract_from_state(
+            state_contract(domain_count, DType::F32),
             DType::F32,
             &[],
         )
@@ -598,8 +608,8 @@ mod tests {
             tokenizer_domain(2, 2, StateClock::AudioSamples, &[(2, 3), (4, 5)]),
             tokenizer_domain(3, 2, StateClock::AudioSamples, &[(6, 7)]),
         ];
-        let contract = vibevoice_invocation_contract_from_legacy(
-            &legacy_contract(1, DType::F32),
+        let contract = vibevoice_invocation_contract_from_state(
+            state_contract(1, DType::F32),
             DType::F32,
             &tokenizer,
         )
@@ -664,8 +674,8 @@ mod tests {
             tokenizer_domain(3, 3, StateClock::CodecFrames, &[(2, 3)]),
             tokenizer_domain(4, 3, StateClock::CodecFrames, &[(4, 5)]),
         ];
-        let contract = vibevoice_invocation_contract_from_legacy(
-            &legacy_contract(2, DType::F32),
+        let contract = vibevoice_invocation_contract_from_state(
+            state_contract(2, DType::F32),
             DType::F32,
             &tokenizer,
         )
@@ -708,8 +718,8 @@ mod tests {
             StateClock::CodecFrames,
             &[(2, 3), (4, 5)],
         )];
-        let contract = vibevoice_invocation_contract_from_legacy(
-            &legacy_contract(1, DType::F16),
+        let contract = vibevoice_invocation_contract_from_state(
+            state_contract(1, DType::F16),
             DType::F16,
             &tokenizer,
         )

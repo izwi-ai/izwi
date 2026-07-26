@@ -1637,15 +1637,15 @@ impl LoadedModelBundle {
 mod tests {
     use super::*;
     use crate::engine::{EngineCore, EngineCoreConfig};
-    use crate::kv::CacheCapability;
+    use crate::kv::InferenceStateCapability;
     use crate::runtime::adapters::ExecutionTargetKind;
 
     #[test]
     fn managed_qwen_publication_seals_a_physical_v2_runtime() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(8);
-        let legacy_contract = crate::kv::test_contract();
-        let capability = CacheCapability::Managed(legacy_contract.clone());
+        let state_contract = crate::kv::test_contract();
+        let capability = InferenceStateCapability::Managed(state_contract.clone());
         let mut core = EngineCore::new(EngineCoreConfig {
             max_blocks: 4,
             block_size: 32,
@@ -1665,7 +1665,7 @@ mod tests {
             HashMap::from([(
                 CapabilityKind::Chat,
                 LoadedStatePublication::ManagedV2 {
-                    contract: crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).unwrap(),
+                    contract: state_contract,
                     physical: physical.clone(),
                 },
             )]),
@@ -1720,7 +1720,7 @@ mod tests {
     fn sealed_adapter_bundle_does_not_pin_an_idle_physical_generation() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(80);
-        let legacy_contract = crate::kv::test_contract();
+        let state_contract = crate::kv::test_contract();
         let mut core = EngineCore::new(EngineCoreConfig {
             max_blocks: 4,
             block_size: 32,
@@ -1730,7 +1730,7 @@ mod tests {
         let physical = core
             .load_managed_model_cache(
                 model_instance,
-                &CacheCapability::Managed(legacy_contract.clone()),
+                &InferenceStateCapability::Managed(state_contract.clone()),
             )
             .unwrap()
             .expect("physical managed runtime");
@@ -1743,7 +1743,7 @@ mod tests {
             HashMap::from([(
                 CapabilityKind::Chat,
                 LoadedStatePublication::ManagedV2 {
-                    contract: crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).unwrap(),
+                    contract: state_contract,
                     physical: physical.clone(),
                 },
             )]),
@@ -1768,8 +1768,8 @@ mod tests {
     fn qwen_asr_rejects_retained_only_publication() {
         let registry = RuntimeAdapterRegistry::built_in();
         let model_instance = ModelInstanceId::new(81);
-        let legacy_contract = crate::kv::test_contract();
-        let capability = CacheCapability::Managed(legacy_contract.clone());
+        let state_contract = crate::kv::test_contract();
+        let capability = InferenceStateCapability::Managed(state_contract.clone());
         let mut core = EngineCore::new(EngineCoreConfig {
             max_blocks: 4,
             block_size: 32,
@@ -1789,7 +1789,7 @@ mod tests {
             HashMap::from([(
                 CapabilityKind::Asr,
                 LoadedStatePublication::ManagedV2 {
-                    contract: crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).unwrap(),
+                    contract: state_contract,
                     physical,
                 },
             )]),

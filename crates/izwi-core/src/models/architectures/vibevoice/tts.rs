@@ -329,7 +329,7 @@ impl VibeVoiceTtsModel {
             &self.language_model,
             self.dtype,
             default_kv_page_size(),
-            &[CacheDomainId::new(0), CacheDomainId::new(1)],
+            &[CacheDomainId::new(1), CacheDomainId::new(2)],
             &tokenizer_domains,
         )?;
         let max_context_tokens = self

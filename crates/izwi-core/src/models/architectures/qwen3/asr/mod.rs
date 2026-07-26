@@ -24,15 +24,12 @@ use crate::engine::{StageDescriptor, StageProgressKind};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kv::v2::{
-    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
-    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
-    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PrefixPolicy,
-    RetainedStateCapability, StateDType, StateDomainSpec, StateScope, WorkspaceFormula,
-    CURRENT_INFERENCE_STATE_ABI,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InvocationLeaseScope,
+    InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceDomain,
+    InvocationWorkspaceProfile, InvocationWorkspaceSet, PrefixPolicy, RetainedStateCapability,
+    StateDType, StateDomainSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
-use crate::kv::{
-    CacheCapability, CacheDomainId, KvCacheContractProvider, KvDomainSpec, KvPrefixSemantics,
-};
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     qwen3_runtime_profile_delta, qwen3_runtime_profile_snapshot, qwen3_runtime_profiling_enabled,
@@ -84,7 +81,6 @@ pub struct Qwen3AsrModel {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrPhysicalStateSpec {
-    pub(crate) retained_v1: crate::kv::KvCacheContract,
     pub(crate) retained: crate::kv::v2::InferenceStateContract,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: crate::kv::v2::InferenceStateContract,
@@ -95,16 +91,22 @@ impl Qwen3AsrModel {
     ///
     /// This is kept separate from the advertised loaded-model capability until
     /// the ASR engine route supplies its transaction-owned reservation.
-    pub(crate) fn managed_kv_cache_contract(&self) -> Result<crate::kv::KvCacheContract> {
-        let mut contract = self.text_model.managed_kv_cache_contract(
-            CacheDomainId::new(0),
+    pub(crate) fn managed_inference_state_contract(
+        &self,
+    ) -> Result<crate::kv::v2::InferenceStateContract> {
+        let mut contract = self.text_model.managed_inference_state_contract(
+            crate::kv::v2::StateDomainId::new(1),
             self.text_dtype,
             default_kv_page_size(),
         )?;
         for domain in &mut contract.domains {
-            if let KvDomainSpec::PagedAttention(domain) = domain {
-                domain.prefix_semantics = KvPrefixSemantics::Disabled;
+            if let StateDomainSpec::PagedAttention(domain) = domain {
+                domain.header.prefix = PrefixPolicy::Disabled;
+                domain.header.checkpoint = CheckpointPolicy::Transactional;
             }
+        }
+        for group in &mut contract.groups {
+            group.prefix_shareable = false;
         }
         contract.validate()?;
         Ok(contract)
@@ -132,12 +134,16 @@ impl Qwen3AsrModel {
                     .to_string(),
             )
         })?;
-        qwen3_asr_physical_state_spec(&self.managed_kv_cache_contract()?, max_tokens, stage_graphs)
+        qwen3_asr_physical_state_spec(
+            &self.managed_inference_state_contract()?,
+            max_tokens,
+            stage_graphs,
+        )
     }
 }
 
 fn qwen3_asr_physical_state_spec(
-    retained_v1: &crate::kv::KvCacheContract,
+    retained: &crate::kv::v2::InferenceStateContract,
     max_tokens: usize,
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<Qwen3AsrPhysicalStateSpec> {
@@ -154,7 +160,6 @@ fn qwen3_asr_physical_state_spec(
         ));
     }
 
-    let retained = upgrade_kv_contract_v1(retained_v1)?;
     let mut invocation_contract = retained.clone();
     let StateDomainSpec::PagedAttention(invocation_domain) = &mut invocation_contract.domains[0]
     else {
@@ -231,8 +236,7 @@ fn qwen3_asr_physical_state_spec(
         descriptor.validate_against_stages(stages)?;
     }
     Ok(Qwen3AsrPhysicalStateSpec {
-        retained_v1: retained_v1.clone(),
-        retained,
+        retained: retained.clone(),
         descriptor,
         invocation: invocation_contract,
     })
@@ -281,9 +285,11 @@ fn qwen3_asr_invocation_workspace_bytes(domain: &StateDomainSpec, max_tokens: u6
         })
 }
 
-impl KvCacheContractProvider for Qwen3AsrModel {
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
-        Ok(CacheCapability::Managed(self.managed_kv_cache_contract()?))
+impl InferenceStateContractProvider for Qwen3AsrModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        Ok(InferenceStateCapability::Managed(
+            self.managed_inference_state_contract()?,
+        ))
     }
 }
 

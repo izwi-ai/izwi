@@ -20,7 +20,7 @@ use crate::kv::v2::{
     RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2, StateDomainId,
     StateDomainSpec, StateScope,
 };
-use crate::kv::KvCacheContractProvider;
+use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::runtime::adapters::{CapabilityKind, LoadedExecutionContract, LoadedStatePublication};
 use crate::runtime::lifecycle::controller::{
@@ -641,10 +641,10 @@ impl ModelLifecycleController {
                         .await?;
                     state_publications.insert(CapabilityKind::Chat, publication);
                 } else {
-                    let loaded_cache = loaded.kv_cache_contract()?;
+                    let loaded_cache = loaded.inference_state_contract()?;
                     loaded_cache.validate()?;
                     let publication = match &loaded_cache {
-                        crate::kv::CacheCapability::Managed(contract) => {
+                        crate::kv::InferenceStateCapability::Managed(contract) => {
                             if !managed_kv_backend_compiled(backend) {
                                 return Err(Error::ModelLoadError(format!(
                                     "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
@@ -655,7 +655,7 @@ impl ModelLifecycleController {
                                 .load_managed_model_cache(model_instance_id, &loaded_cache)
                                 .await?;
                             Some(LoadedStatePublication::ManagedV2 {
-                                contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
+                                contract: contract.clone(),
                                 physical: physical.ok_or_else(|| {
                                     Error::ModelLoadError(
                                         "managed state allocation returned no physical runtime"
@@ -664,7 +664,7 @@ impl ModelLifecycleController {
                                 })?,
                             })
                         }
-                        crate::kv::CacheCapability::Stateless => None,
+                        crate::kv::InferenceStateCapability::Stateless => None,
                     };
                     if let Some(publication) = publication {
                         state_publications.insert(CapabilityKind::Chat, publication);
@@ -744,7 +744,7 @@ impl ModelLifecycleController {
                         .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
                 } else if let Some(loaded) = self.model_registry.get_asr(variant).await {
-                    let loaded_cache = loaded.kv_cache_contract()?;
+                    let loaded_cache = loaded.inference_state_contract()?;
                     loaded_cache.validate()?;
                     let publication_route = loaded_asr_state_publication_route(variant);
                     if publication_route == LoadedAsrStatePublicationRoute::Qwen3 {
@@ -763,7 +763,6 @@ impl ModelLifecycleController {
                             .core_engine
                             .load_managed_model_state(
                                 model_instance_id,
-                                &physical_spec.retained_v1,
                                 &physical_spec.retained,
                             )
                             .await?;
@@ -893,7 +892,9 @@ impl ModelLifecycleController {
                             )
                             .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);
-                    } else if let crate::kv::CacheCapability::Managed(contract) = &loaded_cache {
+                    } else if let crate::kv::InferenceStateCapability::Managed(contract) =
+                        &loaded_cache
+                    {
                         return Err(Error::ModelLoadError(format!(
                             "loaded non-Qwen ASR model {variant} still publishes legacy managed state with {} domains",
                             contract.domains.len()
@@ -1048,7 +1049,6 @@ impl ModelLifecycleController {
                         .core_engine
                         .load_managed_model_state(
                             model_instance_id,
-                            &physical_spec.retained_v1,
                             &physical_spec.retained,
                         )
                         .await?;

@@ -19,12 +19,13 @@ use crate::backends::kv::KvArena;
 use crate::backends::kv::{KvSlotMap, KvWriteArgs, KvWriteCompletionCollector, PagedKvDecodeArgs};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
-use crate::kv::{
-    AttentionSemantics, CacheDomainId, CacheTokenAxis, KeyEncoding, KvCacheContract,
-    KvDecodeBatchMetadata, KvDomainSpec, KvPrefixSemantics, KvStorageDType, KvStorageRequest,
-    PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    CURRENT_KV_CONTRACT_ABI,
+use crate::kv::v2::{
+    AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
+    PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy,
+    PrefixPolicy, StateClock, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
+    StateGroupId, StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
+use crate::kv::KvDecodeBatchMetadata;
 #[cfg(test)]
 use crate::kv::{CacheBlockRef, KvLayerBinding};
 use crate::models::shared::attention::batched::{
@@ -113,8 +114,8 @@ impl Qwen3Config {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3DecoderCacheGeometry {
-    pub domain: CacheDomainId,
-    pub token_axis: CacheTokenAxis,
+    pub domain: StateDomainId,
+    pub clock: StateClock,
     pub num_layers: usize,
     pub num_query_heads: usize,
     pub num_kv_heads: usize,
@@ -123,7 +124,7 @@ pub(crate) struct Qwen3DecoderCacheGeometry {
     pub sliding_window: Option<usize>,
     pub storage_dtype: DType,
     pub preferred_page_tokens: usize,
-    pub prefix_semantics: KvPrefixSemantics,
+    pub prefix: PrefixPolicy,
 }
 
 pub(crate) fn qwen3_decoder_cache_domain(
@@ -143,16 +144,16 @@ pub(crate) fn qwen3_decoder_cache_domain(
         .map_err(|_| Error::InvalidInput("Qwen3 page size exceeds u32".into()))?;
     let max_page_tokens = preferred.max(256);
     let attention = match geometry.sliding_window {
-        Some(window_tokens) => AttentionSemantics::SlidingWindow {
+        Some(window_tokens) => AttentionPattern::SlidingWindow {
             window_tokens: u32::try_from(window_tokens)
                 .map_err(|_| Error::InvalidInput("Qwen3 sliding window exceeds u32".into()))?,
         },
-        None => AttentionSemantics::Full,
+        None => AttentionPattern::Full,
     };
     let storage_dtype = match geometry.storage_dtype {
-        DType::F32 => KvStorageDType::F32,
-        DType::F16 => KvStorageDType::F16,
-        DType::BF16 => KvStorageDType::Bf16,
+        DType::F32 => StateDType::F32,
+        DType::F16 => StateDType::F16,
+        DType::BF16 => StateDType::Bf16,
         dtype => {
             return Err(Error::InvalidInput(format!(
                 "Qwen3 managed KV does not support {dtype:?} storage"
@@ -163,31 +164,38 @@ pub(crate) fn qwen3_decoder_cache_domain(
     let layers = (0..num_layers)
         .map(|model_layer| PagedAttentionLayerSpec {
             model_layer,
-            num_query_heads,
-            num_kv_heads,
+            query_heads: num_query_heads,
+            kv_heads: num_kv_heads,
             key_head_dim,
             value_head_dim,
-            attention,
+            pattern: attention,
+            mask: AttentionMask::Causal,
             key_encoding: KeyEncoding::Rotary {
                 rotary_dim: key_head_dim,
             },
         })
         .collect();
     Ok(PagedAttentionDomainSpec {
-        id: geometry.domain,
-        token_axis: geometry.token_axis,
+        header: StateDomainHeader {
+            id: geometry.domain,
+            scope: StateScope::Retained,
+            clock: geometry.clock,
+            placement: PlacementPolicy::BackendLocalWithHostOffload,
+            checkpoint: if matches!(geometry.prefix, PrefixPolicy::Disabled) {
+                CheckpointPolicy::Transactional
+            } else {
+                CheckpointPolicy::CopyOnWrite
+            },
+            prefix: geometry.prefix,
+        },
         layers,
-        page_tokens: PageTokenConstraint {
-            min: 1,
-            preferred,
-            max: max_page_tokens,
+        page_size: PageSizeConstraint {
+            min_tokens: 1,
+            preferred_tokens: preferred,
+            max_tokens: max_page_tokens,
             multiple_of: 1,
         },
-        storage: KvStorageRequest {
-            dtypes: vec![storage_dtype],
-            allow_quantized: false,
-        },
-        prefix_semantics: geometry.prefix_semantics,
+        accepted_dtypes: vec![storage_dtype],
     })
 }
 
@@ -2493,15 +2501,15 @@ impl Qwen3Model {
         self.cfg.sliding_window().is_none()
     }
 
-    pub(crate) fn managed_kv_cache_contract(
+    pub(crate) fn managed_inference_state_contract(
         &self,
-        domain: CacheDomainId,
+        domain: StateDomainId,
         storage_dtype: DType,
         preferred_page_tokens: usize,
-    ) -> Result<KvCacheContract> {
+    ) -> Result<InferenceStateContract> {
         let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
             domain,
-            token_axis: CacheTokenAxis::DecoderTokens,
+            clock: StateClock::DecoderTokens,
             num_layers: self.cfg.num_hidden_layers,
             num_query_heads: self.cfg.num_attention_heads,
             num_kv_heads: self.cfg.num_key_value_heads,
@@ -2510,13 +2518,18 @@ impl Qwen3Model {
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
-            prefix_semantics: KvPrefixSemantics::CommittedFullPages {
-                positions: crate::kv::PositionSemantics::Absolute,
+            prefix: PrefixPolicy::CommittedPages {
+                positions: crate::kv::v2::PositionSemantics::Absolute,
             },
         })?;
-        let contract = KvCacheContract {
-            abi: CURRENT_KV_CONTRACT_ABI,
-            domains: vec![KvDomainSpec::PagedAttention(cache_domain)],
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::PagedAttention(cache_domain)],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(domain.get()),
+                domains: vec![domain],
+                prefix_shareable: true,
+            }],
         };
         contract.validate()?;
         Ok(contract)
@@ -3340,8 +3353,8 @@ mod tests {
     #[test]
     fn cache_domain_is_derived_from_loaded_qwen3_geometry() {
         let domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-            domain: CacheDomainId::new(4),
-            token_axis: CacheTokenAxis::DecoderTokens,
+            domain: StateDomainId::new(4),
+            clock: StateClock::DecoderTokens,
             num_layers: 3,
             num_query_heads: 12,
             num_kv_heads: 4,
@@ -3350,16 +3363,16 @@ mod tests {
             sliding_window: Some(1024),
             storage_dtype: DType::BF16,
             preferred_page_tokens: 32,
-            prefix_semantics: KvPrefixSemantics::Disabled,
+            prefix: PrefixPolicy::Disabled,
         })
         .unwrap();
         assert_eq!(domain.layers.len(), 3);
-        assert_eq!(domain.layers[2].num_query_heads, 12);
-        assert_eq!(domain.layers[2].num_kv_heads, 4);
+        assert_eq!(domain.layers[2].query_heads, 12);
+        assert_eq!(domain.layers[2].kv_heads, 4);
         assert_eq!(domain.layers[2].key_head_dim, 80);
         assert_eq!(domain.layers[2].value_head_dim, 64);
-        assert_eq!(domain.storage.dtypes, vec![KvStorageDType::Bf16]);
-        assert_eq!(domain.page_tokens.preferred, 32);
+        assert_eq!(domain.accepted_dtypes, vec![StateDType::Bf16]);
+        assert_eq!(domain.page_size.preferred_tokens, 32);
     }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {

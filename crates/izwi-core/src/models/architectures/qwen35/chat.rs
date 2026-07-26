@@ -16,7 +16,8 @@ use crate::backends::state::{
 };
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
-use crate::kv::{CacheCapability, KvCacheContract, KvCacheContractProvider};
+use crate::kv::v2::InferenceStateContract;
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -411,13 +412,13 @@ pub struct Qwen35ChatModel {
     vision_model: Qwen35VisionModel,
 }
 
-impl KvCacheContractProvider for Qwen35ChatModel {
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+impl InferenceStateContractProvider for Qwen35ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         let dtype = match self.device_kind {
             BackendKind::Cuda => DType::F16,
             BackendKind::Cpu | BackendKind::Metal => DType::F32,
         };
-        Ok(CacheCapability::Managed(
+        Ok(InferenceStateCapability::Managed(
             self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
         ))
     }
@@ -500,7 +501,7 @@ impl Qwen35ChatModel {
         &self,
         attention_dtype: DType,
         preferred_page_tokens: usize,
-    ) -> Result<KvCacheContract> {
+    ) -> Result<InferenceStateContract> {
         qwen35_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
     }
 

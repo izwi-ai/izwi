@@ -5,13 +5,12 @@ use candle_core::DType;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
-    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
-    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, StateDType,
-    StateDomainSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy,
+    PrefixPolicy, RetainedStateCapability, StateDType, StateDomainId, StateDomainSpec, StateScope,
+    WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
-use crate::kv::{CacheDomainId, KvCacheContract};
 
 mod layers;
 pub mod lm;
@@ -30,30 +29,26 @@ pub(crate) fn voxtral_invocation_contract(
     model: &VoxtralLM,
     dtype: DType,
     preferred_page_tokens: usize,
-    domains: &[CacheDomainId],
+    domains: &[StateDomainId],
 ) -> Result<InferenceStateContract> {
     if domains.is_empty() {
         return Err(Error::ModelLoadError(
             "Voxtral invocation state has no cache domains".into(),
         ));
     }
-    let mut legacy_domains = Vec::with_capacity(domains.len());
+    let mut state_domains = Vec::with_capacity(domains.len());
+    let mut groups = Vec::with_capacity(domains.len());
     for domain in domains {
-        let contract = model.managed_kv_cache_contract(*domain, dtype, preferred_page_tokens)?;
-        legacy_domains.extend(contract.domains);
+        let contract =
+            model.managed_inference_state_contract(*domain, dtype, preferred_page_tokens)?;
+        state_domains.extend(contract.domains);
+        groups.extend(contract.groups);
     }
-    let legacy = KvCacheContract {
-        abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
-        domains: legacy_domains,
+    let mut contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: state_domains,
+        groups,
     };
-    voxtral_invocation_contract_from_legacy(&legacy)
-}
-
-fn voxtral_invocation_contract_from_legacy(
-    legacy: &KvCacheContract,
-) -> Result<InferenceStateContract> {
-    legacy.validate()?;
-    let mut contract = upgrade_kv_contract_v1(legacy)?;
     for domain in &mut contract.domains {
         let StateDomainSpec::PagedAttention(domain) = domain else {
             return Err(Error::ModelLoadError(

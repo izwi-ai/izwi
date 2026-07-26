@@ -22,8 +22,7 @@ use crate::backends::kv::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
 use crate::backends::kv::MetalKvBackendRuntime;
 use crate::backends::kv::{
-    CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendPlanRequest, KvBackendRuntime,
-    KvLayerConfig,
+    CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendRuntime, KvLayerConfig,
 };
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
@@ -36,13 +35,12 @@ use crate::engine::{
     ResourceAmount, ResourceAuthority, ResourceLease, ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
-use crate::kv::v2::{upgrade_kv_contract_v1, InferenceStateContract, ResolvedStatePlan};
+use crate::kv::v2::{
+    AttentionPattern, InferenceStateContract, PrefixPolicy, ResolvedStatePlan, StateDomainSpec,
+};
 #[cfg(test)]
 use crate::kv::CacheDomainId;
-use crate::kv::{
-    AttentionSemantics, CacheCapability, KvArenaId, KvCacheContract, KvDomainSpec, KvGroupId,
-    KvPrefixSemantics, KvStorageDType, ResolvedKvGroupKind, ResolvedKvPlan,
-};
+use crate::kv::{InferenceStateCapability, KvArenaId, KvGroupId, KvStorageDType, ResolvedKvPlan};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ManagedKvOperationSnapshot {
@@ -184,7 +182,7 @@ impl ManagedKvModelRuntime {
 }
 
 struct ManagedKvModelState {
-    contract: KvCacheContract,
+    contract: InferenceStateContract,
     runtime: Arc<ManagedKvModelRuntime>,
     coordinators: HashMap<KvArenaId, KvCacheCoordinator>,
     prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
@@ -384,19 +382,17 @@ impl ManagedKvCacheManager {
         backend: BackendKind,
         capacity_pages: usize,
         page_tokens_hint: usize,
-        capability: &CacheCapability,
+        capability: &InferenceStateCapability,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
         };
-        let state_contract_v2 = upgrade_kv_contract_v1(contract)?;
         self.bind_model_state(
             model_instance,
             backend,
             capacity_pages,
             page_tokens_hint,
             contract,
-            &state_contract_v2,
         )
         .map(Some)
     }
@@ -407,15 +403,13 @@ impl ManagedKvCacheManager {
         backend: BackendKind,
         capacity_pages: usize,
         page_tokens_hint: usize,
-        contract: &KvCacheContract,
-        state_contract_v2: &InferenceStateContract,
+        contract: &InferenceStateContract,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         validate_sliding_contract(contract, backend)?;
         if let Some(state) = self.models.get(&model_instance) {
             if &state.contract != contract
                 || state.runtime.plan.backend != backend
-                || state.runtime.state_plan_v2.contract_fingerprint
-                    != state_contract_v2.fingerprint()?
+                || state.runtime.state_plan_v2.contract_fingerprint != contract.fingerprint()?
             {
                 return Err(Error::InvalidInput(
                     "one loaded model instance published incompatible managed KV contracts"
@@ -442,31 +436,21 @@ impl ManagedKvCacheManager {
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".to_string()))?;
         let first_arena_generation = self.next_arena_generation;
-        let paged_contract = paged_only_contract(contract)?;
-        let plan = backend_runtime.negotiate(
-            &paged_contract,
-            &KvBackendPlanRequest {
-                model_instance,
-                backend,
-                device_ordinal: self.worker_device_ordinal,
-                capacity_pages,
-                page_tokens_hint: Some(page_tokens_hint),
-                storage_dtype_hint: None,
-                first_arena_generation,
-            },
-        )?;
         let state_plan_v2 = negotiate_state_plan(
-            state_contract_v2,
+            contract,
             &StateBackendPlanRequest {
                 backend,
                 device_ordinal: self.worker_device_ordinal,
-                // Resolve against the exact page geometry selected by the
-                // allocating backend, not merely the configuration hint.
-                page_tokens_hint: plan.groups.first().map(|group| group.page_tokens),
+                page_tokens_hint: Some(page_tokens_hint),
                 storage_dtype_hint: None,
             },
         )?;
-        validate_v2_physical_equivalence(&plan, &state_plan_v2)?;
+        let plan = ResolvedKvPlan::from_state_plan(
+            model_instance,
+            capacity_pages,
+            first_arena_generation,
+            &state_plan_v2,
+        )?;
         let tensor_state = (!state_plan_v2.non_paged.is_empty())
             .then(|| {
                 TensorStateArena::new(Arc::new(state_plan_v2.clone()), self.worker_device.clone())
@@ -556,7 +540,7 @@ impl ManagedKvCacheManager {
         &self,
         model_instance: ModelInstanceId,
         backend: BackendKind,
-        capability: &CacheCapability,
+        capability: &InferenceStateCapability,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
@@ -1268,62 +1252,6 @@ pub(super) fn managed_device_ordinal(device: &Device) -> Option<u32> {
     }
 }
 
-/// During the declaration migration both planners inspect the same semantic
-/// model geometry. Refuse Ready publication unless v2 resolves to the exact
-/// physical page shape already allocated by the proven arena implementation.
-/// This check disappears together with the v1 planner after the final model
-/// declaration is native v2.
-fn validate_v2_physical_equivalence(legacy: &ResolvedKvPlan, v2: &ResolvedStatePlan) -> Result<()> {
-    if legacy.backend != v2.backend
-        || legacy.device_ordinal != v2.device_ordinal
-        || legacy.groups.len() != v2.paged_attention.len()
-    {
-        return Err(Error::ModelLoadError(
-            "v2 state plan does not match the allocating KV backend".to_string(),
-        ));
-    }
-
-    for (legacy_group, v2_group) in legacy.groups.iter().zip(&v2.paged_attention) {
-        let ResolvedKvGroupKind::PagedAttention { layers } = &legacy_group.kind else {
-            return Err(Error::ModelLoadError(
-                "v1 model-state groups require a native v2 backend allocator".to_string(),
-            ));
-        };
-        let same_layers = layers.len() == v2_group.layers.len()
-            && layers.iter().zip(&v2_group.layers).all(|(left, right)| {
-                left.model_layer == right.model_layer && left.physical_layer == right.physical_layer
-            });
-        if legacy_group.page_tokens != v2_group.page_tokens
-            || legacy_group.bytes_per_page != v2_group.bytes_per_page
-            || !same_layers
-        {
-            return Err(Error::ModelLoadError(
-                "v2 state plan resolved different physical KV geometry".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn paged_only_contract(contract: &KvCacheContract) -> Result<KvCacheContract> {
-    let paged = KvCacheContract {
-        abi: contract.abi,
-        domains: contract
-            .domains
-            .iter()
-            .filter(|domain| matches!(domain, KvDomainSpec::PagedAttention(_)))
-            .cloned()
-            .collect(),
-    };
-    if paged.domains.is_empty() {
-        return Err(Error::ModelLoadError(
-            "retained tensor-only state requires the native v2 runtime loader".into(),
-        ));
-    }
-    paged.validate()?;
-    Ok(paged)
-}
-
 fn plan_physical_bytes(plan: &ResolvedKvPlan) -> Result<u64> {
     plan.groups.iter().try_fold(0_u64, |total, group| {
         let group_bytes = group
@@ -1457,7 +1385,7 @@ fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 fn prefix_enabled_for_domain(
-    contract: &KvCacheContract,
+    contract: &InferenceStateContract,
     domain_id: crate::kv::CacheDomainId,
 ) -> bool {
     contract.domains.iter().any(|domain| {
@@ -1465,25 +1393,19 @@ fn prefix_enabled_for_domain(
             return false;
         }
         match domain {
-            KvDomainSpec::PagedAttention(spec) => {
-                spec.layers
-                    .iter()
-                    .all(|layer| matches!(layer.attention, AttentionSemantics::Full))
-                    && matches!(
-                        spec.prefix_semantics,
-                        KvPrefixSemantics::CommittedFullPages { .. }
-                    )
+            StateDomainSpec::PagedAttention(spec) => {
+                matches!(spec.header.prefix, PrefixPolicy::CommittedPages { .. })
             }
-            KvDomainSpec::ModelState(spec) => matches!(
-                spec.prefix_semantics,
-                KvPrefixSemantics::CommittedFullPages { .. }
+            _ => matches!(
+                domain.prefix_policy(),
+                PrefixPolicy::CommittedSnapshots { .. }
             ),
         }
     })
 }
 
 fn sliding_window_for_domain(
-    contract: &KvCacheContract,
+    contract: &InferenceStateContract,
     domain_id: crate::kv::CacheDomainId,
 ) -> Result<Option<u32>> {
     let Some(domain) = contract
@@ -1495,7 +1417,7 @@ fn sliding_window_for_domain(
             "managed KV plan references a missing semantic domain".into(),
         ));
     };
-    let KvDomainSpec::PagedAttention(spec) = domain else {
+    let StateDomainSpec::PagedAttention(spec) = domain else {
         return Ok(None);
     };
     let first = spec.layers.first().ok_or_else(|| {
@@ -1504,20 +1426,23 @@ fn sliding_window_for_domain(
     if spec
         .layers
         .iter()
-        .any(|layer| layer.attention != first.attention)
+        .any(|layer| layer.pattern != first.pattern)
     {
-        return Err(Error::InvalidInput(format!(
-            "managed KV domain {} mixes full and sliding attention semantics",
-            domain_id.get()
-        )));
+        // A mixed local/global decoder (for example Gemma 3) shares one
+        // physical page table across layers. Keep the complete logical table;
+        // local layers lower their own bounded view at attention dispatch.
+        return Ok(None);
     }
-    Ok(match first.attention {
-        AttentionSemantics::Full => None,
-        AttentionSemantics::SlidingWindow { window_tokens } => Some(window_tokens),
+    Ok(match first.pattern {
+        AttentionPattern::Full => None,
+        AttentionPattern::SlidingWindow { window_tokens } => Some(window_tokens),
     })
 }
 
-fn validate_sliding_contract(contract: &KvCacheContract, backend: BackendKind) -> Result<()> {
+fn validate_sliding_contract(
+    contract: &InferenceStateContract,
+    backend: BackendKind,
+) -> Result<()> {
     for domain in &contract.domains {
         if let Some(window_tokens) = sliding_window_for_domain(contract, domain.id())? {
             if backend == BackendKind::Cuda {
@@ -1648,7 +1573,7 @@ fn abort_reservation(state: &mut ManagedKvModelState, reservation: &ManagedCache
 }
 
 fn arena_config(
-    contract: &KvCacheContract,
+    contract: &InferenceStateContract,
     group: &crate::kv::ResolvedKvGroup,
 ) -> Result<KvArenaConfig> {
     let domain = contract
@@ -1658,18 +1583,13 @@ fn arena_config(
         .ok_or_else(|| {
             Error::InferenceError("resolved KV group lost its semantic domain".into())
         })?;
-    let (spec, bindings) = match (domain, &group.kind) {
-        (KvDomainSpec::PagedAttention(spec), ResolvedKvGroupKind::PagedAttention { layers }) => {
-            (spec, layers)
-        }
-        _ => {
-            return Err(Error::InvalidInput(
-                "dense paged KV arena requires a paged-attention domain".to_string(),
-            ));
-        }
+    let StateDomainSpec::PagedAttention(spec) = domain else {
+        return Err(Error::InvalidInput(
+            "dense paged KV arena requires a paged-attention domain".to_string(),
+        ));
     };
-    let mut layers = Vec::with_capacity(bindings.len());
-    for binding in bindings {
+    let mut layers = Vec::with_capacity(group.layers.len());
+    for binding in &group.layers {
         let layer = spec
             .layers
             .iter()
@@ -1677,7 +1597,7 @@ fn arena_config(
             .ok_or_else(|| Error::InferenceError("resolved KV layer binding is stale".into()))?;
         layers.push(KvLayerConfig {
             binding: *binding,
-            num_kv_heads: layer.num_kv_heads,
+            num_kv_heads: layer.kv_heads,
             key_head_dim: layer.key_head_dim,
             value_head_dim: layer.value_head_dim,
         });
@@ -1727,10 +1647,13 @@ mod tests {
         PhysicalCapacityProvider, PhysicalCapacitySnapshot, SequencePhase, StageDescriptor,
         StageId,
     };
-    use crate::kv::{test_contract, CacheBlockRef, KvSlotRef};
+    use crate::kv::v2::{
+        BoundedShape, ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId,
+        StateDomainHeader, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
+        TensorStateDomainSpec,
+    };
     use crate::kv::{
-        CacheTokenAxis, KvDomainSpec as LegacyDomainSpec, KvStorageRequest, ModelStateDomainSpec,
-        ModelStateKind, ModelStateLayerSpec,
+        test_contract, CacheBlockRef, InferenceStateCapability as CacheCapability, KvSlotRef,
     };
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -1818,36 +1741,85 @@ mod tests {
         }
     }
 
-    fn sliding_contract(window_tokens: u32) -> KvCacheContract {
+    fn sliding_contract(window_tokens: u32) -> InferenceStateContract {
         let mut contract = test_contract();
-        let KvDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
             unreachable!()
         };
         for layer in &mut domain.layers {
-            layer.attention = AttentionSemantics::SlidingWindow { window_tokens };
+            layer.pattern = AttentionPattern::SlidingWindow { window_tokens };
         }
-        domain.prefix_semantics = KvPrefixSemantics::Disabled;
+        domain.header.prefix = PrefixPolicy::Disabled;
+        domain.header.checkpoint = crate::kv::v2::CheckpointPolicy::Transactional;
+        contract.groups[0].prefix_shareable = false;
         contract
     }
 
-    fn composite_tensor_contract() -> KvCacheContract {
+    fn mixed_attention_contract(window_tokens: u32) -> InferenceStateContract {
         let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        domain.layers[0].pattern = AttentionPattern::SlidingWindow { window_tokens };
+        let mut global = domain.layers[0].clone();
+        global.model_layer = 1;
+        global.pattern = AttentionPattern::Full;
+        domain.layers.push(global);
+        contract
+    }
+
+    #[test]
+    fn mixed_local_and_global_layers_keep_one_full_physical_table() {
+        let contract = mixed_attention_contract(32);
+        assert_eq!(
+            sliding_window_for_domain(&contract, CacheDomainId::new(1)).unwrap(),
+            None
+        );
+        assert!(prefix_enabled_for_domain(&contract, CacheDomainId::new(1)));
+        let mut manager = ManagedKvCacheManager::default();
+        assert!(manager
+            .bind_request(
+                ModelInstanceId::new(702),
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(contract),
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    fn composite_tensor_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
+        let domain = CacheDomainId::new(2);
         contract
             .domains
-            .push(LegacyDomainSpec::ModelState(ModelStateDomainSpec {
-                id: CacheDomainId::new(2),
-                token_axis: CacheTokenAxis::DecoderTokens,
-                layers: vec![ModelStateLayerSpec {
-                    model_layer: 0,
-                    kind: ModelStateKind::Recurrent,
-                    elements_per_sequence: 4,
-                }],
-                storage: KvStorageRequest {
-                    dtypes: vec![KvStorageDType::F32],
-                    allow_quantized: false,
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: domain,
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: crate::kv::v2::PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: crate::kv::v2::CheckpointPolicy::Transactional,
                 },
-                prefix_semantics: KvPrefixSemantics::Disabled,
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: 4 },
+                        }],
+                    },
+                    accepted_dtypes: vec![KvStorageDType::F32],
+                }],
             }));
+        contract.groups = vec![StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(1),
+            domains: vec![CacheDomainId::new(1), domain],
+            prefix_shareable: false,
+        }];
         contract.validate().unwrap();
         contract
     }
@@ -2222,8 +2194,8 @@ mod tests {
             )
             .expect("first binding");
         let mut changed = test_contract();
-        if let KvDomainSpec::PagedAttention(domain) = &mut changed.domains[0] {
-            domain.layers[0].num_kv_heads = 2;
+        if let StateDomainSpec::PagedAttention(domain) = &mut changed.domains[0] {
+            domain.layers[0].kv_heads = 2;
         }
         assert!(manager
             .bind_request(
@@ -2242,10 +2214,15 @@ mod tests {
         let session = SessionKey::new("managed-composite".to_string(), 3);
         let mut contract = test_contract();
         let mut second = contract.domains[0].clone();
-        if let KvDomainSpec::PagedAttention(domain) = &mut second {
-            domain.id = CacheDomainId::new(2);
+        if let StateDomainSpec::PagedAttention(domain) = &mut second {
+            domain.header.id = CacheDomainId::new(2);
         }
         contract.domains.push(second);
+        contract.groups.push(StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(2),
+            domains: vec![CacheDomainId::new(2)],
+            prefix_shareable: true,
+        });
         let mut manager = ManagedKvCacheManager::default();
         let runtime = manager
             .bind_request(
@@ -2282,10 +2259,15 @@ mod tests {
         let session = SessionKey::new("managed-composite-failure".to_string(), 1);
         let mut contract = test_contract();
         let mut second = contract.domains[0].clone();
-        if let KvDomainSpec::PagedAttention(domain) = &mut second {
-            domain.id = CacheDomainId::new(2);
+        if let StateDomainSpec::PagedAttention(domain) = &mut second {
+            domain.header.id = CacheDomainId::new(2);
         }
         contract.domains.push(second);
+        contract.groups.push(StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(2),
+            domains: vec![CacheDomainId::new(2)],
+            prefix_shareable: true,
+        });
         let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([5; 32]));
         let runtime = manager
             .bind_request(
@@ -2344,7 +2326,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let arena = runtime.tensor_state().unwrap().clone();
-        let tensor_domain = crate::kv::v2::StateDomainId::new(3);
+        let tensor_domain = crate::kv::v2::StateDomainId::new(2);
 
         let aborted = manager
             .prepare(&runtime, 31, &session, &sequence_work(0, 1), None)

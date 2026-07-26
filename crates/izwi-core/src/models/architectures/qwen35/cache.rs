@@ -6,24 +6,26 @@
 use candle_core::DType;
 
 use crate::error::{Error, Result};
-use crate::kv::{
-    AttentionSemantics, CacheDomainId, CacheTokenAxis, KeyEncoding, KvCacheContract, KvDomainSpec,
-    KvPrefixSemantics, KvStorageDType, KvStorageRequest, ModelStateDomainSpec, ModelStateKind,
-    ModelStateLayerSpec, PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    CURRENT_KV_CONTRACT_ABI,
+use crate::kv::v2::{
+    AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy, InferenceStateContract,
+    KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
+    PlacementPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+    CURRENT_INFERENCE_STATE_ABI,
 };
 
 use super::chat::Qwen35TextConfig;
 
-pub(crate) const FULL_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(0);
-pub(crate) const RECURRENT_STATE_DOMAIN: CacheDomainId = CacheDomainId::new(1);
-pub(crate) const CONVOLUTION_STATE_DOMAIN: CacheDomainId = CacheDomainId::new(2);
+pub(crate) const FULL_ATTENTION_DOMAIN: StateDomainId = StateDomainId::new(1);
+pub(crate) const RECURRENT_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
+pub(crate) const CONVOLUTION_STATE_DOMAIN: StateDomainId = StateDomainId::new(3);
 
 pub(crate) fn qwen35_composite_cache_contract(
     config: &Qwen35TextConfig,
     attention_dtype: DType,
     preferred_page_tokens: usize,
-) -> Result<KvCacheContract> {
+) -> Result<InferenceStateContract> {
     if config.full_attention_interval == 0 {
         return Err(Error::InvalidInput(
             "Qwen3.5 composite cache requires a non-zero full-attention interval".into(),
@@ -70,26 +72,22 @@ pub(crate) fn qwen35_composite_cache_contract(
         if (layer + 1).is_multiple_of(config.full_attention_interval) {
             attention_layers.push(PagedAttentionLayerSpec {
                 model_layer,
-                num_query_heads: query_heads,
-                num_kv_heads: kv_heads,
+                query_heads,
+                kv_heads,
                 key_head_dim,
                 value_head_dim,
-                attention: AttentionSemantics::Full,
+                pattern: AttentionPattern::Full,
+                mask: AttentionMask::Causal,
                 key_encoding: KeyEncoding::Rotary { rotary_dim },
             });
         } else {
-            recurrent_layers.push(ModelStateLayerSpec {
+            recurrent_layers.push((model_layer, recurrent_elements));
+            convolution_layers.push((
                 model_layer,
-                kind: ModelStateKind::Recurrent,
-                elements_per_sequence: recurrent_elements,
-            });
-            convolution_layers.push(ModelStateLayerSpec {
-                model_layer,
-                kind: ModelStateKind::Convolution,
-                elements_per_sequence: u64::try_from(convolution_elements).map_err(|_| {
+                u64::try_from(convolution_elements).map_err(|_| {
                     Error::InvalidInput("Qwen3.5 convolution state exceeds u64".into())
                 })?,
-            });
+            ));
         }
     }
     if attention_layers.is_empty() || recurrent_layers.is_empty() {
@@ -98,60 +96,77 @@ pub(crate) fn qwen35_composite_cache_contract(
         ));
     }
 
-    let storage = KvStorageRequest {
-        dtypes: vec![dtype],
-        allow_quantized: false,
+    let retained_header = |id| StateDomainHeader {
+        id,
+        scope: StateScope::Retained,
+        clock: StateClock::DecoderTokens,
+        placement: PlacementPolicy::BackendLocalWithHostOffload,
+        prefix: PrefixPolicy::Disabled,
+        checkpoint: CheckpointPolicy::Transactional,
     };
-    let token_axis = CacheTokenAxis::DecoderTokens;
-    let contract = KvCacheContract {
-        abi: CURRENT_KV_CONTRACT_ABI,
+    let tensor_components = |layers: &[(u32, u64)], role: TensorRole| {
+        layers
+            .iter()
+            .enumerate()
+            .map(|(index, (_, elements))| {
+                Ok(TensorComponentSpec {
+                    id: StateComponentId::new(u32::try_from(index + 1).map_err(|_| {
+                        Error::InvalidInput("Qwen3.5 state component count exceeds u32".into())
+                    })?),
+                    role: role.clone(),
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: *elements },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![
-            KvDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-                id: FULL_ATTENTION_DOMAIN,
-                token_axis: token_axis.clone(),
+            StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
+                header: retained_header(FULL_ATTENTION_DOMAIN),
                 layers: attention_layers,
-                page_tokens: PageTokenConstraint {
-                    min: 1,
-                    preferred,
-                    max: preferred.max(256),
+                page_size: PageSizeConstraint {
+                    min_tokens: 1,
+                    preferred_tokens: preferred,
+                    max_tokens: preferred.max(256),
                     multiple_of: 1,
                 },
-                storage: storage.clone(),
-                // Attention-only reuse is invalid while recurrent and conv
-                // state remain part of the same token transition.
-                prefix_semantics: KvPrefixSemantics::Disabled,
+                accepted_dtypes: vec![dtype],
             }),
-            KvDomainSpec::ModelState(ModelStateDomainSpec {
-                id: RECURRENT_STATE_DOMAIN,
-                token_axis: token_axis.clone(),
-                layers: recurrent_layers,
-                storage: KvStorageRequest {
-                    dtypes: vec![KvStorageDType::F32],
-                    allow_quantized: false,
-                },
-                prefix_semantics: KvPrefixSemantics::Disabled,
+            StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: retained_header(RECURRENT_STATE_DOMAIN),
+                components: tensor_components(&recurrent_layers, TensorRole::RecurrentHidden)?,
             }),
-            KvDomainSpec::ModelState(ModelStateDomainSpec {
-                id: CONVOLUTION_STATE_DOMAIN,
-                token_axis,
-                layers: convolution_layers,
-                storage: KvStorageRequest {
-                    dtypes: vec![KvStorageDType::F32],
-                    allow_quantized: false,
-                },
-                prefix_semantics: KvPrefixSemantics::Disabled,
+            StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: retained_header(CONVOLUTION_STATE_DOMAIN),
+                components: tensor_components(&convolution_layers, TensorRole::ConvolutionState)?,
             }),
         ],
+        groups: vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: vec![
+                FULL_ATTENTION_DOMAIN,
+                RECURRENT_STATE_DOMAIN,
+                CONVOLUTION_STATE_DOMAIN,
+            ],
+            prefix_shareable: false,
+        }],
     };
     contract.validate()?;
     Ok(contract)
 }
 
-fn storage_dtype(dtype: DType) -> Result<KvStorageDType> {
+fn storage_dtype(dtype: DType) -> Result<StateDType> {
     match dtype {
-        DType::F32 => Ok(KvStorageDType::F32),
-        DType::F16 => Ok(KvStorageDType::F16),
-        DType::BF16 => Ok(KvStorageDType::Bf16),
+        DType::F32 => Ok(StateDType::F32),
+        DType::F16 => Ok(StateDType::F16),
+        DType::BF16 => Ok(StateDType::Bf16),
         dtype => Err(Error::InvalidInput(format!(
             "Qwen3.5 managed attention does not support {dtype:?} storage"
         ))),
@@ -205,10 +220,10 @@ mod tests {
         let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
         assert_eq!(contract.domains.len(), 3);
 
-        let KvDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
+        let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
             panic!("expected attention domain");
         };
-        assert_eq!(attention.id, FULL_ATTENTION_DOMAIN);
+        assert_eq!(attention.header.id, FULL_ATTENTION_DOMAIN);
         assert_eq!(
             attention
                 .layers
@@ -217,46 +232,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 7]
         );
-        assert_eq!(attention.prefix_semantics, KvPrefixSemantics::Disabled);
+        assert_eq!(attention.header.prefix, PrefixPolicy::Disabled);
 
-        let KvDomainSpec::ModelState(recurrent) = &contract.domains[1] else {
+        let StateDomainSpec::Tensor(recurrent) = &contract.domains[1] else {
             panic!("expected recurrent domain");
         };
-        let KvDomainSpec::ModelState(convolution) = &contract.domains[2] else {
+        let StateDomainSpec::Tensor(convolution) = &contract.domains[2] else {
             panic!("expected convolution domain");
         };
-        assert_eq!(recurrent.layers.len(), 6);
-        assert_eq!(convolution.layers.len(), 6);
-        assert!(recurrent
-            .layers
-            .iter()
-            .all(|layer| layer.elements_per_sequence == 65_536));
-        assert!(convolution
-            .layers
-            .iter()
-            .all(|layer| layer.elements_per_sequence == 4_608));
-        assert_eq!(recurrent.prefix_semantics, KvPrefixSemantics::Disabled);
-        assert_eq!(convolution.prefix_semantics, KvPrefixSemantics::Disabled);
+        assert_eq!(recurrent.components.len(), 6);
+        assert_eq!(convolution.components.len(), 6);
+        assert!(recurrent.components.iter().all(|component| component
+            .shape
+            .maximum_elements()
+            .unwrap()
+            == 65_536));
+        assert!(convolution.components.iter().all(|component| component
+            .shape
+            .maximum_elements()
+            .unwrap()
+            == 4_608));
+        assert_eq!(recurrent.header.prefix, PrefixPolicy::Disabled);
+        assert_eq!(convolution.header.prefix, PrefixPolicy::Disabled);
     }
 
     #[test]
     fn composite_contract_allocates_paged_and_transactional_tensor_arenas() {
         use crate::backends::BackendKind;
         use crate::engine::{ManagedKvCacheManager, ModelInstanceId};
-        use crate::kv::CacheCapability;
+        use crate::kv::InferenceStateCapability;
 
         let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
-        let upgraded = crate::kv::v2::upgrade_kv_contract_v1(&contract).unwrap();
-        assert_eq!(upgraded.groups.len(), 1);
+        assert_eq!(contract.groups.len(), 1);
         assert_eq!(
-            upgraded.groups[0].domains,
+            contract.groups[0].domains,
             vec![
                 crate::kv::v2::StateDomainId::new(1),
                 crate::kv::v2::StateDomainId::new(2),
                 crate::kv::v2::StateDomainId::new(3),
             ]
         );
-        assert!(!upgraded.groups[0].prefix_shareable);
+        assert!(!contract.groups[0].prefix_shareable);
         let mut manager = ManagedKvCacheManager::default();
         let runtime = manager
             .bind_request(
@@ -264,7 +280,7 @@ mod tests {
                 BackendKind::Cpu,
                 2,
                 32,
-                &CacheCapability::Managed(contract),
+                &InferenceStateCapability::Managed(contract),
             )
             .unwrap()
             .unwrap();

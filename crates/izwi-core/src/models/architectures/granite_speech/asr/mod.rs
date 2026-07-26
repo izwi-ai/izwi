@@ -14,13 +14,12 @@ use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, upgrade_kv_contract_v1, CapabilityStateDescriptorV2, CheckpointPolicy,
-    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
-    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, StateDType,
-    StateDomainSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
+    stage_graph_fingerprint, CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract,
+    InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
+    InvocationWorkspaceDomain, InvocationWorkspaceProfile, InvocationWorkspaceSet, PlacementPolicy,
+    PrefixPolicy, RetainedStateCapability, StateClock, StateDType, StateDomainId, StateDomainSpec,
+    StateGroupId, StateGroupSpec, StateScope, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
-use crate::kv::{CacheDomainId, CacheTokenAxis, KvCacheContract, KvDomainSpec, KvPrefixSemantics};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
@@ -512,9 +511,10 @@ fn granite_speech_invocation_contract(
     preferred_page_tokens: usize,
 ) -> Result<InferenceStateContract> {
     let text = &config.text_config;
+    let domain_id = StateDomainId::new(1);
     let domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-        domain: CacheDomainId::new(0),
-        token_axis: CacheTokenAxis::DecoderTokens,
+        domain: domain_id,
+        clock: StateClock::DecoderTokens,
         num_layers: text.num_hidden_layers,
         num_query_heads: text.num_attention_heads,
         num_kv_heads: text.num_key_value_heads,
@@ -523,14 +523,17 @@ fn granite_speech_invocation_contract(
         sliding_window: None,
         storage_dtype: dtype,
         preferred_page_tokens,
-        prefix_semantics: KvPrefixSemantics::Disabled,
+        prefix: PrefixPolicy::Disabled,
     })?;
-    let legacy = KvCacheContract {
-        abi: crate::kv::CURRENT_KV_CONTRACT_ABI,
-        domains: vec![KvDomainSpec::PagedAttention(domain)],
+    let mut contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: vec![StateDomainSpec::PagedAttention(domain)],
+        groups: vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: vec![domain_id],
+            prefix_shareable: false,
+        }],
     };
-    legacy.validate()?;
-    let mut contract = upgrade_kv_contract_v1(&legacy)?;
     for domain in &mut contract.domains {
         let StateDomainSpec::PagedAttention(domain) = domain else {
             return Err(Error::ModelLoadError(

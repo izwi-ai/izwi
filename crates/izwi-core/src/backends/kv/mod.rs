@@ -8,7 +8,6 @@
 #[cfg(any(feature = "cuda", feature = "metal"))]
 mod accelerator;
 mod cpu;
-mod negotiate;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -18,8 +17,7 @@ use candle_core::{DType, DeviceLocation, Tensor};
 
 use crate::backends::BackendKind;
 use crate::kv::{
-    CacheBlockRef, KvArenaId, KvCacheContract, KvDecodeBatchMetadata, KvGroupId, KvLayerBinding,
-    KvSlotRef, ResolvedKvPlan,
+    CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvGroupId, KvLayerBinding, KvSlotRef,
 };
 use crate::{Error, Result};
 
@@ -32,7 +30,6 @@ pub use accelerator::{
     candle_accelerator_kv_support, CandleAcceleratorKvArena, CandleAcceleratorKvSupport,
 };
 pub use cpu::{CpuKvArena, CpuKvBackendRuntime};
-pub use negotiate::{negotiate_kv_plan, KvBackendPlanRequest};
 
 /// Whether this binary contains a complete managed-KV runtime for a backend.
 /// Capability publication and live worker binding share this gate so a loaded
@@ -513,20 +510,6 @@ pub trait KvArena: Send + Sync {
 /// Allocates backend-owned arenas from resolved physical configurations.
 pub trait KvBackendRuntime: Send + Sync {
     fn backend_kind(&self) -> BackendKind;
-    fn negotiate(
-        &self,
-        contract: &KvCacheContract,
-        request: &KvBackendPlanRequest,
-    ) -> Result<ResolvedKvPlan> {
-        if request.backend != self.backend_kind() {
-            return Err(crate::Error::InvalidInput(format!(
-                "KV negotiation request targets {:?}, but runtime is {:?}",
-                request.backend,
-                self.backend_kind()
-            )));
-        }
-        negotiate_kv_plan(contract, request)
-    }
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>>;
 }
 

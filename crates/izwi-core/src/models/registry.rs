@@ -20,7 +20,7 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
-use crate::kv::{CacheCapability, KvCacheContractProvider};
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::{
@@ -557,15 +557,15 @@ pub enum NativeAsrModel {
     GraniteSpeech(GraniteSpeechAsrModel),
 }
 
-impl KvCacheContractProvider for NativeAsrModel {
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+impl InferenceStateContractProvider for NativeAsrModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         match self {
-            Self::Qwen3(model) => model.kv_cache_contract(),
+            Self::Qwen3(model) => model.inference_state_contract(),
             Self::Parakeet(_)
             | Self::Nemotron(_)
             | Self::WhisperTurbo(_)
             | Self::VibeVoice(_)
-            | Self::GraniteSpeech(_) => Ok(CacheCapability::Stateless),
+            | Self::GraniteSpeech(_) => Ok(InferenceStateCapability::Stateless),
         }
     }
 }
@@ -2412,13 +2412,13 @@ pub enum NativeChatModel {
     Lfm2(Lfm2ChatModel),
 }
 
-impl KvCacheContractProvider for NativeChatModel {
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+impl InferenceStateContractProvider for NativeChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         match self {
-            Self::Qwen3(model) => model.kv_cache_contract(),
-            Self::Qwen35(model) => model.kv_cache_contract(),
-            Self::Gemma3(model) => model.kv_cache_contract(),
-            Self::Lfm2(_) => Ok(CacheCapability::Stateless),
+            Self::Qwen3(model) => model.inference_state_contract(),
+            Self::Qwen35(model) => model.inference_state_contract(),
+            Self::Gemma3(model) => model.inference_state_contract(),
+            Self::Lfm2(_) => Ok(InferenceStateCapability::Stateless),
         }
     }
 }

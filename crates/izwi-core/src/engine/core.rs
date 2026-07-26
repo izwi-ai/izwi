@@ -2678,7 +2678,7 @@ impl EngineCore {
     pub(crate) fn load_managed_model_cache(
         &mut self,
         model_instance: super::ModelInstanceId,
-        capability: &crate::kv::CacheCapability,
+        capability: &crate::kv::InferenceStateCapability,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         if capability.managed_contract().is_none() {
             return Ok(None);
@@ -2704,7 +2704,6 @@ impl EngineCore {
     pub(crate) fn load_managed_model_state(
         &mut self,
         model_instance: super::ModelInstanceId,
-        retained_kv: &crate::kv::KvCacheContract,
         retained_state: &crate::kv::v2::InferenceStateContract,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let backend = self.managed_kv_cache.worker_backend();
@@ -2713,7 +2712,6 @@ impl EngineCore {
             backend,
             self.config.max_blocks,
             self.config.block_size,
-            retained_kv,
             retained_state,
         )
     }
@@ -3385,8 +3383,8 @@ mod tests {
         model_instance: ModelInstanceId,
     ) {
         let variant = request.model_variant.expect("managed test model");
-        let legacy_contract = crate::kv::test_contract();
-        let capability = crate::kv::CacheCapability::Managed(legacy_contract.clone());
+        let state_contract = crate::kv::test_contract();
+        let capability = crate::kv::InferenceStateCapability::Managed(state_contract.clone());
         let physical = core
             .load_managed_model_cache(model_instance, &capability)
             .expect("load managed state")
@@ -3415,7 +3413,7 @@ mod tests {
             stages: Arc::from([stage]),
         };
         let descriptor = crate::kv::v2::CapabilityStateDescriptorV2::managed_for_stages_test(
-            crate::kv::v2::upgrade_kv_contract_v1(&legacy_contract).expect("upgrade test contract"),
+            state_contract,
             &execution.stages,
         );
         let runtime = Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::managed(
@@ -5541,7 +5539,7 @@ mod tests {
         let error = core
             .load_managed_model_cache(
                 ModelInstanceId::new(44),
-                &crate::kv::CacheCapability::Managed(crate::kv::test_contract()),
+                &crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract()),
             )
             .unwrap_err();
         assert!(error.to_string().contains("capacity"));

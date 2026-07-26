@@ -8,9 +8,9 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
-use crate::kv::{
-    CacheDomainId, CacheTokenAxis, KvCacheContract, KvDomainSpec, KvPrefixSemantics,
-    PositionSemantics, CURRENT_KV_CONTRACT_ABI,
+use crate::kv::v2::{
+    InferenceStateContract, PositionSemantics, PrefixPolicy, StateClock, StateDomainId,
+    StateDomainSpec, StateGroupId, StateGroupSpec, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::qwen3::core::{
     build_mrope_cache, build_rope_cache, qwen3_decoder_cache_domain, Qwen3Config,
@@ -132,15 +132,15 @@ impl VoxtralLM {
         })
     }
 
-    pub(crate) fn managed_kv_cache_contract(
+    pub(crate) fn managed_inference_state_contract(
         &self,
-        domain: CacheDomainId,
+        domain: StateDomainId,
         storage_dtype: DType,
         preferred_page_tokens: usize,
-    ) -> Result<KvCacheContract> {
+    ) -> Result<InferenceStateContract> {
         let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
             domain,
-            token_axis: CacheTokenAxis::DecoderTokens,
+            clock: StateClock::DecoderTokens,
             num_layers: self.cfg.num_hidden_layers,
             num_query_heads: self.cfg.num_attention_heads,
             num_kv_heads: self.cfg.num_key_value_heads,
@@ -149,13 +149,18 @@ impl VoxtralLM {
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
-            prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+            prefix: PrefixPolicy::CommittedPages {
                 positions: PositionSemantics::Absolute,
             },
         })?;
-        let contract = KvCacheContract {
-            abi: CURRENT_KV_CONTRACT_ABI,
-            domains: vec![KvDomainSpec::PagedAttention(cache_domain)],
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::PagedAttention(cache_domain)],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(domain.get()),
+                domains: vec![domain],
+                prefix_shareable: true,
+            }],
         };
         contract.validate()?;
         Ok(contract)

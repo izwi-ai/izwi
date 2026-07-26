@@ -66,13 +66,6 @@ fn public_runtime_reexports_remain_compile_visible() {
 }
 
 #[test]
-fn compatibility_kv_abi_has_an_explicit_v1_namespace() {
-    assert_eq!(izwi_core::kv::v1::CURRENT_KV_CONTRACT_ABI.get(), 1);
-    let domain = izwi_core::kv::v1::CacheDomainId::new(7);
-    assert_eq!(domain.get(), 7);
-}
-
-#[test]
 fn product_crates_do_not_import_internal_model_architectures() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -117,7 +110,10 @@ fn legacy_inference_state_surface_does_not_expand_during_migration() {
     // model from quietly adding another model-owned cache while v2 is landing.
     const LEGACY_SYMBOL_LIMITS: &[(&str, usize)] = &[
         ("OpaqueModelOwned", 0),
-        ("KvDomainSpec::ModelState", 9),
+        ("upgrade_kv_contract_v1", 0),
+        ("CURRENT_KV_CONTRACT_ABI", 0),
+        ("KvCacheContract", 0),
+        ("KvDomainSpec::", 0),
         ("Qwen3ManagedCache", 33),
         ("Qwen3Cache", 63),
         ("DenseKvCache", 45),

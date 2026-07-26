@@ -26,7 +26,7 @@ pub(crate) const CURRENT_INFERENCE_STATE_ABI: InferenceStateAbi = InferenceState
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct StateDomainId(u32);
+pub struct StateDomainId(u32);
 
 impl StateDomainId {
     pub(crate) const fn new(value: u32) -> Self {
@@ -357,7 +357,7 @@ impl StateClock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum StateDType {
+pub enum StateDType {
     F32,
     F16,
     Bf16,

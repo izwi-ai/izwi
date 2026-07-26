@@ -52,7 +52,7 @@ use crate::backends::{
     BackendSelectionSource,
 };
 use crate::error::{Error, Result};
-use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat, ResolvedKvGroupKind};
+use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
@@ -69,11 +69,10 @@ fn qwen3_managed_cache_for_row(
         Error::InferenceError("managed Qwen3 row has no model runtime".to_string())
     })?;
     let mut groups = runtime.plan().groups.iter().filter(|group| {
-        matches!(&group.kind, ResolvedKvGroupKind::PagedAttention { .. })
-            && reservation
-                .domains
-                .iter()
-                .any(|domain| domain.domain == group.domain && domain.arena == group.arena)
+        reservation
+            .domains
+            .iter()
+            .any(|domain| domain.domain == group.domain && domain.arena == group.arena)
     });
     let group = groups.next().ok_or_else(|| {
         Error::InvalidInput("native Qwen3 reservation has no resolved paged-attention group".into())
@@ -122,11 +121,7 @@ fn physical_paged_cache_for_row(
             "managed-cache plan repeats a domain/group pair".into(),
         ));
     }
-    let ResolvedKvGroupKind::PagedAttention { layers } = &group.kind else {
-        return Err(Error::InvalidInput(
-            "managed-cache domain/group is not paged attention".to_string(),
-        ));
-    };
+    let layers = &group.layers;
     if layers.is_empty() {
         return Err(Error::InferenceError(
             "managed-cache paged-attention group has no layer bindings".into(),

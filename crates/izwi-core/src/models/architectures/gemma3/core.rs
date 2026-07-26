@@ -8,12 +8,13 @@ use candle_transformers::models::gemma3::Config;
 
 use crate::backends::kv::{KvSlotMap, KvWriteArgs, KvWriteCompletionCollector, PagedKvDecodeArgs};
 use crate::error::{Error, Result};
-use crate::kv::{
-    AttentionSemantics, CacheDomainId, CacheTokenAxis, KeyEncoding, KvCacheContract,
-    KvDecodeBatchMetadata, KvDomainSpec, KvPrefixSemantics, KvStorageDType, KvStorageRequest,
-    PageTokenConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    CURRENT_KV_CONTRACT_ABI,
+use crate::kv::v2::{
+    AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
+    PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy,
+    PositionSemantics, PrefixPolicy, StateClock, StateDType, StateDomainHeader, StateDomainId,
+    StateDomainSpec, StateGroupId, StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 #[derive(Debug, Clone)]
@@ -498,16 +499,16 @@ impl Gemma3PhysicalModel {
         self.config.hidden_size
     }
 
-    pub(crate) fn managed_kv_cache_contract(
+    pub(crate) fn managed_inference_state_contract(
         &self,
-        domain: CacheDomainId,
+        domain: StateDomainId,
         storage_dtype: DType,
         preferred_page_tokens: usize,
-    ) -> Result<KvCacheContract> {
+    ) -> Result<InferenceStateContract> {
         let storage_dtype = match storage_dtype {
-            DType::F32 => KvStorageDType::F32,
-            DType::F16 => KvStorageDType::F16,
-            DType::BF16 => KvStorageDType::Bf16,
+            DType::F32 => StateDType::F32,
+            DType::F16 => StateDType::F16,
+            DType::BF16 => StateDType::Bf16,
             dtype => {
                 return Err(Error::InvalidInput(format!(
                     "Gemma physical KV does not support {dtype:?}"
@@ -525,42 +526,50 @@ impl Gemma3PhysicalModel {
         let layers = (0..self.config.num_hidden_layers)
             .map(|index| PagedAttentionLayerSpec {
                 model_layer: index as u32,
-                num_query_heads: query_heads,
-                num_kv_heads: kv_heads,
+                query_heads,
+                kv_heads,
                 key_head_dim: head_dim,
                 value_head_dim: head_dim,
-                attention: if (index + 1) % self.config.sliding_window_pattern != 0 {
-                    AttentionSemantics::SlidingWindow {
+                pattern: if (index + 1) % self.config.sliding_window_pattern != 0 {
+                    AttentionPattern::SlidingWindow {
                         window_tokens: self.config.sliding_window as u32,
                     }
                 } else {
-                    AttentionSemantics::Full
+                    AttentionPattern::Full
                 },
+                mask: AttentionMask::Causal,
                 key_encoding: KeyEncoding::Rotary {
                     rotary_dim: head_dim,
                 },
             })
             .collect();
-        let contract = KvCacheContract {
-            abi: CURRENT_KV_CONTRACT_ABI,
-            domains: vec![KvDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-                id: domain,
-                token_axis: CacheTokenAxis::DecoderTokens,
+        let contract = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: vec![StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
+                header: StateDomainHeader {
+                    id: domain,
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::CommittedPages {
+                        positions: PositionSemantics::Absolute,
+                    },
+                    checkpoint: CheckpointPolicy::CopyOnWrite,
+                },
                 layers,
-                page_tokens: PageTokenConstraint {
-                    min: 1,
-                    preferred,
-                    max: preferred.max(256),
+                page_size: PageSizeConstraint {
+                    min_tokens: 1,
+                    preferred_tokens: preferred,
+                    max_tokens: preferred.max(256),
                     multiple_of: 1,
                 },
-                storage: KvStorageRequest {
-                    dtypes: vec![storage_dtype],
-                    allow_quantized: false,
-                },
-                prefix_semantics: KvPrefixSemantics::CommittedFullPages {
-                    positions: crate::kv::PositionSemantics::Absolute,
-                },
+                accepted_dtypes: vec![storage_dtype],
             })],
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(domain.get()),
+                domains: vec![domain],
+                prefix_shareable: true,
+            }],
         };
         contract.validate()?;
         Ok(contract)
@@ -902,20 +911,17 @@ mod tests {
         )
         .unwrap();
         let contract = model
-            .managed_kv_cache_contract(CacheDomainId::new(3), DType::F32, 4)
+            .managed_inference_state_contract(StateDomainId::new(3), DType::F32, 4)
             .unwrap();
-        let KvDomainSpec::PagedAttention(domain) = &contract.domains[0] else {
+        let StateDomainSpec::PagedAttention(domain) = &contract.domains[0] else {
             panic!("Gemma contract must contain paged attention");
         };
-        assert_eq!(domain.id, CacheDomainId::new(3));
+        assert_eq!(domain.header.id, StateDomainId::new(3));
         assert!(matches!(
-            domain.layers[0].attention,
-            AttentionSemantics::SlidingWindow { window_tokens: 2 }
+            domain.layers[0].pattern,
+            AttentionPattern::SlidingWindow { window_tokens: 2 }
         ));
-        assert!(matches!(
-            domain.layers[1].attention,
-            AttentionSemantics::Full
-        ));
+        assert!(matches!(domain.layers[1].pattern, AttentionPattern::Full));
     }
 
     #[test]

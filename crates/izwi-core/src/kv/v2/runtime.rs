@@ -1960,7 +1960,7 @@ mod tests {
         EngineCore, EngineCoreConfig, ExecutionMode, ExecutionProfile, InvocationPagedKvPoolOwner,
         NativeBatchMode, PhysicalStateManager, StageDescriptor, StageId,
     };
-    use crate::kv::v2::{test_contract, upgrade_kv_contract_v1};
+    use crate::kv::v2::test_contract;
     use crate::kv::v2::{
         AppendStateDomainSpec, BoundedShape, CheckpointPolicy, InferenceStateContract,
         InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceProfile,
@@ -1970,7 +1970,7 @@ mod tests {
         StaticTensorDomainSpec, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
         WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
     };
-    use crate::kv::{CacheCapability, KvArenaId, KvGroupId, KvLayerBinding};
+    use crate::kv::{InferenceStateCapability, KvArenaId, KvGroupId, KvLayerBinding};
 
     fn binding() -> ExecutionAdapterBinding {
         let variant = ModelVariant::Kokoro82M;
@@ -2540,7 +2540,7 @@ mod tests {
         execution.model_instance_id = model_instance;
         let graph = stage_graph_fingerprint(&execution.stages).unwrap();
         let (pool, workspace_domain) = invocation_pool(model_instance);
-        let retained_contract = upgrade_kv_contract_v1(&crate::kv::test_contract()).unwrap();
+        let retained_contract = crate::kv::test_contract();
         let descriptor = CapabilityStateDescriptorV2 {
             abi: CURRENT_INFERENCE_STATE_ABI,
             retained: RetainedStateCapability::Managed {
@@ -2574,7 +2574,7 @@ mod tests {
         let physical = core
             .load_managed_model_cache(
                 model_instance,
-                &CacheCapability::Managed(crate::kv::test_contract()),
+                &InferenceStateCapability::Managed(crate::kv::test_contract()),
             )
             .unwrap()
             .expect("managed physical cache");

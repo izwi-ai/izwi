@@ -16,7 +16,8 @@ use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
-use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
+use crate::kv::v2::StateDomainId;
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::core::Gemma3PhysicalModel;
 use crate::models::shared::attention::paged::default_kv_page_size;
@@ -370,11 +371,11 @@ pub struct Gemma3ChatModel {
     text_model: Gemma3PhysicalModel,
 }
 
-impl KvCacheContractProvider for Gemma3ChatModel {
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
-        Ok(CacheCapability::Managed(
-            self.text_model.managed_kv_cache_contract(
-                CacheDomainId::new(0),
+impl InferenceStateContractProvider for Gemma3ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        Ok(InferenceStateCapability::Managed(
+            self.text_model.managed_inference_state_contract(
+                StateDomainId::new(1),
                 self.compute_dtype,
                 default_kv_page_size(),
             )?,

@@ -16,7 +16,8 @@ use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
-use crate::kv::{CacheCapability, CacheDomainId, KvCacheContractProvider};
+use crate::kv::v2::StateDomainId;
+use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3Model};
 use crate::models::shared::attention::paged::default_kv_page_size;
@@ -180,17 +181,17 @@ pub struct Qwen3ChatModel {
     text_model: Qwen3Model,
 }
 
-impl KvCacheContractProvider for Qwen3ChatModel {
-    fn kv_cache_contract(&self) -> Result<CacheCapability> {
+impl InferenceStateContractProvider for Qwen3ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         if !self.text_model.supports_managed_kv_execution() {
             return Err(Error::ModelLoadError(
                 "native Qwen3 attention geometry is unsupported by the physical runtime"
                     .to_string(),
             ));
         }
-        Ok(CacheCapability::Managed(
-            self.text_model.managed_kv_cache_contract(
-                CacheDomainId::new(0),
+        Ok(InferenceStateCapability::Managed(
+            self.text_model.managed_inference_state_contract(
+                StateDomainId::new(1),
                 self.compute_dtype,
                 default_kv_page_size(),
             )?,

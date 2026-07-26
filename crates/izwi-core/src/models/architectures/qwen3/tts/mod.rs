@@ -37,17 +37,14 @@ use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, upgrade_kv_contract_v1, BoundedShape, CapabilityStateDescriptorV2,
-    CheckpointPolicy, InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
+    stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
+    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
     InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, PlacementPolicy, PrefixPolicy, RetainedStateCapability, ShapeAxis,
-    ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType, StateDomainHeader,
-    StateDomainId, StateDomainSpec, StateScope, TensorComponentSpec, TensorRole,
-    TensorStateDomainSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
-};
-use crate::kv::{
-    CacheDomainId, CacheTokenAxis, KvCacheContract, KvDomainSpec, KvPrefixSemantics,
-    PositionSemantics, CURRENT_KV_CONTRACT_ABI,
+    InvocationWorkspaceSet, PlacementPolicy, PositionSemantics, PrefixPolicy,
+    RetainedStateCapability, ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId,
+    StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec,
+    StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec, WorkspaceFormula,
+    CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
@@ -63,7 +60,6 @@ const QWEN3_TTS_MODEL_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3TtsPhysicalStateSpec {
-    pub(crate) retained_v1: KvCacheContract,
     pub(crate) retained: InferenceStateContract,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) predictor_contract: InferenceStateContract,
@@ -427,8 +423,8 @@ impl Qwen3TtsModel {
     ///
     /// The loaded adapter remains opaque until both cache owners consume one
     /// engine transaction and return domain-complete write receipts.
-    pub(crate) fn managed_kv_cache_contract(&self) -> Result<KvCacheContract> {
-        qwen3_tts_managed_kv_cache_contract(
+    pub(crate) fn managed_inference_state_contract(&self) -> Result<InferenceStateContract> {
+        qwen3_tts_inference_state_contract(
             &self.config,
             self.dtype,
             self.code_predictor_dtype,
@@ -447,24 +443,26 @@ impl Qwen3TtsModel {
                 "Qwen3 TTS physical state has no execution graph".to_string(),
             ));
         }
-        let full = self.managed_kv_cache_contract()?;
-        let mut retained_v1 = KvCacheContract {
+        let full = self.managed_inference_state_contract()?;
+        let mut retained_base = InferenceStateContract {
             abi: full.abi,
             domains: vec![full.domains[0].clone()],
+            groups: vec![full.groups[0].clone()],
         };
-        let KvDomainSpec::PagedAttention(talker_v1) = &mut retained_v1.domains[0] else {
+        let StateDomainSpec::PagedAttention(talker) = &mut retained_base.domains[0] else {
             unreachable!("Qwen3 TTS talker is paged attention")
         };
-        talker_v1.prefix_semantics = KvPrefixSemantics::Disabled;
-        retained_v1.validate()?;
-        let retained = qwen3_tts_retained_state_contract(&retained_v1, &self.config, self.dtype)?;
+        talker.header.prefix = PrefixPolicy::Disabled;
+        talker.header.checkpoint = CheckpointPolicy::Transactional;
+        retained_base.groups[0].prefix_shareable = false;
+        retained_base.validate()?;
+        let retained = qwen3_tts_retained_state_contract(retained_base, &self.config, self.dtype)?;
 
-        let predictor_v1 = KvCacheContract {
+        let mut predictor_contract = InferenceStateContract {
             abi: full.abi,
             domains: vec![full.domains[1].clone()],
+            groups: vec![full.groups[1].clone()],
         };
-        predictor_v1.validate()?;
-        let mut predictor_contract = upgrade_kv_contract_v1(&predictor_v1)?;
         let StateDomainSpec::PagedAttention(predictor) = &mut predictor_contract.domains[0] else {
             unreachable!("Qwen3 TTS predictor is paged attention")
         };
@@ -524,7 +522,6 @@ impl Qwen3TtsModel {
             descriptor.validate_against_stages(stages)?;
         }
         Ok(Qwen3TtsPhysicalStateSpec {
-            retained_v1,
             retained,
             descriptor,
             predictor_contract,
@@ -544,11 +541,10 @@ fn qwen3_tts_state_dtype(dtype: DType) -> Result<StateDType> {
 }
 
 fn qwen3_tts_retained_state_contract(
-    retained_v1: &KvCacheContract,
+    mut retained: InferenceStateContract,
     config: &Qwen3TtsConfig,
     dtype: DType,
 ) -> Result<InferenceStateContract> {
-    let mut retained = upgrade_kv_contract_v1(retained_v1)?;
     let state_dtype = qwen3_tts_state_dtype(dtype)?;
     let hidden = config.talker_config.hidden_size;
     let max_sequence = config.talker_config.max_position_embeddings;
@@ -632,17 +628,17 @@ fn qwen3_tts_state_component(
     })
 }
 
-fn qwen3_tts_managed_kv_cache_contract(
+fn qwen3_tts_inference_state_contract(
     config: &Qwen3TtsConfig,
     talker_dtype: DType,
     predictor_dtype: DType,
     page_tokens: usize,
-) -> Result<KvCacheContract> {
+) -> Result<InferenceStateContract> {
     let talker = &config.talker_config;
     let predictor = &talker.code_predictor_config;
     let talker_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-        domain: CacheDomainId::new(0),
-        token_axis: CacheTokenAxis::Custom("qwen3_tts_talker_tokens".into()),
+        domain: StateDomainId::new(1),
+        clock: StateClock::Custom("qwen3_tts_talker_tokens".into()),
         num_layers: talker.num_hidden_layers,
         num_query_heads: talker.num_attention_heads,
         num_kv_heads: talker.num_key_value_heads,
@@ -651,13 +647,13 @@ fn qwen3_tts_managed_kv_cache_contract(
         sliding_window: None,
         storage_dtype: talker_dtype,
         preferred_page_tokens: page_tokens,
-        prefix_semantics: KvPrefixSemantics::CommittedFullPages {
+        prefix: PrefixPolicy::CommittedPages {
             positions: PositionSemantics::Absolute,
         },
     })?;
     let predictor_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
-        domain: CacheDomainId::new(1),
-        token_axis: CacheTokenAxis::Custom("qwen3_tts_predictor_tokens".into()),
+        domain: StateDomainId::new(2),
+        clock: StateClock::Custom("qwen3_tts_predictor_tokens".into()),
         num_layers: predictor.num_hidden_layers,
         num_query_heads: predictor.num_attention_heads,
         num_kv_heads: predictor.num_key_value_heads,
@@ -666,13 +662,25 @@ fn qwen3_tts_managed_kv_cache_contract(
         sliding_window: None,
         storage_dtype: predictor_dtype,
         preferred_page_tokens: page_tokens,
-        prefix_semantics: KvPrefixSemantics::Disabled,
+        prefix: PrefixPolicy::Disabled,
     })?;
-    let contract = KvCacheContract {
-        abi: CURRENT_KV_CONTRACT_ABI,
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![
-            KvDomainSpec::PagedAttention(talker_domain),
-            KvDomainSpec::PagedAttention(predictor_domain),
+            StateDomainSpec::PagedAttention(talker_domain),
+            StateDomainSpec::PagedAttention(predictor_domain),
+        ],
+        groups: vec![
+            StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: vec![StateDomainId::new(1)],
+                prefix_shareable: true,
+            },
+            StateGroupSpec {
+                id: StateGroupId::new(2),
+                domains: vec![StateDomainId::new(2)],
+                prefix_shareable: false,
+            },
         ],
     };
     contract.validate()?;
@@ -2796,40 +2804,40 @@ mod tests {
     #[test]
     fn target_managed_contract_keeps_talker_and_predictor_domains_distinct() {
         let contract =
-            qwen3_tts_managed_kv_cache_contract(&cache_test_config(), DType::F16, DType::F32, 32)
+            qwen3_tts_inference_state_contract(&cache_test_config(), DType::F16, DType::F32, 32)
                 .expect("target contract");
         assert_eq!(contract.domains.len(), 2);
 
-        let KvDomainSpec::PagedAttention(talker) = &contract.domains[0] else {
+        let StateDomainSpec::PagedAttention(talker) = &contract.domains[0] else {
             panic!("talker domain must be paged attention");
         };
-        let KvDomainSpec::PagedAttention(predictor) = &contract.domains[1] else {
+        let StateDomainSpec::PagedAttention(predictor) = &contract.domains[1] else {
             panic!("predictor domain must be paged attention");
         };
-        assert_eq!(talker.id, CacheDomainId::new(0));
+        assert_eq!(talker.header.id, StateDomainId::new(1));
         assert_eq!(talker.layers.len(), 28);
-        assert_eq!(talker.storage.dtypes, vec![crate::kv::KvStorageDType::F16]);
-        assert_eq!(predictor.id, CacheDomainId::new(1));
+        assert_eq!(talker.accepted_dtypes, vec![StateDType::F16]);
+        assert_eq!(predictor.header.id, StateDomainId::new(2));
         assert_eq!(predictor.layers.len(), 5);
-        assert_eq!(
-            predictor.storage.dtypes,
-            vec![crate::kv::KvStorageDType::F32]
-        );
+        assert_eq!(predictor.accepted_dtypes, vec![StateDType::F32]);
     }
 
     fn retained_state_test_contract() -> InferenceStateContract {
         let full =
-            qwen3_tts_managed_kv_cache_contract(&cache_test_config(), DType::F32, DType::F32, 32)
+            qwen3_tts_inference_state_contract(&cache_test_config(), DType::F32, DType::F32, 32)
                 .expect("managed contract");
-        let mut retained_v1 = KvCacheContract {
+        let mut retained = InferenceStateContract {
             abi: full.abi,
             domains: vec![full.domains[0].clone()],
+            groups: vec![full.groups[0].clone()],
         };
-        let KvDomainSpec::PagedAttention(talker) = &mut retained_v1.domains[0] else {
+        let StateDomainSpec::PagedAttention(talker) = &mut retained.domains[0] else {
             panic!("talker domain must be paged attention");
         };
-        talker.prefix_semantics = KvPrefixSemantics::Disabled;
-        qwen3_tts_retained_state_contract(&retained_v1, &cache_test_config(), DType::F32)
+        talker.header.prefix = PrefixPolicy::Disabled;
+        talker.header.checkpoint = CheckpointPolicy::Transactional;
+        retained.groups[0].prefix_shareable = false;
+        qwen3_tts_retained_state_contract(retained, &cache_test_config(), DType::F32)
             .expect("retained state contract")
     }
 
