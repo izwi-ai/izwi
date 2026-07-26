@@ -1,13 +1,14 @@
 //! Slow semantic transformer for Fish S2 DualAR generation.
 
-use candle_core::{Tensor, D};
+use candle_core::Tensor;
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::contracts::build_semantic_allowed_mask;
 use crate::models::architectures::fish_s2::tokenizer::FishS2ConditioningPrompt;
-use crate::models::architectures::qwen3::core::{build_rope_cache, causal_mask, repeat_kv};
+use crate::models::architectures::qwen3::core::build_rope_cache;
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2SlowConfig {
@@ -32,17 +33,6 @@ pub struct FishS2SlowConfig {
 pub struct FishS2SlowOutput {
     pub logits: Tensor,
     pub hidden_states: Tensor,
-}
-
-#[derive(Debug, Default)]
-pub struct FishS2SlowCache {
-    layers: Vec<FishS2LayerCache>,
-}
-
-#[derive(Debug, Default)]
-struct FishS2LayerCache {
-    key: Option<Tensor>,
-    value: Option<Tensor>,
 }
 
 pub struct FishS2SlowTransformer {
@@ -119,24 +109,6 @@ impl FishS2SlowConfig {
     }
 }
 
-impl FishS2SlowCache {
-    pub fn new(num_layers: usize) -> Self {
-        Self {
-            layers: (0..num_layers)
-                .map(|_| FishS2LayerCache::default())
-                .collect(),
-        }
-    }
-
-    pub fn current_len(&self) -> usize {
-        self.layers
-            .first()
-            .and_then(|layer| layer.key.as_ref())
-            .and_then(|key| key.dims().get(2).copied())
-            .unwrap_or(0)
-    }
-}
-
 impl FishS2SlowTransformer {
     pub fn load(cfg: FishS2SlowConfig, vb: VarBuilder) -> Result<Self> {
         let embeddings =
@@ -173,10 +145,6 @@ impl FishS2SlowTransformer {
 
     pub fn config(&self) -> &FishS2SlowConfig {
         &self.cfg
-    }
-
-    pub fn new_cache(&self) -> FishS2SlowCache {
-        FishS2SlowCache::new(self.layers.len())
     }
 
     pub fn embed_prompt(&self, prompt: &FishS2ConditioningPrompt) -> Result<Tensor> {
@@ -274,13 +242,36 @@ impl FishS2SlowTransformer {
         &self,
         x: &Tensor,
         start_pos: usize,
-        mut cache: Option<&mut FishS2SlowCache>,
+        cache: &mut PhysicalPagedKvCache,
         return_all: bool,
     ) -> Result<FishS2SlowOutput> {
+        let (batch_size, sequence_len, hidden_size) = x.dims3()?;
+        if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 slow physical paging expects [1,sequence,{}], got {:?}",
+                self.cfg.hidden_size,
+                x.dims()
+            )));
+        }
+        let end_pos = start_pos.checked_add(sequence_len).ok_or_else(|| {
+            Error::InvalidInput("Fish S2 slow physical context length overflow".into())
+        })?;
+        if end_pos > self.cfg.max_seq_len || end_pos > cache.capacity_tokens() {
+            return Err(Error::InvalidInput(format!(
+                "Fish S2 slow physical append ends at {end_pos}, beyond model/cache capacity {}/{}",
+                self.cfg.max_seq_len,
+                cache.capacity_tokens()
+            )));
+        }
+        cache.validate_model(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim,
+        )?;
+        let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
         let mut hidden = x.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
-            let layer_cache = cache.as_deref_mut().map(|cache| &mut cache.layers[idx]);
-            hidden = layer.forward(&hidden, start_pos, layer_cache)?;
+            hidden = layer.forward(&hidden, start_pos, cache, &mut prepared, idx)?;
         }
 
         let hidden_for_fast = self.norm.forward(&hidden)?;
@@ -297,16 +288,18 @@ impl FishS2SlowTransformer {
             let seq_len = hidden_for_fast.dim(1)?;
             hidden_for_fast.narrow(1, seq_len - 1, 1)?
         };
-        Ok(FishS2SlowOutput {
+        let output = FishS2SlowOutput {
             logits,
             hidden_states,
-        })
+        };
+        cache.commit_prepared(prepared)?;
+        Ok(output)
     }
 
     pub fn forward_prompt(
         &self,
         prompt: &FishS2ConditioningPrompt,
-        cache: Option<&mut FishS2SlowCache>,
+        cache: &mut PhysicalPagedKvCache,
         return_all: bool,
     ) -> Result<FishS2SlowOutput> {
         let x = self.embed_prompt(prompt)?;
@@ -386,10 +379,14 @@ impl FishS2SlowLayer {
         &self,
         x: &Tensor,
         start_pos: usize,
-        cache: Option<&mut FishS2LayerCache>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn = self.self_attn.forward(&normed, start_pos, cache)?;
+        let attn = self
+            .self_attn
+            .forward(&normed, start_pos, cache, prepared, layer_idx)?;
         let x = x.broadcast_add(&attn)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp = self.mlp.forward(&normed)?;
@@ -432,10 +429,17 @@ impl FishS2PackedAttention {
         &self,
         x: &Tensor,
         start_pos: usize,
-        cache: Option<&mut FishS2LayerCache>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
+        if bsz != 1 {
+            return Err(Error::InvalidInput(
+                "Fish S2 slow physical paged attention expects one sequence".into(),
+            ));
+        }
         let q_size = self.num_heads * self.head_dim;
         let kv_size = self.num_kv_heads * self.head_dim;
         let qkv = self.qkv_proj.forward(x)?;
@@ -473,38 +477,12 @@ impl FishS2PackedAttention {
         )?;
         let q = apply_rope(&q, &cos, &sin)?;
         let k = apply_rope(&k, &cos, &sin)?;
-        let q = q.transpose(1, 2)?;
-        let mut k = k.transpose(1, 2)?;
-        let mut v = v.transpose(1, 2)?;
-
-        if let Some(cache) = cache {
-            if let (Some(prev_k), Some(prev_v)) = (&cache.key, &cache.value) {
-                k = Tensor::cat(&[prev_k, &k], 2)?;
-                v = Tensor::cat(&[prev_v, &v], 2)?;
-            }
-            cache.key = Some(k.clone());
-            cache.value = Some(v.clone());
-        }
-
-        let total_len = k.dim(2)?;
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-        let mask = causal_mask(seq_len, total_len, start_pos, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
+        let q = q.squeeze(0)?;
+        let k = k.squeeze(0)?;
+        let v = v.squeeze(0)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let out = cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?;
+        let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
 }
@@ -679,12 +657,17 @@ mod tests {
             vq_mask: vec![false, true, true],
             prompt_length: 3,
         };
-        let mut cache = model.new_cache();
-        let output = model
-            .forward_prompt(&prompt, Some(&mut cache), false)
-            .unwrap();
+        let cfg = model.config();
+        let mut cache = super::super::physical::test_physical_cache(
+            201,
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.max_seq_len,
+        );
+        let output = model.forward_prompt(&prompt, &mut cache, false).unwrap();
         assert_eq!(output.logits.dims(), &[1, 1, 32]);
         assert_eq!(output.hidden_states.dims(), &[1, 1, 4]);
-        assert_eq!(cache.current_len(), 3);
+        assert_eq!(cache.context_len(), 3);
     }
 }

@@ -10,7 +10,9 @@ use crate::catalog::ModelFamily;
 use crate::engine::{GenerationParams as CoreGenParams, ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::fish_s2::{FishS2GenerationParams, FishS2Reference};
+use crate::models::architectures::fish_s2::{
+    FishS2GenerationParams, FishS2Reference, FISH_S2_FAST_STATE_DOMAIN, FISH_S2_SLOW_STATE_DOMAIN,
+};
 use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
 use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
@@ -818,8 +820,8 @@ impl RuntimeService {
             Some(variant),
             streaming_required,
         )?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
+        let (residency_lease, execution_contract, state_binding) = self
+            .load_capability_with_state_for_job(
                 job,
                 variant,
                 CapabilityKind::Tts,
@@ -839,13 +841,14 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No Fish S2 TTS model loaded".to_string()))?;
         self.coordinator
-            .run_loaded_blocking_stage(
+            .run_loaded_blocking_stage_with_invocation_paged(
                 job,
                 execution_contract,
+                state_binding,
                 WorkUnit::AtomicJob {
                     kind: CapabilityKind::Tts.as_str().to_string(),
                 },
-                move || {
+                move |leases| {
                     let _residency_lease = residency_lease;
                     let reference = fish_s2_reference_from_request(&request)?;
                     let mut params = FishS2GenerationParams::default();
@@ -860,7 +863,11 @@ impl RuntimeService {
                     params.top_p = request.config.options.top_p;
 
                     let started = Instant::now();
-                    let output = model.generate_with_reference(&text, reference, params)?;
+                    let (slow_cache, fast_cache) = leases
+                        .cache_pair_mut(FISH_S2_SLOW_STATE_DOMAIN, FISH_S2_FAST_STATE_DOMAIN)?;
+                    let output = model.generate_with_reference_physical(
+                        &text, reference, params, slow_cache, fast_cache,
+                    )?;
                     let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
 
                     Ok(GenerationResult {

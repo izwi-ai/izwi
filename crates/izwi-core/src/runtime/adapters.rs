@@ -376,7 +376,7 @@ impl ModelCapabilityAdapter for TtsCapabilityAdapter {
             },
             state_requirement: match model_variant.family() {
                 ModelFamily::Qwen3Tts => InferenceStateRequirement::RetainedAndInvocation,
-                ModelFamily::VibeVoiceTts | ModelFamily::VoxtralTts => {
+                ModelFamily::VibeVoiceTts | ModelFamily::VoxtralTts | ModelFamily::FishS2Tts => {
                     InferenceStateRequirement::Invocation
                 }
                 _ => InferenceStateRequirement::Stateless,
@@ -942,6 +942,10 @@ mod tests {
             .expect("Fish S2 TTS adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(
+            adapter.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
     }
 
     #[test]
