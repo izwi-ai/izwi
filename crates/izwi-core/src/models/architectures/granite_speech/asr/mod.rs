@@ -1,14 +1,11 @@
 //! Native Granite Speech ASR facade.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Tensor};
+use candle_core::DType;
 use serde_json::json;
 use tracing::info;
 
@@ -72,7 +69,6 @@ const REQUIRED_ARTIFACTS: &[&str] = &[
 
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 9.0 * 60.0;
 const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 5.0 * 60.0;
-const AUDIO_EMBEDDING_CACHE_MAX_SECONDS: f32 = 60.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraniteSpeechAsrTranscriptionOutput {
@@ -110,28 +106,12 @@ pub struct GraniteSpeechAsrModel {
     prompt_tokenizer: GraniteSpeechPromptTokenizer,
     preprocessor: GraniteSpeechPreprocessor,
     runtime: GraniteSpeechRuntime,
-    audio_embedding_cache: Mutex<Option<GraniteSpeechAudioEmbeddingCacheEntry>>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct GraniteSpeechPhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: InferenceStateContract,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GraniteSpeechAudioEmbeddingCacheKey {
-    sample_rate: u32,
-    sample_count: usize,
-    hash: u64,
-}
-
-#[derive(Clone)]
-struct GraniteSpeechAudioEmbeddingCacheEntry {
-    key: GraniteSpeechAudioEmbeddingCacheKey,
-    features: GraniteSpeechAudioFeatures,
-    audio_embeds: Tensor,
-    stats: GraniteSpeechAudioEmbeddingStats,
 }
 
 impl GraniteSpeechAsrModel {
@@ -175,7 +155,6 @@ impl GraniteSpeechAsrModel {
             prompt_tokenizer,
             preprocessor,
             runtime,
-            audio_embedding_cache: Mutex::new(None),
         })
     }
 
@@ -468,48 +447,13 @@ impl GraniteSpeechAsrModel {
         emit_deltas: bool,
     ) -> Result<GraniteSpeechAsrTranscriptionOutput> {
         let model_start = Instant::now();
-        let cache_eligible = granite_audio_embedding_cache_eligible(audio.len(), sample_rate);
-        let cache_key =
-            cache_eligible.then(|| granite_audio_embedding_cache_key(audio, sample_rate));
         let prepare_start = Instant::now();
-        let cached = cache_key.and_then(|key| self.cached_audio_embedding(key));
-        let (features, audio_embeds, audio_stats, mel_prepare, encoder_forward, audio_cache_hit) =
-            if let Some(cached) = cached {
-                let stats = granite_cached_audio_embedding_stats(cached.stats);
-                (
-                    cached.features,
-                    cached.audio_embeds,
-                    stats,
-                    prepare_start.elapsed(),
-                    Duration::ZERO,
-                    true,
-                )
-            } else {
-                let features = self.prepare_audio_features(audio, sample_rate)?;
-                let mel_prepare = prepare_start.elapsed();
-                validate_granite_audio_duration(features.audio_seconds)?;
-                let encoder_start = Instant::now();
-                let (audio_embeds, audio_stats) =
-                    self.runtime.audio_embeddings_with_stats(&features)?;
-                let encoder_forward = encoder_start.elapsed();
-                if let Some(cache_key) = cache_key {
-                    self.store_audio_embedding(
-                        cache_key,
-                        features.clone(),
-                        audio_embeds.clone(),
-                        audio_stats,
-                    );
-                }
-                (
-                    features,
-                    audio_embeds,
-                    audio_stats,
-                    mel_prepare,
-                    encoder_forward,
-                    false,
-                )
-            };
+        let features = self.prepare_audio_features(audio, sample_rate)?;
+        let mel_prepare = prepare_start.elapsed();
         validate_granite_audio_duration(features.audio_seconds)?;
+        let encoder_start = Instant::now();
+        let (audio_embeds, audio_stats) = self.runtime.audio_embeddings_with_stats(&features)?;
+        let encoder_forward = encoder_start.elapsed();
 
         let prompt_options = GraniteSpeechPromptOptions {
             task,
@@ -542,7 +486,7 @@ impl GraniteSpeechAsrModel {
             prefill: generation.stats.timings.prefill,
             decode: generation.stats.timings.decode,
             model_total,
-            audio_cache_hit,
+            audio_cache_hit: false,
         };
 
         Ok(GraniteSpeechAsrTranscriptionOutput {
@@ -559,31 +503,6 @@ impl GraniteSpeechAsrModel {
                 audio_stats,
             )),
         })
-    }
-
-    fn cached_audio_embedding(
-        &self,
-        key: GraniteSpeechAudioEmbeddingCacheKey,
-    ) -> Option<GraniteSpeechAudioEmbeddingCacheEntry> {
-        let guard = self.audio_embedding_cache.lock().ok()?;
-        guard.as_ref().filter(|entry| entry.key == key).cloned()
-    }
-
-    fn store_audio_embedding(
-        &self,
-        key: GraniteSpeechAudioEmbeddingCacheKey,
-        features: GraniteSpeechAudioFeatures,
-        audio_embeds: Tensor,
-        stats: GraniteSpeechAudioEmbeddingStats,
-    ) {
-        if let Ok(mut guard) = self.audio_embedding_cache.lock() {
-            *guard = Some(GraniteSpeechAudioEmbeddingCacheEntry {
-                key,
-                features,
-                audio_embeds,
-                stats,
-            });
-        }
     }
 }
 
@@ -772,40 +691,6 @@ struct GraniteSpeechAsrTimings {
     decode: Duration,
     model_total: Duration,
     audio_cache_hit: bool,
-}
-
-fn granite_audio_embedding_cache_eligible(sample_count: usize, sample_rate: u32) -> bool {
-    sample_rate > 0
-        && sample_count > 0
-        && sample_count as f32 / sample_rate as f32 <= AUDIO_EMBEDDING_CACHE_MAX_SECONDS
-}
-
-fn granite_audio_embedding_cache_key(
-    audio: &[f32],
-    sample_rate: u32,
-) -> GraniteSpeechAudioEmbeddingCacheKey {
-    let mut hasher = DefaultHasher::new();
-    sample_rate.hash(&mut hasher);
-    audio.len().hash(&mut hasher);
-    for sample in audio {
-        sample.to_bits().hash(&mut hasher);
-    }
-    GraniteSpeechAudioEmbeddingCacheKey {
-        sample_rate,
-        sample_count: audio.len(),
-        hash: hasher.finish(),
-    }
-}
-
-fn granite_cached_audio_embedding_stats(
-    stats: GraniteSpeechAudioEmbeddingStats,
-) -> GraniteSpeechAudioEmbeddingStats {
-    GraniteSpeechAudioEmbeddingStats {
-        upload: Duration::ZERO,
-        encoder: Duration::ZERO,
-        projector: Duration::ZERO,
-        ..stats
-    }
 }
 
 fn validate_granite_audio_duration(audio_seconds: f32) -> Result<()> {
@@ -1460,7 +1345,7 @@ mod tests {
             prefill: generation.stats.timings.prefill,
             decode: generation.stats.timings.decode,
             model_total: Duration::from_millis(12),
-            audio_cache_hit: true,
+            audio_cache_hit: false,
         };
         let audio_stats = GraniteSpeechAudioEmbeddingStats {
             upload: Duration::from_millis(1),
@@ -1522,7 +1407,7 @@ mod tests {
         assert_eq!(diagnostics["execution"]["chunked_stop_check"], false);
         assert_eq!(diagnostics["execution"]["stop_check_interval"], 1);
         assert_eq!(diagnostics["execution"]["dense_decode_max_tokens"], 8192);
-        assert_eq!(diagnostics["execution"]["audio_embedding_cache_hit"], true);
+        assert_eq!(diagnostics["execution"]["audio_embedding_cache_hit"], false);
         assert_eq!(diagnostics["decode_profile"]["enabled"], true);
         assert_eq!(
             diagnostics["decode_profile"]["timing_kind"],
@@ -1571,58 +1456,5 @@ mod tests {
         assert_eq!(diagnostics["timings_ms"]["model_non_generation"], 2.0);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
-    }
-
-    #[test]
-    fn audio_embedding_cache_key_tracks_exact_audio_and_rate() {
-        let audio = [0.0f32, 0.25, -0.5, f32::INFINITY];
-        let same = granite_audio_embedding_cache_key(&audio, 16_000);
-        assert_eq!(same, granite_audio_embedding_cache_key(&audio, 16_000));
-
-        let mut changed_audio = audio;
-        changed_audio[1] = 0.5;
-        assert_ne!(
-            same,
-            granite_audio_embedding_cache_key(&changed_audio, 16_000)
-        );
-        assert_ne!(same, granite_audio_embedding_cache_key(&audio, 8_000));
-    }
-
-    #[test]
-    fn audio_embedding_cache_is_bounded_to_short_audio() {
-        assert!(granite_audio_embedding_cache_eligible(16_000, 16_000));
-        assert!(granite_audio_embedding_cache_eligible(60 * 16_000, 16_000));
-        assert!(!granite_audio_embedding_cache_eligible(
-            60 * 16_000 + 1,
-            16_000
-        ));
-        assert!(!granite_audio_embedding_cache_eligible(1, 0));
-        assert!(!granite_audio_embedding_cache_eligible(0, 16_000));
-    }
-
-    #[test]
-    fn cached_audio_embedding_stats_zero_current_run_timings() {
-        let stats = GraniteSpeechAudioEmbeddingStats {
-            upload: Duration::from_millis(1),
-            encoder: Duration::from_millis(2),
-            projector: Duration::from_millis(3),
-            encoder_frames: 4,
-            encoder_dim: 5,
-            conformer_context_size: 6,
-            conformer_blocks: 7,
-            conformer_pad_frames: 8,
-            conformer_layers: 9,
-            qformer_windows: 10,
-            qformer_window_size: 11,
-            qformer_queries_per_window: 12,
-            qformer_layers: 13,
-        };
-        let cached = granite_cached_audio_embedding_stats(stats);
-
-        assert_eq!(cached.upload, Duration::ZERO);
-        assert_eq!(cached.encoder, Duration::ZERO);
-        assert_eq!(cached.projector, Duration::ZERO);
-        assert_eq!(cached.encoder_frames, stats.encoder_frames);
-        assert_eq!(cached.qformer_windows, stats.qformer_windows);
     }
 }
