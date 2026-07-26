@@ -15,7 +15,8 @@ use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::{ModelFamily, ModelTask};
 use crate::engine::{
-    InvocationStaticAttentionLease, RetainedTensorStateRuntimeV2, StageDescriptor,
+    InvocationStaticAttentionLease, InvocationTensorLease, RetainedTensorStateRuntimeV2,
+    StageDescriptor,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
@@ -29,6 +30,7 @@ use crate::models::architectures::granite_speech::asr::{
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
+use crate::models::architectures::lfm2::physical::Lfm2PhysicalStateSpec;
 use crate::models::architectures::lfm25_audio::{
     Lfm25AudioGenerationConfig, Lfm25AudioModel, Lfm25AudioStreamConfig,
 };
@@ -2445,6 +2447,44 @@ pub struct NativeChatDecodeStep {
 }
 
 impl NativeChatModel {
+    pub(crate) fn lfm2_physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm2PhysicalStateSpec> {
+        match self {
+            Self::Lfm2(model) => model.physical_state_spec(stage_graphs),
+            _ => Err(Error::InvalidInput(
+                "loaded chat model is not an LFM2 physical-state provider".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn generate_lfm2_with_callback_physical(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatGenerationOutput> {
+        match self {
+            Self::Lfm2(model) => {
+                let output = model.generate_with_callback_physical(
+                    messages,
+                    max_new_tokens,
+                    cache,
+                    shortconv,
+                    on_delta,
+                )?;
+                Ok(ChatGenerationOutput {
+                    text: output.text,
+                    tokens_generated: output.tokens_generated,
+                })
+            }
+            _ => Err(Error::InvalidInput("loaded chat model is not LFM2".into())),
+        }
+    }
+
     /// Prepare the exact prompt consumed by execution. Qwen3.5 returns its
     /// reusable multimodal artifact; text-only families return token IDs only.
     pub fn prepare_prompt_for_execution(
@@ -2505,13 +2545,9 @@ impl NativeChatModel {
                     tokens_generated: output.tokens_generated,
                 })
             }
-            Self::Lfm2(model) => {
-                let output = model.generate(messages, max_new_tokens)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Lfm2(_) => Err(Error::InvalidInput(
+                "LFM2 chat requires invocation-owned physical state".into(),
+            )),
         }
     }
 
@@ -2544,13 +2580,9 @@ impl NativeChatModel {
                     tokens_generated: output.tokens_generated,
                 })
             }
-            Self::Lfm2(model) => {
-                let output = model.generate_with_callback(messages, max_new_tokens, on_delta)?;
-                Ok(ChatGenerationOutput {
-                    text: output.text,
-                    tokens_generated: output.tokens_generated,
-                })
-            }
+            Self::Lfm2(_) => Err(Error::InvalidInput(
+                "LFM2 chat requires invocation-owned physical state".into(),
+            )),
         }
     }
 

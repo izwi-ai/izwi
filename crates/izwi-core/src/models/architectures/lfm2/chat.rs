@@ -13,15 +13,18 @@ use tracing::info;
 
 use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::models::shared::telemetry::record_prefill_sequence_span;
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::Tokenizer;
 
 use super::backbone::QuantizedLfm2Backbone;
-use super::config::parse_lfm2_backbone_config;
+use super::config::{parse_lfm2_backbone_config, Lfm2BackboneConfig};
+use super::physical::{lfm2_physical_state_spec, Lfm2PhysicalStateSpec};
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -355,6 +358,7 @@ pub struct Lfm2ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
     prompt_scaffold: PromptScaffoldTokens,
+    config: Lfm2BackboneConfig,
     text_model: Mutex<QuantizedLfm2Backbone>,
 }
 
@@ -381,7 +385,7 @@ impl Lfm2ChatModel {
         let loader =
             GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
         let config = parse_lfm2_backbone_config(&loader)?;
-        let text_model = QuantizedLfm2Backbone::load(&loader, config, &device.device)?;
+        let text_model = QuantizedLfm2Backbone::load(&loader, config.clone(), &device.device)?;
         let prompt_scaffold = PromptScaffoldTokens::load(&tokenizer)?;
 
         info!(
@@ -408,6 +412,7 @@ impl Lfm2ChatModel {
             device,
             tokenizer,
             prompt_scaffold,
+            config,
             text_model: Mutex::new(text_model),
         })
     }
@@ -416,20 +421,31 @@ impl Lfm2ChatModel {
         false
     }
 
-    pub fn generate(
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm2PhysicalStateSpec> {
+        lfm2_physical_state_spec(&self.config, stage_graphs)
+    }
+
+    pub(crate) fn generate_with_callback_physical(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+        on_delta: &mut dyn FnMut(&str),
     ) -> Result<ChatGenerationOutput> {
-        let mut no_op = |_delta: &str| {};
-        self.generate_with_callback(messages, max_new_tokens, &mut no_op)
+        self.generate_with_callback_state(messages, max_new_tokens, on_delta, cache, shortconv)
     }
 
-    pub fn generate_with_callback(
+    fn generate_with_callback_state(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
         on_delta: &mut dyn FnMut(&str),
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
     ) -> Result<ChatGenerationOutput> {
         let total_started = Instant::now();
         let prompt_build_started = Instant::now();
@@ -444,8 +460,13 @@ impl Lfm2ChatModel {
         let prefill_started = Instant::now();
         let prefill_cfg = *lfm2_prefill_config();
         let prefill_exec = prefill_cfg.resolve(prompt_len);
-        let (mut logits, mut position, prefill_steps) =
-            self.prefill_prompt(&mut model, prompt_ids.as_slice(), prefill_exec)?;
+        let (mut logits, mut position, prefill_steps) = self.prefill_prompt(
+            &mut model,
+            prompt_ids.as_slice(),
+            prefill_exec,
+            cache,
+            shortconv,
+        )?;
         let prefill_forward_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
 
         let max_new_tokens = max_new_tokens.max(1);
@@ -481,7 +502,7 @@ impl Lfm2ChatModel {
 
             let next_tensor = Tensor::from_slice(&[next], (1, 1), &self.device.device)?;
             logits = model
-                .forward_tokens(&next_tensor, position)
+                .forward_tokens_physical(&next_tensor, position, cache, shortconv)
                 .map_err(|e| Error::InferenceError(format!("LFM2 GGUF decode failed: {e}")))?;
             position += 1;
         }
@@ -622,6 +643,8 @@ impl Lfm2ChatModel {
         model: &mut QuantizedLfm2Backbone,
         prompt_ids: &[u32],
         exec: Lfm2PrefillExecution,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
     ) -> Result<(Tensor, usize, usize)> {
         if prompt_ids.is_empty() {
             return Err(Error::InvalidInput(
@@ -635,7 +658,7 @@ impl Lfm2ChatModel {
                 let input_ids =
                     Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device.device)?;
                 let logits = model
-                    .forward_tokens(&input_ids, 0)
+                    .forward_tokens_physical(&input_ids, 0, cache, shortconv)
                     .map_err(|e| Error::InferenceError(format!("LFM2 GGUF forward failed: {e}")))?;
                 Ok((logits, prompt_ids.len(), 1))
             }

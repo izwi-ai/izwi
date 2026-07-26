@@ -186,6 +186,17 @@ impl PhysicalPagedKvCache {
         key_head_dim: usize,
         value_head_dim: usize,
     ) -> Result<()> {
+        let layers = model_layers
+            .iter()
+            .map(|model_layer| (*model_layer, num_kv_heads, key_head_dim, value_head_dim))
+            .collect::<Vec<_>>();
+        self.validate_sparse_model_layers(&layers)
+    }
+
+    pub(crate) fn validate_sparse_model_layers(
+        &self,
+        model_layers: &[(u32, usize, usize, usize)],
+    ) -> Result<()> {
         if self.layer_bindings.len() != model_layers.len()
             || self.arena.config().layers.len() != model_layers.len()
         {
@@ -193,7 +204,7 @@ impl PhysicalPagedKvCache {
                 "physical paged cache does not cover every sparse attention layer".into(),
             ));
         }
-        for ((binding, layer), model_layer) in self
+        for ((binding, layer), (model_layer, num_kv_heads, key_head_dim, value_head_dim)) in self
             .layer_bindings
             .iter()
             .zip(self.arena.config().layers.iter())
@@ -201,9 +212,9 @@ impl PhysicalPagedKvCache {
         {
             if layer.binding != *binding
                 || binding.model_layer != *model_layer
-                || layer.num_kv_heads as usize != num_kv_heads
-                || layer.key_head_dim as usize != key_head_dim
-                || layer.value_head_dim as usize != value_head_dim
+                || layer.num_kv_heads as usize != *num_kv_heads
+                || layer.key_head_dim as usize != *key_head_dim
+                || layer.value_head_dim as usize != *value_head_dim
             {
                 return Err(Error::InvalidInput(
                     "physical paged cache geometry does not match the sparse attention model"

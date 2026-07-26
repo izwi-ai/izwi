@@ -1820,6 +1820,22 @@ mod tests {
     }
 
     #[test]
+    fn lfm2_chat_fails_closed_without_physical_invocation_publication() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let error = LoadedModelBundle::bind(
+            &registry,
+            ExecutionGroupId::new(3),
+            ModelInstanceId::new(11),
+            ModelVariant::Lfm2512BInstructGguf,
+            BackendKind::Cpu,
+        )
+        .expect_err("LFM2 chat must not seal without physical invocation state");
+        assert!(error
+            .to_string()
+            .contains("requires an explicit load-sealed ABI-v2 state publication"));
+    }
+
+    #[test]
     fn v2_state_publication_is_preserved_without_legacy_fallback() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Qwen3TtsTokenizer12Hz;

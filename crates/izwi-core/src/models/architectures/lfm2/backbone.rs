@@ -7,6 +7,8 @@ use candle_transformers::models::with_tracing::QMatMul;
 
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 
+use crate::backends::state::InvocationRingDepthwiseConvTransaction;
+use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_decode_gqa_attention_with_kv_len, try_fused_qk_rms_norm, try_fused_rms_norm,
@@ -16,6 +18,7 @@ use crate::kernels::{
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
 };
+use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_fused_attention_attempt, record_fused_attention_fallback,
     record_fused_attention_success, record_rope_kernel, AttentionFallbackReason,
@@ -26,6 +29,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::architectures::lfm25_audio::cache::DenseKvCache;
 
 use super::config::Lfm2BackboneConfig;
+use super::physical::{lfm2_physical_state_spec, Lfm2PhysicalStateSpec, Lfm2StateLayout};
 
 #[derive(Debug)]
 struct Mlp {
@@ -52,6 +56,7 @@ struct AttentionLayer {
     cos_sin: Tensor,
     neg_inf: Tensor,
     kv_cache: DenseKvCache,
+    physical_layer: usize,
 }
 
 #[derive(Debug)]
@@ -61,6 +66,7 @@ struct ShortConvLayer {
     conv: Tensor,
     l_cache: usize,
     cache: Option<Tensor>,
+    component: crate::kv::v2::StateComponentId,
 }
 
 #[derive(Debug)]
@@ -91,6 +97,7 @@ pub struct QuantizedLfm2Backbone {
     norm: LfmRmsNorm,
     masks: HashMap<usize, Tensor>,
     vocab_size: usize,
+    state_layout: Lfm2StateLayout,
 }
 
 #[derive(Debug, Clone)]
@@ -205,14 +212,12 @@ impl AttentionLayer {
         Ok(None)
     }
 
-    fn forward(
-        &mut self,
+    fn project_qkv(
+        &self,
         hidden_states: &Tensor,
-        mask: Option<&Tensor>,
         index_pos: usize,
-    ) -> Result<Tensor> {
-        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
-
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (batch_size, seq_len, _) = hidden_states.dims3()?;
         let query_states = self.wq.forward(hidden_states)?.reshape((
             batch_size,
             seq_len,
@@ -225,15 +230,12 @@ impl AttentionLayer {
             self.n_kv_head,
             self.head_dim,
         ))?;
-        let value_states = self.wv.forward(hidden_states)?.reshape((
-            batch_size,
-            seq_len,
-            self.n_kv_head,
-            self.head_dim,
-        ))?;
-
-        let value_states = value_states.transpose(1, 2)?.contiguous()?;
-
+        let value_states = self
+            .wv
+            .forward(hidden_states)?
+            .reshape((batch_size, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
         let query_states = query_states.contiguous()?;
         let key_states = key_states.contiguous()?;
         let (query_states, key_states) = if seq_len == 1 && query_states.device().is_metal() {
@@ -271,6 +273,18 @@ impl AttentionLayer {
                 self.apply_rotary_emb(&key_states, index_pos)?,
             )
         };
+        Ok((query_states, key_states, value_states))
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+        let (query_states, key_states, value_states) =
+            self.project_qkv(hidden_states, index_pos)?;
 
         if index_pos == 0 {
             self.kv_cache.reset();
@@ -380,6 +394,35 @@ impl AttentionLayer {
         self.wo.forward(&attn_output).map_err(Error::from)
     }
 
+    fn forward_physical(
+        &self,
+        hidden_states: &Tensor,
+        index_pos: usize,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+    ) -> Result<Tensor> {
+        let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
+        if batch_size != 1 {
+            return Err(Error::InvalidInput(
+                "LFM2 physical attention currently requires batch size one".into(),
+            ));
+        }
+        let (queries, keys, values) = self.project_qkv(hidden_states, index_pos)?;
+        let queries = queries.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let keys = keys.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let values = values.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let output = cache.write_and_attend(
+            self.physical_layer,
+            prepared,
+            &queries,
+            &keys,
+            &values,
+            (1.0f64 / (self.head_dim as f64).sqrt()) as f32,
+        )?;
+        let output = output.reshape((batch_size, seq_len, hidden_size))?;
+        self.wo.forward(&output).map_err(Error::from)
+    }
+
     fn reset_state(&mut self) {
         self.kv_cache.reset();
     }
@@ -482,6 +525,22 @@ impl ShortConvLayer {
         self.out_proj.forward(&conv_out).map_err(Error::from)
     }
 
+    fn forward_physical(
+        &self,
+        hidden_states: &Tensor,
+        transaction: &mut InvocationRingDepthwiseConvTransaction<'_>,
+    ) -> Result<Tensor> {
+        let (_, _, hidden_size) = hidden_states.dims3()?;
+        let projected = self.in_proj.forward(hidden_states)?.transpose(1, 2)?;
+        let b = projected.narrow(1, 0, hidden_size)?;
+        let c = projected.narrow(1, hidden_size, hidden_size)?;
+        let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
+        let bx = (&b * &x)?.contiguous()?;
+        let conv_out = transaction.apply(self.component, &bx, &self.conv)?;
+        let conv_out = (&c * &conv_out)?.transpose(1, 2)?.contiguous()?;
+        self.out_proj.forward(&conv_out).map_err(Error::from)
+    }
+
     fn reset_state(&mut self) {
         self.cache = None;
     }
@@ -534,6 +593,7 @@ impl ProjectionHead {
 
 impl QuantizedLfm2Backbone {
     pub fn load(loader: &GgufLoader, cfg: Lfm2BackboneConfig, device: &Device) -> Result<Self> {
+        let state_layout = Lfm2StateLayout::from_config(&cfg)?;
         let (cos, sin) = precompute_freqs(
             cfg.embedding_length / cfg.attention_head_count,
             cfg.rope_freq_base as f32,
@@ -622,6 +682,15 @@ impl QuantizedLfm2Backbone {
                 > 0;
             let kind = if is_attention {
                 let n_kv_head = cfg.attention_head_count_kv[layer_idx];
+                let physical_layer = state_layout
+                    .attention_model_layers
+                    .iter()
+                    .position(|model_layer| *model_layer as usize == layer_idx)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!(
+                            "LFM2 attention layer {layer_idx} is absent from physical layout"
+                        ))
+                    })?;
                 let q_norm = LfmRmsNorm::from_qtensor(
                     load_qtensor_any(
                         loader,
@@ -699,6 +768,7 @@ impl QuantizedLfm2Backbone {
                     cos_sin: cos_sin.clone(),
                     neg_inf: neg_inf.clone(),
                     kv_cache: DenseKvCache::new(1),
+                    physical_layer,
                 })
             } else {
                 LayerKind::ShortConv(ShortConvLayer {
@@ -737,6 +807,7 @@ impl QuantizedLfm2Backbone {
                     )?,
                     l_cache: cfg.shortconv_l_cache,
                     cache: None,
+                    component: state_layout.shortconv_component(layer_idx)?,
                 })
             };
 
@@ -756,6 +827,7 @@ impl QuantizedLfm2Backbone {
             norm,
             masks: HashMap::new(),
             vocab_size,
+            state_layout,
         })
     }
 
@@ -769,6 +841,13 @@ impl QuantizedLfm2Backbone {
 
     pub fn hidden_size(&self) -> usize {
         self.cfg.embedding_length
+    }
+
+    pub(crate) fn physical_state_spec(
+        &self,
+        stage_graphs: &[&[StageDescriptor]],
+    ) -> Result<Lfm2PhysicalStateSpec> {
+        lfm2_physical_state_spec(&self.cfg, stage_graphs)
     }
 
     pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
@@ -791,6 +870,116 @@ impl QuantizedLfm2Backbone {
         let hidden_states = self.embed_tokens(token_ids)?;
         let hidden_states = self.forward_embeds(&hidden_states, index_pos)?;
         self.project_last_hidden(&hidden_states)
+    }
+
+    pub(crate) fn forward_tokens_physical(
+        &mut self,
+        token_ids: &Tensor,
+        index_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+    ) -> Result<Tensor> {
+        let hidden_states = self.embed_tokens(token_ids)?;
+        let hidden_states =
+            self.forward_embeds_physical(&hidden_states, index_pos, cache, shortconv)?;
+        self.project_last_hidden(&hidden_states)
+    }
+
+    pub(crate) fn forward_embeds_physical(
+        &mut self,
+        input_embeds: &Tensor,
+        index_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden) = input_embeds.dims3()?;
+        if batch != 1 || hidden != self.cfg.embedding_length || index_pos != cache.context_len() {
+            return Err(Error::InvalidInput(
+                "LFM2 physical input does not match its invocation state".into(),
+            ));
+        }
+        let head_dim = self.cfg.embedding_length / self.cfg.attention_head_count;
+        let sparse_geometry = self
+            .state_layout
+            .attention_model_layers
+            .iter()
+            .map(|model_layer| {
+                (
+                    *model_layer,
+                    self.cfg.attention_head_count_kv[*model_layer as usize],
+                    head_dim,
+                    head_dim,
+                )
+            })
+            .collect::<Vec<_>>();
+        cache.validate_sparse_model_layers(&sparse_geometry)?;
+
+        if let Some(window_tokens) = self.cfg.attention_sliding_window {
+            let mut outputs = Vec::with_capacity(seq_len);
+            for offset in 0..seq_len {
+                outputs.push(
+                    self.forward_embeds_physical_chunk(
+                        &input_embeds.narrow(1, offset, 1)?,
+                        index_pos
+                            .checked_add(offset)
+                            .ok_or_else(|| Error::InvalidInput("LFM2 position overflow".into()))?,
+                        cache,
+                        shortconv,
+                        Some(window_tokens),
+                    )?,
+                );
+            }
+            return match outputs.as_slice() {
+                [single] => Ok(single.clone()),
+                _ => Tensor::cat(&outputs, 1).map_err(Error::from),
+            };
+        }
+
+        self.forward_embeds_physical_chunk(input_embeds, index_pos, cache, shortconv, None)
+    }
+
+    fn forward_embeds_physical_chunk(
+        &mut self,
+        input_embeds: &Tensor,
+        index_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        shortconv: &mut InvocationTensorLease,
+        sliding_window: Option<usize>,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden) = input_embeds.dims3()?;
+        let mut prepared = match sliding_window {
+            Some(window_tokens) => {
+                cache.prepare_append_with_window(index_pos, seq_len, window_tokens)?
+            }
+            None => cache.prepare_append(index_pos, seq_len)?,
+        };
+        let intent = self
+            .state_layout
+            .ring_step_intent(index_pos, batch, hidden, seq_len)?;
+        let output = shortconv.with_ring_depthwise_conv(&intent, |transaction| {
+            let mut hidden_states = input_embeds.clone();
+            for layer in self.layers.iter_mut() {
+                let residual = hidden_states.clone();
+                let hidden = layer.operator_norm.forward(&hidden_states)?;
+                let hidden = match &mut layer.kind {
+                    LayerKind::Attention(attention) => {
+                        attention.forward_physical(&hidden, index_pos, cache, &mut prepared)?
+                    }
+                    LayerKind::ShortConv(shortconv) => {
+                        shortconv.forward_physical(&hidden, transaction)?
+                    }
+                };
+                hidden_states = (&hidden + &residual)?;
+
+                let residual = hidden_states.clone();
+                let hidden = layer.ffn_norm.forward(&hidden_states)?;
+                let hidden = layer.mlp.forward(&hidden)?;
+                hidden_states = (&hidden + &residual)?;
+            }
+            self.norm.forward(&hidden_states).map_err(Error::from)
+        })?;
+        cache.commit_prepared(prepared)?;
+        Ok(output)
     }
 
     pub fn forward_embeds(&mut self, input_embeds: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -836,15 +1025,14 @@ impl QuantizedLfm2Backbone {
             return Ok(mask.clone());
         }
 
-        let mask: Vec<u8> = if let Some(sliding_window) = self.cfg.attention_sliding_window {
-            (0..seq_len)
-                .flat_map(|i| (0..seq_len).map(move |j| u8::from(j > i || j + sliding_window < i)))
-                .collect()
-        } else {
-            (0..seq_len)
-                .flat_map(|i| (0..seq_len).map(move |j| u8::from(j > i)))
-                .collect()
-        };
+        let sliding_window = self.cfg.attention_sliding_window;
+        let mask: Vec<u8> = (0..seq_len)
+            .flat_map(|query| {
+                (0..seq_len).map(move |key| {
+                    u8::from(lfm2_attention_position_masked(query, key, sliding_window))
+                })
+            })
+            .collect();
         let mask = Tensor::from_slice(&mask, (seq_len, seq_len), device)?;
         self.masks.insert(seq_len, mask.clone());
         Ok(mask)
@@ -862,9 +1050,17 @@ fn lfm25_cuda_flash_attention_options(
     sliding_window: Option<usize>,
 ) -> CudaFlashAttentionOptions<'static> {
     CudaFlashAttentionOptions {
-        window_size_left: if masked_prefill { sliding_window } else { None },
+        window_size_left: if masked_prefill {
+            sliding_window.map(|window| window.saturating_sub(1))
+        } else {
+            None
+        },
         ..CudaFlashAttentionOptions::default()
     }
+}
+
+fn lfm2_attention_position_masked(query: usize, key: usize, sliding_window: Option<usize>) -> bool {
+    key > query || sliding_window.is_some_and(|window| query.saturating_sub(key) >= window)
 }
 
 fn should_try_lfm25_metal_prefill_sdpa(
@@ -998,12 +1194,12 @@ fn load_optional_bias_any(
 
 #[cfg(test)]
 mod tests {
-    use super::lfm25_cuda_flash_attention_options;
+    use super::{lfm25_cuda_flash_attention_options, lfm2_attention_position_masked};
 
     #[test]
     fn lfm25_cuda_flash_options_use_window_only_for_masked_prefill() {
         let options = lfm25_cuda_flash_attention_options(true, Some(512));
-        assert_eq!(options.window_size_left, Some(512));
+        assert_eq!(options.window_size_left, Some(511));
         assert_eq!(options.window_size_right, None);
         assert!(options.alibi_slopes.is_none());
         assert!(options.softcap.is_none());
@@ -1013,5 +1209,15 @@ mod tests {
 
         let full_causal_options = lfm25_cuda_flash_attention_options(true, None);
         assert_eq!(full_causal_options.window_size_left, None);
+    }
+
+    #[test]
+    fn lfm2_sliding_window_counts_the_current_token() {
+        let window = Some(3);
+        assert!(!lfm2_attention_position_masked(4, 4, window));
+        assert!(!lfm2_attention_position_masked(4, 2, window));
+        assert!(lfm2_attention_position_masked(4, 1, window));
+        assert!(lfm2_attention_position_masked(4, 5, window));
+        assert!(!lfm2_attention_position_masked(4, 0, None));
     }
 }

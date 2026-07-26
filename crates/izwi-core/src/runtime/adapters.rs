@@ -495,12 +495,13 @@ impl ModelCapabilityAdapter for ChatCapabilityAdapter {
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
             sequence_execution: chat_sequence_execution(model_variant),
-            state_requirement: if chat_sequence_execution(model_variant)
-                == SequenceExecutionMode::Always
-            {
-                InferenceStateRequirement::Retained
-            } else {
-                InferenceStateRequirement::Stateless
+            state_requirement: match (
+                model_variant.family(),
+                chat_sequence_execution(model_variant),
+            ) {
+                (ModelFamily::Lfm2Chat, _) => InferenceStateRequirement::Invocation,
+                (_, SequenceExecutionMode::Always) => InferenceStateRequirement::Retained,
+                _ => InferenceStateRequirement::Stateless,
             },
         })
     }
@@ -692,6 +693,9 @@ mod tests {
         let gemma_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
             .unwrap();
+        let lfm_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Lfm2512BInstructGguf)
+            .unwrap();
         let qwen_tts = *registry
             .require(CapabilityKind::Tts, ModelVariant::Qwen3Tts12Hz06BBase)
             .unwrap();
@@ -710,6 +714,11 @@ mod tests {
             InferenceStateRequirement::RetainedAndInvocation
         );
         assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::None);
+        assert_eq!(lfm_chat.sequence_execution, SequenceExecutionMode::None);
+        assert_eq!(
+            lfm_chat.state_requirement,
+            InferenceStateRequirement::Invocation
+        );
         assert_eq!(
             scalar_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
             ExecutionMode::Atomic

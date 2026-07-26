@@ -4,13 +4,14 @@ use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, BoundedShape,
-    CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract, InvocationLeaseScope,
-    InvocationStageWorkspace, InvocationStateCapacity, InvocationWorkspaceDomain,
-    InvocationWorkspaceProfile, InvocationWorkspaceSet, KeyEncoding, PageSizeConstraint,
-    PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy, PrefixPolicy,
-    RetainedStateCapability, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeExtent,
-    StateClock, StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
-    StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, WorkspaceFormula,
+    CapabilityStateDescriptorV2, CheckpointPolicy, ComponentShapeInstantiation, DomainStepIntent,
+    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
+    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
+    InvocationWorkspaceSet, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
+    PagedAttentionLayerSpec, PlacementPolicy, PrefixPolicy, RetainedStateCapability,
+    RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, StateScope, StateUpdateKind, TensorComponentSpec, TensorRole, WorkspaceFormula,
     CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
@@ -76,6 +77,51 @@ impl Lfm2StateLayout {
                     "LFM2 model layer {model_layer} is not a ShortConv component"
                 ))
             })
+    }
+
+    pub(crate) fn ring_step_intent(
+        &self,
+        expected_cursor: usize,
+        batch: usize,
+        hidden: usize,
+        steps: usize,
+    ) -> Result<DomainStepIntent> {
+        let expected_cursor = u64::try_from(expected_cursor)
+            .map_err(|_| Error::InvalidInput("LFM2 ring cursor exceeds u64".into()))?;
+        let steps = u64::try_from(steps)
+            .map_err(|_| Error::InvalidInput("LFM2 ring step count exceeds u64".into()))?;
+        let target_cursor = expected_cursor
+            .checked_add(steps)
+            .ok_or_else(|| Error::InvalidInput("LFM2 ring cursor overflow".into()))?;
+        let batch = u64::try_from(batch)
+            .map_err(|_| Error::InvalidInput("LFM2 ring batch exceeds u64".into()))?;
+        let hidden = u64::try_from(hidden)
+            .map_err(|_| Error::InvalidInput("LFM2 ring hidden width exceeds u64".into()))?;
+        Ok(DomainStepIntent {
+            domain: LFM2_SHORTCONV_STATE_DOMAIN,
+            expected_cursor,
+            target_cursor,
+            update: StateUpdateKind::RingAdvance {
+                steps,
+                components_per_step: self
+                    .shortconv_components
+                    .iter()
+                    .map(|(_, component)| ComponentShapeInstantiation {
+                        component: *component,
+                        dimensions: vec![
+                            ShapeDimensionValue {
+                                axis: ShapeAxis::Batch,
+                                units: batch,
+                            },
+                            ShapeDimensionValue {
+                                axis: ShapeAxis::Hidden,
+                                units: hidden,
+                            },
+                        ],
+                    })
+                    .collect(),
+            },
+        })
     }
 }
 
@@ -295,6 +341,7 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
         || config.embedding_length % config.attention_head_count != 0
         || config.attention_head_count_kv.len() != config.block_count
         || config.shortconv_l_cache == 0
+        || config.attention_sliding_window == Some(0)
         || config
             .attention_head_count_kv
             .iter()
@@ -313,12 +360,24 @@ fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u6
             "LFM2 paged byte bound received non-paged state".into(),
         ));
     };
-    let page_tokens = u64::from(spec.page_size.preferred_tokens);
-    let rounded_tokens = max_tokens
-        .checked_add(page_tokens.saturating_sub(1))
-        .and_then(|tokens| tokens.checked_div(page_tokens))
-        .and_then(|pages| pages.checked_mul(page_tokens))
-        .ok_or_else(|| Error::ModelLoadError("LFM2 page capacity overflow".into()))?;
+    let mut rounded_tokens = 0_u64;
+    for candidate in spec.page_size.min_tokens..=spec.page_size.max_tokens {
+        if !spec.page_size.accepts(candidate) {
+            continue;
+        }
+        let page_tokens = u64::from(candidate);
+        let candidate_tokens = max_tokens
+            .checked_add(page_tokens.saturating_sub(1))
+            .and_then(|tokens| tokens.checked_div(page_tokens))
+            .and_then(|pages| pages.checked_mul(page_tokens))
+            .ok_or_else(|| Error::ModelLoadError("LFM2 page capacity overflow".into()))?;
+        rounded_tokens = rounded_tokens.max(candidate_tokens);
+    }
+    if rounded_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "LFM2 page constraint has no admissible size".into(),
+        ));
+    }
     spec.layers
         .iter()
         .try_fold(0_u64, |total, layer| {
@@ -398,6 +457,32 @@ mod tests {
                 (4, StateComponentId::new(3)),
             ]
         );
+        let intent = layout.ring_step_intent(7, 1, 16, 2).unwrap();
+        assert_eq!(intent.domain, LFM2_SHORTCONV_STATE_DOMAIN);
+        assert_eq!(intent.expected_cursor, 7);
+        assert_eq!(intent.target_cursor, 9);
+        let StateUpdateKind::RingAdvance {
+            steps,
+            components_per_step,
+        } = intent.update
+        else {
+            panic!("LFM2 ShortConv intent must advance a ring");
+        };
+        assert_eq!(steps, 2);
+        assert_eq!(components_per_step.len(), 3);
+        assert!(components_per_step.iter().all(|component| {
+            component.dimensions
+                == vec![
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Batch,
+                        units: 1,
+                    },
+                    ShapeDimensionValue {
+                        axis: ShapeAxis::Hidden,
+                        units: 16,
+                    },
+                ]
+        }));
     }
 
     #[test]
@@ -442,6 +527,10 @@ mod tests {
         assert!(attention.layers.iter().all(|layer| {
             layer.pattern == AttentionPattern::SlidingWindow { window_tokens: 8 }
         }));
+        assert_eq!(
+            paged_invocation_bytes(&spec.invocation.domains[0], 17).unwrap(),
+            32_768
+        );
         let StateDomainSpec::Ring(shortconv) = &spec.invocation.domains[1] else {
             panic!("second domain must be ShortConv ring");
         };

@@ -613,33 +613,58 @@ impl ModelLifecycleController {
             // an already-selected execution adapter.
             let mut state_publications = HashMap::new();
             if let Some(loaded) = self.model_registry.get_chat(variant).await {
-                let loaded_cache = loaded.kv_cache_contract()?;
-                loaded_cache.validate()?;
-                let publication = match &loaded_cache {
-                    crate::kv::CacheCapability::Managed(contract) => {
-                        if !managed_kv_backend_compiled(backend) {
-                            return Err(Error::ModelLoadError(format!(
-                                "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
-                            )));
-                        }
-                        let physical = self
-                            .core_engine
-                            .load_managed_model_cache(model_instance_id, &loaded_cache)
-                            .await?;
-                        Some(LoadedStatePublication::ManagedV2 {
-                            contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
-                            physical: physical.ok_or_else(|| {
-                                Error::ModelLoadError(
-                                    "managed state allocation returned no physical runtime"
-                                        .to_string(),
-                                )
-                            })?,
-                        })
+                if variant.family() == crate::catalog::ModelFamily::Lfm2Chat {
+                    if !managed_kv_backend_compiled(backend) {
+                        return Err(Error::ModelLoadError(format!(
+                            "loaded model {variant} requires physical LFM2 invocation state, but the {backend:?} build has no direct paged-attention runtime"
+                        )));
                     }
-                    crate::kv::CacheCapability::Stateless => None,
-                };
-                if let Some(publication) = publication {
+                    let contracts = bundle_draft.execution_contracts(CapabilityKind::Chat)?;
+                    let stage_graphs = contracts
+                        .iter()
+                        .map(|contract| contract.stages.as_ref())
+                        .collect::<Vec<_>>();
+                    let physical_spec = loaded.lfm2_physical_state_spec(&stage_graphs)?;
+                    let publication = self
+                        .load_invocation_workspace_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            &physical_spec.invocation,
+                            None,
+                            HashMap::new(),
+                        )
+                        .await?;
                     state_publications.insert(CapabilityKind::Chat, publication);
+                } else {
+                    let loaded_cache = loaded.kv_cache_contract()?;
+                    loaded_cache.validate()?;
+                    let publication = match &loaded_cache {
+                        crate::kv::CacheCapability::Managed(contract) => {
+                            if !managed_kv_backend_compiled(backend) {
+                                return Err(Error::ModelLoadError(format!(
+                                    "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
+                                )));
+                            }
+                            let physical = self
+                                .core_engine
+                                .load_managed_model_cache(model_instance_id, &loaded_cache)
+                                .await?;
+                            Some(LoadedStatePublication::ManagedV2 {
+                                contract: crate::kv::v2::upgrade_kv_contract_v1(contract)?,
+                                physical: physical.ok_or_else(|| {
+                                    Error::ModelLoadError(
+                                        "managed state allocation returned no physical runtime"
+                                            .to_string(),
+                                    )
+                                })?,
+                            })
+                        }
+                        crate::kv::CacheCapability::Stateless => None,
+                    };
+                    if let Some(publication) = publication {
+                        state_publications.insert(CapabilityKind::Chat, publication);
+                    }
                 }
             }
             if variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr {
