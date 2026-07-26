@@ -164,6 +164,34 @@ fn legacy_inference_state_surface_does_not_expand_during_migration() {
     );
 }
 
+#[test]
+fn qwen_model_owned_cache_and_materializing_pages_are_test_only() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let qwen_core = fs::read_to_string(manifest_dir.join("src/models/architectures/qwen3/core.rs"))
+        .expect("read Qwen3 core");
+    let paged = fs::read_to_string(manifest_dir.join("src/models/shared/attention/paged.rs"))
+        .expect("read legacy paged helpers");
+    let qwen_asr =
+        fs::read_to_string(manifest_dir.join("src/models/architectures/qwen3/asr/mod.rs"))
+            .expect("read Qwen3 ASR");
+
+    assert!(
+        qwen_core.contains("#[cfg(test)]\npub struct Qwen3Cache"),
+        "the dependency-owned Qwen cache must never return to production"
+    );
+    assert!(
+        paged.contains(
+            "#[cfg(test)]\npub use legacy::{append_to_pages, materialize_pages, \
+             paged_decode_attention, KvPage};"
+        ),
+        "materializing paged-attention helpers must remain test-only"
+    );
+    assert!(
+        qwen_asr.contains(".forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())"),
+        "cacheless forced-alignment work must not acquire a model-owned cache"
+    );
+}
+
 fn collect_rs_files(root: &Path, visit: &mut impl FnMut(&Path)) {
     let Ok(entries) = fs::read_dir(root) else {
         return;

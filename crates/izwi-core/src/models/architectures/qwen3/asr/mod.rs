@@ -1614,7 +1614,7 @@ impl Qwen3AsrModel {
             ),
             AsrForwardCache::None => {
                 self.text_model
-                    .forward_with_embeds(&embeds, 0, None, position_ids.as_ref())
+                    .forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())
             }
         }
     }

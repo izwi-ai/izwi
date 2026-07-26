@@ -18,9 +18,6 @@ pub struct ManagedKvTelemetrySnapshot {
     pub reused_tokens: u64,
     pub avoided_prefill_tokens: u64,
     pub decode_dispatches: u64,
-    pub legacy_materializations: u64,
-    pub page_concatenations: u64,
-    pub gqa_repeats: u64,
     pub host_synchronizations: u64,
     pub backing_allocations: u64,
 }
@@ -39,9 +36,6 @@ pub struct ManagedKvTelemetry {
     reused_tokens: AtomicU64,
     avoided_prefill_tokens: AtomicU64,
     decode_dispatches: AtomicU64,
-    legacy_materializations: AtomicU64,
-    page_concatenations: AtomicU64,
-    gqa_repeats: AtomicU64,
     host_synchronizations: AtomicU64,
     backing_allocations: AtomicU64,
 }
@@ -91,18 +85,6 @@ impl ManagedKvTelemetry {
         self.decode_dispatches.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_legacy_materialization(&self) {
-        self.legacy_materializations.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_page_concatenation(&self) {
-        self.page_concatenations.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_gqa_repeat(&self) {
-        self.gqa_repeats.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn record_host_synchronization(&self) {
         self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
     }
@@ -125,9 +107,6 @@ impl ManagedKvTelemetry {
             reused_tokens: load(&self.reused_tokens),
             avoided_prefill_tokens: load(&self.avoided_prefill_tokens),
             decode_dispatches: load(&self.decode_dispatches),
-            legacy_materializations: load(&self.legacy_materializations),
-            page_concatenations: load(&self.page_concatenations),
-            gqa_repeats: load(&self.gqa_repeats),
             host_synchronizations: load(&self.host_synchronizations),
             backing_allocations: load(&self.backing_allocations),
         }
@@ -147,7 +126,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_distinguishes_direct_and_legacy_hot_path_work() {
+    fn snapshot_reports_physical_hot_path_work() {
         let metrics = ManagedKvTelemetry::default();
         metrics.record_zero(2);
         metrics.record_copy(1);
@@ -163,8 +142,5 @@ mod tests {
         assert_eq!(snapshot.reused_tokens, 16);
         assert_eq!(snapshot.avoided_prefill_tokens, 16);
         assert_eq!(snapshot.transaction_commits, 1);
-        assert_eq!(snapshot.legacy_materializations, 0);
-        assert_eq!(snapshot.page_concatenations, 0);
-        assert_eq!(snapshot.gqa_repeats, 0);
     }
 }

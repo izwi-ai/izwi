@@ -5,7 +5,9 @@
 
 use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{kv_cache::Cache, ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
+#[cfg(test)]
+use candle_nn::kv_cache::Cache;
+use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,15 +31,17 @@ use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
+#[cfg(test)]
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
     paged_decode_attention, KvCacheQuantization, KvPage,
 };
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+#[cfg(test)]
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
-use crate::models::shared::telemetry::{
-    record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
-};
+#[cfg(test)]
+use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
+use crate::models::shared::telemetry::{record_rope_kernel, record_rope_manual};
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
 
@@ -187,6 +191,7 @@ pub(crate) fn qwen3_decoder_cache_domain(
     })
 }
 
+#[cfg(test)]
 pub struct Qwen3Cache {
     k_pages: Vec<Vec<KvPage>>,
     v_pages: Vec<Vec<KvPage>>,
@@ -201,6 +206,7 @@ pub struct Qwen3Cache {
     quantization: KvCacheQuantization,
 }
 
+#[cfg(test)]
 struct Qwen3RopeCacheEntry {
     seq_len: usize,
     start_pos: usize,
@@ -212,6 +218,7 @@ struct Qwen3RopeCacheEntry {
     sin_half: Tensor,
 }
 
+#[cfg(test)]
 impl Qwen3Cache {
     pub fn paged_storage_bytes(&self) -> usize {
         self.k_pages
@@ -606,6 +613,7 @@ impl Qwen3Cache {
     }
 }
 
+#[cfg(test)]
 fn dense_cache_initial_capacity(
     append_tokens: usize,
     page_size: usize,
@@ -623,6 +631,7 @@ fn dense_cache_initial_capacity(
         .min(dense_decode_max_tokens.max(1))
 }
 
+#[cfg(test)]
 pub(crate) fn qwen3_dense_decode_max_tokens(
     device: &Device,
     page_size: usize,
@@ -639,6 +648,7 @@ pub(crate) fn qwen3_dense_decode_max_tokens(
         .saturating_mul(qwen3_dense_decode_max_pages())
 }
 
+#[cfg(test)]
 fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_QWEN3_DENSE_DECODE_ATTENTION")
         .ok()
@@ -646,6 +656,7 @@ fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
     qwen3_use_dense_decode_attention_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
+#[cfg(test)]
 fn qwen3_use_dense_decode_attention_policy(
     is_metal: bool,
     is_cuda: bool,
@@ -657,6 +668,7 @@ fn qwen3_use_dense_decode_attention_policy(
     override_enabled.unwrap_or(true)
 }
 
+#[cfg(test)]
 fn qwen3_dense_decode_max_pages() -> usize {
     std::env::var("IZWI_QWEN3_DENSE_DECODE_MAX_PAGES")
         .ok()
@@ -1674,7 +1686,6 @@ impl Qwen3Attention {
         k: Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(1)?;
         if k.dim(1)? != seq_len {
@@ -1707,17 +1718,6 @@ impl Qwen3Attention {
                     &self.rope_inv_freqs,
                 )?
             }
-        } else if let Some(cache) = cache {
-            cache.cached_rope_pair(
-                seq_len,
-                start_pos,
-                self.head_dim,
-                q.device(),
-                q.dtype(),
-                self.use_mrope,
-                self.mrope_section.as_deref().unwrap_or(&[]),
-                &self.rope_inv_freqs,
-            )?
         } else if self.use_mrope {
             let mut data = Vec::with_capacity(3 * seq_len);
             let base = start_pos as i64;
@@ -1774,12 +1774,96 @@ impl Qwen3Attention {
         matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
     }
 
+    fn forward_stateless(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let batch = x.dim(0)?;
+        let sequence = x.dim(1)?;
+        let (query, key, value) = self.qkv_proj.forward(x)?;
+        let query = query.reshape((batch, sequence, self.num_heads, self.head_dim))?;
+        let key = key.reshape((batch, sequence, self.num_kv_heads, self.head_dim))?;
+        let value = value.reshape((batch, sequence, self.num_kv_heads, self.head_dim))?;
+        let (query, key) = self.apply_qk_norm_pair(query, key, sequence)?;
+        let (query, key) = self.apply_rope_pair(query, key, start_pos, position_ids)?;
+
+        if batch > 1 {
+            let key = repeat_kv(&key, self.num_heads, self.num_kv_heads)?;
+            let value = repeat_kv(&value, self.num_heads, self.num_kv_heads)?;
+            let input = BatchedAttentionInput {
+                queries: query.reshape((batch, sequence, self.num_heads * self.head_dim))?,
+                keys: key.reshape((batch, sequence, self.num_heads * self.head_dim))?,
+                values: value.reshape((batch, sequence, self.num_heads * self.head_dim))?,
+                attention_mask: (sequence > 1)
+                    .then(|| causal_mask(sequence, sequence, start_pos, x.device(), x.dtype()))
+                    .transpose()?,
+                seq_lengths: vec![sequence; batch],
+            };
+            return self
+                .o_proj
+                .forward(&batched_scaled_dot_product_attention(
+                    &input,
+                    &BatchedAttentionConfig::new(self.num_heads, self.head_dim),
+                )?)
+                .map_err(Error::from);
+        }
+
+        let query = query.transpose(1, 2)?;
+        let key_heads = key.transpose(1, 2)?;
+        let value_heads = value.transpose(1, 2)?;
+        if start_pos == 0 {
+            if let Some(output) = try_fused_self_attention(
+                &query,
+                &key_heads,
+                &value_heads,
+                None,
+                self.head_dim,
+                true,
+            )? {
+                return self
+                    .o_proj
+                    .forward(&output.transpose(1, 2)?.reshape((
+                        batch,
+                        sequence,
+                        self.num_heads * self.head_dim,
+                    ))?)
+                    .map_err(Error::from);
+            }
+        }
+
+        let key = repeat_kv(&key, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
+        let value = repeat_kv(&value, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
+        let query = query.reshape((batch * self.num_heads, sequence, self.head_dim))?;
+        let key = key.reshape((batch * self.num_heads, sequence, self.head_dim))?;
+        let value = value.reshape((batch * self.num_heads, sequence, self.head_dim))?;
+        let mut scores = query.matmul(&key.transpose(1, 2)?)?;
+        scores = (scores / (self.head_dim as f64).sqrt())?;
+        if sequence > 1 {
+            scores = scores.broadcast_add(&causal_mask(
+                sequence,
+                sequence,
+                start_pos,
+                scores.device(),
+                scores.dtype(),
+            )?)?;
+        }
+        let output = ops::softmax(&scores, D::Minus1)?
+            .matmul(&value)?
+            .reshape((batch, self.num_heads, sequence, self.head_dim))?
+            .transpose(1, 2)?
+            .reshape((batch, sequence, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&output).map_err(Error::from)
+    }
+
+    #[cfg(test)]
     fn forward(
         &self,
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: Option<&mut Qwen3Cache>,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
@@ -1793,7 +1877,7 @@ impl Qwen3Attention {
 
         (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
 
-        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, cache.as_deref_mut())?;
+        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids)?;
 
         let (k, v) = if let Some(cache) = cache {
             cache.append(layer_idx, k.clone(), v.clone())?;
@@ -1944,7 +2028,7 @@ impl Qwen3Attention {
         let k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
         let (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
-        let (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids, None)?;
+        let (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids)?;
 
         let queries = q
             .reshape((seq_len, self.num_heads, self.head_dim))?
@@ -2005,8 +2089,7 @@ impl Qwen3Attention {
         for row in 0..bsz {
             let q_row = q.i(row)?.unsqueeze(0)?;
             let k_row = k.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) =
-                self.apply_rope_pair(q_row, k_row, start_positions[row], None, None)?;
+            let (q_row, k_row) = self.apply_rope_pair(q_row, k_row, start_positions[row], None)?;
             query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
             key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
             value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
@@ -2046,6 +2129,7 @@ impl Qwen3Attention {
         self.o_proj.forward(&out).map_err(Error::from)
     }
 
+    #[cfg(test)]
     fn forward_decode_batch(
         &self,
         x: &Tensor,
@@ -2083,7 +2167,7 @@ impl Qwen3Attention {
             let k_row = k.i(row_idx)?.unsqueeze(0)?;
             let v_row = v.i(row_idx)?.unsqueeze(0)?;
             let (q_row, k_row) =
-                self.apply_rope_pair(q_row, k_row, start_positions[row_idx], None, Some(cache))?;
+                self.apply_rope_pair(q_row, k_row, start_positions[row_idx], None)?;
             cache.append(layer_idx, k_row, v_row)?;
 
             let attention = if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
@@ -2261,6 +2345,25 @@ impl Qwen3Layer {
             .add(self.mlp.projection_diagnostics())
     }
 
+    fn forward_stateless(
+        &self,
+        input: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let attention = self.self_attn.forward_stateless(
+            &self.input_layernorm.forward(input)?,
+            start_pos,
+            position_ids,
+        )?;
+        let hidden = input.broadcast_add(&attention)?;
+        let mlp = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&hidden)?)?;
+        hidden.broadcast_add(&mlp).map_err(Error::from)
+    }
+
+    #[cfg(test)]
     fn forward(
         &self,
         x: &Tensor,
@@ -2281,6 +2384,7 @@ impl Qwen3Layer {
         Ok(x)
     }
 
+    #[cfg(test)]
     fn forward_decode_batch(
         &self,
         x: &Tensor,
@@ -2572,6 +2676,7 @@ impl Qwen3Model {
             })
     }
 
+    #[cfg(test)]
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -2585,6 +2690,7 @@ impl Qwen3Model {
     /// Execute one token for a changing set of independently cached sessions.
     /// Dense projections and MLPs use one real batch dimension; attention
     /// remains ragged and writes back into each exact session cache.
+    #[cfg(test)]
     pub fn forward_decode_batch(
         &self,
         input_ids: &Tensor,
@@ -2800,6 +2906,20 @@ impl Qwen3Model {
         self.embed_tokens.forward(input_ids).map_err(Error::from)
     }
 
+    pub fn forward_stateless_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let mut hidden = embeds.clone();
+        for layer in &self.layers {
+            hidden = layer.forward_stateless(&hidden, start_pos, position_ids)?;
+        }
+        self.logits_from_hidden(&self.norm.forward(&hidden)?)
+    }
+
+    #[cfg(test)]
     pub fn forward_with_embeds(
         &self,
         embeds: &Tensor,
@@ -2812,6 +2932,7 @@ impl Qwen3Model {
         self.logits_from_hidden(&hidden)
     }
 
+    #[cfg(test)]
     pub fn forward_hidden_with_embeds(
         &self,
         embeds: &Tensor,
