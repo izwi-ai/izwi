@@ -22,6 +22,21 @@ pub(crate) const LFM2_ATTENTION_STATE_DOMAIN: StateDomainId = StateDomainId::new
 pub(crate) const LFM2_SHORTCONV_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 const LFM2_MAIN_STATE_GROUP: StateGroupId = StateGroupId::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm2StateIds {
+    pub(crate) attention: StateDomainId,
+    pub(crate) shortconv: StateDomainId,
+    pub(crate) main_group: StateGroupId,
+}
+
+impl Lfm2StateIds {
+    const CANONICAL: Self = Self {
+        attention: LFM2_ATTENTION_STATE_DOMAIN,
+        shortconv: LFM2_SHORTCONV_STATE_DOMAIN,
+        main_group: LFM2_MAIN_STATE_GROUP,
+    };
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Lfm2PhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
@@ -136,7 +151,7 @@ pub(crate) fn lfm2_physical_state_spec(
         ));
     }
     let layout = Lfm2StateLayout::from_config(config)?;
-    let invocation = lfm2_invocation_contract(config, &layout)?;
+    let invocation = lfm2_main_invocation_contract(config, &layout, Lfm2StateIds::CANONICAL)?;
     let max_tokens = u64::try_from(config.context_length)
         .map_err(|_| Error::ModelLoadError("LFM2 context exceeds u64".into()))?;
     let max_domain_id = invocation
@@ -233,9 +248,10 @@ pub(crate) fn lfm2_physical_state_spec(
     })
 }
 
-fn lfm2_invocation_contract(
+pub(crate) fn lfm2_main_invocation_contract(
     config: &Lfm2BackboneConfig,
     layout: &Lfm2StateLayout,
+    ids: Lfm2StateIds,
 ) -> Result<InferenceStateContract> {
     let head_dim = config.embedding_length / config.attention_head_count;
     let query_heads = u32::try_from(config.attention_head_count)
@@ -272,7 +288,7 @@ fn lfm2_invocation_contract(
     let preferred_tokens = u32::try_from(default_kv_page_size())
         .map_err(|_| Error::ModelLoadError("LFM2 page size exceeds u32".into()))?;
     let attention = StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-        header: header(LFM2_ATTENTION_STATE_DOMAIN),
+        header: invocation_header(ids.attention, StateClock::DecoderTokens),
         layers,
         page_size: PageSizeConstraint {
             min_tokens: 1,
@@ -285,7 +301,7 @@ fn lfm2_invocation_contract(
     let hidden = u64::try_from(config.embedding_length)
         .map_err(|_| Error::ModelLoadError("LFM2 hidden width exceeds u64".into()))?;
     let shortconv = StateDomainSpec::Ring(RingStateDomainSpec {
-        header: header(LFM2_SHORTCONV_STATE_DOMAIN),
+        header: invocation_header(ids.shortconv, StateClock::DecoderTokens),
         components_per_step: layout
             .shortconv_components
             .iter()
@@ -314,8 +330,8 @@ fn lfm2_invocation_contract(
         abi: CURRENT_INFERENCE_STATE_ABI,
         domains: vec![attention, shortconv],
         groups: vec![StateGroupSpec {
-            id: LFM2_MAIN_STATE_GROUP,
-            domains: vec![LFM2_ATTENTION_STATE_DOMAIN, LFM2_SHORTCONV_STATE_DOMAIN],
+            id: ids.main_group,
+            domains: vec![ids.attention, ids.shortconv],
             prefix_shareable: false,
         }],
     };
@@ -323,11 +339,11 @@ fn lfm2_invocation_contract(
     Ok(contract)
 }
 
-fn header(id: StateDomainId) -> StateDomainHeader {
+pub(crate) fn invocation_header(id: StateDomainId, clock: StateClock) -> StateDomainHeader {
     StateDomainHeader {
         id,
         scope: StateScope::Invocation,
-        clock: StateClock::DecoderTokens,
+        clock,
         placement: PlacementPolicy::BackendLocal,
         prefix: PrefixPolicy::Disabled,
         checkpoint: CheckpointPolicy::None,
@@ -355,7 +371,7 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
     Ok(())
 }
 
-fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
+pub(crate) fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
     let StateDomainSpec::PagedAttention(spec) = state else {
         return Err(Error::ModelLoadError(
             "LFM2 paged byte bound received non-paged state".into(),
@@ -394,7 +410,7 @@ fn paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u6
         .ok_or_else(|| Error::ModelLoadError("LFM2 paged byte bound overflow".into()))
 }
 
-fn ring_invocation_bytes(state: &StateDomainSpec) -> Result<u64> {
+pub(crate) fn ring_invocation_bytes(state: &StateDomainSpec) -> Result<u64> {
     let StateDomainSpec::Ring(spec) = state else {
         return Err(Error::ModelLoadError(
             "LFM2 ring byte bound received non-ring state".into(),

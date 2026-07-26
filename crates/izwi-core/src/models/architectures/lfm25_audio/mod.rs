@@ -7,6 +7,7 @@ mod config;
 mod conformer;
 mod detokenizer;
 mod model;
+mod physical;
 mod preprocessor;
 mod sampling;
 mod tokenizer;
