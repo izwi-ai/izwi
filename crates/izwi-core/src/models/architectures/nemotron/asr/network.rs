@@ -48,6 +48,10 @@ const NORMALIZE_EPS: f32 = 1e-5;
 const DEFAULT_MAX_SYMBOLS_PER_FRAME: usize = 10;
 const MAX_SHAPE_CACHE_ENTRIES: usize = 4;
 const MAX_SHAPE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROMPT_CACHE_ENTRIES: usize = PROMPT_DIM;
+const MAX_PROMPT_CACHE_BYTES: usize = PROMPT_DIM * PROMPT_DIM * std::mem::size_of::<f32>();
+pub(crate) const NEMOTRON_MODEL_MEMO_MAX_BYTES: u64 =
+    (4 * MAX_SHAPE_CACHE_BYTES + MAX_PROMPT_CACHE_BYTES) as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NemotronRealtimeStateShape {
@@ -2548,10 +2552,17 @@ impl PromptKernel {
             cached
         } else {
             let tensor = build_prompt_one_hot(prompt_id, encoded.device(), encoded.dtype())?;
-            self.prompt_cache
+            let mut cache = self
+                .prompt_cache
                 .lock()
-                .map_err(|_| Error::InferenceError("Nemotron prompt cache lock poisoned".into()))?
-                .insert(key, tensor.clone());
+                .map_err(|_| Error::InferenceError("Nemotron prompt cache lock poisoned".into()))?;
+            insert_bounded_tensor_cache(
+                &mut cache,
+                key,
+                tensor.clone(),
+                MAX_PROMPT_CACHE_ENTRIES,
+                MAX_PROMPT_CACHE_BYTES,
+            );
             tensor
         };
         base.broadcast_as((b, t, PROMPT_DIM)).map_err(Error::from)

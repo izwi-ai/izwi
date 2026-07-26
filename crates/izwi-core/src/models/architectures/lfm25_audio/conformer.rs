@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module};
@@ -16,7 +13,6 @@ pub struct Lfm25AudioEncoder {
     layers: Vec<ConformerLayer>,
     adapter: AudioAdapter,
     cfg: Lfm25AudioEncoderConfig,
-    pos_emb_cache: Mutex<HashMap<usize, Tensor>>,
 }
 
 impl Lfm25AudioEncoder {
@@ -39,7 +35,6 @@ impl Lfm25AudioEncoder {
             layers,
             adapter,
             cfg,
-            pos_emb_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -56,17 +51,7 @@ impl Lfm25AudioEncoder {
     }
 
     fn rel_positional_embedding(&self, encoded_len: usize, device: &Device) -> Result<Tensor> {
-        let mut cache = self.pos_emb_cache.lock().map_err(|_| {
-            Error::InferenceError("LFM2.5 Audio encoder position cache mutex poisoned".to_string())
-        })?;
-        if let Some(pos_emb) = cache.get(&encoded_len) {
-            return Ok(pos_emb.clone());
-        }
-
-        let pos_emb =
-            build_rel_positional_embedding(encoded_len, self.cfg.embedding_length, device)?;
-        cache.insert(encoded_len, pos_emb.clone());
-        Ok(pos_emb)
+        build_rel_positional_embedding(encoded_len, self.cfg.embedding_length, device)
     }
 }
 
@@ -628,7 +613,6 @@ struct RelPosSelfAttention {
     pos_bias_v: Tensor,
     n_heads: usize,
     head_dim: usize,
-    projected_pos_cache: Mutex<HashMap<usize, Tensor>>,
 }
 
 impl RelPosSelfAttention {
@@ -748,7 +732,6 @@ impl RelPosSelfAttention {
             pos_bias_v,
             n_heads: cfg.attention_head_count,
             head_dim: cfg.embedding_length / cfg.attention_head_count,
-            projected_pos_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -803,31 +786,12 @@ impl RelPosSelfAttention {
     }
 
     fn projected_pos_embedding(&self, pos_emb: &Tensor, seq_len: usize) -> Result<Tensor> {
-        {
-            let cache = self.projected_pos_cache.lock().map_err(|_| {
-                Error::InferenceError(
-                    "LFM2.5 Audio encoder projected position cache mutex poisoned".to_string(),
-                )
-            })?;
-            if let Some(projected) = cache.get(&seq_len) {
-                return Ok(projected.clone());
-            }
-        }
-
-        let projected = self
-            .pos_proj
+        self.pos_proj
             .forward(pos_emb)?
             .reshape((1, 2 * seq_len - 1, self.n_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?;
-
-        let mut cache = self.projected_pos_cache.lock().map_err(|_| {
-            Error::InferenceError(
-                "LFM2.5 Audio encoder projected position cache mutex poisoned".to_string(),
-            )
-        })?;
-        cache.insert(seq_len, projected.clone());
-        Ok(projected)
+            .contiguous()
+            .map_err(Error::from)
     }
 }
 
@@ -1286,10 +1250,8 @@ pub fn subsampled_len_3x(mut len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs::{self, File};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
     use candle_core::quantized::gguf_file::{write as write_gguf, Value as GgufValue};
     use candle_core::quantized::{GgmlDType, QTensor};
@@ -1424,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_relative_position_embedding_is_cached_by_length() {
+    fn projected_relative_position_embedding_is_request_local() {
         let device = Device::Cpu;
         let identity = Tensor::eye(4, candle_core::DType::F32, &device).expect("identity");
         let zero_bias = Tensor::zeros(4, candle_core::DType::F32, &device).expect("bias");
@@ -1439,7 +1401,6 @@ mod tests {
             pos_bias_v: Tensor::zeros((2, 2), candle_core::DType::F32, &device).expect("bias v"),
             n_heads: 2,
             head_dim: 2,
-            projected_pos_cache: Mutex::new(HashMap::new()),
         };
         let pos_emb =
             build_rel_positional_embedding(5, 4, &device).expect("relative position embedding");
@@ -1453,7 +1414,10 @@ mod tests {
 
         assert_eq!(first.dims4().unwrap(), (1, 2, 9, 2));
         assert_eq!(second.dims4().unwrap(), (1, 2, 9, 2));
-        assert_eq!(attn.projected_pos_cache.lock().unwrap().len(), 1);
+        assert_eq!(
+            first.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            second.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     #[test]

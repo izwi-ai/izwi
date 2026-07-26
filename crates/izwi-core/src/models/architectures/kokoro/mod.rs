@@ -33,6 +33,7 @@ use self::prosody::{
 };
 use self::text_encoder::KokoroTextEncoder;
 use self::voice::VoiceLibrary;
+pub(crate) use self::voice::KOKORO_MODEL_MEMO_MAX_BYTES;
 
 const CHECKPOINT_FILE: &str = "kokoro-v1_0.pth";
 const CONFIG_FILE: &str = "config.json";

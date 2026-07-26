@@ -104,7 +104,7 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
     const GIB: u64 = 1024 * 1024 * 1024;
 
     let inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
-    match variant {
+    let base = match variant {
         // The 5 GiB catalog value describes total inference memory, including
         // request-scoped activations and audio workspace that the coordinator
         // reserves separately. The GGUF loader retains about 2.25 GiB of
@@ -118,6 +118,25 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
             load_peak_bytes: inference_bytes,
             resident_bytes: inference_bytes,
         },
+    };
+    let memo_bytes = match variant {
+        ModelVariant::Nemotron35AsrStreaming06B => {
+            crate::models::architectures::nemotron::asr::NEMOTRON_MODEL_MEMO_MAX_BYTES
+        }
+        ModelVariant::Kokoro82M => {
+            crate::models::architectures::kokoro::KOKORO_MODEL_MEMO_MAX_BYTES
+        }
+        _ => 0,
+    };
+    ModelMemoryEstimate {
+        load_peak_bytes: base
+            .load_peak_bytes
+            .checked_add(memo_bytes)
+            .expect("catalog model load estimate overflowed"),
+        resident_bytes: base
+            .resident_bytes
+            .checked_add(memo_bytes)
+            .expect("catalog model residency estimate overflowed"),
     }
 }
 
@@ -1805,6 +1824,24 @@ mod tests {
                 resident_bytes: 3 * GIB,
             }
         );
+    }
+
+    #[test]
+    fn bounded_model_memos_are_part_of_resident_authorization() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let nemotron = model_memory_estimate(ModelVariant::Nemotron35AsrStreaming06B);
+        assert_eq!(
+            nemotron.resident_bytes,
+            6 * GIB + crate::models::architectures::nemotron::asr::NEMOTRON_MODEL_MEMO_MAX_BYTES
+        );
+        let kokoro = model_memory_estimate(ModelVariant::Kokoro82M);
+        assert_eq!(
+            kokoro.resident_bytes,
+            2 * GIB + crate::models::architectures::kokoro::KOKORO_MODEL_MEMO_MAX_BYTES
+        );
+        assert_eq!(nemotron.load_peak_bytes, nemotron.resident_bytes);
+        assert_eq!(kokoro.load_peak_bytes, kokoro.resident_bytes);
     }
 
     #[test]

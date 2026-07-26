@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -9,12 +8,14 @@ use zip::ZipArchive;
 
 use crate::error::{Error, Result};
 
+pub(crate) const KOKORO_MODEL_MEMO_MAX_BYTES: u64 = (510 * 256 * std::mem::size_of::<f32>()) as u64;
+
 #[derive(Debug)]
 pub struct VoiceLibrary {
     voices_dir: PathBuf,
     device: candle_core::Device,
     dtype: DType,
-    cache: RwLock<HashMap<String, Tensor>>,
+    cache: RwLock<Option<(String, Tensor)>>,
 }
 
 impl VoiceLibrary {
@@ -29,7 +30,7 @@ impl VoiceLibrary {
             voices_dir,
             device,
             dtype,
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(None),
         })
     }
 
@@ -54,8 +55,9 @@ impl VoiceLibrary {
             .cache
             .read()
             .map_err(|_| Error::ModelLoadError("Voice cache lock poisoned".to_string()))?
-            .get(speaker)
-            .cloned()
+            .as_ref()
+            .filter(|(cached_speaker, _)| cached_speaker == speaker)
+            .map(|(_, tensor)| tensor.clone())
         {
             return Ok(cached);
         }
@@ -80,7 +82,7 @@ impl VoiceLibrary {
         self.cache
             .write()
             .map_err(|_| Error::ModelLoadError("Voice cache lock poisoned".to_string()))?
-            .insert(speaker.to_string(), tensor.clone());
+            .replace((speaker.to_string(), tensor.clone()));
         Ok(tensor)
     }
 
