@@ -8,8 +8,15 @@
 //! envelopes are exact; unsupported growth, pinned memory, domains, and builds
 //! remain fail-closed.
 
+mod invocation;
 mod tensor;
 
+#[allow(unused_imports)]
+pub(crate) use invocation::{
+    InvocationTensorArena, InvocationTensorChronologicalSegment, InvocationTensorComponentSlice,
+    InvocationTensorComponentValue, InvocationTensorDomainKind, InvocationTensorSnapshot,
+    InvocationTensorStepValues,
+};
 #[allow(unused_imports)]
 pub(crate) use tensor::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, StateDomainSnapshot,
