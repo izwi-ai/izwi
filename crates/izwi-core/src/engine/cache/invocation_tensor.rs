@@ -52,6 +52,8 @@ pub(crate) trait InvocationSlotArena:
     fn maximum_bytes(&self) -> u64;
 
     fn reset_for_reuse(&mut self) -> Result<()>;
+
+    fn prepare_completion(&mut self) -> Result<()>;
 }
 
 impl slot_arena_sealed::Sealed for InvocationTensorArena {}
@@ -79,6 +81,10 @@ impl InvocationSlotArena for InvocationTensorArena {
 
     fn reset_for_reuse(&mut self) -> Result<()> {
         InvocationTensorArena::reset_for_reuse(self)
+    }
+
+    fn prepare_completion(&mut self) -> Result<()> {
+        InvocationTensorArena::prepare_completion(self)
     }
 }
 
@@ -169,6 +175,7 @@ struct InvocationSlotPoolState {
     lifecycle: InvocationSlotPoolLifecycle,
     owner_alive: bool,
     next_nonce: u64,
+    admission_cursor: usize,
     drain_cursor: usize,
     slots: Vec<InvocationSlotState>,
 }
@@ -320,6 +327,7 @@ impl<A: InvocationSlotArena> InvocationSlotPoolOwner<A> {
                     lifecycle: InvocationSlotPoolLifecycle::Accepting,
                     owner_alive: true,
                     next_nonce: 0,
+                    admission_cursor: 0,
                     drain_cursor: 0,
                     slots: vec![InvocationSlotState::Vacant { generation: 0 }; slot_count],
                 }),
@@ -519,6 +527,10 @@ impl<A: InvocationSlotArena> InvocationSlotLease<A> {
 
     fn begin_completion(&mut self) -> Result<InvocationWorkspacePhysicalCompletionV2> {
         self.require_leased()?;
+        {
+            let mut arena = lock_arena(self.inner.as_ref(), self.slot.slot)?;
+            arena.prepare_completion()?;
+        }
         let receipt = transition_to_completing(self.inner.as_ref(), self.slot)?;
         self.phase = InvocationSlotLeasePhase::Completing { receipt };
         Ok(InvocationWorkspacePhysicalCompletionV2::Typed {
@@ -592,18 +604,37 @@ impl<A: InvocationSlotArena> Drop for InvocationSlotLease<A> {
 fn lease_from_inner<A: InvocationSlotArena>(
     inner: Arc<InvocationSlotPoolInner<A>>,
 ) -> Result<InvocationSlotLease<A>> {
-    let slot = begin_lease(inner.as_ref())?;
-    let mut reservation = PreparingSlotGuard::new(inner.clone(), slot);
-    reset_arena_for_reuse(inner.as_ref(), slot.slot)?;
-    if !transition_to_leased(inner.as_ref(), slot) {
-        return Err(invalid("invocation slot lost its preparing generation"));
+    let mut attempted = vec![false; inner.arenas.len()];
+    let mut first_reset_error = None;
+    loop {
+        let Some(slot) = reserve_next_vacant(inner.as_ref(), &attempted)? else {
+            return match first_reset_error {
+                Some(error) => Err(error),
+                None => Err(Error::Backpressure(
+                    "invocation slot pool has no free slot".to_string(),
+                )),
+            };
+        };
+        attempted[slot.slot as usize] = true;
+        let mut reservation = PreparingSlotGuard::new(inner.clone(), slot);
+        match reset_arena_for_reuse(inner.as_ref(), slot.slot) {
+            Ok(()) => {}
+            Err(error) => {
+                first_reset_error.get_or_insert(error);
+                drop(reservation);
+                continue;
+            }
+        }
+        if !transition_to_leased(inner.as_ref(), slot) {
+            return Err(invalid("invocation slot lost its preparing generation"));
+        }
+        reservation.disarm();
+        return Ok(InvocationSlotLease {
+            inner,
+            slot,
+            phase: InvocationSlotLeasePhase::Leased,
+        });
     }
-    reservation.disarm();
-    Ok(InvocationSlotLease {
-        inner,
-        slot,
-        phase: InvocationSlotLeasePhase::Leased,
-    })
 }
 
 struct PreparingSlotGuard<A: InvocationSlotArena> {
@@ -637,6 +668,15 @@ impl<A: InvocationSlotArena> Drop for PreparingSlotGuard<A> {
 fn begin_lease<A: InvocationSlotArena>(
     inner: &InvocationSlotPoolInner<A>,
 ) -> Result<InvocationSlotRef> {
+    let attempted = vec![false; inner.arenas.len()];
+    reserve_next_vacant(inner, &attempted)?
+        .ok_or_else(|| Error::Backpressure("invocation slot pool has no free slot".to_string()))
+}
+
+fn reserve_next_vacant<A: InvocationSlotArena>(
+    inner: &InvocationSlotPoolInner<A>,
+    attempted: &[bool],
+) -> Result<Option<InvocationSlotRef>> {
     let mut state = inner
         .state
         .lock()
@@ -644,11 +684,18 @@ fn begin_lease<A: InvocationSlotArena>(
     if !state.owner_alive || state.lifecycle != InvocationSlotPoolLifecycle::Accepting {
         return Err(invalid("invocation slot pool is closed for admission"));
     }
-    let slot_index = state
-        .slots
-        .iter()
-        .position(|slot| slot.is_vacant())
-        .ok_or_else(|| Error::Backpressure("invocation slot pool has no free slot".to_string()))?;
+    if attempted.len() != state.slots.len() {
+        return Err(invalid(
+            "invocation slot admission mask has a mismatched capacity",
+        ));
+    }
+    let slot_count = state.slots.len();
+    let slot_index = (0..slot_count)
+        .map(|offset| (state.admission_cursor + offset) % slot_count)
+        .find(|index| !attempted[*index] && state.slots[*index].is_vacant());
+    let Some(slot_index) = slot_index else {
+        return Ok(None);
+    };
     let generation = state.slots[slot_index]
         .generation()
         .checked_add(1)
@@ -659,13 +706,14 @@ fn begin_lease<A: InvocationSlotArena>(
         .ok_or_else(|| invalid("invocation slot lease nonce exhausted"))?;
     let nonce = state.next_nonce;
     state.slots[slot_index] = InvocationSlotState::Preparing { generation, nonce };
-    Ok(InvocationSlotRef {
+    state.admission_cursor = (slot_index + 1) % slot_count;
+    Ok(Some(InvocationSlotRef {
         pool: inner.id,
         slot: u32::try_from(slot_index)
             .map_err(|_| invalid("invocation slot index exceeds u32"))?,
         slot_generation: generation,
         nonce,
-    })
+    }))
 }
 
 fn transition_to_leased<A: InvocationSlotArena>(
@@ -935,7 +983,7 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
     use candle_core::Tensor;
 
@@ -957,6 +1005,8 @@ mod tests {
         plan: Arc<ResolvedStatePlan>,
         workspace: InvocationWorkspaceDomain,
         resets: Arc<AtomicUsize>,
+        fail_reset: Arc<AtomicBool>,
+        fail_completion: Arc<AtomicBool>,
         maximum_bytes: u64,
     }
 
@@ -985,7 +1035,37 @@ mod tests {
 
         fn reset_for_reuse(&mut self) -> Result<()> {
             self.resets.fetch_add(1, AtomicOrdering::AcqRel);
+            if self.fail_reset.load(AtomicOrdering::Acquire) {
+                return Err(Error::InferenceError(
+                    "injected invocation slot reset failure".to_string(),
+                ));
+            }
             Ok(())
+        }
+
+        fn prepare_completion(&mut self) -> Result<()> {
+            if self.fail_completion.load(AtomicOrdering::Acquire) {
+                return Err(Error::InferenceError(
+                    "injected invocation slot completion fence failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn test_slot_arena(
+        plan: Arc<ResolvedStatePlan>,
+        workspace: InvocationWorkspaceDomain,
+        resets: Arc<AtomicUsize>,
+        maximum_bytes: u64,
+    ) -> TestSlotArena {
+        TestSlotArena {
+            plan,
+            workspace,
+            resets,
+            fail_reset: Arc::new(AtomicBool::new(false)),
+            fail_completion: Arc::new(AtomicBool::new(false)),
+            maximum_bytes,
         }
     }
 
@@ -1174,18 +1254,8 @@ mod tests {
             ModelInstanceId::new(10),
             21,
             vec![
-                TestSlotArena {
-                    plan: plan.clone(),
-                    workspace: workspace.clone(),
-                    resets: resets.clone(),
-                    maximum_bytes: 64,
-                },
-                TestSlotArena {
-                    plan: plan.clone(),
-                    workspace,
-                    resets: resets.clone(),
-                    maximum_bytes: 64,
-                },
+                test_slot_arena(plan.clone(), workspace.clone(), resets.clone(), 64),
+                test_slot_arena(plan.clone(), workspace, resets.clone(), 64),
             ],
         )
         .unwrap();
@@ -1223,18 +1293,8 @@ mod tests {
             ModelInstanceId::new(11),
             22,
             vec![
-                TestSlotArena {
-                    plan: plan.clone(),
-                    workspace: workspace.clone(),
-                    resets: resets.clone(),
-                    maximum_bytes: 64,
-                },
-                TestSlotArena {
-                    plan: foreign_plan,
-                    workspace: workspace.clone(),
-                    resets: resets.clone(),
-                    maximum_bytes: 64,
-                },
+                test_slot_arena(plan.clone(), workspace.clone(), resets.clone(), 64),
+                test_slot_arena(foreign_plan, workspace.clone(), resets.clone(), 64),
             ],
         )
         .is_err());
@@ -1243,14 +1303,110 @@ mod tests {
             workspace.clone(),
             ModelInstanceId::new(11),
             23,
-            vec![TestSlotArena {
-                plan: plan.clone(),
-                workspace,
-                resets,
-                maximum_bytes: 0,
-            }],
+            vec![test_slot_arena(plan.clone(), workspace, resets, 0)],
         )
         .is_err());
+    }
+
+    #[test]
+    fn completion_fence_failure_issues_no_receipt_and_abort_recovers_slot() {
+        let base_contract = contract(tensor_state(1, 4));
+        let (plan, workspace) = plan_and_workspace(&base_contract, StateDomainId::new(1));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let fail_completion = Arc::new(AtomicBool::new(true));
+        let mut arena = test_slot_arena(plan.clone(), workspace.clone(), resets.clone(), 64);
+        arena.fail_completion = fail_completion.clone();
+        let owner = InvocationSlotPoolOwner::from_arenas(
+            plan.as_ref(),
+            workspace,
+            ModelInstanceId::new(12),
+            24,
+            vec![arena],
+        )
+        .unwrap();
+        let backing = owner.backing();
+        let mut lease = backing.lease().unwrap();
+
+        assert!(lease.complete().is_err());
+        let forged = InvocationWorkspacePhysicalCompletionV2::Typed {
+            backing: backing.identity(),
+            authentication: [9; 32],
+        };
+        assert!(backing.authenticate_completion(&forged).is_err());
+        lease.abort();
+        fail_completion.store(false, AtomicOrdering::Release);
+
+        let mut recovered = backing.lease().unwrap();
+        let completion = recovered.complete().unwrap();
+        backing.authenticate_completion(&completion).unwrap();
+        assert_eq!(resets.load(AtomicOrdering::Acquire), 2);
+        drop((lease, recovered));
+        owner.close_and_drain().unwrap();
+    }
+
+    #[test]
+    fn reset_failure_does_not_starve_later_vacant_slots_or_retry_forever() {
+        let base_contract = contract(tensor_state(1, 4));
+        let (plan, workspace) = plan_and_workspace(&base_contract, StateDomainId::new(1));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let fail_first = Arc::new(AtomicBool::new(true));
+        let mut first = test_slot_arena(plan.clone(), workspace.clone(), resets.clone(), 64);
+        first.fail_reset = fail_first.clone();
+        let second = test_slot_arena(plan.clone(), workspace.clone(), resets.clone(), 64);
+        let owner = InvocationSlotPoolOwner::from_arenas(
+            plan.as_ref(),
+            workspace.clone(),
+            ModelInstanceId::new(13),
+            25,
+            vec![first, second],
+        )
+        .unwrap();
+
+        let mut lease = owner.lease().unwrap();
+        assert_eq!(lease.slot().slot, 1);
+        {
+            let state = owner.inner.state.lock().unwrap();
+            assert_eq!(state.slots[0].generation(), 1);
+            assert_eq!(state.slots[1].generation(), 1);
+        }
+        let completion = lease.complete().unwrap();
+        owner
+            .backing()
+            .authenticate_completion(&completion)
+            .unwrap();
+        drop(lease);
+        fail_first.store(false, AtomicOrdering::Release);
+        owner.close_and_drain().unwrap();
+
+        let fail_a = Arc::new(AtomicBool::new(true));
+        let fail_b = Arc::new(AtomicBool::new(true));
+        let mut first = test_slot_arena(plan.clone(), workspace.clone(), resets.clone(), 64);
+        first.fail_reset = fail_a.clone();
+        let mut second = test_slot_arena(plan.clone(), workspace.clone(), resets, 64);
+        second.fail_reset = fail_b.clone();
+        let all_failing = InvocationSlotPoolOwner::from_arenas(
+            plan.as_ref(),
+            workspace,
+            ModelInstanceId::new(14),
+            26,
+            vec![first, second],
+        )
+        .unwrap();
+        let error = all_failing.lease().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InferenceError(message)
+                if message.contains("injected invocation slot reset failure")
+        ));
+        {
+            let state = all_failing.inner.state.lock().unwrap();
+            assert_eq!(state.slots[0].generation(), 1);
+            assert_eq!(state.slots[1].generation(), 1);
+            assert!(state.slots.iter().all(|slot| slot.is_vacant()));
+        }
+        fail_a.store(false, AtomicOrdering::Release);
+        fail_b.store(false, AtomicOrdering::Release);
+        all_failing.close_and_drain().unwrap();
     }
 
     #[test]

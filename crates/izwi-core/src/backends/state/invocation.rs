@@ -394,6 +394,17 @@ impl InvocationTensorArena {
         self.reset()
     }
 
+    /// Fence every write issued through this exact arena before the pool
+    /// publishes an authenticated completion receipt.
+    pub(crate) fn prepare_completion(&mut self) -> Result<()> {
+        self.require_clean()?;
+        if let Err(error) = self.device.synchronize() {
+            self.dirty = true;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     fn backing(&self, component: StateComponentId) -> Result<Tensor> {
         self.require_clean()?;
         Ok(self.component(component)?.storage.as_tensor().clone())
@@ -1374,6 +1385,7 @@ mod tests {
         arena
             .replace(0, 1, &[value(&[1.0, 2.0, 3.0, 4.0])])
             .unwrap();
+        arena.prepare_completion().unwrap();
         let aliased_value = InvocationTensorComponentValue {
             component: StateComponentId::new(1),
             tensor: arena.backing(StateComponentId::new(1)).unwrap(),
@@ -1393,6 +1405,7 @@ mod tests {
         // Model the state left by any failed write/sync and verify that only a
         // successful reset makes the arena observable and reusable.
         arena.dirty = true;
+        assert!(arena.prepare_completion().is_err());
         assert!(arena.snapshot().is_err());
         assert!(arena.backing(StateComponentId::new(1)).is_err());
         assert!(arena
@@ -1400,6 +1413,7 @@ mod tests {
             .is_err());
 
         arena.reset().unwrap();
+        arena.prepare_completion().unwrap();
         assert!(!arena.is_dirty());
         assert_eq!(
             arena
