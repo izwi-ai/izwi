@@ -16,6 +16,12 @@ mod resolved_domains;
 mod runtime;
 mod scratch;
 
+#[cfg(test)]
+pub(crate) use resolved_domains::tests::{
+    contract as tensor_test_contract, tensor_plan as tensor_test_plan,
+    TestRegistry as TensorTestOperationRegistry,
+};
+
 #[allow(unused_imports)]
 pub(crate) use batch::{
     PhysicalArenaId, PhysicalArenaLease, PhysicalBlockRef, PhysicalSlotRef,

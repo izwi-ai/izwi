@@ -228,17 +228,26 @@ impl StateResourceRegistry for StateBackendRegistry {
                 self.backend
             )));
         }
-        if !matches!(query.strategy, CapacityStrategy::Fixed { .. }) {
+        let strategy_supported = matches!(
+            (query.resolved, query.strategy),
+            (
+                ResolvedCapacityDomain::Paged(_),
+                CapacityStrategy::Fixed { .. }
+            ) | (
+                ResolvedCapacityDomain::NonPaged(_),
+                CapacityStrategy::BoundedLazy { .. }
+            )
+        );
+        if !strategy_supported {
             return Err(invalid(
-                "state backend currently supports only fully-backed fixed capacity",
+                "state backend does not support the requested capacity materialization strategy",
             ));
         }
         match query.resolved {
             ResolvedCapacityDomain::Paged(plan)
                 if plan.layout == StatePhysicalLayout::PageTokenHeadDim
                     && placement_is_allocatable(self.backend, plan.placement)
-                    && dtype_is_supported(self.backend, plan.storage.dtype())
-                    && (self.backend != BackendKind::Cuda || plan.page_tokens % 32 == 0) => {}
+                    && dtype_is_supported(self.backend, plan.storage.dtype()) => {}
             ResolvedCapacityDomain::NonPaged(plan)
                 if placement_is_allocatable(self.backend, plan.placement())
                     && non_paged_resolved_dtypes_supported(plan, self.backend) => {}
@@ -256,7 +265,14 @@ impl StateResourceRegistry for StateBackendRegistry {
         Ok(ResolvedGroupResourceEnvelope {
             allocator_alignment_bytes: 1,
             allocator_overhead_per_allocation: 0,
-            max_backing_allocations: 1,
+            max_backing_allocations: if matches!(
+                query.strategy,
+                CapacityStrategy::BoundedLazy { .. }
+            ) {
+                0
+            } else {
+                1
+            },
             reservation_metadata_bytes: 0,
             metadata_bytes_per_block: 0,
             pinned_bytes_per_block: 0,
@@ -856,10 +872,10 @@ mod tests {
     use super::*;
     use crate::engine::ModelInstanceId;
     use crate::kv::v2::{
-        test_contract, AttentionPattern, GroupCapacityRequest, GroupResourceQuery,
-        ResolvedCapacityDomain, StateResourceRegistry, StateResourceVector,
-        StateRuntimeAllocationPlan, WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement,
-        WorkspaceResourceQuery,
+        tensor_test_contract, tensor_test_plan, test_contract, AttentionPattern,
+        GroupCapacityRequest, GroupResourceQuery, ResolvedCapacityDomain, StateResourceRegistry,
+        StateResourceVector, StateRuntimeAllocationPlan, TensorTestOperationRegistry,
+        WorkspaceContract, WorkspaceDimensionBound, WorkspacePlacement, WorkspaceResourceQuery,
     };
 
     fn request(backend: BackendKind) -> StateBackendPlanRequest {
@@ -999,6 +1015,66 @@ mod tests {
                 },
             })
             .is_err());
+    }
+
+    #[test]
+    fn resource_registry_separates_paged_backing_from_lazy_tensor_authorization() {
+        let contract = tensor_test_contract();
+        let state_plan = ResolvedStatePlan::build(
+            BackendKind::Cpu,
+            None,
+            &contract,
+            vec![],
+            vec![tensor_test_plan(16)],
+            &TensorTestOperationRegistry,
+        )
+        .unwrap();
+        let registry = StateBackendRegistry::new(BackendKind::Cpu, None).unwrap();
+        let lazy = registry
+            .resolve_group_resources(&GroupResourceQuery {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                resolved: ResolvedCapacityDomain::NonPaged(&state_plan.non_paged[0]),
+                strategy: CapacityStrategy::BoundedLazy { max_blocks: 4 },
+            })
+            .unwrap();
+        assert_eq!(lazy.max_backing_allocations, 0);
+        assert!(registry
+            .resolve_group_resources(&GroupResourceQuery {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                resolved: ResolvedCapacityDomain::NonPaged(&state_plan.non_paged[0]),
+                strategy: CapacityStrategy::Fixed { blocks: 4 },
+            })
+            .is_err());
+
+        let paged_contract = test_contract();
+        let paged = resolved_group(&paged_contract, BackendKind::Cpu);
+        assert!(registry
+            .resolve_group_resources(&GroupResourceQuery {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                resolved: ResolvedCapacityDomain::Paged(&paged),
+                strategy: CapacityStrategy::BoundedLazy { max_blocks: 4 },
+            })
+            .is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_resource_registry_attests_page_16_native_fallback_backing() {
+        let contract = test_contract();
+        let group = resolved_group(&contract, BackendKind::Cuda);
+        assert_eq!(group.page_tokens, 16);
+        StateBackendRegistry::new(BackendKind::Cuda, Some(0))
+            .unwrap()
+            .resolve_group_resources(&GroupResourceQuery {
+                backend: BackendKind::Cuda,
+                device_ordinal: Some(0),
+                resolved: ResolvedCapacityDomain::Paged(&group),
+                strategy: CapacityStrategy::Fixed { blocks: 8 },
+            })
+            .unwrap();
     }
 
     #[test]

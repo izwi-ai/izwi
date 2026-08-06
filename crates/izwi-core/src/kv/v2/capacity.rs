@@ -49,6 +49,10 @@ pub(crate) enum CapacityStrategy {
     /// Fully backed before Ready publication; preferred for stable graph and
     /// pointer identities.
     Fixed { blocks: u32 },
+    /// Backing is demand-materialized inside a separately bounded arena. The
+    /// complete logical envelope is admitted before Ready, but no allocation
+    /// receipt is required because there is no monolithic initial backing.
+    BoundedLazy { max_blocks: u32 },
     /// Stable address/indirection space reserved up front, with backing
     /// committed only during admission or a maintenance barrier.
     Reserved {
@@ -68,6 +72,7 @@ impl CapacityStrategy {
     fn validate(self) -> Result<()> {
         match self {
             Self::Fixed { blocks } if blocks > 0 => Ok(()),
+            Self::BoundedLazy { max_blocks } if max_blocks > 0 => Ok(()),
             Self::Reserved {
                 initial_blocks,
                 max_blocks,
@@ -91,14 +96,16 @@ impl CapacityStrategy {
     const fn initial_blocks(self) -> u32 {
         match self {
             Self::Fixed { blocks } => blocks,
+            Self::BoundedLazy { .. } => 0,
             Self::Reserved { initial_blocks, .. }
             | Self::AdmissionGrowable { initial_blocks, .. } => initial_blocks,
         }
     }
 
-    const fn max_blocks(self) -> u32 {
+    pub(crate) const fn maximum_blocks(self) -> u32 {
         match self {
             Self::Fixed { blocks } => blocks,
+            Self::BoundedLazy { max_blocks } => max_blocks,
             Self::Reserved { max_blocks, .. } | Self::AdmissionGrowable { max_blocks, .. } => {
                 max_blocks
             }
@@ -107,6 +114,7 @@ impl CapacityStrategy {
 
     const fn minimum_backing_allocations(self) -> u32 {
         match self {
+            Self::BoundedLazy { .. } => 0,
             Self::Fixed { .. } | Self::Reserved { .. } => 1,
             Self::AdmissionGrowable {
                 initial_blocks,
@@ -225,8 +233,11 @@ impl GroupCapacityPlan {
         self.strategy.validate()?;
         let blocks = u64::from(self.strategy.initial_blocks());
         self.validate_resources()?;
-        let metadata_blocks = if matches!(self.strategy, CapacityStrategy::Reserved { .. }) {
-            u64::from(self.strategy.max_blocks())
+        let metadata_blocks = if matches!(
+            self.strategy,
+            CapacityStrategy::Reserved { .. } | CapacityStrategy::BoundedLazy { .. }
+        ) {
+            u64::from(self.strategy.maximum_blocks())
         } else {
             blocks
         };
@@ -262,7 +273,7 @@ impl GroupCapacityPlan {
         placement: ResolvedPlacement,
     ) -> Result<StateResourceVector> {
         self.strategy.validate()?;
-        let blocks = u64::from(self.strategy.max_blocks());
+        let blocks = u64::from(self.strategy.maximum_blocks());
         let owned = self
             .rounded_owned_bytes(blocks)?
             .checked_add(
@@ -285,12 +296,17 @@ impl GroupCapacityPlan {
     }
 
     fn maximum_requested_owned_bytes(&self) -> Result<u64> {
-        u64::from(self.strategy.max_blocks())
+        u64::from(self.strategy.maximum_blocks())
             .checked_mul(self.bytes_per_block)
             .ok_or_else(|| invalid("maximum requested state size overflow"))
     }
 
     fn validate_receipt(&self, receipt: AllocationReceipt) -> Result<()> {
+        if matches!(self.strategy, CapacityStrategy::BoundedLazy { .. }) {
+            return Err(invalid(
+                "bounded-lazy state is reconciled by arena occupancy, not allocation receipts",
+            ));
+        }
         receipt.validate()?;
         if receipt.requested_owned_bytes == 0
             || receipt.requested_owned_bytes % self.bytes_per_block != 0
@@ -526,6 +542,39 @@ pub(crate) struct StateRuntimeAllocationPlan {
 }
 
 impl StateRuntimeAllocationPlan {
+    /// Build a sealed plan whose hard limit is exactly the allocator-attested
+    /// maximum for its state groups and workspace.
+    pub(crate) fn build_exact(
+        state_plan: &ResolvedStatePlan,
+        model_instance: ModelInstanceId,
+        groups: Vec<GroupCapacityRequest>,
+        workspace: WorkspaceContract,
+        resource_registry: &dyn StateResourceRegistry,
+    ) -> Result<Self> {
+        let provisional = Self::build(
+            state_plan,
+            model_instance,
+            groups.clone(),
+            workspace.clone(),
+            StateResourceVector {
+                host_bytes: u64::MAX,
+                device_bytes: u64::MAX,
+                pinned_bytes: u64::MAX,
+                metadata_bytes: u64::MAX,
+            },
+            resource_registry,
+        )?;
+        let exact_limit = provisional.maximum_resources(state_plan)?;
+        Self::build(
+            state_plan,
+            model_instance,
+            groups,
+            workspace,
+            exact_limit,
+            resource_registry,
+        )
+    }
+
     pub(crate) fn build(
         state_plan: &ResolvedStatePlan,
         model_instance: ModelInstanceId,
@@ -668,7 +717,73 @@ impl StateRuntimeAllocationPlan {
         Ok(())
     }
 
-    fn group(&self, group: StateGroupId, domain: StateDomainId) -> Result<&GroupCapacityPlan> {
+    pub(crate) fn maximum_resources(
+        &self,
+        state_plan: &ResolvedStatePlan,
+    ) -> Result<StateResourceVector> {
+        if self.state_plan != state_plan.id {
+            return Err(invalid(
+                "runtime allocation plan belongs to a different state plan",
+            ));
+        }
+        let mut maximum = self
+            .workspace
+            .maximum_resources(state_plan.backend, self.workspace_resources)?;
+        for group in &self.groups {
+            let placement = self.group_placement(state_plan, group)?;
+            maximum =
+                maximum.checked_add(group.maximum_resources(state_plan.backend, placement)?)?;
+        }
+        Ok(maximum)
+    }
+
+    /// Physical state backing that must exist before Ready publication.
+    /// Transient workspace and bounded-lazy owned bytes are intentionally
+    /// excluded; metadata reserved for the lazy arena remains included.
+    pub(crate) fn initial_state_resources(
+        &self,
+        state_plan: &ResolvedStatePlan,
+    ) -> Result<StateResourceVector> {
+        if self.state_plan != state_plan.id {
+            return Err(invalid(
+                "runtime allocation plan belongs to a different state plan",
+            ));
+        }
+        self.groups
+            .iter()
+            .try_fold(StateResourceVector::default(), |total, group| {
+                let placement = self.group_placement(state_plan, group)?;
+                total.checked_add(group.initial_resources(state_plan.backend, placement)?)
+            })
+    }
+
+    fn group_placement(
+        &self,
+        state_plan: &ResolvedStatePlan,
+        group: &GroupCapacityPlan,
+    ) -> Result<ResolvedPlacement> {
+        state_plan
+            .paged_attention
+            .iter()
+            .find(|candidate| candidate.group == group.group && candidate.domain == group.domain)
+            .map(|candidate| candidate.placement)
+            .or_else(|| {
+                state_plan
+                    .non_paged
+                    .iter()
+                    .find(|candidate| {
+                        candidate.group() == group.group && candidate.domain() == group.domain
+                    })
+                    .map(ResolvedNonPagedDomainPlan::placement)
+            })
+            .ok_or_else(|| invalid("runtime capacity references an unknown state group"))
+    }
+
+    pub(crate) fn group_capacity(
+        &self,
+        group: StateGroupId,
+        domain: StateDomainId,
+    ) -> Result<&GroupCapacityPlan> {
         self.groups
             .iter()
             .find(|candidate| candidate.group == group && candidate.domain == domain)
@@ -768,7 +883,7 @@ impl StateAllocationLedger {
                 "allocation ledger belongs to a different runtime plan",
             ));
         }
-        let capacity = plan.group(group, domain)?;
+        let capacity = plan.group_capacity(group, domain)?;
         capacity.validate_receipt(receipt)?;
         let previous = self
             .groups
@@ -782,6 +897,11 @@ impl StateAllocationLedger {
             capacity.strategy.initial_blocks()
         } else {
             match capacity.strategy {
+                CapacityStrategy::BoundedLazy { .. } => {
+                    return Err(invalid(
+                        "bounded-lazy state cannot publish allocation receipts",
+                    ));
+                }
                 CapacityStrategy::Fixed { .. } => {
                     return Err(invalid("fixed state capacity cannot grow after Ready"));
                 }
@@ -820,12 +940,12 @@ impl StateAllocationLedger {
             )?,
         };
         let maximum_committed =
-            capacity.rounded_owned_bytes(u64::from(capacity.strategy.max_blocks()))?;
+            capacity.rounded_owned_bytes(u64::from(capacity.strategy.maximum_blocks()))?;
         let maximum_overhead = u64::from(capacity.resources.max_backing_allocations)
             .checked_mul(capacity.resources.allocator_overhead_per_allocation)
             .ok_or_else(|| invalid("allocator overhead bound overflow"))?;
         if next.allocations > capacity.resources.max_backing_allocations
-            || next.allocated_blocks > capacity.strategy.max_blocks()
+            || next.allocated_blocks > capacity.strategy.maximum_blocks()
             || next.requested_owned_bytes > capacity.maximum_requested_owned_bytes()?
             || next.committed_owned_bytes > maximum_committed
             || next.allocator_overhead_bytes > maximum_overhead
@@ -845,6 +965,9 @@ impl StateAllocationLedger {
             ));
         }
         for capacity in &plan.groups {
+            if matches!(capacity.strategy, CapacityStrategy::BoundedLazy { .. }) {
+                continue;
+            }
             let totals = self
                 .groups
                 .get(&(capacity.group, capacity.domain))
@@ -905,6 +1028,7 @@ mod tests {
         ) -> Result<ResolvedGroupResourceEnvelope> {
             let (max_backing_allocations, reservation_metadata_bytes) = match query.strategy {
                 CapacityStrategy::Fixed { .. } => (1, 0),
+                CapacityStrategy::BoundedLazy { .. } => (0, 0),
                 CapacityStrategy::Reserved { .. } => (3, 64),
                 CapacityStrategy::AdmissionGrowable { .. } => {
                     (query.strategy.minimum_backing_allocations(), 0)
@@ -1265,13 +1389,13 @@ mod tests {
             &TensorOperationRegistry,
         )
         .unwrap();
-        let allocation = StateRuntimeAllocationPlan::build(
+        let allocation = StateRuntimeAllocationPlan::build_exact(
             &state_plan,
             ModelInstanceId::new(9),
             vec![GroupCapacityRequest {
                 group: StateGroupId::new(1),
                 domain: StateDomainId::new(1),
-                strategy: CapacityStrategy::Fixed { blocks: 1 },
+                strategy: CapacityStrategy::BoundedLazy { max_blocks: 3 },
             }],
             WorkspaceContract {
                 fixed_bytes: 0,
@@ -1280,15 +1404,36 @@ mod tests {
                 placement: WorkspacePlacement::Host,
                 concurrency_slots: 1,
             },
-            StateResourceVector {
-                host_bytes: 8192,
-                pinned_bytes: 16,
-                metadata_bytes: 32,
-                ..StateResourceVector::default()
-            },
             &TestResources,
         )
         .unwrap();
         assert_eq!(allocation.groups[0].bytes_per_block, 16);
+        assert_eq!(allocation.groups[0].strategy.initial_blocks(), 0);
+        assert_eq!(allocation.groups[0].strategy.maximum_blocks(), 3);
+        assert_eq!(
+            allocation.hard_limit,
+            allocation.maximum_resources(&state_plan).unwrap()
+        );
+        let initial = allocation.groups[0]
+            .initial_resources(BackendKind::Cpu, ResolvedPlacement::BackendLocal)
+            .unwrap();
+        assert_eq!(initial.host_bytes, 0);
+        assert_eq!(initial.metadata_bytes, 3 * 32);
+
+        let mut ledger = StateAllocationLedger::new(&allocation);
+        ledger.ensure_ready(&allocation).unwrap();
+        assert!(ledger
+            .reconcile_group_receipt(
+                &allocation,
+                StateGroupId::new(1),
+                StateDomainId::new(1),
+                AllocationReceipt {
+                    requested_owned_bytes: 16,
+                    committed_owned_bytes: 16,
+                    allocator_overhead_bytes: 0,
+                    residency: ResidencyMeasurement::Unknown,
+                },
+            )
+            .is_err());
     }
 }
