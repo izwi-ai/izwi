@@ -230,6 +230,13 @@ impl ResourceLedger {
         self.used
     }
 
+    fn update_capacity(&mut self, capacity: ResourceVector) {
+        // Existing reservations remain owned even if a live provider lowers
+        // its advertised ceiling. Future guarded admission must observe the
+        // latest ceiling and fail until usage returns beneath it.
+        self.capacity = capacity;
+    }
+
     pub fn reserve(&mut self, resources: ResourceVector) -> Result<ResourceReservation> {
         self.reserve_internal(resources, true)
     }
@@ -451,14 +458,38 @@ enum ReservationEnforcement {
 #[derive(Debug)]
 pub struct ResourceAuthority {
     provider: Arc<dyn PhysicalCapacityProvider>,
+    domain_policy: ResourceDomainPolicy,
     state: Mutex<AuthorityState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceDomainPolicy {
+    Independent,
+    /// CPU host allocations and Metal unified allocations consume the same
+    /// physical memory on a unified-memory host. Canonicalize both into the
+    /// unified ledger domain so independently constructed workers cannot spend
+    /// the process memory budget twice.
+    SharedHostUnified,
 }
 
 impl ResourceAuthority {
     pub fn new(provider: Arc<dyn PhysicalCapacityProvider>) -> Self {
-        let capacity = provider.snapshot().capacity;
+        Self::with_domain_policy(provider, ResourceDomainPolicy::Independent)
+    }
+
+    pub(crate) fn new_shared_host_unified(provider: Arc<dyn PhysicalCapacityProvider>) -> Self {
+        Self::with_domain_policy(provider, ResourceDomainPolicy::SharedHostUnified)
+    }
+
+    fn with_domain_policy(
+        provider: Arc<dyn PhysicalCapacityProvider>,
+        domain_policy: ResourceDomainPolicy,
+    ) -> Self {
+        let capacity =
+            normalize_physical_resource_domains(provider.snapshot().capacity, domain_policy);
         Self {
             provider,
+            domain_policy,
             state: Mutex::new(AuthorityState {
                 ledger: ResourceLedger::new(capacity),
                 owners: HashMap::new(),
@@ -472,7 +503,7 @@ impl ResourceAuthority {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let physical = self.provider.snapshot();
+        let physical = self.normalized_physical_snapshot();
         ResourceAuthoritySnapshot {
             physical,
             reserved: state.ledger.used(),
@@ -573,6 +604,9 @@ impl ResourceAuthority {
         materialized: ResourceVector,
         enforcement: ReservationEnforcement,
     ) -> Result<ResourceLease> {
+        let lease_resources = resources;
+        let resources = normalize_resource_domains(resources, self.domain_policy)?;
+        let materialized = normalize_resource_domains(materialized, self.domain_policy)?;
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(format!(
                 "resource reservation for {} contains an unresolved quantity",
@@ -602,7 +636,8 @@ impl ResourceAuthority {
                 // reservations that have not allocated yet. Charge every
                 // pending claim against live headroom so concurrent guarded
                 // reservations cannot spend it more than once.
-                let physical = self.provider.snapshot();
+                let physical = self.normalized_physical_snapshot();
+                state.ledger.update_capacity(physical.capacity);
                 let pending = resources.positive_growth_over(materialized)?;
                 let live_claim = state.pending_resources()?.checked_add(pending)?;
                 if !live_claim.fits_within(physical.available) {
@@ -620,7 +655,7 @@ impl ResourceAuthority {
         Ok(ResourceLease {
             authority: self.clone(),
             id: Some(reservation.id),
-            resources,
+            resources: lease_resources,
         })
     }
 
@@ -633,6 +668,7 @@ impl ResourceAuthority {
     }
 
     fn resize(&self, id: ReservationId, resources: ResourceVector) -> Result<()> {
+        let resources = normalize_resource_domains(resources, self.domain_policy)?;
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(
                 "resource resize contains an unresolved quantity".to_string(),
@@ -663,7 +699,8 @@ impl ResourceAuthority {
             let next_pending = resources.positive_growth_over(materialized)?;
             let other_pending = state.pending_resources()?.checked_sub(current_pending)?;
             let live_claim = other_pending.checked_add(next_pending)?;
-            let physical = self.provider.snapshot();
+            let physical = self.normalized_physical_snapshot();
+            state.ledger.update_capacity(physical.capacity);
             if !live_claim.fits_within(physical.available) {
                 return Err(Error::Overloaded(
                     "insufficient live physical capacity for resource lease growth".to_string(),
@@ -686,6 +723,7 @@ impl ResourceAuthority {
         id: ReservationId,
         resources: ResourceVector,
     ) -> Result<()> {
+        let resources = normalize_resource_domains(resources, self.domain_policy)?;
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(
                 "materialized resource usage contains an unresolved quantity".to_string(),
@@ -723,6 +761,7 @@ impl ResourceAuthority {
         id: ReservationId,
         resources: ResourceVector,
     ) -> Result<()> {
+        let resources = normalize_resource_domains(resources, self.domain_policy)?;
         if !resources.is_fully_known() {
             return Err(Error::InvalidInput(
                 "materialized resource release contains an unresolved quantity".to_string(),
@@ -757,6 +796,43 @@ impl ResourceAuthority {
         // still sees the allocation excluded from physical headroom.
         state.materialized.insert(id, resources);
         Ok(())
+    }
+
+    fn normalized_physical_snapshot(&self) -> PhysicalCapacitySnapshot {
+        let physical = self.provider.snapshot();
+        PhysicalCapacitySnapshot {
+            capacity: normalize_physical_resource_domains(physical.capacity, self.domain_policy),
+            available: normalize_physical_resource_domains(physical.available, self.domain_policy),
+            source: physical.source,
+        }
+    }
+}
+
+fn normalize_resource_domains(
+    mut resources: ResourceVector,
+    policy: ResourceDomainPolicy,
+) -> Result<ResourceVector> {
+    if policy == ResourceDomainPolicy::SharedHostUnified {
+        resources.unified_bytes = resources.host_bytes.checked_add(resources.unified_bytes)?;
+        resources.host_bytes = ResourceAmount::Known(0);
+    }
+    Ok(resources)
+}
+
+fn normalize_physical_resource_domains(
+    mut resources: ResourceVector,
+    policy: ResourceDomainPolicy,
+) -> ResourceVector {
+    match normalize_resource_domains(resources, policy) {
+        Ok(resources) => resources,
+        Err(_) => {
+            // A provider overflow is untrustworthy capacity, never infinite
+            // capacity and never a process panic. Preserve unrelated domains
+            // while making the aliased pool fail closed.
+            resources.host_bytes = ResourceAmount::Known(0);
+            resources.unified_bytes = ResourceAmount::Unknown;
+            resources
+        }
     }
 }
 

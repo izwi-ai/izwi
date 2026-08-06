@@ -172,9 +172,19 @@ impl InferenceCoordinator {
 
     pub fn snapshot(&self) -> CoordinatorSnapshot {
         let reserved = self.resources.snapshot().reserved;
-        let reserved_host_memory_bytes = known_memory_bytes(reserved.host_bytes);
+        let shared_host_unified = known_memory_bytes(reserved.host_bytes)
+            .saturating_add(known_memory_bytes(reserved.unified_bytes));
+        let reserved_host_memory_bytes = match self.backend {
+            BackendKind::Cpu => shared_host_unified,
+            BackendKind::Metal => 0,
+            BackendKind::Cuda => known_memory_bytes(reserved.host_bytes),
+        };
         let reserved_device_memory_bytes = known_memory_bytes(reserved.device_bytes);
-        let reserved_unified_memory_bytes = known_memory_bytes(reserved.unified_bytes);
+        let reserved_unified_memory_bytes = match self.backend {
+            BackendKind::Metal => shared_host_unified,
+            BackendKind::Cpu => 0,
+            BackendKind::Cuda => known_memory_bytes(reserved.unified_bytes),
+        };
         let reserved_memory_bytes = reserved_host_memory_bytes
             .saturating_add(reserved_device_memory_bytes)
             .saturating_add(reserved_unified_memory_bytes);
@@ -772,7 +782,90 @@ fn validate_device_identity_parts(
 
 #[derive(Debug, Default)]
 struct ResourceAuthorityRegistry {
-    authorities: Mutex<HashMap<DeviceLocation, Weak<ResourceAuthority>>>,
+    state: Mutex<ResourceAuthorityRegistryState>,
+}
+
+#[derive(Debug, Default)]
+struct ResourceAuthorityRegistryState {
+    host_unified: Option<SharedAuthorityRegistration>,
+    exclusive_devices: HashMap<DeviceLocation, Weak<ResourceAuthority>>,
+}
+
+#[derive(Debug)]
+struct SharedAuthorityRegistration {
+    authority: Weak<ResourceAuthority>,
+    provider: Arc<SharedHostUnifiedCapacityProvider>,
+}
+
+#[derive(Debug, Default)]
+struct SharedHostUnifiedCapacityProvider {
+    providers: Mutex<HashMap<DeviceLocation, Arc<dyn PhysicalCapacityProvider>>>,
+}
+
+impl SharedHostUnifiedCapacityProvider {
+    fn register(&self, location: DeviceLocation, provider: Arc<dyn PhysicalCapacityProvider>) {
+        self.providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(location)
+            .or_insert(provider);
+    }
+}
+
+impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
+    fn snapshot(&self) -> PhysicalCapacitySnapshot {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut snapshots = providers.values().map(|provider| provider.snapshot());
+        let Some(first) = snapshots.next() else {
+            return PhysicalCapacitySnapshot {
+                capacity: shared_host_unified_vector(ResourceAmount::Unknown),
+                available: shared_host_unified_vector(ResourceAmount::Unknown),
+                source: CapacitySource::Unavailable,
+            };
+        };
+        let mut capacity = shared_host_unified_amount(first.capacity);
+        let mut available = shared_host_unified_amount(first.available);
+        for snapshot in snapshots {
+            capacity =
+                minimum_known_amount(capacity, shared_host_unified_amount(snapshot.capacity));
+            available =
+                minimum_known_amount(available, shared_host_unified_amount(snapshot.available));
+        }
+        PhysicalCapacitySnapshot {
+            capacity: shared_host_unified_vector(capacity),
+            available: shared_host_unified_vector(available),
+            source: first.source,
+        }
+    }
+}
+
+fn shared_host_unified_amount(resources: ResourceVector) -> ResourceAmount {
+    match (resources.host_bytes, resources.unified_bytes) {
+        (ResourceAmount::Known(host), ResourceAmount::Known(unified)) => host
+            .checked_add(unified)
+            .map(ResourceAmount::Known)
+            .unwrap_or(ResourceAmount::Unknown),
+        _ => ResourceAmount::Unknown,
+    }
+}
+
+fn shared_host_unified_vector(amount: ResourceAmount) -> ResourceVector {
+    ResourceVector {
+        unified_bytes: amount,
+        ..ResourceVector::zero()
+    }
+}
+
+fn minimum_known_amount(left: ResourceAmount, right: ResourceAmount) -> ResourceAmount {
+    match (left, right) {
+        (ResourceAmount::Known(left), ResourceAmount::Known(right)) => {
+            ResourceAmount::Known(left.min(right))
+        }
+        _ => ResourceAmount::Unknown,
+    }
 }
 
 impl ResourceAuthorityRegistry {
@@ -781,37 +874,86 @@ impl ResourceAuthorityRegistry {
         location: DeviceLocation,
         provider: Arc<dyn PhysicalCapacityProvider>,
     ) -> Result<Arc<ResourceAuthority>> {
-        let mut authorities = self
-            .authorities
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        authorities.retain(|_, authority| authority.strong_count() > 0);
-        if let Some(authority) = authorities.get(&location).and_then(Weak::upgrade) {
-            return Ok(authority);
+        state
+            .exclusive_devices
+            .retain(|_, authority| authority.strong_count() > 0);
+        if state
+            .host_unified
+            .as_ref()
+            .is_some_and(|registration| registration.authority.strong_count() == 0)
+        {
+            state.host_unified = None;
         }
-        let conflicting_location = authorities
-            .iter()
-            .find_map(|(candidate, authority)| authority.upgrade().map(|_| *candidate));
-        if let Some(conflicting_location) = conflicting_location {
-            return Err(Error::ConfigError(format!(
-                "simultaneous physical device locations are unsupported: {conflicting_location:?} is already active and {location:?} cannot be registered because the shared host-memory domain is not yet split from per-device accounting"
-            )));
+
+        match location {
+            DeviceLocation::Cpu | DeviceLocation::Metal { .. } => {
+                if let Some(conflicting_location) = state.exclusive_devices.keys().next().copied() {
+                    return Err(resource_authority_conflict(conflicting_location, location));
+                }
+                if let Some(registration) = state.host_unified.as_ref() {
+                    if let Some(authority) = registration.authority.upgrade() {
+                        registration.provider.register(location, provider);
+                        return Ok(authority);
+                    }
+                }
+                let shared_provider = Arc::new(SharedHostUnifiedCapacityProvider::default());
+                shared_provider.register(location, provider);
+                let authority = Arc::new(ResourceAuthority::new_shared_host_unified(
+                    shared_provider.clone(),
+                ));
+                state.host_unified = Some(SharedAuthorityRegistration {
+                    authority: Arc::downgrade(&authority),
+                    provider: shared_provider,
+                });
+                Ok(authority)
+            }
+            DeviceLocation::Cuda { .. } => {
+                if state
+                    .host_unified
+                    .as_ref()
+                    .and_then(|registration| registration.authority.upgrade())
+                    .is_some()
+                {
+                    return Err(resource_authority_conflict(DeviceLocation::Cpu, location));
+                }
+                if let Some(authority) = state
+                    .exclusive_devices
+                    .get(&location)
+                    .and_then(Weak::upgrade)
+                {
+                    return Ok(authority);
+                }
+                if let Some(conflicting_location) = state.exclusive_devices.keys().next().copied() {
+                    return Err(resource_authority_conflict(conflicting_location, location));
+                }
+                let authority = Arc::new(ResourceAuthority::new(provider));
+                state
+                    .exclusive_devices
+                    .insert(location, Arc::downgrade(&authority));
+                Ok(authority)
+            }
         }
-        let authority = Arc::new(ResourceAuthority::new(provider));
-        authorities.insert(location, Arc::downgrade(&authority));
-        Ok(authority)
     }
+}
+
+fn resource_authority_conflict(active: DeviceLocation, requested: DeviceLocation) -> Error {
+    Error::ConfigError(format!(
+        "simultaneous physical device locations are unsupported: {active:?} is already active and {requested:?} cannot be registered because the shared host-memory domain for CUDA is not yet split from per-device accounting"
+    ))
 }
 
 fn shared_resource_authority(
     location: DeviceLocation,
     provider: Arc<dyn PhysicalCapacityProvider>,
 ) -> Result<Arc<ResourceAuthority>> {
-    // DeviceLocation correctly identifies accelerator capacity, but each
-    // provider also exposes process-wide host headroom. Until reservations are
-    // composite (one shared host domain plus one per-device domain), distinct
-    // simultaneous physical locations must fail closed instead of each
-    // spending the full host budget. The normal selector exposes one location.
+    // CPU host allocations and Metal unified allocations spend one physical
+    // pool on Apple Silicon, so they share a canonical authority even when
+    // workers use distinct DeviceLocation identities. CUDA remains exclusive
+    // until its shared host claim and per-device claim become composite.
     static AUTHORITIES: OnceLock<ResourceAuthorityRegistry> = OnceLock::new();
     AUTHORITIES
         .get_or_init(ResourceAuthorityRegistry::default)
@@ -1562,6 +1704,15 @@ mod tests {
         )))
     }
 
+    fn authority_resources_for_location(location: DeviceLocation, bytes: u64) -> ResourceVector {
+        match location {
+            DeviceLocation::Cpu | DeviceLocation::Metal { .. } => {
+                shared_host_unified_vector(ResourceAmount::Known(bytes))
+            }
+            DeviceLocation::Cuda { .. } => resources_for_location(location, bytes),
+        }
+    }
+
     fn cuda_resources(host_bytes: u64, device_bytes: u64) -> ResourceVector {
         ResourceVector {
             host_bytes: ResourceAmount::Known(host_bytes),
@@ -1730,26 +1881,109 @@ mod tests {
             ));
             assert_eq!(
                 second.snapshot().physical.capacity,
-                resources_for_location(location, 100),
+                authority_resources_for_location(location, 100),
                 "the first provider remains authoritative for a shared identity"
             );
         }
     }
 
     #[test]
-    fn simultaneous_distinct_physical_locations_fail_closed() {
-        let locations = [
-            DeviceLocation::Cpu,
-            DeviceLocation::Metal { gpu_id: 0 },
-            DeviceLocation::Metal { gpu_id: 1 },
-            DeviceLocation::Cuda { gpu_id: 0 },
-            DeviceLocation::Cuda { gpu_id: 1 },
-        ];
-        for first_location in locations {
-            for second_location in locations {
-                if first_location == second_location {
-                    continue;
-                }
+    fn cpu_and_metal_locations_share_one_host_unified_authority() {
+        let registry = ResourceAuthorityRegistry::default();
+        let cpu = registry
+            .authority_for(
+                DeviceLocation::Cpu,
+                provider_for_location(DeviceLocation::Cpu, 100),
+            )
+            .unwrap();
+        let metal = registry
+            .authority_for(
+                DeviceLocation::Metal { gpu_id: 0 },
+                provider_for_location(DeviceLocation::Metal { gpu_id: 0 }, 80),
+            )
+            .unwrap();
+        let other_metal = registry
+            .authority_for(
+                DeviceLocation::Metal { gpu_id: 1 },
+                provider_for_location(DeviceLocation::Metal { gpu_id: 1 }, 90),
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&cpu, &metal));
+        assert!(Arc::ptr_eq(&cpu, &other_metal));
+        assert_eq!(
+            cpu.snapshot().physical.capacity,
+            shared_host_unified_vector(ResourceAmount::Known(80)),
+            "the most conservative live provider controls the shared pool"
+        );
+        let _cpu_lease = cpu
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "shared-cpu"),
+                resources_for_location(DeviceLocation::Cpu, 60),
+            )
+            .unwrap();
+        assert!(matches!(
+            metal.reserve(
+                ReservationOwner::new(ReservationClass::Request, "shared-metal"),
+                resources_for_location(DeviceLocation::Metal { gpu_id: 0 }, 30),
+            ),
+            Err(Error::Overloaded(_))
+        ));
+        assert_eq!(
+            metal.snapshot().reserved,
+            shared_host_unified_vector(ResourceAmount::Known(60))
+        );
+    }
+
+    #[test]
+    fn shared_authority_telemetry_projects_usage_into_each_backend_domain() {
+        let registry = ResourceAuthorityRegistry::default();
+        let authority = registry
+            .authority_for(
+                DeviceLocation::Cpu,
+                provider_for_location(DeviceLocation::Cpu, 100),
+            )
+            .unwrap();
+        registry
+            .authority_for(
+                DeviceLocation::Metal { gpu_id: 0 },
+                provider_for_location(DeviceLocation::Metal { gpu_id: 0 }, 100),
+            )
+            .unwrap();
+        let cpu = InferenceCoordinator::with_resource_authority(
+            BackendKind::Cpu,
+            1,
+            1,
+            authority.clone(),
+        );
+        let metal = InferenceCoordinator::with_resource_authority(
+            BackendKind::Metal,
+            1,
+            1,
+            authority.clone(),
+        );
+        let _lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "telemetry-alias"),
+                resources_for_location(DeviceLocation::Cpu, 40),
+            )
+            .unwrap();
+
+        let cpu_snapshot = cpu.snapshot();
+        assert_eq!(cpu_snapshot.reserved_host_memory_bytes, 40);
+        assert_eq!(cpu_snapshot.reserved_unified_memory_bytes, 0);
+        let metal_snapshot = metal.snapshot();
+        assert_eq!(metal_snapshot.reserved_host_memory_bytes, 0);
+        assert_eq!(metal_snapshot.reserved_unified_memory_bytes, 40);
+    }
+
+    #[test]
+    fn cuda_and_shared_host_unified_locations_remain_exclusive() {
+        for shared_location in [DeviceLocation::Cpu, DeviceLocation::Metal { gpu_id: 0 }] {
+            for (first_location, second_location) in [
+                (shared_location, DeviceLocation::Cuda { gpu_id: 0 }),
+                (DeviceLocation::Cuda { gpu_id: 0 }, shared_location),
+            ] {
                 let registry = ResourceAuthorityRegistry::default();
                 let first = registry
                     .authority_for(first_location, provider_for_location(first_location, 100))
@@ -1757,22 +1991,15 @@ mod tests {
                 assert!(matches!(
                     registry.authority_for(
                         second_location,
-                        provider_for_location(second_location, 200),
+                        provider_for_location(second_location, 100),
                     ),
                     Err(Error::ConfigError(message))
                         if message.contains("shared host-memory domain")
                 ));
-
-                // Once the first physical-device authority is no longer
-                // active, a different location may establish a fresh provider.
                 drop(first);
-                let second = registry
-                    .authority_for(second_location, provider_for_location(second_location, 200))
-                    .unwrap();
-                assert_eq!(
-                    second.snapshot().physical.capacity,
-                    resources_for_location(second_location, 200)
-                );
+                registry
+                    .authority_for(second_location, provider_for_location(second_location, 100))
+                    .expect("a new domain may register after the active authority expires");
             }
         }
     }
@@ -1803,7 +2030,7 @@ mod tests {
         ));
         assert_eq!(
             cpu.snapshot().reserved,
-            resources_for_location(DeviceLocation::Cpu, 60)
+            shared_host_unified_vector(ResourceAmount::Known(60))
         );
     }
 
@@ -1850,7 +2077,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 recreated.snapshot().physical.capacity,
-                resources_for_location(location, 200)
+                authority_resources_for_location(location, 200)
             );
         }
     }
