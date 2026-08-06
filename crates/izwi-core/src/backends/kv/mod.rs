@@ -28,6 +28,7 @@ pub use accelerator::MetalKvBackendRuntime;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use accelerator::{
     candle_accelerator_kv_support, CandleAcceleratorKvArena, CandleAcceleratorKvSupport,
+    CandleAttentionPlanCacheStats,
 };
 pub use cpu::{CpuKvArena, CpuKvBackendRuntime};
 

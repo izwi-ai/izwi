@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -7,6 +7,7 @@ use candle_core::{DType, Device, DeviceLocation, Tensor};
 use crate::backends::BackendKind;
 use crate::error::Error;
 use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSlotRef};
+use crate::runtime::rollout::KvProviderRollout;
 use crate::Result;
 
 #[cfg(feature = "cuda")]
@@ -24,6 +25,16 @@ pub struct CandleAcceleratorKvSupport {
     pub device_page_copy: bool,
     pub in_place_slot_write: bool,
     pub direct_paged_attention: bool,
+}
+
+/// Resource telemetry for device-resident paged-attention metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandleAttentionPlanCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub device_uploads: u64,
+    pub resident_bytes: u64,
 }
 
 impl CandleAcceleratorKvSupport {
@@ -249,6 +260,84 @@ struct CachedDecodeDeviceMetadata {
     block_table: Tensor,
 }
 
+const ATTENTION_PLAN_CACHE_BYTES_PER_KIND: usize = 4 * 1024 * 1024;
+const ATTENTION_PLAN_CACHE_ENTRIES_PER_KIND: usize = 32;
+
+trait ResidentAttentionPlan {
+    fn resident_bytes(&self) -> usize;
+}
+
+impl ResidentAttentionPlan for CachedPrefillDeviceMetadata {
+    fn resident_bytes(&self) -> usize {
+        self.cumulative_queries
+            .elem_count()
+            .saturating_add(self.cumulative_contexts.elem_count())
+            .saturating_add(self.block_table.elem_count())
+            .saturating_mul(std::mem::size_of::<u32>())
+    }
+}
+
+impl ResidentAttentionPlan for CachedDecodeDeviceMetadata {
+    fn resident_bytes(&self) -> usize {
+        self.cumulative_queries
+            .elem_count()
+            .saturating_add(self.cumulative_contexts.elem_count())
+            .saturating_add(self.block_table.elem_count())
+            .saturating_mul(std::mem::size_of::<u32>())
+    }
+}
+
+#[derive(Debug)]
+struct ResidentAttentionPlanCache<T> {
+    entries: VecDeque<T>,
+    resident_bytes: usize,
+}
+
+impl<T> Default for ResidentAttentionPlanCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            resident_bytes: 0,
+        }
+    }
+}
+
+impl<T: ResidentAttentionPlan> ResidentAttentionPlanCache<T> {
+    fn promote(&mut self, index: usize) -> Option<&T> {
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back()
+    }
+
+    fn insert(&mut self, entry: T) -> usize {
+        let entry_bytes = entry.resident_bytes();
+        if entry_bytes > ATTENTION_PLAN_CACHE_BYTES_PER_KIND {
+            return 0;
+        }
+        let mut evictions = 0;
+        while self.entries.len() >= ATTENTION_PLAN_CACHE_ENTRIES_PER_KIND
+            || self.resident_bytes.saturating_add(entry_bytes) > ATTENTION_PLAN_CACHE_BYTES_PER_KIND
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.resident_bytes = self.resident_bytes.saturating_sub(evicted.resident_bytes());
+            evictions += 1;
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(entry_bytes);
+        self.entries.push_back(entry);
+        evictions
+    }
+}
+
+fn update_resident_byte_gauge(gauge: &AtomicU64, before: usize, after: usize) {
+    if after >= before {
+        gauge.fetch_add((after - before) as u64, Ordering::Relaxed);
+    } else {
+        gauge.fetch_sub((before - after) as u64, Ordering::Relaxed);
+    }
+}
+
 /// Device-resident KV storage backed by Candle's accelerator tensors.
 ///
 /// `new_mutation_only` is deliberately explicit: it exposes the independently
@@ -260,12 +349,16 @@ pub struct CandleAcceleratorKvArena {
     config: KvArenaConfig,
     backend: BackendKind,
     device: Device,
+    optimized_provider_enabled: bool,
     layers: HashMap<KvLayerBinding, AcceleratorLayerStorage>,
     mutation_lock: Mutex<()>,
-    prefill_metadata_cache: Mutex<Option<CachedPrefillDeviceMetadata>>,
-    decode_metadata_cache: Mutex<Option<CachedDecodeDeviceMetadata>>,
+    prefill_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedPrefillDeviceMetadata>>,
+    decode_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedDecodeDeviceMetadata>>,
     attention_plan_cache_hits: AtomicU64,
     attention_plan_cache_misses: AtomicU64,
+    attention_plan_cache_evictions: AtomicU64,
+    attention_plan_device_uploads: AtomicU64,
+    attention_plan_resident_bytes: AtomicU64,
     slot_write_dispatches: AtomicU64,
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
@@ -277,6 +370,8 @@ pub struct CandleAcceleratorKvArena {
 impl CandleAcceleratorKvArena {
     pub fn new_mutation_only(config: KvArenaConfig, device: Device) -> Result<Self> {
         let backend = backend_for_device(&device)?;
+        let optimized_provider_enabled =
+            KvProviderRollout::from_process_env()?.optimized_provider_enabled();
         validate_config(&config, backend, &device)?;
         let support = candle_accelerator_kv_support(backend);
         if !support.in_place_zero || !support.device_page_copy || !support.in_place_slot_write {
@@ -328,12 +423,16 @@ impl CandleAcceleratorKvArena {
             config,
             backend,
             device,
+            optimized_provider_enabled,
             layers,
             mutation_lock: Mutex::new(()),
-            prefill_metadata_cache: Mutex::new(None),
-            decode_metadata_cache: Mutex::new(None),
+            prefill_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
+            decode_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
             attention_plan_cache_hits: AtomicU64::new(0),
             attention_plan_cache_misses: AtomicU64::new(0),
+            attention_plan_cache_evictions: AtomicU64::new(0),
+            attention_plan_device_uploads: AtomicU64::new(0),
+            attention_plan_resident_bytes: AtomicU64::new(0),
             slot_write_dispatches: AtomicU64::new(0),
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
@@ -346,6 +445,16 @@ impl CandleAcceleratorKvArena {
     pub fn layer_tensors(&self, binding: KvLayerBinding) -> Result<(Tensor, Tensor)> {
         let layer = self.layer(binding)?;
         Ok((layer.keys.clone(), layer.values.clone()))
+    }
+
+    pub fn attention_plan_cache_stats(&self) -> CandleAttentionPlanCacheStats {
+        CandleAttentionPlanCacheStats {
+            hits: self.attention_plan_cache_hits.load(Ordering::Relaxed),
+            misses: self.attention_plan_cache_misses.load(Ordering::Relaxed),
+            evictions: self.attention_plan_cache_evictions.load(Ordering::Relaxed),
+            device_uploads: self.attention_plan_device_uploads.load(Ordering::Relaxed),
+            resident_bytes: self.attention_plan_resident_bytes.load(Ordering::Relaxed),
+        }
     }
 
     fn layer(&self, binding: KvLayerBinding) -> Result<&AcceleratorLayerStorage> {
@@ -610,12 +719,16 @@ impl CandleAcceleratorKvArena {
         let mut cache = self.prefill_metadata_cache.lock().map_err(|_| {
             Error::InferenceError("accelerator prefill metadata cache was poisoned".into())
         })?;
-        if let Some(cached) = cache
-            .as_ref()
-            .filter(|cached| cached.key == lowered.cache_key)
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|cached| cached.key == lowered.cache_key)
         {
             self.attention_plan_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
+            let cached = cache.promote(index).ok_or_else(|| {
+                Error::InferenceError("accelerator prefill plan cache lost an entry".into())
+            })?;
             return Ok((
                 cached.cumulative_queries.clone(),
                 cached.cumulative_contexts.clone(),
@@ -638,13 +751,23 @@ impl CandleAcceleratorKvArena {
             (lowered.sequence_count, lowered.max_blocks),
             &self.device,
         )?;
-        *cache = Some(CachedPrefillDeviceMetadata {
+        let before_bytes = cache.resident_bytes;
+        let evictions = cache.insert(CachedPrefillDeviceMetadata {
             key: lowered.cache_key.clone(),
             cumulative_queries: cumulative_queries.clone(),
             cumulative_contexts: cumulative_contexts.clone(),
             block_table: block_table.clone(),
         });
+        update_resident_byte_gauge(
+            &self.attention_plan_resident_bytes,
+            before_bytes,
+            cache.resident_bytes,
+        );
         self.attention_plan_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        self.attention_plan_cache_evictions
+            .fetch_add(evictions as u64, Ordering::Relaxed);
+        self.attention_plan_device_uploads
             .fetch_add(1, Ordering::Relaxed);
         Ok((cumulative_queries, cumulative_contexts, block_table))
     }
@@ -659,9 +782,12 @@ impl CandleAcceleratorKvArena {
         let mut cache = self.decode_metadata_cache.lock().map_err(|_| {
             Error::InferenceError("accelerator decode metadata cache was poisoned".into())
         })?;
-        if let Some(cached) = cache.as_ref().filter(|cached| cached.key == *batch) {
+        if let Some(index) = cache.entries.iter().position(|cached| cached.key == *batch) {
             self.attention_plan_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
+            let cached = cache.promote(index).ok_or_else(|| {
+                Error::InferenceError("accelerator decode plan cache lost an entry".into())
+            })?;
             return Ok((
                 cached.cumulative_queries.clone(),
                 cached.cumulative_contexts.clone(),
@@ -677,28 +803,32 @@ impl CandleAcceleratorKvArena {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let cumulative_queries = Tensor::from_vec(
-            cumulative_queries,
-            batch_size + 1,
-            &self.device,
-        )?;
+        let cumulative_queries =
+            Tensor::from_vec(cumulative_queries, batch_size + 1, &self.device)?;
         let cumulative_contexts = Tensor::from_vec(
             cumulative_contexts.to_vec(),
             cumulative_contexts.len(),
             &self.device,
         )?;
-        let block_table = Tensor::from_vec(
-            block_table.to_vec(),
-            (batch_size, max_blocks),
-            &self.device,
-        )?;
-        *cache = Some(CachedDecodeDeviceMetadata {
+        let block_table =
+            Tensor::from_vec(block_table.to_vec(), (batch_size, max_blocks), &self.device)?;
+        let before_bytes = cache.resident_bytes;
+        let evictions = cache.insert(CachedDecodeDeviceMetadata {
             key: batch.clone(),
             cumulative_queries: cumulative_queries.clone(),
             cumulative_contexts: cumulative_contexts.clone(),
             block_table: block_table.clone(),
         });
+        update_resident_byte_gauge(
+            &self.attention_plan_resident_bytes,
+            before_bytes,
+            cache.resident_bytes,
+        );
         self.attention_plan_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        self.attention_plan_cache_evictions
+            .fetch_add(evictions as u64, Ordering::Relaxed);
+        self.attention_plan_device_uploads
             .fetch_add(1, Ordering::Relaxed);
         Ok((cumulative_queries, cumulative_contexts, block_table))
     }
@@ -767,19 +897,17 @@ impl CandleAcceleratorKvArena {
         let (table, seqlens_k, first_page_offsets, max_blocks, _max_context) =
             self.lower_decode_tables(args.batch)?;
         #[cfg(feature = "flash-attn")]
-        if cuda_flash_paged_attention_eligible(
-            self.config.dtype,
-            self.config.page_tokens,
-            layer.key_head_dim,
-            layer.value_head_dim,
-            first_page_offsets.iter().all(|offset| *offset == 0),
-        ) {
-            let (seqlens_q, seqlens_k, block_table) = self.cached_decode_device_metadata(
-                args.batch,
-                &seqlens_k,
-                &table,
-                max_blocks,
-            )?;
+        if self.optimized_provider_enabled
+            && cuda_flash_paged_attention_eligible(
+                self.config.dtype,
+                self.config.page_tokens,
+                layer.key_head_dim,
+                layer.value_head_dim,
+                first_page_offsets.iter().all(|offset| *offset == 0),
+            )
+        {
+            let (seqlens_q, seqlens_k, block_table) =
+                self.cached_decode_device_metadata(args.batch, &seqlens_k, &table, max_blocks)?;
             return Ok(candle_flash_attn::flash_attn_varlen_paged_windowed(
                 args.queries,
                 &layer.keys,
@@ -1070,6 +1198,7 @@ impl KvArena for CandleAcceleratorKvArena {
 
         #[cfg(all(feature = "cuda", feature = "flash-attn"))]
         if self.backend == BackendKind::Cuda
+            && self.optimized_provider_enabled
             && cuda_flash_paged_attention_eligible(
                 self.config.dtype,
                 self.config.page_tokens,
@@ -1499,6 +1628,37 @@ mod tests {
     use crate::engine::ModelInstanceId;
     use crate::kv::KvGroupId;
 
+    #[derive(Debug)]
+    struct MockResidentPlan(usize);
+
+    impl ResidentAttentionPlan for MockResidentPlan {
+        fn resident_bytes(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn resident_attention_plan_cache_is_byte_bounded_and_lru() {
+        let mut cache = ResidentAttentionPlanCache::default();
+        let half_budget = ATTENTION_PLAN_CACHE_BYTES_PER_KIND / 2;
+        assert_eq!(cache.insert(MockResidentPlan(half_budget)), 0);
+        assert_eq!(cache.insert(MockResidentPlan(half_budget)), 0);
+        assert_eq!(cache.resident_bytes, ATTENTION_PLAN_CACHE_BYTES_PER_KIND);
+
+        // Promote the oldest entry, making the other one the deterministic victim.
+        assert_eq!(cache.promote(0).map(|entry| entry.0), Some(half_budget));
+        assert_eq!(cache.insert(MockResidentPlan(1)), 1);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.resident_bytes, half_budget + 1);
+
+        // Plans larger than the configured budget are used by the caller but not retained.
+        assert_eq!(
+            cache.insert(MockResidentPlan(ATTENTION_PLAN_CACHE_BYTES_PER_KIND + 1)),
+            0
+        );
+        assert_eq!(cache.resident_bytes, half_budget + 1);
+    }
+
     #[test]
     fn support_matrix_matches_compiled_direct_attention() {
         let metal = candle_accelerator_kv_support(BackendKind::Metal);
@@ -1733,6 +1893,7 @@ mod tests {
         arena.cached_prefill_device_metadata(&lowered)?;
         arena.cached_prefill_device_metadata(&lowered)?;
         arena.cached_prefill_device_metadata(&next_generation)?;
+        arena.cached_prefill_device_metadata(&lowered)?;
 
         let decode = KvDecodeBatchMetadata {
             sequences: vec![
@@ -1762,8 +1923,14 @@ mod tests {
             max_blocks,
         )?;
         let stats = arena.operation_stats();
-        assert_eq!(stats.attention_plan_cache_hits, 2);
+        assert_eq!(stats.attention_plan_cache_hits, 3);
         assert_eq!(stats.attention_plan_cache_misses, 4);
+        let cache_stats = arena.attention_plan_cache_stats();
+        assert_eq!(cache_stats.hits, 3);
+        assert_eq!(cache_stats.misses, 4);
+        assert_eq!(cache_stats.evictions, 0);
+        assert_eq!(cache_stats.device_uploads, 4);
+        assert!(cache_stats.resident_bytes > 0);
         Ok(())
     }
 

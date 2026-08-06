@@ -17,6 +17,7 @@ mod kokoro;
 mod lifecycle;
 mod pipeline;
 mod request;
+pub(crate) mod rollout;
 mod routing;
 mod service;
 mod speech_to_speech;
