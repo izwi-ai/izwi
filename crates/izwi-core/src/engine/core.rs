@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::cache::managed::ManagedKvCacheManager;
+use super::cache::managed::{ManagedKvCacheManager, ManagedStateCapacityRequest};
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
 #[cfg(test)]
@@ -2686,10 +2686,17 @@ impl EngineCore {
         let backend = self.managed_kv_cache.worker_backend();
         let runtime = self
             .managed_kv_cache
-            .bind_request(
+            .bind_request_with_capacity(
                 model_instance,
                 backend,
-                self.config.max_blocks,
+                ManagedStateCapacityRequest {
+                    total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
+                        Error::InvalidInput("managed KV page budget exceeds u32".into())
+                    })?,
+                    max_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
+                        |_| Error::InvalidInput("managed state batch limit exceeds u32".into()),
+                    )?,
+                },
                 self.config.block_size,
                 capability,
             )?
@@ -2707,10 +2714,17 @@ impl EngineCore {
         retained_state: &crate::kv::v2::InferenceStateContract,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let backend = self.managed_kv_cache.worker_backend();
-        self.managed_kv_cache.bind_model_state(
+        self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
             backend,
-            self.config.max_blocks,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
+                    Error::InvalidInput("managed KV page budget exceeds u32".into())
+                })?,
+                max_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(|_| {
+                    Error::InvalidInput("managed state batch limit exceeds u32".into())
+                })?,
+            },
             self.config.block_size,
             retained_state,
         )

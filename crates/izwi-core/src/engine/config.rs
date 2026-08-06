@@ -33,7 +33,8 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_kv_cache_dtype")]
     pub kv_cache_dtype: String,
 
-    /// Maximum number of KV cache blocks
+    /// Aggregate number of KV cache blocks across all paged state groups.
+    /// Heterogeneous groups receive capacities with equal token reach.
     #[serde(default = "default_max_blocks")]
     pub max_blocks: usize,
 

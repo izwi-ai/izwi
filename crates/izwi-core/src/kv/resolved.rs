@@ -8,8 +8,8 @@ use crate::engine::ModelInstanceId;
 use crate::error::{Error, Result};
 
 use super::v2::{
-    ResolvedStatePlan, StateDType, StateDomainId, StateLayerBinding, StatePhysicalLayout,
-    StateStorageFormat,
+    CapacityStrategy, ResolvedStatePlan, StateAllocationPlanId, StateDType, StateDomainId,
+    StateLayerBinding, StatePhysicalLayout, StateRuntimeAllocationPlan, StateStorageFormat,
 };
 
 const PLAN_FINGERPRINT_DOMAIN: &[u8] = b"izwi.physical-kv.allocation-plan.v2\0";
@@ -88,19 +88,19 @@ pub struct ResolvedKvPlan {
     pub device_ordinal: Option<u32>,
     pub contract_fingerprint: [u8; 32],
     pub state_plan_fingerprint: [u8; 32],
+    pub(crate) state_allocation_plan: StateAllocationPlanId,
     pub groups: Vec<ResolvedKvGroup>,
 }
 
 impl ResolvedKvPlan {
-    pub(crate) fn from_state_plan(
-        model_instance: ModelInstanceId,
-        capacity_pages: u32,
+    pub(crate) fn from_runtime_allocation(
         first_arena_generation: u32,
         state_plan: &ResolvedStatePlan,
+        allocation_plan: &StateRuntimeAllocationPlan,
     ) -> Result<Self> {
-        if capacity_pages == 0 || first_arena_generation == 0 {
+        if first_arena_generation == 0 {
             return Err(invalid(
-                "physical KV capacity and first arena generation must be non-zero",
+                "first physical KV arena generation must be non-zero",
             ));
         }
         if state_plan.paged_attention.is_empty() {
@@ -108,9 +108,19 @@ impl ResolvedKvPlan {
                 "physical KV allocation requires a resolved paged-attention domain",
             ));
         }
+        allocation_plan.validate_against(state_plan)?;
 
         let mut groups = Vec::with_capacity(state_plan.paged_attention.len());
         for (ordinal, resolved) in state_plan.paged_attention.iter().enumerate() {
+            let capacity = allocation_plan.group_capacity(resolved.group, resolved.domain)?;
+            let CapacityStrategy::Fixed {
+                blocks: capacity_pages,
+            } = capacity.strategy
+            else {
+                return Err(invalid(
+                    "paged-attention capacity must use fully-backed fixed allocation",
+                ));
+            };
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| invalid("physical KV group count exceeds u32"))?;
             let generation = first_arena_generation
@@ -126,7 +136,7 @@ impl ResolvedKvPlan {
             groups.push(ResolvedKvGroup {
                 id: KvGroupId::new(resolved.group.get()),
                 arena: KvArenaId {
-                    model_instance,
+                    model_instance: allocation_plan.model_instance,
                     backend: state_plan.backend,
                     device_ordinal: state_plan.device_ordinal,
                     generation,
@@ -150,15 +160,16 @@ impl ResolvedKvPlan {
 
         let mut plan = Self {
             id: KvPlanId::new(KvPlanFingerprint::new([0; 32])),
-            model_instance,
+            model_instance: allocation_plan.model_instance,
             backend: state_plan.backend,
             device_ordinal: state_plan.device_ordinal,
             contract_fingerprint: state_plan.contract_fingerprint,
             state_plan_fingerprint: state_plan.fingerprint().bytes(),
+            state_allocation_plan: allocation_plan.id,
             groups,
         };
         plan.id = KvPlanId::new(plan.compute_fingerprint()?);
-        plan.validate_against(state_plan)?;
+        plan.validate_against_allocation(state_plan, allocation_plan)?;
         Ok(plan)
     }
 
@@ -216,6 +227,33 @@ impl ResolvedKvPlan {
         Ok(())
     }
 
+    pub(crate) fn validate_against_allocation(
+        &self,
+        state_plan: &ResolvedStatePlan,
+        allocation_plan: &StateRuntimeAllocationPlan,
+    ) -> Result<()> {
+        self.validate_against(state_plan)?;
+        allocation_plan.validate_against(state_plan)?;
+        if self.state_allocation_plan != allocation_plan.id
+            || self.model_instance != allocation_plan.model_instance
+        {
+            return Err(invalid(
+                "physical KV allocation belongs to a different runtime allocation plan",
+            ));
+        }
+        for (group, resolved) in self.groups.iter().zip(&state_plan.paged_attention) {
+            let capacity = allocation_plan.group_capacity(resolved.group, resolved.domain)?;
+            if capacity.strategy.maximum_blocks() != group.capacity_pages
+                || !matches!(capacity.strategy, CapacityStrategy::Fixed { .. })
+            {
+                return Err(invalid(
+                    "physical KV group capacity diverges from its runtime allocation plan",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn compute_fingerprint(&self) -> Result<KvPlanFingerprint> {
         #[derive(Serialize)]
         struct FingerprintPayload<'a> {
@@ -224,6 +262,7 @@ impl ResolvedKvPlan {
             device_ordinal: Option<u32>,
             contract_fingerprint: &'a [u8; 32],
             state_plan_fingerprint: &'a [u8; 32],
+            state_allocation_plan: StateAllocationPlanId,
             groups: &'a [ResolvedKvGroup],
         }
 
@@ -233,6 +272,7 @@ impl ResolvedKvPlan {
             device_ordinal: self.device_ordinal,
             contract_fingerprint: &self.contract_fingerprint,
             state_plan_fingerprint: &self.state_plan_fingerprint,
+            state_allocation_plan: self.state_allocation_plan,
             groups: &self.groups,
         };
         let encoded = serde_json::to_vec(&payload)
@@ -307,8 +347,12 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
-    use crate::kv::v2::test_contract;
+    use crate::backends::state::{
+        negotiate_state_plan, StateBackendPlanRequest, StateBackendRegistry,
+    };
+    use crate::kv::v2::{
+        test_contract, GroupCapacityRequest, WorkspaceContract, WorkspacePlacement,
+    };
 
     #[test]
     fn physical_allocation_is_derived_from_the_exact_state_plan() {
@@ -322,8 +366,30 @@ mod tests {
             },
         )
         .unwrap();
-        let plan =
-            ResolvedKvPlan::from_state_plan(ModelInstanceId::new(42), 128, 7, &state_plan).unwrap();
+        let model_instance = ModelInstanceId::new(42);
+        let allocation = StateRuntimeAllocationPlan::build_exact(
+            &state_plan,
+            model_instance,
+            state_plan
+                .paged_attention
+                .iter()
+                .map(|group| GroupCapacityRequest {
+                    group: group.group,
+                    domain: group.domain,
+                    strategy: CapacityStrategy::Fixed { blocks: 128 },
+                })
+                .collect(),
+            WorkspaceContract {
+                fixed_bytes: 0,
+                dimensions: vec![],
+                terms: vec![],
+                placement: WorkspacePlacement::Host,
+                concurrency_slots: 1,
+            },
+            &StateBackendRegistry::new(BackendKind::Cpu, None).unwrap(),
+        )
+        .unwrap();
+        let plan = ResolvedKvPlan::from_runtime_allocation(7, &state_plan, &allocation).unwrap();
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].capacity_pages, 128);
         assert_eq!(plan.groups[0].arena.generation, 7);
@@ -331,5 +397,32 @@ mod tests {
             plan.state_plan_fingerprint,
             state_plan.fingerprint().bytes()
         );
+        assert_eq!(plan.state_allocation_plan, allocation.id);
+
+        let other = StateRuntimeAllocationPlan::build_exact(
+            &state_plan,
+            model_instance,
+            state_plan
+                .paged_attention
+                .iter()
+                .map(|group| GroupCapacityRequest {
+                    group: group.group,
+                    domain: group.domain,
+                    strategy: CapacityStrategy::Fixed { blocks: 64 },
+                })
+                .collect(),
+            WorkspaceContract {
+                fixed_bytes: 0,
+                dimensions: vec![],
+                terms: vec![],
+                placement: WorkspacePlacement::Host,
+                concurrency_slots: 1,
+            },
+            &StateBackendRegistry::new(BackendKind::Cpu, None).unwrap(),
+        )
+        .unwrap();
+        assert!(plan
+            .validate_against_allocation(&state_plan, &other)
+            .is_err());
     }
 }

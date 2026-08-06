@@ -26,7 +26,7 @@ use crate::backends::kv::{
 };
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
-    StateBackendPlanRequest, TensorStateArena, TensorStateCapacity,
+    StateBackendPlanRequest, StateBackendRegistry, TensorStateArena, TensorStateCapacity,
 };
 use crate::backends::BackendKind;
 use crate::engine::{
@@ -36,7 +36,10 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    AttentionPattern, InferenceStateContract, PrefixPolicy, ResolvedStatePlan, StateDomainSpec,
+    AllocationReceipt, AttentionPattern, CapacityStrategy, GroupCapacityRequest,
+    InferenceStateContract, PrefixPolicy, ResidencyMeasurement, ResolvedStatePlan,
+    StateAllocationLedger, StateDomainSpec, StateResourceVector, StateRuntimeAllocationPlan,
+    WorkspaceContract, WorkspacePlacement,
 };
 #[cfg(test)]
 use crate::kv::CacheDomainId;
@@ -142,6 +145,7 @@ impl Default for ManagedKvRuntimeSnapshot {
 pub(crate) struct ManagedKvModelRuntime {
     plan: Arc<ResolvedKvPlan>,
     state_plan_v2: Arc<ResolvedStatePlan>,
+    allocation_plan: Arc<StateRuntimeAllocationPlan>,
     arenas: HashMap<KvArenaId, Arc<dyn KvArena>>,
     tensor_state: Option<Arc<TensorStateArena>>,
     physical_bytes: u64,
@@ -153,6 +157,7 @@ impl fmt::Debug for ManagedKvModelRuntime {
             .debug_struct("ManagedKvModelRuntime")
             .field("plan", &self.plan.id)
             .field("state_plan_v2", &self.state_plan_v2.id)
+            .field("allocation_plan", &self.allocation_plan.id)
             .field("arena_count", &self.arenas.len())
             .field("physical_bytes", &self.physical_bytes)
             .finish()
@@ -166,6 +171,10 @@ impl ManagedKvModelRuntime {
 
     pub(crate) fn state_plan_v2(&self) -> &ResolvedStatePlan {
         &self.state_plan_v2
+    }
+
+    pub(crate) fn allocation_plan(&self) -> &StateRuntimeAllocationPlan {
+        &self.allocation_plan
     }
 
     pub(crate) fn arena(&self, id: KvArenaId) -> Option<&Arc<dyn KvArena>> {
@@ -214,6 +223,14 @@ pub(crate) struct ManagedKvCacheManager {
     worker_device_ordinal: Option<u32>,
     backend_runtime: Option<Arc<dyn KvBackendRuntime>>,
     backend_unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManagedStateCapacityRequest {
+    /// Aggregate backing pages shared fairly across every paged state group.
+    pub(crate) total_paged_pages: u32,
+    /// Maximum number of concurrently staged retained-state transactions.
+    pub(crate) max_transaction_rows: u32,
 }
 
 impl Default for ManagedKvCacheManager {
@@ -376,6 +393,7 @@ impl ManagedKvCacheManager {
         self.worker_backend
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_request(
         &mut self,
         model_instance: ModelInstanceId,
@@ -387,21 +405,73 @@ impl ManagedKvCacheManager {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
         };
-        self.bind_model_state(
+        let capacity = ManagedStateCapacityRequest {
+            total_paged_pages: u32::try_from(capacity_pages).map_err(|_| {
+                Error::InvalidInput("managed KV page capacity exceeds u32".to_string())
+            })?,
+            max_transaction_rows: u32::try_from(capacity_pages).map_err(|_| {
+                Error::InvalidInput("managed KV transaction capacity exceeds u32".to_string())
+            })?,
+        };
+        self.bind_model_state_with_capacity(
             model_instance,
             backend,
-            capacity_pages,
+            capacity,
             page_tokens_hint,
             contract,
         )
         .map(Some)
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_model_state(
         &mut self,
         model_instance: ModelInstanceId,
         backend: BackendKind,
         capacity_pages: usize,
+        page_tokens_hint: usize,
+        contract: &InferenceStateContract,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        let capacity_pages = u32::try_from(capacity_pages)
+            .map_err(|_| Error::InvalidInput("managed KV page capacity exceeds u32".to_string()))?;
+        self.bind_model_state_with_capacity(
+            model_instance,
+            backend,
+            ManagedStateCapacityRequest {
+                total_paged_pages: capacity_pages,
+                max_transaction_rows: capacity_pages,
+            },
+            page_tokens_hint,
+            contract,
+        )
+    }
+
+    pub(crate) fn bind_request_with_capacity(
+        &mut self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        capacity: ManagedStateCapacityRequest,
+        page_tokens_hint: usize,
+        capability: &InferenceStateCapability,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        let Some(contract) = capability.managed_contract() else {
+            return Ok(None);
+        };
+        self.bind_model_state_with_capacity(
+            model_instance,
+            backend,
+            capacity,
+            page_tokens_hint,
+            contract,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn bind_model_state_with_capacity(
+        &mut self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        capacity: ManagedStateCapacityRequest,
         page_tokens_hint: usize,
         contract: &InferenceStateContract,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
@@ -431,8 +501,6 @@ impl ManagedKvCacheManager {
                     .unwrap_or_else(|| format!("managed KV is unavailable for {backend:?}")),
             )
         })?;
-        let capacity_pages = u32::try_from(capacity_pages)
-            .map_err(|_| Error::InvalidInput("managed KV page capacity exceeds u32".to_string()))?;
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".to_string()))?;
         let first_arena_generation = self.next_arena_generation;
@@ -445,19 +513,13 @@ impl ManagedKvCacheManager {
                 storage_dtype_hint: None,
             },
         )?;
-        let plan = ResolvedKvPlan::from_state_plan(
-            model_instance,
-            capacity_pages,
+        let (allocation_plan, tensor_capacity) =
+            plan_managed_state_capacity(&state_plan_v2, model_instance, capacity)?;
+        let plan = ResolvedKvPlan::from_runtime_allocation(
             first_arena_generation,
             &state_plan_v2,
+            &allocation_plan,
         )?;
-        // Until the runtime allocation planner supplies per-domain counts,
-        // use the existing loaded-model page authority as a conservative
-        // resident-sequence bound. Unlike the previous raw map, this is finite
-        // and its committed plus staged tensor backing is admitted below.
-        let tensor_capacity = (!state_plan_v2.non_paged.is_empty())
-            .then(|| TensorStateCapacity::for_plan(&state_plan_v2, capacity_pages, capacity_pages))
-            .transpose()?;
         let tensor_state = tensor_capacity
             .map(|capacity| {
                 TensorStateArena::new(
@@ -469,10 +531,11 @@ impl ManagedKvCacheManager {
             .transpose()?
             .map(Arc::new);
 
-        let paged_physical_bytes = plan_physical_bytes(&plan, None)?;
-        let physical_bytes = plan_physical_bytes(&plan, tensor_capacity)?;
-        let resources = managed_arena_resources(backend, physical_bytes);
-        let materialized_resources = managed_arena_resources(backend, paged_physical_bytes);
+        let maximum_state_resources = allocation_plan.maximum_resources(&state_plan_v2)?;
+        let initial_state_resources = allocation_plan.initial_state_resources(&state_plan_v2)?;
+        let physical_bytes = state_resource_total(maximum_state_resources)?;
+        let resources = managed_state_resources(backend, maximum_state_resources)?;
+        let materialized_resources = managed_state_resources(backend, initial_state_resources)?;
         let resource_lease = self
             .resource_authority
             .as_ref()
@@ -481,6 +544,7 @@ impl ManagedKvCacheManager {
         let mut arenas = HashMap::with_capacity(plan.groups.len());
         let mut coordinators = HashMap::with_capacity(plan.groups.len());
         let mut prefix_indexes = HashMap::with_capacity(plan.groups.len());
+        let mut allocation_ledger = StateAllocationLedger::new(&allocation_plan);
         for group in &plan.groups {
             let config = arena_config(contract, group)?;
             let arena = backend_runtime.allocate_arena(config)?;
@@ -503,6 +567,21 @@ impl ManagedKvCacheManager {
                     "resolved KV plan reused one arena identity".to_string(),
                 ));
             }
+            let requested_owned_bytes = group
+                .bytes_per_page
+                .checked_mul(u64::from(group.capacity_pages))
+                .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))?;
+            allocation_ledger.reconcile_group_receipt(
+                &allocation_plan,
+                crate::kv::v2::StateGroupId::new(group.id.get()),
+                group.domain,
+                AllocationReceipt {
+                    requested_owned_bytes,
+                    committed_owned_bytes: requested_owned_bytes,
+                    allocator_overhead_bytes: 0,
+                    residency: ResidencyMeasurement::Unknown,
+                },
+            )?;
             self.telemetry.record_backing_allocation();
             coordinators.insert(
                 group.arena,
@@ -516,6 +595,7 @@ impl ManagedKvCacheManager {
                 ),
             );
         }
+        allocation_ledger.ensure_ready(&allocation_plan)?;
         if let Some(lease) = resource_lease.as_ref() {
             // Paged arenas preallocate their backing. Tensor capacity is a
             // hard authorization for demand-allocated Candle tensors and must
@@ -525,6 +605,7 @@ impl ManagedKvCacheManager {
         let runtime = Arc::new(ManagedKvModelRuntime {
             plan: Arc::new(plan),
             state_plan_v2: Arc::new(state_plan_v2),
+            allocation_plan: Arc::new(allocation_plan),
             arenas,
             tensor_state,
             physical_bytes,
@@ -1286,32 +1367,154 @@ pub(super) fn managed_device_ordinal(device: &Device) -> Option<u32> {
     }
 }
 
-fn plan_physical_bytes(
-    plan: &ResolvedKvPlan,
-    tensor_capacity: Option<TensorStateCapacity>,
-) -> Result<u64> {
-    let paged_bytes = plan.groups.iter().try_fold(0_u64, |total, group| {
-        let group_bytes = group
-            .bytes_per_page
-            .checked_mul(u64::from(group.capacity_pages))
-            .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))?;
-        total
-            .checked_add(group_bytes)
-            .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))
-    })?;
-    paged_bytes
-        .checked_add(tensor_capacity.map_or(0, TensorStateCapacity::authorized_bytes))
+fn plan_managed_state_capacity(
+    state_plan: &ResolvedStatePlan,
+    model_instance: ModelInstanceId,
+    request: ManagedStateCapacityRequest,
+) -> Result<(StateRuntimeAllocationPlan, Option<TensorStateCapacity>)> {
+    if request.total_paged_pages == 0 || request.max_transaction_rows == 0 {
+        return Err(Error::InvalidInput(
+            "managed state capacity requires non-zero page and transaction limits".into(),
+        ));
+    }
+    if state_plan.paged_attention.is_empty() {
+        return Err(Error::InvalidInput(
+            "managed state capacity requires a paged-attention anchor".into(),
+        ));
+    }
+    let page_sizes = state_plan
+        .paged_attention
+        .iter()
+        .map(|group| group.page_tokens)
+        .collect::<Vec<_>>();
+    if usize::try_from(request.total_paged_pages).unwrap_or(usize::MAX) < page_sizes.len() {
+        return Err(Error::Backpressure(
+            "managed KV page budget cannot back every paged state group".into(),
+        ));
+    }
+    let upper = u64::from(request.total_paged_pages)
+        .checked_mul(u64::from(
+            *page_sizes.iter().max().expect("non-empty page sizes"),
+        ))
+        .ok_or_else(|| Error::InvalidInput("managed KV token reach overflow".into()))?;
+    let required_pages = |tokens: u64| -> Result<u64> {
+        page_sizes.iter().try_fold(0_u64, |total, page_tokens| {
+            let pages = tokens.div_ceil(u64::from(*page_tokens));
+            total
+                .checked_add(pages)
+                .ok_or_else(|| Error::InvalidInput("managed KV page demand overflow".into()))
+        })
+    };
+    let (mut low, mut high) = (1_u64, upper);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if required_pages(middle)? <= u64::from(request.total_paged_pages) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let token_reach = low;
+    let mut groups =
+        Vec::with_capacity(state_plan.paged_attention.len() + state_plan.non_paged.len());
+    let mut sequence_capacity = u32::MAX;
+    for group in &state_plan.paged_attention {
+        let blocks = u32::try_from(token_reach.div_ceil(u64::from(group.page_tokens)))
+            .map_err(|_| Error::InvalidInput("managed KV group capacity exceeds u32".into()))?;
+        sequence_capacity = sequence_capacity.min(blocks);
+        groups.push(GroupCapacityRequest {
+            group: group.group,
+            domain: group.domain,
+            strategy: CapacityStrategy::Fixed { blocks },
+        });
+    }
+    let transaction_capacity = request.max_transaction_rows.min(sequence_capacity);
+    let lazy_blocks = sequence_capacity
+        .checked_add(transaction_capacity)
+        .ok_or_else(|| Error::InvalidInput("managed tensor state capacity overflow".into()))?;
+    for domain in &state_plan.non_paged {
+        groups.push(GroupCapacityRequest {
+            group: domain.group(),
+            domain: domain.domain(),
+            strategy: CapacityStrategy::BoundedLazy {
+                max_blocks: lazy_blocks,
+            },
+        });
+    }
+    groups.sort_unstable_by_key(|group| (group.group, group.domain));
+    let workspace = WorkspaceContract {
+        fixed_bytes: 0,
+        dimensions: vec![],
+        terms: vec![],
+        placement: match state_plan.backend {
+            BackendKind::Cpu => WorkspacePlacement::Host,
+            BackendKind::Metal | BackendKind::Cuda => WorkspacePlacement::BackendLocal,
+        },
+        concurrency_slots: transaction_capacity,
+    };
+    let registry = StateBackendRegistry::new(state_plan.backend, state_plan.device_ordinal)?;
+    let allocation_plan = StateRuntimeAllocationPlan::build_exact(
+        state_plan,
+        model_instance,
+        groups,
+        workspace,
+        &registry,
+    )?;
+    let tensor_capacity = (!state_plan.non_paged.is_empty())
+        .then(|| TensorStateCapacity::for_plan(state_plan, sequence_capacity, transaction_capacity))
+        .transpose()?;
+    if let Some(capacity) = tensor_capacity {
+        let planned_authorization = capacity
+            .per_sequence_bytes()
+            .checked_mul(u64::from(lazy_blocks))
+            .ok_or_else(|| Error::InvalidInput("tensor authorization overflow".into()))?;
+        if capacity.authorized_bytes() != planned_authorization {
+            return Err(Error::InferenceError(
+                "tensor arena authorization diverges from the allocation plan".into(),
+            ));
+        }
+    }
+    Ok((allocation_plan, tensor_capacity))
+}
+
+fn state_resource_total(resources: StateResourceVector) -> Result<u64> {
+    resources
+        .host_bytes
+        .checked_add(resources.device_bytes)
+        .and_then(|total| total.checked_add(resources.pinned_bytes))
+        .and_then(|total| total.checked_add(resources.metadata_bytes))
         .ok_or_else(|| Error::Overloaded("managed state byte total overflow".into()))
 }
 
-fn managed_arena_resources(backend: BackendKind, bytes: u64) -> ResourceVector {
+fn managed_state_resources(
+    backend: BackendKind,
+    state: StateResourceVector,
+) -> Result<ResourceVector> {
     let mut resources = ResourceVector::zero();
+    let host = state
+        .host_bytes
+        .checked_add(state.pinned_bytes)
+        .and_then(|bytes| bytes.checked_add(state.metadata_bytes))
+        .ok_or_else(|| Error::Overloaded("managed state host byte total overflow".into()))?;
     match backend {
-        BackendKind::Cpu => resources.host_bytes = ResourceAmount::Known(bytes),
-        BackendKind::Metal => resources.unified_bytes = ResourceAmount::Known(bytes),
-        BackendKind::Cuda => resources.device_bytes = ResourceAmount::Known(bytes),
+        BackendKind::Cpu => {
+            let total = host
+                .checked_add(state.device_bytes)
+                .ok_or_else(|| Error::Overloaded("managed CPU state total overflow".into()))?;
+            resources.host_bytes = ResourceAmount::Known(total);
+        }
+        BackendKind::Metal => {
+            let total = host
+                .checked_add(state.device_bytes)
+                .ok_or_else(|| Error::Overloaded("managed Metal state total overflow".into()))?;
+            resources.unified_bytes = ResourceAmount::Known(total);
+        }
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(host);
+            resources.device_bytes = ResourceAmount::Known(state.device_bytes);
+        }
     }
-    resources
+    Ok(resources)
 }
 
 fn reserve_managed_arena(
@@ -1688,9 +1891,9 @@ mod tests {
         StageId,
     };
     use crate::kv::v2::{
-        BoundedShape, ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId,
-        StateDomainHeader, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
-        TensorStateDomainSpec,
+        BoundedShape, PageSizeConstraint, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+        StateComponentId, StateDomainHeader, StateGroupSpec, StateScope, TensorComponentSpec,
+        TensorRole, TensorStateDomainSpec,
     };
     use crate::kv::{
         test_contract, CacheBlockRef, InferenceStateCapability as CacheCapability, KvSlotRef,
@@ -1862,6 +2065,130 @@ mod tests {
         }];
         contract.validate().unwrap();
         contract
+    }
+
+    fn heterogeneous_paged_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(first) = &contract.domains[0] else {
+            unreachable!()
+        };
+        let mut second = first.clone();
+        second.header.id = CacheDomainId::new(2);
+        second.page_size = PageSizeConstraint {
+            min_tokens: 32,
+            preferred_tokens: 32,
+            max_tokens: 32,
+            multiple_of: 32,
+        };
+        contract
+            .domains
+            .push(StateDomainSpec::PagedAttention(second));
+        contract.groups.push(StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(2),
+            domains: vec![CacheDomainId::new(2)],
+            prefix_shareable: true,
+        });
+        contract.validate().unwrap();
+        contract
+    }
+
+    #[test]
+    fn capacity_planner_gives_heterogeneous_groups_equal_token_reach() {
+        let state_plan = negotiate_state_plan(
+            &heterogeneous_paged_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let (allocation, tensor) = plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(800),
+            ManagedStateCapacityRequest {
+                total_paged_pages: 7,
+                max_transaction_rows: 3,
+            },
+        )
+        .unwrap();
+        assert!(tensor.is_none());
+        let capacities = state_plan
+            .paged_attention
+            .iter()
+            .map(|group| {
+                let capacity = allocation
+                    .group_capacity(group.group, group.domain)
+                    .unwrap();
+                (group.page_tokens, capacity.strategy.maximum_blocks())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(capacities, vec![(16, 4), (32, 2)]);
+        assert_eq!(capacities.iter().map(|(_, pages)| pages).sum::<u32>(), 6);
+        assert_eq!(capacities[0].0 * capacities[0].1, 64);
+        assert_eq!(capacities[1].0 * capacities[1].1, 64);
+        assert_eq!(
+            allocation.hard_limit,
+            allocation.maximum_resources(&state_plan).unwrap()
+        );
+    }
+
+    #[test]
+    fn capacity_planner_rejects_a_budget_that_cannot_back_every_group() {
+        let state_plan = negotiate_state_plan(
+            &heterogeneous_paged_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(16),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        assert!(plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(801),
+            ManagedStateCapacityRequest {
+                total_paged_pages: 1,
+                max_transaction_rows: 1,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_runtime_uses_one_allocation_plan_for_paged_and_tensor_capacity() {
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request_with_capacity(
+                ModelInstanceId::new(802),
+                BackendKind::Cpu,
+                ManagedStateCapacityRequest {
+                    total_paged_pages: 4,
+                    max_transaction_rows: 2,
+                },
+                16,
+                &CacheCapability::Managed(composite_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        runtime
+            .plan()
+            .validate_against_allocation(runtime.state_plan_v2(), runtime.allocation_plan())
+            .unwrap();
+        let tensor = runtime.tensor_state().unwrap().capacity();
+        assert_eq!(tensor.sequence_capacity(), 4);
+        assert_eq!(tensor.transaction_capacity(), 2);
+        let non_paged = &runtime.state_plan_v2().non_paged[0];
+        assert_eq!(
+            runtime
+                .allocation_plan()
+                .group_capacity(non_paged.group(), non_paged.domain())
+                .unwrap()
+                .strategy,
+            CapacityStrategy::BoundedLazy { max_blocks: 6 }
+        );
     }
 
     fn prefix_request(model: ModelInstanceId, tokens: Vec<u32>) -> EngineCoreRequest {
@@ -2625,7 +2952,14 @@ mod tests {
     fn cuda_arena_accounting_is_guarded_while_cpu_and_metal_are_advisory() {
         for backend in [BackendKind::Cpu, BackendKind::Metal] {
             let authority = authority_with_capacity(1);
-            let resources = managed_arena_resources(backend, 2);
+            let resources = managed_state_resources(
+                backend,
+                StateResourceVector {
+                    host_bytes: 2,
+                    ..StateResourceVector::default()
+                },
+            )
+            .unwrap();
             let lease =
                 reserve_managed_arena(&authority, ModelInstanceId::new(46), backend, resources)
                     .expect("advisory arena accounting");
@@ -2637,7 +2971,14 @@ mod tests {
             &authority,
             ModelInstanceId::new(47),
             BackendKind::Cuda,
-            managed_arena_resources(BackendKind::Cuda, 2),
+            managed_state_resources(
+                BackendKind::Cuda,
+                StateResourceVector {
+                    device_bytes: 2,
+                    ..StateResourceVector::default()
+                },
+            )
+            .unwrap(),
         )
         .is_err());
     }

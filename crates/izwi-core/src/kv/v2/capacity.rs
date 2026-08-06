@@ -516,7 +516,7 @@ impl WorkspaceContract {
 
 /// Per-loaded-instance capacity negotiation. It references an immutable state
 /// plan but cannot change its fingerprint or kernel/layout identity.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct StateAllocationPlanId([u8; 32]);
 
