@@ -209,11 +209,11 @@ impl Qwen35TextRuntimeState {
 }
 
 fn recurrent_domain_v2() -> StateDomainId {
-    StateDomainId::new(RECURRENT_STATE_DOMAIN.get() + 1)
+    RECURRENT_STATE_DOMAIN
 }
 
 fn convolution_domain_v2() -> StateDomainId {
-    StateDomainId::new(CONVOLUTION_STATE_DOMAIN.get() + 1)
+    CONVOLUTION_STATE_DOMAIN
 }
 
 #[derive(Clone)]
@@ -1810,9 +1810,12 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rotary_emb, build_mrope, non_finite_counts, owned_zero_tensor, repeat_head_states,
-        repeat_head_states_seq, softplus, ConvRingState, Qwen35LayerRuntimeState,
-        Qwen35TextRuntimeState,
+        apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
+        recurrent_domain_v2, repeat_head_states, repeat_head_states_seq, softplus, ConvRingState,
+        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+    };
+    use crate::models::architectures::qwen35::cache::{
+        CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
@@ -1822,6 +1825,12 @@ mod tests {
     fn tensor_storage_address(tensor: &Tensor) -> usize {
         let (storage, _) = tensor.storage_and_layout();
         std::ptr::from_ref(&*storage) as usize
+    }
+
+    #[test]
+    fn retained_state_access_uses_the_contracts_canonical_domain_ids() {
+        assert_eq!(recurrent_domain_v2(), RECURRENT_STATE_DOMAIN);
+        assert_eq!(convolution_domain_v2(), CONVOLUTION_STATE_DOMAIN);
     }
 
     #[test]
