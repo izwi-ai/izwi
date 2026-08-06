@@ -1647,6 +1647,7 @@ mod tests {
         let state_contract = crate::kv::test_contract();
         let capability = InferenceStateCapability::Managed(state_contract.clone());
         let mut core = EngineCore::new(EngineCoreConfig {
+            backend: BackendKind::Cpu,
             max_blocks: 4,
             block_size: 32,
             ..EngineCoreConfig::default()
@@ -1722,6 +1723,7 @@ mod tests {
         let model_instance = ModelInstanceId::new(80);
         let state_contract = crate::kv::test_contract();
         let mut core = EngineCore::new(EngineCoreConfig {
+            backend: BackendKind::Cpu,
             max_blocks: 4,
             block_size: 32,
             ..EngineCoreConfig::default()

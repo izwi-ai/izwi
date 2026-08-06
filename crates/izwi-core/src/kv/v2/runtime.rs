@@ -2566,6 +2566,7 @@ mod tests {
             .validate_against_stages(&execution.stages)
             .unwrap();
         let mut core = EngineCore::new(EngineCoreConfig {
+            backend: BackendKind::Cpu,
             max_blocks: 4,
             block_size: 16,
             ..EngineCoreConfig::default()

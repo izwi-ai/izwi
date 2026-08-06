@@ -3548,7 +3548,11 @@ mod tests {
 
     #[test]
     fn load_sealed_stateless_v2_runtime_enters_the_engine() {
-        let mut core = EngineCore::new(EngineCoreConfig::default()).unwrap();
+        let mut core = EngineCore::new(EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..EngineCoreConfig::default()
+        })
+        .unwrap();
         let variant = ModelVariant::Kokoro82M;
         let instance = ModelInstanceId::new(102);
         let profile =
