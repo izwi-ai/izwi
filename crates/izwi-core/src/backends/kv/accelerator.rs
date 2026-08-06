@@ -157,6 +157,7 @@ fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
 struct AcceleratorSlotMap {
     arena: KvArenaId,
     flat_slots: Vec<usize>,
+    device_indices: Tensor,
     logical_slots: Arc<[KvSlotRef]>,
 }
 
@@ -558,9 +559,11 @@ impl KvArena for CandleAcceleratorKvArena {
             }
             flat_slots.push(flat);
         }
+        let device_indices = accelerator_indices(&flat_slots, &self.device)?;
         Ok(Arc::new(AcceleratorSlotMap {
             arena: self.config.id,
             flat_slots,
+            device_indices,
             logical_slots: Arc::from(slots),
         }))
     }
@@ -575,10 +578,31 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
-        for layer in self.layers.values() {
-            for &page in &page_indices {
-                layer.keys.narrow(0, page, 1)?.zero_set()?;
-                layer.values.narrow(0, page, 1)?.zero_set()?;
+        if !page_indices.is_empty() {
+            let page_indices = accelerator_indices(&page_indices, &self.device)?;
+            for layer in self.layers.values() {
+                let zero_keys = Tensor::zeros(
+                    (
+                        page_indices.elem_count(),
+                        self.config.page_tokens as usize,
+                        layer.num_kv_heads,
+                        layer.key_head_dim,
+                    ),
+                    self.config.dtype,
+                    &self.device,
+                )?;
+                let zero_values = Tensor::zeros(
+                    (
+                        page_indices.elem_count(),
+                        self.config.page_tokens as usize,
+                        layer.num_kv_heads,
+                        layer.value_head_dim,
+                    ),
+                    self.config.dtype,
+                    &self.device,
+                )?;
+                scatter_rows(&layer.keys, &page_indices, &zero_keys)?;
+                scatter_rows(&layer.values, &page_indices, &zero_values)?;
             }
         }
         self.page_zero_dispatches.fetch_add(1, Ordering::Relaxed);
@@ -602,24 +626,26 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
-        for layer in self.layers.values() {
-            // Snapshot every source on device before any destination is changed;
-            // this preserves parallel-copy semantics for chains and cycles.
-            let key_sources = lowered
-                .iter()
-                .map(|(source, _)| layer.keys.narrow(0, *source, 1)?.copy())
-                .collect::<candle_core::Result<Vec<_>>>()?;
-            let value_sources = lowered
-                .iter()
-                .map(|(source, _)| layer.values.narrow(0, *source, 1)?.copy())
-                .collect::<candle_core::Result<Vec<_>>>()?;
-            for (((_, destination), keys), values) in lowered
-                .iter()
-                .zip(key_sources.iter())
-                .zip(value_sources.iter())
-            {
-                layer.keys.slice_set(keys, 0, *destination)?;
-                layer.values.slice_set(values, 0, *destination)?;
+        if !lowered.is_empty() {
+            let source_indices = accelerator_indices(
+                &lowered
+                    .iter()
+                    .map(|(source, _)| *source)
+                    .collect::<Vec<_>>(),
+                &self.device,
+            )?;
+            let destination_indices = accelerator_indices(
+                &lowered
+                    .iter()
+                    .map(|(_, destination)| *destination)
+                    .collect::<Vec<_>>(),
+                &self.device,
+            )?;
+            for layer in self.layers.values() {
+                // index_select snapshots every source before either destination
+                // tensor is mutated, preserving parallel-copy chains and cycles.
+                copy_rows_parallel(&layer.keys, &source_indices, &destination_indices)?;
+                copy_rows_parallel(&layer.values, &source_indices, &destination_indices)?;
             }
         }
         self.page_copy_dispatches.fetch_add(1, Ordering::Relaxed);
@@ -666,9 +692,9 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
-        for (token, &slot) in slots.flat_slots.iter().enumerate() {
-            flat_keys.slice_set(&args.keys.narrow(0, token, 1)?, 0, slot)?;
-            flat_values.slice_set(&args.values.narrow(0, token, 1)?, 0, slot)?;
+        if !slots.flat_slots.is_empty() {
+            scatter_rows(&flat_keys, &slots.device_indices, args.keys)?;
+            scatter_rows(&flat_values, &slots.device_indices, args.values)?;
         }
         self.slot_write_dispatches.fetch_add(1, Ordering::Relaxed);
         let fence = self.mutation_fence()?;
@@ -988,6 +1014,39 @@ fn validate_decode_query(
     Ok(())
 }
 
+fn accelerator_indices(indices: &[usize], device: &Device) -> Result<Tensor> {
+    let indices = indices
+        .iter()
+        .copied()
+        .map(|index| {
+            u32::try_from(index)
+                .map_err(|_| Error::InferenceError("accelerator KV index exceeds u32".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let len = indices.len();
+    Ok(Tensor::from_vec(indices, len, device)?)
+}
+
+fn scatter_rows(destination: &Tensor, indices: &Tensor, source: &Tensor) -> Result<()> {
+    let mut index_shape = vec![1; source.rank()];
+    index_shape[0] = indices.elem_count();
+    let indices = indices
+        .reshape(index_shape)?
+        .broadcast_as(source.shape())?
+        .contiguous()?;
+    destination.scatter_set(&indices, source, 0)?;
+    Ok(())
+}
+
+fn copy_rows_parallel(
+    tensor: &Tensor,
+    source_indices: &Tensor,
+    destination_indices: &Tensor,
+) -> Result<()> {
+    let source_rows = tensor.index_select(source_indices, 0)?;
+    scatter_rows(tensor, destination_indices, &source_rows)
+}
+
 fn reject_duplicate_pages(pages: &[usize], operation: &str) -> Result<()> {
     let mut unique = HashSet::with_capacity(pages.len());
     for &page in pages {
@@ -1044,6 +1103,81 @@ mod tests {
         assert_eq!(host_synchronizations.load(Ordering::Relaxed), 1);
         timeline.drain()?;
         assert_eq!(host_synchronizations.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_row_mutations_preserve_order_dtypes_and_parallel_copy_semantics() -> Result<()> {
+        let mut devices = vec![Device::Cpu];
+        #[cfg(feature = "metal")]
+        if let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) {
+            devices.push(device);
+        }
+        #[cfg(feature = "cuda")]
+        if let Ok(device) = Device::new_cuda(0) {
+            devices.push(device);
+        }
+
+        for device in devices {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let destination = Tensor::from_vec(
+                    vec![0_f32, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
+                    (4, 2),
+                    &device,
+                )?
+                .to_dtype(dtype)?;
+                let source = Tensor::from_vec(vec![100_f32, 101.0, 200.0, 201.0], (2, 2), &device)?
+                    .to_dtype(dtype)?;
+                let rows = accelerator_indices(&[3, 1], &device)?;
+                scatter_rows(&destination, &rows, &source)?;
+                assert_eq!(
+                    destination
+                        .to_device(&Device::Cpu)?
+                        .to_dtype(DType::F32)?
+                        .to_vec2::<f32>()?,
+                    vec![
+                        vec![0.0, 1.0],
+                        vec![200.0, 201.0],
+                        vec![20.0, 21.0],
+                        vec![100.0, 101.0],
+                    ],
+                    "batched scatter failed for {:?} {dtype:?}",
+                    device.location()
+                );
+
+                let chain = Tensor::from_vec(vec![0_f32, 1.0, 2.0, 3.0], (4, 1), &device)?
+                    .to_dtype(dtype)?;
+                let chain_sources = accelerator_indices(&[0, 1], &device)?;
+                let chain_destinations = accelerator_indices(&[1, 2], &device)?;
+                copy_rows_parallel(&chain, &chain_sources, &chain_destinations)?;
+                assert_eq!(
+                    chain
+                        .to_device(&Device::Cpu)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    vec![0.0, 0.0, 1.0, 3.0],
+                    "parallel copy chain failed for {:?} {dtype:?}",
+                    device.location()
+                );
+
+                let cycle =
+                    Tensor::from_vec(vec![0_f32, 1.0, 2.0], (3, 1), &device)?.to_dtype(dtype)?;
+                let cycle_sources = accelerator_indices(&[0, 1, 2], &device)?;
+                let cycle_destinations = accelerator_indices(&[1, 2, 0], &device)?;
+                copy_rows_parallel(&cycle, &cycle_sources, &cycle_destinations)?;
+                assert_eq!(
+                    cycle
+                        .to_device(&Device::Cpu)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    vec![2.0, 0.0, 1.0],
+                    "parallel copy cycle failed for {:?} {dtype:?}",
+                    device.location()
+                );
+            }
+        }
         Ok(())
     }
 
