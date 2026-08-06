@@ -482,7 +482,10 @@ impl KvArena for CpuKvArena {
         }
         validate_decode_query(args.queries, self.config.dtype)?;
 
-        let mut tables = Vec::with_capacity(query_dims[0]);
+        let mut tables = LoweredAttentionTables {
+            pages: Vec::new(),
+            rows: Vec::with_capacity(query_dims[0]),
+        };
         let mut next_query = 0_u32;
         for (row_index, row) in args.rows.iter().enumerate() {
             if row.query_start != next_query
@@ -500,6 +503,8 @@ impl KvArena for CpuKvArena {
                 .copied()
                 .map(|block| self.validate_block(block))
                 .collect::<Result<Vec<_>>>()?;
+            let row_pages_start = tables.pages.len();
+            tables.pages.extend_from_slice(&pages);
             let prefix_len = row.context_len - row.query_len;
             for local_query in 0..row.query_len {
                 let causal_context_len = prefix_len
@@ -510,30 +515,27 @@ impl KvArena for CpuKvArena {
                     .window_tokens
                     .map_or(causal_context_len, |window| causal_context_len.min(window));
                 let dropped = causal_context_len - context_len;
-                let physical_start = row
-                    .first_page_offset
-                    .checked_add(dropped)
-                    .ok_or_else(|| {
+                let physical_start =
+                    row.first_page_offset.checked_add(dropped).ok_or_else(|| {
                         Error::InferenceError("prefill physical range overflow".into())
                     })?;
                 let first_page = (physical_start / self.config.page_tokens) as usize;
                 let first_page_offset = (physical_start % self.config.page_tokens) as usize;
                 let required_pages = first_page_offset
                     .checked_add(context_len as usize)
-                    .ok_or_else(|| {
-                        Error::InferenceError("prefill physical range overflow".into())
-                    })?
+                    .ok_or_else(|| Error::InferenceError("prefill physical range overflow".into()))?
                     .div_ceil(self.config.page_tokens as usize);
-                let end_page = first_page.checked_add(required_pages).ok_or_else(|| {
-                    Error::InferenceError("prefill block range overflow".into())
-                })?;
+                let end_page = first_page
+                    .checked_add(required_pages)
+                    .ok_or_else(|| Error::InferenceError("prefill block range overflow".into()))?;
                 if required_pages == 0 || end_page > pages.len() {
                     return Err(Error::InferenceError(format!(
                         "CPU paged prefill row {row_index} has an incomplete block table"
                     )));
                 }
-                tables.push(LoweredDecodeRow {
-                    pages: pages[first_page..end_page].to_vec(),
+                tables.rows.push(LoweredDecodeRow {
+                    page_start: row_pages_start + first_page,
+                    page_len: required_pages,
                     first_page_offset,
                     context_len: context_len as usize,
                 });
@@ -542,7 +544,7 @@ impl KvArena for CpuKvArena {
                 .checked_add(row.query_len)
                 .ok_or_else(|| Error::InferenceError("prefill query range overflow".into()))?;
         }
-        if next_query as usize != query_dims[0] || tables.is_empty() {
+        if next_query as usize != query_dims[0] || tables.rows.is_empty() {
             return Err(Error::InferenceError(
                 "CPU paged prefill rows do not cover every query exactly once".into(),
             ));
@@ -628,57 +630,70 @@ impl KvArena for CpuKvArena {
 }
 
 impl CpuKvArena {
-    fn lower_decode_tables(&self, batch: &KvDecodeBatchMetadata) -> Result<Vec<LoweredDecodeRow>> {
-        batch
+    fn lower_decode_tables(&self, batch: &KvDecodeBatchMetadata) -> Result<LoweredAttentionTables> {
+        let total_pages = batch
             .sequences
             .iter()
-            .enumerate()
-            .map(|(row, sequence)| {
-                if sequence.context_len == 0 {
-                    return Err(Error::InferenceError(format!(
-                        "CPU paged decode row {row} has an empty context"
-                    )));
-                }
-                if sequence.first_page_offset >= self.config.page_tokens {
-                    return Err(Error::InferenceError(format!(
-                        "CPU paged decode row {row} first-page offset {} exceeds page size {}",
-                        sequence.first_page_offset, self.config.page_tokens
-                    )));
-                }
-                let physical_tokens = sequence
-                    .context_len
-                    .checked_add(sequence.first_page_offset)
-                    .ok_or_else(|| {
-                        Error::InferenceError(
-                            "CPU paged decode physical token range exceeds u32".into(),
-                        )
-                    })?;
-                let required_pages =
-                    (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
-                if sequence.blocks.len() != required_pages {
-                    return Err(Error::InferenceError(format!(
-                        "CPU paged decode row {row} has {} pages, expected {required_pages}",
-                        sequence.blocks.len()
-                    )));
-                }
-                let pages = sequence
-                    .blocks
-                    .iter()
-                    .copied()
-                    .map(|block| self.validate_block(block))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(LoweredDecodeRow {
-                    pages,
-                    first_page_offset: sequence.first_page_offset as usize,
-                    context_len: sequence.context_len as usize,
+            .try_fold(0_usize, |total, sequence| {
+                total.checked_add(sequence.blocks.len()).ok_or_else(|| {
+                    Error::InferenceError("CPU paged decode table size overflow".into())
                 })
-            })
-            .collect()
+            })?;
+        let mut lowered = LoweredAttentionTables {
+            pages: Vec::with_capacity(total_pages),
+            rows: Vec::with_capacity(batch.sequences.len()),
+        };
+        for (row, sequence) in batch.sequences.iter().enumerate() {
+            if sequence.context_len == 0 {
+                return Err(Error::InferenceError(format!(
+                    "CPU paged decode row {row} has an empty context"
+                )));
+            }
+            if sequence.first_page_offset >= self.config.page_tokens {
+                return Err(Error::InferenceError(format!(
+                    "CPU paged decode row {row} first-page offset {} exceeds page size {}",
+                    sequence.first_page_offset, self.config.page_tokens
+                )));
+            }
+            let physical_tokens = sequence
+                .context_len
+                .checked_add(sequence.first_page_offset)
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "CPU paged decode physical token range exceeds u32".into(),
+                    )
+                })?;
+            let required_pages =
+                (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
+            if sequence.blocks.len() != required_pages {
+                return Err(Error::InferenceError(format!(
+                    "CPU paged decode row {row} has {} pages, expected {required_pages}",
+                    sequence.blocks.len()
+                )));
+            }
+            let page_start = lowered.pages.len();
+            for block in sequence.blocks.iter().copied() {
+                lowered.pages.push(self.validate_block(block)?);
+            }
+            lowered.rows.push(LoweredDecodeRow {
+                page_start,
+                page_len: required_pages,
+                first_page_offset: sequence.first_page_offset as usize,
+                context_len: sequence.context_len as usize,
+            });
+        }
+        Ok(lowered)
     }
 }
 
-struct LoweredDecodeRow {
+struct LoweredAttentionTables {
     pages: Vec<usize>,
+    rows: Vec<LoweredDecodeRow>,
+}
+
+struct LoweredDecodeRow {
+    page_start: usize,
+    page_len: usize,
     first_page_offset: usize,
     context_len: usize,
 }
@@ -711,7 +726,7 @@ fn online_paged_decode<T>(
     key_start: usize,
     value_start: usize,
     query_start: usize,
-    tables: &[LoweredDecodeRow],
+    tables: &LoweredAttentionTables,
     page_tokens: usize,
     kv_heads: usize,
     key_dim: usize,
@@ -724,13 +739,13 @@ where
     T: Copy,
     f32: From<T>,
 {
-    let batch_size = tables.len();
+    let batch_size = tables.rows.len();
     let mut output = vec![0.0f32; batch_size * query_heads * value_dim];
     let queries_per_kv_head = query_heads / kv_heads;
     let key_page_stride = page_tokens * kv_heads * key_dim;
     let value_page_stride = page_tokens * kv_heads * value_dim;
 
-    for (row, table) in tables.iter().enumerate() {
+    for (row, table) in tables.rows.iter().enumerate() {
         for query_head in 0..query_heads {
             let kv_head = query_head / queries_per_kv_head;
             let query_offset = query_start + (row * query_heads + query_head) * key_dim;
@@ -740,7 +755,13 @@ where
 
             for token in 0..table.context_len {
                 let physical_token = table.first_page_offset + token;
-                let page = table.pages[physical_token / page_tokens];
+                let logical_page = physical_token / page_tokens;
+                if logical_page >= table.page_len {
+                    return Err(Error::InferenceError(
+                        "CPU paged attention lowered table is incomplete".into(),
+                    ));
+                }
+                let page = tables.pages[table.page_start + logical_page];
                 let page_offset = physical_token % page_tokens;
                 let key_offset = key_start
                     + page * key_page_stride
