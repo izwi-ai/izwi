@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use candle_core::{
     backend::BackendStorage, CpuStorage, DType, Device, InplaceOp1, InplaceOp3, Layout, Storage,
     Tensor,
 };
+use rayon::prelude::*;
 
 use crate::backends::BackendKind;
 use crate::error::Error;
@@ -14,8 +15,8 @@ use crate::Result;
 
 use super::{
     validate_attention_softcap, DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats,
-    KvBackendRuntime, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion,
-    PagedKvDecodeArgs, PagedKvPrefillArgs,
+    KvAttentionProvider, KvBackendRuntime, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs,
+    KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
 };
 
 #[derive(Debug)]
@@ -78,11 +79,12 @@ struct CpuLayerStorage {
 pub struct CpuKvArena {
     config: KvArenaConfig,
     layers: HashMap<KvLayerBinding, CpuLayerStorage>,
-    mutation_lock: Mutex<()>,
+    mutation_lock: RwLock<()>,
     slot_write_dispatches: AtomicU64,
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
     page_copy_dispatches: AtomicU64,
+    last_attention_provider: AtomicU64,
 }
 
 impl CpuKvArena {
@@ -121,11 +123,12 @@ impl CpuKvArena {
         Ok(Self {
             config,
             layers,
-            mutation_lock: Mutex::new(()),
+            mutation_lock: RwLock::new(()),
             slot_write_dispatches: AtomicU64::new(0),
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
             page_copy_dispatches: AtomicU64::new(0),
+            last_attention_provider: AtomicU64::new(0),
         })
     }
 
@@ -248,7 +251,7 @@ impl KvArena for CpuKvArena {
 
         let _guard = self
             .mutation_lock
-            .lock()
+            .write()
             .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
         let op = PageZeroOp {
             pages: page_indices,
@@ -283,7 +286,7 @@ impl KvArena for CpuKvArena {
         // chains and cycles have parallel-copy rather than sequential-copy semantics.
         let _guard = self
             .mutation_lock
-            .lock()
+            .write()
             .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
         let op = PageCopyOp {
             copies: page_copies,
@@ -323,7 +326,7 @@ impl KvArena for CpuKvArena {
 
         let _guard = self
             .mutation_lock
-            .lock()
+            .write()
             .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
         layer
             .keys
@@ -381,7 +384,7 @@ impl KvArena for CpuKvArena {
         // provide stable direct slices for the complete online-softmax pass.
         let _guard = self
             .mutation_lock
-            .lock()
+            .read()
             .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
         let (key_storage, key_layout) = layer.keys.storage_and_layout();
         let (value_storage, value_layout) = layer.values.storage_and_layout();
@@ -447,6 +450,8 @@ impl KvArena for CpuKvArena {
         )?
         .to_dtype(self.config.dtype)?;
         self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.last_attention_provider
+            .store(KvAttentionProvider::CpuReference.code(), Ordering::Relaxed);
         Ok(output)
     }
 
@@ -552,7 +557,7 @@ impl KvArena for CpuKvArena {
 
         let _guard = self
             .mutation_lock
-            .lock()
+            .read()
             .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
         let (key_storage, key_layout) = layer.keys.storage_and_layout();
         let (value_storage, value_layout) = layer.values.storage_and_layout();
@@ -603,13 +608,17 @@ impl KvArena for CpuKvArena {
                 ))
             }
         }?;
-        Tensor::from_vec(
+        let output = Tensor::from_vec(
             output,
             (query_dims[0], query_heads, layer.value_head_dim),
             &Device::Cpu,
         )?
         .to_dtype(self.config.dtype)
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+        self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.last_attention_provider
+            .store(KvAttentionProvider::CpuReference.code(), Ordering::Relaxed);
+        Ok(output)
     }
 
     fn operation_stats(&self) -> KvArenaOperationStats {
@@ -620,6 +629,14 @@ impl KvArena for CpuKvArena {
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
             attention_plan_cache_hits: 0,
             attention_plan_cache_misses: 0,
+            attention_plan_cache_evictions: 0,
+            attention_plan_device_uploads: 0,
+            attention_plan_resident_bytes: 0,
+            backing_allocations: Some((self.layers.len() * 2) as u64),
+            workspace_bytes: Some(0),
+            last_attention_provider: KvAttentionProvider::from_code(
+                self.last_attention_provider.load(Ordering::Relaxed),
+            ),
             host_synchronizations: 0,
         }
     }
@@ -736,7 +753,7 @@ fn online_paged_decode<T>(
     softcap: Option<f32>,
 ) -> Result<Vec<f32>>
 where
-    T: Copy,
+    T: Copy + Sync,
     f32: From<T>,
 {
     let batch_size = tables.rows.len();
@@ -745,55 +762,76 @@ where
     let key_page_stride = page_tokens * kv_heads * key_dim;
     let value_page_stride = page_tokens * kv_heads * value_dim;
 
-    for (row, table) in tables.rows.iter().enumerate() {
-        for query_head in 0..query_heads {
-            let kv_head = query_head / queries_per_kv_head;
-            let query_offset = query_start + (row * query_heads + query_head) * key_dim;
-            let mut running_max = f32::NEG_INFINITY;
-            let mut running_sum = 0.0f32;
-            let mut accumulator = vec![0.0f32; value_dim];
+    for table in &tables.rows {
+        let covered_pages = table
+            .first_page_offset
+            .checked_add(table.context_len)
+            .ok_or_else(|| Error::InferenceError("CPU paged attention range overflow".into()))?
+            .div_ceil(page_tokens);
+        if covered_pages > table.page_len
+            || table.page_start.saturating_add(table.page_len) > tables.pages.len()
+        {
+            return Err(Error::InferenceError(
+                "CPU paged attention lowered table is incomplete".into(),
+            ));
+        }
+    }
 
-            for token in 0..table.context_len {
-                let physical_token = table.first_page_offset + token;
-                let logical_page = physical_token / page_tokens;
-                if logical_page >= table.page_len {
-                    return Err(Error::InferenceError(
-                        "CPU paged attention lowered table is incomplete".into(),
-                    ));
-                }
-                let page = tables.pages[table.page_start + logical_page];
-                let page_offset = physical_token % page_tokens;
-                let key_offset = key_start
-                    + page * key_page_stride
-                    + (page_offset * kv_heads + kv_head) * key_dim;
-                let value_offset = value_start
-                    + page * value_page_stride
-                    + (page_offset * kv_heads + kv_head) * value_dim;
-                let mut score = 0.0f32;
-                for dim in 0..key_dim {
-                    score +=
-                        f32::from(queries[query_offset + dim]) * f32::from(keys[key_offset + dim]);
-                }
-                score *= softmax_scale;
-                if let Some(softcap) = softcap {
-                    score = softcap * (score / softcap).tanh();
-                }
+    let compute_head = |row_head: usize, output: &mut [f32], accumulator: &mut Vec<f32>| {
+        let row = row_head / query_heads;
+        let query_head = row_head % query_heads;
+        let table = &tables.rows[row];
+        let kv_head = query_head / queries_per_kv_head;
+        let query_offset = query_start + row_head * key_dim;
+        accumulator.resize(value_dim, 0.0);
+        accumulator.fill(0.0);
+        let mut running_max = f32::NEG_INFINITY;
+        let mut running_sum = 0.0f32;
 
-                let next_max = running_max.max(score);
-                let previous_weight = (running_max - next_max).exp();
-                let token_weight = (score - next_max).exp();
-                running_sum = running_sum * previous_weight + token_weight;
-                for dim in 0..value_dim {
-                    accumulator[dim] = accumulator[dim] * previous_weight
-                        + f32::from(values[value_offset + dim]) * token_weight;
-                }
-                running_max = next_max;
+        for token in 0..table.context_len {
+            let physical_token = table.first_page_offset + token;
+            let logical_page = physical_token / page_tokens;
+            let page = tables.pages[table.page_start + logical_page];
+            let page_offset = physical_token % page_tokens;
+            let key_offset =
+                key_start + page * key_page_stride + (page_offset * kv_heads + kv_head) * key_dim;
+            let value_offset = value_start
+                + page * value_page_stride
+                + (page_offset * kv_heads + kv_head) * value_dim;
+            let mut score = 0.0f32;
+            for dim in 0..key_dim {
+                score += f32::from(queries[query_offset + dim]) * f32::from(keys[key_offset + dim]);
+            }
+            score *= softmax_scale;
+            if let Some(softcap) = softcap {
+                score = softcap * (score / softcap).tanh();
             }
 
-            let output_offset = (row * query_heads + query_head) * value_dim;
+            let next_max = running_max.max(score);
+            let previous_weight = (running_max - next_max).exp();
+            let token_weight = (score - next_max).exp();
+            running_sum = running_sum * previous_weight + token_weight;
             for dim in 0..value_dim {
-                output[output_offset + dim] = accumulator[dim] / running_sum;
+                accumulator[dim] = accumulator[dim] * previous_weight
+                    + f32::from(values[value_offset + dim]) * token_weight;
             }
+            running_max = next_max;
+        }
+        for dim in 0..value_dim {
+            output[dim] = accumulator[dim] / running_sum;
+        }
+    };
+
+    let row_heads = batch_size * query_heads;
+    if row_heads >= 8 {
+        output.par_chunks_mut(value_dim).enumerate().for_each_init(
+            || Vec::with_capacity(value_dim),
+            |acc, (row_head, output)| compute_head(row_head, output, acc),
+        );
+    } else {
+        let mut accumulator = Vec::with_capacity(value_dim);
+        for (row_head, output) in output.chunks_mut(value_dim).enumerate() {
+            compute_head(row_head, output, &mut accumulator);
         }
     }
     Ok(output)
