@@ -634,6 +634,7 @@ impl KvArena for CpuKvArena {
             attention_plan_resident_bytes: 0,
             backing_allocations: Some((self.layers.len() * 2) as u64),
             workspace_bytes: Some(0),
+            workspace_allocations: Some(0),
             last_attention_provider: KvAttentionProvider::from_code(
                 self.last_attention_provider.load(Ordering::Relaxed),
             ),

@@ -13,8 +13,8 @@ use crate::Result;
 #[cfg(feature = "cuda")]
 use super::KvBackendRuntime;
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvDeviceFence, KvPageCopy,
-    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvAttentionProvider, KvDeviceFence,
+    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
     PagedKvPrefillRow,
 };
 
@@ -97,72 +97,26 @@ fn cuda_flash_paged_attention_eligible(
         && key_head_dim % 8 == 0
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Debug)]
-struct AcceleratorFence {
-    timeline: Arc<AcceleratorFenceTimeline>,
-    target_epoch: u64,
+struct CudaEventFence {
+    event: cudarc::driver::CudaEvent,
+    host_synchronizations: Arc<AtomicU64>,
 }
 
-impl KvDeviceFence for AcceleratorFence {
+#[cfg(feature = "cuda")]
+impl KvDeviceFence for CudaEventFence {
     fn is_complete(&self) -> bool {
-        self.timeline.completed.load(Ordering::Acquire) >= self.target_epoch
+        self.event.is_complete()
     }
 
     fn wait(&self) -> Result<()> {
         if !self.is_complete() {
-            self.timeline.synchronize_issued()?;
+            self.event.synchronize().map_err(|error| {
+                Error::InferenceError(format!("CUDA KV completion event failed: {error}"))
+            })?;
+            self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct AcceleratorFenceTimeline {
-    device: Device,
-    issued: AtomicU64,
-    completed: AtomicU64,
-    synchronization_lock: Mutex<()>,
-    host_synchronizations: Arc<AtomicU64>,
-}
-
-impl AcceleratorFenceTimeline {
-    fn issue(self: &Arc<Self>) -> Result<DeviceFence> {
-        let _guard = self.synchronization_lock.lock().map_err(|_| {
-            Error::InferenceError("accelerator KV fence timeline was poisoned".into())
-        })?;
-        let current = self.issued.load(Ordering::Acquire);
-        let target_epoch = current
-            .checked_add(1)
-            .ok_or_else(|| Error::InferenceError("accelerator KV fence epoch overflow".into()))?;
-        self.issued.store(target_epoch, Ordering::Release);
-        Ok(Arc::new(AcceleratorFence {
-            timeline: self.clone(),
-            target_epoch,
-        }))
-    }
-
-    fn synchronize_issued(&self) -> Result<()> {
-        let _guard = self.synchronization_lock.lock().map_err(|_| {
-            Error::InferenceError("accelerator KV fence timeline was poisoned".into())
-        })?;
-        let issued = self.issued.load(Ordering::Acquire);
-        if self.completed.load(Ordering::Acquire) >= issued {
-            return Ok(());
-        }
-        self.device.synchronize()?;
-        self.completed.store(issued, Ordering::Release);
-        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn drain(&self) -> Result<()> {
-        let _guard = self.synchronization_lock.lock().map_err(|_| {
-            Error::InferenceError("accelerator KV fence timeline was poisoned".into())
-        })?;
-        self.device.synchronize()?;
-        self.completed
-            .store(self.issued.load(Ordering::Acquire), Ordering::Release);
-        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -186,6 +140,110 @@ fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
     // coordinator commit/reuse never races queued private-buffer work.
     device.synchronize()?;
     Ok(Arc::new(CompletedAcceleratorFence))
+}
+
+const ACCELERATOR_WORKSPACE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceleratorWorkspaceKey {
+    shape: Vec<usize>,
+    dtype: DType,
+}
+
+#[derive(Debug)]
+struct AcceleratorWorkspaceLease {
+    key: AcceleratorWorkspaceKey,
+    tensor: Tensor,
+    bytes: usize,
+}
+
+struct RetiredAcceleratorWorkspace {
+    lease: AcceleratorWorkspaceLease,
+    retirement: DeviceFence,
+}
+
+/// A bounded scratch pool whose entries are unavailable until their exact
+/// submission token proves completion. The byte count includes checked-out and
+/// retired storage, so allocation failure is deterministic rather than a
+/// driver-OOM side effect.
+struct AcceleratorWorkspacePool {
+    budget_bytes: usize,
+    reserved_bytes: usize,
+    allocations: u64,
+    retired: Vec<RetiredAcceleratorWorkspace>,
+}
+
+impl std::fmt::Debug for AcceleratorWorkspacePool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceleratorWorkspacePool")
+            .field("budget_bytes", &self.budget_bytes)
+            .field("reserved_bytes", &self.reserved_bytes)
+            .field("allocations", &self.allocations)
+            .field("retired_entries", &self.retired.len())
+            .finish()
+    }
+}
+
+impl AcceleratorWorkspacePool {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            reserved_bytes: 0,
+            allocations: 0,
+            retired: Vec::new(),
+        }
+    }
+
+    fn acquire(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<AcceleratorWorkspaceLease> {
+        let key = AcceleratorWorkspaceKey {
+            shape: shape.to_vec(),
+            dtype,
+        };
+        if let Some(index) = self
+            .retired
+            .iter()
+            .position(|entry| entry.lease.key == key && entry.retirement.is_complete())
+        {
+            return Ok(self.retired.swap_remove(index).lease);
+        }
+
+        let elements = shape.iter().try_fold(1usize, |total, dimension| {
+            total.checked_mul(*dimension).ok_or_else(|| {
+                Error::Overloaded("accelerator workspace element count overflow".into())
+            })
+        })?;
+        let bytes = elements
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| Error::Overloaded("accelerator workspace byte count overflow".into()))?;
+        let requested_total = self.reserved_bytes.checked_add(bytes).ok_or_else(|| {
+            Error::Overloaded("accelerator workspace reservation overflow".into())
+        })?;
+        if requested_total > self.budget_bytes {
+            return Err(Error::Overloaded(format!(
+                "accelerator workspace budget exceeded: requested_bytes={bytes}, reserved_bytes={}, budget_bytes={}",
+                self.reserved_bytes, self.budget_bytes
+            )));
+        }
+        let tensor = Tensor::zeros(shape, dtype, device)?;
+        self.reserved_bytes = requested_total;
+        self.allocations = self.allocations.saturating_add(1);
+        Ok(AcceleratorWorkspaceLease { key, tensor, bytes })
+    }
+
+    fn retire(&mut self, lease: AcceleratorWorkspaceLease, retirement: DeviceFence) {
+        self.retired
+            .push(RetiredAcceleratorWorkspace { lease, retirement });
+    }
+
+    fn discard(&mut self, lease: AcceleratorWorkspaceLease) {
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(lease.bytes);
+    }
 }
 
 #[derive(Debug)]
@@ -354,6 +412,11 @@ pub struct CandleAcceleratorKvArena {
     mutation_lock: Mutex<()>,
     prefill_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedPrefillDeviceMetadata>>,
     decode_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedDecodeDeviceMetadata>>,
+    // Candle 0.11 does not expose a Metal command-buffer token or custom-op
+    // output-buffer ABI. Pool only arena-owned mutation scratch here; native
+    // attention partials/metadata must remain unpooled until that boundary can
+    // return an exact retirement token.
+    workspace_pool: Mutex<AcceleratorWorkspacePool>,
     attention_plan_cache_hits: AtomicU64,
     attention_plan_cache_misses: AtomicU64,
     attention_plan_cache_evictions: AtomicU64,
@@ -363,8 +426,8 @@ pub struct CandleAcceleratorKvArena {
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
     page_copy_dispatches: AtomicU64,
+    last_attention_provider: AtomicU64,
     host_synchronizations: Arc<AtomicU64>,
-    fence_timeline: Option<Arc<AcceleratorFenceTimeline>>,
 }
 
 impl CandleAcceleratorKvArena {
@@ -410,15 +473,6 @@ impl CandleAcceleratorKvArena {
         }
 
         let host_synchronizations = Arc::new(AtomicU64::new(0));
-        let fence_timeline = (backend == BackendKind::Cuda).then(|| {
-            Arc::new(AcceleratorFenceTimeline {
-                device: device.clone(),
-                issued: AtomicU64::new(0),
-                completed: AtomicU64::new(0),
-                synchronization_lock: Mutex::new(()),
-                host_synchronizations: host_synchronizations.clone(),
-            })
-        });
         Ok(Self {
             config,
             backend,
@@ -428,6 +482,9 @@ impl CandleAcceleratorKvArena {
             mutation_lock: Mutex::new(()),
             prefill_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
             decode_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
+            workspace_pool: Mutex::new(AcceleratorWorkspacePool::new(
+                ACCELERATOR_WORKSPACE_BUDGET_BYTES,
+            )),
             attention_plan_cache_hits: AtomicU64::new(0),
             attention_plan_cache_misses: AtomicU64::new(0),
             attention_plan_cache_evictions: AtomicU64::new(0),
@@ -437,8 +494,8 @@ impl CandleAcceleratorKvArena {
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
             page_copy_dispatches: AtomicU64::new(0),
+            last_attention_provider: AtomicU64::new(0),
             host_synchronizations,
-            fence_timeline,
         })
     }
 
@@ -501,10 +558,23 @@ impl CandleAcceleratorKvArena {
             self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
             Ok(fence)
         } else {
-            self.fence_timeline
-                .as_ref()
-                .ok_or_else(|| Error::InferenceError("CUDA KV fence timeline is missing".into()))?
-                .issue()
+            #[cfg(feature = "cuda")]
+            {
+                let stream = self.device.as_cuda_device()?.cuda_stream();
+                let event = stream.record_event(None).map_err(|error| {
+                    Error::InferenceError(format!(
+                        "failed to record CUDA KV completion event: {error}"
+                    ))
+                })?;
+                return Ok(Arc::new(CudaEventFence {
+                    event,
+                    host_synchronizations: self.host_synchronizations.clone(),
+                }));
+            }
+            #[cfg(not(feature = "cuda"))]
+            Err(Error::InferenceError(
+                "CUDA KV completion events are not compiled".into(),
+            ))
         }
     }
 
@@ -908,7 +978,7 @@ impl CandleAcceleratorKvArena {
         {
             let (seqlens_q, seqlens_k, block_table) =
                 self.cached_decode_device_metadata(args.batch, &seqlens_k, &table, max_blocks)?;
-            return Ok(candle_flash_attn::flash_attn_varlen_paged_windowed(
+            let output = candle_flash_attn::flash_attn_varlen_paged_windowed(
                 args.queries,
                 &layer.keys,
                 &layer.values,
@@ -923,7 +993,12 @@ impl CandleAcceleratorKvArena {
                 None,
                 self.config.page_tokens as usize,
                 args.softcap,
-            )?);
+            )?;
+            self.last_attention_provider.store(
+                KvAttentionProvider::CudaFlashAttention.code(),
+                Ordering::Relaxed,
+            );
+            return Ok(output);
         }
 
         let context_lens = seqlens_k
@@ -935,7 +1010,7 @@ impl CandleAcceleratorKvArena {
         metadata.extend(context_lens);
         metadata.extend(first_page_offsets);
         metadata.extend(table);
-        Ok(crate::kernels::cuda::paged_decode_attention(
+        let output = crate::kernels::cuda::paged_decode_attention(
             args.queries,
             &layer.keys,
             &layer.values,
@@ -949,7 +1024,10 @@ impl CandleAcceleratorKvArena {
             layer.value_head_dim,
             args.softmax_scale,
             args.softcap,
-        )?)
+        )?;
+        self.last_attention_provider
+            .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
+        Ok(output)
     }
 
     #[cfg(feature = "metal")]
@@ -1047,35 +1125,83 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
+        let mut workspaces = Vec::new();
+        let mut dispatch_result = Ok(());
         if !page_indices.is_empty() {
             let page_indices = accelerator_indices(&page_indices, &self.device)?;
             for layer in self.layers.values() {
-                let zero_keys = Tensor::zeros(
-                    (
-                        page_indices.elem_count(),
-                        self.config.page_tokens as usize,
-                        layer.num_kv_heads,
-                        layer.key_head_dim,
-                    ),
-                    self.config.dtype,
-                    &self.device,
-                )?;
-                let zero_values = Tensor::zeros(
-                    (
-                        page_indices.elem_count(),
-                        self.config.page_tokens as usize,
-                        layer.num_kv_heads,
-                        layer.value_head_dim,
-                    ),
-                    self.config.dtype,
-                    &self.device,
-                )?;
-                scatter_rows(&layer.keys, &page_indices, &zero_keys)?;
-                scatter_rows(&layer.values, &page_indices, &zero_values)?;
+                let key_shape = [
+                    page_indices.elem_count(),
+                    self.config.page_tokens as usize,
+                    layer.num_kv_heads,
+                    layer.key_head_dim,
+                ];
+                let value_shape = [
+                    page_indices.elem_count(),
+                    self.config.page_tokens as usize,
+                    layer.num_kv_heads,
+                    layer.value_head_dim,
+                ];
+                let acquired = (|| {
+                    let mut pool = self.workspace_pool.lock().map_err(|_| {
+                        Error::InferenceError("accelerator workspace pool was poisoned".into())
+                    })?;
+                    let keys = pool.acquire(&key_shape, self.config.dtype, &self.device)?;
+                    match pool.acquire(&value_shape, self.config.dtype, &self.device) {
+                        Ok(values) => Ok((keys, values)),
+                        Err(error) => {
+                            pool.discard(keys);
+                            Err(error)
+                        }
+                    }
+                })();
+                let (zero_keys, zero_values) = match acquired {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        dispatch_result = Err(error);
+                        break;
+                    }
+                };
+                let keys_index = workspaces.len();
+                workspaces.push(zero_keys);
+                let values_index = workspaces.len();
+                workspaces.push(zero_values);
+                if let Err(error) =
+                    scatter_rows(&layer.keys, &page_indices, &workspaces[keys_index].tensor)
+                        .and_then(|_| {
+                            scatter_rows(
+                                &layer.values,
+                                &page_indices,
+                                &workspaces[values_index].tensor,
+                            )
+                        })
+                {
+                    dispatch_result = Err(error);
+                    break;
+                }
             }
         }
         self.page_zero_dispatches.fetch_add(1, Ordering::Relaxed);
-        self.mutation_fence()
+        let retirement = match self.mutation_fence() {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                if let Ok(mut pool) = self.workspace_pool.lock() {
+                    for workspace in workspaces {
+                        pool.discard(workspace);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let mut pool = self
+            .workspace_pool
+            .lock()
+            .map_err(|_| Error::InferenceError("accelerator workspace pool was poisoned".into()))?;
+        for workspace in workspaces {
+            pool.retire(workspace, retirement.clone());
+        }
+        dispatch_result?;
+        Ok(retirement)
     }
 
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence> {
@@ -1192,6 +1318,8 @@ impl KvArena for CandleAcceleratorKvArena {
                 Error::InferenceError("accelerator KV mutation lock was poisoned".into())
             })?;
             let output = self.metal_paged_prefill(layer, &args, &lowered)?;
+            self.last_attention_provider
+                .store(KvAttentionProvider::MetalNative.code(), Ordering::Relaxed);
             self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
@@ -1211,11 +1339,18 @@ impl KvArena for CandleAcceleratorKvArena {
                 Error::InferenceError("accelerator KV mutation lock was poisoned".into())
             })?;
             let output = self.cuda_flash_paged_prefill(layer, &args, &lowered)?;
+            self.last_attention_provider.store(
+                KvAttentionProvider::CudaFlashAttention.code(),
+                Ordering::Relaxed,
+            );
             self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
 
-        super::portable_paged_prefill(self, binding, args)
+        let output = super::portable_paged_prefill(self, binding, args)?;
+        self.last_attention_provider
+            .store(KvAttentionProvider::Portable.code(), Ordering::Relaxed);
+        Ok(output)
     }
 
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
@@ -1241,6 +1376,8 @@ impl KvArena for CandleAcceleratorKvArena {
         #[cfg(feature = "metal")]
         if self.backend == BackendKind::Metal {
             let output = self.metal_paged_decode(layer, args)?;
+            self.last_attention_provider
+                .store(KvAttentionProvider::MetalNative.code(), Ordering::Relaxed);
             self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
@@ -1252,6 +1389,17 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn operation_stats(&self) -> KvArenaOperationStats {
+        let (workspace_bytes, workspace_allocations) = self
+            .workspace_pool
+            .lock()
+            .ok()
+            .map(|pool| {
+                (
+                    u64::try_from(pool.reserved_bytes).ok(),
+                    Some(pool.allocations),
+                )
+            })
+            .unwrap_or((None, None));
         KvArenaOperationStats {
             slot_write_dispatches: self.slot_write_dispatches.load(Ordering::Relaxed),
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
@@ -1259,17 +1407,47 @@ impl KvArena for CandleAcceleratorKvArena {
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
             attention_plan_cache_hits: self.attention_plan_cache_hits.load(Ordering::Relaxed),
             attention_plan_cache_misses: self.attention_plan_cache_misses.load(Ordering::Relaxed),
+            attention_plan_cache_evictions: self
+                .attention_plan_cache_evictions
+                .load(Ordering::Relaxed),
+            attention_plan_device_uploads: self
+                .attention_plan_device_uploads
+                .load(Ordering::Relaxed),
+            attention_plan_resident_bytes: self
+                .attention_plan_resident_bytes
+                .load(Ordering::Relaxed),
+            backing_allocations: Some((self.layers.len() * 2) as u64),
+            workspace_bytes,
+            workspace_allocations,
+            last_attention_provider: KvAttentionProvider::from_code(
+                self.last_attention_provider.load(Ordering::Relaxed),
+            ),
             host_synchronizations: self.host_synchronizations.load(Ordering::Relaxed),
         }
     }
 
     fn drain(&self) -> Result<()> {
-        if let Some(timeline) = self.fence_timeline.as_ref() {
-            timeline.drain()
-        } else {
+        if self.backend == BackendKind::Metal {
             self.device.synchronize()?;
             self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        } else {
+            #[cfg(feature = "cuda")]
+            {
+                self.device
+                    .as_cuda_device()?
+                    .cuda_stream()
+                    .synchronize()
+                    .map_err(|error| {
+                        Error::InferenceError(format!("CUDA KV stream drain failed: {error}"))
+                    })?;
+                self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            #[cfg(not(feature = "cuda"))]
+            Err(Error::InferenceError(
+                "CUDA KV stream drain is not compiled".into(),
+            ))
         }
     }
 }
@@ -1637,6 +1815,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestCompletionFence(Arc<std::sync::atomic::AtomicBool>);
+
+    impl KvDeviceFence for TestCompletionFence {
+        fn is_complete(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+
+        fn wait(&self) -> Result<()> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    fn test_completion(complete: bool) -> (DeviceFence, Arc<std::sync::atomic::AtomicBool>) {
+        let state = Arc::new(std::sync::atomic::AtomicBool::new(complete));
+        (Arc::new(TestCompletionFence(state.clone())), state)
+    }
+
+    #[test]
+    fn accelerator_workspace_pool_reuses_one_allocation_for_one_hundred_operations() -> Result<()> {
+        let mut pool = AcceleratorWorkspacePool::new(64);
+        let (completed, _) = test_completion(true);
+        for _ in 0..100 {
+            let workspace = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+            pool.retire(workspace, completed.clone());
+        }
+        assert_eq!(pool.allocations, 1);
+        assert_eq!(pool.reserved_bytes, 64);
+        assert_eq!(pool.retired.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn accelerator_workspace_pool_never_reuses_before_retirement() -> Result<()> {
+        let mut pool = AcceleratorWorkspacePool::new(128);
+        let (pending, pending_state) = test_completion(false);
+        let first = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        let first_id = first.tensor.id();
+        pool.retire(first, pending);
+
+        let (also_pending, _) = test_completion(false);
+        let second = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        assert_ne!(second.tensor.id(), first_id);
+        pool.retire(second, also_pending);
+        assert_eq!(pool.allocations, 2);
+
+        pending_state.store(true, Ordering::Release);
+        let reused = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        assert_eq!(reused.tensor.id(), first_id);
+        assert_eq!(pool.allocations, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn accelerator_workspace_pool_returns_structured_budget_error() -> Result<()> {
+        let mut pool = AcceleratorWorkspacePool::new(64);
+        let (pending, _) = test_completion(false);
+        let workspace = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        pool.retire(workspace, pending);
+
+        let error = pool
+            .acquire(&[16], DType::F32, &Device::Cpu)
+            .expect_err("an in-flight workspace must still consume the budget");
+        let message = error.to_string();
+        assert!(message.contains("requested_bytes=64"));
+        assert!(message.contains("reserved_bytes=64"));
+        assert!(message.contains("budget_bytes=64"));
+        Ok(())
+    }
+
     #[test]
     fn resident_attention_plan_cache_is_byte_bounded_and_lru() {
         let mut cache = ResidentAttentionPlanCache::default();
@@ -1703,36 +1952,6 @@ mod tests {
                 offsets_zero,
             ));
         }
-    }
-
-    #[test]
-    fn fence_timeline_coalesces_all_issued_mutations_into_one_wait() -> Result<()> {
-        let host_synchronizations = Arc::new(AtomicU64::new(0));
-        let timeline = Arc::new(AcceleratorFenceTimeline {
-            device: Device::Cpu,
-            issued: AtomicU64::new(0),
-            completed: AtomicU64::new(0),
-            synchronization_lock: Mutex::new(()),
-            host_synchronizations: host_synchronizations.clone(),
-        });
-        let first = timeline.issue()?;
-        let second = timeline.issue()?;
-        let third = timeline.issue()?;
-        assert!(!first.is_complete());
-        assert!(!third.is_complete());
-
-        first.wait()?;
-        assert!(first.is_complete());
-        assert!(second.is_complete());
-        assert!(third.is_complete());
-        assert_eq!(host_synchronizations.load(Ordering::Relaxed), 1);
-
-        second.wait()?;
-        third.wait()?;
-        assert_eq!(host_synchronizations.load(Ordering::Relaxed), 1);
-        timeline.drain()?;
-        assert_eq!(host_synchronizations.load(Ordering::Relaxed), 2);
-        Ok(())
     }
 
     #[test]

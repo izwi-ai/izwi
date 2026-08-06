@@ -78,8 +78,56 @@ pub struct KvArenaOperationStats {
     pub page_copy_dispatches: u64,
     pub attention_plan_cache_hits: u64,
     pub attention_plan_cache_misses: u64,
+    pub attention_plan_cache_evictions: u64,
+    pub attention_plan_device_uploads: u64,
+    pub attention_plan_resident_bytes: u64,
+    /// Number of long-lived K/V backing allocations owned by the arena.
+    pub backing_allocations: Option<u64>,
+    /// Provider workspace bytes currently retained by the arena. `None`
+    /// means the provider cannot meter this value yet.
+    pub workspace_bytes: Option<u64>,
+    /// Number of provider workspace allocations made by this arena.
+    pub workspace_allocations: Option<u64>,
+    /// Provider that completed the most recent attention operation.
+    pub last_attention_provider: Option<KvAttentionProvider>,
     /// Explicit device synchronization that blocks the calling host thread.
     pub host_synchronizations: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvAttentionProvider {
+    CpuReference,
+    Portable,
+    CudaNative,
+    CudaFlashAttention,
+    MetalNative,
+}
+
+impl KvAttentionProvider {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CpuReference => "cpu_reference",
+            Self::Portable => "portable",
+            Self::CudaNative => "cuda_native",
+            Self::CudaFlashAttention => "cuda_flash_attention",
+            Self::MetalNative => "metal_native",
+        }
+    }
+
+    const fn code(self) -> u64 {
+        self as u64 + 1
+    }
+
+    fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::CpuReference),
+            2 => Some(Self::Portable),
+            3 => Some(Self::CudaNative),
+            4 => Some(Self::CudaFlashAttention),
+            5 => Some(Self::MetalNative),
+            _ => None,
+        }
+    }
 }
 
 /// Backend-specific, immutable lowering of host slot references.

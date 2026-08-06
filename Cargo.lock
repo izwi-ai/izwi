@@ -3711,6 +3711,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "cudaforge",
+ "cudarc 0.19.8",
  "dirs 5.0.1",
  "flate2",
  "futures",
