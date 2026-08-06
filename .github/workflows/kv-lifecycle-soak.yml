@@ -1,0 +1,42 @@
+name: Managed KV Lifecycle Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Soak profile
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - smoke
+          - pr
+          - nightly
+  schedule:
+    - cron: "41 1 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kv-lifecycle-soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  managed-kv-lifecycle:
+    name: Managed KV Lifecycle (${{ inputs.profile || 'nightly' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run managed KV lifecycle soak
+        run: scripts/ci/run-kv-lifecycle-soak.sh --profile "${{ inputs.profile || 'nightly' }}"

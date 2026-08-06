@@ -3036,3 +3036,7 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "managed_stress.rs"]
+mod stress_tests;
