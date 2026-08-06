@@ -1050,3 +1050,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidInput(_)));
     }
 }
+
+#[cfg(test)]
+#[path = "adapters/state_topology_certification.rs"]
+mod state_topology_certification;
