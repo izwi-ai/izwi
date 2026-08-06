@@ -16,7 +16,10 @@ use std::time::Instant;
 
 #[cfg(test)]
 use crate::backends::kv::KvArena;
-use crate::backends::kv::{KvSlotMap, KvWriteArgs, KvWriteCompletionCollector, PagedKvDecodeArgs};
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::v2::{
@@ -2123,16 +2126,17 @@ impl Qwen3Attention {
                 slots,
             },
         )?;
-        completion.wait()?;
+        let (out, completion) = submit_ordered_after_write(completion, || {
+            first.arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: metadata,
+                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                },
+            )
+        })?;
         completions.collect(completion)?;
-        let out = first.arena.paged_decode(
-            binding,
-            PagedKvDecodeArgs {
-                queries: &queries,
-                batch: metadata,
-                softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-            },
-        )?;
         let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }

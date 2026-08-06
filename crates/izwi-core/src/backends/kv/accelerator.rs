@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, DeviceLocation, Tensor};
@@ -64,29 +64,85 @@ pub const fn candle_accelerator_kv_support(backend: BackendKind) -> CandleAccele
 
 #[derive(Debug)]
 struct AcceleratorFence {
-    device: Device,
-    complete: AtomicBool,
+    timeline: Arc<AcceleratorFenceTimeline>,
+    target_epoch: u64,
 }
 
 impl KvDeviceFence for AcceleratorFence {
     fn is_complete(&self) -> bool {
-        self.complete.load(Ordering::Acquire)
+        self.timeline.completed.load(Ordering::Acquire) >= self.target_epoch
     }
 
     fn wait(&self) -> Result<()> {
         if !self.is_complete() {
-            self.device.synchronize()?;
-            self.complete.store(true, Ordering::Release);
+            self.timeline.synchronize_issued()?;
         }
         Ok(())
     }
 }
 
-fn device_fence(device: &Device) -> DeviceFence {
-    Arc::new(AcceleratorFence {
-        device: device.clone(),
-        complete: AtomicBool::new(false),
-    })
+#[derive(Debug)]
+struct AcceleratorFenceTimeline {
+    device: Device,
+    issued: AtomicU64,
+    completed: AtomicU64,
+    synchronization_lock: Mutex<()>,
+    host_synchronizations: Arc<AtomicU64>,
+}
+
+impl AcceleratorFenceTimeline {
+    fn issue(self: &Arc<Self>) -> Result<DeviceFence> {
+        let _guard = self.synchronization_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV fence timeline was poisoned".into())
+        })?;
+        let current = self.issued.load(Ordering::Acquire);
+        let target_epoch = current
+            .checked_add(1)
+            .ok_or_else(|| Error::InferenceError("accelerator KV fence epoch overflow".into()))?;
+        self.issued.store(target_epoch, Ordering::Release);
+        Ok(Arc::new(AcceleratorFence {
+            timeline: self.clone(),
+            target_epoch,
+        }))
+    }
+
+    fn synchronize_issued(&self) -> Result<()> {
+        let _guard = self.synchronization_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV fence timeline was poisoned".into())
+        })?;
+        let issued = self.issued.load(Ordering::Acquire);
+        if self.completed.load(Ordering::Acquire) >= issued {
+            return Ok(());
+        }
+        self.device.synchronize()?;
+        self.completed.store(issued, Ordering::Release);
+        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<()> {
+        let _guard = self.synchronization_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV fence timeline was poisoned".into())
+        })?;
+        self.device.synchronize()?;
+        self.completed
+            .store(self.issued.load(Ordering::Acquire), Ordering::Release);
+        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CompletedAcceleratorFence;
+
+impl KvDeviceFence for CompletedAcceleratorFence {
+    fn is_complete(&self) -> bool {
+        true
+    }
+
+    fn wait(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
@@ -94,10 +150,7 @@ fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
     // completion token. Complete this mutation before publishing its fence so
     // coordinator commit/reuse never races queued private-buffer work.
     device.synchronize()?;
-    Ok(Arc::new(AcceleratorFence {
-        device: device.clone(),
-        complete: AtomicBool::new(true),
-    }))
+    Ok(Arc::new(CompletedAcceleratorFence))
 }
 
 #[derive(Debug)]
@@ -151,7 +204,8 @@ pub struct CandleAcceleratorKvArena {
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
     page_copy_dispatches: AtomicU64,
-    host_synchronizations: AtomicU64,
+    host_synchronizations: Arc<AtomicU64>,
+    fence_timeline: Option<Arc<AcceleratorFenceTimeline>>,
 }
 
 impl CandleAcceleratorKvArena {
@@ -194,6 +248,16 @@ impl CandleAcceleratorKvArena {
             );
         }
 
+        let host_synchronizations = Arc::new(AtomicU64::new(0));
+        let fence_timeline = (backend == BackendKind::Cuda).then(|| {
+            Arc::new(AcceleratorFenceTimeline {
+                device: device.clone(),
+                issued: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+                synchronization_lock: Mutex::new(()),
+                host_synchronizations: host_synchronizations.clone(),
+            })
+        });
         Ok(Self {
             config,
             backend,
@@ -204,7 +268,8 @@ impl CandleAcceleratorKvArena {
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
             page_copy_dispatches: AtomicU64::new(0),
-            host_synchronizations: AtomicU64::new(0),
+            host_synchronizations,
+            fence_timeline,
         })
     }
 
@@ -257,7 +322,10 @@ impl CandleAcceleratorKvArena {
             self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
             Ok(fence)
         } else {
-            Ok(device_fence(&self.device))
+            self.fence_timeline
+                .as_ref()
+                .ok_or_else(|| Error::InferenceError("CUDA KV fence timeline is missing".into()))?
+                .issue()
         }
     }
 
@@ -656,9 +724,13 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn drain(&self) -> Result<()> {
-        self.device.synchronize()?;
-        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        if let Some(timeline) = self.fence_timeline.as_ref() {
+            timeline.drain()
+        } else {
+            self.device.synchronize()?;
+            self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 }
 
@@ -943,6 +1015,36 @@ mod tests {
         let cuda = candle_accelerator_kv_support(BackendKind::Cuda);
         assert_eq!(cuda.direct_paged_attention, cfg!(feature = "cuda"));
         assert_eq!(cuda.is_complete(), cfg!(feature = "cuda"));
+    }
+
+    #[test]
+    fn fence_timeline_coalesces_all_issued_mutations_into_one_wait() -> Result<()> {
+        let host_synchronizations = Arc::new(AtomicU64::new(0));
+        let timeline = Arc::new(AcceleratorFenceTimeline {
+            device: Device::Cpu,
+            issued: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            synchronization_lock: Mutex::new(()),
+            host_synchronizations: host_synchronizations.clone(),
+        });
+        let first = timeline.issue()?;
+        let second = timeline.issue()?;
+        let third = timeline.issue()?;
+        assert!(!first.is_complete());
+        assert!(!third.is_complete());
+
+        first.wait()?;
+        assert!(first.is_complete());
+        assert!(second.is_complete());
+        assert!(third.is_complete());
+        assert_eq!(host_synchronizations.load(Ordering::Relaxed), 1);
+
+        second.wait()?;
+        third.wait()?;
+        assert_eq!(host_synchronizations.load(Ordering::Relaxed), 1);
+        timeline.drain()?;
+        assert_eq!(host_synchronizations.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 
     #[cfg(feature = "metal")]

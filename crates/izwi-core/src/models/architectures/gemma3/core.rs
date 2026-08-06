@@ -6,7 +6,10 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_b as linear, Embedding, Linear, VarBuilder};
 use candle_transformers::models::gemma3::Config;
 
-use crate::backends::kv::{KvSlotMap, KvWriteArgs, KvWriteCompletionCollector, PagedKvDecodeArgs};
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
@@ -322,17 +325,6 @@ impl GemmaAttention {
                 "Gemma physical decode received an incompatible slot map".into(),
             ));
         }
-        let binding = first.layer_binding(layer_index)?;
-        let completion = first.arena().write_slots(
-            binding,
-            KvWriteArgs {
-                keys: &keys,
-                values: &values,
-                slots,
-            },
-        )?;
-        completion.wait()?;
-        completions.collect(completion)?;
         let metadata = KvDecodeBatchMetadata {
             sequences: caches
                 .iter()
@@ -343,14 +335,26 @@ impl GemmaAttention {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
-        let attended = first.arena().paged_decode(
+        let binding = first.layer_binding(layer_index)?;
+        let completion = first.arena().write_slots(
             binding,
-            PagedKvDecodeArgs {
-                queries: &queries,
-                batch: &metadata,
-                softmax_scale: self.softmax_scale,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
             },
         )?;
+        let (attended, completion) = submit_ordered_after_write(completion, || {
+            first.arena().paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: &metadata,
+                    softmax_scale: self.softmax_scale,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
         attended
             .reshape((batch, 1, self.num_heads * self.head_dim))?
             .apply(&self.output)

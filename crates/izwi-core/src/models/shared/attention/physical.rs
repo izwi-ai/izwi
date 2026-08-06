@@ -6,8 +6,8 @@ use std::sync::Arc;
 use candle_core::Tensor;
 
 use crate::backends::kv::{
-    KvArena, KvSlotMap, KvWriteArgs, KvWriteBatchCompletion, KvWriteCompletionCollector,
-    PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+    submit_ordered_after_write, KvArena, KvSlotMap, KvWriteArgs, KvWriteBatchCompletion,
+    KvWriteCompletionCollector, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
 };
 use crate::error::{Error, Result};
 use crate::kv::{
@@ -469,28 +469,29 @@ impl PhysicalPagedKvCache {
                 "physical paged write returned a mismatched backend completion".into(),
             ));
         }
-        completion.wait()?;
-        prepared.completions.collect(completion)?;
+        let (output, completion) = submit_ordered_after_write(completion, || {
+            if token_count == 1 {
+                return self.arena.paged_decode(
+                    binding,
+                    PagedKvDecodeArgs {
+                        queries,
+                        batch: &prepared.decode,
+                        softmax_scale,
+                    },
+                );
+            }
 
-        if token_count == 1 {
-            return self.arena.paged_decode(
+            self.arena.paged_prefill(
                 binding,
-                PagedKvDecodeArgs {
+                PagedKvPrefillArgs {
                     queries,
-                    batch: &prepared.decode,
+                    rows: &prepared.prefill,
                     softmax_scale,
                 },
-            );
-        }
-
-        self.arena.paged_prefill(
-            binding,
-            PagedKvPrefillArgs {
-                queries,
-                rows: &prepared.prefill,
-                softmax_scale,
-            },
-        )
+            )
+        })?;
+        prepared.completions.collect(completion)?;
+        Ok(output)
     }
 
     /// One-token append with a layer-specific visible window. The block table
@@ -538,18 +539,20 @@ impl PhysicalPagedKvCache {
                 "physical paged windowed write returned a mismatched backend completion".into(),
             ));
         }
-        completion.wait()?;
-        prepared.completions.collect(completion)?;
-        self.arena.paged_decode(
-            binding,
-            PagedKvDecodeArgs {
-                queries,
-                batch: &KvDecodeBatchMetadata {
-                    sequences: vec![table],
+        let (output, completion) = submit_ordered_after_write(completion, || {
+            self.arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries,
+                    batch: &KvDecodeBatchMetadata {
+                        sequences: vec![table],
+                    },
+                    softmax_scale,
                 },
-                softmax_scale,
-            },
-        )
+            )
+        })?;
+        prepared.completions.collect(completion)?;
+        Ok(output)
     }
 
     pub(crate) fn commit_prepared(&mut self, prepared: PreparedPhysicalPagedStep) -> Result<()> {

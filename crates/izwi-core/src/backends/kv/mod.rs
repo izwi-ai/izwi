@@ -192,6 +192,25 @@ impl KvWriteCompletion {
     }
 }
 
+/// Submit an arena operation ordered after one physical write without forcing
+/// immediate host synchronization. A failed submission drains the write fence
+/// before returning so aborted pages cannot be reused while mutation remains
+/// in flight. Successful callers retain the completion for batch sealing.
+pub(crate) fn submit_ordered_after_write<T>(
+    completion: KvWriteCompletion,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(T, KvWriteCompletion)> {
+    match operation() {
+        Ok(output) => Ok((output, completion)),
+        Err(operation_error) => match completion.wait() {
+            Ok(()) => Err(operation_error),
+            Err(drain_error) => Err(Error::InferenceError(format!(
+                "ordered KV operation failed: {operation_error}; write drain also failed: {drain_error}"
+            ))),
+        },
+    }
+}
+
 /// Sealed proof that every expected layer write in one physical batch has
 /// completed on the exact arena that issued the write tokens.
 ///
@@ -412,6 +431,9 @@ pub trait KvArena: Send + Sync {
 
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence>;
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
+    /// Operations submitted through this arena after the write observe it in
+    /// device submission order. The completion fence proves host visibility
+    /// and safe reuse; callers may defer its wait until batch seal.
     fn write_slots(
         &self,
         layer: KvLayerBinding,
@@ -700,6 +722,35 @@ mod tests {
             index,
             slot_generation: 1,
         }
+    }
+
+    #[test]
+    fn ordered_write_submission_defers_success_wait_but_drains_failure() {
+        let arena = test_arena(1);
+        let binding = layer(0, 0);
+        let logical_slots = slots(arena, 1);
+        let waits = Arc::new(AtomicUsize::new(0));
+        let successful = completion(
+            arena,
+            binding,
+            logical_slots.clone(),
+            TestFence::new(waits.clone()),
+        );
+        let (value, successful) =
+            submit_ordered_after_write(successful, || Ok::<_, Error>(7)).unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(waits.load(Ordering::Relaxed), 0);
+        successful.wait().unwrap();
+        assert_eq!(waits.load(Ordering::Relaxed), 1);
+
+        let failed = completion(arena, binding, logical_slots, TestFence::new(waits.clone()));
+        assert!(submit_ordered_after_write::<()>(failed, || {
+            Err(Error::InferenceError(
+                "injected ordered operation failure".into(),
+            ))
+        })
+        .is_err());
+        assert_eq!(waits.load(Ordering::Relaxed), 2);
     }
 
     #[test]
