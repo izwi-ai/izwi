@@ -115,6 +115,61 @@ pub enum KvTerminalState {
     Aborted,
 }
 
+/// Number of exact terminal dispositions retained for diagnostics.
+///
+/// Duplicate/stale transaction rejection does not depend on this window: the
+/// coordinator also keeps a constant-size high-water mark. The window only
+/// preserves the committed-versus-aborted detail for recently completed work.
+const TERMINAL_TRANSACTION_HISTORY_LIMIT: usize = 4_096;
+
+#[derive(Debug)]
+struct TerminalTransactionHistory {
+    states: HashMap<PlanId, KvTerminalState>,
+    completion_order: VecDeque<PlanId>,
+    high_watermark: Option<PlanId>,
+    limit: usize,
+}
+
+impl TerminalTransactionHistory {
+    fn new(limit: usize) -> Self {
+        assert!(limit > 0, "terminal history must retain at least one entry");
+        Self {
+            // Avoid eagerly reserving the full diagnostic window for every
+            // model arena; these grow only as that arena completes work.
+            states: HashMap::new(),
+            completion_order: VecDeque::new(),
+            high_watermark: None,
+            limit,
+        }
+    }
+
+    fn contains(&self, txn_id: PlanId) -> bool {
+        // Scheduler PlanIds are globally monotonic on first admission. Active
+        // transactions may finish out of order, so exact recent states remain
+        // separate, but an ID at or below a completed high-water mark can only
+        // be a delayed report, a stale reservation, or a reused exhausted ID.
+        self.high_watermark.is_some_and(|high| txn_id <= high)
+    }
+
+    fn state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
+        self.states.get(&txn_id).copied()
+    }
+
+    fn record(&mut self, txn_id: PlanId, state: KvTerminalState) {
+        self.high_watermark = Some(self.high_watermark.map_or(txn_id, |high| high.max(txn_id)));
+        if self.states.insert(txn_id, state).is_none() {
+            self.completion_order.push_back(txn_id);
+        }
+        while self.states.len() > self.limit {
+            let expired = self
+                .completion_order
+                .pop_front()
+                .expect("terminal history order matches retained states");
+            self.states.remove(&expired);
+        }
+    }
+}
+
 /// Exact coordinator counters. Managed arena bytes are intentionally absent:
 /// the resource authority accounts for physical backing once at arena scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -276,7 +331,7 @@ pub struct KvCacheCoordinator {
     free: VecDeque<u32>,
     tables: HashMap<TableKey, KvSnapshot>,
     transactions: HashMap<PlanId, Transaction>,
-    terminal_transactions: HashMap<PlanId, KvTerminalState>,
+    terminal_transactions: TerminalTransactionHistory,
 }
 
 impl KvCacheCoordinator {
@@ -289,7 +344,9 @@ impl KvCacheCoordinator {
             free,
             tables: HashMap::new(),
             transactions: HashMap::new(),
-            terminal_transactions: HashMap::new(),
+            terminal_transactions: TerminalTransactionHistory::new(
+                TERMINAL_TRANSACTION_HISTORY_LIMIT,
+            ),
         }
     }
 
@@ -334,8 +391,11 @@ impl KvCacheCoordinator {
         self.transactions.get(&txn_id).map(|txn| txn.state)
     }
 
+    /// Returns the exact disposition when `txn_id` remains in the bounded
+    /// diagnostic window. `None` does not prove that the transaction was never
+    /// completed; stale-ID rejection is retained independently.
     pub fn terminal_state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
-        self.terminal_transactions.get(&txn_id).copied()
+        self.terminal_transactions.state(txn_id)
     }
 
     /// Reserve an exact versioned append/window transition.
@@ -420,7 +480,7 @@ impl KvCacheCoordinator {
     /// Atomically reserve shared/fresh pages and exclusive writable tails.
     pub fn reserve(&mut self, request: KvReserveRequest) -> KvCoordinatorResult<()> {
         if self.transactions.contains_key(&request.txn_id)
-            || self.terminal_transactions.contains_key(&request.txn_id)
+            || self.terminal_transactions.contains(request.txn_id)
         {
             return Err(KvCoordinatorError::DuplicateTransaction(request.txn_id));
         }
@@ -846,7 +906,7 @@ impl KvCacheCoordinator {
         self.tables.insert(txn.key, committed.clone());
         self.transactions.remove(&txn_id);
         self.terminal_transactions
-            .insert(txn_id, KvTerminalState::Committed);
+            .record(txn_id, KvTerminalState::Committed);
         committed
     }
 
@@ -856,7 +916,7 @@ impl KvCacheCoordinator {
             self.abort_internal(txn_id);
             return Ok(true);
         }
-        if self.terminal_transactions.contains_key(&txn_id) {
+        if self.terminal_transactions.contains(txn_id) {
             return Ok(false);
         }
         Err(KvCoordinatorError::MissingTransaction(txn_id))
@@ -1118,7 +1178,7 @@ impl KvCacheCoordinator {
         self.release_transaction_pins(&txn);
         self.release_transaction_holds(&txn);
         self.terminal_transactions
-            .insert(txn_id, KvTerminalState::Aborted);
+            .record(txn_id, KvTerminalState::Aborted);
     }
 
     fn release_transaction_pins(&mut self, txn: &Transaction) {
@@ -1318,6 +1378,72 @@ mod tests {
             assert_eq!(coordinator.stats().allocated_pages, 0);
             coordinator.check_invariants().unwrap();
         }
+    }
+
+    #[test]
+    fn terminal_history_is_bounded_without_allowing_stale_transaction_reuse() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 1);
+        coordinator.terminal_transactions = TerminalTransactionHistory::new(2);
+        let initial = coordinator
+            .register_table(session("terminal-history", 1), CacheDomainId::new(0))
+            .unwrap();
+
+        for txn_id in 10..=12 {
+            reserve_fresh(&mut coordinator, txn_id, initial.clone(), 1, 1);
+            assert!(coordinator.abort(txn_id).unwrap());
+        }
+
+        assert_eq!(coordinator.terminal_transactions.states.len(), 2);
+        assert_eq!(coordinator.terminal_state(10), None);
+        assert_eq!(
+            coordinator.terminal_state(11),
+            Some(KvTerminalState::Aborted)
+        );
+        assert_eq!(
+            coordinator.terminal_state(12),
+            Some(KvTerminalState::Aborted)
+        );
+
+        // Exact diagnostics may expire, but the high-water mark makes delayed
+        // aborts idempotent and permanently rejects a reused scheduler plan ID.
+        assert!(!coordinator.abort(10).unwrap());
+        assert_eq!(
+            coordinator.reserve(KvReserveRequest {
+                txn_id: 10,
+                expected: initial,
+                target_committed_tokens: 1,
+                target_window_start: 0,
+                groups: vec![KvGroupReservation {
+                    group: KvGroupId::new(0),
+                    blocks: vec![KvBlockIntent::Fresh],
+                }],
+            }),
+            Err(KvCoordinatorError::DuplicateTransaction(10))
+        );
+    }
+
+    #[test]
+    fn terminal_high_watermark_tolerates_out_of_order_completion() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 2);
+        let initial = coordinator
+            .register_table(session("out-of-order-terminal", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 20, initial.clone(), 1, 1);
+        reserve_fresh(&mut coordinator, 21, initial, 1, 1);
+
+        assert!(coordinator.abort(21).unwrap());
+        assert!(coordinator.abort(20).unwrap());
+        assert!(!coordinator.abort(19).unwrap());
+        assert_eq!(
+            coordinator.abort(22),
+            Err(KvCoordinatorError::MissingTransaction(22))
+        );
+        let current = coordinator
+            .snapshot(&session("out-of-order-terminal", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 22, current, 1, 1);
+        assert!(coordinator.abort(22).unwrap());
+        coordinator.check_invariants().unwrap();
     }
 
     #[test]
