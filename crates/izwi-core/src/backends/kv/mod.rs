@@ -434,7 +434,7 @@ pub trait KvArena: Send + Sync {
         }
 
         let mut next_query = 0_u32;
-        let mut outputs = Vec::with_capacity(query_dims[0]);
+        let mut sequences = Vec::with_capacity(query_dims[0]);
         for row in args.rows {
             if row.query_start != next_query
                 || row.query_len == 0
@@ -463,25 +463,11 @@ pub trait KvArena: Send + Sync {
                         "paged prefill block table does not cover its causal context".into(),
                     ));
                 }
-                let query_index = row.query_start.checked_add(local_query).ok_or_else(|| {
-                    crate::Error::InferenceError("paged prefill query index overflow".into())
-                })?;
-                let query = args.queries.narrow(0, query_index as usize, 1)?;
-                let batch = KvDecodeBatchMetadata {
-                    sequences: vec![crate::kv::KvSequenceBlockTable {
-                        blocks: row.blocks[..required_pages].to_vec(),
-                        first_page_offset: row.first_page_offset,
-                        context_len: visible,
-                    }],
-                };
-                outputs.push(self.paged_decode(
-                    layer,
-                    PagedKvDecodeArgs {
-                        queries: &query,
-                        batch: &batch,
-                        softmax_scale: args.softmax_scale,
-                    },
-                )?);
+                sequences.push(crate::kv::KvSequenceBlockTable {
+                    blocks: row.blocks[..required_pages].to_vec(),
+                    first_page_offset: row.first_page_offset,
+                    context_len: visible,
+                });
             }
             next_query = next_query.checked_add(row.query_len).ok_or_else(|| {
                 crate::Error::InferenceError("paged prefill query range overflow".into())
@@ -492,8 +478,14 @@ pub trait KvArena: Send + Sync {
                 "paged prefill rows do not cover every query exactly once".into(),
             ));
         }
-        let outputs = outputs.iter().collect::<Vec<_>>();
-        Tensor::cat(&outputs, 0).map_err(crate::Error::from)
+        self.paged_decode(
+            layer,
+            PagedKvDecodeArgs {
+                queries: args.queries,
+                batch: &KvDecodeBatchMetadata { sequences },
+                softmax_scale: args.softmax_scale,
+            },
+        )
     }
     fn paged_decode(&self, layer: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor>;
 
@@ -516,9 +508,81 @@ pub trait KvBackendRuntime: Send + Sync {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
     use crate::engine::ModelInstanceId;
+
+    struct RecordingDecodeArena {
+        config: KvArenaConfig,
+        calls: AtomicUsize,
+        batches: Mutex<Vec<KvDecodeBatchMetadata>>,
+    }
+
+    impl RecordingDecodeArena {
+        fn new() -> Self {
+            let arena = test_arena(1);
+            Self {
+                config: config(arena, &[layer(0, 0)]),
+                calls: AtomicUsize::new(0),
+                batches: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl KvArena for RecordingDecodeArena {
+        fn id(&self) -> KvArenaId {
+            self.config.id
+        }
+
+        fn backend_kind(&self) -> BackendKind {
+            BackendKind::Cpu
+        }
+
+        fn device_location(&self) -> DeviceLocation {
+            DeviceLocation::Cpu
+        }
+
+        fn config(&self) -> &KvArenaConfig {
+            &self.config
+        }
+
+        fn lower_slots(&self, _slots: &[KvSlotRef]) -> Result<Arc<dyn KvSlotMap>> {
+            Err(Error::InferenceError(
+                "unused recording slot lowering".into(),
+            ))
+        }
+
+        fn zero_pages(&self, _pages: &[CacheBlockRef]) -> Result<DeviceFence> {
+            Err(Error::InferenceError("unused recording page zero".into()))
+        }
+
+        fn copy_pages(&self, _copies: &[KvPageCopy]) -> Result<DeviceFence> {
+            Err(Error::InferenceError("unused recording page copy".into()))
+        }
+
+        fn write_slots(
+            &self,
+            _layer: KvLayerBinding,
+            _args: KvWriteArgs<'_>,
+        ) -> Result<KvWriteCompletion> {
+            Err(Error::InferenceError("unused recording slot write".into()))
+        }
+
+        fn paged_decode(
+            &self,
+            _layer: KvLayerBinding,
+            args: PagedKvDecodeArgs<'_>,
+        ) -> Result<Tensor> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.batches.lock().unwrap().push(args.batch.clone());
+            Ok(args.queries.clone())
+        }
+
+        fn drain(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct TestFence {
@@ -627,6 +691,120 @@ mod tests {
         fence: impl KvDeviceFence + 'static,
     ) -> KvWriteCompletion {
         KvWriteCompletion::new(arena, layer, slots, Arc::new(fence))
+    }
+
+    fn block(arena: KvArenaId, index: u32) -> CacheBlockRef {
+        CacheBlockRef {
+            arena,
+            group: KvGroupId::new(1),
+            index,
+            slot_generation: 1,
+        }
+    }
+
+    #[test]
+    fn paged_prefill_batches_every_causal_query_into_one_decode_dispatch() {
+        let arena = RecordingDecodeArena::new();
+        let id = arena.id();
+        let queries = Tensor::from_vec(
+            (0..10).map(|value| value as f32).collect(),
+            (5, 1, 2),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let output = arena
+            .paged_prefill(
+                layer(0, 0),
+                PagedKvPrefillArgs {
+                    queries: &queries,
+                    rows: &[
+                        PagedKvPrefillRow {
+                            blocks: vec![block(id, 0), block(id, 1)],
+                            first_page_offset: 1,
+                            query_start: 0,
+                            query_len: 3,
+                            context_len: 5,
+                        },
+                        PagedKvPrefillRow {
+                            blocks: vec![block(id, 2)],
+                            first_page_offset: 0,
+                            query_start: 3,
+                            query_len: 2,
+                            context_len: 2,
+                        },
+                    ],
+                    softmax_scale: 0.5,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(arena.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            output.to_vec3::<f32>().unwrap(),
+            queries.to_vec3::<f32>().unwrap()
+        );
+        let batches = arena.batches.lock().unwrap();
+        let sequences = &batches[0].sequences;
+        assert_eq!(sequences.len(), 5);
+        assert_eq!(
+            sequences
+                .iter()
+                .map(|sequence| sequence.context_len)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 1, 2]
+        );
+        assert_eq!(
+            sequences
+                .iter()
+                .map(|sequence| sequence.blocks.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2, 1, 1]
+        );
+        assert!(sequences[..3]
+            .iter()
+            .all(|sequence| sequence.first_page_offset == 1));
+    }
+
+    #[test]
+    fn invalid_paged_prefill_never_dispatches_decode() {
+        let arena = RecordingDecodeArena::new();
+        let id = arena.id();
+        let queries = Tensor::zeros((2, 1, 2), DType::F32, &candle_core::Device::Cpu).unwrap();
+        let invalid_start = [PagedKvPrefillRow {
+            blocks: vec![block(id, 0)],
+            first_page_offset: 0,
+            query_start: 1,
+            query_len: 2,
+            context_len: 2,
+        }];
+        assert!(arena
+            .paged_prefill(
+                layer(0, 0),
+                PagedKvPrefillArgs {
+                    queries: &queries,
+                    rows: &invalid_start,
+                    softmax_scale: 0.5,
+                },
+            )
+            .is_err());
+        let incomplete = [PagedKvPrefillRow {
+            blocks: vec![block(id, 0)],
+            first_page_offset: 1,
+            query_start: 0,
+            query_len: 2,
+            context_len: 5,
+        }];
+        assert!(arena
+            .paged_prefill(
+                layer(0, 0),
+                PagedKvPrefillArgs {
+                    queries: &queries,
+                    rows: &incomplete,
+                    softmax_scale: 0.5,
+                },
+            )
+            .is_err());
+        assert_eq!(arena.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
