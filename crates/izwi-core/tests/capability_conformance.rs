@@ -103,28 +103,7 @@ fn product_crates_do_not_import_internal_model_architectures() {
 }
 
 #[test]
-fn legacy_inference_state_surface_does_not_expand_during_migration() {
-    // This is a migration ratchet, not the final acceptance test. Every limit
-    // must trend down to zero before the v1/opaque implementation is deleted.
-    // Keeping the inventory in a compiled integration test prevents a new
-    // model from quietly adding another model-owned cache while v2 is landing.
-    const LEGACY_SYMBOL_LIMITS: &[(&str, usize)] = &[
-        ("OpaqueModelOwned", 0),
-        ("upgrade_kv_contract_v1", 0),
-        ("CURRENT_KV_CONTRACT_ABI", 0),
-        ("KvCacheContract", 0),
-        ("KvDomainSpec::", 0),
-        ("Qwen3ManagedCache", 33),
-        ("Qwen3Cache", 63),
-        ("DenseKvCache", 45),
-        ("Qwen35DenseKvCache", 27),
-        ("KvPage", 76),
-        ("append_to_pages", 32),
-        ("materialize_pages", 20),
-        ("paged_decode_attention", 28),
-        ("repeat_kv(", 56),
-    ];
-
+fn legacy_inference_state_surface_is_confined_to_test_references() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_root = manifest_dir.join("src");
     let mut sources = Vec::new();
@@ -134,79 +113,62 @@ fn legacy_inference_state_surface_does_not_expand_during_migration() {
         }
     });
 
+    sources.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     let mut violations = Vec::new();
-    for (symbol, limit) in LEGACY_SYMBOL_LIMITS {
-        let count = sources
-            .iter()
-            .map(|(_, source)| source.matches(symbol).count())
-            .sum::<usize>();
-        if count > *limit {
-            let files = sources
-                .iter()
-                .filter_map(|(path, source)| source.contains(symbol).then(|| path.display()))
-                .map(|path| path.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            violations.push(format!(
-                "legacy symbol `{symbol}` grew from at most {limit} to {count}: {files}"
-            ));
-        }
+    for (path, source) in sources {
+        let relative = path.strip_prefix(&source_root).unwrap_or(&path);
+        violations.extend(legacy_state_violations(relative, &source));
     }
-
-    assert!(
-        violations.is_empty(),
-        "the v1/model-owned inference-state surface must only shrink:\n{}",
-        violations.join("\n")
-    );
-}
-
-#[test]
-fn legacy_model_owned_state_symbols_are_confined_to_test_references() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source_root = manifest_dir.join("src");
-    let qwen_reference = source_root.join("models/architectures/qwen3/core.rs");
-    let paged_reference = source_root.join("models/shared/attention/paged.rs");
-    let mut violations = Vec::new();
-
-    collect_rs_files(&source_root, &mut |path| {
-        let Ok(source) = fs::read_to_string(path) else {
-            return;
-        };
-        for symbol in [
-            "OpaqueModelOwned",
-            "upgrade_kv_contract_v1",
-            "CURRENT_KV_CONTRACT_ABI",
-            "KvCacheContract",
-            "DenseKvCache",
-            "Qwen35DenseKvCache",
-        ] {
-            if source.contains(symbol) {
-                violations.push(format!("{} contains `{symbol}`", path.display()));
-            }
-        }
-        if path != qwen_reference && source.contains("Qwen3Cache") {
-            violations.push(format!(
-                "{} contains model-owned `Qwen3Cache` outside its test reference",
-                path.display()
-            ));
-        }
-        if path != qwen_reference
-            && path != paged_reference
-            && ["append_to_pages", "materialize_pages"]
-                .iter()
-                .any(|symbol| source.contains(symbol))
-        {
-            violations.push(format!(
-                "{} contains a materializing legacy page helper",
-                path.display()
-            ));
-        }
-    });
 
     assert!(
         violations.is_empty(),
         "production inference state must use the sole physical ABI-v2 architecture:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn legacy_ratchet_allows_physical_provider_names_but_rejects_legacy_items() {
+    let provider = r#"
+        pub struct PhysicalQwen3CacheProvider;
+        pub struct PhysicalKvPageProvider;
+        pub trait PhysicalKvCacheContractProvider {}
+        pub fn physical_paged_decode_attention_provider() {}
+    "#;
+    assert!(legacy_state_violations(Path::new("backends/kv/provider.rs"), provider).is_empty());
+
+    let physical_operation = "pub fn paged_decode_attention() {}";
+    assert!(legacy_state_violations(Path::new("kernels/metal.rs"), physical_operation).is_empty());
+
+    let documentation = r#"
+        // DenseKvCache and KvPage are legacy names, not live definitions here.
+        const MIGRATION_NOTE: &str = "do not call append_to_pages";
+    "#;
+    assert!(legacy_state_violations(
+        Path::new("models/architectures/new_model.rs"),
+        documentation
+    )
+    .is_empty());
+
+    let legacy = r#"
+        pub struct DenseKvCache;
+        pub enum KvPage {}
+        pub fn append_to_pages() {}
+        pub fn materialize_pages() {}
+        pub fn paged_decode_attention() {}
+    "#;
+    assert_eq!(
+        legacy_state_violations(Path::new("models/architectures/new_model.rs"), legacy),
+        vec![
+            "models/architectures/new_model.rs contains model-owned `DenseKvCache`".to_string(),
+            "models/architectures/new_model.rs contains legacy page type `KvPage`".to_string(),
+            "models/architectures/new_model.rs contains materializing helper `append_to_pages`"
+                .to_string(),
+            "models/architectures/new_model.rs contains materializing helper `materialize_pages`"
+                .to_string(),
+            "models/architectures/new_model.rs bypasses the physical arena with `paged_decode_attention`"
+                .to_string(),
+        ]
     );
 }
 
@@ -233,9 +195,158 @@ fn qwen_model_owned_cache_and_materializing_pages_are_test_only() {
         "materializing paged-attention helpers must remain test-only"
     );
     assert!(
+        paged.contains("#[cfg(test)]\nmod legacy"),
+        "the materializing paged-attention implementation must remain test-only"
+    );
+    assert!(
         qwen_asr.contains(".forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())"),
         "cacheless forced-alignment work must not acquire a model-owned cache"
     );
+}
+
+fn legacy_state_violations(path: &Path, source: &str) -> Vec<String> {
+    const REMOVED_ABI_IDENTIFIERS: &[&str] = &[
+        "OpaqueModelOwned",
+        "upgrade_kv_contract_v1",
+        "CURRENT_KV_CONTRACT_ABI",
+        "KvCacheContract",
+        "KvDomainSpec",
+    ];
+    const MODEL_OWNED_CACHE_IDENTIFIERS: &[&str] = &[
+        "Qwen3ManagedCache",
+        "Qwen3Cache",
+        "DenseKvCache",
+        "Qwen35DenseKvCache",
+    ];
+    const MATERIALIZING_HELPERS: &[&str] = &["append_to_pages", "materialize_pages"];
+
+    // `repeat_kv` alone is not evidence of retained model-owned state: several
+    // cacheless full-sequence attention paths legitimately expand GQA heads.
+    // This ratchet instead rejects the cache/page definitions and helpers that
+    // can reintroduce independent retained storage.
+
+    let path = path.to_string_lossy().replace('\\', "/");
+    let identifiers = rust_identifiers(source);
+    let qwen_reference = path == "models/architectures/qwen3/core.rs";
+    let paged_reference = path == "models/shared/attention/paged.rs";
+    let physical_provider = path.starts_with("backends/kv/")
+        || path.starts_with("backends/state/")
+        || path.starts_with("kernels/");
+    let mut violations = Vec::new();
+
+    for identifier in REMOVED_ABI_IDENTIFIERS {
+        if identifiers.contains(*identifier) {
+            violations.push(format!(
+                "{path} contains removed ABI identifier `{identifier}`"
+            ));
+        }
+    }
+    for identifier in MODEL_OWNED_CACHE_IDENTIFIERS {
+        if identifiers.contains(*identifier) && !(qwen_reference && *identifier == "Qwen3Cache") {
+            violations.push(format!("{path} contains model-owned `{identifier}`"));
+        }
+    }
+    if identifiers.contains("KvPage") && !qwen_reference && !paged_reference {
+        violations.push(format!("{path} contains legacy page type `KvPage`"));
+    }
+    for helper in MATERIALIZING_HELPERS {
+        if identifiers.contains(*helper) && !qwen_reference && !paged_reference {
+            violations.push(format!("{path} contains materializing helper `{helper}`"));
+        }
+    }
+    if identifiers.contains("paged_decode_attention")
+        && !qwen_reference
+        && !paged_reference
+        && !physical_provider
+    {
+        violations.push(format!(
+            "{path} bypasses the physical arena with `paged_decode_attention`"
+        ));
+    }
+    violations
+}
+
+fn rust_identifiers(source: &str) -> BTreeSet<String> {
+    let bytes = source.as_bytes();
+    let mut identifiers = BTreeSet::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'/') {
+            cursor += 2;
+            while bytes.get(cursor).is_some_and(|byte| *byte != b'\n') {
+                cursor += 1;
+            }
+            continue;
+        }
+        if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+            cursor += 2;
+            let mut depth = 1_usize;
+            while cursor < bytes.len() && depth != 0 {
+                match (bytes[cursor], bytes.get(cursor + 1)) {
+                    (b'/', Some(b'*')) => {
+                        depth += 1;
+                        cursor += 2;
+                    }
+                    (b'*', Some(b'/')) => {
+                        depth -= 1;
+                        cursor += 2;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            continue;
+        }
+        if bytes[cursor] == b'r' {
+            let mut quote = cursor + 1;
+            while bytes.get(quote) == Some(&b'#') {
+                quote += 1;
+            }
+            if bytes.get(quote) == Some(&b'"') {
+                let hashes = quote - cursor - 1;
+                cursor = quote + 1;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'"'
+                        && (0..hashes).all(|index| bytes.get(cursor + 1 + index) == Some(&b'#'))
+                    {
+                        cursor += hashes + 1;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                continue;
+            }
+        }
+        if bytes[cursor] == b'"' {
+            cursor += 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                    b'"' => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            continue;
+        }
+        if bytes[cursor] == b'_' || bytes[cursor].is_ascii_alphabetic() {
+            let start = cursor;
+            cursor += 1;
+            while bytes
+                .get(cursor)
+                .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+            {
+                cursor += 1;
+            }
+            identifiers.insert(source[start..cursor].to_string());
+            continue;
+        }
+        cursor += 1;
+    }
+
+    identifiers
 }
 
 fn collect_rs_files(root: &Path, visit: &mut impl FnMut(&Path)) {
