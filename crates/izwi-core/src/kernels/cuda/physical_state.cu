@@ -197,6 +197,263 @@ __device__ void izwi_paged_decode_attention(
   }
 }
 
+// Partitioned decode for long contexts. The first pass computes an independent
+// online-softmax state for each token partition. The second pass combines those
+// states with the same max-rescaling identity, so no materialized score tensor
+// is required and arbitrary first-page offsets retain the one-pass semantics.
+template <typename T>
+__device__ void izwi_paged_decode_attention_partition(
+    const T* __restrict__ queries,
+    const T* __restrict__ keys,
+    const T* __restrict__ values,
+    const unsigned int* __restrict__ metadata,
+    float* __restrict__ partials,
+    int batch,
+    int query_heads,
+    int kv_heads,
+    int page_tokens,
+    int max_blocks,
+    int key_dim,
+    int value_dim,
+    int capacity_pages,
+    int partition_tokens,
+    int num_partitions,
+    float softmax_scale,
+    float softcap) {
+  const int row_head = blockIdx.x;
+  const int partition = blockIdx.y;
+  if (row_head >= batch * query_heads || partition >= num_partitions) {
+    return;
+  }
+  const int row = row_head / query_heads;
+  const int query_head = row_head - row * query_heads;
+  const unsigned int context_len = metadata[row];
+  const unsigned int first_page_offset = metadata[batch + row];
+  const unsigned int* block_table = metadata + batch * 2;
+  const unsigned int token_start =
+      static_cast<unsigned int>(partition) * partition_tokens;
+  const unsigned int token_end =
+      min(context_len, token_start + static_cast<unsigned int>(partition_tokens));
+  const int query_base = row_head * key_dim;
+  const unsigned long long partial_stride =
+      static_cast<unsigned long long>(value_dim) + 2;
+  const unsigned long long partial_base =
+      (static_cast<unsigned long long>(row_head) * num_partitions + partition) *
+      partial_stride;
+
+  bool metadata_valid = query_heads > 0 && page_tokens > 0 && max_blocks > 0 &&
+                        kv_heads > 0 && query_heads >= kv_heads &&
+                        query_heads % kv_heads == 0 && context_len > 0 &&
+                        first_page_offset < static_cast<unsigned int>(page_tokens) &&
+                        partition_tokens > 0 && num_partitions > 0;
+  if (metadata_valid) {
+    const unsigned long long physical_tokens =
+        static_cast<unsigned long long>(context_len) + first_page_offset;
+    const unsigned long long required_pages =
+        (physical_tokens + static_cast<unsigned long long>(page_tokens) - 1) /
+        static_cast<unsigned long long>(page_tokens);
+    metadata_valid = required_pages > 0 &&
+                     required_pages <= static_cast<unsigned long long>(max_blocks);
+  }
+  if (!metadata_valid) {
+    if (threadIdx.x == 0) {
+      partials[partial_base] = -INFINITY;
+      partials[partial_base + 1] = 0.0f;
+    }
+    if (threadIdx.x < value_dim) {
+      partials[partial_base + 2 + threadIdx.x] = 0.0f;
+    }
+    const int second_dim = threadIdx.x + blockDim.x;
+    if (second_dim < value_dim) {
+      partials[partial_base + 2 + second_dim] = 0.0f;
+    }
+    return;
+  }
+  const int kv_head = query_head / (query_heads / kv_heads);
+
+  extern __shared__ float reduction[];
+  float output_0 = 0.0f;
+  float output_1 = 0.0f;
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+
+  for (unsigned int logical_token = token_start; logical_token < token_end;
+       ++logical_token) {
+    const unsigned int physical_token = logical_token + first_page_offset;
+    const unsigned int logical_page = physical_token / page_tokens;
+    const unsigned int page_offset = physical_token - logical_page * page_tokens;
+    const unsigned int physical_page =
+        block_table[row * max_blocks + logical_page];
+    // Host validation proves every referenced page is in the arena. Keep a
+    // defensive guard because this kernel is also an exported PTX symbol.
+    if (physical_page >= static_cast<unsigned int>(capacity_pages)) {
+      if (threadIdx.x == 0) {
+        partials[partial_base] = -INFINITY;
+        partials[partial_base + 1] = 0.0f;
+      }
+      if (threadIdx.x < value_dim) {
+        partials[partial_base + 2 + threadIdx.x] = 0.0f;
+      }
+      const int second_dim = threadIdx.x + blockDim.x;
+      if (second_dim < value_dim) {
+        partials[partial_base + 2 + second_dim] = 0.0f;
+      }
+      return;
+    }
+    const int key_base =
+        ((physical_page * page_tokens + page_offset) * kv_heads + kv_head) *
+        key_dim;
+    const int value_base =
+        ((physical_page * page_tokens + page_offset) * kv_heads + kv_head) *
+        value_dim;
+
+    float dot = 0.0f;
+    for (int dim = threadIdx.x; dim < key_dim; dim += blockDim.x) {
+      dot += izwi_to_float(queries[query_base + dim]) *
+             izwi_to_float(keys[key_base + dim]);
+    }
+    reduction[threadIdx.x] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      float score = reduction[0] * softmax_scale;
+      if (softcap > 0.0f) {
+        score = softcap * tanhf(score / softcap);
+      }
+      const float next_max = fmaxf(running_max, score);
+      const float previous_weight = expf(running_max - next_max);
+      const float token_weight = expf(score - next_max);
+      running_sum = running_sum * previous_weight + token_weight;
+      running_max = next_max;
+      reduction[0] = previous_weight;
+      reduction[1] = token_weight;
+      reduction[2] = running_sum;
+      reduction[3] = running_max;
+    }
+    __syncthreads();
+    const float previous_weight = reduction[0];
+    const float token_weight = reduction[1];
+    if (threadIdx.x < value_dim) {
+      output_0 = output_0 * previous_weight +
+                 izwi_to_float(values[value_base + threadIdx.x]) * token_weight;
+    }
+    const int second_dim = threadIdx.x + blockDim.x;
+    if (second_dim < value_dim) {
+      output_1 = output_1 * previous_weight +
+                 izwi_to_float(values[value_base + second_dim]) * token_weight;
+    }
+    __syncthreads();
+    running_sum = reduction[2];
+    running_max = reduction[3];
+  }
+
+  if (threadIdx.x == 0) {
+    partials[partial_base] = running_max;
+    partials[partial_base + 1] = running_sum;
+  }
+  if (threadIdx.x < value_dim) {
+    partials[partial_base + 2 + threadIdx.x] = output_0;
+  }
+  const int second_dim = threadIdx.x + blockDim.x;
+  if (second_dim < value_dim) {
+    partials[partial_base + 2 + second_dim] = output_1;
+  }
+}
+
+template <typename T>
+__device__ void izwi_paged_decode_attention_reduce(
+    const float* __restrict__ partials,
+    T* __restrict__ output,
+    int row_heads,
+    int value_dim,
+    int num_partitions) {
+  const int row_head = blockIdx.x;
+  if (row_head >= row_heads) {
+    return;
+  }
+  const unsigned long long partial_stride =
+      static_cast<unsigned long long>(value_dim) + 2;
+  const unsigned long long row_base =
+      static_cast<unsigned long long>(row_head) * num_partitions * partial_stride;
+  const int output_base = row_head * value_dim;
+  extern __shared__ float reduction[];
+  float output_0 = 0.0f;
+  float output_1 = 0.0f;
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+
+  for (int partition = 0; partition < num_partitions; ++partition) {
+    const unsigned long long partial_base = row_base + partition * partial_stride;
+    if (threadIdx.x == 0) {
+      const float partial_max = partials[partial_base];
+      const float partial_sum = partials[partial_base + 1];
+      if (partial_sum > 0.0f) {
+        const float next_max = fmaxf(running_max, partial_max);
+        reduction[0] = expf(running_max - next_max);
+        reduction[1] = expf(partial_max - next_max);
+        running_sum = running_sum * reduction[0] + partial_sum * reduction[1];
+        running_max = next_max;
+      } else {
+        reduction[0] = 1.0f;
+        reduction[1] = 0.0f;
+      }
+      reduction[2] = running_sum;
+      reduction[3] = running_max;
+    }
+    __syncthreads();
+    if (threadIdx.x < value_dim) {
+      output_0 = output_0 * reduction[0] +
+                 partials[partial_base + 2 + threadIdx.x] * reduction[1];
+    }
+    const int second_dim = threadIdx.x + blockDim.x;
+    if (second_dim < value_dim) {
+      output_1 = output_1 * reduction[0] +
+                 partials[partial_base + 2 + second_dim] * reduction[1];
+    }
+    __syncthreads();
+    running_sum = reduction[2];
+    running_max = reduction[3];
+  }
+
+  if (threadIdx.x < value_dim) {
+    output[output_base + threadIdx.x] =
+        izwi_from_float<T>(running_sum > 0.0f ? output_0 / running_sum : 0.0f);
+  }
+  const int second_dim = threadIdx.x + blockDim.x;
+  if (second_dim < value_dim) {
+    output[output_base + second_dim] =
+        izwi_from_float<T>(running_sum > 0.0f ? output_1 / running_sum : 0.0f);
+  }
+}
+
+#define IZWI_DEFINE_PAGED_DECODE_PARTITION(SUFFIX, TYPE)                       \
+  extern "C" __global__ void physical_paged_decode_partition_##SUFFIX(       \
+      const TYPE* queries, const TYPE* keys, const TYPE* values,               \
+      const unsigned int* metadata, float* partials, int batch,                \
+      int query_heads, int kv_heads, int page_tokens, int max_blocks,          \
+      int key_dim, int value_dim, int capacity_pages, int partition_tokens,    \
+      int num_partitions, float softmax_scale, float softcap) {                \
+    izwi_paged_decode_attention_partition(                                     \
+        queries, keys, values, metadata, partials, batch, query_heads,         \
+        kv_heads, page_tokens, max_blocks, key_dim, value_dim, capacity_pages, \
+        partition_tokens, num_partitions, softmax_scale, softcap);             \
+  }                                                                            \
+  extern "C" __global__ void physical_paged_decode_reduce_##SUFFIX(          \
+      const float* partials, TYPE* output, int row_heads, int value_dim,        \
+      int num_partitions) {                                                     \
+    izwi_paged_decode_attention_reduce(partials, output, row_heads, value_dim,  \
+                                        num_partitions);                        \
+  }
+
+IZWI_DEFINE_PAGED_DECODE_PARTITION(f32, float)
+IZWI_DEFINE_PAGED_DECODE_PARTITION(f16, __half)
+IZWI_DEFINE_PAGED_DECODE_PARTITION(bf16, __nv_bfloat16)
+
 extern "C" __global__ void physical_paged_decode_f32(
     const float* queries,
     const float* keys,

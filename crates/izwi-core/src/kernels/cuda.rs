@@ -327,6 +327,50 @@ fn validate_cuda_paged_decode_metadata(
     Ok(())
 }
 
+// This is deliberately a conservative, compile-time routing policy until a
+// CUDA certification runner can establish model- and GPU-specific thresholds.
+const CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS: usize = 2_048;
+const CUDA_PAGED_DECODE_PARTITION_TOKENS: usize = 1_024;
+const CUDA_PAGED_DECODE_MAX_PARTITIONS: usize = u16::MAX as usize;
+const CUDA_PAGED_DECODE_MAX_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CudaPagedDecodeStrategy {
+    OnePass,
+    Partitioned { partitions: usize },
+}
+
+fn cuda_paged_decode_strategy(
+    max_context_len: usize,
+    batch: usize,
+    query_heads: usize,
+    value_dim: usize,
+) -> candle_core::Result<CudaPagedDecodeStrategy> {
+    if max_context_len <= CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS {
+        return Ok(CudaPagedDecodeStrategy::OnePass);
+    }
+    let partitions = max_context_len.div_ceil(CUDA_PAGED_DECODE_PARTITION_TOKENS);
+    if partitions > CUDA_PAGED_DECODE_MAX_PARTITIONS {
+        candle_core::bail!(
+            "CUDA paged decode requires {partitions} partitions, exceeding the kernel grid limit"
+        )
+    }
+    let workspace_bytes = batch
+        .checked_mul(query_heads)
+        .and_then(|value| value.checked_mul(partitions))
+        .and_then(|value| value.checked_mul(value_dim.checked_add(2)?))
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .unwrap_or(usize::MAX);
+    if workspace_bytes > CUDA_PAGED_DECODE_MAX_WORKSPACE_BYTES {
+        return Ok(CudaPagedDecodeStrategy::OnePass);
+    }
+    Ok(CudaPagedDecodeStrategy::Partitioned { partitions })
+}
+
+fn cuda_paged_decode_page_tokens_supported(page_tokens: usize) -> bool {
+    matches!(page_tokens, 16 | 32 | 64)
+}
+
 pub(crate) fn paged_decode_attention(
     queries: &Tensor,
     keys: &Tensor,
@@ -367,7 +411,7 @@ pub(crate) fn paged_decode_attention(
         || key_dim > 512
         || value_dim == 0
         || value_dim > 512
-        || page_tokens == 0
+        || !cuda_paged_decode_page_tokens_supported(page_tokens)
         || max_blocks == 0
         || !softmax_scale.is_finite()
         || softmax_scale <= 0.0
@@ -377,6 +421,8 @@ pub(crate) fn paged_decode_attention(
     }
     let capacity_pages = keys.dims()[0];
     validate_cuda_paged_decode_metadata(&metadata, batch, page_tokens, max_blocks, capacity_pages)?;
+    let max_context_len = metadata[..batch].iter().copied().max().unwrap_or(0) as usize;
+    let strategy = cuda_paged_decode_strategy(max_context_len, batch, query_heads, value_dim)?;
     let kernel_geometry = [
         batch,
         query_heads,
@@ -412,6 +458,7 @@ pub(crate) fn paged_decode_attention(
             capacity_pages,
             softmax_scale,
             softcap,
+            strategy,
         },
     )
 }
@@ -757,6 +804,7 @@ struct CudaPagedDecodeOp {
     capacity_pages: usize,
     softmax_scale: f32,
     softcap: Option<f32>,
+    strategy: CudaPagedDecodeStrategy,
 }
 
 struct CudaPhysicalRingShortConvOp {
@@ -915,14 +963,14 @@ impl CustomOp3 for CudaPagedDecodeOp {
             .ok_or_else(|| {
                 candle_core::Error::Msg("CUDA paged decode grid overflow".to_string())
             })?;
-        let config = LaunchConfig {
+        let one_pass_config = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
         };
 
         macro_rules! launch {
-            ($variant:ident, $ty:ty, $function_name:literal) => {{
+            ($variant:ident, $ty:ty, $function_name:literal, $partition_name:literal, $reduce_name:literal) => {{
                 let CudaStorageSlice::$variant(query_slice) = &queries.slice else {
                     candle_core::bail!("CUDA paged decode query storage dtype mismatch")
                 };
@@ -947,33 +995,107 @@ impl CustomOp3 for CudaPagedDecodeOp {
                 // SAFETY: the custom kernel writes every output element before
                 // the returned storage is observed.
                 let output = unsafe { device.alloc::<$ty>(output_elements)? };
-                let function = device.get_or_load_custom_func(
-                    $function_name,
-                    "izwi_physical_state",
-                    cuda_ptx::PHYSICAL_STATE,
-                )?;
-                let mut builder = function.builder();
-                builder.arg(&query_view);
-                builder.arg(&key_view);
-                builder.arg(&value_view);
-                builder.arg(&metadata);
-                builder.arg(&output);
-                candle_core::builder_arg!(
-                    builder,
-                    self.batch as i32,
-                    self.query_heads as i32,
-                    self.kv_heads as i32,
-                    self.page_tokens as i32,
-                    self.max_blocks as i32,
-                    self.key_dim as i32,
-                    self.value_dim as i32,
-                    self.capacity_pages as i32,
-                    self.softmax_scale,
-                    self.softcap.unwrap_or(0.0)
-                );
-                // SAFETY: argument types, tensor bounds, and launch dimensions
-                // match the selected CUDA kernel signature.
-                unsafe { builder.launch(config) }.w()?;
+                match self.strategy {
+                    CudaPagedDecodeStrategy::OnePass => {
+                        let function = device.get_or_load_custom_func(
+                            $function_name,
+                            "izwi_physical_state",
+                            cuda_ptx::PHYSICAL_STATE,
+                        )?;
+                        let mut builder = function.builder();
+                        builder.arg(&query_view);
+                        builder.arg(&key_view);
+                        builder.arg(&value_view);
+                        builder.arg(&metadata);
+                        builder.arg(&output);
+                        candle_core::builder_arg!(
+                            builder,
+                            self.batch as i32,
+                            self.query_heads as i32,
+                            self.kv_heads as i32,
+                            self.page_tokens as i32,
+                            self.max_blocks as i32,
+                            self.key_dim as i32,
+                            self.value_dim as i32,
+                            self.capacity_pages as i32,
+                            self.softmax_scale,
+                            self.softcap.unwrap_or(0.0)
+                        );
+                        // SAFETY: argument types, tensor bounds, and launch
+                        // dimensions match the selected one-pass kernel.
+                        unsafe { builder.launch(one_pass_config) }.w()?;
+                    }
+                    CudaPagedDecodeStrategy::Partitioned { partitions } => {
+                        let partial_stride = self.value_dim.checked_add(2).ok_or_else(|| {
+                            candle_core::Error::Msg(
+                                "CUDA paged decode partial stride overflow".to_string(),
+                            )
+                        })?;
+                        let partial_elements = (blocks as usize)
+                            .checked_mul(partitions)
+                            .and_then(|value| value.checked_mul(partial_stride))
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg(
+                                    "CUDA paged decode partial workspace overflow".to_string(),
+                                )
+                            })?;
+                        // SAFETY: the partition kernel initializes every
+                        // workspace element consumed by the reduction kernel.
+                        let partials = unsafe { device.alloc::<f32>(partial_elements)? };
+                        let partition_function = device.get_or_load_custom_func(
+                            $partition_name,
+                            "izwi_physical_state",
+                            cuda_ptx::PHYSICAL_STATE,
+                        )?;
+                        let partition_config = LaunchConfig {
+                            grid_dim: (blocks, partitions as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+                        };
+                        let mut builder = partition_function.builder();
+                        builder.arg(&query_view);
+                        builder.arg(&key_view);
+                        builder.arg(&value_view);
+                        builder.arg(&metadata);
+                        builder.arg(&partials);
+                        candle_core::builder_arg!(
+                            builder,
+                            self.batch as i32,
+                            self.query_heads as i32,
+                            self.kv_heads as i32,
+                            self.page_tokens as i32,
+                            self.max_blocks as i32,
+                            self.key_dim as i32,
+                            self.value_dim as i32,
+                            self.capacity_pages as i32,
+                            CUDA_PAGED_DECODE_PARTITION_TOKENS as i32,
+                            partitions as i32,
+                            self.softmax_scale,
+                            self.softcap.unwrap_or(0.0)
+                        );
+                        // SAFETY: the validated metadata and geometry bound
+                        // every input and workspace access.
+                        unsafe { builder.launch(partition_config) }.w()?;
+
+                        let reduce_function = device.get_or_load_custom_func(
+                            $reduce_name,
+                            "izwi_physical_state",
+                            cuda_ptx::PHYSICAL_STATE,
+                        )?;
+                        let mut builder = reduce_function.builder();
+                        builder.arg(&partials);
+                        builder.arg(&output);
+                        candle_core::builder_arg!(
+                            builder,
+                            blocks as i32,
+                            self.value_dim as i32,
+                            partitions as i32
+                        );
+                        // SAFETY: the first launch initializes the complete
+                        // partial workspace on the same ordered CUDA stream.
+                        unsafe { builder.launch(one_pass_config) }.w()?;
+                    }
+                }
                 candle_core::CudaStorage {
                     slice: CudaStorageSlice::$variant(output),
                     device: device.clone(),
@@ -982,12 +1104,30 @@ impl CustomOp3 for CudaPagedDecodeOp {
         }
 
         let output = match &queries.slice {
-            CudaStorageSlice::F32(_) => launch!(F32, f32, "physical_paged_decode_f32"),
+            CudaStorageSlice::F32(_) => launch!(
+                F32,
+                f32,
+                "physical_paged_decode_f32",
+                "physical_paged_decode_partition_f32",
+                "physical_paged_decode_reduce_f32"
+            ),
             CudaStorageSlice::F16(_) => {
-                launch!(F16, half::f16, "physical_paged_decode_f16")
+                launch!(
+                    F16,
+                    half::f16,
+                    "physical_paged_decode_f16",
+                    "physical_paged_decode_partition_f16",
+                    "physical_paged_decode_reduce_f16"
+                )
             }
             CudaStorageSlice::BF16(_) => {
-                launch!(BF16, half::bf16, "physical_paged_decode_bf16")
+                launch!(
+                    BF16,
+                    half::bf16,
+                    "physical_paged_decode_bf16",
+                    "physical_paged_decode_partition_bf16",
+                    "physical_paged_decode_reduce_bf16"
+                )
             }
             _ => candle_core::bail!("CUDA paged decode requires F32/F16/BF16 storage"),
         };
@@ -1058,6 +1198,55 @@ mod tests {
         assert!(validate_cuda_paged_decode_metadata(&[], usize::MAX, 1, usize::MAX, 1).is_err());
     }
 
+    #[test]
+    fn cuda_paged_decode_routes_only_long_contexts_to_partitions() {
+        assert_eq!(
+            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS, 1, 1, 1).unwrap(),
+            CudaPagedDecodeStrategy::OnePass
+        );
+        assert_eq!(
+            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS + 1, 1, 1, 1)
+                .unwrap(),
+            CudaPagedDecodeStrategy::Partitioned { partitions: 3 }
+        );
+        assert_eq!(
+            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_PARTITION_TOKENS * 9, 1, 1, 1).unwrap(),
+            CudaPagedDecodeStrategy::Partitioned { partitions: 9 }
+        );
+        assert!(cuda_paged_decode_strategy(
+            CUDA_PAGED_DECODE_PARTITION_TOKENS * CUDA_PAGED_DECODE_MAX_PARTITIONS + 1,
+            1,
+            1,
+            1,
+        )
+        .is_err());
+        assert_eq!(
+            cuda_paged_decode_strategy(
+                CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS + 1,
+                512,
+                512,
+                512,
+            )
+            .unwrap(),
+            CudaPagedDecodeStrategy::OnePass,
+            "an oversized split workspace must retain the bounded one-pass path"
+        );
+    }
+
+    #[test]
+    fn cuda_paged_decode_geometry_supports_certified_page_sizes_and_offsets() {
+        for page_tokens in [16, 32, 64] {
+            assert!(cuda_paged_decode_page_tokens_supported(page_tokens));
+            let context_len = page_tokens * 2;
+            let first_page_offset = page_tokens - 1;
+            let metadata = vec![context_len as u32, first_page_offset as u32, 0, 1, 2];
+            validate_cuda_paged_decode_metadata(&metadata, 1, page_tokens, 3, 3).unwrap();
+        }
+        for page_tokens in [0, 1, 8, 128] {
+            assert!(!cuda_paged_decode_page_tokens_supported(page_tokens));
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_paged_decode_softcap_matches_reference_for_supported_dtypes() {
@@ -1066,8 +1255,10 @@ mod tests {
         };
         let cpu = candle_core::Device::Cpu;
         let query_data = vec![2.0f32, -1.0];
-        let key_data = vec![4.0f32, 0.0, 0.0, 2.0];
-        let value_data = vec![1.0f32, 3.0, 5.0, -2.0];
+        let mut key_data = vec![0.0f32; 16 * 2];
+        key_data[..4].copy_from_slice(&[4.0, 0.0, 0.0, 2.0]);
+        let mut value_data = vec![0.0f32; 16 * 2];
+        value_data[..4].copy_from_slice(&[1.0, 3.0, 5.0, -2.0]);
         let metadata = vec![2, 0, 0];
         let softcap = 0.5f32;
         let raw_scores = [8.0f32, -2.0];
@@ -1085,11 +1276,11 @@ mod tests {
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap();
-            let keys = Tensor::from_vec(key_data.clone(), (1, 2, 1, 2), &device)
+            let keys = Tensor::from_vec(key_data.clone(), (1, 16, 1, 2), &device)
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap();
-            let values = Tensor::from_vec(value_data.clone(), (1, 2, 1, 2), &device)
+            let values = Tensor::from_vec(value_data.clone(), (1, 16, 1, 2), &device)
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap();
@@ -1101,7 +1292,7 @@ mod tests {
                 1,
                 1,
                 1,
-                2,
+                16,
                 1,
                 2,
                 2,
