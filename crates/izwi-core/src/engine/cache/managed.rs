@@ -394,10 +394,12 @@ impl ManagedKvCacheManager {
             })
             .collect::<Vec<_>>();
         models.sort_by_key(|model| model.model_instance);
+        let mut counters = self.telemetry.snapshot();
+        counters.prefix_retained_pages = totals.coordinator.prefix_refs;
         ManagedKvRuntimeSnapshot {
             memory_accounting: "physical_arena_backing",
             totals,
-            counters: self.telemetry.snapshot(),
+            counters,
             models,
         }
     }
@@ -755,6 +757,7 @@ impl ManagedKvCacheManager {
                         )
                         .map_err(prefix_error)?
                 } else {
+                    self.telemetry.record_prefix_rejection();
                     Default::default()
                 }
             } else {
@@ -884,6 +887,10 @@ impl ManagedKvCacheManager {
                     return Err(error);
                 }
                 self.telemetry.record_copy(prepared.page_copies.len());
+                if !prefix_match.blocks.is_empty() {
+                    self.telemetry
+                        .record_prefix_copy_on_write(prepared.page_copies.len());
+                }
             }
             domains.push(ManagedCacheDomainReservation {
                 arena: group.arena,
@@ -2484,6 +2491,12 @@ mod tests {
         manager
             .release_session(&first_session)
             .expect("first release");
+        let retained = manager.runtime_snapshot();
+        assert_eq!(retained.counters.prefix_retained_pages, 2);
+        assert_eq!(
+            retained.counters.prefix_retained_pages,
+            retained.totals.coordinator.prefix_refs
+        );
 
         let mut second_tokens = tokens;
         *second_tokens.last_mut().unwrap() = 999;
@@ -2538,6 +2551,7 @@ mod tests {
         assert_eq!(reservation.domains[0].execution_start_tokens, 0);
         assert_eq!(manager.telemetry_snapshot().prefix_hits, 0);
         assert_eq!(manager.telemetry_snapshot().prefix_misses, 0);
+        assert_eq!(manager.telemetry_snapshot().prefix_rejections, 1);
     }
 
     #[test]
