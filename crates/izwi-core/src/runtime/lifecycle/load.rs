@@ -673,14 +673,20 @@ impl ModelLifecycleController {
                                 .core_engine
                                 .load_managed_model_cache(model_instance_id, &loaded_cache)
                                 .await?;
+                            let physical = physical.ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "managed state allocation returned no physical runtime"
+                                        .to_string(),
+                                )
+                            })?;
+                            crate::runtime::rollout::certify_managed_state_plan(
+                                variant,
+                                CapabilityKind::Chat,
+                                physical.state_plan_v2(),
+                            )?;
                             Some(LoadedStatePublication::ManagedV2 {
                                 contract: contract.clone(),
-                                physical: physical.ok_or_else(|| {
-                                    Error::ModelLoadError(
-                                        "managed state allocation returned no physical runtime"
-                                            .to_string(),
-                                    )
-                                })?,
+                                physical,
                             })
                         }
                         crate::kv::InferenceStateCapability::Stateless => None,
@@ -785,6 +791,11 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                             )
                             .await?;
+                        crate::runtime::rollout::certify_managed_state_plan(
+                            variant,
+                            CapabilityKind::Asr,
+                            physical.state_plan_v2(),
+                        )?;
                         let retained_uses = contracts
                             .iter()
                             .map(|contract| {
@@ -1071,6 +1082,11 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                         )
                         .await?;
+                    crate::runtime::rollout::certify_managed_state_plan(
+                        variant,
+                        capability,
+                        retained.state_plan_v2(),
+                    )?;
                     let retained_uses = contracts
                         .iter()
                         .map(|contract| {

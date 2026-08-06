@@ -47,6 +47,7 @@ use crate::kv::v2::{
     StaticTensorOperationSet, TensorComponentSpec, TensorPhysicalLayout, TensorStateOperationSet,
     WorkspacePlacement, WorkspaceResourceQuery,
 };
+use crate::runtime::rollout::KvProviderRollout;
 
 const PAGED_OPERATION_ABI: OperationAbi = OperationAbi::new(1);
 const NON_PAGED_OPERATION_ABI: OperationAbi = OperationAbi::new(1);
@@ -155,15 +156,18 @@ impl PagedOperationCapabilities {
 pub(crate) struct StateBackendRegistry {
     backend: BackendKind,
     device_ordinal: Option<u32>,
+    rollout: KvProviderRollout,
 }
 
 impl StateBackendRegistry {
     pub(crate) fn new(backend: BackendKind, device_ordinal: Option<u32>) -> Result<Self> {
+        let rollout = KvProviderRollout::from_process_env()?;
         match (backend, device_ordinal) {
             (BackendKind::Cpu, None) | (BackendKind::Metal | BackendKind::Cuda, Some(_)) => {
                 Ok(Self {
                     backend,
                     device_ordinal,
+                    rollout,
                 })
             }
             (BackendKind::Cpu, Some(_)) => Err(invalid(
@@ -212,6 +216,7 @@ impl StateBackendRegistry {
             self.backend,
             self.paged_backend_compiled(),
             cfg!(feature = "flash-attn"),
+            self.rollout.optimized_provider_enabled(),
             semantic,
             policy,
         )
@@ -797,6 +802,7 @@ fn resolve_paged_operation_capabilities(
     backend: BackendKind,
     backend_compiled: bool,
     cuda_flash_attention_compiled: bool,
+    optimized_provider_enabled: bool,
     semantic: &PagedAttentionDomainSpec,
     policy: ResolvedPagedPolicy,
 ) -> PagedOperationCapabilities {
@@ -807,11 +813,15 @@ fn resolve_paged_operation_capabilities(
         BackendKind::Cpu => PagedOperationCapabilities::portable(),
         BackendKind::Metal => PagedOperationCapabilities {
             write: PagedOperationCapability::Portable,
-            prefill: PagedOperationCapability::Optimized,
-            decode: PagedOperationCapability::Optimized,
+            // The native Metal kernels are the certified direct provider.
+            // Keep them Portable until a distinct optimized implementation
+            // has its own numerical and performance certification cell.
+            prefill: PagedOperationCapability::Portable,
+            decode: PagedOperationCapability::Portable,
         },
         BackendKind::Cuda => {
-            let flash_compatible = cuda_flash_attention_compiled
+            let flash_compatible = optimized_provider_enabled
+                && cuda_flash_attention_compiled
                 && policy.page_tokens != 0
                 && policy.page_tokens % 32 == 0
                 && matches!(policy.storage.dtype(), StateDType::F16 | StateDType::Bf16)
@@ -1158,7 +1168,7 @@ mod tests {
         assert_eq!(
             metal_capabilities.prefill,
             if cfg!(feature = "metal") {
-                PagedOperationCapability::Optimized
+                PagedOperationCapability::Portable
             } else {
                 PagedOperationCapability::Unavailable
             }
@@ -1166,7 +1176,7 @@ mod tests {
         assert_eq!(
             metal_capabilities.decode,
             if cfg!(feature = "metal") {
-                PagedOperationCapability::Optimized
+                PagedOperationCapability::Portable
             } else {
                 PagedOperationCapability::Unavailable
             }
@@ -1214,14 +1224,14 @@ mod tests {
         cuda_request.page_tokens_hint = Some(32);
         cuda_request.storage_dtype_hint = Some(StateDType::F16);
         let page_32_half = resolve_paged_policy(spec, &cuda_request).unwrap();
-        assert!(
-            spec.layers
-                .iter()
-                .all(|layer| layer.key_head_dim == layer.value_head_dim)
-        );
+        assert!(spec
+            .layers
+            .iter()
+            .all(|layer| layer.key_head_dim == layer.value_head_dim));
 
         let optimized = resolve_paged_operation_capabilities(
             BackendKind::Cuda,
+            true,
             true,
             true,
             spec,
@@ -1239,13 +1249,11 @@ mod tests {
                 BackendKind::Cuda,
                 true,
                 true,
+                true,
                 &incompatible_heads,
                 page_32_half,
             );
-            assert_eq!(
-                capabilities.prefill,
-                PagedOperationCapability::Portable
-            );
+            assert_eq!(capabilities.prefill, PagedOperationCapability::Portable);
             assert_eq!(capabilities.decode, PagedOperationCapability::Portable);
         }
 
@@ -1255,6 +1263,7 @@ mod tests {
         };
         let page_16_capabilities = resolve_paged_operation_capabilities(
             BackendKind::Cuda,
+            true,
             true,
             true,
             spec,
@@ -1275,27 +1284,16 @@ mod tests {
             },
             ..page_32_half
         };
-        let f32_capabilities = resolve_paged_operation_capabilities(
-            BackendKind::Cuda,
-            true,
-            true,
-            spec,
-            f32,
-        );
-        assert_eq!(
-            f32_capabilities.prefill,
-            PagedOperationCapability::Portable
-        );
-        assert_eq!(
-            f32_capabilities.decode,
-            PagedOperationCapability::Portable
-        );
+        let f32_capabilities =
+            resolve_paged_operation_capabilities(BackendKind::Cuda, true, true, true, spec, f32);
+        assert_eq!(f32_capabilities.prefill, PagedOperationCapability::Portable);
+        assert_eq!(f32_capabilities.decode, PagedOperationCapability::Portable);
 
         let mut offset_sensitive = spec.clone();
-        offset_sensitive.layers[0].pattern =
-            AttentionPattern::SlidingWindow { window_tokens: 128 };
+        offset_sensitive.layers[0].pattern = AttentionPattern::SlidingWindow { window_tokens: 128 };
         let offset_capabilities = resolve_paged_operation_capabilities(
             BackendKind::Cuda,
+            true,
             true,
             true,
             &offset_sensitive,
@@ -1314,6 +1312,7 @@ mod tests {
             BackendKind::Metal,
             true,
             true,
+            true,
             spec,
             page_32_half,
         );
@@ -1321,8 +1320,25 @@ mod tests {
             metal_capabilities,
             PagedOperationCapabilities {
                 write: PagedOperationCapability::Portable,
-                prefill: PagedOperationCapability::Optimized,
-                decode: PagedOperationCapability::Optimized,
+                prefill: PagedOperationCapability::Portable,
+                decode: PagedOperationCapability::Portable,
+            }
+        );
+
+        let killed = resolve_paged_operation_capabilities(
+            BackendKind::Cuda,
+            true,
+            true,
+            false,
+            spec,
+            page_32_half,
+        );
+        assert_eq!(
+            killed,
+            PagedOperationCapabilities {
+                write: PagedOperationCapability::Portable,
+                prefill: PagedOperationCapability::Portable,
+                decode: PagedOperationCapability::Portable,
             }
         );
     }
