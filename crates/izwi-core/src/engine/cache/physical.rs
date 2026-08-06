@@ -1,7 +1,7 @@
 //! Lifecycle-owned physical inference-state allocations beyond retained KV.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, DeviceLocation};
@@ -11,7 +11,7 @@ use crate::backends::kv::{KvArenaConfig, KvBackendRuntime, KvLayerConfig};
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
     StateBackendPlanRequest, StateBackendRegistry, StateComponentValue, StateDomainSnapshot,
-    TensorStateArena,
+    TensorStateArena, TensorStateCapacity,
 };
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
@@ -93,9 +93,6 @@ pub(crate) struct RetainedTensorStateRuntimeV2 {
     arena: Arc<TensorStateArena>,
     next_sequence: AtomicU64,
     next_transaction: AtomicU64,
-    active_sequences: AtomicU32,
-    sequence_capacity: u32,
-    maximum_bytes: u64,
 }
 
 impl std::fmt::Debug for RetainedTensorStateRuntimeV2 {
@@ -103,8 +100,8 @@ impl std::fmt::Debug for RetainedTensorStateRuntimeV2 {
         formatter
             .debug_struct("RetainedTensorStateRuntimeV2")
             .field("id", &self.id)
-            .field("sequence_capacity", &self.sequence_capacity)
-            .field("maximum_bytes", &self.maximum_bytes)
+            .field("sequence_capacity", &self.sequence_capacity())
+            .field("maximum_bytes", &self.maximum_bytes())
             .finish_non_exhaustive()
     }
 }
@@ -118,29 +115,18 @@ impl RetainedTensorStateRuntimeV2 {
         &self.state_plan
     }
 
-    pub(crate) const fn maximum_bytes(&self) -> u64 {
-        self.maximum_bytes
+    pub(crate) fn maximum_bytes(&self) -> u64 {
+        self.arena.capacity().authorized_bytes()
     }
 
-    pub(crate) const fn sequence_capacity(&self) -> u32 {
-        self.sequence_capacity
+    pub(crate) fn sequence_capacity(&self) -> u32 {
+        self.arena.capacity().sequence_capacity()
     }
 
     pub(crate) fn register_sequence(&self) -> Result<PhysicalStateSequenceId> {
-        self.active_sequences
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.sequence_capacity).then_some(active + 1)
-            })
-            .map_err(|_| invalid("retained tensor sequence capacity is exhausted"))?;
-        let registered = (|| {
-            let sequence = PhysicalStateSequenceId::new(next_identity(&self.next_sequence)?)?;
-            self.arena.register(sequence)?;
-            Ok(sequence)
-        })();
-        if registered.is_err() {
-            self.active_sequences.fetch_sub(1, Ordering::AcqRel);
-        }
-        registered
+        let sequence = PhysicalStateSequenceId::new(next_identity(&self.next_sequence)?)?;
+        self.arena.register(sequence)?;
+        Ok(sequence)
     }
 
     pub(crate) fn begin_transaction(
@@ -198,17 +184,7 @@ impl RetainedTensorStateRuntimeV2 {
     }
 
     pub(crate) fn release_sequence(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
-        self.arena.release(sequence)?;
-        self.active_sequences
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                active.checked_sub(1)
-            })
-            .map_err(|_| {
-                Error::InferenceError(
-                    "retained tensor sequence accounting underflowed after release".into(),
-                )
-            })?;
-        Ok(())
+        self.arena.release(sequence)
     }
 
     fn close_and_validate_drained(&self) -> Result<()> {
@@ -323,15 +299,9 @@ impl PhysicalStateManager {
                 "retained tensor allocation resolved an invalid physical domain set",
             ));
         }
-        let per_sequence_bytes = state_plan
-            .non_paged
-            .iter()
-            .try_fold(0_u64, |total, domain| {
-                total
-                    .checked_add(domain.maximum_bytes())
-                    .ok_or_else(|| invalid("retained tensor byte bound overflow"))
-            })?;
-        let maximum_bytes = retained_capacity_bytes(per_sequence_bytes, sequence_capacity)?;
+        let capacity =
+            TensorStateCapacity::for_plan(&state_plan, sequence_capacity, sequence_capacity)?;
+        let maximum_bytes = capacity.authorized_bytes();
         let generation = self.next_allocation_generation;
         if generation == 0 {
             return Err(invalid("physical retained allocation generation exhausted"));
@@ -349,6 +319,7 @@ impl PhysicalStateManager {
             .transpose()?;
         let arena = Arc::new(TensorStateArena::new(
             state_plan.clone(),
+            capacity,
             self.worker_device.clone(),
         )?);
         let runtime = Arc::new(RetainedTensorStateRuntimeV2 {
@@ -361,9 +332,6 @@ impl PhysicalStateManager {
             arena,
             next_sequence: AtomicU64::new(1),
             next_transaction: AtomicU64::new(1),
-            active_sequences: AtomicU32::new(0),
-            sequence_capacity,
-            maximum_bytes,
         });
         let model = self.models.entry(model_instance).or_default();
         if model
@@ -798,12 +766,6 @@ fn next_identity(counter: &AtomicU64) -> Result<u64> {
             value.checked_add(1)
         })
         .map_err(|_| invalid("physical state identity space exhausted"))
-}
-
-fn retained_capacity_bytes(per_sequence_bytes: u64, sequence_capacity: u32) -> Result<u64> {
-    per_sequence_bytes
-        .checked_mul(u64::from(sequence_capacity))
-        .ok_or_else(|| invalid("retained tensor sequence capacity byte bound overflow"))
 }
 
 fn validate_key(key: InvocationPhysicalKey) -> Result<()> {
@@ -1856,7 +1818,7 @@ mod tests {
         assert!(runtime.state_plan_v2().paged_attention.is_empty());
         assert_eq!(runtime.state_plan_v2().non_paged.len(), 1);
         assert_eq!(runtime.sequence_capacity(), 2);
-        assert!(runtime.maximum_bytes() >= 2 * 8 * 4);
+        assert_eq!(runtime.maximum_bytes(), 4 * 8 * 4);
         assert!(manager
             .allocate_retained_tensor(model, &retained_tensor_contract(4), 2)
             .is_err());
@@ -1896,12 +1858,6 @@ mod tests {
         runtime.release_sequence(second_sequence).unwrap();
         assert!(manager.unload_model(model).unwrap());
         assert_eq!(manager.model_count(), 0);
-    }
-
-    #[test]
-    fn retained_tensor_capacity_bytes_reject_overflow() {
-        assert!(retained_capacity_bytes(u64::MAX, 2).is_err());
-        assert_eq!(retained_capacity_bytes(32, 3).unwrap(), 96);
     }
 
     #[test]

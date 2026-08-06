@@ -2894,8 +2894,10 @@ mod tests {
             },
         )
         .expect("state plan");
-        let arena =
-            TensorStateArena::new(Arc::new(plan), candle_core::Device::Cpu).expect("tensor arena");
+        let capacity = crate::backends::state::TensorStateCapacity::for_plan(&plan, 1, 1)
+            .expect("tensor capacity");
+        let arena = TensorStateArena::new(Arc::new(plan), capacity, candle_core::Device::Cpu)
+            .expect("tensor arena");
         let sequence = PhysicalStateSequenceId::new(7).unwrap();
         arena.register(sequence).unwrap();
 

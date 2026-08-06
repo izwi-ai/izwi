@@ -26,7 +26,7 @@ use crate::backends::kv::{
 };
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
-    StateBackendPlanRequest, TensorStateArena,
+    StateBackendPlanRequest, TensorStateArena, TensorStateCapacity,
 };
 use crate::backends::BackendKind;
 use crate::engine::{
@@ -451,15 +451,28 @@ impl ManagedKvCacheManager {
             first_arena_generation,
             &state_plan_v2,
         )?;
-        let tensor_state = (!state_plan_v2.non_paged.is_empty())
-            .then(|| {
-                TensorStateArena::new(Arc::new(state_plan_v2.clone()), self.worker_device.clone())
+        // Until the runtime allocation planner supplies per-domain counts,
+        // use the existing loaded-model page authority as a conservative
+        // resident-sequence bound. Unlike the previous raw map, this is finite
+        // and its committed plus staged tensor backing is admitted below.
+        let tensor_capacity = (!state_plan_v2.non_paged.is_empty())
+            .then(|| TensorStateCapacity::for_plan(&state_plan_v2, capacity_pages, capacity_pages))
+            .transpose()?;
+        let tensor_state = tensor_capacity
+            .map(|capacity| {
+                TensorStateArena::new(
+                    Arc::new(state_plan_v2.clone()),
+                    capacity,
+                    self.worker_device.clone(),
+                )
             })
             .transpose()?
             .map(Arc::new);
 
-        let physical_bytes = plan_physical_bytes(&plan)?;
+        let paged_physical_bytes = plan_physical_bytes(&plan, None)?;
+        let physical_bytes = plan_physical_bytes(&plan, tensor_capacity)?;
         let resources = managed_arena_resources(backend, physical_bytes);
+        let materialized_resources = managed_arena_resources(backend, paged_physical_bytes);
         let resource_lease = self
             .resource_authority
             .as_ref()
@@ -504,7 +517,10 @@ impl ManagedKvCacheManager {
             );
         }
         if let Some(lease) = resource_lease.as_ref() {
-            lease.record_materialized_usage(resources)?;
+            // Paged arenas preallocate their backing. Tensor capacity is a
+            // hard authorization for demand-allocated Candle tensors and must
+            // not be reported as already materialized at model load.
+            lease.record_materialized_usage(materialized_resources)?;
         }
         let runtime = Arc::new(ManagedKvModelRuntime {
             plan: Arc::new(plan),
@@ -577,7 +593,16 @@ impl ManagedKvCacheManager {
             Error::InvalidInput("managed KV token position exceeds u32".to_string())
         })?;
         let namespace = managed_prefix_namespace(request, runtime, self.prefix_cache_salt)?;
-        let tensor_sequence_candidate = if runtime.tensor_state().is_some() {
+        let tensor_transaction = runtime
+            .tensor_state()
+            .map(|_| PhysicalStateTransactionId::new(txn_id))
+            .transpose()?;
+        let needs_tensor_sequence = runtime.tensor_state().is_some()
+            && self
+                .models
+                .get(&runtime.plan.model_instance)
+                .is_some_and(|state| !state.tensor_sequences.contains_key(session));
+        let tensor_sequence_candidate = if needs_tensor_sequence {
             let candidate = PhysicalStateSequenceId::new(self.next_tensor_sequence)?;
             self.next_tensor_sequence = self
                 .next_tensor_sequence
@@ -816,22 +841,31 @@ impl ManagedKvCacheManager {
             ));
         }
         let tensor_state = if let Some(arena) = runtime.tensor_state() {
-            let sequence = if let Some(sequence) = state.tensor_sequences.get(session).copied() {
-                sequence
-            } else {
-                let sequence = tensor_sequence_candidate.expect("tensor arena has a candidate");
-                if let Err(error) = arena.register(sequence) {
-                    abort_domains(state, txn_id, &domains);
-                    state.pending_prefixes.remove(&txn_id);
-                    return Err(error);
-                }
-                state.tensor_sequences.insert(session.clone(), sequence);
-                sequence
-            };
-            let transaction = PhysicalStateTransactionId::new(txn_id)?;
+            let transaction = tensor_transaction.expect("tensor arena has a transaction");
+            let (sequence, newly_registered) =
+                if let Some(sequence) = state.tensor_sequences.get(session).copied() {
+                    (sequence, false)
+                } else {
+                    let sequence = tensor_sequence_candidate.expect("tensor arena has a candidate");
+                    if let Err(error) = arena.register(sequence) {
+                        abort_domains(state, txn_id, &domains);
+                        state.pending_prefixes.remove(&txn_id);
+                        return Err(error);
+                    }
+                    state.tensor_sequences.insert(session.clone(), sequence);
+                    (sequence, true)
+                };
             if let Err(error) = arena.begin(transaction, sequence) {
                 abort_domains(state, txn_id, &domains);
                 state.pending_prefixes.remove(&txn_id);
+                if newly_registered {
+                    state.tensor_sequences.remove(session);
+                    arena.release(sequence).map_err(|release_error| {
+                        Error::InferenceError(format!(
+                            "tensor transaction admission failed ({error}); newly registered sequence rollback also failed: {release_error}"
+                        ))
+                    })?;
+                }
                 return Err(error);
             }
             Some(ManagedTensorStateReservation {
@@ -1252,8 +1286,11 @@ pub(super) fn managed_device_ordinal(device: &Device) -> Option<u32> {
     }
 }
 
-fn plan_physical_bytes(plan: &ResolvedKvPlan) -> Result<u64> {
-    plan.groups.iter().try_fold(0_u64, |total, group| {
+fn plan_physical_bytes(
+    plan: &ResolvedKvPlan,
+    tensor_capacity: Option<TensorStateCapacity>,
+) -> Result<u64> {
+    let paged_bytes = plan.groups.iter().try_fold(0_u64, |total, group| {
         let group_bytes = group
             .bytes_per_page
             .checked_mul(u64::from(group.capacity_pages))
@@ -1261,7 +1298,10 @@ fn plan_physical_bytes(plan: &ResolvedKvPlan) -> Result<u64> {
         total
             .checked_add(group_bytes)
             .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))
-    })
+    })?;
+    paged_bytes
+        .checked_add(tensor_capacity.map_or(0, TensorStateCapacity::authorized_bytes))
+        .ok_or_else(|| Error::Overloaded("managed state byte total overflow".into()))
 }
 
 fn managed_arena_resources(backend: BackendKind, bytes: u64) -> ResourceVector {
@@ -2327,6 +2367,16 @@ mod tests {
             .unwrap();
         let arena = runtime.tensor_state().unwrap().clone();
         let tensor_domain = crate::kv::v2::StateDomainId::new(2);
+        let paged_bytes = runtime
+            .plan()
+            .groups
+            .iter()
+            .map(|group| group.bytes_per_page * u64::from(group.capacity_pages))
+            .sum::<u64>();
+        assert_eq!(
+            runtime.physical_bytes(),
+            paged_bytes + arena.capacity().authorized_bytes()
+        );
 
         let aborted = manager
             .prepare(&runtime, 31, &session, &sequence_work(0, 1), None)
@@ -2348,6 +2398,7 @@ mod tests {
             )
             .unwrap();
         manager.finalize(&aborted, None, false).unwrap();
+        let next_sequence_after_first_prepare = manager.next_tensor_sequence;
         assert!(arena.read(sequence, tensor_domain).unwrap().is_none());
         assert_eq!(
             manager
@@ -2361,6 +2412,10 @@ mod tests {
             .prepare(&runtime, 32, &session, &sequence_work(0, 1), None)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            manager.next_tensor_sequence, next_sequence_after_first_prepare,
+            "an existing session must not consume another tensor sequence identity"
+        );
         arena
             .stage_replace(
                 PhysicalStateTransactionId::new(committed.txn_id).unwrap(),
@@ -2399,6 +2454,64 @@ mod tests {
                 .unwrap()
                 .committed_tokens,
             1
+        );
+    }
+
+    #[test]
+    fn failed_tensor_begin_rolls_back_a_new_managed_sequence() {
+        let model = ModelInstanceId::new(53);
+        let session = SessionKey::new("tensor-begin-rollback".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(composite_tensor_contract()),
+            )
+            .unwrap();
+        let runtime = runtime.unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let existing_sequence = PhysicalStateSequenceId::new(900).unwrap();
+        let conflicting_transaction = PhysicalStateTransactionId::new(41).unwrap();
+        arena.register(existing_sequence).unwrap();
+        arena
+            .begin(conflicting_transaction, existing_sequence)
+            .unwrap();
+        assert_eq!(
+            arena.occupancy().unwrap(),
+            crate::backends::state::TensorStateOccupancy {
+                active_sequences: 1,
+                active_transactions: 1,
+            }
+        );
+
+        // The independently active tensor transaction forces begin() to fail
+        // only after the managed session has registered its new sequence.
+        assert!(manager
+            .prepare(&runtime, 41, &session, &sequence_work(0, 1), None)
+            .is_err());
+        assert_eq!(
+            arena.occupancy().unwrap(),
+            crate::backends::state::TensorStateOccupancy {
+                active_sequences: 1,
+                active_transactions: 1,
+            }
+        );
+        assert!(!manager.models[&model]
+            .tensor_sequences
+            .contains_key(&session));
+
+        arena.abort(conflicting_transaction).unwrap();
+        arena.release(existing_sequence).unwrap();
+        manager.release_session(&session).unwrap();
+        assert_eq!(
+            arena.occupancy().unwrap(),
+            crate::backends::state::TensorStateOccupancy {
+                active_sequences: 0,
+                active_transactions: 0,
+            }
         );
     }
 

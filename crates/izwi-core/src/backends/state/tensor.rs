@@ -71,12 +71,112 @@ struct ArenaState {
     transactions: HashMap<PhysicalStateTransactionId, StagedTransaction>,
 }
 
+/// Immutable admission and byte-authorization envelope for one tensor arena.
+///
+/// Committed state and transaction-private staged replacements can coexist.
+/// Their capacities are therefore accounted independently instead of assuming
+/// one generation of backing per retained sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TensorStateCapacity {
+    per_sequence_bytes: u64,
+    sequence_capacity: u32,
+    transaction_capacity: u32,
+    committed_capacity_bytes: u64,
+    staging_capacity_bytes: u64,
+    authorized_bytes: u64,
+}
+
+impl TensorStateCapacity {
+    pub(crate) fn for_plan(
+        plan: &ResolvedStatePlan,
+        sequence_capacity: u32,
+        transaction_capacity: u32,
+    ) -> Result<Self> {
+        if sequence_capacity == 0
+            || transaction_capacity == 0
+            || transaction_capacity > sequence_capacity
+        {
+            return Err(invalid(
+                "tensor state capacity requires non-zero transaction capacity not exceeding sequence capacity",
+            ));
+        }
+        let per_sequence_bytes = plan.non_paged.iter().try_fold(0_u64, |total, domain| {
+            total
+                .checked_add(domain.maximum_bytes())
+                .ok_or_else(|| invalid("tensor state per-sequence byte bound overflow"))
+        })?;
+        if per_sequence_bytes == 0 {
+            return Err(invalid(
+                "tensor state capacity requires resolved non-paged state bytes",
+            ));
+        }
+        let (committed_capacity_bytes, staging_capacity_bytes, authorized_bytes) =
+            capacity_byte_totals(per_sequence_bytes, sequence_capacity, transaction_capacity)?;
+        Ok(Self {
+            per_sequence_bytes,
+            sequence_capacity,
+            transaction_capacity,
+            committed_capacity_bytes,
+            staging_capacity_bytes,
+            authorized_bytes,
+        })
+    }
+
+    pub(crate) const fn per_sequence_bytes(self) -> u64 {
+        self.per_sequence_bytes
+    }
+
+    pub(crate) const fn sequence_capacity(self) -> u32 {
+        self.sequence_capacity
+    }
+
+    pub(crate) const fn transaction_capacity(self) -> u32 {
+        self.transaction_capacity
+    }
+
+    pub(crate) const fn committed_capacity_bytes(self) -> u64 {
+        self.committed_capacity_bytes
+    }
+
+    pub(crate) const fn staging_capacity_bytes(self) -> u64 {
+        self.staging_capacity_bytes
+    }
+
+    pub(crate) const fn authorized_bytes(self) -> u64 {
+        self.authorized_bytes
+    }
+}
+
+fn capacity_byte_totals(
+    per_sequence_bytes: u64,
+    sequence_capacity: u32,
+    transaction_capacity: u32,
+) -> Result<(u64, u64, u64)> {
+    let committed = per_sequence_bytes
+        .checked_mul(u64::from(sequence_capacity))
+        .ok_or_else(|| invalid("tensor state committed byte capacity overflow"))?;
+    let staging = per_sequence_bytes
+        .checked_mul(u64::from(transaction_capacity))
+        .ok_or_else(|| invalid("tensor state staging byte capacity overflow"))?;
+    let authorized = committed
+        .checked_add(staging)
+        .ok_or_else(|| invalid("tensor state authorized byte capacity overflow"))?;
+    Ok((committed, staging, authorized))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TensorStateOccupancy {
+    pub(crate) active_sequences: u32,
+    pub(crate) active_transactions: u32,
+}
+
 /// Model-neutral transactional ownership for retained tensor, append, and
 /// ring state. Tensors remain on the selected Candle device; a transition is
 /// invisible until every domain in its consistency closure is staged and the
 /// transaction is committed under one lock.
 pub(crate) struct TensorStateArena {
     plan: Arc<ResolvedStatePlan>,
+    capacity: TensorStateCapacity,
     device: Device,
     state: Mutex<ArenaState>,
 }
@@ -86,13 +186,18 @@ impl std::fmt::Debug for TensorStateArena {
         formatter
             .debug_struct("TensorStateArena")
             .field("plan", &self.plan.id)
+            .field("capacity", &self.capacity)
             .field("device", &self.device.location())
             .finish_non_exhaustive()
     }
 }
 
 impl TensorStateArena {
-    pub(crate) fn new(plan: Arc<ResolvedStatePlan>, device: Device) -> Result<Self> {
+    pub(crate) fn new(
+        plan: Arc<ResolvedStatePlan>,
+        capacity: TensorStateCapacity,
+        device: Device,
+    ) -> Result<Self> {
         if plan.non_paged.is_empty() {
             return Err(invalid(
                 "tensor state arena requires at least one resolved non-paged domain",
@@ -112,8 +217,19 @@ impl TensorStateArena {
                 "static attention requires its direct backend arena, not the tensor-state arena",
             ));
         }
+        let expected_capacity = TensorStateCapacity::for_plan(
+            &plan,
+            capacity.sequence_capacity,
+            capacity.transaction_capacity,
+        )?;
+        if capacity != expected_capacity {
+            return Err(invalid(
+                "tensor state capacity does not match the resolved state plan",
+            ));
+        }
         Ok(Self {
             plan,
+            capacity,
             device,
             state: Mutex::new(ArenaState::default()),
         })
@@ -123,6 +239,20 @@ impl TensorStateArena {
         &self.plan
     }
 
+    pub(crate) const fn capacity(&self) -> TensorStateCapacity {
+        self.capacity
+    }
+
+    pub(crate) fn occupancy(&self) -> Result<TensorStateOccupancy> {
+        let state = self.lock()?;
+        Ok(TensorStateOccupancy {
+            active_sequences: u32::try_from(state.sequences.len())
+                .map_err(|_| invalid("tensor state sequence occupancy exceeds u32"))?,
+            active_transactions: u32::try_from(state.transactions.len())
+                .map_err(|_| invalid("tensor state transaction occupancy exceeds u32"))?,
+        })
+    }
+
     pub(crate) fn register(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
         let mut state = self.lock()?;
         if state.closed {
@@ -130,6 +260,11 @@ impl TensorStateArena {
         }
         if state.sequences.contains_key(&sequence) {
             return Err(invalid("physical state sequence is already registered"));
+        }
+        if state.sequences.len() >= self.capacity.sequence_capacity as usize {
+            return Err(Error::Backpressure(
+                "tensor state sequence capacity is exhausted".into(),
+            ));
         }
         state.sequences.insert(sequence, SequenceState::default());
         Ok(())
@@ -146,6 +281,11 @@ impl TensorStateArena {
         }
         if state.transactions.contains_key(&transaction) {
             return Err(invalid("physical state transaction id is already active"));
+        }
+        if state.transactions.len() >= self.capacity.transaction_capacity as usize {
+            return Err(Error::Backpressure(
+                "tensor state transaction capacity is exhausted".into(),
+            ));
         }
         if state
             .transactions
@@ -503,7 +643,8 @@ mod tests {
             },
         )
         .unwrap();
-        TensorStateArena::new(Arc::new(plan), Device::Cpu).unwrap()
+        let capacity = TensorStateCapacity::for_plan(&plan, 2, 2).unwrap();
+        TensorStateArena::new(Arc::new(plan), capacity, Device::Cpu).unwrap()
     }
 
     fn value(values: &[f32]) -> StateComponentValue {
@@ -657,6 +798,60 @@ mod tests {
         arena
             .begin(PhysicalStateTransactionId::new(2).unwrap(), sequence)
             .unwrap();
+    }
+
+    #[test]
+    fn capacity_accounts_for_committed_and_staged_generations() {
+        let arena = arena();
+        let capacity = arena.capacity();
+        assert_eq!(capacity.per_sequence_bytes(), 8 * 4);
+        assert_eq!(capacity.sequence_capacity(), 2);
+        assert_eq!(capacity.transaction_capacity(), 2);
+        assert_eq!(capacity.committed_capacity_bytes(), 2 * 8 * 4);
+        assert_eq!(capacity.staging_capacity_bytes(), 2 * 8 * 4);
+        assert_eq!(capacity.authorized_bytes(), 4 * 8 * 4);
+
+        let plan = arena.plan();
+        assert!(TensorStateCapacity::for_plan(plan, 0, 1).is_err());
+        assert!(TensorStateCapacity::for_plan(plan, 1, 0).is_err());
+        assert!(TensorStateCapacity::for_plan(plan, 1, 2).is_err());
+        assert!(capacity_byte_totals(u64::MAX, 2, 1).is_err());
+        assert!(capacity_byte_totals(u64::MAX / 2 + 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn sequence_and_transaction_admission_are_bounded_and_reusable() {
+        let arena = arena();
+        let first = PhysicalStateSequenceId::new(1).unwrap();
+        let second = PhysicalStateSequenceId::new(2).unwrap();
+        let third = PhysicalStateSequenceId::new(3).unwrap();
+        arena.register(first).unwrap();
+        arena.register(second).unwrap();
+        assert!(matches!(arena.register(third), Err(Error::Backpressure(_))));
+
+        let first_txn = PhysicalStateTransactionId::new(1).unwrap();
+        let second_txn = PhysicalStateTransactionId::new(2).unwrap();
+        let third_txn = PhysicalStateTransactionId::new(3).unwrap();
+        arena.begin(first_txn, first).unwrap();
+        arena.begin(second_txn, second).unwrap();
+        assert!(matches!(
+            arena.begin(third_txn, first),
+            Err(Error::Backpressure(_))
+        ));
+
+        arena.abort(first_txn).unwrap();
+        arena.begin(third_txn, first).unwrap();
+        arena.abort(third_txn).unwrap();
+        arena.abort(second_txn).unwrap();
+        arena.release(first).unwrap();
+        arena.register(third).unwrap();
+        assert_eq!(
+            arena.occupancy().unwrap(),
+            TensorStateOccupancy {
+                active_sequences: 2,
+                active_transactions: 0,
+            }
+        );
     }
 
     #[test]

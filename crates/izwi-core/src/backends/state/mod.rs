@@ -27,7 +27,7 @@ pub(crate) use static_attention::{
 #[allow(unused_imports)]
 pub(crate) use tensor::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, StateDomainSnapshot,
-    TensorStateArena,
+    TensorStateArena, TensorStateCapacity, TensorStateOccupancy,
 };
 
 use crate::backends::BackendKind;
