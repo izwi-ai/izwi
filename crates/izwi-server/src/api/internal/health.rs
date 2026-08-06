@@ -168,6 +168,9 @@ fn current_server_binary_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_core::config::{
+        EffectiveKvCachePolicy, KvCacheDtype, PrefixCachePolicy, RequestedKvCachePolicy,
+    };
 
     #[test]
     fn cuda_runtime_health_response_does_not_expose_local_paths() {
@@ -222,6 +225,19 @@ mod tests {
                 selected_dtype: "bf16".to_string(),
                 reason: "policy".to_string(),
             },
+            kv_cache_policy: ResolvedKvCachePolicy {
+                requested: RequestedKvCachePolicy {
+                    page_size: 16,
+                    dtype: KvCacheDtype::Float16,
+                    prefix: PrefixCachePolicy::Disabled,
+                },
+                effective: EffectiveKvCachePolicy {
+                    page_size: 16,
+                    dtype: KvCacheDtype::Bfloat16,
+                    prefix: PrefixCachePolicy::Disabled,
+                },
+                fallback_reason: Some("selected backend cache dtype for CUDA".to_string()),
+            },
             fused_attention: FusedAttentionResponse {
                 cuda_flash_attention_compiled: true,
                 requested: true,
@@ -273,17 +289,17 @@ mod tests {
         assert_eq!(value["loaded_tts_model"]["device_kind"], "Cuda");
         assert_eq!(value["loaded_tts_model"]["dtype"], "BF16");
         assert_eq!(value["loaded_models"][0]["family"], "vibevoice_tts");
-        assert_eq!(
-            value["loaded_models"][0]["actual_compute_dtype"],
-            "f16"
-        );
-        assert_eq!(
-            value["loaded_models"][0]["default_compute_dtype"],
-            "bf16"
-        );
+        assert_eq!(value["loaded_models"][0]["actual_compute_dtype"], "f16");
+        assert_eq!(value["loaded_models"][0]["default_compute_dtype"], "bf16");
         assert_eq!(
             value["loaded_models"][0]["family_diagnostics"]["dtype"],
             "BF16"
+        );
+        assert_eq!(value["kv_cache_policy"]["requested"]["dtype"], "float16");
+        assert_eq!(value["kv_cache_policy"]["effective"]["dtype"], "bfloat16");
+        assert_eq!(
+            value["kv_cache_policy"]["fallback_reason"],
+            "selected backend cache dtype for CUDA"
         );
     }
 }
