@@ -218,6 +218,14 @@ struct CachedPrefillDeviceMetadata {
     block_table: Tensor,
 }
 
+#[derive(Debug)]
+struct CachedDecodeDeviceMetadata {
+    key: KvDecodeBatchMetadata,
+    cumulative_queries: Tensor,
+    cumulative_contexts: Tensor,
+    block_table: Tensor,
+}
+
 /// Device-resident KV storage backed by Candle's accelerator tensors.
 ///
 /// `new_mutation_only` is deliberately explicit: it exposes the independently
@@ -232,8 +240,9 @@ pub struct CandleAcceleratorKvArena {
     layers: HashMap<KvLayerBinding, AcceleratorLayerStorage>,
     mutation_lock: Mutex<()>,
     prefill_metadata_cache: Mutex<Option<CachedPrefillDeviceMetadata>>,
-    prefill_metadata_cache_hits: AtomicU64,
-    prefill_metadata_cache_misses: AtomicU64,
+    decode_metadata_cache: Mutex<Option<CachedDecodeDeviceMetadata>>,
+    attention_plan_cache_hits: AtomicU64,
+    attention_plan_cache_misses: AtomicU64,
     slot_write_dispatches: AtomicU64,
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
@@ -299,8 +308,9 @@ impl CandleAcceleratorKvArena {
             layers,
             mutation_lock: Mutex::new(()),
             prefill_metadata_cache: Mutex::new(None),
-            prefill_metadata_cache_hits: AtomicU64::new(0),
-            prefill_metadata_cache_misses: AtomicU64::new(0),
+            decode_metadata_cache: Mutex::new(None),
+            attention_plan_cache_hits: AtomicU64::new(0),
+            attention_plan_cache_misses: AtomicU64::new(0),
             slot_write_dispatches: AtomicU64::new(0),
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
@@ -581,7 +591,7 @@ impl CandleAcceleratorKvArena {
             .as_ref()
             .filter(|cached| cached.key == lowered.cache_key)
         {
-            self.prefill_metadata_cache_hits
+            self.attention_plan_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
             return Ok((
                 cached.cumulative_queries.clone(),
@@ -611,7 +621,61 @@ impl CandleAcceleratorKvArena {
             cumulative_contexts: cumulative_contexts.clone(),
             block_table: block_table.clone(),
         });
-        self.prefill_metadata_cache_misses
+        self.attention_plan_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        Ok((cumulative_queries, cumulative_contexts, block_table))
+    }
+
+    fn cached_decode_device_metadata(
+        &self,
+        batch: &KvDecodeBatchMetadata,
+        cumulative_contexts: &[u32],
+        block_table: &[u32],
+        max_blocks: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let mut cache = self.decode_metadata_cache.lock().map_err(|_| {
+            Error::InferenceError("accelerator decode metadata cache was poisoned".into())
+        })?;
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.key == *batch) {
+            self.attention_plan_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok((
+                cached.cumulative_queries.clone(),
+                cached.cumulative_contexts.clone(),
+                cached.block_table.clone(),
+            ));
+        }
+
+        let batch_size = batch.sequences.len();
+        let cumulative_queries = (0..=batch_size)
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    Error::InferenceError("CUDA paged decode batch exceeds u32".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cumulative_queries = Tensor::from_vec(
+            cumulative_queries,
+            batch_size + 1,
+            &self.device,
+        )?;
+        let cumulative_contexts = Tensor::from_vec(
+            cumulative_contexts.to_vec(),
+            cumulative_contexts.len(),
+            &self.device,
+        )?;
+        let block_table = Tensor::from_vec(
+            block_table.to_vec(),
+            (batch_size, max_blocks),
+            &self.device,
+        )?;
+        *cache = Some(CachedDecodeDeviceMetadata {
+            key: batch.clone(),
+            cumulative_queries: cumulative_queries.clone(),
+            cumulative_contexts: cumulative_contexts.clone(),
+            block_table: block_table.clone(),
+        });
+        self.attention_plan_cache_misses
             .fetch_add(1, Ordering::Relaxed);
         Ok((cumulative_queries, cumulative_contexts, block_table))
     }
@@ -684,15 +748,12 @@ impl CandleAcceleratorKvArena {
             && self.config.page_tokens % 32 == 0
             && first_page_offsets.iter().all(|offset| *offset == 0)
         {
-            let mut seqlens_q = Vec::with_capacity(batch_size + 1);
-            for value in 0..=batch_size {
-                seqlens_q.push(u32::try_from(value).map_err(|_| {
-                    Error::InferenceError("CUDA paged decode batch exceeds u32".into())
-                })?);
-            }
-            let seqlens_q = Tensor::from_vec(seqlens_q, batch_size + 1, &self.device)?;
-            let seqlens_k = Tensor::from_vec(seqlens_k, batch_size + 1, &self.device)?;
-            let block_table = Tensor::from_vec(table, (batch_size, max_blocks), &self.device)?;
+            let (seqlens_q, seqlens_k, block_table) = self.cached_decode_device_metadata(
+                args.batch,
+                &seqlens_k,
+                &table,
+                max_blocks,
+            )?;
             return Ok(candle_flash_attn::flash_attn_varlen_paged_windowed(
                 args.queries,
                 &layer.keys,
@@ -1040,8 +1101,8 @@ impl KvArena for CandleAcceleratorKvArena {
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
             page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
-            attention_plan_cache_hits: self.prefill_metadata_cache_hits.load(Ordering::Relaxed),
-            attention_plan_cache_misses: self.prefill_metadata_cache_misses.load(Ordering::Relaxed),
+            attention_plan_cache_hits: self.attention_plan_cache_hits.load(Ordering::Relaxed),
+            attention_plan_cache_misses: self.attention_plan_cache_misses.load(Ordering::Relaxed),
             host_synchronizations: self.host_synchronizations.load(Ordering::Relaxed),
         }
     }
@@ -1610,9 +1671,37 @@ mod tests {
         arena.cached_prefill_device_metadata(&lowered)?;
         arena.cached_prefill_device_metadata(&lowered)?;
         arena.cached_prefill_device_metadata(&next_generation)?;
+
+        let decode = KvDecodeBatchMetadata {
+            sequences: vec![
+                crate::kv::KvSequenceBlockTable {
+                    blocks: rows[0].blocks.clone(),
+                    first_page_offset: 1,
+                    context_len: 3,
+                },
+                crate::kv::KvSequenceBlockTable {
+                    blocks: rows[1].blocks.clone(),
+                    first_page_offset: 0,
+                    context_len: 2,
+                },
+            ],
+        };
+        let (table, cumulative, _, max_blocks, _) = arena.lower_decode_tables(&decode)?;
+        arena.cached_decode_device_metadata(&decode, &cumulative, &table, max_blocks)?;
+        arena.cached_decode_device_metadata(&decode, &cumulative, &table, max_blocks)?;
+        let mut next_decode_generation = decode.clone();
+        next_decode_generation.sequences[0].blocks[0].slot_generation = 2;
+        let (table, cumulative, _, max_blocks, _) =
+            arena.lower_decode_tables(&next_decode_generation)?;
+        arena.cached_decode_device_metadata(
+            &next_decode_generation,
+            &cumulative,
+            &table,
+            max_blocks,
+        )?;
         let stats = arena.operation_stats();
-        assert_eq!(stats.attention_plan_cache_hits, 1);
-        assert_eq!(stats.attention_plan_cache_misses, 2);
+        assert_eq!(stats.attention_plan_cache_hits, 2);
+        assert_eq!(stats.attention_plan_cache_misses, 4);
         Ok(())
     }
 
