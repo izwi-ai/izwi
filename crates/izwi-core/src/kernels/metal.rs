@@ -28,6 +28,12 @@ const METAL_PAGED_ATTENTION_PARTITION_TOKENS: usize = 512;
 const METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT: usize = 2048;
 #[cfg(feature = "metal")]
 const METAL_PAGED_ATTENTION_SPLIT_MAX_BASE_WORKGROUPS: usize = 64;
+// This path is intentionally conservative until hardware-backed benchmarks
+// establish a lower crossover point for packed prefill on supported GPUs.
+#[cfg(feature = "metal")]
+const METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT: usize = 4096;
+#[cfg(feature = "metal")]
+const METAL_PAGED_PREFILL_SPLIT_MAX_BASE_WORKGROUPS: usize = 64;
 
 #[cfg(feature = "metal")]
 const IZWI_METAL_SOURCE: &str = r#"
@@ -1024,13 +1030,8 @@ kernel void izwi_paged_prefill_attention_f32(
         return;
     }
 
-    uint sequence = 0;
-    for (; sequence + 1 < sequence_count; sequence++) {
-        const uint next_query_start = metadata[sequence + 1];
-        if (query_index < next_query_start) {
-            break;
-        }
-    }
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
     const uint query_start = metadata[sequence];
     const uint query_len = metadata[sequence_count + sequence];
     const uint context_len = metadata[2 * sequence_count + sequence];
@@ -1138,13 +1139,8 @@ kernel void izwi_paged_prefill_attention_f16(
         return;
     }
 
-    uint sequence = 0;
-    for (; sequence + 1 < sequence_count; sequence++) {
-        const uint next_query_start = metadata[sequence + 1];
-        if (query_index < next_query_start) {
-            break;
-        }
-    }
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
     const uint query_start = metadata[sequence];
     const uint query_len = metadata[sequence_count + sequence];
     const uint context_len = metadata[2 * sequence_count + sequence];
@@ -1218,6 +1214,244 @@ kernel void izwi_paged_prefill_attention_f16(
     const float inv_sum = 1.0f / online_state[1];
     for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
         output[out_base + dim] = half(accumulator[dim] * inv_sum);
+    }
+}
+
+kernel void izwi_paged_prefill_attention_split_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* partial_values [[buffer(3)]],
+    device float* partial_maxes [[buffer(4)]],
+    device float* partial_sums [[buffer(5)]],
+    device const uint* metadata [[buffer(6)]],
+    constant uint& sequence_count [[buffer(7)]],
+    constant uint& total_queries [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& page_tokens [[buffer(11)]],
+    constant uint& max_blocks [[buffer(12)]],
+    constant uint& key_head_dim [[buffer(13)]],
+    constant uint& value_head_dim [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant float& softcap [[buffer(16)]],
+    constant uint& window_tokens [[buffer(17)]],
+    constant uint& partition_tokens [[buffer(18)]],
+    constant uint& max_partitions [[buffer(19)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint query_index = group.y;
+    const uint partition = group.z;
+    if (query_index >= total_queries || head >= num_heads || partition >= max_partitions) {
+        return;
+    }
+
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
+    const uint query_start = metadata[sequence];
+    const uint query_len = metadata[sequence_count + sequence];
+    const uint context_len = metadata[2 * sequence_count + sequence];
+    const uint first_page_offset = metadata[3 * sequence_count + sequence];
+    const uint query_offset = query_index - query_start;
+    const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
+    const uint attended_tokens = visible_context - window_start;
+    const uint relative_start = partition * partition_tokens;
+    const uint relative_end = min(relative_start + partition_tokens, attended_tokens);
+    const uint partial_index = (query_index * num_heads + head) * max_partitions + partition;
+    const uint partial_base = partial_index * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (relative_start < attended_tokens) {
+        const uint table_base = 4 * sequence_count + sequence * max_blocks;
+        const uint kv_group = num_heads / num_kv_heads;
+        const uint kv_head = head / kv_group;
+        const uint q_base = (query_index * num_heads + head) * key_head_dim;
+        for (uint relative_pos = relative_start; relative_pos < relative_end; relative_pos++) {
+            const uint physical_pos = first_page_offset + window_start + relative_pos;
+            const uint logical_page = physical_pos / page_tokens;
+            const uint page_offset = physical_pos - logical_page * page_tokens;
+            const uint physical_page = metadata[table_base + logical_page];
+            const uint slot = physical_page * page_tokens + page_offset;
+            const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+            float local_dot = 0.0f;
+            for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+                local_dot += q[q_base + dim] * k[k_base + dim];
+            }
+            dot_scratch[tid] = local_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    dot_scratch[tid] += dot_scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(online_state[0], score);
+                const float alpha = online_state[1] == 0.0f ? 0.0f : exp(online_state[0] - next_max);
+                const float beta = exp(score - next_max);
+                online_state[0] = next_max;
+                online_state[1] = online_state[1] * alpha + beta;
+                online_state[2] = alpha;
+                online_state[3] = beta;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+            for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+                accumulator[dim] = accumulator[dim] * online_state[2]
+                    + v[v_base + dim] * online_state[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        partial_values[partial_base + dim] = accumulator[dim];
+    }
+    if (tid == 0) {
+        partial_maxes[partial_index] = online_state[0];
+        partial_sums[partial_index] = online_state[1];
+    }
+}
+
+kernel void izwi_paged_prefill_attention_split_f16(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
+    device float* partial_values [[buffer(3)]],
+    device float* partial_maxes [[buffer(4)]],
+    device float* partial_sums [[buffer(5)]],
+    device const uint* metadata [[buffer(6)]],
+    constant uint& sequence_count [[buffer(7)]],
+    constant uint& total_queries [[buffer(8)]],
+    constant uint& num_heads [[buffer(9)]],
+    constant uint& num_kv_heads [[buffer(10)]],
+    constant uint& page_tokens [[buffer(11)]],
+    constant uint& max_blocks [[buffer(12)]],
+    constant uint& key_head_dim [[buffer(13)]],
+    constant uint& value_head_dim [[buffer(14)]],
+    constant float& scale [[buffer(15)]],
+    constant float& softcap [[buffer(16)]],
+    constant uint& window_tokens [[buffer(17)]],
+    constant uint& partition_tokens [[buffer(18)]],
+    constant uint& max_partitions [[buffer(19)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 threads_per_group [[threads_per_threadgroup]]
+) {
+    threadgroup float dot_scratch[256];
+    threadgroup float accumulator[512];
+    threadgroup float online_state[4];
+
+    const uint head = group.x;
+    const uint query_index = group.y;
+    const uint partition = group.z;
+    if (query_index >= total_queries || head >= num_heads || partition >= max_partitions) {
+        return;
+    }
+
+    const uint query_rows_base = sequence_count * (4 + max_blocks);
+    const uint sequence = metadata[query_rows_base + query_index];
+    const uint query_start = metadata[sequence];
+    const uint query_len = metadata[sequence_count + sequence];
+    const uint context_len = metadata[2 * sequence_count + sequence];
+    const uint first_page_offset = metadata[3 * sequence_count + sequence];
+    const uint query_offset = query_index - query_start;
+    const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
+    const uint attended_tokens = visible_context - window_start;
+    const uint relative_start = partition * partition_tokens;
+    const uint relative_end = min(relative_start + partition_tokens, attended_tokens);
+    const uint partial_index = (query_index * num_heads + head) * max_partitions + partition;
+    const uint partial_base = partial_index * value_head_dim;
+    const uint threads_per_threadgroup = threads_per_group.x;
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        accumulator[dim] = 0.0f;
+    }
+    if (tid == 0) {
+        online_state[0] = -INFINITY;
+        online_state[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (relative_start < attended_tokens) {
+        const uint table_base = 4 * sequence_count + sequence * max_blocks;
+        const uint kv_group = num_heads / num_kv_heads;
+        const uint kv_head = head / kv_group;
+        const uint q_base = (query_index * num_heads + head) * key_head_dim;
+        for (uint relative_pos = relative_start; relative_pos < relative_end; relative_pos++) {
+            const uint physical_pos = first_page_offset + window_start + relative_pos;
+            const uint logical_page = physical_pos / page_tokens;
+            const uint page_offset = physical_pos - logical_page * page_tokens;
+            const uint physical_page = metadata[table_base + logical_page];
+            const uint slot = physical_page * page_tokens + page_offset;
+            const uint k_base = (slot * num_kv_heads + kv_head) * key_head_dim;
+            float local_dot = 0.0f;
+            for (uint dim = tid; dim < key_head_dim; dim += threads_per_threadgroup) {
+                local_dot += float(q[q_base + dim]) * float(k[k_base + dim]);
+            }
+            dot_scratch[tid] = local_dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    dot_scratch[tid] += dot_scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0) {
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(online_state[0], score);
+                const float alpha = online_state[1] == 0.0f ? 0.0f : exp(online_state[0] - next_max);
+                const float beta = exp(score - next_max);
+                online_state[0] = next_max;
+                online_state[1] = online_state[1] * alpha + beta;
+                online_state[2] = alpha;
+                online_state[3] = beta;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint v_base = (slot * num_kv_heads + kv_head) * value_head_dim;
+            for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+                accumulator[dim] = accumulator[dim] * online_state[2]
+                    + float(v[v_base + dim]) * online_state[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint dim = tid; dim < value_head_dim; dim += threads_per_threadgroup) {
+        partial_values[partial_base + dim] = accumulator[dim];
+    }
+    if (tid == 0) {
+        partial_maxes[partial_index] = online_state[0];
+        partial_sums[partial_index] = online_state[1];
     }
 }
 
@@ -2802,6 +3036,9 @@ impl CustomOp3 for PagedPrefillAttentionOp {
         }
 
         let mut next_query = 0usize;
+        let mut query_rows = Vec::with_capacity(self.total_queries);
+        let mut query_attention_lens = Vec::with_capacity(self.total_queries);
+        let mut max_attention_len = 0usize;
         for sequence in 0..self.sequence_count {
             let query_start = self.metadata[sequence] as usize;
             let query_len = self.metadata[self.sequence_count + sequence] as usize;
@@ -2831,6 +3068,15 @@ impl CustomOp3 for PagedPrefillAttentionOp {
             next_query = next_query
                 .checked_add(query_len)
                 .ok_or_else(|| candle_core::Error::Msg("paged prefill query overflow".into()))?;
+            for query_offset in 0..query_len {
+                let visible_context = context_len - query_len + query_offset + 1;
+                let attention_len = self.window_tokens.map_or(visible_context, |window| {
+                    visible_context.min(window as usize)
+                });
+                query_rows.push(sequence as u32);
+                query_attention_lens.push(attention_len as u32);
+                max_attention_len = max_attention_len.max(attention_len);
+            }
         }
         if next_query != self.total_queries {
             bail!("izwi-paged-prefill-attention-metal rows do not cover every query")
@@ -2856,59 +3102,156 @@ impl CustomOp3 for PagedPrefillAttentionOp {
             .ok_or_else(|| candle_core::Error::Msg("paged prefill output overflow".into()))?;
         let device = q_storage.device().clone();
         let output = device.new_buffer(elem_count, dtype, "izwi-paged-prefill-attention")?;
-        let metadata = device.new_buffer_with_data(&self.metadata)?;
+        // Append direct query-to-sequence rows after the compact sequence
+        // records. Both short and split kernels now perform O(1) row lookup.
+        let mut expanded_metadata = self.metadata.clone();
+        expanded_metadata.extend_from_slice(&query_rows);
+        let metadata = device.new_buffer_with_data(&expanded_metadata)?;
         let encoder = device.command_encoder()?;
-        encoder.set_label("izwi-paged-prefill-attention");
-        let pipeline = paged_prefill_attention_pipeline(device.metal_device(), dtype)?;
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_input_buffer(
-            0,
-            Some(q_storage.buffer()),
-            q_layout.start_offset() * dtype.size_in_bytes(),
-        );
-        encoder.set_input_buffer(
-            1,
-            Some(k_storage.buffer()),
-            k_layout.start_offset() * dtype.size_in_bytes(),
-        );
-        encoder.set_input_buffer(
-            2,
-            Some(v_storage.buffer()),
-            v_layout.start_offset() * dtype.size_in_bytes(),
-        );
-        encoder.set_output_buffer(3, Some(&output), 0);
-        encoder.set_input_buffer(4, Some(&metadata), 0);
-        encoder.set_bytes(5, &(self.sequence_count as u32));
-        encoder.set_bytes(6, &(self.total_queries as u32));
-        encoder.set_bytes(7, &(self.num_heads as u32));
-        encoder.set_bytes(8, &(self.num_kv_heads as u32));
-        encoder.set_bytes(9, &(self.page_tokens as u32));
-        encoder.set_bytes(10, &(self.max_blocks as u32));
-        encoder.set_bytes(11, &(self.key_head_dim as u32));
-        encoder.set_bytes(12, &(self.value_head_dim as u32));
-        encoder.set_bytes(13, &self.scale);
-        encoder.set_bytes(14, &self.softcap.unwrap_or(0.0));
-        encoder.set_bytes(15, &self.window_tokens.unwrap_or(0));
-
         let reduction_width = self
             .key_head_dim
             .max(self.value_head_dim)
             .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
             .min(256)
             .max(1);
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: self.num_heads,
-                height: self.total_queries,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: reduction_width,
-                height: 1,
-                depth: 1,
-            },
-        );
+        let base_workgroups = self.total_queries.saturating_mul(self.num_heads);
+        let use_split_kv = max_attention_len > METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT
+            && base_workgroups <= METAL_PAGED_PREFILL_SPLIT_MAX_BASE_WORKGROUPS;
+
+        if use_split_kv {
+            let max_partitions = max_attention_len.div_ceil(METAL_PAGED_ATTENTION_PARTITION_TOKENS);
+            let partial_count = base_workgroups
+                .checked_mul(max_partitions)
+                .ok_or_else(|| candle_core::Error::Msg("paged prefill split overflow".into()))?;
+            let partial_value_count = partial_count
+                .checked_mul(self.value_head_dim)
+                .ok_or_else(|| candle_core::Error::Msg("paged prefill split overflow".into()))?;
+            let partial_values =
+                device.new_buffer(partial_value_count, DType::F32, "izwi-paged-prefill-parts")?;
+            let partial_maxes =
+                device.new_buffer(partial_count, DType::F32, "izwi-paged-prefill-maxes")?;
+            let partial_sums =
+                device.new_buffer(partial_count, DType::F32, "izwi-paged-prefill-sums")?;
+            let attention_lens = device.new_buffer_with_data(&query_attention_lens)?;
+            let (split_pipeline, reduce_pipeline) =
+                paged_prefill_attention_split_pipelines(device.metal_device(), dtype)?;
+
+            encoder.set_label("izwi-paged-prefill-attention-split");
+            encoder.set_compute_pipeline_state(&split_pipeline);
+            encoder.set_input_buffer(
+                0,
+                Some(q_storage.buffer()),
+                q_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                1,
+                Some(k_storage.buffer()),
+                k_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                2,
+                Some(v_storage.buffer()),
+                v_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_output_buffer(3, Some(&partial_values), 0);
+            encoder.set_output_buffer(4, Some(&partial_maxes), 0);
+            encoder.set_output_buffer(5, Some(&partial_sums), 0);
+            encoder.set_input_buffer(6, Some(&metadata), 0);
+            encoder.set_bytes(7, &(self.sequence_count as u32));
+            encoder.set_bytes(8, &(self.total_queries as u32));
+            encoder.set_bytes(9, &(self.num_heads as u32));
+            encoder.set_bytes(10, &(self.num_kv_heads as u32));
+            encoder.set_bytes(11, &(self.page_tokens as u32));
+            encoder.set_bytes(12, &(self.max_blocks as u32));
+            encoder.set_bytes(13, &(self.key_head_dim as u32));
+            encoder.set_bytes(14, &(self.value_head_dim as u32));
+            encoder.set_bytes(15, &self.scale);
+            encoder.set_bytes(16, &self.softcap.unwrap_or(0.0));
+            encoder.set_bytes(17, &self.window_tokens.unwrap_or(0));
+            encoder.set_bytes(18, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(19, &(max_partitions as u32));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.total_queries,
+                    depth: max_partitions,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.insert_memory_barrier();
+
+            encoder.set_label("izwi-paged-prefill-attention-reduce");
+            encoder.set_compute_pipeline_state(&reduce_pipeline);
+            encoder.set_input_buffer(0, Some(&partial_values), 0);
+            encoder.set_input_buffer(1, Some(&partial_maxes), 0);
+            encoder.set_input_buffer(2, Some(&partial_sums), 0);
+            encoder.set_output_buffer(3, Some(&output), 0);
+            encoder.set_input_buffer(4, Some(&attention_lens), 0);
+            encoder.set_bytes(5, &(self.num_heads as u32));
+            encoder.set_bytes(6, &(self.value_head_dim as u32));
+            encoder.set_bytes(7, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(8, &(max_partitions as u32));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.total_queries,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            encoder.set_label("izwi-paged-prefill-attention");
+            let pipeline = paged_prefill_attention_pipeline(device.metal_device(), dtype)?;
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_input_buffer(
+                0,
+                Some(q_storage.buffer()),
+                q_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                1,
+                Some(k_storage.buffer()),
+                k_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_input_buffer(
+                2,
+                Some(v_storage.buffer()),
+                v_layout.start_offset() * dtype.size_in_bytes(),
+            );
+            encoder.set_output_buffer(3, Some(&output), 0);
+            encoder.set_input_buffer(4, Some(&metadata), 0);
+            encoder.set_bytes(5, &(self.sequence_count as u32));
+            encoder.set_bytes(6, &(self.total_queries as u32));
+            encoder.set_bytes(7, &(self.num_heads as u32));
+            encoder.set_bytes(8, &(self.num_kv_heads as u32));
+            encoder.set_bytes(9, &(self.page_tokens as u32));
+            encoder.set_bytes(10, &(self.max_blocks as u32));
+            encoder.set_bytes(11, &(self.key_head_dim as u32));
+            encoder.set_bytes(12, &(self.value_head_dim as u32));
+            encoder.set_bytes(13, &self.scale);
+            encoder.set_bytes(14, &self.softcap.unwrap_or(0.0));
+            encoder.set_bytes(15, &self.window_tokens.unwrap_or(0));
+            encoder.dispatch_thread_groups(
+                objc2_metal::MTLSize {
+                    width: self.num_heads,
+                    height: self.total_queries,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: reduction_width.min(pipeline.max_total_threads_per_threadgroup()),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
         drop(encoder);
 
         Ok((
@@ -2955,6 +3298,58 @@ fn paged_prefill_attention_pipeline(
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?
         .insert(key, pipeline.clone());
     Ok(pipeline)
+}
+
+#[cfg(feature = "metal")]
+fn paged_prefill_attention_split_pipelines(
+    device: &MetalDevice,
+    dtype: DType,
+) -> CandleResult<(ComputePipeline, ComputePipeline)> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), (ComputePipeline, ComputePipeline)>>> =
+        OnceLock::new();
+    let registry_id = device.registry_id();
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (registry_id, dtype);
+    if let Some(pipelines) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipelines);
+    }
+
+    let (split_name, reduce_name) = match dtype {
+        DType::F32 => (
+            "izwi_paged_prefill_attention_split_f32",
+            "izwi_paged_decode_attention_reduce_f32",
+        ),
+        DType::F16 => (
+            "izwi_paged_prefill_attention_split_f16",
+            "izwi_paged_decode_attention_reduce_f16",
+        ),
+        _ => bail!("izwi-paged-prefill-attention-metal only supports F32 and F16 tensors"),
+    };
+    let library = device
+        .new_library_with_source(IZWI_METAL_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let split_function = library
+        .get_function(split_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let reduce_function = library
+        .get_function(reduce_name, None)
+        .map_err(candle_core::Error::wrap)?;
+    let split_pipeline = device
+        .new_compute_pipeline_state_with_function(&split_function)
+        .map_err(candle_core::Error::wrap)?;
+    let reduce_pipeline = device
+        .new_compute_pipeline_state_with_function(&reduce_function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, (split_pipeline.clone(), reduce_pipeline.clone()));
+    Ok((split_pipeline, reduce_pipeline))
 }
 
 #[cfg(feature = "metal")]
@@ -4419,9 +4814,11 @@ pub(crate) fn paged_decode_attention(
 ///
 /// `metadata` is compact per sequence rather than expanded per query:
 /// `[query_starts..., query_lens..., context_lens..., first_page_offsets...,
-/// padded_block_table...]`. Each query derives its causal visible context in
-/// the shader. This mirrors vllm-metal's unified varlen indexing while keeping
-/// Izwi's existing Candle storage ABI.
+/// padded_block_table...]`. Dispatch appends a direct query-to-sequence map so
+/// shaders avoid scanning ragged sequence boundaries. Each query derives its
+/// causal visible context in the shader. Long, low-occupancy rows are split
+/// into bounded online-softmax partitions and merged in F32; the conservative
+/// crossover remains a candidate for hardware-backed promotion tuning.
 #[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paged_prefill_attention(
@@ -5333,9 +5730,8 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-                let scores = [8.0f32, -2.0].map(|score| {
-                    softcap.map_or(score, |cap| cap * (score / cap).tanh())
-                });
+                let scores = [8.0f32, -2.0]
+                    .map(|score| softcap.map_or(score, |cap| cap * (score / cap).tanh()));
                 let max_score = scores[0].max(scores[1]);
                 let weights = scores.map(|score| (score - max_score).exp());
                 let denominator = weights[0] + weights[1];
@@ -5598,6 +5994,148 @@ mod tests {
             }
             let tolerance = if dtype == DType::F16 { 2e-3 } else { 2e-5 };
             assert_f32_close(&actual, &expected, tolerance, "packed paged prefill");
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_split_packed_prefill_matches_asymmetric_gqa_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let page_tokens = 64usize;
+        let context_len = METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT + 1;
+        let first_page_offset = 1usize;
+        let page_count = (context_len + first_page_offset).div_ceil(page_tokens);
+        let num_heads = 2usize;
+        let key_head_dim = 2usize;
+        let value_head_dim = 3usize;
+        let query_data = vec![0.5f32, -0.25, -0.125, 0.75];
+        let mut key_data = vec![0.0f32; page_count * page_tokens * key_head_dim];
+        let mut value_data = vec![0.0f32; page_count * page_tokens * value_head_dim];
+        for slot in 0..page_count * page_tokens {
+            key_data[slot * key_head_dim] = ((slot % 17) as f32 - 8.0) / 9.0;
+            key_data[slot * key_head_dim + 1] = ((slot % 13) as f32 - 6.0) / 7.0;
+            for dim in 0..value_head_dim {
+                value_data[slot * value_head_dim + dim] =
+                    ((slot * (dim + 3) % 29) as f32 - 14.0) / 11.0;
+            }
+        }
+        let mut metadata = Vec::with_capacity(4 + page_count);
+        metadata.extend([0, 1, context_len as u32, first_page_offset as u32]);
+        metadata.extend((0..page_count).map(|page| page as u32));
+
+        for dtype in [DType::F32, DType::F16] {
+            let queries =
+                Tensor::from_vec(query_data.clone(), (1, num_heads, key_head_dim), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+            let keys = Tensor::from_vec(
+                key_data.clone(),
+                (page_count, page_tokens, 1, key_head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let values = Tensor::from_vec(
+                value_data.clone(),
+                (page_count, page_tokens, 1, value_head_dim),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let actual = paged_prefill_attention(
+                &queries,
+                &keys,
+                &values,
+                metadata.clone(),
+                1,
+                1,
+                num_heads,
+                1,
+                page_tokens,
+                page_count,
+                key_head_dim,
+                value_head_dim,
+                0.5,
+                Some(0.8),
+                None,
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let queries = queries
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let keys = keys
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let values = values
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut expected = Vec::with_capacity(num_heads * value_head_dim);
+            for head in 0..num_heads {
+                let q_base = head * key_head_dim;
+                let mut scores = Vec::with_capacity(context_len);
+                let mut max_score = f32::NEG_INFINITY;
+                for token in 0..context_len {
+                    let slot = first_page_offset + token;
+                    let k_base = slot * key_head_dim;
+                    let raw_score = (0..key_head_dim)
+                        .map(|dim| queries[q_base + dim] * keys[k_base + dim])
+                        .sum::<f32>()
+                        * 0.5;
+                    let score = 0.8 * (raw_score / 0.8).tanh();
+                    max_score = max_score.max(score);
+                    scores.push(score);
+                }
+                let denominator = scores
+                    .iter()
+                    .map(|score| (*score - max_score).exp())
+                    .sum::<f32>();
+                for dim in 0..value_head_dim {
+                    let value = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(token, score)| {
+                            let slot = first_page_offset + token;
+                            ((*score - max_score).exp() / denominator)
+                                * values[slot * value_head_dim + dim]
+                        })
+                        .sum::<f32>();
+                    expected.push(value);
+                }
+            }
+            let tolerance = if dtype == DType::F16 { 4e-3 } else { 5e-5 };
+            assert_f32_close(&actual, &expected, tolerance, "split packed paged prefill");
         }
     }
 
