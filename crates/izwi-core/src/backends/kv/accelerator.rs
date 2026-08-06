@@ -63,6 +63,29 @@ pub const fn candle_accelerator_kv_support(backend: BackendKind) -> CandleAccele
     }
 }
 
+/// Return whether Candle FlashAttention can consume this physical paged layout.
+///
+/// Keep every runtime call site on this predicate. In particular, Candle's
+/// paged FA2 binding rejects head dimensions that are not multiples of eight;
+/// those otherwise-valid arenas must use izwi's native paged kernel instead.
+#[allow(dead_code)]
+fn cuda_flash_paged_attention_eligible(
+    dtype: DType,
+    page_tokens: u32,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    all_first_page_offsets_zero: bool,
+) -> bool {
+    matches!(dtype, DType::F16 | DType::BF16)
+        && page_tokens != 0
+        && page_tokens % 32 == 0
+        && all_first_page_offsets_zero
+        && key_head_dim == value_head_dim
+        && key_head_dim != 0
+        && key_head_dim <= 512
+        && key_head_dim % 8 == 0
+}
+
 #[derive(Debug)]
 struct AcceleratorFence {
     timeline: Arc<AcceleratorFenceTimeline>,
@@ -744,10 +767,13 @@ impl CandleAcceleratorKvArena {
         let (table, seqlens_k, first_page_offsets, max_blocks, _max_context) =
             self.lower_decode_tables(args.batch)?;
         #[cfg(feature = "flash-attn")]
-        if matches!(self.config.dtype, DType::F16 | DType::BF16)
-            && self.config.page_tokens % 32 == 0
-            && first_page_offsets.iter().all(|offset| *offset == 0)
-        {
+        if cuda_flash_paged_attention_eligible(
+            self.config.dtype,
+            self.config.page_tokens,
+            layer.key_head_dim,
+            layer.value_head_dim,
+            first_page_offsets.iter().all(|offset| *offset == 0),
+        ) {
             let (seqlens_q, seqlens_k, block_table) = self.cached_decode_device_metadata(
                 args.batch,
                 &seqlens_k,
@@ -1044,12 +1070,13 @@ impl KvArena for CandleAcceleratorKvArena {
 
         #[cfg(all(feature = "cuda", feature = "flash-attn"))]
         if self.backend == BackendKind::Cuda
-            && matches!(self.config.dtype, DType::F16 | DType::BF16)
-            && self.config.page_tokens % 32 == 0
-            && lowered.all_first_page_offsets_zero
-            && layer.key_head_dim == layer.value_head_dim
-            && layer.key_head_dim <= 512
-            && layer.key_head_dim % 8 == 0
+            && cuda_flash_paged_attention_eligible(
+                self.config.dtype,
+                self.config.page_tokens,
+                layer.key_head_dim,
+                layer.value_head_dim,
+                lowered.all_first_page_offsets_zero,
+            )
         {
             let _guard = self.mutation_lock.lock().map_err(|_| {
                 Error::InferenceError("accelerator KV mutation lock was poisoned".into())
@@ -1481,6 +1508,41 @@ mod tests {
         let cuda = candle_accelerator_kv_support(BackendKind::Cuda);
         assert_eq!(cuda.direct_paged_attention, cfg!(feature = "cuda"));
         assert_eq!(cuda.is_complete(), cfg!(feature = "cuda"));
+    }
+
+    #[test]
+    fn cuda_flash_paged_attention_eligibility_matches_fa2_shape_contract() {
+        assert!(cuda_flash_paged_attention_eligible(
+            DType::F16,
+            32,
+            64,
+            64,
+            true,
+        ));
+        assert!(cuda_flash_paged_attention_eligible(
+            DType::BF16,
+            64,
+            512,
+            512,
+            true,
+        ));
+
+        for (dtype, page_tokens, key_dim, value_dim, offsets_zero) in [
+            (DType::F32, 32, 64, 64, true),
+            (DType::F16, 16, 64, 64, true),
+            (DType::F16, 32, 4, 4, true),
+            (DType::F16, 32, 513, 513, true),
+            (DType::F16, 32, 64, 32, true),
+            (DType::F16, 32, 64, 64, false),
+        ] {
+            assert!(!cuda_flash_paged_attention_eligible(
+                dtype,
+                page_tokens,
+                key_dim,
+                value_dim,
+                offsets_zero,
+            ));
+        }
     }
 
     #[test]

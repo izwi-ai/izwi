@@ -260,7 +260,74 @@ pub fn try_tiled_deltanet_recurrence(
     Some((Tensor::cat(&output_refs, 1).ok()?, state))
 }
 
-pub fn paged_decode_attention(
+fn validate_cuda_paged_decode_metadata(
+    metadata: &[u32],
+    batch: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    capacity_pages: usize,
+) -> candle_core::Result<()> {
+    let expected_metadata = batch
+        .checked_mul(2_usize.checked_add(max_blocks).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?;
+    if metadata.len() != expected_metadata {
+        candle_core::bail!(
+            "CUDA paged decode metadata has {} entries, expected {expected_metadata}",
+            metadata.len()
+        )
+    }
+    if batch == 0 || page_tokens == 0 || max_blocks == 0 || capacity_pages == 0 {
+        candle_core::bail!("CUDA paged decode metadata has invalid empty geometry")
+    }
+
+    let table_start = batch.checked_mul(2).ok_or_else(|| {
+        candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+    })?;
+    for row in 0..batch {
+        let context_len = metadata[row] as usize;
+        let first_page_offset = metadata[batch + row] as usize;
+        if context_len == 0 || first_page_offset >= page_tokens {
+            candle_core::bail!("CUDA paged decode metadata row {row} has an invalid context")
+        }
+        let physical_tokens = context_len.checked_add(first_page_offset).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode context overflow".to_string())
+        })?;
+        if physical_tokens > u32::MAX as usize {
+            candle_core::bail!(
+                "CUDA paged decode metadata row {row} exceeds the unsigned 32-bit token index ABI"
+            )
+        }
+        let required_pages = physical_tokens.div_ceil(page_tokens);
+        if required_pages == 0 || required_pages > max_blocks {
+            candle_core::bail!("CUDA paged decode metadata row {row} has an incomplete block table")
+        }
+        let row_start = table_start
+            .checked_add(row.checked_mul(max_blocks).ok_or_else(|| {
+                candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+            })?)
+            .ok_or_else(|| {
+                candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+            })?;
+        let row_end = row_start.checked_add(required_pages).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?;
+        if metadata[row_start..row_end]
+            .iter()
+            .any(|&page| page as usize >= capacity_pages)
+        {
+            candle_core::bail!(
+                "CUDA paged decode metadata row {row} contains an out-of-bounds physical page"
+            )
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn paged_decode_attention(
     queries: &Tensor,
     keys: &Tensor,
     values: &Tensor,
@@ -308,18 +375,27 @@ pub fn paged_decode_attention(
     {
         candle_core::bail!("CUDA paged decode received invalid tensor or attention geometry")
     }
-    let expected_metadata = batch
-        .checked_mul(2_usize.checked_add(max_blocks).ok_or_else(|| {
-            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
-        })?)
-        .ok_or_else(|| {
-            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
-        })?;
-    if metadata.len() != expected_metadata {
-        candle_core::bail!(
-            "CUDA paged decode metadata has {} entries, expected {expected_metadata}",
-            metadata.len()
-        )
+    let capacity_pages = keys.dims()[0];
+    validate_cuda_paged_decode_metadata(&metadata, batch, page_tokens, max_blocks, capacity_pages)?;
+    let kernel_geometry = [
+        batch,
+        query_heads,
+        kv_heads,
+        page_tokens,
+        max_blocks,
+        key_dim,
+        value_dim,
+        capacity_pages,
+        metadata.len(),
+        queries.elem_count(),
+        keys.elem_count(),
+        values.elem_count(),
+    ];
+    if kernel_geometry
+        .iter()
+        .any(|&value| value > i32::MAX as usize)
+    {
+        candle_core::bail!("CUDA paged decode exceeds the signed 32-bit kernel index ABI")
     }
     queries.contiguous()?.apply_op3_no_bwd(
         &keys.contiguous()?,
@@ -333,6 +409,7 @@ pub fn paged_decode_attention(
             max_blocks,
             key_dim,
             value_dim,
+            capacity_pages,
             softmax_scale,
             softcap,
         },
@@ -677,6 +754,7 @@ struct CudaPagedDecodeOp {
     max_blocks: usize,
     key_dim: usize,
     value_dim: usize,
+    capacity_pages: usize,
     softmax_scale: f32,
     softcap: Option<f32>,
 }
@@ -889,6 +967,7 @@ impl CustomOp3 for CudaPagedDecodeOp {
                     self.max_blocks as i32,
                     self.key_dim as i32,
                     self.value_dim as i32,
+                    self.capacity_pages as i32,
                     self.softmax_scale,
                     self.softcap.unwrap_or(0.0)
                 );
@@ -946,6 +1025,37 @@ mod tests {
         assert!(try_fused_l2_norm(&lhs, 1e-6).is_none());
         assert!(try_fused_rms_norm(&lhs, &rhs, 1e-6).is_none());
         assert!(try_fused_gated_rms_norm(&lhs, &rhs, &rhs, 1e-6).is_none());
+    }
+
+    #[test]
+    fn cuda_paged_decode_metadata_validation_rejects_unsafe_tables() {
+        // Layout: contexts, first-page offsets, then two padded table rows.
+        let valid = vec![5, 3, 1, 0, 0, 1, 2, u32::MAX];
+        validate_cuda_paged_decode_metadata(&valid, 2, 4, 2, 3).unwrap();
+
+        let mut zero_context = valid.clone();
+        zero_context[0] = 0;
+        assert!(validate_cuda_paged_decode_metadata(&zero_context, 2, 4, 2, 3).is_err());
+
+        let mut invalid_offset = valid.clone();
+        invalid_offset[2] = 4;
+        assert!(validate_cuda_paged_decode_metadata(&invalid_offset, 2, 4, 2, 3).is_err());
+
+        let wrapping_context = vec![u32::MAX, 1, 0];
+        assert!(
+            validate_cuda_paged_decode_metadata(&wrapping_context, 1, usize::MAX, 1, 1,).is_err()
+        );
+
+        let mut incomplete_table = valid.clone();
+        incomplete_table[0] = 8;
+        assert!(validate_cuda_paged_decode_metadata(&incomplete_table, 2, 4, 2, 3).is_err());
+
+        let mut out_of_bounds_page = valid.clone();
+        out_of_bounds_page[5] = 3;
+        assert!(validate_cuda_paged_decode_metadata(&out_of_bounds_page, 2, 4, 2, 3).is_err());
+
+        assert!(validate_cuda_paged_decode_metadata(&valid[..7], 2, 4, 2, 3).is_err());
+        assert!(validate_cuda_paged_decode_metadata(&[], usize::MAX, 1, usize::MAX, 1).is_err());
     }
 
     #[cfg(feature = "cuda")]

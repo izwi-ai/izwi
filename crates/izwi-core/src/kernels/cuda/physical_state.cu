@@ -61,6 +61,7 @@ __device__ void izwi_paged_decode_attention(
     int max_blocks,
     int key_dim,
     int value_dim,
+    int capacity_pages,
     float softmax_scale,
     float softcap) {
   const int row_head = blockIdx.x;
@@ -75,6 +76,45 @@ __device__ void izwi_paged_decode_attention(
   const unsigned int first_page_offset = metadata[batch + row];
   const unsigned int* block_table = metadata + batch * 2;
   const int query_base = row_head * key_dim;
+  const int output_base = row_head * value_dim;
+
+  // Leave a deterministic result if a future caller bypasses host-side plan
+  // validation. Every condition below is uniform across the thread block.
+  bool metadata_valid = page_tokens > 0 && max_blocks > 0 &&
+                        capacity_pages > 0 && context_len > 0;
+  unsigned long long required_pages = 0;
+  if (metadata_valid) {
+    metadata_valid =
+        first_page_offset < static_cast<unsigned int>(page_tokens);
+    const unsigned long long physical_tokens =
+        static_cast<unsigned long long>(context_len) + first_page_offset;
+    required_pages =
+        (physical_tokens + static_cast<unsigned long long>(page_tokens) - 1) /
+        static_cast<unsigned long long>(page_tokens);
+    metadata_valid = metadata_valid && required_pages > 0 &&
+                     required_pages <=
+                         static_cast<unsigned long long>(max_blocks);
+  }
+  if (metadata_valid) {
+    for (unsigned long long logical_page = 0; logical_page < required_pages;
+         ++logical_page) {
+      if (block_table[row * max_blocks + logical_page] >=
+          static_cast<unsigned int>(capacity_pages)) {
+        metadata_valid = false;
+        break;
+      }
+    }
+  }
+  if (!metadata_valid) {
+    if (threadIdx.x < value_dim) {
+      output[output_base + threadIdx.x] = izwi_from_float<T>(0.0f);
+    }
+    const int second_output_dim = threadIdx.x + blockDim.x;
+    if (second_output_dim < value_dim) {
+      output[output_base + second_output_dim] = izwi_from_float<T>(0.0f);
+    }
+    return;
+  }
 
   extern __shared__ float reduction[];
   float output_0 = 0.0f;
@@ -146,7 +186,6 @@ __device__ void izwi_paged_decode_attention(
     running_max = reduction[3];
   }
 
-  const int output_base = row_head * value_dim;
   if (threadIdx.x < value_dim) {
     output[output_base + threadIdx.x] =
         izwi_from_float<T>(output_0 / running_sum);
@@ -171,11 +210,13 @@ extern "C" __global__ void physical_paged_decode_f32(
     int max_blocks,
     int key_dim,
     int value_dim,
+    int capacity_pages,
     float softmax_scale,
     float softcap) {
   izwi_paged_decode_attention(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
-      page_tokens, max_blocks, key_dim, value_dim, softmax_scale, softcap);
+      page_tokens, max_blocks, key_dim, value_dim, capacity_pages,
+      softmax_scale, softcap);
 }
 
 extern "C" __global__ void physical_paged_decode_f16(
@@ -191,11 +232,13 @@ extern "C" __global__ void physical_paged_decode_f16(
     int max_blocks,
     int key_dim,
     int value_dim,
+    int capacity_pages,
     float softmax_scale,
     float softcap) {
   izwi_paged_decode_attention(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
-      page_tokens, max_blocks, key_dim, value_dim, softmax_scale, softcap);
+      page_tokens, max_blocks, key_dim, value_dim, capacity_pages,
+      softmax_scale, softcap);
 }
 
 extern "C" __global__ void physical_paged_decode_bf16(
@@ -211,11 +254,13 @@ extern "C" __global__ void physical_paged_decode_bf16(
     int max_blocks,
     int key_dim,
     int value_dim,
+    int capacity_pages,
     float softmax_scale,
     float softcap) {
   izwi_paged_decode_attention(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
-      page_tokens, max_blocks, key_dim, value_dim, softmax_scale, softcap);
+      page_tokens, max_blocks, key_dim, value_dim, capacity_pages,
+      softmax_scale, softcap);
 }
 
 // Consume a physical circular ShortConv ring directly. The ring layout is
