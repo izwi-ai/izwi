@@ -631,6 +631,16 @@ impl EngineCore {
                         "Unexecuted plan rollback found a mismatched session fence"
                     );
                 }
+                if !self
+                    .scheduler
+                    .refund_unexecuted_service(&session, scheduled.num_tokens)
+                {
+                    warn!(
+                        plan_id = scheduled.plan_id,
+                        request_id = %scheduled.request_id,
+                        "Scheduler rejected unexecuted weighted-service refund"
+                    );
+                }
             }
             if let Some(tracker) = self.execution_trackers.get_mut(&scheduled.request_id) {
                 if tracker.session() == &session {
@@ -1132,6 +1142,7 @@ impl EngineCore {
         &mut self,
         requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
+        capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
     ) -> Result<Vec<PreparedExecutionBatch>> {
         let available = requests
             .iter()
@@ -1173,19 +1184,29 @@ impl EngineCore {
                     stage.output_visibility
                 });
             let planned_work = plan.work.clone();
-            let managed_cache = request
-                .managed_cache_runtime()
-                .map(|runtime| {
-                    self.managed_kv_cache.prepare(
-                        runtime,
-                        plan.plan_id,
-                        &plan.session,
-                        &planned_work,
-                        Some(&request),
-                    )
-                })
-                .transpose()?
-                .flatten();
+            let managed_cache = match request.managed_cache_runtime().map(|runtime| {
+                self.managed_kv_cache.prepare(
+                    runtime,
+                    plan.plan_id,
+                    &plan.session,
+                    &planned_work,
+                    Some(&request),
+                )
+            }) {
+                Some(Ok(reservation)) => reservation,
+                None => None,
+                Some(Err(Error::Backpressure(reason))) => {
+                    capacity_blocked.push(scheduled.clone());
+                    debug!(
+                        request_id = %scheduled.request_id,
+                        plan_id = scheduled.plan_id,
+                        reason = %reason,
+                        "Withholding only the row blocked by managed KV capacity"
+                    );
+                    continue;
+                }
+                Some(Err(error)) => return Err(error),
+            };
             if let Some(reservation) = managed_cache.as_ref() {
                 if self
                     .active_managed_cache
@@ -2094,7 +2115,12 @@ impl EngineCore {
             return Ok(None);
         }
 
-        let decode_batches = match self.form_physical_batches(&decode_requests, &decode_scheduled) {
+        let mut capacity_blocked = Vec::new();
+        let decode_batches = match self.form_physical_batches(
+            &decode_requests,
+            &decode_scheduled,
+            &mut capacity_blocked,
+        ) {
             Ok(batches) => batches,
             Err(Error::Backpressure(reason)) => {
                 self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
@@ -2106,19 +2132,29 @@ impl EngineCore {
                 return Err(error);
             }
         };
-        let prefill_batches =
-            match self.form_physical_batches(&prefill_requests, &prefill_scheduled) {
-                Ok(batches) => batches,
-                Err(Error::Backpressure(reason)) => {
-                    self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
-                    debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
-                    return Ok(None);
-                }
-                Err(error) => {
-                    self.rollback_unexecuted_schedule(&all_scheduled);
-                    return Err(error);
-                }
-            };
+        let prefill_batches = match self.form_physical_batches(
+            &prefill_requests,
+            &prefill_scheduled,
+            &mut capacity_blocked,
+        ) {
+            Ok(batches) => batches,
+            Err(Error::Backpressure(reason)) => {
+                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                return Ok(None);
+            }
+            Err(error) => {
+                self.rollback_unexecuted_schedule(&all_scheduled);
+                return Err(error);
+            }
+        };
+        self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
+        if decode_batches.is_empty()
+            && prefill_batches.is_empty()
+            && self.pending_terminal_outputs.is_empty()
+        {
+            return Ok(None);
+        }
 
         Ok(Some(PreparedEngineStep::new(
             self.executor.clone(),
@@ -4280,7 +4316,9 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let joined = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let joined = core
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].physical_batch().rows.len(), 2);
         assert_eq!(
@@ -4303,7 +4341,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .model_instance_id = super::super::ModelInstanceId::new(9);
-        let split = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let split = core
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .unwrap();
         assert_eq!(split.len(), 2);
         assert!(split
             .iter()
@@ -4438,7 +4478,9 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let batches = core
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .unwrap();
         let widths = batches
             .iter()
             .map(|batch| batch.physical_batch().rows.len())
@@ -4536,7 +4578,9 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let batches = core
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .unwrap();
         assert_eq!(batches.len(), 2);
         assert!(batches
             .iter()
@@ -4625,7 +4669,9 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
-        let batches = core.form_physical_batches(&requests, &scheduled).unwrap();
+        let batches = core
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(
             batches[0].physical_batch().mode,
@@ -5509,6 +5555,161 @@ mod tests {
             )
             .expect("waiter committed table");
         assert_eq!(snapshot.committed_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn managed_kv_backpressure_defers_only_the_blocked_row() {
+        let blocked_model = ModelInstanceId::new(93);
+        let runnable_model = ModelInstanceId::new(94);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+
+        let owner = managed_test_request(
+            &mut core,
+            blocked_model,
+            "isolated-capacity-owner",
+            vec![1, 2, 3, 4],
+        );
+        core.add_request(owner).expect("add capacity owner");
+        core.step().await.expect("commit capacity owner");
+        core.scheduler
+            .finish_request(&"isolated-capacity-owner".to_string());
+
+        let blocked = managed_test_request(
+            &mut core,
+            blocked_model,
+            "isolated-capacity-blocked",
+            vec![5, 6, 7, 8],
+        );
+        let runnable = managed_test_request(
+            &mut core,
+            runnable_model,
+            "isolated-capacity-runnable",
+            vec![9, 10, 11, 12],
+        );
+        core.add_request(blocked).expect("add blocked row");
+        core.add_request(runnable).expect("add runnable row");
+
+        core.step().await.expect("execute independent runnable row");
+        let runnable_session = core
+            .get_session_key(&"isolated-capacity-runnable".to_string())
+            .expect("runnable session");
+        assert!(core
+            .managed_kv_cache
+            .snapshot(
+                runnable_model,
+                &runnable_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .is_some());
+        let blocked_session = core
+            .get_session_key(&"isolated-capacity-blocked".to_string())
+            .expect("blocked session");
+        let blocked_snapshot = core
+            .managed_kv_cache
+            .snapshot(
+                blocked_model,
+                &blocked_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .expect("blocked row owns an empty logical table");
+        assert_eq!(blocked_snapshot.committed_tokens, 0);
+        assert!(core
+            .active_plans
+            .values()
+            .all(|plan| plan.session != blocked_session));
+    }
+
+    #[tokio::test]
+    async fn blocked_prefill_does_not_discard_an_already_prepared_decode() {
+        let saturated_model = ModelInstanceId::new(95);
+        let decode_model = ModelInstanceId::new(96);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+
+        let owner = managed_test_request(
+            &mut core,
+            saturated_model,
+            "decode-isolation-owner",
+            vec![1, 2, 3, 4],
+        );
+        let decoder = managed_test_request(
+            &mut core,
+            decode_model,
+            "decode-isolation-runnable",
+            vec![5, 6, 7, 8],
+        );
+        core.add_request(owner).expect("add capacity owner");
+        core.add_request(decoder).expect("add decoder");
+        core.step().await.expect("commit both prefills");
+        core.scheduler
+            .finish_request(&"decode-isolation-owner".to_string());
+
+        let blocked = managed_test_request(
+            &mut core,
+            saturated_model,
+            "decode-isolation-blocked",
+            vec![9, 10, 11, 12],
+        );
+        core.add_request(blocked).expect("add blocked prefill");
+        core.step()
+            .await
+            .expect("commit decode despite later blocked prefill");
+
+        let decode_session = core
+            .get_session_key(&"decode-isolation-runnable".to_string())
+            .expect("decode session");
+        assert_eq!(
+            core.managed_kv_cache
+                .snapshot(
+                    decode_model,
+                    &decode_session,
+                    crate::kv::CacheDomainId::new(1),
+                )
+                .expect("decode snapshot")
+                .committed_tokens,
+            5
+        );
+        let blocked_session = core
+            .get_session_key(&"decode-isolation-blocked".to_string())
+            .expect("blocked session");
+        assert_eq!(
+            core.managed_kv_cache
+                .snapshot(
+                    saturated_model,
+                    &blocked_session,
+                    crate::kv::CacheDomainId::new(1),
+                )
+                .expect("blocked logical table")
+                .committed_tokens,
+            0
+        );
     }
 
     #[test]

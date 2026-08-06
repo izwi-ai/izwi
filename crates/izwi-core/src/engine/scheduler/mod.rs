@@ -1023,6 +1023,32 @@ impl Scheduler {
         true
     }
 
+    /// Remove service charged when a scheduled quantum never reached
+    /// execution. The engine calls this exactly once while removing the
+    /// corresponding active plan, so capacity retries cannot lose weighted
+    /// fair-share merely by being selected.
+    pub(crate) fn refund_unexecuted_service(
+        &mut self,
+        session: &SessionKey,
+        scheduled_tokens: usize,
+    ) -> bool {
+        if self.config.policy != SchedulingPolicy::WeightedFair {
+            return true;
+        }
+        let Some(metadata) = self.requests.get(&session.request_id) else {
+            return false;
+        };
+        if metadata.sequence_id != session.epoch {
+            return false;
+        }
+        let service = self
+            .class_service
+            .entry(metadata.workload_class)
+            .or_default();
+        *service = service.saturating_sub(scheduled_tokens.max(1) as u64);
+        true
+    }
+
     /// Defer the next execution quantum for an exact session. This clears an
     /// uncommitted prefill marker without changing committed progress.
     pub(crate) fn defer_execution_retry(
@@ -2052,6 +2078,37 @@ mod tests {
         assert_eq!(retry.prefill_requests[0].session_key(), session);
         assert_eq!(retry.prefill_requests[0].num_computed_tokens, 0);
         assert_eq!(retry.prefill_requests[0].num_tokens, 8);
+    }
+
+    #[test]
+    fn unexecuted_quantum_refunds_weighted_service_before_retry() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            policy: SchedulingPolicy::WeightedFair,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let request_id = "capacity-service-refund".to_string();
+        let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        request.prompt_tokens = vec![1; 8];
+        request.workload_class = WorkloadClass::Background;
+        scheduler.add_request(&request);
+
+        let scheduled = scheduler.schedule();
+        let quantum = &scheduled.prefill_requests[0];
+        let session = quantum.session_key();
+        let tokens = quantum.num_tokens;
+        assert_eq!(
+            scheduler.class_service[&WorkloadClass::Background],
+            tokens as u64
+        );
+        assert!(scheduler.refund_unexecuted_service(&session, tokens));
+        assert_eq!(scheduler.class_service[&WorkloadClass::Background], 0);
+
+        let stale = SessionKey::new(request_id, session.epoch.saturating_add(1));
+        assert!(!scheduler.refund_unexecuted_service(&stale, tokens));
+        assert_eq!(scheduler.class_service[&WorkloadClass::Background], 0);
     }
 
     #[test]
