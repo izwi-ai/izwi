@@ -5,9 +5,12 @@ loading a model. Its default matrix covers:
 
 - default features on CPU, plus Metal/CUDA feature lanes when a compatible
   host device is detected;
-- 16- and 32-token physical pages;
+- 16-, 32-, and 64-token physical pages;
+- F32/F16/BF16 CPU reference cells and backend-supported accelerator dtypes;
 - ragged short contexts and configurable long contexts;
-- paged prefill, paged decode, page copy, page zero, and slot writes.
+- paged prefill and decode compared numerically with the CPU provider;
+- readback-validated slot writes, page copy cycles, and page zeroing;
+- offset/window/softcap and MQA shape coverage in each backend lane.
 
 Run the supported matrix and save its JSON Lines output:
 
@@ -21,13 +24,14 @@ Run a single lane or reduce the iteration count during development:
 scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 3 --warmup 1
 ```
 
-The harness synchronizes after every measured operation. Reported latency is
+The harness certifies correctness before reporting a timing. It synchronizes
+after every measured operation. Reported latency is
 therefore dispatch-to-completion latency at the arena boundary, not an
-end-to-end model latency or throughput result. Dispatch counts come from the
-arena's monotonic operation counters. The ABI currently has no dedicated
-prefill counter: fused accelerator prefill advances the paged-decode counter,
-while CPU prefill reports zero dispatches. Preserve that distinction when
-comparing paths.
+end-to-end model latency or throughput result. JSONL records include the
+observed attention provider, correctness error/tolerance, dispatches, resident
+plan cache/upload counters, backing allocations, and host synchronizations.
+Unavailable workspace, RSS, and VRAM measurements are encoded as JSON `null`;
+they are never inferred from the selected feature or page size.
 
 Unsupported accelerator lanes emit `status: "unsupported"` records and are not
 compiled or presented as measurements. A visible accelerator can still reject
@@ -35,13 +39,22 @@ a case at runtime; that produces `status: "failed"` and a non-zero matrix exit.
 The runner deliberately does not infer CUDA availability from feature
 compilation alone.
 
+Designated hardware jobs must pass `--require-device`. In that mode a missing
+device or any benchmark-level `unsupported` record fails the lane:
+
+```bash
+scripts/bench/run_kv_cache_matrix.sh --lane cuda --require-device \
+  --iterations 30 --warmup 5 --output target/kv-cache-cuda-certification.jsonl
+```
+
 The CUDA lane builds with `--features flash-attn` (which implies `cuda`) and
-uses F16 tensors. Its zero-offset page-32 cases are eligible for Candle FA2;
-page-16 cases exercise Izwi's native CUDA fallback. Each measurement records
-the intended `kernel_path`. Treat this as a long-running, nightly production
-certification lane: the first CUDA/FA2 build can be substantial and requires a
-compatible CUDA toolchain as well as a device. This script does not claim or
-substitute CUDA measurements on hosts lacking either prerequisite.
+exercises both the portable kill switch and enabled optimized rollout with F16
+and BF16. Provider attribution comes from the arena after execution, so native
+fallback is visible instead of being guessed from CLI arguments. Treat this as
+a long-running production certification lane: the first CUDA/FA2 build can be
+substantial and requires a compatible CUDA toolchain as well as a device. This
+script does not claim or substitute CUDA measurements on hosts lacking either
+prerequisite.
 
 Validate argument routing and capability classification without compiling:
 

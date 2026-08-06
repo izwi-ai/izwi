@@ -13,6 +13,7 @@ Options:
   --warmup N                    Warmup iterations per case (default: 2)
   --long-context N              Maximum context for long cases (default: 1024)
   --output PATH                 Also write JSON Lines to PATH
+  --require-device             Fail instead of skipping a requested hardware lane
   --dry-run                     Print commands/capability decisions only
   -h, --help                    Show this help
 
@@ -33,6 +34,7 @@ warmup=2
 long_context=1024
 output=
 dry_run=0
+require_device=0
 
 while (($#)); do
   case "$1" in
@@ -58,6 +60,10 @@ while (($#)); do
       ;;
     --dry-run)
       dry_run=1
+      shift
+      ;;
+    --require-device)
+      require_device=1
       shift
       ;;
     -h|--help)
@@ -100,11 +106,12 @@ emit_skip() {
   local backend=$1
   local reason=$2
   local page profile
-  for page in 16 32; do
+  for page in 16 32 64; do
     for profile in ragged long; do
-      write_record "{\"schema\":\"izwi.kv-cache-matrix.v1\",\"status\":\"unsupported\",\"backend\":\"$backend\",\"page_tokens\":$page,\"profile\":\"$profile\",\"reason\":\"$reason\"}"
+      write_record "{\"schema\":\"izwi.kv-cache-matrix.v2\",\"status\":\"unsupported\",\"backend\":\"$backend\",\"page_tokens\":$page,\"profile\":\"$profile\",\"reason\":\"$reason\"}"
     done
   done
+  ((require_device == 0))
 }
 
 run_case() {
@@ -112,6 +119,9 @@ run_case() {
   local feature=$2
   local page=$3
   local profile=$4
+  local dtype=$5
+  local provider=$6
+  shift 6
   local -a command=(cargo run --locked --quiet -p izwi-core)
   if [[ -n "$feature" ]]; then
     command+=(--features "$feature")
@@ -120,9 +130,11 @@ run_case() {
     --backend "$backend"
     --page-tokens "$page"
     --profile "$profile"
+    --dtype "$dtype"
+    --provider "$provider"
     --iterations "$iterations"
     --warmup "$warmup"
-    --long-context "$long_context")
+    --long-context "$long_context" "$@")
 
   if ((dry_run)); then
     printf 'DRY-RUN'
@@ -133,7 +145,12 @@ run_case() {
 
   local result
   if ! result=$("${command[@]}"); then
-    write_record "{\"schema\":\"izwi.kv-cache-matrix.v1\",\"status\":\"failed\",\"backend\":\"$backend\",\"page_tokens\":$page,\"profile\":\"$profile\",\"reason\":\"benchmark command failed\"}"
+    write_record "{\"schema\":\"izwi.kv-cache-matrix.v2\",\"status\":\"failed\",\"backend\":\"$backend\",\"dtype\":\"$dtype\",\"page_tokens\":$page,\"profile\":\"$profile\",\"requested_provider\":\"$provider\",\"reason\":\"benchmark command failed\"}"
+    return 1
+  fi
+  if ((require_device)) && grep -q '"status":"unsupported"' <<<"$result"; then
+    printf '%s\n' "$result"
+    echo "error: required $backend device case was reported unsupported" >&2
     return 1
   fi
   while IFS= read -r record; do
@@ -144,13 +161,32 @@ run_case() {
 run_lane() {
   local backend=$1
   local feature=$2
-  local page profile
+  local dtypes=$3
+  local providers=$4
+  local page profile dtype provider
   local lane_failed=0
-  for page in 16 32; do
-    for profile in ragged long; do
-      run_case "$backend" "$feature" "$page" "$profile" || lane_failed=1
+  for dtype in $dtypes; do
+    for provider in $providers; do
+      for page in 16 32 64; do
+        # The optimized CUDA provider requires a page size divisible by 32.
+        # Keep page-16 in the portable corpus instead of accepting fallback
+        # while claiming an optimized certification cell.
+        if [[ "$provider" == optimized && "$page" == 16 ]]; then
+          continue
+        fi
+        for profile in ragged long; do
+          run_case "$backend" "$feature" "$page" "$profile" "$dtype" "$provider" \
+            || lane_failed=1
+        done
+      done
     done
   done
+  # One deliberately non-default semantic/shape cell prevents the broad matrix
+  # from accidentally certifying only zero-offset, full-context GQA.
+  run_case "$backend" "$feature" 64 long "${dtypes%% *}" "${providers%% *}" \
+    --first-page-offset 1 --window-tokens 128 --softcap 30 \
+    --query-heads 8 --kv-heads 1 --head-dim 80 --batch-size 3 --context-len 257 \
+    || lane_failed=1
   return "$lane_failed"
 }
 
@@ -160,14 +196,14 @@ cuda_device=${IZWI_KV_MATRIX_CUDA_DEVICE:-auto}
 failed=0
 
 if [[ "$lane" == all || "$lane" == default ]]; then
-  run_lane cpu "" || failed=1
+  run_lane cpu "" "f32 f16 bf16" "portable" || failed=1
 fi
 
 if [[ "$lane" == all || "$lane" == metal ]]; then
   if [[ "$metal_device" == 0 || ("$metal_device" == auto && "$host_os" != Darwin) ]]; then
-    emit_skip metal "Metal lane requires a macOS Metal device"
+    emit_skip metal "Metal lane requires a macOS Metal device" || failed=1
   else
-    run_lane metal metal || failed=1
+    run_lane metal metal "f32 f16" "portable" || failed=1
   fi
 fi
 
@@ -180,9 +216,9 @@ if [[ "$lane" == all || "$lane" == cuda ]]; then
     fi
   fi
   if [[ "$cuda_device" == 0 ]]; then
-    emit_skip cuda "CUDA lane requires a device visible to nvidia-smi"
+    emit_skip cuda "CUDA lane requires a device visible to nvidia-smi" || failed=1
   else
-    run_lane cuda flash-attn || failed=1
+    run_lane cuda flash-attn "f16 bf16" "portable optimized" || failed=1
   fi
 fi
 

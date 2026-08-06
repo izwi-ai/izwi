@@ -7,9 +7,12 @@ usage() {
 Usage: scripts/ci/check-backend-truth.sh <command>
 
 Commands:
+  hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
   cargo-metal   Run Metal-focused cargo checks and core scheduler regressions on macOS
   cargo-cuda    Run CUDA-focused checks, portable regressions, and a device smoke when available
+  cargo-cuda-device
+                Require NVIDIA hardware and run native/FA2 numerical certification
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
   docker-cuda   Validate the CUDA Docker Compose profile, build, and audit the CUDA image
   test-cuda-feature-mapping
@@ -352,8 +355,9 @@ run_cargo_cpu() {
 
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
-    run_core_scheduler_regressions
-    run_server_scheduler_regressions
+    cargo test --locked -p izwi-core --lib --tests
+    cargo test --locked -p izwi-server --lib
+    scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
 }
 
 run_cargo_metal() {
@@ -367,8 +371,31 @@ run_cargo_metal() {
     cargo check --locked -p izwi-core --features metal
     cargo check --locked -p izwi-cli --features metal
     cargo check --locked -p izwi-server
-    run_core_scheduler_regressions metal
-    run_server_scheduler_regressions
+    cargo test --locked -p izwi-core --features metal --lib --tests
+    cargo test --locked -p izwi-server --lib
+    scripts/bench/run_kv_cache_matrix.sh --lane metal --iterations 1 --warmup 0 --require-device
+}
+
+run_hygiene() {
+    require_command cargo
+
+    git diff --check
+    # The repository still has a documented, pre-existing workspace rustfmt
+    # backlog. Gate the production KV surface touched by this rollout without
+    # rewriting or silently grandfathering new drift in those files.
+    rustfmt --edition 2021 --check --config skip_children=true \
+        crates/izwi-core/src/backends/kv/mod.rs \
+        crates/izwi-core/src/backends/kv/cpu.rs \
+        crates/izwi-core/src/backends/kv/accelerator.rs \
+        crates/izwi-core/src/kernels/cuda.rs \
+        crates/izwi-core/src/kernels/metal.rs \
+        crates/izwi-core/src/runtime/rollout.rs \
+        crates/izwi-core/examples/kv-cache-bench.rs \
+        crates/izwi-core/tests/kv_public_compatibility.rs
+    cargo clippy --locked --workspace --all-targets -- -D warnings
+    cargo check --locked --workspace --all-targets
+    bash -n scripts/ci/*.sh scripts/bench/*.sh
+    scripts/bench/test-run-kv-cache-matrix.sh
 }
 
 run_cargo_cuda() {
@@ -403,6 +430,24 @@ run_cargo_cuda() {
         run_server_scheduler_regressions
     fi
     smoke_cuda_device_if_available "${wrapper_features}"
+}
+
+run_cargo_cuda_device() {
+    require_command cargo
+    require_command nvcc
+    if ! cuda_device_available; then
+        echo "CUDA hardware certification requires a device visible to nvidia-smi." >&2
+        exit 1
+    fi
+
+    IZWI_CUDA_FEATURES="cuda-base,cudnn-base" run_cargo_cuda
+    IZWI_CUDA_FEATURES="cuda,cudnn" run_cargo_cuda
+    scripts/bench/run_kv_cache_matrix.sh \
+        --lane cuda \
+        --iterations "${IZWI_KV_CERT_ITERATIONS:-30}" \
+        --warmup "${IZWI_KV_CERT_WARMUP:-5}" \
+        --require-device \
+        --output "${IZWI_KV_CERT_OUTPUT:-target/kv-cache-cuda-certification.jsonl}"
 }
 
 run_docker_cpu() {
@@ -444,6 +489,9 @@ main() {
     fi
 
     case "$1" in
+        hygiene)
+            run_hygiene
+            ;;
         cargo-cpu)
             run_cargo_cpu
             ;;
@@ -452,6 +500,9 @@ main() {
             ;;
         cargo-cuda)
             run_cargo_cuda
+            ;;
+        cargo-cuda-device)
+            run_cargo_cuda_device
             ;;
         docker-cpu)
             run_docker_cpu
