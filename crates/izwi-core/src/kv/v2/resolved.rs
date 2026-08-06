@@ -119,6 +119,11 @@ pub(crate) struct StateOperationSet {
     pub(crate) write: RegisteredOperationId,
     pub(crate) prefill: RegisteredOperationId,
     pub(crate) decode: RegisteredOperationId,
+    /// Resolved dispatch class for each stable operation ABI. This is kept
+    /// separate from the registry identity so an optimized implementation can
+    /// replace a portable one without inventing a new operation name.
+    #[serde(default)]
+    pub(crate) implementations: PagedOperationImplementationSet,
 }
 
 impl StateOperationSet {
@@ -126,6 +131,49 @@ impl StateOperationSet {
         self.write.validate()?;
         self.prefill.validate()?;
         self.decode.validate()
+    }
+}
+
+/// Implementation class selected for one paged-attention operation.
+///
+/// `Portable` remains a direct backend implementation with the same ABI and
+/// semantics; `Optimized` records that the selected backend has a specialized
+/// implementation for the resolved plan. Runtime fallback is not encoded by
+/// changing operation names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PagedOperationImplementation {
+    Portable,
+    Optimized,
+}
+
+impl Default for PagedOperationImplementation {
+    fn default() -> Self {
+        Self::Portable
+    }
+}
+
+/// Fingerprinted implementation plan for the three paged-attention ABIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct PagedOperationImplementationSet {
+    pub(crate) write: PagedOperationImplementation,
+    pub(crate) prefill: PagedOperationImplementation,
+    pub(crate) decode: PagedOperationImplementation,
+}
+
+impl PagedOperationImplementationSet {
+    pub(crate) const fn portable() -> Self {
+        Self {
+            write: PagedOperationImplementation::Portable,
+            prefill: PagedOperationImplementation::Portable,
+            decode: PagedOperationImplementation::Portable,
+        }
+    }
+}
+
+impl Default for PagedOperationImplementationSet {
+    fn default() -> Self {
+        Self::portable()
     }
 }
 
@@ -625,6 +673,7 @@ pub(crate) fn test_plan(contract: &InferenceStateContract) -> ResolvedStatePlan 
                     OperationAbi::new(1),
                 ),
                 decode: RegisteredOperationId::new("paged_attention_decode", OperationAbi::new(1)),
+                implementations: PagedOperationImplementationSet::portable(),
             },
         }],
         vec![],
@@ -672,6 +721,45 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn plan_fingerprint_tracks_paged_operation_implementation_class() {
+        let contract = test_contract();
+        let first = test_plan(&contract);
+        let mut changed_group = first.paged_attention[0].clone();
+        changed_group.operations.implementations.decode = PagedOperationImplementation::Optimized;
+
+        let changed = ResolvedStatePlan::build(
+            BackendKind::Cpu,
+            None,
+            &contract,
+            vec![changed_group],
+            vec![],
+            &TestOperationRegistry,
+        )
+        .unwrap();
+
+        assert_ne!(first.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn legacy_operation_set_defaults_to_portable_implementations() {
+        let operations: StateOperationSet = serde_json::from_value(serde_json::json!({
+            "write": { "name": "paged_kv_write", "abi": 1 },
+            "prefill": { "name": "paged_attention_prefill", "abi": 1 },
+            "decode": { "name": "paged_attention_decode", "abi": 1 }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            operations.implementations,
+            PagedOperationImplementationSet::portable()
+        );
+        assert_eq!(
+            serde_json::to_value(&operations).unwrap()["implementations"]["decode"],
+            "portable"
+        );
     }
 
     #[test]

@@ -33,9 +33,10 @@ pub(crate) use tensor::{
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    align_bytes, AppendStateOperationSet, CapacityStrategy, GroupResourceQuery,
+    align_bytes, AppendStateOperationSet, AttentionPattern, CapacityStrategy, GroupResourceQuery,
     InferenceStateContract, NonPagedStateOperationQuery, NonPagedStateOperationRegistry,
-    OperationAbi, PagedAttentionDomainSpec, PagedAttentionOperationQuery, PlacementPolicy,
+    OperationAbi, PagedAttentionDomainSpec, PagedAttentionOperationQuery,
+    PagedOperationImplementation, PagedOperationImplementationSet, PlacementPolicy,
     RegisteredOperationId, ResolvedAppendStatePlan, ResolvedCapacityDomain,
     ResolvedGroupResourceEnvelope, ResolvedNonPagedDomainPlan, ResolvedPagedAttentionGroup,
     ResolvedPlacement, ResolvedRingStatePlan, ResolvedStatePlan, ResolvedStaticAttentionPlan,
@@ -93,6 +94,62 @@ impl PagedOperationAvailability {
     }
 }
 
+/// Backend support for one stable paged-attention operation ABI.
+///
+/// Availability and implementation class are deliberately one capability:
+/// negotiation cannot accidentally claim an optimized path merely because a
+/// function with the right registry name exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PagedOperationCapability {
+    Unavailable,
+    Portable,
+    Optimized,
+}
+
+impl PagedOperationCapability {
+    const fn implementation(self) -> Option<PagedOperationImplementation> {
+        match self {
+            Self::Unavailable => None,
+            Self::Portable => Some(PagedOperationImplementation::Portable),
+            Self::Optimized => Some(PagedOperationImplementation::Optimized),
+        }
+    }
+}
+
+/// Backend capability matrix for the complete paged-attention operation set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PagedOperationCapabilities {
+    pub(crate) write: PagedOperationCapability,
+    pub(crate) prefill: PagedOperationCapability,
+    pub(crate) decode: PagedOperationCapability,
+}
+
+impl PagedOperationCapabilities {
+    const fn unavailable() -> Self {
+        Self {
+            write: PagedOperationCapability::Unavailable,
+            prefill: PagedOperationCapability::Unavailable,
+            decode: PagedOperationCapability::Unavailable,
+        }
+    }
+
+    const fn portable() -> Self {
+        Self {
+            write: PagedOperationCapability::Portable,
+            prefill: PagedOperationCapability::Portable,
+            decode: PagedOperationCapability::Portable,
+        }
+    }
+
+    fn implementation_plan(self) -> Option<PagedOperationImplementationSet> {
+        Some(PagedOperationImplementationSet {
+            write: self.write.implementation()?,
+            prefill: self.prefill.implementation()?,
+            decode: self.decode.implementation()?,
+        })
+    }
+}
+
 /// One model-neutral registry for the exact selected backend/device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StateBackendRegistry {
@@ -146,6 +203,20 @@ impl StateBackendRegistry {
         }
     }
 
+    pub(crate) fn paged_operation_capabilities(
+        self,
+        semantic: &PagedAttentionDomainSpec,
+        policy: ResolvedPagedPolicy,
+    ) -> PagedOperationCapabilities {
+        resolve_paged_operation_capabilities(
+            self.backend,
+            self.paged_backend_compiled(),
+            cfg!(feature = "flash-attn"),
+            semantic,
+            policy,
+        )
+    }
+
     const fn paged_backend_compiled(self) -> bool {
         match self.backend {
             BackendKind::Cpu => true,
@@ -173,7 +244,6 @@ impl StateBackendRegistry {
         if !self.validate_identity(query.backend, query.device_ordinal)
             || !self.paged_backend_compiled()
             || query.layout != StatePhysicalLayout::PageTokenHeadDim
-            || query.operations != &paged_operation_set()
             || query.layers.len() != query.semantic.layers.len()
         {
             return false;
@@ -188,10 +258,17 @@ impl StateBackendRegistry {
             },
         );
         expected.is_ok_and(|expected| {
+            let Some(implementations) = self
+                .paged_operation_capabilities(query.semantic, expected)
+                .implementation_plan()
+            else {
+                return false;
+            };
             expected.page_tokens == query.page_tokens
                 && expected.layout == query.layout
                 && expected.storage == query.storage
                 && expected.placement == query.placement
+                && query.operations == &paged_operation_set(implementations)
         })
     }
 }
@@ -351,6 +428,16 @@ pub(crate) fn negotiate_state_plan(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let bytes_per_page = paged_bytes_per_page(spec, policy)?;
+                let implementations = registry
+                    .paged_operation_capabilities(spec, policy)
+                    .implementation_plan()
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "backend {:?} cannot attest a complete paged state operation set; missing {}",
+                            request.backend,
+                            registry.paged_operation_availability().missing().join(", ")
+                        ))
+                    })?;
                 let resolved = ResolvedPagedAttentionGroup {
                     group: group.id,
                     domain: spec.header.id,
@@ -360,7 +447,7 @@ pub(crate) fn negotiate_state_plan(
                     storage: policy.storage,
                     placement: policy.placement,
                     layers,
-                    operations: paged_operation_set(),
+                    operations: paged_operation_set(implementations),
                 };
                 let query = PagedAttentionOperationQuery {
                     backend: request.backend,
@@ -706,11 +793,51 @@ pub(crate) fn resolve_paged_policy(
     })
 }
 
-fn paged_operation_set() -> StateOperationSet {
+fn resolve_paged_operation_capabilities(
+    backend: BackendKind,
+    backend_compiled: bool,
+    cuda_flash_attention_compiled: bool,
+    semantic: &PagedAttentionDomainSpec,
+    policy: ResolvedPagedPolicy,
+) -> PagedOperationCapabilities {
+    if !backend_compiled {
+        return PagedOperationCapabilities::unavailable();
+    }
+    match backend {
+        BackendKind::Cpu => PagedOperationCapabilities::portable(),
+        BackendKind::Metal => PagedOperationCapabilities::portable(),
+        BackendKind::Cuda => {
+            let flash_compatible = cuda_flash_attention_compiled
+                && policy.page_tokens != 0
+                && policy.page_tokens % 32 == 0
+                && matches!(policy.storage.dtype(), StateDType::F16 | StateDType::Bf16)
+                && semantic.layers.iter().all(|layer| {
+                    layer.key_head_dim == layer.value_head_dim
+                        && layer.key_head_dim != 0
+                        && layer.key_head_dim <= 512
+                        && layer.key_head_dim % 8 == 0
+                        && matches!(layer.pattern, AttentionPattern::Full)
+                });
+            let attention = if flash_compatible {
+                PagedOperationCapability::Optimized
+            } else {
+                PagedOperationCapability::Portable
+            };
+            PagedOperationCapabilities {
+                write: PagedOperationCapability::Portable,
+                prefill: attention,
+                decode: attention,
+            }
+        }
+    }
+}
+
+fn paged_operation_set(implementations: PagedOperationImplementationSet) -> StateOperationSet {
     StateOperationSet {
         write: RegisteredOperationId::new("paged_slot_write", PAGED_OPERATION_ABI),
         prefill: RegisteredOperationId::new("paged_prefill", PAGED_OPERATION_ABI),
         decode: RegisteredOperationId::new("paged_decode", PAGED_OPERATION_ABI),
+        implementations,
     }
 }
 
@@ -900,6 +1027,11 @@ mod tests {
     ) -> ResolvedPagedAttentionGroup {
         let spec = paged_spec(contract);
         let policy = resolve_paged_policy(spec, &request(backend)).unwrap();
+        let registry = StateBackendRegistry::new(backend, request(backend).device_ordinal).unwrap();
+        let implementations = registry
+            .paged_operation_capabilities(spec, policy)
+            .implementation_plan()
+            .expect("resolved test backend must have complete paged operations");
         ResolvedPagedAttentionGroup {
             group: contract.groups[0].id,
             domain: spec.header.id,
@@ -917,7 +1049,7 @@ mod tests {
                     physical_layer: physical as u32,
                 })
                 .collect(),
-            operations: paged_operation_set(),
+            operations: paged_operation_set(implementations),
         }
     }
 
@@ -938,9 +1070,37 @@ mod tests {
                 decode: true,
             }
         );
+        assert_eq!(
+            registry.paged_operation_capabilities(spec, policy),
+            PagedOperationCapabilities {
+                write: PagedOperationCapability::Portable,
+                prefill: PagedOperationCapability::Portable,
+                decode: PagedOperationCapability::Portable,
+            }
+        );
         let plan = negotiate_state_plan(&contract, &request(BackendKind::Cpu)).unwrap();
         assert_eq!(plan.backend, BackendKind::Cpu);
         assert_eq!(plan.paged_attention.len(), 1);
+        assert_eq!(
+            plan.paged_attention[0].operations.implementations,
+            PagedOperationImplementationSet {
+                write: PagedOperationImplementation::Portable,
+                prefill: PagedOperationImplementation::Portable,
+                decode: PagedOperationImplementation::Portable,
+            }
+        );
+
+        let mut unattested = plan.paged_attention[0].clone();
+        unattested.operations.implementations.decode = PagedOperationImplementation::Optimized;
+        assert!(ResolvedStatePlan::build(
+            BackendKind::Cpu,
+            None,
+            &contract,
+            vec![unattested],
+            vec![],
+            &registry,
+        )
+        .is_err());
     }
 
     #[test]
@@ -972,19 +1132,191 @@ mod tests {
 
     #[test]
     fn accelerator_operation_registry_tracks_compiled_direct_paged_support() {
+        let contract = test_contract();
+        let spec = paged_spec(&contract);
+
         let metal = StateBackendRegistry::new(BackendKind::Metal, Some(0)).unwrap();
+        let metal_policy = resolve_paged_policy(spec, &request(BackendKind::Metal)).unwrap();
         let metal_operations = metal.paged_operation_availability();
         assert_eq!(metal_operations.write, cfg!(feature = "metal"));
         assert_eq!(metal_operations.decode, cfg!(feature = "metal"));
         assert_eq!(metal_operations.prefill, cfg!(feature = "metal"));
         assert_eq!(metal_operations.complete(), cfg!(feature = "metal"));
+        let metal_capabilities = metal.paged_operation_capabilities(spec, metal_policy);
+        assert_eq!(
+            metal_capabilities.write,
+            if cfg!(feature = "metal") {
+                PagedOperationCapability::Portable
+            } else {
+                PagedOperationCapability::Unavailable
+            }
+        );
+        assert_eq!(
+            metal_capabilities.prefill,
+            if cfg!(feature = "metal") {
+                PagedOperationCapability::Portable
+            } else {
+                PagedOperationCapability::Unavailable
+            }
+        );
+        assert_eq!(
+            metal_capabilities.decode,
+            if cfg!(feature = "metal") {
+                PagedOperationCapability::Portable
+            } else {
+                PagedOperationCapability::Unavailable
+            }
+        );
 
         let cuda = StateBackendRegistry::new(BackendKind::Cuda, Some(0)).unwrap();
+        let cuda_policy = resolve_paged_policy(spec, &request(BackendKind::Cuda)).unwrap();
         let cuda_operations = cuda.paged_operation_availability();
         assert_eq!(cuda_operations.write, cfg!(feature = "cuda"));
         assert_eq!(cuda_operations.decode, cfg!(feature = "cuda"));
         assert_eq!(cuda_operations.prefill, cfg!(feature = "cuda"));
         assert_eq!(cuda_operations.complete(), cfg!(feature = "cuda"));
+        let cuda_capabilities = cuda.paged_operation_capabilities(spec, cuda_policy);
+        assert_eq!(
+            cuda_capabilities.write,
+            if cfg!(feature = "cuda") {
+                PagedOperationCapability::Portable
+            } else {
+                PagedOperationCapability::Unavailable
+            }
+        );
+        assert_eq!(
+            cuda_capabilities.prefill,
+            if cfg!(feature = "cuda") {
+                PagedOperationCapability::Portable
+            } else {
+                PagedOperationCapability::Unavailable
+            }
+        );
+        assert_eq!(
+            cuda_capabilities.decode,
+            if cfg!(feature = "cuda") {
+                PagedOperationCapability::Portable
+            } else {
+                PagedOperationCapability::Unavailable
+            }
+        );
+    }
+
+    #[test]
+    fn paged_attention_optimization_classification_is_shape_and_semantics_exact() {
+        let contract = test_contract();
+        let spec = paged_spec(&contract);
+        let mut cuda_request = request(BackendKind::Cuda);
+        cuda_request.page_tokens_hint = Some(32);
+        cuda_request.storage_dtype_hint = Some(StateDType::F16);
+        let page_32_half = resolve_paged_policy(spec, &cuda_request).unwrap();
+        assert!(
+            spec.layers
+                .iter()
+                .all(|layer| layer.key_head_dim == layer.value_head_dim)
+        );
+
+        let optimized = resolve_paged_operation_capabilities(
+            BackendKind::Cuda,
+            true,
+            true,
+            spec,
+            page_32_half,
+        );
+        assert_eq!(optimized.write, PagedOperationCapability::Portable);
+        assert_eq!(optimized.prefill, PagedOperationCapability::Optimized);
+        assert_eq!(optimized.decode, PagedOperationCapability::Optimized);
+
+        for (key_head_dim, value_head_dim) in [(64, 32), (0, 0), (520, 520), (66, 66)] {
+            let mut incompatible_heads = spec.clone();
+            incompatible_heads.layers[0].key_head_dim = key_head_dim;
+            incompatible_heads.layers[0].value_head_dim = value_head_dim;
+            let capabilities = resolve_paged_operation_capabilities(
+                BackendKind::Cuda,
+                true,
+                true,
+                &incompatible_heads,
+                page_32_half,
+            );
+            assert_eq!(
+                capabilities.prefill,
+                PagedOperationCapability::Portable
+            );
+            assert_eq!(capabilities.decode, PagedOperationCapability::Portable);
+        }
+
+        let page_16 = ResolvedPagedPolicy {
+            page_tokens: 16,
+            ..page_32_half
+        };
+        let page_16_capabilities = resolve_paged_operation_capabilities(
+            BackendKind::Cuda,
+            true,
+            true,
+            spec,
+            page_16,
+        );
+        assert_eq!(
+            page_16_capabilities.prefill,
+            PagedOperationCapability::Portable
+        );
+        assert_eq!(
+            page_16_capabilities.decode,
+            PagedOperationCapability::Portable
+        );
+
+        let f32 = ResolvedPagedPolicy {
+            storage: StateStorageFormat::Dense {
+                dtype: StateDType::F32,
+            },
+            ..page_32_half
+        };
+        let f32_capabilities = resolve_paged_operation_capabilities(
+            BackendKind::Cuda,
+            true,
+            true,
+            spec,
+            f32,
+        );
+        assert_eq!(
+            f32_capabilities.prefill,
+            PagedOperationCapability::Portable
+        );
+        assert_eq!(
+            f32_capabilities.decode,
+            PagedOperationCapability::Portable
+        );
+
+        let mut offset_sensitive = spec.clone();
+        offset_sensitive.layers[0].pattern =
+            AttentionPattern::SlidingWindow { window_tokens: 128 };
+        let offset_capabilities = resolve_paged_operation_capabilities(
+            BackendKind::Cuda,
+            true,
+            true,
+            &offset_sensitive,
+            page_32_half,
+        );
+        assert_eq!(
+            offset_capabilities.prefill,
+            PagedOperationCapability::Portable
+        );
+        assert_eq!(
+            offset_capabilities.decode,
+            PagedOperationCapability::Portable
+        );
+
+        let metal_capabilities = resolve_paged_operation_capabilities(
+            BackendKind::Metal,
+            true,
+            true,
+            spec,
+            page_32_half,
+        );
+        assert_eq!(
+            metal_capabilities,
+            PagedOperationCapabilities::portable()
+        );
     }
 
     #[test]

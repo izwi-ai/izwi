@@ -61,7 +61,8 @@ pub(crate) use intent::{
 };
 #[allow(unused_imports)]
 pub(crate) use resolved::{
-    OperationAbi, PagedAttentionOperationQuery, RegisteredOperationId, ResolvedPagedAttentionGroup,
+    OperationAbi, PagedAttentionOperationQuery, PagedOperationImplementation,
+    PagedOperationImplementationSet, RegisteredOperationId, ResolvedPagedAttentionGroup,
     ResolvedPlacement, ResolvedStatePlan, StateLayerBinding, StateOperationRegistry,
     StateOperationSet, StatePhysicalLayout, StatePlanFingerprint, StatePlanId, StateStorageFormat,
 };
