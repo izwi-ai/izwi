@@ -13,8 +13,9 @@ use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding,
 use crate::Result;
 
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvBackendRuntime, KvDeviceFence,
-    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    validate_attention_softcap, DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats,
+    KvBackendRuntime, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion,
+    PagedKvDecodeArgs, PagedKvPrefillArgs,
 };
 
 #[derive(Debug)]
@@ -372,6 +373,7 @@ impl KvArena for CpuKvArena {
                 "CPU paged decode softmax scale must be finite and positive".into(),
             ));
         }
+        validate_attention_softcap(args.softcap)?;
         validate_decode_query(args.queries, self.config.dtype)?;
         let tables = self.lower_decode_tables(args.batch)?;
 
@@ -404,6 +406,7 @@ impl KvArena for CpuKvArena {
                     layer.value_head_dim,
                     query_heads,
                     args.softmax_scale,
+                    args.softcap,
                 )
             };
         }
@@ -471,6 +474,12 @@ impl KvArena for CpuKvArena {
                 "CPU paged prefill softmax scale must be finite and positive".into(),
             ));
         }
+        validate_attention_softcap(args.softcap)?;
+        if args.window_tokens == Some(0) {
+            return Err(Error::InferenceError(
+                "CPU paged prefill window cannot be zero".into(),
+            ));
+        }
         validate_decode_query(args.queries, self.config.dtype)?;
 
         let mut tables = Vec::with_capacity(query_dims[0]);
@@ -493,26 +502,39 @@ impl KvArena for CpuKvArena {
                 .collect::<Result<Vec<_>>>()?;
             let prefix_len = row.context_len - row.query_len;
             for local_query in 0..row.query_len {
-                let context_len = prefix_len
+                let causal_context_len = prefix_len
                     .checked_add(local_query)
                     .and_then(|value| value.checked_add(1))
                     .ok_or_else(|| Error::InferenceError("prefill context overflow".into()))?;
-                let physical_tokens =
-                    context_len
-                        .checked_add(row.first_page_offset)
-                        .ok_or_else(|| {
-                            Error::InferenceError("prefill physical range overflow".into())
-                        })?;
-                let required_pages =
-                    (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
-                if required_pages == 0 || required_pages > pages.len() {
+                let context_len = args
+                    .window_tokens
+                    .map_or(causal_context_len, |window| causal_context_len.min(window));
+                let dropped = causal_context_len - context_len;
+                let physical_start = row
+                    .first_page_offset
+                    .checked_add(dropped)
+                    .ok_or_else(|| {
+                        Error::InferenceError("prefill physical range overflow".into())
+                    })?;
+                let first_page = (physical_start / self.config.page_tokens) as usize;
+                let first_page_offset = (physical_start % self.config.page_tokens) as usize;
+                let required_pages = first_page_offset
+                    .checked_add(context_len as usize)
+                    .ok_or_else(|| {
+                        Error::InferenceError("prefill physical range overflow".into())
+                    })?
+                    .div_ceil(self.config.page_tokens as usize);
+                let end_page = first_page.checked_add(required_pages).ok_or_else(|| {
+                    Error::InferenceError("prefill block range overflow".into())
+                })?;
+                if required_pages == 0 || end_page > pages.len() {
                     return Err(Error::InferenceError(format!(
                         "CPU paged prefill row {row_index} has an incomplete block table"
                     )));
                 }
                 tables.push(LoweredDecodeRow {
-                    pages: pages[..required_pages].to_vec(),
-                    first_page_offset: row.first_page_offset as usize,
+                    pages: pages[first_page..end_page].to_vec(),
+                    first_page_offset,
                     context_len: context_len as usize,
                 });
             }
@@ -553,6 +575,7 @@ impl KvArena for CpuKvArena {
                     layer.value_head_dim,
                     query_heads,
                     args.softmax_scale,
+                    args.softcap,
                 )
             };
         }
@@ -593,6 +616,8 @@ impl KvArena for CpuKvArena {
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
             page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
+            attention_plan_cache_hits: 0,
+            attention_plan_cache_misses: 0,
             host_synchronizations: 0,
         }
     }
@@ -693,6 +718,7 @@ fn online_paged_decode<T>(
     value_dim: usize,
     query_heads: usize,
     softmax_scale: f32,
+    softcap: Option<f32>,
 ) -> Result<Vec<f32>>
 where
     T: Copy,
@@ -728,6 +754,9 @@ where
                         f32::from(queries[query_offset + dim]) * f32::from(keys[key_offset + dim]);
                 }
                 score *= softmax_scale;
+                if let Some(softcap) = softcap {
+                    score = softcap * (score / softcap).tanh();
+                }
 
                 let next_max = running_max.max(score);
                 let previous_weight = (running_max - next_max).exp();
@@ -1125,6 +1154,7 @@ mod tests {
         value_dim: usize,
         logical_tokens: &[Vec<usize>],
         scale: f32,
+        softcap: Option<f32>,
     ) -> Vec<f32> {
         let mut output = Vec::new();
         let queries_per_kv_head = query_heads / kv_heads;
@@ -1136,12 +1166,16 @@ mod tests {
                     .iter()
                     .map(|&token| {
                         let key = &keys[(token * kv_heads + kv_head) * key_dim..][..key_dim];
-                        query
+                        let score = query
                             .iter()
                             .zip(key)
                             .map(|(query, key)| query * key)
                             .sum::<f32>()
-                            * scale
+                            * scale;
+                        match softcap {
+                            Some(softcap) => softcap * (score / softcap).tanh(),
+                            None => score,
+                        }
                     })
                     .collect::<Vec<_>>();
                 let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -1474,6 +1508,7 @@ mod tests {
                     queries: &queries,
                     batch: &batch,
                     softmax_scale: scale,
+                    softcap: None,
                 },
             )?
             .flatten_all()?
@@ -1490,6 +1525,7 @@ mod tests {
             1,
             &[vec![5, 0, 1], vec![2]],
             scale,
+            None,
         );
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
@@ -1548,6 +1584,7 @@ mod tests {
                         queries: &queries,
                         batch: &batch,
                         softmax_scale: 0.5,
+                        softcap: None,
                     },
                 )?
                 .flatten_all()?
@@ -1562,6 +1599,7 @@ mod tests {
                 1,
                 &[vec![0, 1]],
                 0.5,
+                None,
             );
             for (actual, expected) in actual.iter().zip(expected) {
                 assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
@@ -1571,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn paged_prefill_matches_ragged_causal_dense_attention() -> Result<()> {
+    fn paged_prefill_applies_per_query_window_and_softcap() -> Result<()> {
         let arena = CpuKvArena::new(config(DType::F32))?;
         let physical_slots = (0..3)
             .flat_map(|page| {
@@ -1621,6 +1659,7 @@ mod tests {
             },
         ];
         let scale = 1.0 / 2.0f32.sqrt();
+        let softcap = Some(0.75);
         let actual = arena
             .paged_prefill(
                 LAYER,
@@ -1628,6 +1667,8 @@ mod tests {
                     queries: &queries,
                     rows: &rows,
                     softmax_scale: scale,
+                    softcap,
+                    window_tokens: Some(2),
                 },
             )?
             .flatten_all()?
@@ -1640,8 +1681,9 @@ mod tests {
             2,
             2,
             1,
-            &[vec![5, 0], vec![5, 0, 1], vec![2]],
+            &[vec![5, 0], vec![0, 1], vec![2]],
             scale,
+            softcap,
         );
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");

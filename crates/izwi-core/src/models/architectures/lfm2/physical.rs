@@ -282,6 +282,7 @@ pub(crate) fn lfm2_main_invocation_contract(
                 key_encoding: KeyEncoding::Rotary {
                     rotary_dim: head_dim,
                 },
+                attention_logit_softcap: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;

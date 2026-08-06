@@ -172,6 +172,7 @@ fn whisper_invocation_contract(
                 pattern: AttentionPattern::Full,
                 mask: AttentionMask::Causal,
                 key_encoding: KeyEncoding::Raw,
+                attention_logit_softcap: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;

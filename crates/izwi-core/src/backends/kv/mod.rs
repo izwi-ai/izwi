@@ -75,6 +75,8 @@ pub struct KvArenaOperationStats {
     pub paged_decode_dispatches: u64,
     pub page_zero_dispatches: u64,
     pub page_copy_dispatches: u64,
+    pub attention_plan_cache_hits: u64,
+    pub attention_plan_cache_misses: u64,
     /// Explicit device synchronization that blocks the calling host thread.
     pub host_synchronizations: u64,
 }
@@ -108,6 +110,9 @@ pub struct PagedKvDecodeArgs<'a> {
     pub queries: &'a Tensor,
     pub batch: &'a KvDecodeBatchMetadata,
     pub softmax_scale: f32,
+    /// Optional Gemma-style logit softcap applied after scaling and before
+    /// online softmax: `cap * tanh(score / cap)`.
+    pub softcap: Option<f32>,
 }
 
 /// One ragged row in a multi-query paged prefill/extend operation.
@@ -130,6 +135,11 @@ pub struct PagedKvPrefillArgs<'a> {
     pub queries: &'a Tensor,
     pub rows: &'a [PagedKvPrefillRow],
     pub softmax_scale: f32,
+    /// Optional Gemma-style logit softcap applied after scaling and before
+    /// online softmax.
+    pub softcap: Option<f32>,
+    /// Optional causal window size, including the current query token.
+    pub window_tokens: Option<u32>,
 }
 
 /// Completion token for an ordered backend mutation.
@@ -443,71 +453,7 @@ pub trait KvArena: Send + Sync {
     /// portable default remains page-native by issuing the already-attested
     /// direct decode operation for each causal query position.
     fn paged_prefill(&self, layer: KvLayerBinding, args: PagedKvPrefillArgs<'_>) -> Result<Tensor> {
-        let query_dims = args.queries.dims();
-        if query_dims.len() != 3 {
-            return Err(crate::Error::InferenceError(format!(
-                "paged prefill queries must have rank 3, got {query_dims:?}"
-            )));
-        }
-        if args.rows.is_empty() || !args.softmax_scale.is_finite() || args.softmax_scale <= 0.0 {
-            return Err(crate::Error::InferenceError(
-                "paged prefill requires rows and a finite positive scale".into(),
-            ));
-        }
-
-        let mut next_query = 0_u32;
-        let mut sequences = Vec::with_capacity(query_dims[0]);
-        for row in args.rows {
-            if row.query_start != next_query
-                || row.query_len == 0
-                || row.query_len > row.context_len
-                || row.first_page_offset >= self.config().page_tokens
-            {
-                return Err(crate::Error::InferenceError(
-                    "paged prefill rows are not canonical valid causal ranges".into(),
-                ));
-            }
-            let prefix_len = row.context_len - row.query_len;
-            for local_query in 0..row.query_len {
-                let visible = prefix_len
-                    .checked_add(local_query)
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or_else(|| {
-                        crate::Error::InferenceError("paged prefill context overflow".into())
-                    })?;
-                let physical_tokens =
-                    visible.checked_add(row.first_page_offset).ok_or_else(|| {
-                        crate::Error::InferenceError("paged prefill physical range overflow".into())
-                    })?;
-                let required_pages = physical_tokens.div_ceil(self.config().page_tokens) as usize;
-                if required_pages == 0 || required_pages > row.blocks.len() {
-                    return Err(crate::Error::InferenceError(
-                        "paged prefill block table does not cover its causal context".into(),
-                    ));
-                }
-                sequences.push(crate::kv::KvSequenceBlockTable {
-                    blocks: row.blocks[..required_pages].to_vec(),
-                    first_page_offset: row.first_page_offset,
-                    context_len: visible,
-                });
-            }
-            next_query = next_query.checked_add(row.query_len).ok_or_else(|| {
-                crate::Error::InferenceError("paged prefill query range overflow".into())
-            })?;
-        }
-        if next_query as usize != query_dims[0] {
-            return Err(crate::Error::InferenceError(
-                "paged prefill rows do not cover every query exactly once".into(),
-            ));
-        }
-        self.paged_decode(
-            layer,
-            PagedKvDecodeArgs {
-                queries: args.queries,
-                batch: &KvDecodeBatchMetadata { sequences },
-                softmax_scale: args.softmax_scale,
-            },
-        )
+        portable_paged_prefill(self, layer, args)
     }
     fn paged_decode(&self, layer: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor>;
 
@@ -519,6 +465,111 @@ pub trait KvArena: Send + Sync {
     /// storage has completed. Model unload calls this before dropping the
     /// arena generation and its physical resource lease.
     fn drain(&self) -> Result<()>;
+}
+
+/// Page-native correctness fallback for backends without a fused prefill
+/// provider. Kept outside the trait default so an overriding backend can
+/// explicitly select this path without recursively dispatching to itself.
+pub(crate) fn portable_paged_prefill<A: KvArena + ?Sized>(
+    arena: &A,
+    layer: KvLayerBinding,
+    args: PagedKvPrefillArgs<'_>,
+) -> Result<Tensor> {
+    let query_dims = args.queries.dims();
+    if query_dims.len() != 3 {
+        return Err(crate::Error::InferenceError(format!(
+            "paged prefill queries must have rank 3, got {query_dims:?}"
+        )));
+    }
+    if args.rows.is_empty() || !args.softmax_scale.is_finite() || args.softmax_scale <= 0.0 {
+        return Err(crate::Error::InferenceError(
+            "paged prefill requires rows and a finite positive scale".into(),
+        ));
+    }
+    validate_attention_softcap(args.softcap)?;
+    if args.window_tokens == Some(0) {
+        return Err(crate::Error::InferenceError(
+            "paged prefill window cannot be zero".into(),
+        ));
+    }
+
+    let mut next_query = 0_u32;
+    let mut sequences = Vec::with_capacity(query_dims[0]);
+    for row in args.rows {
+        if row.query_start != next_query
+            || row.query_len == 0
+            || row.query_len > row.context_len
+            || row.first_page_offset >= arena.config().page_tokens
+        {
+            return Err(crate::Error::InferenceError(
+                "paged prefill rows are not canonical valid causal ranges".into(),
+            ));
+        }
+        let prefix_len = row.context_len - row.query_len;
+        for local_query in 0..row.query_len {
+            let causal_visible = prefix_len
+                .checked_add(local_query)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    crate::Error::InferenceError("paged prefill context overflow".into())
+                })?;
+            let visible = args
+                .window_tokens
+                .map_or(causal_visible, |window| causal_visible.min(window));
+            let dropped = causal_visible - visible;
+            let physical_start = row.first_page_offset.checked_add(dropped).ok_or_else(|| {
+                crate::Error::InferenceError("paged prefill physical range overflow".into())
+            })?;
+            let page_tokens = arena.config().page_tokens;
+            let first_block = (physical_start / page_tokens) as usize;
+            let first_page_offset = physical_start % page_tokens;
+            let required_pages = first_page_offset
+                .checked_add(visible)
+                .ok_or_else(|| {
+                    crate::Error::InferenceError("paged prefill physical range overflow".into())
+                })?
+                .div_ceil(page_tokens) as usize;
+            let end_block = first_block.checked_add(required_pages).ok_or_else(|| {
+                crate::Error::InferenceError("paged prefill block range overflow".into())
+            })?;
+            if required_pages == 0 || end_block > row.blocks.len() {
+                return Err(crate::Error::InferenceError(
+                    "paged prefill block table does not cover its causal context".into(),
+                ));
+            }
+            sequences.push(crate::kv::KvSequenceBlockTable {
+                blocks: row.blocks[first_block..end_block].to_vec(),
+                first_page_offset,
+                context_len: visible,
+            });
+        }
+        next_query = next_query.checked_add(row.query_len).ok_or_else(|| {
+            crate::Error::InferenceError("paged prefill query range overflow".into())
+        })?;
+    }
+    if next_query as usize != query_dims[0] {
+        return Err(crate::Error::InferenceError(
+            "paged prefill rows do not cover every query exactly once".into(),
+        ));
+    }
+    arena.paged_decode(
+        layer,
+        PagedKvDecodeArgs {
+            queries: args.queries,
+            batch: &KvDecodeBatchMetadata { sequences },
+            softmax_scale: args.softmax_scale,
+            softcap: args.softcap,
+        },
+    )
+}
+
+pub(crate) fn validate_attention_softcap(softcap: Option<f32>) -> Result<()> {
+    if softcap.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err(crate::Error::InferenceError(
+            "paged attention softcap must be finite and positive".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Allocates backend-owned arenas from resolved physical configurations.
@@ -539,6 +590,7 @@ mod tests {
         config: KvArenaConfig,
         calls: AtomicUsize,
         batches: Mutex<Vec<KvDecodeBatchMetadata>>,
+        softcaps: Mutex<Vec<Option<f32>>>,
     }
 
     impl RecordingDecodeArena {
@@ -548,6 +600,7 @@ mod tests {
                 config: config(arena, &[layer(0, 0)]),
                 calls: AtomicUsize::new(0),
                 batches: Mutex::new(Vec::new()),
+                softcaps: Mutex::new(Vec::new()),
             }
         }
     }
@@ -598,6 +651,7 @@ mod tests {
         ) -> Result<Tensor> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.batches.lock().unwrap().push(args.batch.clone());
+            self.softcaps.lock().unwrap().push(args.softcap);
             Ok(args.queries.clone())
         }
 
@@ -785,6 +839,8 @@ mod tests {
                         },
                     ],
                     softmax_scale: 0.5,
+                    softcap: Some(1.25),
+                    window_tokens: Some(3),
                 },
             )
             .unwrap();
@@ -802,7 +858,7 @@ mod tests {
                 .iter()
                 .map(|sequence| sequence.context_len)
                 .collect::<Vec<_>>(),
-            vec![3, 4, 5, 1, 2]
+            vec![3, 3, 3, 1, 2]
         );
         assert_eq!(
             sequences
@@ -813,7 +869,9 @@ mod tests {
         );
         assert!(sequences[..3]
             .iter()
-            .all(|sequence| sequence.first_page_offset == 1));
+            .map(|sequence| sequence.first_page_offset)
+            .eq([1, 2, 3]));
+        assert_eq!(*arena.softcaps.lock().unwrap(), vec![Some(1.25)]);
     }
 
     #[test]
@@ -835,6 +893,8 @@ mod tests {
                     queries: &queries,
                     rows: &invalid_start,
                     softmax_scale: 0.5,
+                    softcap: None,
+                    window_tokens: None,
                 },
             )
             .is_err());
@@ -852,6 +912,8 @@ mod tests {
                     queries: &queries,
                     rows: &incomplete,
                     softmax_scale: 0.5,
+                    softcap: None,
+                    window_tokens: None,
                 },
             )
             .is_err());

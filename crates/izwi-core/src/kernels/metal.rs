@@ -487,6 +487,7 @@ kernel void izwi_paged_decode_attention_f32(
     constant uint& key_head_dim [[buffer(10)]],
     constant uint& value_head_dim [[buffer(11)]],
     constant float& scale [[buffer(12)]],
+    constant float& softcap [[buffer(13)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]],
     uint2 threads_per_group [[threads_per_threadgroup]]
@@ -540,7 +541,10 @@ kernel void izwi_paged_decode_attention_f32(
         }
 
         if (tid == 0) {
-            const float score = dot_scratch[0] * scale;
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
             const float next_max = max(online_state[0], score);
             const float alpha = online_state[1] == 0.0f
                 ? 0.0f
@@ -582,6 +586,7 @@ kernel void izwi_paged_decode_attention_f16(
     constant uint& key_head_dim [[buffer(10)]],
     constant uint& value_head_dim [[buffer(11)]],
     constant float& scale [[buffer(12)]],
+    constant float& softcap [[buffer(13)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]],
     uint2 threads_per_group [[threads_per_threadgroup]]
@@ -635,7 +640,10 @@ kernel void izwi_paged_decode_attention_f16(
         }
 
         if (tid == 0) {
-            const float score = dot_scratch[0] * scale;
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
             const float next_max = max(online_state[0], score);
             const float alpha = online_state[1] == 0.0f
                 ? 0.0f
@@ -679,8 +687,9 @@ kernel void izwi_paged_decode_attention_split_f32(
     constant uint& key_head_dim [[buffer(12)]],
     constant uint& value_head_dim [[buffer(13)]],
     constant float& scale [[buffer(14)]],
-    constant uint& partition_tokens [[buffer(15)]],
-    constant uint& max_partitions [[buffer(16)]],
+    constant float& softcap [[buffer(15)]],
+    constant uint& partition_tokens [[buffer(16)]],
+    constant uint& max_partitions [[buffer(17)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]],
     uint3 threads_per_group [[threads_per_threadgroup]]
@@ -741,7 +750,10 @@ kernel void izwi_paged_decode_attention_split_f32(
             }
 
             if (tid == 0) {
-                const float score = dot_scratch[0] * scale;
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
                 const float next_max = max(online_state[0], score);
                 const float alpha = online_state[1] == 0.0f
                     ? 0.0f
@@ -788,8 +800,9 @@ kernel void izwi_paged_decode_attention_split_f16(
     constant uint& key_head_dim [[buffer(12)]],
     constant uint& value_head_dim [[buffer(13)]],
     constant float& scale [[buffer(14)]],
-    constant uint& partition_tokens [[buffer(15)]],
-    constant uint& max_partitions [[buffer(16)]],
+    constant float& softcap [[buffer(15)]],
+    constant uint& partition_tokens [[buffer(16)]],
+    constant uint& max_partitions [[buffer(17)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]],
     uint3 threads_per_group [[threads_per_threadgroup]]
@@ -850,7 +863,10 @@ kernel void izwi_paged_decode_attention_split_f16(
             }
 
             if (tid == 0) {
-                const float score = dot_scratch[0] * scale;
+                float score = dot_scratch[0] * scale;
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
                 const float next_max = max(online_state[0], score);
                 const float alpha = online_state[1] == 0.0f
                     ? 0.0f
@@ -992,6 +1008,8 @@ kernel void izwi_paged_prefill_attention_f32(
     constant uint& key_head_dim [[buffer(11)]],
     constant uint& value_head_dim [[buffer(12)]],
     constant float& scale [[buffer(13)]],
+    constant float& softcap [[buffer(14)]],
+    constant uint& window_tokens [[buffer(15)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]],
     uint2 threads_per_group [[threads_per_threadgroup]]
@@ -1019,6 +1037,9 @@ kernel void izwi_paged_prefill_attention_f32(
     const uint first_page_offset = metadata[3 * sequence_count + sequence];
     const uint query_offset = query_index - query_start;
     const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
     const uint table_base = 4 * sequence_count + sequence * max_blocks;
     const uint kv_group = num_heads / num_kv_heads;
     const uint kv_head = head / kv_group;
@@ -1034,7 +1055,7 @@ kernel void izwi_paged_prefill_attention_f32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint pos = 0; pos < visible_context; pos++) {
+    for (uint pos = window_start; pos < visible_context; pos++) {
         const uint physical_pos = first_page_offset + pos;
         const uint logical_page = physical_pos / page_tokens;
         const uint page_offset = physical_pos - logical_page * page_tokens;
@@ -1055,7 +1076,10 @@ kernel void izwi_paged_prefill_attention_f32(
         }
 
         if (tid == 0) {
-            const float score = dot_scratch[0] * scale;
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
             const float next_max = max(online_state[0], score);
             const float alpha = online_state[1] == 0.0f
                 ? 0.0f
@@ -1098,6 +1122,8 @@ kernel void izwi_paged_prefill_attention_f16(
     constant uint& key_head_dim [[buffer(11)]],
     constant uint& value_head_dim [[buffer(12)]],
     constant float& scale [[buffer(13)]],
+    constant float& softcap [[buffer(14)]],
+    constant uint& window_tokens [[buffer(15)]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]],
     uint2 threads_per_group [[threads_per_threadgroup]]
@@ -1125,6 +1151,9 @@ kernel void izwi_paged_prefill_attention_f16(
     const uint first_page_offset = metadata[3 * sequence_count + sequence];
     const uint query_offset = query_index - query_start;
     const uint visible_context = context_len - query_len + query_offset + 1;
+    const uint window_start = window_tokens > 0 && visible_context > window_tokens
+        ? visible_context - window_tokens
+        : 0;
     const uint table_base = 4 * sequence_count + sequence * max_blocks;
     const uint kv_group = num_heads / num_kv_heads;
     const uint kv_head = head / kv_group;
@@ -1140,7 +1169,7 @@ kernel void izwi_paged_prefill_attention_f16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint pos = 0; pos < visible_context; pos++) {
+    for (uint pos = window_start; pos < visible_context; pos++) {
         const uint physical_pos = first_page_offset + pos;
         const uint logical_page = physical_pos / page_tokens;
         const uint page_offset = physical_pos - logical_page * page_tokens;
@@ -1161,7 +1190,10 @@ kernel void izwi_paged_prefill_attention_f16(
         }
 
         if (tid == 0) {
-            const float score = dot_scratch[0] * scale;
+            float score = dot_scratch[0] * scale;
+            if (softcap > 0.0f) {
+                score = softcap * tanh(score / softcap);
+            }
             const float next_max = max(online_state[0], score);
             const float alpha = online_state[1] == 0.0f
                 ? 0.0f
@@ -2089,6 +2121,7 @@ struct PagedDecodeAttentionOp {
     key_head_dim: usize,
     value_head_dim: usize,
     scale: f32,
+    softcap: Option<f32>,
 }
 
 #[cfg(feature = "metal")]
@@ -2104,6 +2137,8 @@ struct PagedPrefillAttentionOp {
     key_head_dim: usize,
     value_head_dim: usize,
     scale: f32,
+    softcap: Option<f32>,
+    window_tokens: Option<u32>,
 }
 
 #[cfg(feature = "metal")]
@@ -2354,6 +2389,9 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             || self.value_head_dim == 0
             || self.key_head_dim > 512
             || self.value_head_dim > 512
+            || self
+                .softcap
+                .is_some_and(|softcap| !softcap.is_finite() || softcap <= 0.0)
             || self.metadata.len()
                 != self
                     .batch_size
@@ -2495,8 +2533,9 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             encoder.set_bytes(12, &(self.key_head_dim as u32));
             encoder.set_bytes(13, &(self.value_head_dim as u32));
             encoder.set_bytes(14, &self.scale);
-            encoder.set_bytes(15, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
-            encoder.set_bytes(16, &(max_partitions as u32));
+            encoder.set_bytes(15, &self.softcap.unwrap_or(0.0));
+            encoder.set_bytes(16, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
+            encoder.set_bytes(17, &(max_partitions as u32));
             encoder.dispatch_thread_groups(
                 objc2_metal::MTLSize {
                     width: self.num_heads,
@@ -2563,6 +2602,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             encoder.set_bytes(10, &(self.key_head_dim as u32));
             encoder.set_bytes(11, &(self.value_head_dim as u32));
             encoder.set_bytes(12, &self.scale);
+            encoder.set_bytes(13, &self.softcap.unwrap_or(0.0));
             encoder.dispatch_thread_groups(
                 objc2_metal::MTLSize {
                     width: self.num_heads,
@@ -2731,6 +2771,10 @@ impl CustomOp3 for PagedPrefillAttentionOp {
             || self.metadata.len() != expected_metadata
             || !self.scale.is_finite()
             || self.scale <= 0.0
+            || self
+                .softcap
+                .is_some_and(|softcap| !softcap.is_finite() || softcap <= 0.0)
+            || self.window_tokens == Some(0)
         {
             bail!("izwi-paged-prefill-attention-metal unsupported shape")
         }
@@ -2843,6 +2887,8 @@ impl CustomOp3 for PagedPrefillAttentionOp {
         encoder.set_bytes(11, &(self.key_head_dim as u32));
         encoder.set_bytes(12, &(self.value_head_dim as u32));
         encoder.set_bytes(13, &self.scale);
+        encoder.set_bytes(14, &self.softcap.unwrap_or(0.0));
+        encoder.set_bytes(15, &self.window_tokens.unwrap_or(0));
 
         let reduction_width = self
             .key_head_dim
@@ -4349,6 +4395,7 @@ pub(crate) fn paged_decode_attention(
     key_head_dim: usize,
     value_head_dim: usize,
     scale: f32,
+    softcap: Option<f32>,
 ) -> CandleResult<Tensor> {
     q.apply_op3_no_bwd(
         k,
@@ -4363,6 +4410,7 @@ pub(crate) fn paged_decode_attention(
             key_head_dim,
             value_head_dim,
             scale,
+            softcap,
         },
     )
 }
@@ -4390,6 +4438,8 @@ pub(crate) fn paged_prefill_attention(
     key_head_dim: usize,
     value_head_dim: usize,
     scale: f32,
+    softcap: Option<f32>,
+    window_tokens: Option<u32>,
 ) -> CandleResult<Tensor> {
     q.apply_op3_no_bwd(
         k,
@@ -4405,6 +4455,8 @@ pub(crate) fn paged_prefill_attention(
             key_head_dim,
             value_head_dim,
             scale,
+            softcap,
+            window_tokens,
         },
     )
 }
@@ -5233,6 +5285,72 @@ mod tests {
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
+    fn metal_one_pass_paged_attention_softcap_matches_reference_if_available() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let query_data = vec![2.0f32, -1.0];
+        let key_data = vec![4.0f32, 0.0, 0.0, 2.0];
+        let value_data = vec![1.0f32, 3.0, 5.0, -2.0];
+        let metadata = vec![2, 0, 0];
+
+        for dtype in [DType::F32, DType::F16] {
+            let query = Tensor::from_vec(query_data.clone(), (1, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let keys = Tensor::from_vec(key_data.clone(), (1, 2, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let values = Tensor::from_vec(value_data.clone(), (1, 2, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            for softcap in [None, Some(0.5f32)] {
+                let actual = paged_decode_attention(
+                    &query,
+                    &keys,
+                    &values,
+                    metadata.clone(),
+                    1,
+                    1,
+                    1,
+                    2,
+                    1,
+                    2,
+                    2,
+                    1.0,
+                    softcap,
+                )
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+                let scores = [8.0f32, -2.0].map(|score| {
+                    softcap.map_or(score, |cap| cap * (score / cap).tanh())
+                });
+                let max_score = scores[0].max(scores[1]);
+                let weights = scores.map(|score| (score - max_score).exp());
+                let denominator = weights[0] + weights[1];
+                let expected = [
+                    (weights[0] * 1.0 + weights[1] * 5.0) / denominator,
+                    (weights[0] * 3.0 + weights[1] * -2.0) / denominator,
+                ];
+                let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
+                assert_f32_close(&actual, &expected, tolerance, "one-pass paged attention");
+            }
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
     fn metal_split_paged_attention_matches_online_reference_if_available() {
         let Ok(device) = Device::new_metal(0) else {
             return;
@@ -5290,6 +5408,7 @@ mod tests {
                 head_dim,
                 head_dim,
                 0.5,
+                Some(0.7),
             )
             .unwrap()
             .to_dtype(DType::F32)
@@ -5332,10 +5451,11 @@ mod tests {
             let mut scores = Vec::with_capacity(context_len);
             for token in 0..context_len {
                 let base = token * head_dim;
-                let score = (0..head_dim)
+                let raw_score = (0..head_dim)
                     .map(|dim| query_reference[dim] * key_reference[base + dim])
                     .sum::<f32>()
                     * 0.5;
+                let score = 0.7 * (raw_score / 0.7).tanh();
                 max_score = max_score.max(score);
                 scores.push(score);
             }
@@ -5375,7 +5495,6 @@ mod tests {
         // Two compact rows: q=[0..2), final context=3, first-page offset=1;
         // q=[2..3), final context=2, first-page offset=0.
         let metadata = vec![0, 2, 2, 1, 3, 2, 1, 0, 0, 1];
-        let visible_contexts = [2usize, 3, 2];
         let slots = [&[1usize, 2][..], &[1usize, 2, 3][..], &[4usize, 5][..]];
 
         for dtype in [DType::F32, DType::F16] {
@@ -5406,6 +5525,8 @@ mod tests {
                 head_dim,
                 head_dim,
                 1.0,
+                Some(0.75),
+                Some(2),
             )
             .unwrap()
             .to_dtype(DType::F32)
@@ -5446,13 +5567,16 @@ mod tests {
             let mut expected = Vec::with_capacity(3 * head_dim);
             for query_index in 0..3 {
                 let q_base = query_index * head_dim;
-                let mut scores = Vec::with_capacity(visible_contexts[query_index]);
+                let visible_slots = slots[query_index];
+                let visible_slots = &visible_slots[visible_slots.len().saturating_sub(2)..];
+                let mut scores = Vec::with_capacity(visible_slots.len());
                 let mut max_score = f32::NEG_INFINITY;
-                for &slot in slots[query_index] {
+                for &slot in visible_slots {
                     let k_base = slot * head_dim;
-                    let score = (0..head_dim)
+                    let raw_score = (0..head_dim)
                         .map(|dim| queries[q_base + dim] * keys[k_base + dim])
                         .sum::<f32>();
+                    let score = 0.75 * (raw_score / 0.75).tanh();
                     max_score = max_score.max(score);
                     scores.push(score);
                 }
@@ -5463,7 +5587,7 @@ mod tests {
                 for dim in 0..head_dim {
                     let value = scores
                         .iter()
-                        .zip(slots[query_index])
+                        .zip(visible_slots)
                         .map(|(score, slot)| {
                             ((*score - max_score).exp() / denominator)
                                 * values[slot * head_dim + dim]

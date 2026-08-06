@@ -38,8 +38,8 @@ pub(crate) use capacity::{
 };
 #[allow(unused_imports)]
 pub(crate) use contract::{
-    AppendStateDomainSpec, AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy,
-    InferenceStateAbi, InferenceStateContract, KeyEncoding, PageSizeConstraint,
+    AppendStateDomainSpec, AttentionLogitSoftcap, AttentionMask, AttentionPattern, BoundedShape,
+    CheckpointPolicy, InferenceStateAbi, InferenceStateContract, KeyEncoding, PageSizeConstraint,
     PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy, PositionSemantics,
     PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
     StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,

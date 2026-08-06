@@ -805,7 +805,11 @@ fn resolve_paged_operation_capabilities(
     }
     match backend {
         BackendKind::Cpu => PagedOperationCapabilities::portable(),
-        BackendKind::Metal => PagedOperationCapabilities::portable(),
+        BackendKind::Metal => PagedOperationCapabilities {
+            write: PagedOperationCapability::Portable,
+            prefill: PagedOperationCapability::Optimized,
+            decode: PagedOperationCapability::Optimized,
+        },
         BackendKind::Cuda => {
             let flash_compatible = cuda_flash_attention_compiled
                 && policy.page_tokens != 0
@@ -1154,7 +1158,7 @@ mod tests {
         assert_eq!(
             metal_capabilities.prefill,
             if cfg!(feature = "metal") {
-                PagedOperationCapability::Portable
+                PagedOperationCapability::Optimized
             } else {
                 PagedOperationCapability::Unavailable
             }
@@ -1162,7 +1166,7 @@ mod tests {
         assert_eq!(
             metal_capabilities.decode,
             if cfg!(feature = "metal") {
-                PagedOperationCapability::Portable
+                PagedOperationCapability::Optimized
             } else {
                 PagedOperationCapability::Unavailable
             }
@@ -1315,7 +1319,11 @@ mod tests {
         );
         assert_eq!(
             metal_capabilities,
-            PagedOperationCapabilities::portable()
+            PagedOperationCapabilities {
+                write: PagedOperationCapability::Portable,
+                prefill: PagedOperationCapability::Optimized,
+                decode: PagedOperationCapability::Optimized,
+            }
         );
     }
 

@@ -13,7 +13,8 @@ use crate::Result;
 use super::KvBackendRuntime;
 use super::{
     DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvDeviceFence, KvPageCopy,
-    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs,
+    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    PagedKvPrefillRow,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -188,6 +189,35 @@ struct AcceleratorLayerStorage {
     value_head_dim: usize,
 }
 
+#[derive(Debug)]
+struct LoweredPrefillMetadata {
+    cache_key: PrefillMetadataCacheKey,
+    compact_rows: Vec<u32>,
+    cumulative_queries: Vec<u32>,
+    cumulative_contexts: Vec<u32>,
+    block_table: Vec<u32>,
+    sequence_count: usize,
+    total_queries: usize,
+    max_blocks: usize,
+    max_query_len: usize,
+    max_context_len: usize,
+    all_first_page_offsets_zero: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefillMetadataCacheKey {
+    rows: Vec<PagedKvPrefillRow>,
+    total_queries: usize,
+}
+
+#[derive(Debug)]
+struct CachedPrefillDeviceMetadata {
+    key: PrefillMetadataCacheKey,
+    cumulative_queries: Tensor,
+    cumulative_contexts: Tensor,
+    block_table: Tensor,
+}
+
 /// Device-resident KV storage backed by Candle's accelerator tensors.
 ///
 /// `new_mutation_only` is deliberately explicit: it exposes the independently
@@ -201,6 +231,9 @@ pub struct CandleAcceleratorKvArena {
     device: Device,
     layers: HashMap<KvLayerBinding, AcceleratorLayerStorage>,
     mutation_lock: Mutex<()>,
+    prefill_metadata_cache: Mutex<Option<CachedPrefillDeviceMetadata>>,
+    prefill_metadata_cache_hits: AtomicU64,
+    prefill_metadata_cache_misses: AtomicU64,
     slot_write_dispatches: AtomicU64,
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
@@ -265,6 +298,9 @@ impl CandleAcceleratorKvArena {
             device,
             layers,
             mutation_lock: Mutex::new(()),
+            prefill_metadata_cache: Mutex::new(None),
+            prefill_metadata_cache_hits: AtomicU64::new(0),
+            prefill_metadata_cache_misses: AtomicU64::new(0),
             slot_write_dispatches: AtomicU64::new(0),
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
@@ -418,6 +454,222 @@ impl CandleAcceleratorKvArena {
         ))
     }
 
+    fn lower_prefill_metadata(
+        &self,
+        args: &PagedKvPrefillArgs<'_>,
+    ) -> Result<LoweredPrefillMetadata> {
+        let sequence_count = args.rows.len();
+        let total_queries = args.queries.dims()[0];
+        let max_blocks = args
+            .rows
+            .iter()
+            .map(|row| row.blocks.len())
+            .max()
+            .unwrap_or(0);
+        if sequence_count == 0 || total_queries == 0 || max_blocks == 0 {
+            return Err(Error::InferenceError(
+                "accelerator paged prefill requires non-empty rows, queries, and block tables"
+                    .into(),
+            ));
+        }
+
+        let compact_len = sequence_count
+            .checked_mul(4_usize.checked_add(max_blocks).ok_or_else(|| {
+                Error::InferenceError("accelerator prefill metadata width overflow".into())
+            })?)
+            .ok_or_else(|| {
+                Error::InferenceError("accelerator prefill metadata length overflow".into())
+            })?;
+        let mut compact_rows = vec![0_u32; compact_len];
+        let mut block_table = vec![0_u32; sequence_count * max_blocks];
+        let mut cumulative_queries = Vec::with_capacity(sequence_count + 1);
+        let mut cumulative_contexts = Vec::with_capacity(sequence_count + 1);
+        cumulative_queries.push(0);
+        cumulative_contexts.push(0);
+        let mut next_query = 0_u32;
+        let mut cumulative_context = 0_u32;
+        let mut max_query_len = 0_usize;
+        let mut max_context_len = 0_usize;
+        let mut all_first_page_offsets_zero = true;
+
+        for (row_index, row) in args.rows.iter().enumerate() {
+            if row.query_start != next_query
+                || row.query_len == 0
+                || row.query_len > row.context_len
+                || row.first_page_offset >= self.config.page_tokens
+            {
+                return Err(Error::InferenceError(format!(
+                    "accelerator paged prefill row {row_index} is not a canonical causal range"
+                )));
+            }
+            let physical_tokens = row
+                .context_len
+                .checked_add(row.first_page_offset)
+                .ok_or_else(|| {
+                    Error::InferenceError("accelerator prefill physical range overflow".into())
+                })?;
+            let required_pages =
+                (physical_tokens as usize).div_ceil(self.config.page_tokens as usize);
+            if required_pages == 0 || required_pages > row.blocks.len() {
+                return Err(Error::InferenceError(format!(
+                    "accelerator paged prefill row {row_index} has an incomplete block table"
+                )));
+            }
+
+            compact_rows[row_index] = row.query_start;
+            compact_rows[sequence_count + row_index] = row.query_len;
+            compact_rows[2 * sequence_count + row_index] = row.context_len;
+            compact_rows[3 * sequence_count + row_index] = row.first_page_offset;
+            all_first_page_offsets_zero &= row.first_page_offset == 0;
+            max_query_len = max_query_len.max(row.query_len as usize);
+            max_context_len = max_context_len.max(row.context_len as usize);
+
+            let table_start = row_index * max_blocks;
+            let compact_table_start = 4 * sequence_count + table_start;
+            for (logical_page, block) in row.blocks.iter().copied().enumerate() {
+                let physical_page = u32::try_from(self.validate_block(block)?).map_err(|_| {
+                    Error::InferenceError("accelerator prefill page index exceeds u32".into())
+                })?;
+                block_table[table_start + logical_page] = physical_page;
+                compact_rows[compact_table_start + logical_page] = physical_page;
+            }
+
+            next_query = next_query.checked_add(row.query_len).ok_or_else(|| {
+                Error::InferenceError("accelerator prefill query range overflow".into())
+            })?;
+            cumulative_context =
+                cumulative_context
+                    .checked_add(row.context_len)
+                    .ok_or_else(|| {
+                        Error::InferenceError("accelerator prefill context range overflow".into())
+                    })?;
+            cumulative_queries.push(next_query);
+            cumulative_contexts.push(cumulative_context);
+        }
+        if next_query as usize != total_queries {
+            return Err(Error::InferenceError(
+                "accelerator paged prefill rows do not cover every query exactly once".into(),
+            ));
+        }
+
+        Ok(LoweredPrefillMetadata {
+            cache_key: PrefillMetadataCacheKey {
+                rows: args.rows.to_vec(),
+                total_queries,
+            },
+            compact_rows,
+            cumulative_queries,
+            cumulative_contexts,
+            block_table,
+            sequence_count,
+            total_queries,
+            max_blocks,
+            max_query_len,
+            max_context_len,
+            all_first_page_offsets_zero,
+        })
+    }
+
+    fn cached_prefill_device_metadata(
+        &self,
+        lowered: &LoweredPrefillMetadata,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let mut cache = self.prefill_metadata_cache.lock().map_err(|_| {
+            Error::InferenceError("accelerator prefill metadata cache was poisoned".into())
+        })?;
+        if let Some(cached) = cache
+            .as_ref()
+            .filter(|cached| cached.key == lowered.cache_key)
+        {
+            self.prefill_metadata_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok((
+                cached.cumulative_queries.clone(),
+                cached.cumulative_contexts.clone(),
+                cached.block_table.clone(),
+            ));
+        }
+
+        let cumulative_queries = Tensor::from_vec(
+            lowered.cumulative_queries.clone(),
+            lowered.cumulative_queries.len(),
+            &self.device,
+        )?;
+        let cumulative_contexts = Tensor::from_vec(
+            lowered.cumulative_contexts.clone(),
+            lowered.cumulative_contexts.len(),
+            &self.device,
+        )?;
+        let block_table = Tensor::from_vec(
+            lowered.block_table.clone(),
+            (lowered.sequence_count, lowered.max_blocks),
+            &self.device,
+        )?;
+        *cache = Some(CachedPrefillDeviceMetadata {
+            key: lowered.cache_key.clone(),
+            cumulative_queries: cumulative_queries.clone(),
+            cumulative_contexts: cumulative_contexts.clone(),
+            block_table: block_table.clone(),
+        });
+        self.prefill_metadata_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        Ok((cumulative_queries, cumulative_contexts, block_table))
+    }
+
+    #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+    fn cuda_flash_paged_prefill(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: &PagedKvPrefillArgs<'_>,
+        lowered: &LoweredPrefillMetadata,
+    ) -> Result<Tensor> {
+        let (cumulative_queries, cumulative_contexts, block_table) =
+            self.cached_prefill_device_metadata(lowered)?;
+        Ok(candle_flash_attn::flash_attn_varlen_paged_windowed(
+            args.queries,
+            &layer.keys,
+            &layer.values,
+            &cumulative_queries,
+            &cumulative_contexts,
+            &block_table,
+            None,
+            lowered.max_query_len,
+            lowered.max_context_len,
+            args.softmax_scale,
+            args.window_tokens
+                .map(|window| window.saturating_sub(1) as usize),
+            Some(0),
+            self.config.page_tokens as usize,
+            args.softcap,
+        )?)
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_paged_prefill(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: &PagedKvPrefillArgs<'_>,
+        lowered: &LoweredPrefillMetadata,
+    ) -> Result<Tensor> {
+        Ok(crate::kernels::metal::paged_prefill_attention(
+            args.queries,
+            &layer.keys,
+            &layer.values,
+            lowered.compact_rows.clone(),
+            lowered.sequence_count,
+            lowered.total_queries,
+            args.queries.dims()[1],
+            layer.num_kv_heads,
+            self.config.page_tokens as usize,
+            lowered.max_blocks,
+            layer.key_head_dim,
+            layer.value_head_dim,
+            args.softmax_scale,
+            args.softcap,
+            args.window_tokens,
+        )?)
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_paged_decode(
         &self,
@@ -455,7 +707,7 @@ impl CandleAcceleratorKvArena {
                 None,
                 None,
                 self.config.page_tokens as usize,
-                None,
+                args.softcap,
             )?);
         }
 
@@ -481,6 +733,7 @@ impl CandleAcceleratorKvArena {
             layer.key_head_dim,
             layer.value_head_dim,
             args.softmax_scale,
+            args.softcap,
         )?)
     }
 
@@ -516,6 +769,7 @@ impl CandleAcceleratorKvArena {
             layer.key_head_dim,
             layer.value_head_dim,
             args.softmax_scale,
+            args.softcap,
         )?)
     }
 }
@@ -706,6 +960,47 @@ impl KvArena for CandleAcceleratorKvArena {
         ))
     }
 
+    fn paged_prefill(
+        &self,
+        binding: KvLayerBinding,
+        args: PagedKvPrefillArgs<'_>,
+    ) -> Result<Tensor> {
+        let layer = self.layer(binding)?;
+        validate_prefill_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
+        let lowered = self.lower_prefill_metadata(&args)?;
+
+        #[cfg(feature = "metal")]
+        if self.backend == BackendKind::Metal
+            && matches!(self.config.dtype, DType::F32 | DType::F16)
+        {
+            let _guard = self.mutation_lock.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+            })?;
+            let output = self.metal_paged_prefill(layer, &args, &lowered)?;
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
+        }
+
+        #[cfg(all(feature = "cuda", feature = "flash-attn"))]
+        if self.backend == BackendKind::Cuda
+            && matches!(self.config.dtype, DType::F16 | DType::BF16)
+            && self.config.page_tokens % 32 == 0
+            && lowered.all_first_page_offsets_zero
+            && layer.key_head_dim == layer.value_head_dim
+            && layer.key_head_dim <= 512
+            && layer.key_head_dim % 8 == 0
+        {
+            let _guard = self.mutation_lock.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+            })?;
+            let output = self.cuda_flash_paged_prefill(layer, &args, &lowered)?;
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
+        }
+
+        super::portable_paged_prefill(self, binding, args)
+    }
+
     fn paged_decode(&self, binding: KvLayerBinding, args: PagedKvDecodeArgs<'_>) -> Result<Tensor> {
         if !candle_accelerator_kv_support(self.backend).direct_paged_attention {
             return Err(Error::InferenceError(format!(
@@ -745,6 +1040,8 @@ impl KvArena for CandleAcceleratorKvArena {
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
             page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
+            attention_plan_cache_hits: self.prefill_metadata_cache_hits.load(Ordering::Relaxed),
+            attention_plan_cache_misses: self.prefill_metadata_cache_misses.load(Ordering::Relaxed),
             host_synchronizations: self.host_synchronizations.load(Ordering::Relaxed),
         }
     }
@@ -1011,7 +1308,56 @@ fn validate_decode_query(
             "paged decode softmax scale must be finite and positive".into(),
         ));
     }
-    Ok(())
+    super::validate_attention_softcap(args.softcap)
+}
+
+fn validate_prefill_query(
+    layer: &AcceleratorLayerStorage,
+    args: &PagedKvPrefillArgs<'_>,
+    dtype: DType,
+    device: &Device,
+    backend: BackendKind,
+) -> Result<()> {
+    if args.queries.device().location() != device.location() {
+        return Err(Error::InferenceError(format!(
+            "{backend:?} paged prefill queries are on the wrong device"
+        )));
+    }
+    if args.queries.dtype() != dtype {
+        return Err(Error::InferenceError(format!(
+            "{backend:?} paged prefill query dtype {:?} does not match arena dtype {dtype:?}",
+            args.queries.dtype()
+        )));
+    }
+    if !args.queries.layout().is_contiguous() {
+        return Err(Error::InferenceError(format!(
+            "{backend:?} paged prefill queries must be contiguous"
+        )));
+    }
+    let dims = args.queries.dims();
+    if dims.len() != 3 || dims[0] == 0 || dims[2] != layer.key_head_dim {
+        return Err(Error::InferenceError(format!(
+            "{backend:?} paged prefill query shape {dims:?} does not match key head dimension {}",
+            layer.key_head_dim
+        )));
+    }
+    if dims[1] == 0 || dims[1] % layer.num_kv_heads != 0 {
+        return Err(Error::InferenceError(format!(
+            "{backend:?} paged prefill query heads {} are not divisible by KV heads {}",
+            dims[1], layer.num_kv_heads
+        )));
+    }
+    if !args.softmax_scale.is_finite() || args.softmax_scale <= 0.0 {
+        return Err(Error::InferenceError(
+            "paged prefill softmax scale must be finite and positive".into(),
+        ));
+    }
+    if args.window_tokens == Some(0) {
+        return Err(Error::InferenceError(
+            "paged prefill attention window must be non-zero".into(),
+        ));
+    }
+    super::validate_attention_softcap(args.softcap)
 }
 
 fn accelerator_indices(indices: &[usize], device: &Device) -> Result<Tensor> {
@@ -1183,7 +1529,96 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
-    fn metal_paged_decode_matches_cpu_for_ragged_shuffled_mha_gqa_mqa() -> Result<()> {
+    fn prefill_lowering_is_compact_and_cache_key_tracks_generations() -> Result<()> {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return Ok(());
+        };
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(1),
+            backend: BackendKind::Metal,
+            device_ordinal: Some(0),
+            generation: 1,
+        };
+        let group = KvGroupId::new(0);
+        let config = KvArenaConfig {
+            id: arena_id,
+            group,
+            page_tokens: 2,
+            capacity_pages: 4,
+            dtype: DType::F32,
+            layers: vec![super::super::KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 3,
+            }],
+        };
+        let arena = CandleAcceleratorKvArena::new_mutation_only(config, device.clone())?;
+        let block = |index, slot_generation| CacheBlockRef {
+            arena: arena_id,
+            group,
+            index,
+            slot_generation,
+        };
+        let rows = vec![
+            PagedKvPrefillRow {
+                blocks: vec![block(2, 1), block(0, 1)],
+                first_page_offset: 1,
+                query_start: 0,
+                query_len: 2,
+                context_len: 3,
+            },
+            PagedKvPrefillRow {
+                blocks: vec![block(3, 1)],
+                first_page_offset: 0,
+                query_start: 2,
+                query_len: 1,
+                context_len: 2,
+            },
+        ];
+        let queries = Tensor::zeros((3, 2, 2), DType::F32, &device)?;
+        let args = PagedKvPrefillArgs {
+            queries: &queries,
+            rows: &rows,
+            softmax_scale: 0.5,
+            softcap: None,
+            window_tokens: None,
+        };
+        let lowered = arena.lower_prefill_metadata(&args)?;
+        assert_eq!(lowered.cumulative_queries, vec![0, 2, 3]);
+        assert_eq!(lowered.cumulative_contexts, vec![0, 3, 5]);
+        assert_eq!(lowered.block_table, vec![2, 0, 3, 0]);
+        assert_eq!(
+            lowered.compact_rows,
+            vec![0, 2, 2, 1, 3, 2, 1, 0, 2, 0, 3, 0]
+        );
+        assert_eq!(lowered.max_query_len, 2);
+        assert_eq!(lowered.max_context_len, 3);
+        assert!(!lowered.all_first_page_offsets_zero);
+
+        let mut next_generation_rows = rows.clone();
+        next_generation_rows[0].blocks[0].slot_generation = 2;
+        let next_generation = arena.lower_prefill_metadata(&PagedKvPrefillArgs {
+            rows: &next_generation_rows,
+            ..args
+        })?;
+        assert_ne!(lowered.cache_key, next_generation.cache_key);
+        arena.cached_prefill_device_metadata(&lowered)?;
+        arena.cached_prefill_device_metadata(&lowered)?;
+        arena.cached_prefill_device_metadata(&next_generation)?;
+        let stats = arena.operation_stats();
+        assert_eq!(stats.attention_plan_cache_hits, 1);
+        assert_eq!(stats.attention_plan_cache_misses, 2);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_paged_decode_and_prefill_match_cpu_for_ragged_shuffled_mha_gqa_mqa() -> Result<()> {
         // Candle 0.11 panics inside Device::new_metal when Metal reports an
         // empty device list, so feature-only CI must guard both failure modes.
         let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
@@ -1334,6 +1769,7 @@ mod tests {
                         queries: &metal_query,
                         batch: &metal_batch,
                         softmax_scale: 0.5,
+                        softcap: None,
                     },
                 )?;
                 let cpu_output = cpu_arena.paged_decode(
@@ -1342,6 +1778,7 @@ mod tests {
                         queries: &cpu_query,
                         batch: &cpu_batch,
                         softmax_scale: 0.5,
+                        softcap: None,
                     },
                 )?;
                 let metal_values = metal_output
@@ -1360,6 +1797,122 @@ mod tests {
                         (actual - expected).abs() < tolerance,
                         "{dtype:?} {num_query_heads}Q/{num_kv_heads}KV: {actual} != {expected}"
                     );
+                }
+
+                let metal_rows = vec![
+                    PagedKvPrefillRow {
+                        blocks: vec![metal_block(2), metal_block(0)],
+                        first_page_offset: 1,
+                        query_start: 0,
+                        query_len: 2,
+                        context_len: 3,
+                    },
+                    PagedKvPrefillRow {
+                        blocks: vec![metal_block(3)],
+                        first_page_offset: 0,
+                        query_start: 2,
+                        query_len: 1,
+                        context_len: 2,
+                    },
+                ];
+                let cpu_rows = vec![
+                    PagedKvPrefillRow {
+                        blocks: vec![cpu_block(2), cpu_block(0)],
+                        first_page_offset: 1,
+                        query_start: 0,
+                        query_len: 2,
+                        context_len: 3,
+                    },
+                    PagedKvPrefillRow {
+                        blocks: vec![cpu_block(3)],
+                        first_page_offset: 0,
+                        query_start: 2,
+                        query_len: 1,
+                        context_len: 2,
+                    },
+                ];
+                let prefill_query_data = (0..(3 * num_query_heads * 2))
+                    .map(|index| (index as f32 - 4.0) / 6.0)
+                    .collect::<Vec<_>>();
+                let metal_prefill_queries =
+                    Tensor::from_vec(prefill_query_data.clone(), (3, num_query_heads, 2), &device)?
+                        .to_dtype(dtype)?;
+                let cpu_prefill_queries =
+                    Tensor::from_vec(prefill_query_data, (3, num_query_heads, 2), &Device::Cpu)?
+                        .to_dtype(dtype)?;
+                let metal_prefill = metal_arena.paged_prefill(
+                    binding,
+                    PagedKvPrefillArgs {
+                        queries: &metal_prefill_queries,
+                        rows: &metal_rows,
+                        softmax_scale: 0.5,
+                        softcap: None,
+                        window_tokens: None,
+                    },
+                )?;
+                let cpu_prefill = cpu_arena.paged_prefill(
+                    binding,
+                    PagedKvPrefillArgs {
+                        queries: &cpu_prefill_queries,
+                        rows: &cpu_rows,
+                        softmax_scale: 0.5,
+                        softcap: None,
+                        window_tokens: None,
+                    },
+                )?;
+                let metal_prefill = metal_prefill
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let cpu_prefill = cpu_prefill
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert_eq!(metal_prefill.len(), cpu_prefill.len());
+                for (actual, expected) in metal_prefill.iter().zip(cpu_prefill.iter()) {
+                    assert!(
+                        (actual - expected).abs() < tolerance,
+                        "prefill {dtype:?} {num_query_heads}Q/{num_kv_heads}KV: {actual} != {expected}"
+                    );
+                }
+
+                if dtype == DType::F32 && num_kv_heads == 1 && num_query_heads == 2 {
+                    let metal_windowed = metal_arena.paged_prefill(
+                        binding,
+                        PagedKvPrefillArgs {
+                            queries: &metal_prefill_queries,
+                            rows: &metal_rows,
+                            softmax_scale: 0.5,
+                            softcap: None,
+                            window_tokens: Some(2),
+                        },
+                    )?;
+                    let cpu_windowed = cpu_arena.paged_prefill(
+                        binding,
+                        PagedKvPrefillArgs {
+                            queries: &cpu_prefill_queries,
+                            rows: &cpu_rows,
+                            softmax_scale: 0.5,
+                            softcap: None,
+                            window_tokens: Some(2),
+                        },
+                    )?;
+                    let metal_windowed = metal_windowed
+                        .to_device(&Device::Cpu)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let cpu_windowed = cpu_windowed
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    for (actual, expected) in metal_windowed.iter().zip(cpu_windowed.iter()) {
+                        assert!(
+                            (actual - expected).abs() < 1e-5,
+                            "windowed portable prefill fallback: {actual} != {expected}"
+                        );
+                    }
                 }
             }
         }
@@ -1520,6 +2073,7 @@ mod tests {
                         queries: &cuda_query,
                         batch: &cuda_batch,
                         softmax_scale: 0.5,
+                        softcap: None,
                     },
                 )?;
                 let cpu_output = cpu_arena.paged_decode(
@@ -1528,6 +2082,7 @@ mod tests {
                         queries: &cpu_query,
                         batch: &cpu_batch,
                         softmax_scale: 0.5,
+                        softcap: None,
                     },
                 )?;
                 let actual = cuda_output

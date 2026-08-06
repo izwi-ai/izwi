@@ -228,6 +228,7 @@ fn depthformer_domain(config: &Lfm25AudioDecoderConfig) -> Result<StateDomainSpe
                 key_encoding: KeyEncoding::Rotary {
                     rotary_dim: head_dim,
                 },
+                attention_logit_softcap: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;

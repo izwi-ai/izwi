@@ -273,6 +273,7 @@ pub fn paged_decode_attention(
     key_dim: usize,
     value_dim: usize,
     softmax_scale: f32,
+    softcap: Option<f32>,
 ) -> candle_core::Result<Tensor> {
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
@@ -303,6 +304,7 @@ pub fn paged_decode_attention(
         || max_blocks == 0
         || !softmax_scale.is_finite()
         || softmax_scale <= 0.0
+        || softcap.is_some_and(|softcap| !softcap.is_finite() || softcap <= 0.0)
     {
         candle_core::bail!("CUDA paged decode received invalid tensor or attention geometry")
     }
@@ -332,6 +334,7 @@ pub fn paged_decode_attention(
             key_dim,
             value_dim,
             softmax_scale,
+            softcap,
         },
     )
 }
@@ -675,6 +678,7 @@ struct CudaPagedDecodeOp {
     key_dim: usize,
     value_dim: usize,
     softmax_scale: f32,
+    softcap: Option<f32>,
 }
 
 struct CudaPhysicalRingShortConvOp {
@@ -885,7 +889,8 @@ impl CustomOp3 for CudaPagedDecodeOp {
                     self.max_blocks as i32,
                     self.key_dim as i32,
                     self.value_dim as i32,
-                    self.softmax_scale
+                    self.softmax_scale,
+                    self.softcap.unwrap_or(0.0)
                 );
                 // SAFETY: argument types, tensor bounds, and launch dimensions
                 // match the selected CUDA kernel signature.
@@ -941,6 +946,75 @@ mod tests {
         assert!(try_fused_l2_norm(&lhs, 1e-6).is_none());
         assert!(try_fused_rms_norm(&lhs, &rhs, 1e-6).is_none());
         assert!(try_fused_gated_rms_norm(&lhs, &rhs, &rhs, 1e-6).is_none());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_paged_decode_softcap_matches_reference_for_supported_dtypes() {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            return;
+        };
+        let cpu = candle_core::Device::Cpu;
+        let query_data = vec![2.0f32, -1.0];
+        let key_data = vec![4.0f32, 0.0, 0.0, 2.0];
+        let value_data = vec![1.0f32, 3.0, 5.0, -2.0];
+        let metadata = vec![2, 0, 0];
+        let softcap = 0.5f32;
+        let raw_scores = [8.0f32, -2.0];
+        let scores = raw_scores.map(|score| softcap * (score / softcap).tanh());
+        let max_score = scores[0].max(scores[1]);
+        let weights = scores.map(|score| (score - max_score).exp());
+        let denominator = weights[0] + weights[1];
+        let expected = [
+            (weights[0] * 1.0 + weights[1] * 5.0) / denominator,
+            (weights[0] * 3.0 + weights[1] * -2.0) / denominator,
+        ];
+
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let queries = Tensor::from_vec(query_data.clone(), (1, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let keys = Tensor::from_vec(key_data.clone(), (1, 2, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let values = Tensor::from_vec(value_data.clone(), (1, 2, 1, 2), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let actual = paged_decode_attention(
+                &queries,
+                &keys,
+                &values,
+                metadata.clone(),
+                1,
+                1,
+                1,
+                2,
+                1,
+                2,
+                2,
+                1.0,
+                Some(softcap),
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let tolerance = if dtype == DType::F32 { 1e-5 } else { 5e-3 };
+            for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{dtype:?} softcap mismatch at {index}: {actual} != {expected}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "cuda")]

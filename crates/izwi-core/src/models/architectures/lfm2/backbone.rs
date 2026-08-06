@@ -364,14 +364,26 @@ impl AttentionLayer {
         let queries = queries.squeeze(0)?.transpose(0, 1)?.contiguous()?;
         let keys = keys.squeeze(0)?.transpose(0, 1)?.contiguous()?;
         let values = values.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-        let output = cache.write_and_attend(
-            self.physical_layer,
-            prepared,
-            &queries,
-            &keys,
-            &values,
-            (1.0f64 / (self.head_dim as f64).sqrt()) as f32,
-        )?;
+        let softmax_scale = (1.0f64 / (self.head_dim as f64).sqrt()) as f32;
+        let output = match self.sliding_window {
+            Some(window_tokens) => cache.write_and_attend_with_window(
+                self.physical_layer,
+                prepared,
+                &queries,
+                &keys,
+                &values,
+                softmax_scale,
+                window_tokens,
+            )?,
+            None => cache.write_and_attend(
+                self.physical_layer,
+                prepared,
+                &queries,
+                &keys,
+                &values,
+                softmax_scale,
+            )?,
+        };
         let output = output.reshape((batch_size, seq_len, hidden_size))?;
         self.wo.forward(&output).map_err(Error::from)
     }
@@ -798,7 +810,7 @@ impl QuantizedLfm2Backbone {
         cache: &mut PhysicalPagedKvCache,
         shortconv: &mut InvocationTensorLease,
     ) -> Result<Tensor> {
-        let (batch, seq_len, hidden) = input_embeds.dims3()?;
+        let (batch, _seq_len, hidden) = input_embeds.dims3()?;
         if batch != 1 || hidden != self.cfg.embedding_length || index_pos != cache.context_len() {
             return Err(Error::InvalidInput(
                 "LFM2 physical input does not match its invocation state".into(),
@@ -820,28 +832,13 @@ impl QuantizedLfm2Backbone {
             .collect::<Vec<_>>();
         cache.validate_sparse_model_layers(&sparse_geometry)?;
 
-        if let Some(window_tokens) = self.cfg.attention_sliding_window {
-            let mut outputs = Vec::with_capacity(seq_len);
-            for offset in 0..seq_len {
-                outputs.push(
-                    self.forward_embeds_physical_chunk(
-                        &input_embeds.narrow(1, offset, 1)?,
-                        index_pos
-                            .checked_add(offset)
-                            .ok_or_else(|| Error::InvalidInput("LFM2 position overflow".into()))?,
-                        cache,
-                        shortconv,
-                        Some(window_tokens),
-                    )?,
-                );
-            }
-            return match outputs.as_slice() {
-                [single] => Ok(single.clone()),
-                _ => Tensor::cat(&outputs, 1).map_err(Error::from),
-            };
-        }
-
-        self.forward_embeds_physical_chunk(input_embeds, index_pos, cache, shortconv, None)
+        self.forward_embeds_physical_chunk(
+            input_embeds,
+            index_pos,
+            cache,
+            shortconv,
+            self.cfg.attention_sliding_window,
+        )
     }
 
     fn forward_embeds_physical_chunk(

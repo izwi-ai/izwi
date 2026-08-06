@@ -79,6 +79,7 @@ pub(crate) fn qwen35_composite_cache_contract(
                 pattern: AttentionPattern::Full,
                 mask: AttentionMask::Causal,
                 key_encoding: KeyEncoding::Rotary { rotary_dim },
+                attention_logit_softcap: None,
             });
         } else {
             recurrent_layers.push((model_layer, recurrent_elements));

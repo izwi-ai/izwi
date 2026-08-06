@@ -61,7 +61,8 @@ __device__ void izwi_paged_decode_attention(
     int max_blocks,
     int key_dim,
     int value_dim,
-    float softmax_scale) {
+    float softmax_scale,
+    float softcap) {
   const int row_head = blockIdx.x;
   if (row_head >= batch * query_heads) {
     return;
@@ -111,7 +112,10 @@ __device__ void izwi_paged_decode_attention(
     }
 
     if (threadIdx.x == 0) {
-      const float score = reduction[0] * softmax_scale;
+      float score = reduction[0] * softmax_scale;
+      if (softcap > 0.0f) {
+        score = softcap * tanhf(score / softcap);
+      }
       const float next_max = fmaxf(running_max, score);
       const float previous_weight = expf(running_max - next_max);
       const float token_weight = expf(score - next_max);
@@ -167,10 +171,11 @@ extern "C" __global__ void physical_paged_decode_f32(
     int max_blocks,
     int key_dim,
     int value_dim,
-    float softmax_scale) {
+    float softmax_scale,
+    float softcap) {
   izwi_paged_decode_attention(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
-      page_tokens, max_blocks, key_dim, value_dim, softmax_scale);
+      page_tokens, max_blocks, key_dim, value_dim, softmax_scale, softcap);
 }
 
 extern "C" __global__ void physical_paged_decode_f16(
@@ -186,10 +191,11 @@ extern "C" __global__ void physical_paged_decode_f16(
     int max_blocks,
     int key_dim,
     int value_dim,
-    float softmax_scale) {
+    float softmax_scale,
+    float softcap) {
   izwi_paged_decode_attention(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
-      page_tokens, max_blocks, key_dim, value_dim, softmax_scale);
+      page_tokens, max_blocks, key_dim, value_dim, softmax_scale, softcap);
 }
 
 extern "C" __global__ void physical_paged_decode_bf16(
@@ -205,10 +211,11 @@ extern "C" __global__ void physical_paged_decode_bf16(
     int max_blocks,
     int key_dim,
     int value_dim,
-    float softmax_scale) {
+    float softmax_scale,
+    float softcap) {
   izwi_paged_decode_attention(
       queries, keys, values, metadata, output, batch, query_heads, kv_heads,
-      page_tokens, max_blocks, key_dim, value_dim, softmax_scale);
+      page_tokens, max_blocks, key_dim, value_dim, softmax_scale, softcap);
 }
 
 // Consume a physical circular ShortConv ring directly. The ring layout is

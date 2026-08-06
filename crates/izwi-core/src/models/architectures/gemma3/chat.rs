@@ -564,18 +564,18 @@ impl Gemma3ChatModel {
                 "Gemma physical prefill must retain at least one private prompt token".into(),
             ));
         }
-        let mut logits = None;
-        for (offset, token) in prompt_ids[reused_prefix..].iter().copied().enumerate() {
-            let position = reused_prefix + offset;
-            let input = Tensor::from_vec(vec![token], (1, 1), &self.device.device)?;
-            logits = Some(
-                self.text_model
-                    .forward_physical(&input, position, &mut cache)?,
-            );
-        }
+        let private_prompt = &prompt_ids[reused_prefix..];
+        let input = Tensor::from_slice(
+            private_prompt,
+            (1, private_prompt.len()),
+            &self.device.device,
+        )?;
+        let logits = self
+            .text_model
+            .forward_physical(&input, reused_prefix, &mut cache)?;
         Ok(ChatDecodeState {
             cache,
-            unconsumed_logits: logits,
+            unconsumed_logits: Some(logits),
             position: prompt_ids.len(),
             pending_token: None,
             generated_ids: Vec::new(),

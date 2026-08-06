@@ -793,6 +793,9 @@ pub(crate) struct PagedAttentionLayerSpec {
     pub(crate) pattern: AttentionPattern,
     pub(crate) mask: AttentionMask,
     pub(crate) key_encoding: KeyEncoding,
+    /// Optional post-scale, pre-softmax Gemma-style attention-logit cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attention_logit_softcap: Option<AttentionLogitSoftcap>,
 }
 
 impl PagedAttentionLayerSpec {
@@ -816,6 +819,54 @@ impl PagedAttentionLayerSpec {
         self.pattern.validate()?;
         self.mask.validate()?;
         self.key_encoding.validate(self.key_head_dim)
+    }
+}
+
+/// Finite positive attention-logit softcap with bit-exact equality for
+/// semantic contract fingerprints.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AttentionLogitSoftcap(u32);
+
+impl AttentionLogitSoftcap {
+    pub(crate) fn new(value: f32) -> Result<Self> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(invalid(
+                "attention-logit softcap must be finite and positive",
+            ));
+        }
+        Ok(Self(value.to_bits()))
+    }
+
+    pub(crate) const fn get(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+}
+
+impl fmt::Debug for AttentionLogitSoftcap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AttentionLogitSoftcap")
+            .field(&self.get())
+            .finish()
+    }
+}
+
+impl Serialize for AttentionLogitSoftcap {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_f32(self.get())
+    }
+}
+
+impl<'de> Deserialize<'de> for AttentionLogitSoftcap {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f32::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -968,6 +1019,7 @@ pub(crate) fn test_contract() -> InferenceStateContract {
                 pattern: AttentionPattern::Full,
                 mask: AttentionMask::Causal,
                 key_encoding: KeyEncoding::Rotary { rotary_dim: 64 },
+                attention_logit_softcap: None,
             }],
             page_size: PageSizeConstraint {
                 min_tokens: 8,
@@ -1031,6 +1083,29 @@ mod tests {
         };
         domain.layers[0].kv_heads = 8;
         assert_ne!(first.fingerprint().unwrap(), changed.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn attention_softcap_preserves_legacy_none_encoding_and_changes_fingerprint_when_set() {
+        let contract = test_contract();
+        let legacy = serde_json::to_value(&contract).unwrap();
+        assert!(legacy["domains"][0]["layers"][0]
+            .get("attention_logit_softcap")
+            .is_none());
+        let decoded: InferenceStateContract = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        assert_eq!(decoded.fingerprint().unwrap(), contract.fingerprint().unwrap());
+
+        let mut softcapped = contract.clone();
+        let StateDomainSpec::PagedAttention(domain) = &mut softcapped.domains[0] else {
+            unreachable!()
+        };
+        domain.layers[0].attention_logit_softcap =
+            Some(AttentionLogitSoftcap::new(30.0).unwrap());
+        assert_ne!(
+            contract.fingerprint().unwrap(),
+            softcapped.fingerprint().unwrap()
+        );
     }
 
     #[test]

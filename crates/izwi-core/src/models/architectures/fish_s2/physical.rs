@@ -219,6 +219,7 @@ fn fish_s2_paged_domain(
                 key_encoding: KeyEncoding::Rotary {
                     rotary_dim: head_dim,
                 },
+                attention_logit_softcap: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;

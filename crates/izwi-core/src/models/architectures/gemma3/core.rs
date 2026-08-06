@@ -12,10 +12,11 @@ use crate::backends::kv::{
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    AttentionMask, AttentionPattern, CheckpointPolicy, InferenceStateContract, KeyEncoding,
-    PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec, PlacementPolicy,
-    PositionSemantics, PrefixPolicy, StateClock, StateDType, StateDomainHeader, StateDomainId,
-    StateDomainSpec, StateGroupId, StateGroupSpec, StateScope, CURRENT_INFERENCE_STATE_ABI,
+    AttentionLogitSoftcap, AttentionMask, AttentionPattern, CheckpointPolicy,
+    InferenceStateContract, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
+    PagedAttentionLayerSpec, PlacementPolicy, PositionSemantics, PrefixPolicy, StateClock,
+    StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec,
+    StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -151,6 +152,7 @@ struct GemmaAttention {
     num_kv_heads: usize,
     head_dim: usize,
     softmax_scale: f32,
+    softcap: Option<f32>,
     sliding_window: Option<usize>,
 }
 
@@ -194,6 +196,7 @@ impl GemmaAttention {
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             softmax_scale: 1.0 / (config.query_pre_attn_scalar as f32).sqrt(),
+            softcap: config.attn_logit_softcapping.map(|value| value as f32),
             sliding_window,
         })
     }
@@ -207,9 +210,9 @@ impl GemmaAttention {
         layer_index: usize,
     ) -> Result<Tensor> {
         let (batch, sequence, _) = input.dims3()?;
-        if batch != 1 || sequence != 1 {
+        if batch != 1 || sequence == 0 {
             return Err(Error::InvalidInput(
-                "Gemma physical attention requires one token per sequence step".into(),
+                "Gemma physical attention requires one non-empty sequence".into(),
             ));
         }
         let query = self
@@ -238,25 +241,16 @@ impl GemmaAttention {
             .transpose(1, 2)?
             .reshape((sequence, self.num_kv_heads, self.head_dim))?
             .contiguous()?;
-        let attended = match self.sliding_window {
-            Some(window) => cache.write_and_attend_with_window(
-                layer_index,
-                prepared,
-                &query,
-                &key,
-                &value,
-                self.softmax_scale,
-                window,
-            )?,
-            None => cache.write_and_attend(
-                layer_index,
-                prepared,
-                &query,
-                &key,
-                &value,
-                self.softmax_scale,
-            )?,
-        };
+        let attended = cache.write_and_attend_with_semantics(
+            layer_index,
+            prepared,
+            &query,
+            &key,
+            &value,
+            self.softmax_scale,
+            self.softcap,
+            self.sliding_window,
+        )?;
         attended
             .reshape((batch, sequence, self.num_heads * self.head_dim))?
             .apply(&self.output)
@@ -351,6 +345,7 @@ impl GemmaAttention {
                     queries: &queries,
                     batch: &metadata,
                     softmax_scale: self.softmax_scale,
+                    softcap: self.softcap,
                 },
             )
         })?;
@@ -461,11 +456,12 @@ pub(crate) struct Gemma3PhysicalModel {
 
 impl Gemma3PhysicalModel {
     pub(crate) fn load(config: Config, vb: VarBuilder) -> Result<Self> {
-        if config.attn_logit_softcapping.is_some() {
-            return Err(Error::ModelLoadError(
-                "Gemma attention-logit softcapping is not supported by physical paged kernels"
-                    .into(),
-            ));
+        if let Some(softcap) = config.attn_logit_softcapping {
+            AttentionLogitSoftcap::new(softcap as f32).map_err(|_| {
+                Error::ModelLoadError(
+                    "Gemma attention-logit softcapping must be finite and positive".into(),
+                )
+            })?;
         }
         if config.sliding_window == 0 || config.sliding_window_pattern == 0 {
             return Err(Error::ModelLoadError(
@@ -527,6 +523,11 @@ impl Gemma3PhysicalModel {
             .map_err(|_| Error::InvalidInput("Gemma query head count exceeds u32".into()))?;
         let kv_heads = u32::try_from(self.config.num_key_value_heads)
             .map_err(|_| Error::InvalidInput("Gemma KV head count exceeds u32".into()))?;
+        let attention_logit_softcap = self
+            .config
+            .attn_logit_softcapping
+            .map(|softcap| AttentionLogitSoftcap::new(softcap as f32))
+            .transpose()?;
         let layers = (0..self.config.num_hidden_layers)
             .map(|index| PagedAttentionLayerSpec {
                 model_layer: index as u32,
@@ -545,6 +546,7 @@ impl Gemma3PhysicalModel {
                 key_encoding: KeyEncoding::Rotary {
                     rotary_dim: head_dim,
                 },
+                attention_logit_softcap,
             })
             .collect();
         let contract = InferenceStateContract {
@@ -586,9 +588,17 @@ impl Gemma3PhysicalModel {
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
         let (batch, sequence) = input_ids.dims2()?;
-        if batch != 1 || sequence != 1 {
+        if batch != 1 || sequence == 0 {
             return Err(Error::InvalidInput(
-                "Gemma physical decoder requires [1,1] token steps".into(),
+                "Gemma physical decoder requires one non-empty token sequence".into(),
+            ));
+        }
+        let end_position = position
+            .checked_add(sequence)
+            .ok_or_else(|| Error::InvalidInput("Gemma physical position overflow".into()))?;
+        if end_position > self.config.max_position_embeddings {
+            return Err(Error::InvalidInput(
+                "Gemma physical sequence exceeds maximum position embeddings".into(),
             ));
         }
         cache.validate_model(
@@ -596,7 +606,7 @@ impl Gemma3PhysicalModel {
             self.config.num_key_value_heads,
             self.config.head_dim,
         )?;
-        let mut prepared = cache.prepare_append(position, 1)?;
+        let mut prepared = cache.prepare_append(position, sequence)?;
         let mut hidden =
             (self.embedding.forward(input_ids)? * (self.config.hidden_size as f64).sqrt())?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -608,6 +618,7 @@ impl Gemma3PhysicalModel {
             Some(softcap) => ((logits / softcap)?.tanh()? * softcap)?,
             None => logits,
         };
+        let logits = logits.narrow(1, sequence - 1, 1)?;
         cache.commit_prepared(prepared)?;
         Ok(logits)
     }
@@ -908,7 +919,8 @@ mod tests {
 
     #[test]
     fn gemma_contract_preserves_loaded_global_and_local_layer_pattern() {
-        let config = tiny_config();
+        let mut config = tiny_config();
+        config.attn_logit_softcapping = Some(2.5);
         let model = Gemma3PhysicalModel::load(
             config.clone(),
             VarBuilder::from_tensors(tiny_weights(&config), DType::F32, &Device::Cpu),
@@ -926,6 +938,40 @@ mod tests {
             AttentionPattern::SlidingWindow { window_tokens: 2 }
         ));
         assert!(matches!(domain.layers[1].pattern, AttentionPattern::Full));
+        assert!(domain.layers.iter().all(|layer| {
+            layer.attention_logit_softcap.map(AttentionLogitSoftcap::get) == Some(2.5)
+        }));
+    }
+
+    #[test]
+    fn multi_token_physical_prefill_matches_softcapped_gemma_dependency() {
+        let mut config = tiny_config();
+        config.attn_logit_softcapping = Some(1.5);
+        // Candle's batched Gemma mask treats `sliding_window` as prior tokens,
+        // while its incremental cache treats it as total retained tokens. Keep
+        // the window larger than this prompt so this parity test isolates packed
+        // prefill and attention softcapping rather than that dependency mismatch.
+        config.sliding_window = 8;
+        let weights = tiny_weights(&config);
+        let mut dependency = candle_transformers::models::gemma3::Model::new(
+            false,
+            &config,
+            VarBuilder::from_tensors(weights.clone(), DType::F32, &Device::Cpu),
+        )
+        .unwrap();
+        let physical = Gemma3PhysicalModel::load(
+            config.clone(),
+            VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu),
+        )
+        .unwrap();
+        let mut cache = tiny_cache(&config);
+        let input = Tensor::from_vec(vec![1u32, 7, 3, 11], (1, 4), &Device::Cpu).unwrap();
+
+        let expected = dependency.forward(&input, 0).unwrap();
+        let actual = physical.forward_physical(&input, 0, &mut cache).unwrap();
+
+        assert_close(&actual, &expected);
+        assert_eq!(cache.context_len(), 4);
     }
 
     #[test]

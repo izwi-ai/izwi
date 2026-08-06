@@ -176,6 +176,7 @@ pub(crate) fn qwen3_decoder_cache_domain(
             key_encoding: KeyEncoding::Rotary {
                 rotary_dim: key_head_dim,
             },
+            attention_logit_softcap: None,
         })
         .collect();
     Ok(PagedAttentionDomainSpec {
@@ -2133,6 +2134,7 @@ impl Qwen3Attention {
                     queries: &queries,
                     batch: metadata,
                     softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                    softcap: None,
                 },
             )
         })?;

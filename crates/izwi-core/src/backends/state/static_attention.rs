@@ -776,6 +776,7 @@ impl InvocationStaticAttentionArena {
             usize::try_from(layer.semantic.value_head_dim)
                 .map_err(|_| invalid("static-attention value dimension exceeds usize"))?,
             softmax_scale,
+            None,
         )
         .map_err(Error::from)
     }
