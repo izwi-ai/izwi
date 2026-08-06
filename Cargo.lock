@@ -3636,7 +3636,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "izwi-agent"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "async-trait",
  "serde",
@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-asr-toolkit"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "hound",
  "izwi-vad",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-cli"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -3699,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-core"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3752,7 +3752,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-desktop"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "anyhow",
  "clap",
@@ -3774,7 +3774,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-hooks"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "async-trait",
  "sea-orm",
@@ -3786,7 +3786,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-server"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3824,7 +3824,7 @@ dependencies = [
 
 [[package]]
 name = "izwi-vad"
-version = "0.1.0-beta-17"
+version = "0.1.0-beta-18"
 dependencies = [
  "earshot",
 ]

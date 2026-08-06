@@ -64,7 +64,8 @@
         "pages": [
           "index",
           "getting-started",
-          "support-matrix"
+          "support-matrix",
+          "kv-cache-operations"
         ]
       },
       {

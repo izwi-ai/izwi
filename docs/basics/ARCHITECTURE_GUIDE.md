@@ -153,7 +153,7 @@ Request 3: [Block 4][Block 5]
 
 **Benefits**:
 - **No wasted memory**: Unlike contiguous allocation, we only allocate what we need
-- **Shared prefixes**: Multiple requests with the same prompt start can share blocks
+- **Shared prefixes**: With explicit namespaced prefix reuse enabled, matching requests can share committed full pages
 - **Copy-on-Write**: When a shared block needs modification, it's copied only then
 - **Efficient eviction**: Individual blocks can be freed when done
 
@@ -410,11 +410,15 @@ Paged KV cache enables:
 
 2. **Priority Scheduling**: Ensure critical requests (like voice interruption) get processed first.
 
-3. **KV Cache Quantization**: Store cache in Int8 instead of Float16 to reduce memory by 50%.
+3. **KV Cache Quantization**: A future backend-certified Int8/Q4 storage path
+   could reduce memory, but current quantized KV requests fail closed rather
+   than silently allocating dense pages.
 
 4. **Flash Attention**: Use optimized kernels that fuse attention operations and reduce memory reads.
 
-5. **Prefix Caching**: Cache common prompt beginnings (system prompts, conversation starters) for reuse.
+5. **Prefix Caching**: Opt-in, namespaced committed-page reuse can share common
+   prompt beginnings. It is disabled by default and bounded separately from
+   active-request capacity.
 
 ---
 

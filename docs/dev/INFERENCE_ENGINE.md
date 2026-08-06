@@ -249,12 +249,11 @@ EngineCore::step()
   5. OutputProcessor::process()        → samples tokens, emits chunks
 ```
 
-`EngineCore` owns one managed cache coordinator. A loaded adapter publishes a
-typed `CacheCapability`: `Managed` binds a backend-owned physical arena,
-`OpaqueModelOwned` leaves cache tensors with the model while retaining exact
-resource accounting, and `None` declares that the operation keeps no cache.
-Managed negotiation is mandatory for adapters that publish it; there is no
-runtime rollout switch or managed-to-opaque fallback.
+`EngineCore` owns one managed cache coordinator. A loaded adapter publishes an
+ABI-v2 `InferenceStateCapability`: `Managed` binds backend-owned physical state,
+while `Stateless` declares that no mutable state survives the invocation.
+Managed negotiation is mandatory; there is no managed-to-model-owned fallback.
+See [ADR 0001](./adr/0001-inference-state-abi-v2.md) for the ownership contract.
 
 **Metal execution note:** On MPS devices the step loop runs decode and prefill **sequentially** (not in parallel) to avoid Metal command-buffer contention.
 
@@ -453,20 +452,20 @@ All engine parameters are centralised in `EngineCoreConfig` (`engine/config.rs`)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `model_type` | `ModelVariant` | — | Model to load |
-| `model_path` | `PathBuf` | — | Path to weights directory |
-| `max_num_seqs` | `usize` | 256 | Max concurrent sequences |
-| `max_num_batched_tokens` | `usize` | 8192 | Token budget per step |
-| `max_model_len` | `usize` | model-dep. | Max sequence length |
-| `block_size` | `usize` | 16 | KV block size in tokens |
-| `num_cpu_blocks` | `usize` | auto | CPU KV block count |
-| `num_gpu_blocks` | `usize` | auto | GPU KV block count |
-| `enable_chunked_prefill` | `bool` | `true` | Chunked prefill |
+| `models_dir` | `PathBuf` | platform data directory | Model weights directory |
+| `max_batch_size` | `usize` | 8 | Maximum inference batch size |
+| `max_seq_len` | `usize` | 4096 | Maximum sequence length |
+| `max_tokens_per_step` | `usize` | 384 | Scheduler token budget per step |
+| `block_size` | `usize` | 64 | Requested KV page size in tokens |
+| `kv_cache_dtype` | `String` | `float16` | Requested dense KV dtype; Int8/Q4 fail before readiness |
+| `max_blocks` | `usize` | 1024 | Aggregate physical page capacity |
+| `enable_prefix_caching` | `bool` | `false` | Opt in to committed prefix reuse |
+| `managed_prefix_cache_salt` | `Option<String>` | `None` | Required isolation namespace when prefix reuse is enabled |
+| `max_prefix_cache_pages` | `usize` | 128 | Prefix page bound, clamped to preserve request capacity |
+| `enable_chunked_prefill` | `bool` | `false` | Split long prefills across scheduler steps |
+| `chunked_prefill_threshold` | `usize` | 192 | Prompt threshold for chunked prefill |
 | `backend` | `enum` | `auto` | Backend preference (`auto`, `cpu`, `metal`, `cuda`) |
-| `unified_memory_fraction` | `f32` | 0.85 | Metal memory budget |
 | `scheduling_policy` | `SchedulingPolicy` | `Fcfs` | Scheduler policy |
-| `enable_kv_quantization` | `bool` | `false` | Int8 KV quantization |
-| `streaming_chunk_tokens` | `usize` | 1 | Tokens per stream chunk |
 
 `WorkerConfig` is derived from `EngineCoreConfig` and passed to `NativeExecutor` at construction time.
 
@@ -626,11 +625,11 @@ The following features are scaffolded or partially implemented but not yet activ
 | Feature | Status | Notes |
 |---|---|---|
 | **Speculative Decoding** | Stub only | Draft model infrastructure not wired |
-| **KV Cache Quantization (Int8)** | Config flag exists | Quantization kernel not yet applied |
-| **Flash Attention** | Planned | Standard attention used; Flash Attention would reduce memory bandwidth |
-| **Prefix Caching** | Planned | Block sharing infrastructure exists; hash-based prefix lookup not implemented |
+| **KV Cache Quantization (Int8/Q4)** | Unsupported | Legacy values parse for diagnostics, then fail before readiness; dense fallback is forbidden |
+| **Paged FlashAttention** | Conditional | CUDA `flash-attn` builds promote only compatible, certified resolved cells; other cells use Portable |
+| **Prefix Caching** | Opt-in | Namespaced committed-page reuse with copy-on-write and an independent capacity bound |
 | **Beam Search** | Planned | Sampling infrastructure supports it; beam expansion logic pending |
-| **CUDA Backend Parity** | Partial | CUDA routing and execution exist, but packaging truth, CI coverage, and kernel parity are still behind CPU/Metal |
+| **CUDA hardware certification** | Partial | CUDA routing, native paged operations, and conditional FlashAttention exist; device numerical/model/soak evidence remains a release gate |
 | **ROCm Backend** | Planned | No active ROCm execution path is wired yet |
 
 ---

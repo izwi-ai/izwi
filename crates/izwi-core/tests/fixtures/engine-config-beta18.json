@@ -1,0 +1,13 @@
+{
+  "models_dir": ".izwi-models",
+  "max_batch_size": 4,
+  "max_sequence_length": 2048,
+  "chunk_size": 64,
+  "kv_cache_dtype": "float16",
+  "kv_page_size": 64,
+  "backend": "cpu",
+  "num_threads": 4,
+  "enable_prefix_caching": true,
+  "managed_prefix_cache_salt": "deployment-a/tenant-42",
+  "max_prefix_cache_pages": 24
+}

@@ -90,6 +90,62 @@ and realtime route families. Detailed preview behavior is documented in the
 
 ---
 
+## Managed Inference-State Support
+
+This matrix describes ownership and provider classification in the current
+source tree. It is narrower than general model availability: a model can be
+available while a particular cache provider or hardware cell remains
+uncertified.
+
+| Backend | ABI-v2 physical state | Paged provider class | Current boundary |
+|---|---|---|---|
+| **CPU** | Supported | Portable | Dense F32/F16/BF16 KV policy; direct paged write, prefill, decode, zero, and copy. |
+| **Metal** | Supported when built with `metal` | Portable | Direct native Metal operations are intentionally classified Portable until a separately measured optimized cell is promoted. CPU and Metal share one unified-memory authority. |
+| **CUDA (`cuda-base`)** | Supported when built with CUDA | Portable | Native direct-page provider. CUDA compilation and device execution are separate release gates. |
+| **CUDA (`cuda` / `flash-attn`)** | Supported when built with CUDA and FlashAttention | Portable or Optimized per resolved cell | Optimized requires F16/BF16, full attention, page size divisible by 32, zero first-page offsets, and equal K/V head dimensions divisible by 8 and no larger than 512. Ineligible cells remain Portable. |
+
+The runtime fails model loading when a required ABI-v2 operation set or exact
+model/capability route is not certified. It does not silently switch back to a
+model-owned cache.
+
+### State topology by model family
+
+The load path currently publishes ABI-v2 state as follows:
+
+| Model family / route | ABI-v2 topology | Provider-promotion status |
+|---|---|---|
+| **Qwen3 chat** | Retained paged KV | Portable certified; eligible CUDA cells may be Optimized |
+| **Qwen3.5 chat** | Composite retained paged/ring state | Portable certified; eligible CUDA paged cells may be Optimized |
+| **Gemma 3 chat** | Retained paged KV with model-declared attention semantics | Portable certified; eligible CUDA cells may be Optimized |
+| **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable certified; eligible CUDA cells may be Optimized |
+| **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable certified; eligible CUDA cells may be Optimized |
+| **LFM2 chat; LFM2.5 Audio** | Bounded invocation-scoped paged/ring/composite state | ABI-v2 physical ownership; no Optimized attestation |
+| **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite publishes both ASR routes | ABI-v2 physical ownership; no Optimized attestation |
+| **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
+| **VibeVoice, Fish S2, Voxtral TTS** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
+| **Sortformer diarization** | Bounded invocation-scoped physical state | ABI-v2 physical ownership; no Optimized attestation |
+| **Stateless/catalog-only routes** | No retained mutable state, or no loaded state publication | No cache provider applies |
+
+“ABI-v2 physical ownership” is not a claim of complete model-quality or
+hardware performance certification. The exact model revision, capability,
+backend, dtype, page geometry, attention semantics, and build feature cell must
+pass its release lane.
+
+### Cache policy support
+
+| Policy | Status | Notes |
+|---|---|---|
+| Dense `float16`, `bfloat16`, `float32` KV | Supported by configuration boundary | Backend/model negotiation can still reject an exact incompatible cell. |
+| `int8` / `q4` KV | Unsupported | Parsed for migration diagnostics, then rejected before model readiness. |
+| Prefix reuse | Opt-in | Disabled by default; requires a non-empty isolation namespace and an independently bounded page budget. |
+| Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to a certified Portable provider. |
+| Tiered/offloaded or distributed KV | Not supported | No production ownership or eviction contract is published for these modes. |
+
+For configuration, counters, benchmarks, and rollback, see
+[KV Cache Operations](/kv-cache-operations).
+
+---
+
 ## Verification Guidance
 
 Use the following expectations when validating a host:

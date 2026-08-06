@@ -1,0 +1,8 @@
+{
+  "models_dir": ".izwi-models",
+  "max_batch_size": 4,
+  "max_sequence_length": 2048,
+  "chunk_size": 64,
+  "kv_cache_dtype": "float16",
+  "num_threads": 4
+}
