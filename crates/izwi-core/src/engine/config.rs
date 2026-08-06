@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
+use crate::config::{resolve_kv_cache_policy, ResolvedKvCachePolicy};
+use crate::Result;
 
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,10 +48,14 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_enable_prefix_caching")]
     pub enable_prefix_caching: bool,
 
-    /// Namespace salt for managed physical-prefix reuse. The default enables
-    /// process-local reuse; deployments can override it to isolate namespaces.
+    /// Namespace salt for managed physical-prefix reuse. Required explicitly
+    /// whenever prefix caching is enabled.
     #[serde(default = "default_managed_prefix_cache_salt")]
     pub managed_prefix_cache_salt: Option<String>,
+
+    /// Hard upper bound for retained committed-prefix pages.
+    #[serde(default = "default_max_prefix_cache_pages")]
+    pub max_prefix_cache_pages: usize,
 
     /// Enable chunked prefill for long prompts
     #[serde(default = "default_chunked_prefill")]
@@ -151,7 +157,7 @@ fn default_max_tokens_per_step() -> usize {
     384
 }
 fn default_block_size() -> usize {
-    16
+    64
 }
 fn default_kv_cache_dtype() -> String {
     "float16".to_string()
@@ -248,14 +254,13 @@ fn default_max_decode_tokens_per_request() -> usize {
     2
 }
 fn default_enable_prefix_caching() -> bool {
-    true
+    false
 }
 fn default_managed_prefix_cache_salt() -> Option<String> {
-    let configured = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    Some(configured.unwrap_or_else(|| "izwi-managed-prefix-v1".to_string()))
+    None
+}
+fn default_max_prefix_cache_pages() -> usize {
+    128
 }
 
 impl Default for EngineCoreConfig {
@@ -271,6 +276,7 @@ impl Default for EngineCoreConfig {
             scheduling_policy: SchedulingPolicy::default(),
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
+            max_prefix_cache_pages: default_max_prefix_cache_pages(),
             enable_chunked_prefill: default_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
@@ -299,6 +305,18 @@ impl Default for EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
+    pub fn resolved_kv_cache_policy(&self) -> Result<ResolvedKvCachePolicy> {
+        resolve_kv_cache_policy(
+            self.block_size,
+            &self.kv_cache_dtype,
+            self.enable_prefix_caching,
+            self.managed_prefix_cache_salt.as_deref(),
+            self.max_prefix_cache_pages,
+            self.max_blocks,
+            self.max_seq_len,
+        )
+    }
+
     /// Create config for Qwen3-TTS model
     pub fn for_qwen3_tts() -> Self {
         Self {
@@ -312,14 +330,16 @@ impl EngineCoreConfig {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::EngineCoreConfig;
+    use crate::config::{KvCacheDtype, PrefixCachePolicy};
 
     #[test]
-    fn managed_prefix_reuse_is_enabled_by_default() {
+    fn managed_prefix_reuse_is_disabled_by_default() {
         let config = EngineCoreConfig::default();
-        assert!(config.enable_prefix_caching);
-        assert!(config
-            .managed_prefix_cache_salt
-            .as_deref()
-            .is_some_and(|salt| !salt.is_empty()));
+        assert!(!config.enable_prefix_caching);
+        assert!(config.managed_prefix_cache_salt.is_none());
+        let policy = config.resolved_kv_cache_policy().unwrap();
+        assert_eq!(policy.effective.page_size, 64);
+        assert_eq!(policy.effective.dtype, KvCacheDtype::Float16);
+        assert_eq!(policy.effective.prefix, PrefixCachePolicy::Disabled);
     }
 }

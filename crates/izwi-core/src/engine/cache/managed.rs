@@ -217,6 +217,7 @@ pub(crate) struct ManagedKvCacheManager {
     next_tensor_sequence: u64,
     telemetry: Arc<ManagedKvTelemetry>,
     prefix_cache_salt: Option<[u8; 32]>,
+    max_prefix_cache_pages: usize,
     worker_backend: BackendKind,
     worker_device_location: DeviceLocation,
     worker_device: Device,
@@ -262,6 +263,7 @@ impl ManagedKvCacheManager {
             next_tensor_sequence: 1,
             telemetry: Arc::new(ManagedKvTelemetry::default()),
             prefix_cache_salt: None,
+            max_prefix_cache_pages: 0,
             worker_backend: backend,
             worker_device_location: device.location(),
             worker_device: device.clone(),
@@ -275,19 +277,30 @@ impl ManagedKvCacheManager {
         resource_authority: Option<Arc<ResourceAuthority>>,
         salt: Option<[u8; 32]>,
     ) -> Self {
+        Self::with_prefix_cache_policy(resource_authority, salt, usize::MAX)
+    }
+
+    pub(crate) fn with_prefix_cache_policy(
+        resource_authority: Option<Arc<ResourceAuthority>>,
+        salt: Option<[u8; 32]>,
+        max_prefix_cache_pages: usize,
+    ) -> Self {
         let mut manager = Self::new(resource_authority);
         manager.prefix_cache_salt = salt;
+        manager.max_prefix_cache_pages = max_prefix_cache_pages;
         manager
     }
 
-    pub(crate) fn for_worker_with_prefix_cache_salt(
+    pub(crate) fn for_worker_with_prefix_cache_policy(
         resource_authority: Option<Arc<ResourceAuthority>>,
         salt: Option<[u8; 32]>,
+        max_prefix_cache_pages: usize,
         backend: BackendKind,
         device: Device,
     ) -> Self {
         let mut manager = Self::for_worker(resource_authority, backend, device);
         manager.prefix_cache_salt = salt;
+        manager.max_prefix_cache_pages = max_prefix_cache_pages;
         manager
     }
 
@@ -590,7 +603,7 @@ impl ManagedKvCacheManager {
             prefix_indexes.insert(
                 group.arena,
                 CoordinatedPrefixIndex::with_telemetry(
-                    group.capacity_pages as usize,
+                    (group.capacity_pages as usize).min(self.max_prefix_cache_pages),
                     self.telemetry.clone(),
                 ),
             );
@@ -2030,6 +2043,32 @@ mod tests {
             )
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn prefix_index_capacity_is_independent_from_active_arena_capacity() {
+        let model = ModelInstanceId::new(703);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_policy(None, Some([3; 32]), 2);
+        manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+
+        let state = manager.models.get(&model).expect("registered model");
+        assert!(state
+            .prefix_indexes
+            .values()
+            .all(|index| index.capacity_pages() == 2));
+        assert!(state
+            .coordinators
+            .values()
+            .all(|coordinator| coordinator.stats().capacity_pages == 8));
     }
 
     fn composite_tensor_contract() -> InferenceStateContract {

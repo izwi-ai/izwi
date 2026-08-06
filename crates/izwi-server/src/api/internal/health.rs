@@ -2,6 +2,7 @@
 
 use axum::{extract::State, Json};
 use izwi_core::backends::{CudaRuntimeDiagnostics, DTypeSelectionRequest};
+use izwi_core::config::ResolvedKvCachePolicy;
 use izwi_core::runtime_models::shared::attention::flash::{
     flash_attention_compiled, flash_attention_requested,
 };
@@ -27,6 +28,7 @@ pub struct RuntimeBackendResponse {
     pub compiled_backends: CompiledBackendsResponse,
     pub detected_device: DetectedDeviceResponse,
     pub dtype_policy: DTypePolicyResponse,
+    pub kv_cache_policy: ResolvedKvCachePolicy,
     pub fused_attention: FusedAttentionResponse,
     pub cuda_runtime: CudaRuntimeResponse,
     pub loaded_models: Vec<LoadedModelDiagnostics>,
@@ -120,6 +122,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 selected_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
                 reason: dtype_selection.reason.into_owned(),
             },
+            kv_cache_policy: state.runtime.resolved_kv_cache_policy().clone(),
             fused_attention: FusedAttentionResponse {
                 cuda_flash_attention_compiled: flash_attention_compiled(),
                 requested: flash_attention_requested(),

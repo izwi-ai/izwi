@@ -1457,6 +1457,9 @@ impl EngineCore {
         managed_resource_authority: Option<Arc<super::ResourceAuthority>>,
         managed_worker: Option<(BackendKind, candle_core::Device)>,
     ) -> Result<Self> {
+        // Direct EngineCore users must cross the same fail-closed cache-policy
+        // boundary as RuntimeService users before workers or arenas start.
+        let cache_policy = config.resolved_kv_cache_policy()?;
         // Create scheduler
         let scheduler_config = SchedulerConfig::from(&config);
         let scheduler = Scheduler::new(scheduler_config);
@@ -1469,21 +1472,27 @@ impl EngineCore {
             .then(|| config.managed_prefix_cache_salt.as_deref())
             .flatten()
             .map(|salt| Sha256::digest(salt.as_bytes()).into());
+        let max_prefix_cache_pages = match cache_policy.effective.prefix {
+            crate::config::PrefixCachePolicy::Disabled => 0,
+            crate::config::PrefixCachePolicy::Namespaced { max_pages, .. } => max_pages,
+        };
 
         let (managed_kv_cache, physical_state) = match managed_worker {
             Some((backend, device)) => (
-                ManagedKvCacheManager::for_worker_with_prefix_cache_salt(
+                ManagedKvCacheManager::for_worker_with_prefix_cache_policy(
                     managed_resource_authority.clone(),
                     managed_prefix_salt,
+                    max_prefix_cache_pages,
                     backend,
                     device.clone(),
                 ),
                 PhysicalStateManager::for_worker(managed_resource_authority, backend, device),
             ),
             None => (
-                ManagedKvCacheManager::with_prefix_cache_salt(
+                ManagedKvCacheManager::with_prefix_cache_policy(
                     managed_resource_authority.clone(),
                     managed_prefix_salt,
+                    max_prefix_cache_pages,
                 ),
                 PhysicalStateManager::cpu(managed_resource_authority),
             ),
@@ -5372,7 +5381,7 @@ mod tests {
                 block_size: 1,
                 max_blocks: 1,
                 enable_chunked_prefill: false,
-                enable_prefix_caching: true,
+                enable_prefix_caching: false,
                 enable_adaptive_batching: false,
                 backend: BackendKind::Cpu,
                 ..Default::default()

@@ -338,6 +338,10 @@ impl CoordinatedPrefixIndex {
         self.index.is_empty()
     }
 
+    pub fn capacity_pages(&self) -> usize {
+        self.index.capacity_pages()
+    }
+
     /// Commit a written cache transaction and publish complete pages in one
     /// control-plane operation. Any validation or CAS failure leaves the live
     /// prefix index unchanged.

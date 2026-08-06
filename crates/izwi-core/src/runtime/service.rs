@@ -17,7 +17,7 @@ use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
 use crate::engine::{
     engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, Engine as CoreEngine,
     EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy,
@@ -742,6 +742,7 @@ fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane 
 /// Main inference engine runtime.
 pub struct RuntimeService {
     pub(crate) config: EngineConfig,
+    cache_policy: ResolvedKvCachePolicy,
     pub(crate) backend_router: BackendRouter,
     pub(crate) inference_broker: InferenceBroker,
     pub(crate) adapter_registry: Arc<RuntimeAdapterRegistry>,
@@ -1127,6 +1128,10 @@ impl RuntimeService {
 
     /// Create a new inference engine.
     pub fn new(config: EngineConfig) -> Result<Self> {
+        // Reject unsupported or unsafe cache policy before any model registry,
+        // device arena, or readiness state can be created.
+        let cache_policy =
+            config.resolved_kv_cache_policy(EngineCoreConfig::default().max_blocks)?;
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
@@ -1148,13 +1153,17 @@ impl RuntimeService {
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
-        core_config.kv_cache_dtype = config.kv_cache_dtype.clone();
+        core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
+        core_config.max_prefix_cache_pages = match &cache_policy.effective.prefix {
+            PrefixCachePolicy::Disabled => 0,
+            PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
+        };
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
-        worker_config.kv_cache_dtype = config.kv_cache_dtype.clone();
+        worker_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         worker_config.kv_page_size = config.kv_page_size.max(1);
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
@@ -1196,6 +1205,7 @@ impl RuntimeService {
 
         Ok(Self {
             config,
+            cache_policy,
             backend_router,
             inference_broker: InferenceBroker::from_env(),
             adapter_registry,
@@ -1397,6 +1407,11 @@ impl RuntimeService {
     /// Get runtime configuration.
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Immutable requested/effective KV cache policy selected at startup.
+    pub fn resolved_kv_cache_policy(&self) -> &ResolvedKvCachePolicy {
+        &self.cache_policy
     }
 
     /// Get codec sample rate.

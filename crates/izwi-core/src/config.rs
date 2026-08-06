@@ -4,6 +4,192 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::{BackendPreference, BackendRouter};
+use crate::{Error, Result};
+
+/// Requested storage dtype for retained KV state.
+///
+/// Quantized variants remain deserializable so old configuration files fail
+/// with an actionable startup error instead of an opaque enum parse error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheDtype {
+    #[serde(alias = "fp16", alias = "f16")]
+    Float16,
+    #[serde(alias = "bf16")]
+    Bfloat16,
+    #[serde(alias = "fp32", alias = "f32")]
+    Float32,
+    Int8,
+    #[serde(alias = "int4")]
+    Q4,
+}
+
+impl KvCacheDtype {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "float16" | "fp16" | "f16" => Ok(Self::Float16),
+            "bfloat16" | "bf16" => Ok(Self::Bfloat16),
+            "float32" | "fp32" | "f32" => Ok(Self::Float32),
+            "int8" => Ok(Self::Int8),
+            "q4" | "int4" => Ok(Self::Q4),
+            value => Err(Error::ConfigError(format!(
+                "unsupported kv_cache_dtype `{value}`; expected float16, bfloat16, float32, int8, or q4"
+            ))),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Float16 => "float16",
+            Self::Bfloat16 => "bfloat16",
+            Self::Float32 => "float32",
+            Self::Int8 => "int8",
+            Self::Q4 => "q4",
+        }
+    }
+
+    const fn is_production_supported(self) -> bool {
+        matches!(self, Self::Float16 | Self::Bfloat16 | Self::Float32)
+    }
+}
+
+impl std::fmt::Display for KvCacheDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Prefix-sharing intent after configuration parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PrefixCachePolicy {
+    Disabled,
+    Namespaced {
+        /// Operational isolation value. Presence and mode are reported, but
+        /// the raw tenant/deployment namespace is never serialized to health
+        /// or diagnostics responses.
+        #[serde(skip_serializing)]
+        namespace: String,
+        max_pages: usize,
+    },
+}
+
+/// Cache policy exactly as requested by the deployment configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RequestedKvCachePolicy {
+    pub page_size: usize,
+    pub dtype: KvCacheDtype,
+    pub prefix: PrefixCachePolicy,
+}
+
+/// Cache policy that the runtime will actually enforce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EffectiveKvCachePolicy {
+    pub page_size: usize,
+    pub dtype: KvCacheDtype,
+    pub prefix: PrefixCachePolicy,
+}
+
+/// Requested/effective cache truth, including any safe capacity clamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedKvCachePolicy {
+    pub requested: RequestedKvCachePolicy,
+    pub effective: EffectiveKvCachePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+/// Resolve and validate the cache policy at the configuration boundary.
+pub(crate) fn resolve_kv_cache_policy(
+    page_size: usize,
+    dtype: &str,
+    enable_prefix_caching: bool,
+    prefix_namespace: Option<&str>,
+    max_prefix_cache_pages: usize,
+    total_capacity_pages: usize,
+    max_sequence_length: usize,
+) -> Result<ResolvedKvCachePolicy> {
+    if page_size == 0 {
+        return Err(Error::ConfigError(
+            "kv_page_size/block_size must be greater than zero".to_string(),
+        ));
+    }
+    let dtype = KvCacheDtype::parse(dtype)?;
+    if !dtype.is_production_supported() {
+        return Err(Error::ConfigError(format!(
+            "kv_cache_dtype `{dtype}` is not production-ready; use float16, bfloat16, or float32 until quantized KV storage and model kernels are certified"
+        )));
+    }
+
+    let prefix = if enable_prefix_caching {
+        let namespace = prefix_namespace
+            .map(str::trim)
+            .filter(|namespace| !namespace.is_empty())
+            .ok_or_else(|| {
+                Error::ConfigError(
+                    "enable_prefix_caching=true requires an explicit non-empty managed_prefix_cache_salt namespace"
+                        .to_string(),
+                )
+            })?;
+        if max_prefix_cache_pages == 0 {
+            return Err(Error::ConfigError(
+                "enable_prefix_caching=true requires max_prefix_cache_pages greater than zero"
+                    .to_string(),
+            ));
+        }
+        PrefixCachePolicy::Namespaced {
+            namespace: namespace.to_string(),
+            max_pages: max_prefix_cache_pages,
+        }
+    } else {
+        PrefixCachePolicy::Disabled
+    };
+    let requested = RequestedKvCachePolicy {
+        page_size,
+        dtype,
+        prefix,
+    };
+
+    let request_reserve_pages =
+        max_sequence_length.max(1).saturating_add(page_size - 1) / page_size;
+    let prefix_capacity = total_capacity_pages.saturating_sub(request_reserve_pages);
+    let (effective_prefix, fallback_reason) = match &requested.prefix {
+        PrefixCachePolicy::Disabled => (PrefixCachePolicy::Disabled, None),
+        PrefixCachePolicy::Namespaced {
+            namespace,
+            max_pages,
+        } => {
+            let effective_pages = (*max_pages).min(prefix_capacity);
+            if effective_pages == 0 {
+                return Err(Error::ConfigError(format!(
+                    "prefix cache has no safe page budget: capacity_pages={total_capacity_pages}, reserved_request_pages={request_reserve_pages}"
+                )));
+            }
+            let fallback_reason = (effective_pages != *max_pages).then(|| {
+                format!(
+                    "prefix page budget clamped from {max_pages} to {effective_pages} to reserve {request_reserve_pages} request pages"
+                )
+            });
+            (
+                PrefixCachePolicy::Namespaced {
+                    namespace: namespace.clone(),
+                    max_pages: effective_pages,
+                },
+                fallback_reason,
+            )
+        }
+    };
+
+    Ok(ResolvedKvCachePolicy {
+        effective: EffectiveKvCachePolicy {
+            page_size,
+            dtype,
+            prefix: effective_prefix,
+        },
+        requested,
+        fallback_reason,
+    })
+}
 
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,9 +231,14 @@ pub struct EngineConfig {
     pub enable_prefix_caching: bool,
 
     /// Deployment/tenant namespace salt for managed physical prefix pages.
-    /// A process-local default namespace is used when no override is supplied.
+    /// Required explicitly when prefix caching is enabled.
     #[serde(default = "default_managed_prefix_cache_salt")]
     pub managed_prefix_cache_salt: Option<String>,
+
+    /// Hard upper bound for committed prefix pages. This is additionally
+    /// clamped to preserve capacity for at least one maximum-length request.
+    #[serde(default = "default_max_prefix_cache_pages")]
+    pub max_prefix_cache_pages: usize,
 }
 
 impl Default for EngineConfig {
@@ -63,20 +254,21 @@ impl Default for EngineConfig {
             num_threads: default_num_threads(),
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
+            max_prefix_cache_pages: default_max_prefix_cache_pages(),
         }
     }
 }
 
 fn default_enable_prefix_caching() -> bool {
-    true
+    false
 }
 
 fn default_managed_prefix_cache_salt() -> Option<String> {
-    let configured = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    Some(configured.unwrap_or_else(|| "izwi-managed-prefix-v1".to_string()))
+    None
+}
+
+fn default_max_prefix_cache_pages() -> usize {
+    128
 }
 
 fn default_models_dir() -> PathBuf {
@@ -110,11 +302,25 @@ fn default_kv_cache_dtype() -> String {
 }
 
 fn default_kv_page_size() -> usize {
-    std::env::var("IZWI_KV_PAGE_SIZE")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(64)
+    64
+}
+
+impl EngineConfig {
+    /// Validate cache settings and report requested versus effective policy.
+    pub fn resolved_kv_cache_policy(
+        &self,
+        total_capacity_pages: usize,
+    ) -> Result<ResolvedKvCachePolicy> {
+        resolve_kv_cache_policy(
+            self.kv_page_size,
+            &self.kv_cache_dtype,
+            self.enable_prefix_caching,
+            self.managed_prefix_cache_salt.as_deref(),
+            self.max_prefix_cache_pages,
+            total_capacity_pages,
+            self.max_sequence_length,
+        )
+    }
 }
 
 fn default_backend_preference() -> BackendPreference {
@@ -292,15 +498,78 @@ fn get_num_cpus() -> usize {
 
 #[cfg(test)]
 mod managed_kv_default_tests {
-    use super::EngineConfig;
+    use super::{EngineConfig, KvCacheDtype, PrefixCachePolicy};
 
     #[test]
-    fn managed_prefix_reuse_is_enabled_for_normal_runtime_config() {
+    fn managed_prefix_reuse_is_fail_closed_for_normal_runtime_config() {
         let config = EngineConfig::default();
-        assert!(config.enable_prefix_caching);
-        assert!(config
-            .managed_prefix_cache_salt
-            .as_deref()
-            .is_some_and(|salt| !salt.is_empty()));
+        assert!(!config.enable_prefix_caching);
+        assert!(config.managed_prefix_cache_salt.is_none());
+        let policy = config.resolved_kv_cache_policy(1024).unwrap();
+        assert_eq!(policy.effective.page_size, 64);
+        assert_eq!(policy.effective.dtype, KvCacheDtype::Float16);
+        assert_eq!(policy.effective.prefix, PrefixCachePolicy::Disabled);
+    }
+
+    #[test]
+    fn quantized_cache_requests_fail_before_model_readiness() {
+        for dtype in [KvCacheDtype::Int8, KvCacheDtype::Q4] {
+            let config = EngineConfig {
+                kv_cache_dtype: dtype.to_string(),
+                ..EngineConfig::default()
+            };
+            let error = config.resolved_kv_cache_policy(1024).unwrap_err();
+            assert!(error.to_string().contains("not production-ready"));
+        }
+    }
+
+    #[test]
+    fn prefix_reuse_requires_namespace_and_preserves_request_capacity() {
+        let missing_namespace = EngineConfig {
+            enable_prefix_caching: true,
+            ..EngineConfig::default()
+        };
+        assert!(missing_namespace
+            .resolved_kv_cache_policy(1024)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit non-empty"));
+
+        let config = EngineConfig {
+            max_sequence_length: 512,
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant-a".to_string()),
+            max_prefix_cache_pages: 100,
+            ..EngineConfig::default()
+        };
+        let policy = config.resolved_kv_cache_policy(64).unwrap();
+        assert_eq!(
+            policy.effective.prefix,
+            PrefixCachePolicy::Namespaced {
+                namespace: "tenant-a".to_string(),
+                max_pages: 56,
+            }
+        );
+        assert!(policy.fallback_reason.is_some());
+    }
+
+    #[test]
+    fn legacy_json_cache_values_parse_then_fail_actionably() {
+        let quantized: EngineConfig = serde_json::from_str(r#"{"kv_cache_dtype":"int8"}"#)
+            .expect("legacy int8 config should remain parseable");
+        assert!(quantized
+            .resolved_kv_cache_policy(1024)
+            .unwrap_err()
+            .to_string()
+            .contains("until quantized KV storage"));
+
+        let implicit_namespace: EngineConfig =
+            serde_json::from_str(r#"{"enable_prefix_caching":true}"#)
+                .expect("legacy prefix flag should remain parseable");
+        assert!(implicit_namespace
+            .resolved_kv_cache_policy(1024)
+            .unwrap_err()
+            .to_string()
+            .contains("managed_prefix_cache_salt"));
     }
 }
