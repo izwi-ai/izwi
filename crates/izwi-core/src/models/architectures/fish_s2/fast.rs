@@ -1,6 +1,6 @@
 //! Fast codebook decoder for Fish S2 DualAR generation.
 
-use candle_core::{IndexOp, Tensor};
+use candle_core::{IndexOp, Tensor, D};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -422,15 +422,25 @@ impl FishS2FastMlp {
 }
 
 fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
-    let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-    if values.is_empty() {
+    if row.dims1()? == 0 {
         return Err(Error::InferenceError(
             "Fish S2 fast sampler received empty logits".to_string(),
         ));
     }
     if sampler.temperature <= 1e-5 || sampler.top_p <= 0.0 {
-        return argmax_values(&values);
+        let idx = row.argmax(D::Minus1)?;
+        let idx = if idx.rank() == 0 {
+            idx
+        } else {
+            idx.squeeze(0)?
+        };
+        return idx
+            .to_dtype(candle_core::DType::U32)?
+            .to_scalar::<u32>()
+            .map_err(Error::from);
     }
+
+    let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
 
     let temp = sampler.temperature.max(1e-5);
     let max = values
@@ -646,9 +656,22 @@ mod tests {
     #[test]
     fn sampler_argmax_is_deterministic_at_zero_temperature() {
         let device = Device::Cpu;
-        let row = Tensor::from_vec(vec![0.1f32, 2.0, 1.0], (3,), &device).unwrap();
+        let row = Tensor::from_vec(vec![0.1f32, 2.0, 1.0], (3,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
         let mut sampler = FishS2Sampler::new(0.0, 1.0, 7);
         assert_eq!(sample_logits(&row, &mut sampler).unwrap(), 1);
+    }
+
+    #[test]
+    fn sampler_rejects_empty_greedy_logits_before_readback() {
+        let device = Device::Cpu;
+        let row = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        let mut sampler = FishS2Sampler::new(0.0, 1.0, 7);
+        let err = sample_logits(&row, &mut sampler).expect_err("empty logits should fail");
+
+        assert!(format!("{err}").contains("Fish S2 fast sampler received empty logits"));
     }
 
     #[test]
