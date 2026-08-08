@@ -3507,7 +3507,7 @@ mod tests {
         request.id = id.to_string();
         request.params.max_tokens = 1;
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, tokens, None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, tokens, None, 4096)
             .expect("prepare prompt");
         request
             .bind_model_instance(model_instance)
@@ -5440,7 +5440,12 @@ mod tests {
         request.id = "chat-req".to_string();
         request.model_variant = Some(ModelVariant::Qwen306B);
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22, 33, 44], None)
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![11, 22, 33, 44],
+                None,
+                4096,
+            )
             .unwrap();
 
         core.add_request(request).unwrap();
@@ -5478,7 +5483,12 @@ mod tests {
         .with_model_variant(ModelVariant::Qwen306B);
         request.id = "managed-core".to_string();
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 12, 13, 14], None)
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![11, 12, 13, 14],
+                None,
+                4096,
+            )
             .expect("prepare prompt");
         request
             .bind_model_instance(model_instance)
@@ -5736,7 +5746,7 @@ mod tests {
         }])
         .with_model_variant(ModelVariant::Qwen306B);
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1], None, 4096)
             .unwrap();
         request
             .bind_model_instance(ModelInstanceId::new(43))
@@ -5800,7 +5810,7 @@ mod tests {
         }])
         .with_model_variant(ModelVariant::Qwen306B);
         mismatched
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![11, 22], None, 4096)
             .unwrap();
         mismatched.prompt_tokens[0] = 99;
         let error = core
@@ -5828,7 +5838,12 @@ mod tests {
             content: "full".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
-        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4], None)
+        full.install_chat_execution_preparation(
+            ModelVariant::Qwen306B,
+            vec![1, 2, 3, 4],
+            None,
+            4,
+        )
             .unwrap();
         assert!(core
             .add_request(full)
@@ -5844,7 +5859,7 @@ mod tests {
         bounded.id = "bounded-context".to_string();
         bounded.params.max_tokens = 100;
         bounded
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2], None, 4)
             .unwrap();
         core.add_request(bounded).unwrap();
         assert_eq!(core.requests["bounded-context"].params.max_tokens, 2);

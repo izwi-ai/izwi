@@ -1,7 +1,7 @@
 //! Chat runtime methods routed through the unified core engine.
 
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams, TaskType};
+use crate::engine::{resolve_backend_model_context, GenerationParams, TaskType};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen35::media_resource_estimate;
@@ -139,7 +139,8 @@ impl RuntimeService {
             )));
         }
         let correlation_id = correlation_id.map(ToOwned::to_owned);
-        let context_limit = self.config.max_sequence_length.max(1);
+        let backend = self.backend_router.context().backend_kind;
+        let configured_context_limit = self.config.max_sequence_length;
         let input_bytes = retained_chat_preparation_input_bytes(
             &messages,
             messages.capacity(),
@@ -164,6 +165,11 @@ impl RuntimeService {
                 let model = registry
                     .blocking_get_chat(variant)
                     .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
+                let context_limit = resolve_backend_model_context(
+                    backend,
+                    configured_context_limit,
+                    model.max_context_tokens()?,
+                )?;
                 let original_messages = messages;
                 let initial =
                     model.prepare_prompt_for_execution(&original_messages, &prompt_config)?;
@@ -271,6 +277,7 @@ impl RuntimeService {
                     exact_prompt_tokens,
                     prepared_qwen35_prompt,
                     model,
+                    context_limit,
                 )?;
                 Ok(request)
             },

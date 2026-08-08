@@ -8,6 +8,29 @@ use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSele
 use crate::config::{resolve_kv_cache_policy, ResolvedKvCachePolicy};
 use crate::Result;
 
+/// Largest native text context in the currently supported CUDA model catalog
+/// (Qwen3.5). Longer rope-scaled modes are intentionally excluded until their
+/// scaling semantics are implemented by the corresponding adapters.
+pub(crate) const CUDA_MAX_NATIVE_CONTEXT_TOKENS: usize = 262_144;
+
+pub(crate) fn resolve_backend_model_context(
+    backend: BackendKind,
+    configured_max_seq_len: usize,
+    loaded_model_max: usize,
+) -> Result<usize> {
+    if loaded_model_max == 0 {
+        return Err(crate::Error::ModelLoadError(
+            "loaded model reported a zero context length".into(),
+        ));
+    }
+    let configured = configured_max_seq_len.max(1);
+    Ok(if backend == BackendKind::Cuda {
+        loaded_model_max.min(CUDA_MAX_NATIVE_CONTEXT_TOKENS)
+    } else {
+        configured.min(loaded_model_max)
+    })
+}
+
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreConfig {
@@ -305,6 +328,21 @@ impl Default for EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
+    /// Apply the CUDA-native context ceiling and ensure a single paged-state
+    /// group has enough pages to reach it. CPU and Metal retain the configured
+    /// sequence and cache defaults exactly.
+    pub(crate) fn apply_backend_context_capacity(&mut self, configured_max_seq_len: usize) {
+        if self.backend != BackendKind::Cuda {
+            self.max_seq_len = configured_max_seq_len.max(1);
+            return;
+        }
+
+        self.max_seq_len = CUDA_MAX_NATIVE_CONTEXT_TOKENS;
+        let page_tokens = self.block_size.max(1);
+        let required_pages = self.max_seq_len.div_ceil(page_tokens);
+        self.max_blocks = self.max_blocks.max(required_pages);
+    }
+
     pub fn resolved_kv_cache_policy(&self) -> Result<ResolvedKvCachePolicy> {
         resolve_kv_cache_policy(
             self.block_size,
@@ -329,7 +367,10 @@ impl EngineCoreConfig {
 
 #[cfg(test)]
 mod managed_kv_default_tests {
-    use super::EngineCoreConfig;
+    use super::{
+        resolve_backend_model_context, EngineCoreConfig, CUDA_MAX_NATIVE_CONTEXT_TOKENS,
+    };
+    use crate::backends::BackendKind;
     use crate::config::{KvCacheDtype, PrefixCachePolicy};
 
     #[test]
@@ -341,5 +382,54 @@ mod managed_kv_default_tests {
         assert_eq!(policy.effective.page_size, 64);
         assert_eq!(policy.effective.dtype, KvCacheDtype::Float16);
         assert_eq!(policy.effective.prefix, PrefixCachePolicy::Disabled);
+    }
+
+    #[test]
+    fn cuda_context_capacity_reaches_largest_native_model() {
+        let mut config = EngineCoreConfig {
+            backend: BackendKind::Cuda,
+            block_size: 64,
+            max_blocks: 1024,
+            ..EngineCoreConfig::default()
+        };
+
+        config.apply_backend_context_capacity(4096);
+
+        assert_eq!(config.max_seq_len, CUDA_MAX_NATIVE_CONTEXT_TOKENS);
+        assert_eq!(config.max_blocks, 4096);
+    }
+
+    #[test]
+    fn cpu_and_metal_context_capacity_preserve_configuration() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let mut config = EngineCoreConfig {
+                backend,
+                block_size: 64,
+                max_blocks: 1024,
+                ..EngineCoreConfig::default()
+            };
+
+            config.apply_backend_context_capacity(4096);
+
+            assert_eq!(config.max_seq_len, 4096);
+            assert_eq!(config.max_blocks, 1024);
+        }
+    }
+
+    #[test]
+    fn loaded_model_context_is_cuda_only() {
+        assert_eq!(
+            resolve_backend_model_context(BackendKind::Cuda, 4096, 40_960).unwrap(),
+            40_960
+        );
+        assert_eq!(
+            resolve_backend_model_context(BackendKind::Cpu, 4096, 40_960).unwrap(),
+            4096
+        );
+        assert_eq!(
+            resolve_backend_model_context(BackendKind::Metal, 4096, 40_960).unwrap(),
+            4096
+        );
+        assert!(resolve_backend_model_context(BackendKind::Cuda, 4096, 0).is_err());
     }
 }

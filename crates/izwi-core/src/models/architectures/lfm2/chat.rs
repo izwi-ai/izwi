@@ -360,6 +360,15 @@ pub struct Lfm2ChatModel {
 }
 
 impl Lfm2ChatModel {
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        if self.config.context_length == 0 {
+            return Err(Error::ModelLoadError(
+                "LFM2 checkpoint has a zero context length".into(),
+            ));
+        }
+        Ok(self.config.context_length)
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let gguf_name = match variant {
             ModelVariant::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",

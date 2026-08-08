@@ -681,7 +681,7 @@ mod tests {
             .contains("missing exact model prompt preparation"));
 
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None, 4096)
             .unwrap();
         request.prompt_tokens[0] = 99;
         let error = executor

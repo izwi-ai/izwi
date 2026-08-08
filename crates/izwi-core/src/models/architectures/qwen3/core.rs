@@ -2503,6 +2503,10 @@ impl Default for Qwen3WeightLayout {
 }
 
 impl Qwen3Model {
+    pub fn context_length(&self) -> Option<usize> {
+        self.cfg.context_length()
+    }
+
     pub(crate) fn supports_managed_kv_execution(&self) -> bool {
         self.cfg.sliding_window().is_none()
     }

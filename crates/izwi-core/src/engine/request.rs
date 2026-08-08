@@ -209,6 +209,7 @@ pub(super) struct ChatExecutionReady {
     model: PreparedChatModel,
     fingerprint: u64,
     prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+    context_limit: usize,
     core_validated: bool,
 }
 
@@ -1524,10 +1525,15 @@ impl EngineCoreRequest {
         if self.task_type != TaskType::Chat {
             return Ok(());
         }
+        let context_limit = self
+            .chat_execution_ready
+            .as_ref()
+            .map(|ready| ready.context_limit)
+            .unwrap_or(max_seq_len);
         let prompt_tokens = self.prompt_tokens.len();
-        if max_seq_len == 0 || prompt_tokens >= max_seq_len {
+        if context_limit == 0 || prompt_tokens >= context_limit {
             return Err(Error::InvalidInput(format!(
-                "Chat request {} exact prompt has {prompt_tokens} tokens and leaves no output capacity in the configured {max_seq_len}-token context",
+                "Chat request {} exact prompt has {prompt_tokens} tokens and leaves no output capacity in the resolved {context_limit}-token context",
                 self.id
             )));
         }
@@ -1535,7 +1541,7 @@ impl EngineCoreRequest {
             .params
             .max_tokens
             .max(1)
-            .min(max_seq_len - prompt_tokens);
+            .min(context_limit - prompt_tokens);
         Ok(())
     }
 
@@ -1548,12 +1554,14 @@ impl EngineCoreRequest {
         prompt_tokens: Vec<TokenId>,
         prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
         model: ChatModelLease,
+        context_limit: usize,
     ) -> Result<()> {
         self.install_chat_execution_preparation_inner(
             model_variant,
             prompt_tokens,
             prepared_qwen35_prompt,
             PreparedChatModel::Exact(model),
+            context_limit,
         )
     }
 
@@ -1563,12 +1571,14 @@ impl EngineCoreRequest {
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
         prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        context_limit: usize,
     ) -> Result<()> {
         self.install_chat_execution_preparation_inner(
             model_variant,
             prompt_tokens,
             prepared_qwen35_prompt,
             PreparedChatModel::ValidationOnly,
+            context_limit,
         )
     }
 
@@ -1578,6 +1588,7 @@ impl EngineCoreRequest {
         prompt_tokens: Vec<TokenId>,
         prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
         model: PreparedChatModel,
+        context_limit: usize,
     ) -> Result<()> {
         self.chat_execution_ready = None;
         if self.task_type != TaskType::Chat {
@@ -1604,6 +1615,12 @@ impl EngineCoreRequest {
         if prompt_tokens.is_empty() {
             return Err(Error::InvalidInput(format!(
                 "Chat request {} preparation produced no prompt tokens",
+                self.id
+            )));
+        }
+        if context_limit == 0 {
+            return Err(Error::InvalidInput(format!(
+                "Chat request {} preparation has a zero context limit",
                 self.id
             )));
         }
@@ -1657,6 +1674,7 @@ impl EngineCoreRequest {
             model,
             fingerprint,
             prepared_qwen35_prompt,
+            context_limit,
             core_validated: false,
         });
         Ok(())
@@ -3802,7 +3820,7 @@ mod tests {
         .with_model_variant(ModelVariant::Qwen306B);
         request.params.max_tokens = 100;
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None)
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None, 5)
             .unwrap();
         request
             .enforce_chat_context_window(5)
@@ -3814,7 +3832,12 @@ mod tests {
             content: "Hello".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
-        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4, 5], None)
+        full.install_chat_execution_preparation(
+            ModelVariant::Qwen306B,
+            vec![1, 2, 3, 4, 5],
+            None,
+            5,
+        )
             .unwrap();
         assert!(matches!(
             full.enforce_chat_context_window(5),
@@ -3864,7 +3887,12 @@ mod tests {
         });
 
         request
-            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![41, 42, 43], None)
+            .install_chat_execution_preparation(
+                ModelVariant::Qwen306B,
+                vec![41, 42, 43],
+                None,
+                4096,
+            )
             .expect("exact preparation should install");
         request
             .validate_chat_execution_preparation()
@@ -3888,7 +3916,12 @@ mod tests {
             }])
             .with_model_variant(ModelVariant::Qwen306B);
             request
-                .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![41, 42, 43], None)
+                .install_chat_execution_preparation(
+                    ModelVariant::Qwen306B,
+                    vec![41, 42, 43],
+                    None,
+                    4096,
+                )
                 .unwrap();
             request
         };

@@ -495,6 +495,15 @@ impl Qwen35ChatModel {
         &self.text_config
     }
 
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        if self.text_config.context_length == 0 {
+            return Err(Error::ModelLoadError(
+                "Qwen3.5 checkpoint has a zero context length".into(),
+            ));
+        }
+        Ok(self.text_config.context_length)
+    }
+
     /// Hybrid retained-state contract shared by loading, scheduling, and the
     /// native model adapter.
     pub(crate) fn managed_composite_cache_contract(

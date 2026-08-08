@@ -200,6 +200,14 @@ impl InferenceStateContractProvider for Qwen3ChatModel {
 }
 
 impl Qwen3ChatModel {
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        self.text_model.context_length().ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 checkpoint is missing a positive max_position_embeddings value".into(),
+            )
+        })
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant.is_qwen_chat_gguf() {
             return Self::load_gguf(model_dir, variant, device);

@@ -478,6 +478,10 @@ pub(crate) struct Gemma3PhysicalModel {
 }
 
 impl Gemma3PhysicalModel {
+    pub(crate) fn max_context_tokens(&self) -> usize {
+        self.config.max_position_embeddings
+    }
+
     pub(crate) fn load(config: Config, vb: VarBuilder) -> Result<Self> {
         if let Some(softcap) = config.attn_logit_softcapping {
             AttentionLogitSoftcap::new(softcap as f32).map_err(|_| {

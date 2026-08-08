@@ -61,6 +61,7 @@ pub(crate) use cache::physical::PhysicalStateManager;
 pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub use config::EngineCoreConfig;
+pub(crate) use config::resolve_backend_model_context;
 pub use core::EngineCore;
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
@@ -677,7 +678,7 @@ impl Engine {
             ) -> Result<(
                 Vec<TokenId>,
                 Option<Qwen35PreparedPrompt>,
-                Option<ChatModelLease>,
+                Option<(ChatModelLease, usize)>,
             )> + Send
             + 'static,
     {
@@ -727,12 +728,13 @@ impl Engine {
             let _permit = permit;
             let mut request = request;
             let (prompt_tokens, prepared_qwen35_prompt, model) = prepare(&request)?;
-            if let Some(model) = model {
+            if let Some((model, context_limit)) = model {
                 request.install_chat_execution_preparation_with_model(
                     model_variant,
                     prompt_tokens,
                     prepared_qwen35_prompt,
                     model,
+                    context_limit,
                 )?;
             } else {
                 #[cfg(test)]
@@ -740,6 +742,7 @@ impl Engine {
                     model_variant,
                     prompt_tokens,
                     prepared_qwen35_prompt,
+                    4096,
                 )?;
                 #[cfg(not(test))]
                 return Err(Error::InferenceError(format!(
@@ -867,6 +870,8 @@ impl Engine {
                     .to_string(),
             )
         })?;
+        let backend = self.config.backend;
+        let configured_context_limit = self.config.max_seq_len;
 
         Self::prepare_direct_chat_request_with(
             request,
@@ -884,9 +889,18 @@ impl Engine {
                 let model = registry.blocking_get_chat(variant).ok_or_else(|| {
                     Error::ModelNotFound(format!("Chat model {variant} is not loaded"))
                 })?;
+                let context_limit = resolve_backend_model_context(
+                    backend,
+                    configured_context_limit,
+                    model.max_context_tokens()?,
+                )?;
                 let (prompt_tokens, prepared_qwen35_prompt) = model
                     .prepare_prompt_for_execution(messages, &request.chat_generation_config())?;
-                Ok((prompt_tokens, prepared_qwen35_prompt, Some(model)))
+                Ok((
+                    prompt_tokens,
+                    prepared_qwen35_prompt,
+                    Some((model, context_limit)),
+                ))
             },
         )
         .await

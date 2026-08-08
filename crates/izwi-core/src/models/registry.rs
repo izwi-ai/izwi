@@ -2412,6 +2412,20 @@ pub enum NativeChatModel {
     Lfm2(Lfm2ChatModel),
 }
 
+impl NativeChatModel {
+    /// Native context carried by the exact loaded checkpoint. This deliberately
+    /// excludes optional rope-scaling modes that the local adapter has not
+    /// implemented.
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        match self {
+            Self::Qwen3(model) => model.max_context_tokens(),
+            Self::Qwen35(model) => model.max_context_tokens(),
+            Self::Gemma3(model) => model.max_context_tokens(),
+            Self::Lfm2(model) => model.max_context_tokens(),
+        }
+    }
+}
+
 impl InferenceStateContractProvider for NativeChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         match self {

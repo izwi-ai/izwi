@@ -1149,10 +1149,10 @@ impl RuntimeService {
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.models_dir = config.models_dir.clone();
         core_config.max_batch_size = config.max_batch_size.max(1);
-        core_config.max_seq_len = config.max_sequence_length.max(1);
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
+        core_config.apply_backend_context_capacity(config.max_sequence_length);
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();

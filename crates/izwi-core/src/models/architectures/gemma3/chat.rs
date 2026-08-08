@@ -144,6 +144,7 @@ struct GemmaDefaults {
     num_hidden_layers: usize,
     num_key_value_heads: usize,
     head_dim: usize,
+    max_position_embeddings: usize,
 }
 
 fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
@@ -155,6 +156,7 @@ fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
             num_hidden_layers: 26,
             num_key_value_heads: 1,
             head_dim: 256,
+            max_position_embeddings: 32_768,
         },
         ModelVariant::Gemma34BIt => GemmaDefaults {
             hidden_size: 2560,
@@ -163,6 +165,7 @@ fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
             num_hidden_layers: 34,
             num_key_value_heads: 4,
             head_dim: 256,
+            max_position_embeddings: 131_072,
         },
         _ => GemmaDefaults {
             hidden_size: 2560,
@@ -171,6 +174,7 @@ fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
             num_hidden_layers: 34,
             num_key_value_heads: 4,
             head_dim: 256,
+            max_position_embeddings: 131_072,
         },
     }
 }
@@ -239,7 +243,10 @@ fn parse_gemma3_config(
     set_default("query_pre_attn_scalar", Value::from(256u64));
     set_default("sliding_window", Value::from(512u64));
     set_default("sliding_window_pattern", Value::from(6u64));
-    set_default("max_position_embeddings", Value::from(32_768u64));
+    set_default(
+        "max_position_embeddings",
+        Value::from(defaults.max_position_embeddings as u64),
+    );
     let resolved_vocab_size = checkpoint_vocab_size.unwrap_or_else(|| {
         if has_text_config {
             262_208
@@ -384,6 +391,16 @@ impl InferenceStateContractProvider for Gemma3ChatModel {
 }
 
 impl Gemma3ChatModel {
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        let context = self.text_model.max_context_tokens();
+        if context == 0 {
+            return Err(Error::ModelLoadError(
+                "Gemma 3 checkpoint has a zero context length".into(),
+            ));
+        }
+        Ok(context)
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let tokenizer = GemmaTokenizer::load(model_dir)?;
 
@@ -917,8 +934,12 @@ fn text_delta(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax, select_gemma3_dense_dtype, select_next_token, strip_unused_placeholders};
+    use super::{
+        argmax, parse_gemma3_config, select_gemma3_dense_dtype, select_next_token,
+        strip_unused_placeholders,
+    };
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::model::ModelVariant;
     use candle_core::{DType, Device, Tensor};
 
     #[test]
@@ -933,6 +954,27 @@ mod tests {
         let input = "a <unused> b <unusedx12> c";
         let output = strip_unused_placeholders(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn missing_context_uses_variant_native_limit() {
+        let config = r#"{"vocab_size": 262208}"#;
+        let one_b = parse_gemma3_config(config, ModelVariant::Gemma31BIt, 262_208, None)
+            .expect("1B defaults");
+        let four_b = parse_gemma3_config(config, ModelVariant::Gemma34BIt, 262_208, None)
+            .expect("4B defaults");
+
+        assert_eq!(one_b.max_position_embeddings, 32_768);
+        assert_eq!(four_b.max_position_embeddings, 131_072);
+    }
+
+    #[test]
+    fn explicit_context_overrides_variant_default() {
+        let config = r#"{"vocab_size":262208,"max_position_embeddings":777}"#;
+        let parsed = parse_gemma3_config(config, ModelVariant::Gemma34BIt, 262_208, None)
+            .expect("explicit context");
+
+        assert_eq!(parsed.max_position_embeddings, 777);
     }
 
     #[test]
