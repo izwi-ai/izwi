@@ -89,7 +89,7 @@ jobs:
         run: scripts/ci/check-backend-truth.sh cargo-cpu
 
   cargo-cuda:
-    name: Cargo Validation (CUDA)
+    name: CUDA Compile (Driverless)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -123,12 +123,17 @@ jobs:
             --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Run CUDA backend validation
-        run: scripts/ci/check-backend-truth.sh cargo-cuda
+      - name: Compile CUDA harnesses without execution
+        run: scripts/ci/check-backend-truth.sh cargo-cuda-compile
 
   cuda-device-certification:
     name: CUDA Device Numerical Certification
+    if: github.event_name != 'pull_request'
     runs-on: [self-hosted, linux, x64, nvidia]
+    environment: cuda-certification
+    concurrency:
+      group: cuda-device-certification
+      cancel-in-progress: false
     timeout-minutes: 180
     env:
       CUDA_COMPUTE_CAP: "80"

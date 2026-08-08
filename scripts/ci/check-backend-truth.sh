@@ -10,7 +10,9 @@ Commands:
   hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
   cargo-metal   Run Metal-focused cargo checks and core scheduler regressions on macOS
-  cargo-cuda    Run CUDA-focused checks, portable regressions, and a device smoke when available
+  cargo-cuda-compile
+                Compile/link CUDA harnesses without executing CUDA-linked binaries
+  cargo-cuda    Compatibility alias for cargo-cuda-compile
   cargo-cuda-device
                 Require NVIDIA hardware and run native/FA2 numerical certification
   docker-cpu    Validate the default Docker Compose config, build, and smoke the CPU image
@@ -400,7 +402,7 @@ run_hygiene() {
     scripts/bench/test-run-kv-cache-matrix.sh
 }
 
-run_cargo_cuda() {
+run_cargo_cuda_compile() {
     require_command cargo
     require_command nvcc
     test_cuda_feature_mapping
@@ -419,18 +421,32 @@ run_cargo_cuda() {
 
     cargo check --locked -p izwi-cli --features "${wrapper_features}"
     cargo check --locked -p izwi-server --features "${wrapper_features}"
-    if cuda_device_available; then
-        run_core_scheduler_regressions "${core_features}"
-        run_server_scheduler_regressions "${wrapper_features}"
-    else
-        # CUDA devel images provide linker stubs but GitHub's ordinary hosted
-        # runners do not mount the NVIDIA driver library (`libcuda.so.1`). Build
-        # the CUDA test harnesses to retain compile/link coverage, then execute
-        # the backend-neutral scheduler regressions without CUDA linkage.
-        compile_cuda_test_harnesses "${wrapper_features}" "${core_features}"
-        run_core_scheduler_regressions
-        run_server_scheduler_regressions
-    fi
+    # CUDA devel images provide linker stubs but ordinary hosted runners do not
+    # mount the driver-owned `libcuda.so.1`. Compile/link CUDA harnesses without
+    # running them, then execute only backend-neutral regressions.
+    compile_cuda_test_harnesses "${wrapper_features}" "${core_features}"
+    run_core_scheduler_regressions
+    run_server_scheduler_regressions
+
+    echo "CUDA evidence level: cuda_compiled (runtime not observed)"
+}
+
+run_cargo_cuda() {
+    echo "cargo-cuda is a compatibility alias for compile-only CUDA evidence." >&2
+    echo "Use cargo-cuda-device for required real-device execution." >&2
+    run_cargo_cuda_compile
+}
+
+run_cargo_cuda_device_profile() {
+    local wrapper_features
+    wrapper_features="$(resolve_cuda_wrapper_features)"
+    local core_features
+    core_features="$(resolve_cuda_core_features "${wrapper_features}")"
+
+    cargo check --locked -p izwi-cli --features "${wrapper_features}"
+    cargo check --locked -p izwi-server --features "${wrapper_features}"
+    run_core_scheduler_regressions "${core_features}"
+    run_server_scheduler_regressions "${wrapper_features}"
     smoke_cuda_device_if_available "${wrapper_features}"
 }
 
@@ -442,8 +458,12 @@ run_cargo_cuda_device() {
         exit 1
     fi
 
-    IZWI_CUDA_FEATURES="cuda-base,cudnn-base" run_cargo_cuda
-    IZWI_CUDA_FEATURES="cuda,cudnn" run_cargo_cuda
+    test_cuda_feature_mapping
+    export CUDA_COMPUTE_CAP="$(resolve_cuda_compute_cap)"
+    echo "Using CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}"
+
+    IZWI_CUDA_FEATURES="cuda-base,cudnn-base" run_cargo_cuda_device_profile
+    IZWI_CUDA_FEATURES="cuda,cudnn" run_cargo_cuda_device_profile
     scripts/bench/run_kv_cache_matrix.sh \
         --lane cuda \
         --iterations "${IZWI_KV_CERT_ITERATIONS:-30}" \
@@ -499,6 +519,9 @@ main() {
             ;;
         cargo-metal)
             run_cargo_metal
+            ;;
+        cargo-cuda-compile)
+            run_cargo_cuda_compile
             ;;
         cargo-cuda)
             run_cargo_cuda
