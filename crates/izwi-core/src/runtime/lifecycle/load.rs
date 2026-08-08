@@ -671,7 +671,11 @@ impl ModelLifecycleController {
                             }
                             let physical = self
                                 .core_engine
-                                .load_managed_model_cache(model_instance_id, &loaded_cache)
+                                .load_managed_model_cache(
+                                    model_instance_id,
+                                    &loaded_cache,
+                                    Some(loaded.max_context_tokens()?),
+                                )
                                 .await?;
                             let physical = physical.ok_or_else(|| {
                                 Error::ModelLoadError(
@@ -789,6 +793,7 @@ impl ModelLifecycleController {
                             .load_managed_model_state(
                                 model_instance_id,
                                 &physical_spec.retained,
+                                Some(physical_spec.retained_max_tokens),
                             )
                             .await?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
@@ -1080,6 +1085,7 @@ impl ModelLifecycleController {
                         .load_managed_model_state(
                             model_instance_id,
                             &physical_spec.retained,
+                            Some(physical_spec.retained_max_tokens),
                         )
                         .await?;
                     crate::runtime::rollout::validate_managed_state_plan_eligibility(

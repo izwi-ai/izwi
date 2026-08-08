@@ -82,6 +82,7 @@ pub struct Qwen3AsrModel {
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrPhysicalStateSpec {
     pub(crate) retained: crate::kv::v2::InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: crate::kv::v2::InferenceStateContract,
 }
@@ -237,6 +238,9 @@ fn qwen3_asr_physical_state_spec(
     }
     Ok(Qwen3AsrPhysicalStateSpec {
         retained: retained.clone(),
+        retained_max_tokens: usize::try_from(max_tokens).map_err(|_| {
+            Error::ModelLoadError("Qwen3 ASR retained context exceeds usize".to_string())
+        })?,
         descriptor,
         invocation: invocation_contract,
     })

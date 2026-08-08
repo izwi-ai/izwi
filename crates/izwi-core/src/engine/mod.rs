@@ -1451,24 +1451,28 @@ impl Engine {
         &self,
         model_instance: ModelInstanceId,
         capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .load_managed_model_cache(model_instance, capability)
+        self.core.write().await.load_managed_model_cache(
+            model_instance,
+            capability,
+            logical_context_tokens,
+        )
     }
 
     pub(crate) async fn load_managed_model_state(
         &self,
         model_instance: ModelInstanceId,
         retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .load_managed_model_state(model_instance, retained_state)
+        self.core.write().await.load_managed_model_state(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+        )
     }
 
     pub(crate) async fn load_retained_tensor_state(

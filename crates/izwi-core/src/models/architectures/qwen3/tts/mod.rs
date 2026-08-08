@@ -61,6 +61,7 @@ const QWEN3_TTS_MODEL_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3TtsPhysicalStateSpec {
     pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) predictor_contract: InferenceStateContract,
 }
@@ -523,6 +524,7 @@ impl Qwen3TtsModel {
         }
         Ok(Qwen3TtsPhysicalStateSpec {
             retained,
+            retained_max_tokens: self.config.talker_config.max_position_embeddings,
             descriptor,
             predictor_contract,
         })

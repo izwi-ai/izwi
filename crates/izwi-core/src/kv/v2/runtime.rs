@@ -2577,6 +2577,7 @@ mod tests {
             .load_managed_model_cache(
                 model_instance,
                 &InferenceStateCapability::Managed(crate::kv::test_contract()),
+                None,
             )
             .unwrap()
             .expect("managed physical cache");

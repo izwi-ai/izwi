@@ -1654,7 +1654,7 @@ mod tests {
         })
         .unwrap();
         let physical = core
-            .load_managed_model_cache(model_instance, &capability)
+            .load_managed_model_cache(model_instance, &capability, None)
             .unwrap()
             .expect("physical managed runtime");
         let bundle = LoadedModelBundle::bind_with_state_publications(
@@ -1733,6 +1733,7 @@ mod tests {
             .load_managed_model_cache(
                 model_instance,
                 &InferenceStateCapability::Managed(state_contract.clone()),
+                None,
             )
             .unwrap()
             .expect("physical managed runtime");
@@ -1779,7 +1780,7 @@ mod tests {
         })
         .unwrap();
         let physical = core
-            .load_managed_model_cache(model_instance, &capability)
+            .load_managed_model_cache(model_instance, &capability, None)
             .unwrap()
             .expect("physical managed runtime");
         let error = LoadedModelBundle::bind_with_state_publications(

@@ -284,6 +284,9 @@ pub(crate) struct ManagedKvCacheManager {
 pub(crate) struct ManagedStateCapacityRequest {
     /// Aggregate backing pages shared fairly across every paged state group.
     pub(crate) total_paged_pages: u32,
+    /// Exact logical token reach carried by a loaded CUDA model. Portable
+    /// backends leave this unset and retain the configured aggregate budget.
+    pub(crate) logical_token_reach: Option<u64>,
     /// Maximum number of concurrently staged retained-state transactions.
     pub(crate) max_transaction_rows: u32,
 }
@@ -493,6 +496,7 @@ impl ManagedKvCacheManager {
             total_paged_pages: u32::try_from(capacity_pages).map_err(|_| {
                 Error::InvalidInput("managed KV page capacity exceeds u32".to_string())
             })?,
+            logical_token_reach: None,
             max_transaction_rows: u32::try_from(capacity_pages).map_err(|_| {
                 Error::InvalidInput("managed KV transaction capacity exceeds u32".to_string())
             })?,
@@ -523,6 +527,7 @@ impl ManagedKvCacheManager {
             backend,
             ManagedStateCapacityRequest {
                 total_paged_pages: capacity_pages,
+                logical_token_reach: None,
                 max_transaction_rows: capacity_pages,
             },
             page_tokens_hint,
@@ -1615,16 +1620,26 @@ fn plan_managed_state_capacity(
                 .ok_or_else(|| Error::InvalidInput("managed KV page demand overflow".into()))
         })
     };
-    let (mut low, mut high) = (1_u64, upper);
-    while low < high {
-        let middle = low + (high - low).div_ceil(2);
-        if required_pages(middle)? <= u64::from(request.total_paged_pages) {
-            low = middle;
-        } else {
-            high = middle - 1;
+    let token_reach = match request.logical_token_reach {
+        Some(tokens) if tokens > 0 => tokens,
+        Some(_) => {
+            return Err(Error::InvalidInput(
+                "managed state logical token reach must be non-zero".into(),
+            ));
         }
-    }
-    let token_reach = low;
+        None => {
+            let (mut low, mut high) = (1_u64, upper);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if required_pages(middle)? <= u64::from(request.total_paged_pages) {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            low
+        }
+    };
     let mut groups =
         Vec::with_capacity(state_plan.paged_attention.len() + state_plan.non_paged.len());
     let mut sequence_capacity = u32::MAX;
@@ -2366,6 +2381,7 @@ mod tests {
             ModelInstanceId::new(800),
             ManagedStateCapacityRequest {
                 total_paged_pages: 7,
+                logical_token_reach: None,
                 max_transaction_rows: 3,
             },
         )
@@ -2408,6 +2424,7 @@ mod tests {
             ModelInstanceId::new(801),
             ManagedStateCapacityRequest {
                 total_paged_pages: 1,
+                logical_token_reach: None,
                 max_transaction_rows: 1,
             },
         )
@@ -2430,6 +2447,46 @@ mod tests {
     }
 
     #[test]
+    fn loaded_model_context_resolves_exact_paged_capacity_without_a_cuda_device() {
+        let state_plan = negotiate_state_plan(
+            &crate::kv::test_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+
+        for (model_context, expected_pages) in [
+            (32_768_u64, 512_u32),
+            (40_960, 640),
+            (131_072, 2_048),
+            (262_144, 4_096),
+        ] {
+            let (allocation, _) = plan_managed_state_capacity(
+                &state_plan,
+                ModelInstanceId::new(model_context),
+                ManagedStateCapacityRequest {
+                    // The model-derived reach is authoritative in this mode;
+                    // this legacy aggregate value must not inflate Qwen3 to
+                    // the largest catalog context.
+                    total_paged_pages: 4_096,
+                    logical_token_reach: Some(model_context),
+                    max_transaction_rows: 8,
+                },
+            )
+            .unwrap();
+            let group = &state_plan.paged_attention[0];
+            let capacity = allocation
+                .group_capacity(group.group, group.domain)
+                .unwrap();
+            assert_eq!(capacity.strategy.maximum_blocks(), expected_pages);
+        }
+    }
+
+    #[test]
     fn mixed_runtime_uses_one_allocation_plan_for_paged_and_tensor_capacity() {
         let mut manager = ManagedKvCacheManager::default();
         let runtime = manager
@@ -2438,6 +2495,7 @@ mod tests {
                 BackendKind::Cpu,
                 ManagedStateCapacityRequest {
                     total_paged_pages: 4,
+                    logical_token_reach: None,
                     max_transaction_rows: 2,
                 },
                 16,

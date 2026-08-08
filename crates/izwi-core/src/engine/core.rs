@@ -2724,6 +2724,7 @@ impl EngineCore {
         &mut self,
         model_instance: super::ModelInstanceId,
         capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         if capability.managed_contract().is_none() {
             return Ok(None);
@@ -2738,6 +2739,7 @@ impl EngineCore {
                     total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
                         Error::InvalidInput("managed KV page budget exceeds u32".into())
                     })?,
+                    logical_token_reach: self.managed_cuda_token_reach(logical_context_tokens)?,
                     max_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
                         |_| Error::InvalidInput("managed state batch limit exceeds u32".into()),
                     )?,
@@ -2757,6 +2759,7 @@ impl EngineCore {
         &mut self,
         model_instance: super::ModelInstanceId,
         retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let backend = self.managed_kv_cache.worker_backend();
         self.managed_kv_cache.bind_model_state_with_capacity(
@@ -2766,6 +2769,7 @@ impl EngineCore {
                 total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
+                logical_token_reach: self.managed_cuda_token_reach(logical_context_tokens)?,
                 max_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(|_| {
                     Error::InvalidInput("managed state batch limit exceeds u32".into())
                 })?,
@@ -2773,6 +2777,26 @@ impl EngineCore {
             self.config.block_size,
             retained_state,
         )
+    }
+
+    fn managed_cuda_token_reach(&self, loaded_context: Option<usize>) -> Result<Option<u64>> {
+        if self.managed_kv_cache.worker_backend() != BackendKind::Cuda {
+            return Ok(None);
+        }
+        let loaded_context = loaded_context.ok_or_else(|| {
+            Error::ModelLoadError(
+                "CUDA managed state requires a positive loaded-model context limit".into(),
+            )
+        })?;
+        let effective = loaded_context.min(self.config.max_seq_len);
+        if effective == 0 {
+            return Err(Error::ModelLoadError(
+                "CUDA managed state resolved a zero loaded-model context limit".into(),
+            ));
+        }
+        u64::try_from(effective)
+            .map(Some)
+            .map_err(|_| Error::ModelLoadError("CUDA model context exceeds u64".into()))
     }
 
     pub(crate) fn load_retained_tensor_state(
@@ -3445,7 +3469,7 @@ mod tests {
         let state_contract = crate::kv::test_contract();
         let capability = crate::kv::InferenceStateCapability::Managed(state_contract.clone());
         let physical = core
-            .load_managed_model_cache(model_instance, &capability)
+            .load_managed_model_cache(model_instance, &capability, None)
             .expect("load managed state")
             .expect("physical managed state");
         let mut profile =
@@ -5778,6 +5802,7 @@ mod tests {
             .load_managed_model_cache(
                 ModelInstanceId::new(44),
                 &crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract()),
+                None,
             )
             .unwrap_err();
         assert!(error.to_string().contains("capacity"));
