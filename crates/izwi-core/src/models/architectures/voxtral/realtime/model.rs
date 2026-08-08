@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
@@ -1254,18 +1254,21 @@ fn argmax(logits: &Tensor) -> Result<u32> {
             )));
         }
     };
-    let values = logits
-        .to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    let (idx, _) = values
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Less))
-        .ok_or_else(|| Error::InferenceError("Voxtral logits are empty".to_string()))?;
-    u32::try_from(idx)
-        .map_err(|_| Error::InferenceError(format!("Voxtral token index exceeds u32: {idx}")))
+    if logits.dim(0)? == 0 {
+        return Err(Error::InferenceError(
+            "Voxtral logits are empty".to_string(),
+        ));
+    }
+
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
 
 fn text_delta(previous: &str, current: &str) -> String {
@@ -1664,5 +1667,22 @@ mod tests {
         let err = argmax(&logits).expect_err("rank2 batch > 1 should be rejected");
 
         assert!(format!("{err}").contains("Unexpected batched Voxtral logits"));
+    }
+
+    #[test]
+    fn voxtral_argmax_accepts_singleton_rank2_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, -0.2, 0.9, 0.4], (1, 4), &device).unwrap();
+
+        assert_eq!(argmax(&logits).unwrap(), 2);
+    }
+
+    #[test]
+    fn voxtral_argmax_rejects_empty_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        let err = argmax(&logits).expect_err("empty logits should be rejected");
+
+        assert!(format!("{err}").contains("Voxtral logits are empty"));
     }
 }
