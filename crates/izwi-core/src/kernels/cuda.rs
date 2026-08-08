@@ -371,6 +371,111 @@ fn cuda_paged_decode_page_tokens_supported(page_tokens: usize) -> bool {
     matches!(page_tokens, 16 | 32 | 64)
 }
 
+pub(crate) fn paged_prefill_attention(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    sequences: usize,
+    total_queries: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    window_tokens: Option<u32>,
+) -> candle_core::Result<Tensor> {
+    if !queries.device().is_cuda()
+        || queries.device().location() != keys.device().location()
+        || queries.device().location() != values.device().location()
+        || queries.dtype() != keys.dtype()
+        || queries.dtype() != values.dtype()
+        || !matches!(queries.dtype(), DType::F32 | DType::F16 | DType::BF16)
+    {
+        candle_core::bail!(
+            "CUDA paged prefill requires matching F32/F16/BF16 tensors on one CUDA device"
+        )
+    }
+    let capacity_pages = keys.dims().first().copied().unwrap_or(0);
+    let metadata_len = sequences
+        .checked_mul(4_usize.checked_add(max_blocks).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged prefill metadata overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged prefill metadata overflow".to_string())
+        })?;
+    if queries.dims() != [total_queries, query_heads, key_dim]
+        || keys.dims().len() != 4
+        || values.dims().len() != 4
+        || keys.dims()[1..] != [page_tokens, kv_heads, key_dim]
+        || values.dims()[0] != capacity_pages
+        || values.dims()[1..] != [page_tokens, kv_heads, value_dim]
+        || sequences == 0
+        || total_queries == 0
+        || query_heads == 0
+        || kv_heads == 0
+        || query_heads % kv_heads != 0
+        || page_tokens == 0
+        || max_blocks == 0
+        || key_dim == 0
+        || key_dim > 512
+        || value_dim == 0
+        || value_dim > 512
+        || capacity_pages == 0
+        || metadata.device().location() != queries.device().location()
+        || metadata.dtype() != DType::U32
+        || metadata.dims() != [metadata_len]
+        || !metadata.layout().is_contiguous()
+        || !softmax_scale.is_finite()
+        || softmax_scale <= 0.0
+        || softcap.is_some_and(|value| !value.is_finite() || value <= 0.0)
+        || window_tokens == Some(0)
+    {
+        candle_core::bail!("CUDA paged prefill received invalid tensor or attention geometry")
+    }
+    let geometry = [
+        sequences,
+        total_queries,
+        query_heads,
+        kv_heads,
+        page_tokens,
+        max_blocks,
+        key_dim,
+        value_dim,
+        capacity_pages,
+        metadata_len,
+        window_tokens.unwrap_or(0) as usize,
+        queries.elem_count(),
+        keys.elem_count(),
+        values.elem_count(),
+    ];
+    if geometry.iter().any(|&value| value > i32::MAX as usize) {
+        candle_core::bail!("CUDA paged prefill exceeds the signed 32-bit kernel index ABI")
+    }
+    queries.contiguous()?.apply_op3_no_bwd(
+        &keys.contiguous()?,
+        &values.contiguous()?,
+        &CudaPagedPrefillOp {
+            metadata: metadata.clone(),
+            sequences,
+            total_queries,
+            query_heads,
+            kv_heads,
+            page_tokens,
+            max_blocks,
+            key_dim,
+            value_dim,
+            capacity_pages,
+            window_tokens: window_tokens.unwrap_or(0) as usize,
+            softmax_scale,
+            softcap,
+        },
+    )
+}
+
 pub(crate) fn paged_decode_attention(
     queries: &Tensor,
     keys: &Tensor,
@@ -823,6 +928,22 @@ struct CudaPagedDecodeOp {
     strategy: CudaPagedDecodeStrategy,
 }
 
+struct CudaPagedPrefillOp {
+    metadata: Tensor,
+    sequences: usize,
+    total_queries: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    capacity_pages: usize,
+    window_tokens: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+}
+
 struct CudaPhysicalRingShortConvOp {
     batch: usize,
     hidden: usize,
@@ -925,6 +1046,148 @@ impl CustomOp3 for CudaPhysicalRingShortConvOp {
                 device: device.clone(),
             },
             Shape::from_dims(&[self.batch, self.hidden, self.steps]),
+        ))
+    }
+}
+
+impl CustomOp3 for CudaPagedPrefillOp {
+    fn name(&self) -> &'static str {
+        "physical-paged-prefill"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _queries: &CpuStorage,
+        _queries_layout: &Layout,
+        _keys: &CpuStorage,
+        _keys_layout: &Layout,
+        _values: &CpuStorage,
+        _values_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("physical CUDA paged prefill has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        queries: &candle_core::CudaStorage,
+        queries_layout: &Layout,
+        keys: &candle_core::CudaStorage,
+        keys_layout: &Layout,
+        values: &candle_core::CudaStorage,
+        values_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        let device = queries.device();
+        let (metadata_storage, metadata_layout) = self.metadata.storage_and_layout();
+        let candle_core::Storage::Cuda(metadata_storage) = &*metadata_storage else {
+            candle_core::bail!("CUDA paged prefill metadata storage is not CUDA")
+        };
+        let CudaStorageSlice::U32(metadata_slice) = &metadata_storage.slice else {
+            candle_core::bail!("CUDA paged prefill metadata storage is not U32")
+        };
+        let Some((metadata_start, metadata_end)) = metadata_layout.contiguous_offsets() else {
+            candle_core::bail!("CUDA paged prefill metadata must be contiguous")
+        };
+        let metadata = metadata_slice.slice(metadata_start..metadata_end);
+        let output_elements = self
+            .total_queries
+            .checked_mul(self.query_heads)
+            .and_then(|value| value.checked_mul(self.value_dim))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("CUDA paged prefill output overflow".to_string())
+            })?;
+        let blocks = self
+            .total_queries
+            .checked_mul(self.query_heads)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("CUDA paged prefill grid overflow".to_string())
+            })?;
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+        };
+
+        macro_rules! launch {
+            ($variant:ident, $ty:ty, $function_name:literal) => {{
+                let CudaStorageSlice::$variant(query_slice) = &queries.slice else {
+                    candle_core::bail!("CUDA paged prefill query storage dtype mismatch")
+                };
+                let CudaStorageSlice::$variant(key_slice) = &keys.slice else {
+                    candle_core::bail!("CUDA paged prefill key storage dtype mismatch")
+                };
+                let CudaStorageSlice::$variant(value_slice) = &values.slice else {
+                    candle_core::bail!("CUDA paged prefill value storage dtype mismatch")
+                };
+                let Some((query_start, query_end)) = queries_layout.contiguous_offsets() else {
+                    candle_core::bail!("CUDA paged prefill queries must be contiguous")
+                };
+                let Some((key_start, key_end)) = keys_layout.contiguous_offsets() else {
+                    candle_core::bail!("CUDA paged prefill keys must be contiguous")
+                };
+                let Some((value_start, value_end)) = values_layout.contiguous_offsets() else {
+                    candle_core::bail!("CUDA paged prefill values must be contiguous")
+                };
+                let query_view = query_slice.slice(query_start..query_end);
+                let key_view = key_slice.slice(key_start..key_end);
+                let value_view = value_slice.slice(value_start..value_end);
+                // SAFETY: the kernel initializes every output element for the
+                // validated compact metadata and tensor geometry.
+                let output = unsafe { device.alloc::<$ty>(output_elements)? };
+                let function = device.get_or_load_custom_func(
+                    $function_name,
+                    "izwi_physical_state",
+                    cuda_ptx::PHYSICAL_STATE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&query_view);
+                builder.arg(&key_view);
+                builder.arg(&value_view);
+                builder.arg(&metadata);
+                builder.arg(&output);
+                candle_core::builder_arg!(
+                    builder,
+                    self.sequences as i32,
+                    self.total_queries as i32,
+                    self.query_heads as i32,
+                    self.kv_heads as i32,
+                    self.page_tokens as i32,
+                    self.max_blocks as i32,
+                    self.key_dim as i32,
+                    self.value_dim as i32,
+                    self.capacity_pages as i32,
+                    self.window_tokens as i32,
+                    self.softmax_scale,
+                    self.softcap.unwrap_or(0.0)
+                );
+                // SAFETY: arguments and launch dimensions match the validated
+                // native paged-prefill kernel ABI.
+                unsafe { builder.launch(config) }.w()?;
+                candle_core::CudaStorage {
+                    slice: CudaStorageSlice::$variant(output),
+                    device: device.clone(),
+                }
+            }};
+        }
+
+        let output = match &queries.slice {
+            CudaStorageSlice::F32(_) => launch!(F32, f32, "physical_paged_prefill_f32"),
+            CudaStorageSlice::F16(_) => {
+                launch!(F16, half::f16, "physical_paged_prefill_f16")
+            }
+            CudaStorageSlice::BF16(_) => {
+                launch!(BF16, half::bf16, "physical_paged_prefill_bf16")
+            }
+            _ => candle_core::bail!("CUDA paged prefill requires F32/F16/BF16 storage"),
+        };
+        Ok((
+            output,
+            Shape::from_dims(&[self.total_queries, self.query_heads, self.value_dim]),
         ))
     }
 }
@@ -1189,6 +1452,15 @@ mod tests {
 
         assert!(try_fused_silu_mul(&lhs, &rhs).is_none());
         assert!(try_fused_l2_norm(&lhs, 1e-6).is_none());
+
+        let queries = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
+        let keys = Tensor::zeros((1, 16, 1, 2), DType::F32, &device).unwrap();
+        let values = Tensor::zeros((1, 16, 1, 2), DType::F32, &device).unwrap();
+        let metadata = Tensor::from_vec(vec![0_u32, 1, 1, 0, 0], 5, &device).unwrap();
+        assert!(paged_prefill_attention(
+            &queries, &keys, &values, &metadata, 1, 1, 1, 1, 16, 1, 2, 2, 1.0, None, None,
+        )
+        .is_err());
         assert!(try_fused_rms_norm(&lhs, &rhs, 1e-6).is_none());
         assert!(try_fused_gated_rms_norm(&lhs, &rhs, &rhs, 1e-6).is_none());
     }

@@ -305,6 +305,15 @@ struct PrefillMetadataCacheKey {
 #[derive(Debug)]
 struct CachedPrefillDeviceMetadata {
     key: PrefillMetadataCacheKey,
+    compact_rows: Tensor,
+    cumulative_queries: Tensor,
+    cumulative_contexts: Tensor,
+    block_table: Tensor,
+}
+
+#[derive(Debug)]
+struct PrefillDeviceMetadata {
+    compact_rows: Tensor,
     cumulative_queries: Tensor,
     cumulative_contexts: Tensor,
     block_table: Tensor,
@@ -344,6 +353,7 @@ impl ResidentAttentionPlan for CachedPrefillDeviceMetadata {
     fn resident_bytes(&self) -> usize {
         self.cumulative_queries
             .elem_count()
+            .saturating_add(self.compact_rows.elem_count())
             .saturating_add(self.cumulative_contexts.elem_count())
             .saturating_add(self.block_table.elem_count())
             .saturating_mul(std::mem::size_of::<u32>())
@@ -846,7 +856,7 @@ impl CandleAcceleratorKvArena {
     fn cached_prefill_device_metadata(
         &self,
         lowered: &LoweredPrefillMetadata,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<PrefillDeviceMetadata> {
         let mut cache = self.prefill_metadata_cache.lock().map_err(|_| {
             Error::InferenceError("accelerator prefill metadata cache was poisoned".into())
         })?;
@@ -860,13 +870,19 @@ impl CandleAcceleratorKvArena {
             let cached = cache.promote(index).ok_or_else(|| {
                 Error::InferenceError("accelerator prefill plan cache lost an entry".into())
             })?;
-            return Ok((
-                cached.cumulative_queries.clone(),
-                cached.cumulative_contexts.clone(),
-                cached.block_table.clone(),
-            ));
+            return Ok(PrefillDeviceMetadata {
+                compact_rows: cached.compact_rows.clone(),
+                cumulative_queries: cached.cumulative_queries.clone(),
+                cumulative_contexts: cached.cumulative_contexts.clone(),
+                block_table: cached.block_table.clone(),
+            });
         }
 
+        let compact_rows = Tensor::from_vec(
+            lowered.compact_rows.clone(),
+            lowered.compact_rows.len(),
+            &self.device,
+        )?;
         let cumulative_queries = Tensor::from_vec(
             lowered.cumulative_queries.clone(),
             lowered.cumulative_queries.len(),
@@ -885,6 +901,7 @@ impl CandleAcceleratorKvArena {
         let before_bytes = cache.resident_bytes;
         let evictions = cache.insert(CachedPrefillDeviceMetadata {
             key: lowered.cache_key.clone(),
+            compact_rows: compact_rows.clone(),
             cumulative_queries: cumulative_queries.clone(),
             cumulative_contexts: cumulative_contexts.clone(),
             block_table: block_table.clone(),
@@ -900,7 +917,12 @@ impl CandleAcceleratorKvArena {
             .fetch_add(evictions as u64, Ordering::Relaxed);
         self.attention_plan_device_uploads
             .fetch_add(1, Ordering::Relaxed);
-        Ok((cumulative_queries, cumulative_contexts, block_table))
+        Ok(PrefillDeviceMetadata {
+            compact_rows,
+            cumulative_queries,
+            cumulative_contexts,
+            block_table,
+        })
     }
 
     fn cached_decode_device_metadata(
@@ -1076,15 +1098,14 @@ impl CandleAcceleratorKvArena {
         args: &PagedKvPrefillArgs<'_>,
         lowered: &LoweredPrefillMetadata,
     ) -> Result<Tensor> {
-        let (cumulative_queries, cumulative_contexts, block_table) =
-            self.cached_prefill_device_metadata(lowered)?;
+        let metadata = self.cached_prefill_device_metadata(lowered)?;
         Ok(candle_flash_attn::flash_attn_varlen_paged_windowed(
             args.queries,
             &layer.keys,
             &layer.values,
-            &cumulative_queries,
-            &cumulative_contexts,
-            &block_table,
+            &metadata.cumulative_queries,
+            &metadata.cumulative_contexts,
+            &metadata.block_table,
             None,
             lowered.max_query_len,
             lowered.max_context_len,
@@ -1094,6 +1115,33 @@ impl CandleAcceleratorKvArena {
             Some(0),
             self.config.page_tokens as usize,
             args.softcap,
+        )?)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_native_paged_prefill(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: &PagedKvPrefillArgs<'_>,
+        lowered: &LoweredPrefillMetadata,
+    ) -> Result<Tensor> {
+        let metadata = self.cached_prefill_device_metadata(lowered)?;
+        Ok(crate::kernels::cuda::paged_prefill_attention(
+            args.queries,
+            &layer.keys,
+            &layer.values,
+            &metadata.compact_rows,
+            lowered.sequence_count,
+            lowered.total_queries,
+            args.queries.dims()[1],
+            layer.num_kv_heads,
+            self.config.page_tokens as usize,
+            lowered.max_blocks,
+            layer.key_head_dim,
+            layer.value_head_dim,
+            args.softmax_scale,
+            args.softcap,
+            args.window_tokens,
         )?)
     }
 
@@ -1629,6 +1677,22 @@ impl KvArena for CandleAcceleratorKvArena {
                 KvAttentionProvider::CudaFlashAttention.code(),
                 Ordering::Relaxed,
             );
+            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            return Ok(output);
+        }
+
+        #[cfg(feature = "cuda")]
+        if self.backend == BackendKind::Cuda {
+            let _guard = self.mutation_lock.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+            })?;
+            let layers = self.layers.read().map_err(|_| {
+                Error::InferenceError("accelerator KV layer map was poisoned".into())
+            })?;
+            let layer = self.layer_from(&layers, binding)?;
+            let output = self.cuda_native_paged_prefill(layer, &args, &lowered)?;
+            self.last_attention_provider
+                .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
             self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
@@ -2482,6 +2546,7 @@ mod tests {
         arena.cached_cuda_decode_plan(&next_decode_generation)?;
         let mut next_token = next_decode_generation.clone();
         next_token.sequences[0].context_len += 1;
+        next_token.sequences[0].first_page_offset = 0;
         let (table, cumulative, offsets, _, _) = arena.lower_decode_tables(&next_token)?;
         let native = packed_decode_metadata(&cumulative, &offsets, &table);
         let updated = arena.cached_cuda_decode_plan(&next_token)?;

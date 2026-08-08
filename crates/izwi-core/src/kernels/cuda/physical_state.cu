@@ -197,6 +197,191 @@ __device__ void izwi_paged_decode_attention(
   }
 }
 
+// Direct ragged causal paged prefill. One block owns one
+// (query-token, query-head) pair. Compact metadata stores four row vectors
+// (query start/length, final context length, first-page offset) followed by a
+// rectangular physical block table. This avoids expanding prefill into one
+// host-authored decode row per query token when FlashAttention is ineligible.
+template <typename T>
+__device__ void izwi_paged_prefill_attention(
+    const T* __restrict__ queries,
+    const T* __restrict__ keys,
+    const T* __restrict__ values,
+    const unsigned int* __restrict__ metadata,
+    T* __restrict__ output,
+    int sequences,
+    int total_queries,
+    int query_heads,
+    int kv_heads,
+    int page_tokens,
+    int max_blocks,
+    int key_dim,
+    int value_dim,
+    int capacity_pages,
+    int window_tokens,
+    float softmax_scale,
+    float softcap) {
+  const int query_head_index = blockIdx.x;
+  if (query_head_index >= total_queries * query_heads) {
+    return;
+  }
+  const int query_index = query_head_index / query_heads;
+  const int query_head = query_head_index - query_index * query_heads;
+  const int queries_per_kv = query_heads / kv_heads;
+  const int kv_head = query_head / queries_per_kv;
+  const unsigned int* query_starts = metadata;
+  const unsigned int* query_lengths = metadata + sequences;
+  const unsigned int* context_lengths = metadata + sequences * 2;
+  const unsigned int* first_page_offsets = metadata + sequences * 3;
+  const unsigned int* block_table = metadata + sequences * 4;
+
+  int row = -1;
+  unsigned int local_query = 0;
+  for (int candidate = 0; candidate < sequences; ++candidate) {
+    const unsigned int start = query_starts[candidate];
+    const unsigned int length = query_lengths[candidate];
+    if (query_index >= static_cast<int>(start) &&
+        query_index < static_cast<int>(start + length)) {
+      row = candidate;
+      local_query = static_cast<unsigned int>(query_index) - start;
+      break;
+    }
+  }
+
+  bool metadata_valid = row >= 0 && page_tokens > 0 && max_blocks > 0 &&
+                        capacity_pages > 0;
+  unsigned int visible_context = 0;
+  unsigned int physical_start = 0;
+  unsigned long long required_pages = 0;
+  if (metadata_valid) {
+    const unsigned int query_len = query_lengths[row];
+    const unsigned int context_len = context_lengths[row];
+    const unsigned int first_page_offset = first_page_offsets[row];
+    metadata_valid = query_len > 0 && query_len <= context_len &&
+                     local_query < query_len &&
+                     first_page_offset < static_cast<unsigned int>(page_tokens);
+    if (metadata_valid) {
+      const unsigned int causal_context =
+          context_len - query_len + local_query + 1;
+      visible_context =
+          window_tokens > 0
+              ? min(causal_context, static_cast<unsigned int>(window_tokens))
+              : causal_context;
+      const unsigned int dropped = causal_context - visible_context;
+      physical_start = first_page_offset + dropped;
+      const unsigned long long physical_tokens =
+          static_cast<unsigned long long>(context_len) + first_page_offset;
+      required_pages =
+          (physical_tokens + static_cast<unsigned long long>(page_tokens) - 1) /
+          static_cast<unsigned long long>(page_tokens);
+      metadata_valid = visible_context > 0 && required_pages > 0 &&
+                       required_pages <=
+                           static_cast<unsigned long long>(max_blocks);
+    }
+  }
+  if (metadata_valid) {
+    for (unsigned long long logical_page = 0; logical_page < required_pages;
+         ++logical_page) {
+      if (block_table[row * max_blocks + logical_page] >=
+          static_cast<unsigned int>(capacity_pages)) {
+        metadata_valid = false;
+        break;
+      }
+    }
+  }
+
+  const int output_base = query_head_index * value_dim;
+  if (!metadata_valid) {
+    if (threadIdx.x < value_dim) {
+      output[output_base + threadIdx.x] = izwi_from_float<T>(0.0f);
+    }
+    const int second_output_dim = threadIdx.x + blockDim.x;
+    if (second_output_dim < value_dim) {
+      output[output_base + second_output_dim] = izwi_from_float<T>(0.0f);
+    }
+    return;
+  }
+
+  const int query_base = query_head_index * key_dim;
+  extern __shared__ float reduction[];
+  float output_0 = 0.0f;
+  float output_1 = 0.0f;
+  float running_max = -INFINITY;
+  float running_sum = 0.0f;
+
+  for (unsigned int logical_token = 0; logical_token < visible_context;
+       ++logical_token) {
+    const unsigned int physical_token = physical_start + logical_token;
+    const unsigned int logical_page = physical_token / page_tokens;
+    const unsigned int page_offset =
+        physical_token - logical_page * page_tokens;
+    const unsigned int physical_page =
+        block_table[row * max_blocks + logical_page];
+    const int key_base =
+        ((physical_page * page_tokens + page_offset) * kv_heads + kv_head) *
+        key_dim;
+    const int value_base =
+        ((physical_page * page_tokens + page_offset) * kv_heads + kv_head) *
+        value_dim;
+
+    float partial = 0.0f;
+    for (int dim = threadIdx.x; dim < key_dim; dim += blockDim.x) {
+      partial += izwi_to_float(queries[query_base + dim]) *
+                 izwi_to_float(keys[key_base + dim]);
+    }
+    reduction[threadIdx.x] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      float score = reduction[0] * softmax_scale;
+      if (softcap > 0.0f) {
+        score = softcap * tanhf(score / softcap);
+      }
+      const float next_max = fmaxf(running_max, score);
+      const float previous_weight = expf(running_max - next_max);
+      const float token_weight = expf(score - next_max);
+      running_sum = running_sum * previous_weight + token_weight;
+      running_max = next_max;
+      reduction[0] = previous_weight;
+      reduction[1] = token_weight;
+      reduction[2] = running_sum;
+      reduction[3] = running_max;
+    }
+    __syncthreads();
+    const float previous_weight = reduction[0];
+    const float token_weight = reduction[1];
+    if (threadIdx.x < value_dim) {
+      output_0 = output_0 * previous_weight +
+                 izwi_to_float(values[value_base + threadIdx.x]) *
+                     token_weight;
+    }
+    const int second_dim = threadIdx.x + blockDim.x;
+    if (second_dim < value_dim) {
+      output_1 = output_1 * previous_weight +
+                 izwi_to_float(values[value_base + second_dim]) *
+                     token_weight;
+    }
+    __syncthreads();
+    running_sum = reduction[2];
+    running_max = reduction[3];
+  }
+
+  if (threadIdx.x < value_dim) {
+    output[output_base + threadIdx.x] =
+        izwi_from_float<T>(output_0 / running_sum);
+  }
+  const int second_dim = threadIdx.x + blockDim.x;
+  if (second_dim < value_dim) {
+    output[output_base + second_dim] =
+        izwi_from_float<T>(output_1 / running_sum);
+  }
+}
+
 // Partitioned decode for long contexts. The first pass computes an independent
 // online-softmax state for each token partition. The second pass combines those
 // states with the same max-rescaling identity, so no materialized score tensor
@@ -519,6 +704,23 @@ extern "C" __global__ void physical_paged_decode_bf16(
       page_tokens, max_blocks, key_dim, value_dim, capacity_pages,
       softmax_scale, softcap);
 }
+
+#define IZWI_DEFINE_PAGED_PREFILL(SUFFIX, TYPE)                              \
+  extern "C" __global__ void physical_paged_prefill_##SUFFIX(              \
+      const TYPE* queries, const TYPE* keys, const TYPE* values,              \
+      const unsigned int* metadata, TYPE* output, int sequences,              \
+      int total_queries, int query_heads, int kv_heads, int page_tokens,      \
+      int max_blocks, int key_dim, int value_dim, int capacity_pages,         \
+      int window_tokens, float softmax_scale, float softcap) {                \
+    izwi_paged_prefill_attention(                                             \
+        queries, keys, values, metadata, output, sequences, total_queries,    \
+        query_heads, kv_heads, page_tokens, max_blocks, key_dim, value_dim,   \
+        capacity_pages, window_tokens, softmax_scale, softcap);               \
+  }
+
+IZWI_DEFINE_PAGED_PREFILL(f32, float)
+IZWI_DEFINE_PAGED_PREFILL(f16, __half)
+IZWI_DEFINE_PAGED_PREFILL(bf16, __nv_bfloat16)
 
 // Consume a physical circular ShortConv ring directly. The ring layout is
 // [capacity, batch, hidden], while input/output use [batch, hidden, steps].
