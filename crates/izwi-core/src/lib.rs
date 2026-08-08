@@ -46,17 +46,16 @@ pub mod tokenizer;
 pub use engine::{
     AdapterAbiRevision, AdapterInstanceId, AsrEngineInput, AsrProgress, AsrProgressPhase,
     AudioChatEngineInput, BatchBudget, BatchId, BatchKey, BatchLaneKey, ChatEngineInput, Engine,
-    EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest,
-    EngineMetrics, EngineOutput, EngineTask, ExecutionCapabilities, ExecutionDisposition,
-    ExecutionDomain, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutorStepResult, FailureKind,
-    FailureScope, FinishReason, GenerationParams, HealthImpact,
-    ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
-    ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
-    ManagedKvTelemetrySnapshot, MembershipSafePoint, ModelExecutor, ModelInstanceId,
-    ModelSessionResult, OutputProcessor, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
-    PhysicalBatchRowReport, PlanId, Priority, ReadyQuantum, RequestProcessor, RequestStatus,
-    ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
+    EngineAudioInput, EngineCore, EngineCoreConfig, EngineCoreRequest, EngineMetrics, EngineOutput,
+    EngineTask, ExecutionCapabilities, ExecutionDisposition, ExecutionDomain, ExecutionFailure,
+    ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile, ExecutionReport,
+    ExecutionState, ExecutorStepResult, FailureKind, FailureScope, FinishReason, GenerationParams,
+    HealthImpact, ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot,
+    ManagedKvModelRuntimeSnapshot, ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot,
+    ManagedKvRuntimeTotalsSnapshot, ManagedKvTelemetrySnapshot, MembershipSafePoint, ModelExecutor,
+    ModelInstanceId, ModelSessionResult, OutputProcessor, OutputVisibility, PhysicalBatch,
+    PhysicalBatchReport, PhysicalBatchRowReport, PlanId, Priority, ReadyQuantum, RequestProcessor,
+    RequestStatus, ResourceAmount, ResourceEstimate, ResourceLedger, ResourceReservation,
     ResourceVector, RetryDisposition, Scheduler, SchedulerConfig, SchedulingPolicy, SessionEpoch,
     SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
     StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass,
@@ -80,23 +79,23 @@ pub use runtime::{
     VOICE_TTS_FIRST_AUDIO_MS, VOICE_VAD_SPEECH_START_MS,
 };
 pub use runtime::{
-    AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
-    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationRequest, GenerationResult,
-};
-pub use runtime::{
-    AudioChunk, CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
+    runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase, AudioChunk,
+    CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
     ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeLatencyStats,
     RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,
-    RuntimeRequestContext, RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters,
-    RuntimeStageTiming, RuntimeService, RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
-    RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration,
+    RuntimeRequestContext, RuntimeService, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetrySnapshot, RuntimeTraceContract,
+    RuntimeTracePhase, RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration,
     VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION,
     RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
     TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,
-    TRACE_REQUEST_ID, TRACE_STREAMING_MODE, runtime_trace_contracts, sanitized_replay_record,
-    trace_contract_for_phase,
+    TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
+};
+pub use runtime::{
+    AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
+    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
+    GenerationRequest, GenerationResult,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
@@ -108,8 +107,9 @@ pub use artifacts::{
 pub use catalog::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
     resolve_asr_model_variant, resolve_diarization_model_variant, CudaEvidenceLevel,
-    CudaExecutionStatus, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,
-    CudaSupportLevel, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
+    CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind, CudaProviderClass,
+    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
+    ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole,

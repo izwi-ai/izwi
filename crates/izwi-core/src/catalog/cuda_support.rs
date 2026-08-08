@@ -177,6 +177,54 @@ impl Default for CudaSupportInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaOperatorKind {
+    DenseGemm,
+    QuantizedGemm,
+    Convolution,
+    Attention,
+    PagedAttention,
+    Rope,
+    Normalization,
+    Sampling,
+    State,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaProviderClass {
+    NotApplicable,
+    HostOrchestration,
+    CandleTensor,
+    CandleCudnnEligible,
+    CandleFlashAttentionEligible,
+    IzwiCudaEligible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CudaOperatorCapability {
+    pub operator: CudaOperatorKind,
+    pub provider: CudaProviderClass,
+    pub evidence: CudaEvidenceLevel,
+    pub reason: &'static str,
+}
+
+impl CudaOperatorCapability {
+    const fn source_reviewed(
+        operator: CudaOperatorKind,
+        provider: CudaProviderClass,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            operator,
+            provider,
+            evidence: CudaEvidenceLevel::SourceReviewed,
+            reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CudaQuantizationSupportLevel {
@@ -239,6 +287,154 @@ impl Default for CudaQuantizationInfo {
 }
 
 impl ModelVariant {
+    pub fn cuda_operator_capabilities(&self) -> [CudaOperatorCapability; 9] {
+        use CudaOperatorKind as Operator;
+        use CudaProviderClass as Provider;
+
+        if !self.is_enabled() {
+            return std::array::from_fn(|index| {
+                let operator = CUDA_OPERATOR_ORDER[index];
+                CudaOperatorCapability::source_reviewed(
+                    operator,
+                    Provider::NotApplicable,
+                    "variant is disabled in the application catalog",
+                )
+            });
+        }
+
+        let family = self.family();
+        let convolution = match family {
+            ModelFamily::Qwen3Tts
+            | ModelFamily::KokoroTts
+            | ModelFamily::VoxtralTts
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Lfm25Audio
+            | ModelFamily::Qwen3ForcedAligner
+            | ModelFamily::Voxtral
+            | ModelFamily::Tokenizer => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::CandleCudnnEligible,
+                "convolution uses Candle tensor operators and is eligible for cuDNN only when build, layout, dtype, and grouping constraints match",
+            ),
+            ModelFamily::Qwen35Chat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Qwen3.5 recurrent blocks have an existing Izwi CUDA causal-convolution provider with a Candle fallback",
+            ),
+            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+                CudaOperatorCapability::source_reviewed(
+                    Operator::Convolution,
+                    Provider::NotApplicable,
+                    "text decoder graph has no convolutional hot path",
+                )
+            }
+        };
+        let attention_provider = match family {
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Lfm25Audio => Provider::CandleTensor,
+            _ => Provider::CandleFlashAttentionEligible,
+        };
+        let paged_provider = match family {
+            ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Gemma3Chat
+            | ModelFamily::Qwen3Tts
+            | ModelFamily::VoxtralTts
+            | ModelFamily::VibeVoiceTts
+            | ModelFamily::FishS2Tts
+            | ModelFamily::WhisperAsr
+            | ModelFamily::Qwen3Asr
+            | ModelFamily::VibeVoiceAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::GraniteSpeechAsr
+            | ModelFamily::Lfm25Audio
+            | ModelFamily::Qwen3ForcedAligner
+            | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Tokenizer => Provider::NotApplicable,
+        };
+        let rope_provider = match family {
+            ModelFamily::KokoroTts
+            | ModelFamily::ParakeetAsr
+            | ModelFamily::NemotronAsr
+            | ModelFamily::SortformerDiarization => Provider::NotApplicable,
+            _ => Provider::CandleTensor,
+        };
+        let sampling_provider = match family {
+            ModelFamily::KokoroTts
+            | ModelFamily::SortformerDiarization
+            | ModelFamily::Tokenizer => Provider::NotApplicable,
+            _ => Provider::CandleTensor,
+        };
+        let quantization_provider = match self.cuda_quantization().level {
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric => Provider::CandleTensor,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback => Provider::HostOrchestration,
+            CudaQuantizationSupportLevel::Dense => Provider::NotApplicable,
+            CudaQuantizationSupportLevel::CpuOnly
+            | CudaQuantizationSupportLevel::Disabled
+            | CudaQuantizationSupportLevel::Unknown => Provider::NotApplicable,
+        };
+
+        [
+            CudaOperatorCapability::source_reviewed(
+                Operator::DenseGemm,
+                Provider::CandleTensor,
+                "dense projections use Candle matmul/linear dispatch on the selected device",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::QuantizedGemm,
+                quantization_provider,
+                "provider reflects the checkpoint loading and quantized projection path; it is not CUDA runtime proof",
+            ),
+            convolution,
+            CudaOperatorCapability::source_reviewed(
+                Operator::Attention,
+                attention_provider,
+                "FlashAttention eligibility remains conditional on explicit policy, build, device, dtype, shape, and mask semantics",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::PagedAttention,
+                paged_provider,
+                "iterative decoders use the shared physical paged-attention contract; other graphs mark this operator not applicable",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::Rope,
+                rope_provider,
+                "RoPE uses Candle tensor kernels where the architecture has rotary position encoding",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::Normalization,
+                Provider::CandleTensor,
+                "normalization has a Candle tensor reference path on the selected device",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::Sampling,
+                sampling_provider,
+                "autoregressive selection uses Candle reductions where implemented and explicit host orchestration otherwise",
+            ),
+            CudaOperatorCapability::source_reviewed(
+                Operator::State,
+                paged_provider,
+                "state provider reflects load-sealed physical/invocation ownership, not observed CUDA execution",
+            ),
+        ]
+    }
+
     pub fn cuda_support(&self) -> CudaSupportInfo {
         if !self.is_enabled() {
             return CudaSupportInfo::new(
@@ -356,6 +552,18 @@ impl ModelVariant {
     }
 }
 
+const CUDA_OPERATOR_ORDER: [CudaOperatorKind; 9] = [
+    CudaOperatorKind::DenseGemm,
+    CudaOperatorKind::QuantizedGemm,
+    CudaOperatorKind::Convolution,
+    CudaOperatorKind::Attention,
+    CudaOperatorKind::PagedAttention,
+    CudaOperatorKind::Rope,
+    CudaOperatorKind::Normalization,
+    CudaOperatorKind::Sampling,
+    CudaOperatorKind::State,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +577,44 @@ mod tests {
                 "{variant} must include a CUDA support reason"
             );
         }
+    }
+
+    #[test]
+    fn cuda_operator_inventory_is_complete_and_source_reviewed() {
+        use std::collections::HashSet;
+
+        for variant in ModelVariant::all() {
+            let capabilities = variant.cuda_operator_capabilities();
+            assert_eq!(capabilities.len(), CUDA_OPERATOR_ORDER.len());
+            assert_eq!(
+                capabilities
+                    .iter()
+                    .map(|capability| capability.operator)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                CUDA_OPERATOR_ORDER.len(),
+                "{variant} has duplicate CUDA operator records"
+            );
+            for capability in capabilities {
+                assert_eq!(capability.evidence, CudaEvidenceLevel::SourceReviewed);
+                assert!(!capability.reason.trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn neural_tokenizer_reports_codec_operator_coverage() {
+        let capabilities = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_operator_capabilities();
+        let convolution = capabilities
+            .iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Convolution)
+            .expect("convolution capability");
+        assert_eq!(convolution.provider, CudaProviderClass::CandleCudnnEligible);
+        let sampling = capabilities
+            .iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Sampling)
+            .expect("sampling capability");
+        assert_eq!(sampling.provider, CudaProviderClass::NotApplicable);
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub struct AdminModelInfo {
     pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
     pub cuda_support: serde_json::Value,
     pub cuda_quantization: serde_json::Value,
+    pub cuda_operators: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_diagnostics: Option<serde_json::Value>,
 }
@@ -142,6 +143,8 @@ impl AdminModelInfo {
             cuda_support: serde_json::to_value(info.cuda_support)
                 .unwrap_or(serde_json::Value::Null),
             cuda_quantization: serde_json::to_value(info.cuda_quantization)
+                .unwrap_or(serde_json::Value::Null),
+            cuda_operators: serde_json::to_value(variant.cuda_operator_capabilities())
                 .unwrap_or(serde_json::Value::Null),
             runtime_diagnostics,
         }
@@ -803,10 +806,7 @@ mod tests {
         );
 
         let value = serde_json::to_value(model).expect("serialize admin model");
-        assert_eq!(
-            value["runtime_diagnostics"]["actual_compute_dtype"],
-            "f16"
-        );
+        assert_eq!(value["runtime_diagnostics"]["actual_compute_dtype"], "f16");
         assert_eq!(
             value["runtime_diagnostics"]["default_compute_dtype"],
             "bf16"
