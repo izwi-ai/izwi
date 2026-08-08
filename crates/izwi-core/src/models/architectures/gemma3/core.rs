@@ -25,19 +25,26 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 struct GemmaRmsNorm {
     weight: Tensor,
     eps: f64,
+    cuda_candle_kernel: bool,
 }
 
 impl GemmaRmsNorm {
     fn load(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let cuda_candle_kernel = gemma_cuda_rms_norm_enabled(vb.device());
         Ok(Self {
             weight: vb.get(dim, "weight")?,
             eps,
+            cuda_candle_kernel,
         })
     }
 }
 
 impl Module for GemmaRmsNorm {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        let adjusted_weight = (&self.weight + 1.0)?;
+        if self.cuda_candle_kernel {
+            return candle_nn::ops::rms_norm(input, &adjusted_weight, self.eps as f32);
+        }
         let input_dtype = input.dtype();
         let internal_dtype = match input_dtype {
             DType::F16 | DType::BF16 => DType::F32,
@@ -49,8 +56,24 @@ impl Module for GemmaRmsNorm {
         input
             .broadcast_div(&(variance + self.eps)?.sqrt()?)?
             .to_dtype(input_dtype)?
-            .broadcast_mul(&(&self.weight + 1.0)?)
+            .broadcast_mul(&adjusted_weight)
     }
+}
+
+fn gemma_cuda_rms_norm_enabled(device: &Device) -> bool {
+    let override_enabled =
+        std::env::var("IZWI_GEMMA3_CUDA_RMS_NORM")
+            .ok()
+            .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            });
+    gemma_cuda_rms_norm_policy(device.is_cuda(), override_enabled)
+}
+
+fn gemma_cuda_rms_norm_policy(is_cuda: bool, override_enabled: Option<bool>) -> bool {
+    is_cuda && override_enabled.unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +744,50 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn gemma_cuda_rms_norm_is_explicit_and_default_off() {
+        assert!(!gemma_cuda_rms_norm_policy(true, None));
+        assert!(gemma_cuda_rms_norm_policy(true, Some(true)));
+        assert!(!gemma_cuda_rms_norm_policy(true, Some(false)));
+        assert!(!gemma_cuda_rms_norm_policy(false, Some(true)));
+    }
+
+    #[test]
+    fn candle_rms_norm_matches_gemma_reference_weight_transform() {
+        let device = &Device::Cpu;
+        let input = Tensor::from_vec(
+            vec![0.5f32, -1.25, 2.0, 0.75, -0.25, 1.5, -0.5, 2.25],
+            (2, 4),
+            device,
+        )
+        .expect("input");
+        let weight = Tensor::from_vec(vec![0.1f32, -0.2, 0.05, 0.3], 4, device).expect("weight");
+        let reference = GemmaRmsNorm {
+            weight: weight.clone(),
+            eps: 1e-6,
+            cuda_candle_kernel: false,
+        }
+        .forward(&input)
+        .expect("reference");
+        let candle = GemmaRmsNorm {
+            weight,
+            eps: 1e-6,
+            cuda_candle_kernel: true,
+        }
+        .forward(&input)
+        .expect("candle rms norm");
+
+        let reference = reference.to_vec2::<f32>().expect("reference values");
+        let candle = candle.to_vec2::<f32>().expect("candle values");
+        for (reference, candle) in reference
+            .into_iter()
+            .flatten()
+            .zip(candle.into_iter().flatten())
+        {
+            assert!((reference - candle).abs() < 1e-5, "{reference} != {candle}");
+        }
+    }
+
     fn tiny_weights(config: &Config) -> HashMap<String, Tensor> {
         let device = &Device::Cpu;
         let mut weights = HashMap::new();
@@ -939,7 +1006,10 @@ mod tests {
         ));
         assert!(matches!(domain.layers[1].pattern, AttentionPattern::Full));
         assert!(domain.layers.iter().all(|layer| {
-            layer.attention_logit_softcap.map(AttentionLogitSoftcap::get) == Some(2.5)
+            layer
+                .attention_logit_softcap
+                .map(AttentionLogitSoftcap::get)
+                == Some(2.5)
         }));
     }
 
