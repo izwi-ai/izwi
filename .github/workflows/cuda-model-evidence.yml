@@ -6,7 +6,7 @@ on:
       manifest:
         description: Strict benchmark manifest to certify
         required: true
-        default: benchmarks/manifests/vibevoice-cuda.toml
+        default: benchmarks/manifests/cuda-family-api.toml
         type: string
   schedule:
     - cron: "41 3 * * 1"
@@ -39,7 +39,7 @@ jobs:
       CUDA_COMPUTE_CAP: "80"
       IZWI_CUDA_FEATURES: "cuda,cudnn"
       IZWI_CUDA_CERT_MODELS_DIR: ${{ vars.IZWI_CUDA_CERT_MODELS_DIR }}
-      IZWI_CUDA_CERT_MANIFEST: ${{ inputs.manifest || 'benchmarks/manifests/vibevoice-cuda.toml' }}
+      IZWI_CUDA_CERT_MANIFEST: ${{ inputs.manifest || 'benchmarks/manifests/cuda-family-api.toml' }}
 
     steps:
       - name: Checkout
@@ -50,6 +50,9 @@ jobs:
 
       - name: Require preprovisioned model storage
         run: |
+          command -v jq >/dev/null
+          command -v curl >/dev/null
+          command -v nvidia-smi >/dev/null
           if [[ -z "${IZWI_CUDA_CERT_MODELS_DIR}" || ! -d "${IZWI_CUDA_CERT_MODELS_DIR}" ]]; then
             echo "IZWI_CUDA_CERT_MODELS_DIR must name preprovisioned model storage" >&2
             exit 1
@@ -57,12 +60,16 @@ jobs:
 
       - name: Build the checked-out CUDA server and CLI
         run: |
-          cargo build --locked --release -p izwi-server --features "${IZWI_CUDA_FEATURES}"
-          cargo build --locked --release -p izwi-cli --features "${IZWI_CUDA_FEATURES}"
+          IZWI_BUILD_GIT_SHA="${GITHUB_SHA}" cargo build --locked --release -p izwi-server --features "${IZWI_CUDA_FEATURES}"
+          IZWI_BUILD_GIT_SHA="${GITHUB_SHA}" cargo build --locked --release -p izwi-cli --features "${IZWI_CUDA_FEATURES}"
 
       - name: Start the checked-out CUDA server
         run: |
           mkdir -p target/cuda-model-evidence
+          if curl -fsS http://127.0.0.1:18082/v1/health >/dev/null 2>&1; then
+            echo "Port 18082 is already serving a process; refusing ambiguous CUDA evidence" >&2
+            exit 1
+          fi
           IZWI_MODELS_DIR="${IZWI_CUDA_CERT_MODELS_DIR}" \
           IZWI_PRELOAD_MODELS= \
           IZWI_WARMUP_PRELOADED_MODELS=0 \
@@ -73,12 +80,22 @@ jobs:
             >target/cuda-model-evidence/server.log 2>&1 &
           echo "$!" >target/cuda-model-evidence/server.pid
           for _ in {1..120}; do
+            if ! kill -0 "$(cat target/cuda-model-evidence/server.pid)" >/dev/null 2>&1; then
+              echo "Checked-out CUDA server exited during startup" >&2
+              exit 1
+            fi
             if curl -fsS http://127.0.0.1:18082/v1/health >/dev/null 2>&1; then
+              observed_sha=$(curl -fsS http://127.0.0.1:18082/v1/health | jq -r '.runtime.build_git_sha // empty')
+              if [[ "${observed_sha}" != "${GITHUB_SHA}" ]]; then
+                echo "CUDA server SHA ${observed_sha:-missing} does not match checkout ${GITHUB_SHA}" >&2
+                exit 1
+              fi
               exit 0
             fi
             sleep 1
           done
-          echo "CUDA server did not become healthy; evidence runner will record the failure" >&2
+          echo "CUDA server did not become healthy" >&2
+          exit 1
 
       - name: Run strict CUDA model evidence
         run: |
@@ -86,7 +103,16 @@ jobs:
             --manifest "${IZWI_CUDA_CERT_MANIFEST}" \
             --server http://127.0.0.1:18082 \
             --izwi-bin target/release/izwi \
-            --output target/cuda-model-evidence
+            --output target/cuda-model-evidence/families
+
+      - name: Require optimized CUDA kernel evidence
+        run: |
+          scripts/bench/run-cuda-model-evidence.sh \
+            --manifest benchmarks/manifests/vibevoice-cuda.toml \
+            --server http://127.0.0.1:18082 \
+            --izwi-bin target/release/izwi \
+            --require-optimized-kernel-evidence \
+            --output target/cuda-model-evidence/optimized
 
       - name: Stop CUDA server
         if: always()

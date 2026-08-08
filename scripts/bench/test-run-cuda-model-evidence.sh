@@ -10,6 +10,7 @@ trap 'rm -rf "${tmp_dir}"' EXIT
 
 help=$(${runner} --help)
 grep -q -- '--allow-unsupported' <<<"${help}"
+grep -q -- '--require-optimized-kernel-evidence' <<<"${help}"
 grep -q 'actual_device_kind=cuda' <<<"${help}"
 
 dry_output=$(${runner} --manifest "${manifest}" --output "${tmp_dir}/dry" --dry-run)

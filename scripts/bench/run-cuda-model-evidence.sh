@@ -11,6 +11,7 @@ nvidia_smi="${IZWI_CUDA_EVIDENCE_NVIDIA_SMI:-nvidia-smi}"
 allow_remote=0
 allow_unsupported=0
 dry_run=0
+require_optimized_kernel_evidence=0
 certificate_written=0
 started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -24,6 +25,8 @@ Options:
   --izwi-bin PATH       Izwi CLI binary
   --allow-remote        Permit a non-loopback server URL
   --allow-unsupported   Missing NVIDIA hardware emits unsupported instead of failing
+  --require-optimized-kernel-evidence
+                        Require every case to observe a fused/paged/RoPE CUDA path
   --dry-run             Print the benchmark command without probing hardware/server
   -h, --help            Show this help
 
@@ -56,6 +59,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --allow-unsupported)
             allow_unsupported=1
+            shift
+            ;;
+        --require-optimized-kernel-evidence)
+            require_optimized_kernel_evidence=1
             shift
             ;;
         --dry-run)
@@ -187,6 +194,7 @@ if ! curl -fsS "${server%/}/v1/health" -o "${health_path}"; then
     fail "Unable to read Izwi health from ${server}"
 fi
 if ! jq -e '
+    (.runtime.build_git_sha | type == "string" and length > 0) and
     .runtime.requested_backend == "cuda" and
     .runtime.requested_backend_available == true and
     .runtime.selected_backend == "cuda" and
@@ -195,6 +203,10 @@ if ! jq -e '
     .runtime.cuda_runtime.device_usable == true
 ' "${health_path}" >/dev/null; then
     fail "Izwi health does not prove a usable selected CUDA runtime"
+fi
+if ! jq -e --arg git_sha "${git_sha}" '.runtime.build_git_sha == $git_sha' \
+    "${health_path}" >/dev/null; then
+    fail "Izwi health is not bound to the checked-out git SHA"
 fi
 
 if ! IZWI_BENCH_QUALITY_MODE=strict \
@@ -216,7 +228,7 @@ report_path="${benchmark_dir}/report.json"
 metadata_path="${benchmark_dir}/metadata.json"
 observability_path="${benchmark_dir}/observability.json"
 
-if ! jq -e '
+if ! jq -e --argjson require_optimized "${require_optimized_kernel_evidence}" '
     .schema_version == 1 and
     (.reports | length) > 0 and
     ([.reports[].name] | all(type == "string") and length == (unique | length)) and
@@ -240,9 +252,18 @@ if ! jq -e '
         $telemetry.after.requests_failed == $telemetry.before.requests_failed and
         $telemetry.after.worker_panics == $telemetry.before.worker_panics and
         $telemetry.after.worker_restarts == $telemetry.before.worker_restarts
-    ] | all(. == true))
+    ] | all(. == true)) and
+    (($require_optimized == 0) or ([.reports[] |
+        .report.telemetry as $telemetry |
+        (((($telemetry.after.kernel_path.fused_attention_success_total // 0) -
+           ($telemetry.before.kernel_path.fused_attention_success_total // 0)) > 0) or
+         ((($telemetry.after.kernel_path.decode_attention_paged_total // 0) -
+           ($telemetry.before.kernel_path.decode_attention_paged_total // 0)) > 0) or
+         ((($telemetry.after.kernel_path.rope_kernel_total // 0) -
+           ($telemetry.before.kernel_path.rope_kernel_total // 0)) > 0))
+    ] | all(. == true)))
 ' "${report_path}" >/dev/null; then
-    fail "CUDA benchmark report failed case, sample, quality, or telemetry validation"
+    fail "CUDA benchmark report failed case, sample, quality, runtime, or optimized-kernel validation"
 fi
 if ! jq -e --arg git_sha "${git_sha}" '.schema_version == 1 and .git_sha == $git_sha' \
     "${metadata_path}" >/dev/null; then
@@ -277,6 +298,7 @@ jq -n \
             ended_at: $ended_at
         },
         device: {
+            build_git_sha: $health[0].runtime.build_git_sha,
             requested_backend: $health[0].runtime.requested_backend,
             selected_backend: $health[0].runtime.selected_backend,
             cuda_compiled: $health[0].runtime.compiled_backends.cuda,

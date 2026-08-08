@@ -6036,6 +6036,20 @@ concurrent = [1, 2]
     }
 
     #[test]
+    fn cuda_family_manifest_covers_every_benchmarkable_implementation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/manifests/cuda-family-api.toml");
+        let text = std::fs::read_to_string(path).expect("CUDA family manifest");
+        let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
+        let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
+        assert_eq!(cases.len(), 17);
+        assert!(cases.iter().all(|case| case.model.is_some()));
+        assert!(cases
+            .iter()
+            .all(|case| matches!(case.command.as_str(), "chat" | "tts" | "asr")));
+    }
+
+    #[test]
     fn manifest_matrix_rejects_duplicate_expanded_names() {
         let manifest: BenchmarkManifest = toml::from_str(
             r#"

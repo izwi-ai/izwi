@@ -20,6 +20,7 @@ pub struct HealthResponse {
 
 #[derive(Serialize)]
 pub struct RuntimeBackendResponse {
+    pub build_git_sha: Option<&'static str>,
     pub requested_backend: String,
     pub requested_backend_available: bool,
     pub selected_backend: String,
@@ -96,6 +97,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         runtime: RuntimeBackendResponse {
+            build_git_sha: option_env!("IZWI_BUILD_GIT_SHA"),
             requested_backend: context.preference.as_str().to_string(),
             requested_backend_available,
             selected_backend: context.backend_kind.as_str().to_string(),
@@ -204,6 +206,7 @@ mod tests {
     #[test]
     fn runtime_backend_health_serializes_loaded_tts_model_diagnostics() {
         let response = RuntimeBackendResponse {
+            build_git_sha: Some("test-sha"),
             requested_backend: "cuda".to_string(),
             requested_backend_available: true,
             selected_backend: "cuda".to_string(),
