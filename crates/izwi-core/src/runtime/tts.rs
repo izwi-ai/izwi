@@ -7,7 +7,10 @@ use tracing::info;
 
 use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
-use crate::engine::{GenerationParams as CoreGenParams, ResourceAmount, ResourceVector, WorkUnit};
+use crate::engine::{
+    tts_explicit_output_limit, GenerationParams as CoreGenParams, ResourceAmount, ResourceVector,
+    WorkUnit,
+};
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::{
@@ -54,6 +57,7 @@ struct DirectTtsGenerationShape {
 }
 
 fn direct_tts_generation_shape(
+    backend: BackendKind,
     request: &GenerationRequest,
     variant: ModelVariant,
     max_sequence_length: usize,
@@ -84,7 +88,11 @@ fn direct_tts_generation_shape(
             if explicit == 0 {
                 LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(max_sequence_length.max(1))
             } else {
-                explicit.min(max_sequence_length.max(1))
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
             },
             1_920,
             false,
@@ -93,7 +101,11 @@ fn direct_tts_generation_shape(
             if explicit == 0 {
                 voxtral_tts_auto_max_frames_for_text(&request.text)
             } else {
-                explicit.min(ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES)
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
             },
             1_920,
             false,
@@ -111,9 +123,13 @@ fn direct_tts_generation_shape(
             if explicit == 0 {
                 ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES
             } else {
-                explicit.min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
+                explicit.min(tts_explicit_output_limit(
+                    backend,
+                    variant,
+                    max_sequence_length,
+                ))
             },
-            2_052,
+            2_048,
             true,
         ),
         _ => {
@@ -196,7 +212,7 @@ fn direct_tts_additional_resources(
         }
     }
 
-    let shape = direct_tts_generation_shape(request, variant, max_sequence_length)?;
+    let shape = direct_tts_generation_shape(backend, request, variant, max_sequence_length)?;
     let output_bytes = shape
         .max_output_samples
         .checked_mul(std::mem::size_of::<f32>() as u64)
@@ -526,11 +542,11 @@ impl RuntimeService {
         let max_new_tokens = if request.config.options.max_tokens == 0 {
             LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(self.config.max_sequence_length.max(1))
         } else {
-            request
-                .config
-                .options
-                .max_tokens
-                .min(self.config.max_sequence_length.max(1))
+            request.config.options.max_tokens.min(tts_explicit_output_limit(
+                self.backend_router.context().backend_kind,
+                variant,
+                self.config.max_sequence_length,
+            ))
         };
         let requested_speaker = request
             .config
@@ -620,6 +636,11 @@ impl RuntimeService {
             .get_voxtral_tts(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No Voxtral TTS model loaded".to_string()))?;
+        let explicit_max_frames = tts_explicit_output_limit(
+            self.backend_router.context().backend_kind,
+            variant,
+            self.config.max_sequence_length,
+        );
         let request_id = request.id;
         let config = request.config;
         self.coordinator
@@ -643,8 +664,11 @@ impl RuntimeService {
                                 "Voxtral TTS model exposes no preset voices".to_string(),
                             )
                         })?;
-                    let params =
-                        VoxtralTtsGenerationParams::from_generation_config_for_text(&config, &text);
+                    let params = VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
+                        &config,
+                        &text,
+                        explicit_max_frames,
+                    );
                     let started = Instant::now();
                     let domains = leases.domains().collect::<Vec<_>>();
                     let [domain] = domains.as_slice() else {
@@ -834,6 +858,11 @@ impl RuntimeService {
             .get_fish_s2_tts(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No Fish S2 TTS model loaded".to_string()))?;
+        let explicit_max_frames = tts_explicit_output_limit(
+            self.backend_router.context().backend_kind,
+            variant,
+            self.config.max_sequence_length,
+        );
         self.coordinator
             .run_loaded_blocking_stage_with_invocation_paged(
                 job,
@@ -847,11 +876,8 @@ impl RuntimeService {
                     let reference = fish_s2_reference_from_request(&request)?;
                     let mut params = FishS2GenerationParams::default();
                     if request.config.options.max_tokens > 0 {
-                        params.max_frames = request
-                            .config
-                            .options
-                            .max_tokens
-                            .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES);
+                        params.max_frames =
+                            request.config.options.max_tokens.min(explicit_max_frames);
                     }
                     params.temperature = request.config.options.temperature;
                     params.top_p = request.config.options.top_p;
@@ -1245,7 +1271,13 @@ mod tests {
         let mut request = GenerationRequest::new("bounded LFM output");
         request.config.options.max_tokens = usize::MAX;
         let shape =
-            direct_tts_generation_shape(&request, ModelVariant::Lfm25Audio15BGguf, 4096).unwrap();
+            direct_tts_generation_shape(
+                BackendKind::Cpu,
+                &request,
+                ModelVariant::Lfm25Audio15BGguf,
+                4096,
+            )
+            .unwrap();
 
         assert_eq!(shape.units, 4096);
         assert_eq!(shape.max_output_samples, 4096 * 1_920);
@@ -1253,10 +1285,41 @@ mod tests {
     }
 
     #[test]
+    fn direct_cuda_tts_reserves_unlocked_explicit_context() {
+        let mut request = GenerationRequest::new("long CUDA output");
+        request.config.options.max_tokens = 5000;
+
+        let lfm = direct_tts_generation_shape(
+            BackendKind::Cuda,
+            &request,
+            ModelVariant::Lfm25Audio15BGguf,
+            4096,
+        )
+        .unwrap();
+        let fish = direct_tts_generation_shape(
+            BackendKind::Cuda,
+            &request,
+            ModelVariant::FishAudioS2Pro,
+            4096,
+        )
+        .unwrap();
+
+        assert_eq!(lfm.units, 5000);
+        assert_eq!(fish.units, 5000);
+        assert_eq!(fish.max_output_samples, 5000 * 2048);
+    }
+
+    #[test]
     fn direct_lfm_tts_caps_default_output_budget_to_runtime_sequence_limit() {
         let request = GenerationRequest::new("bounded LFM default output");
         let shape =
-            direct_tts_generation_shape(&request, ModelVariant::Lfm25Audio15BGguf, 64).unwrap();
+            direct_tts_generation_shape(
+                BackendKind::Cpu,
+                &request,
+                ModelVariant::Lfm25Audio15BGguf,
+                64,
+            )
+            .unwrap();
 
         assert_eq!(shape.units, 64);
     }
@@ -1269,7 +1332,12 @@ mod tests {
         request.config.options.speed = 0.5;
         let budget = kokoro_output_budget(&request.text, request.config.options.speed).unwrap();
         let shape =
-            direct_tts_generation_shape(&request, ModelVariant::Kokoro82M, max_sequence_length)
+            direct_tts_generation_shape(
+                BackendKind::Cpu,
+                &request,
+                ModelVariant::Kokoro82M,
+                max_sequence_length,
+            )
                 .unwrap();
 
         let expected_frames = budget

@@ -247,10 +247,13 @@ impl ModelVariant {
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
     pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
     pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;
+    pub const VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES: usize = 2048;
     pub const VOXTRAL_TTS_FRAME_RATE_HZ: f32 = 12.5;
     pub const VIBEVOICE_TTS_MAX_OUTPUT_FRAMES: usize = 40_500;
     pub const VIBEVOICE_TTS_FRAME_RATE_HZ: f32 = 7.5;
     pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
+    pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
+    pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
 
     /// Get HuggingFace repository ID

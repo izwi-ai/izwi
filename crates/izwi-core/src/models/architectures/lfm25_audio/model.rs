@@ -290,6 +290,12 @@ impl Lfm25AudioModel {
             let prompt_concat_started = Instant::now();
             let prompt_embeds = Tensor::cat(&[&prefix_embeds, &audio_embeds, &suffix_embeds], 1)?;
             let prompt_tokens = prompt_embeds.dim(1)?;
+            if prompt_tokens >= self.main_config.context_length {
+                return Err(Error::InvalidInput(format!(
+                    "LFM2.5 Audio prompt has {prompt_tokens} tokens and leaves no generation capacity in the {}-token context",
+                    self.main_config.context_length
+                )));
+            }
             profile.prompt_concat_ms = elapsed_ms(prompt_concat_started);
 
             let prefill_started = Instant::now();
@@ -300,7 +306,9 @@ impl Lfm25AudioModel {
             let mut position = prompt_tokens;
             let mut generated_ids = Vec::new();
             let mut assembled = String::new();
-            let max_new_tokens = max_new_tokens.max(1);
+            let max_new_tokens = max_new_tokens
+                .max(1)
+                .min(self.main_config.context_length - prompt_tokens);
             let mut stop_reason = "max_tokens";
             let stop_check_interval = lfm25_asr_stop_check_interval();
             let use_deferred_device_decode = (self.device.device.is_metal()
@@ -561,6 +569,12 @@ impl Lfm25AudioModel {
             let prompt_embeds = embed_token_ids(main_backbone, &self.device.device, &prompt_ids)?;
             profile.prompt_embed_ms = elapsed_ms(prompt_embed_started);
             let prompt_tokens = prompt_embeds.dim(1)?;
+            if prompt_tokens >= self.main_config.context_length {
+                return Err(Error::InvalidInput(format!(
+                    "LFM2.5 Audio TTS prompt has {prompt_tokens} tokens and leaves no generation capacity in the {}-token context",
+                    self.main_config.context_length
+                )));
+            }
             let prefill_started = Instant::now();
             let prompt_hidden =
                 main_backbone.forward_embeds_physical(&prompt_embeds, 0, cache, shortconv)?;
@@ -576,7 +590,9 @@ impl Lfm25AudioModel {
             let mut generation_done = false;
             let mut sampled_audio_frames: Vec<Lfm25SampledAudioFrame> = Vec::new();
             let mut audio_stop_check_chunk: Vec<Lfm25SampledAudioFrame> = Vec::new();
-            let max_new_tokens = max_new_tokens.max(1);
+            let max_new_tokens = max_new_tokens
+                .max(1)
+                .min(self.main_config.context_length - prompt_tokens);
 
             while tokens_generated < max_new_tokens && !generation_done {
                 if !in_audio {

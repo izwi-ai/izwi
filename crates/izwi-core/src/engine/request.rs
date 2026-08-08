@@ -2990,13 +2990,16 @@ impl RequestProcessor {
         if params.max_tokens > 0 {
             params.max_tokens = match task_type {
                 TaskType::TTS => {
-                    if let Some(tts_limit) =
-                        model_variant.and_then(|variant| variant.tts_max_output_frames_hint())
-                    {
-                        params.max_tokens.min(tts_limit)
-                    } else {
-                        params.max_tokens.min(self.config.max_seq_len)
-                    }
+                    let tts_limit = model_variant
+                        .map(|variant| {
+                            super::tts_explicit_output_limit(
+                                self.config.backend,
+                                variant,
+                                self.config.max_seq_len,
+                            )
+                        })
+                        .unwrap_or(self.config.max_seq_len);
+                    params.max_tokens.min(tts_limit)
                 }
                 _ => params.max_tokens.min(self.config.max_seq_len),
             };
@@ -3222,6 +3225,7 @@ impl RequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::BackendKind;
     use crate::model::ModelVariant;
     use crate::models::shared::chat::ChatRole;
 
@@ -3764,6 +3768,39 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, 5000);
+    }
+
+    #[test]
+    fn request_processor_unlocks_explicit_cuda_audio_contexts() {
+        for (variant, expected) in [
+            (ModelVariant::Lfm25Audio15BGguf, 5000),
+            (ModelVariant::FishAudioS2Pro, 5000),
+            (ModelVariant::Voxtral4BTts2603, 2048),
+        ] {
+            let processor = RequestProcessor::new(EngineCoreConfig {
+                backend: BackendKind::Cuda,
+                ..EngineCoreConfig::default()
+            });
+            let mut request = EngineCoreRequest::tts("Test");
+            request.model_variant = Some(variant);
+            request.params.max_tokens = 5000;
+
+            let processed = processor.process(request).expect("CUDA TTS request");
+            assert_eq!(processed.params.max_tokens, expected, "{variant}");
+        }
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let processor = RequestProcessor::new(EngineCoreConfig {
+                backend,
+                ..EngineCoreConfig::default()
+            });
+            let mut request = EngineCoreRequest::tts("Test");
+            request.model_variant = Some(ModelVariant::FishAudioS2Pro);
+            request.params.max_tokens = 5000;
+
+            let processed = processor.process(request).expect("portable TTS request");
+            assert_eq!(processed.params.max_tokens, 4096, "{backend:?}");
+        }
     }
 
     #[test]

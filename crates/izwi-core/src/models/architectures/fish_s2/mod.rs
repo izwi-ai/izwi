@@ -326,7 +326,6 @@ impl FishS2NativeRuntime {
 
         let max_frames = params
             .max_frames
-            .min(ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
             .min(config.max_seq_len - prompt.prompt_length);
         if max_frames == 0 {
             return Err(Error::InvalidInput(

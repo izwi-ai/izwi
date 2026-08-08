@@ -37,30 +37,47 @@ impl Default for VoxtralTtsGenerationParams {
 
 impl VoxtralTtsGenerationParams {
     pub fn from_generation_config(config: &crate::runtime::GenerationConfig) -> Self {
-        Self::from_generation_config_with_auto_frames(config, None)
+        Self::from_generation_config_with_auto_frames(
+            config,
+            None,
+            ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES,
+        )
     }
 
     pub fn from_generation_config_for_text(
         config: &crate::runtime::GenerationConfig,
         text: &str,
     ) -> Self {
+        Self::from_generation_config_for_text_with_limit(
+            config,
+            text,
+            ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES,
+        )
+    }
+
+    pub fn from_generation_config_for_text_with_limit(
+        config: &crate::runtime::GenerationConfig,
+        text: &str,
+        explicit_max_frames: usize,
+    ) -> Self {
         Self::from_generation_config_with_auto_frames(
             config,
             Some(voxtral_tts_auto_max_frames_for_text(text)),
+            explicit_max_frames,
         )
     }
 
     fn from_generation_config_with_auto_frames(
         config: &crate::runtime::GenerationConfig,
         auto_max_frames: Option<usize>,
+        explicit_max_frames: usize,
     ) -> Self {
         let opts = &config.options;
         let auto_frame_budget = opts.max_tokens == 0;
         let max_frames = if auto_frame_budget {
             auto_max_frames.unwrap_or(ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES)
         } else {
-            opts.max_tokens
-                .clamp(1, ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES)
+            opts.max_tokens.clamp(1, explicit_max_frames.max(1))
         };
         Self {
             temperature: opts.temperature.max(0.0),
@@ -133,6 +150,26 @@ mod tests {
             ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES
         );
         assert!(!params.auto_frame_budget);
+    }
+
+    #[test]
+    fn cuda_explicit_limit_does_not_change_auto_budget() {
+        let mut explicit = GenerationConfig::default();
+        explicit.options.max_tokens = 5000;
+        let explicit = VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
+            &explicit,
+            "long form",
+            ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES,
+        );
+        assert_eq!(explicit.max_frames, 2048);
+
+        let automatic = VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
+            &GenerationConfig::default(),
+            "short text",
+            ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES,
+        );
+        assert!(automatic.auto_frame_budget);
+        assert!(automatic.max_frames < ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES);
     }
 
     #[test]

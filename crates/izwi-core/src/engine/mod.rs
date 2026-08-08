@@ -62,6 +62,7 @@ pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorS
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub use config::EngineCoreConfig;
 pub(crate) use config::resolve_backend_model_context;
+pub(crate) use config::tts_explicit_output_limit;
 pub use core::EngineCore;
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
 use crate::config::{resolve_kv_cache_policy, ResolvedKvCachePolicy};
+use crate::model::ModelVariant;
 use crate::Result;
 
 /// Largest native text context in the currently supported CUDA model catalog
@@ -29,6 +30,33 @@ pub(crate) fn resolve_backend_model_context(
     } else {
         configured.min(loaded_model_max)
     })
+}
+
+pub(crate) fn tts_explicit_output_limit(
+    backend: BackendKind,
+    variant: ModelVariant,
+    configured_max_seq_len: usize,
+) -> usize {
+    let configured = configured_max_seq_len.max(1);
+    if backend == BackendKind::Cuda {
+        return match variant.family() {
+            crate::catalog::ModelFamily::Lfm25Audio => {
+                ModelVariant::LFM25_AUDIO_NATIVE_CONTEXT_TOKENS
+            }
+            crate::catalog::ModelFamily::FishS2Tts => {
+                ModelVariant::FISH_S2_PRO_NATIVE_CONTEXT_TOKENS
+            }
+            crate::catalog::ModelFamily::VoxtralTts => {
+                ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES
+            }
+            _ => variant
+                .tts_max_output_frames_hint()
+                .unwrap_or(configured),
+        };
+    }
+    variant
+        .tts_max_output_frames_hint()
+        .unwrap_or(configured)
 }
 
 /// Configuration for the engine core.
@@ -369,9 +397,11 @@ impl EngineCoreConfig {
 mod managed_kv_default_tests {
     use super::{
         resolve_backend_model_context, EngineCoreConfig, CUDA_MAX_NATIVE_CONTEXT_TOKENS,
+        tts_explicit_output_limit,
     };
     use crate::backends::BackendKind;
     use crate::config::{KvCacheDtype, PrefixCachePolicy};
+    use crate::model::ModelVariant;
 
     #[test]
     fn managed_prefix_reuse_is_disabled_by_default() {
@@ -431,5 +461,39 @@ mod managed_kv_default_tests {
             4096
         );
         assert!(resolve_backend_model_context(BackendKind::Cuda, 4096, 0).is_err());
+    }
+
+    #[test]
+    fn cuda_unlocks_explicit_audio_generation_contexts_only() {
+        assert_eq!(
+            tts_explicit_output_limit(
+                BackendKind::Cuda,
+                ModelVariant::Lfm25Audio15BGguf,
+                4096,
+            ),
+            32_768
+        );
+        assert_eq!(
+            tts_explicit_output_limit(BackendKind::Cuda, ModelVariant::FishAudioS2Pro, 4096),
+            32_768
+        );
+        assert_eq!(
+            tts_explicit_output_limit(BackendKind::Cuda, ModelVariant::Voxtral4BTts2603, 4096),
+            2048
+        );
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(
+                tts_explicit_output_limit(backend, ModelVariant::Lfm25Audio15BGguf, 4096),
+                4096
+            );
+            assert_eq!(
+                tts_explicit_output_limit(backend, ModelVariant::FishAudioS2Pro, 4096),
+                4096
+            );
+            assert_eq!(
+                tts_explicit_output_limit(backend, ModelVariant::Voxtral4BTts2603, 4096),
+                1500
+            );
+        }
     }
 }
