@@ -1298,7 +1298,11 @@ struct DeviceCapacityProbe {
 impl DeviceCapacityProbe {
     fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
         match self.configured_cap {
-            Some(cap) => (total.min(cap), available.min(cap)),
+            Some(cap) => {
+                let effective_total = total.min(cap);
+                let used = total.saturating_sub(available.min(total));
+                (effective_total, effective_total.saturating_sub(used))
+            }
             None => (total, available),
         }
     }
@@ -2273,6 +2277,20 @@ Pages free: 10.\n";
         let decision = cache.decision(refresh_at + Duration::from_millis(2));
         assert_eq!(decision.snapshot, Some(refreshed));
         assert!(!decision.request_refresh);
+    }
+
+    #[test]
+    fn configured_device_cap_subtracts_memory_already_in_use() {
+        let probe = DeviceCapacityProbe {
+            backend: BackendKind::Cuda,
+            device: None,
+            configured_cap: Some(80),
+            test_capacity: None,
+        };
+
+        assert_eq!(probe.apply_cap(100, 70), (80, 50));
+        assert_eq!(probe.apply_cap(100, 10), (80, 0));
+        assert_eq!(probe.apply_cap(64, 40), (64, 40));
     }
 
     #[test]

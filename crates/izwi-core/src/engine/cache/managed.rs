@@ -252,6 +252,7 @@ struct ManagedKvModelState {
     registered_sessions: HashSet<SessionKey>,
     tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
     resource_lease: Option<ResourceLease>,
+    materialized_resources: ResourceVector,
     allocation_ledger: StateAllocationLedger,
 }
 
@@ -622,6 +623,10 @@ impl ManagedKvCacheManager {
 
         let maximum_state_resources = allocation_plan.maximum_resources(&state_plan_v2)?;
         let resources = managed_state_resources(backend, maximum_state_resources)?;
+        let materialized_resources = managed_state_resources(
+            backend,
+            allocation_plan.initial_state_resources(&state_plan_v2)?,
+        )?;
         let initial_authorization = if backend == BackendKind::Cuda {
             let deferred_paged_bytes = plan.groups.iter().try_fold(0_u64, |total, group| {
                 let initial_pages = group.capacity_strategy.initial_blocks();
@@ -647,7 +652,6 @@ impl ManagedKvCacheManager {
         } else {
             resources
         };
-        let materialized_resources = initial_authorization;
         let resource_lease = self
             .resource_authority
             .as_ref()
@@ -743,6 +747,7 @@ impl ManagedKvCacheManager {
                 registered_sessions: HashSet::new(),
                 tensor_sequences: HashMap::new(),
                 resource_lease,
+                materialized_resources,
                 allocation_ledger,
             },
         );
@@ -986,6 +991,11 @@ impl ManagedKvCacheManager {
                             current.checked_add(delta)
                         })
                         .transpose()?;
+                    let final_materialized =
+                        state.materialized_resources.checked_add(ResourceVector {
+                            device_bytes: ResourceAmount::Known(added_bytes),
+                            ..ResourceVector::zero()
+                        })?;
                     // Replacing a contiguous Candle tensor keeps the old arena
                     // alive while allocating the complete target arena. Reserve
                     // that admission-only peak before touching device memory,
@@ -1032,11 +1042,10 @@ impl ManagedKvCacheManager {
                             residency: ResidencyMeasurement::Unknown,
                         },
                     )?;
-                    if let (Some(lease), Some(final_resources)) =
-                        (state.resource_lease.as_ref(), final_authorization)
-                    {
-                        lease.record_materialized_usage(final_resources)?;
+                    if let Some(lease) = state.resource_lease.as_ref() {
+                        lease.record_materialized_usage(final_materialized)?;
                     }
+                    state.materialized_resources = final_materialized;
                     self.telemetry.record_backing_allocation();
                 }
                 Ok(())

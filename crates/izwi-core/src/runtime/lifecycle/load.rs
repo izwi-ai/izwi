@@ -629,6 +629,14 @@ impl ModelLifecycleController {
             // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
             self.publish_loaded_model(instantiated).await?;
+            // Model tensors are now visible in the backend provider's used
+            // memory. Reconcile the lease before reserving any retained or
+            // invocation state so live headroom does not charge the model once
+            // through the provider and again as unmaterialized ledger work.
+            self.finalize_slot_materialization(
+                variant,
+                resource_plan.resident_authorization,
+            )?;
             let backend = self.backend_router.context().backend_kind;
             // Transitional bridge: only the exact loaded chat implementation
             // currently publishes non-default cache truth. Model migrations
@@ -1238,12 +1246,6 @@ impl ModelLifecycleController {
                 model_instance_id,
                 state_publications,
             )?;
-            // The physical allocation is now visible to the live provider.
-            // Reconcile before Ready publication so it is no longer counted as
-            // both pending ledger work and observed backend memory. CUDA drops
-            // its transient host-side authorization at this commit point while
-            // retaining the immutable device residency authorization.
-            self.finalize_slot_materialization(variant, resource_plan.resident_authorization)?;
             // Install the legacy manager projection before the authoritative
             // commit. Inference pins consult the slot, so no caller can observe
             // Ready while this await is still in progress.
