@@ -314,6 +314,23 @@ struct AcceleratorLayerStorage {
     value_head_dim: usize,
 }
 
+fn resident_flat_slot_capacity(
+    layer: &AcceleratorLayerStorage,
+    resident_pages: usize,
+    page_tokens: usize,
+) -> Result<usize> {
+    let key_pages = layer.keys.dim(0)?;
+    let value_pages = layer.values.dim(0)?;
+    if key_pages != resident_pages || value_pages != resident_pages {
+        return Err(Error::InferenceError(format!(
+            "accelerator KV backing/residency mismatch: resident_pages={resident_pages}, key_pages={key_pages}, value_pages={value_pages}"
+        )));
+    }
+    resident_pages
+        .checked_mul(page_tokens)
+        .ok_or_else(|| Error::InferenceError("resident KV slot count overflow".into()))
+}
+
 #[derive(Debug)]
 struct LoweredPrefillMetadata {
     cache_key: PrefillMetadataCacheKey,
@@ -1719,9 +1736,15 @@ impl KvArena for CandleAcceleratorKvArena {
             "value",
         )?;
 
-        let flat_capacity = (self.config.capacity_pages as usize)
-            .checked_mul(self.config.page_tokens as usize)
-            .ok_or_else(|| Error::InferenceError("KV slot count overflow".into()))?;
+        // CUDA growth seals a larger logical envelope than the allocation that
+        // is currently resident. Flatten the actual backing, not that logical
+        // maximum, or every write before the final growth step has a different
+        // element count from the requested reshape.
+        let flat_capacity = resident_flat_slot_capacity(
+            layer,
+            self.resident_capacity_pages() as usize,
+            self.config.page_tokens as usize,
+        )?;
         let flat_keys =
             layer
                 .keys
@@ -2383,6 +2406,39 @@ mod tests {
             self.0.store(true, Ordering::Release);
             Ok(())
         }
+    }
+
+    #[test]
+    fn resident_flat_capacity_uses_materialized_pages_not_logical_envelope() -> Result<()> {
+        let layer = AcceleratorLayerStorage {
+            keys: Tensor::zeros((2, 4, 1, 3), DType::F32, &Device::Cpu)?,
+            values: Tensor::zeros((2, 4, 1, 5), DType::F32, &Device::Cpu)?,
+            num_kv_heads: 1,
+            key_head_dim: 3,
+            value_head_dim: 5,
+        };
+
+        assert_eq!(resident_flat_slot_capacity(&layer, 2, 4)?, 8);
+        assert_eq!(
+            layer.keys.reshape((8, 1, 3))?.dims(),
+            &[8, 1, 3],
+            "a partially resident backing must flatten independently of its logical maximum"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resident_flat_capacity_rejects_published_backing_divergence() {
+        let layer = AcceleratorLayerStorage {
+            keys: Tensor::zeros((2, 4, 1, 3), DType::F32, &Device::Cpu).unwrap(),
+            values: Tensor::zeros((3, 4, 1, 5), DType::F32, &Device::Cpu).unwrap(),
+            num_kv_heads: 1,
+            key_head_dim: 3,
+            value_head_dim: 5,
+        };
+
+        let error = resident_flat_slot_capacity(&layer, 2, 4).unwrap_err();
+        assert!(format!("{error}").contains("backing/residency mismatch"));
     }
 
     fn test_completion(complete: bool) -> (DeviceFence, Arc<std::sync::atomic::AtomicBool>) {
