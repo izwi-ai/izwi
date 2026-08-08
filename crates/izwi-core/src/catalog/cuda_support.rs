@@ -249,8 +249,8 @@ impl ModelVariant {
 
         match self.family() {
             ModelFamily::Tokenizer => CudaSupportInfo::new(
-                CudaSupportLevel::CpuOnly,
-                "tokenizer-only artifact does not run an inference backend",
+                CudaSupportLevel::CandleCudaGeneric,
+                "Qwen3 TTS tokenizer is a neural speech codec whose encoder, RVQ, transformer, and decoder use Candle CUDA tensor kernels when selected",
             ),
             ModelFamily::SortformerDiarization => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
@@ -306,8 +306,8 @@ impl ModelVariant {
 
         match self.family() {
             ModelFamily::Tokenizer => CudaQuantizationInfo::new(
-                CudaQuantizationSupportLevel::CpuOnly,
-                "tokenizer-only artifact does not run quantized CUDA inference",
+                CudaQuantizationSupportLevel::Dense,
+                "Qwen3 TTS tokenizer is a dense neural speech codec; CUDA dtype policy, not text-tokenizer orchestration, controls its execution",
             ),
             ModelFamily::SortformerDiarization => CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Dense,
@@ -387,11 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn known_cpu_only_families_are_explicit() {
+    fn neural_speech_tokenizer_is_cuda_eligible_but_unverified() {
+        let support = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_support();
+        assert_eq!(support.level, CudaSupportLevel::CandleCudaGeneric);
         assert_eq!(
-            ModelVariant::Qwen3TtsTokenizer12Hz.cuda_support_level(),
-            CudaSupportLevel::CpuOnly
+            support.execution_status,
+            CudaExecutionStatus::EligibleUnverified
         );
+        assert_eq!(support.evidence, CudaEvidenceLevel::SourceReviewed);
     }
 
     #[test]
@@ -415,7 +418,6 @@ mod tests {
             .iter()
             .copied()
             .filter(ModelVariant::is_enabled)
-            .filter(|variant| variant.family() != ModelFamily::Tokenizer)
         {
             let info = variant.cuda_support();
             assert_eq!(
@@ -536,6 +538,7 @@ mod tests {
         assert!(dequant.uses_dense_dequantized_fallback());
 
         let tokenizer = ModelVariant::Qwen3TtsTokenizer12Hz.cuda_quantization();
-        assert!(!tokenizer.is_allowed_for_cuda());
+        assert!(tokenizer.is_allowed_for_cuda());
+        assert_eq!(tokenizer.level, CudaQuantizationSupportLevel::Dense);
     }
 }
