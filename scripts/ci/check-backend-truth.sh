@@ -173,6 +173,7 @@ compile_cuda_test_harnesses() {
     echo "Compiling CUDA-linked test harnesses without executing them"
     cargo test --locked -p izwi-core --features "${core_features}" --lib --no-run
     cargo test --locked -p izwi-server --features "${wrapper_features}" --lib --no-run
+    cargo test --locked -p izwi-cli --features "${wrapper_features}" --no-run
 }
 
 smoke_cuda_device_if_available() {
