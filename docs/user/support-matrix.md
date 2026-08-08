@@ -161,6 +161,12 @@ can lower that window but cannot raise it above 60 minutes. See the
 [Voxtral deployment](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/voxtral_tts.yaml),
 and [VibeVoice ASR model card](https://huggingface.co/microsoft/VibeVoice-ASR).
 
+Voxtral Realtime CUDA offline decoding uses the loaded model position range
+(131,072 tokens in the current checkpoint) instead of the portable 1,024-frame
+service limit. Its physical paged cache rotates the 8,192-token attention
+window with one spare page; inputs beyond the loaded position range fail
+explicitly instead of silently dropping the tail.
+
 Architectural processing windows are not expanded. Whisper still processes
 30-second encoder windows, Kokoro still uses at most 510 phonemes per model
 chunk, and streaming ASR/diarization families retain their bounded working

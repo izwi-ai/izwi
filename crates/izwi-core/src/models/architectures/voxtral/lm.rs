@@ -70,6 +70,7 @@ struct VoxtralAttention {
     use_mrope: bool,
     mrope_section: Option<Vec<usize>>,
     rope_theta: f64,
+    sliding_window: Option<usize>,
 }
 
 struct VoxtralMlp {
@@ -130,6 +131,10 @@ impl VoxtralLM {
                 .sliding_window()
                 .map_or(context, |window| context.min(window))
         })
+    }
+
+    pub(crate) fn model_context_limit(&self) -> Option<usize> {
+        self.cfg.context_length()
     }
 
     pub(crate) fn managed_inference_state_contract(
@@ -213,7 +218,7 @@ impl VoxtralLM {
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        cache: &PhysicalPagedKvCache,
+        cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
         t_cond: Option<&Tensor>,
     ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
@@ -228,14 +233,13 @@ impl VoxtralLM {
         let end_pos = start_pos
             .checked_add(sequence_len)
             .ok_or_else(|| Error::InvalidInput("Voxtral managed context length overflow".into()))?;
-        if self
-            .cfg
-            .sliding_window()
-            .is_some_and(|window| end_pos > window)
-        {
-            return Err(Error::InvalidInput(
-                "Voxtral physical paging cannot yet advance sliding-window block tables".into(),
-            ));
+        if self.cfg.context_length().is_some_and(|limit| end_pos > limit) {
+            return Err(Error::InvalidInput(format!(
+                "Voxtral sequence ends at {end_pos}, beyond the loaded model context"
+            )));
+        }
+        if let Some(window) = self.cfg.sliding_window() {
+            cache.advance_sliding_window_for_append(start_pos, sequence_len, window)?;
         }
         cache.validate_model(
             self.cfg.num_hidden_layers,
@@ -416,6 +420,7 @@ impl VoxtralAttention {
             use_mrope,
             mrope_section,
             rope_theta: cfg.rope_theta,
+            sliding_window: cfg.sliding_window(),
         })
     }
 
@@ -465,7 +470,12 @@ impl VoxtralAttention {
         let k = k.squeeze(0)?;
         let v = v.squeeze(0)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let out = cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?;
+        let out = match self.sliding_window {
+            Some(window) => cache.write_and_attend_with_window(
+                layer_idx, prepared, &q, &k, &v, scale, window,
+            )?,
+            None => cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?,
+        };
         let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
         linear_forward_last_dim(&self.o_proj, &out)
     }

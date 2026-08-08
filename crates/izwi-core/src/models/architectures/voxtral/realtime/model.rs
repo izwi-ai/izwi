@@ -8,7 +8,7 @@ use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
-use crate::backends::DeviceProfile;
+use crate::backends::{BackendKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -71,6 +71,29 @@ struct VoxtralRuntimeConfig {
     downsample_factor: Option<usize>,
     audio_length_per_tok: Option<usize>,
     checkpoint_dtype: Option<DType>,
+}
+
+const PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT: usize = 1024;
+
+fn voxtral_realtime_offline_frame_limit(
+    backend: BackendKind,
+    audio_frames: usize,
+    model_context_limit: usize,
+) -> Result<usize> {
+    if backend != BackendKind::Cuda {
+        return Ok(audio_frames.min(PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT));
+    }
+    if model_context_limit == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral Realtime reported a zero physical context".into(),
+        ));
+    }
+    if audio_frames > model_context_limit {
+        return Err(Error::InvalidInput(format!(
+            "Voxtral Realtime produced {audio_frames} audio tokens, exceeding its {model_context_limit}-token loaded model context"
+        )));
+    }
+    Ok(audio_frames)
 }
 
 impl VoxtralRealtimeModel {
@@ -195,11 +218,14 @@ impl VoxtralRealtimeModel {
             default_kv_page_size(),
             &[CacheDomainId::new(1)],
         )?;
-        let max_context_tokens = self
+        let attention_window_tokens = self
             .language_model
             .physical_context_limit()
             .ok_or_else(|| Error::ModelLoadError("Voxtral has no context limit".into()))?;
-        voxtral_physical_state_spec(stage_graphs, invocation, max_context_tokens)
+        let rotating_capacity_tokens = attention_window_tokens
+            .checked_add(default_kv_page_size())
+            .ok_or_else(|| Error::ModelLoadError("Voxtral cache capacity overflow".into()))?;
+        voxtral_physical_state_spec(stage_graphs, invocation, rotating_capacity_tokens)
     }
 
     /// Transcribe audio (non-streaming)
@@ -287,6 +313,34 @@ impl VoxtralRealtimeModel {
             audio.to_vec()
         };
 
+        let backend = BackendKind::from(self.device.kind);
+        let model_context_limit = self
+            .language_model
+            .model_context_limit()
+            .ok_or_else(|| Error::ModelLoadError("Voxtral has no context limit".into()))?;
+        let attention_window_tokens = self
+            .language_model
+            .physical_context_limit()
+            .ok_or_else(|| Error::ModelLoadError("Voxtral has no attention window".into()))?;
+        if backend == BackendKind::Cuda {
+            let (left_pad, right_pad) = offline_streaming_padding_samples(
+                audio.len(),
+                self.raw_audio_length_per_tok,
+                self.offline_left_pad_tokens,
+                self.streaming_right_pad_tokens,
+            );
+            let predicted_audio_frames = left_pad
+                .checked_add(audio.len())
+                .and_then(|samples| samples.checked_add(right_pad))
+                .ok_or_else(|| Error::InvalidInput("Voxtral audio length overflow".into()))?
+                / self.raw_audio_length_per_tok.max(1);
+            voxtral_realtime_offline_frame_limit(
+                backend,
+                predicted_audio_frames,
+                model_context_limit,
+            )?;
+        }
+
         let padded_audio = self.pad_offline_streaming_audio(&audio);
 
         // Compute mel spectrogram
@@ -352,16 +406,26 @@ impl VoxtralRealtimeModel {
         let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
         let prompt_len = prompt_tokens.len();
-        let max_frames = audio_frames.min(1024);
+        let max_frames = voxtral_realtime_offline_frame_limit(
+            backend,
+            audio_frames,
+            model_context_limit,
+        )?;
         if prompt_len > max_frames {
             return Err(Error::InferenceError(format!(
                 "Voxtral prompt length ({prompt_len}) exceeds available audio frames ({max_frames})"
             )));
         }
-        if max_frames > cache.capacity_tokens() {
+        let page_tokens = default_kv_page_size();
+        let resident_tokens = cache.capacity_tokens().saturating_sub(
+            cache.window_start().div_euclid(page_tokens) * page_tokens,
+        );
+        let required_resident_tokens = attention_window_tokens
+            .checked_add(page_tokens)
+            .ok_or_else(|| Error::ModelLoadError("Voxtral cache capacity overflow".into()))?;
+        if resident_tokens < required_resident_tokens {
             return Err(Error::InvalidInput(format!(
-                "Voxtral Realtime needs {max_frames} cache tokens, but its invocation lease has capacity {}",
-                cache.capacity_tokens()
+                "Voxtral Realtime needs {required_resident_tokens} resident cache tokens for rotating attention, but its invocation lease has {resident_tokens}"
             )));
         }
         let mut generated = Vec::new();
@@ -1452,8 +1516,9 @@ mod tests {
         offline_streaming_padding_samples, pool_audio_embeddings_by_block,
         prepare_realtime_conv_input, resample_audio, select_voxtral_dtype, text_delta,
         voxtral_generation_prefix_len, voxtral_realtime_cuda_sliding_flash_options,
+        voxtral_realtime_offline_frame_limit,
     };
-    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device, Tensor};
     use uuid::Uuid;
 
@@ -1471,6 +1536,27 @@ mod tests {
         };
 
         assert_eq!(select_voxtral_dtype(&profile, Some(DType::F16)), DType::F16);
+    }
+
+    #[test]
+    fn cuda_offline_frames_use_the_full_model_context() {
+        assert_eq!(
+            voxtral_realtime_offline_frame_limit(BackendKind::Cuda, 131_072, 131_072).unwrap(),
+            131_072
+        );
+        assert!(
+            voxtral_realtime_offline_frame_limit(BackendKind::Cuda, 131_073, 131_072).is_err()
+        );
+    }
+
+    #[test]
+    fn portable_offline_frame_limit_is_unchanged() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(
+                voxtral_realtime_offline_frame_limit(backend, 8192, 8192).unwrap(),
+                1024
+            );
+        }
     }
 
     #[test]

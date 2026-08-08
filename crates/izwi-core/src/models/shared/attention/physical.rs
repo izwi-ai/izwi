@@ -144,6 +144,51 @@ impl PhysicalPagedKvCache {
         self.window_start
     }
 
+    /// Recycle fully invisible leading pages before a sliding-window append.
+    /// The arena keeps one spare page beyond the logical attention window so
+    /// the partially visible leading and newly written trailing pages can
+    /// coexist. Page identities rotate; absolute positions and context length
+    /// remain monotonic.
+    pub(crate) fn advance_sliding_window_for_append(
+        &mut self,
+        start_pos: usize,
+        token_count: usize,
+        window_tokens: usize,
+    ) -> Result<()> {
+        if start_pos != self.context_len || token_count == 0 || window_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "physical sliding-window rotation received an invalid append".into(),
+            ));
+        }
+        let end_pos = start_pos
+            .checked_add(token_count)
+            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
+        let page_tokens = self.arena.config().page_tokens as usize;
+        let first_query_end = start_pos
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
+        let visible_start = first_query_end.saturating_sub(window_tokens);
+
+        while end_pos > self.capacity_tokens() {
+            let next_window_start = self
+                .window_start
+                .checked_add(page_tokens)
+                .ok_or_else(|| Error::InvalidInput("physical window overflow".into()))?;
+            if next_window_start > visible_start {
+                return Err(Error::InvalidInput(
+                    "physical sliding-window cache needs one spare page beyond the visible window"
+                        .into(),
+                ));
+            }
+            self.blocks.rotate_left(1);
+            self.window_start = next_window_start;
+            self.logical_generation = self.logical_generation.checked_add(1).ok_or_else(|| {
+                Error::InvalidInput("physical window generation overflow".into())
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn arena(&self) -> &Arc<dyn KvArena> {
         &self.arena
     }
@@ -792,5 +837,54 @@ mod tests {
         assert_eq!(prepared.slots.logical_slots()[2].offset, 3);
 
         assert!(cache.prepare_append_with_window(9, 1, 0).is_err());
+    }
+
+    #[test]
+    fn sliding_window_rotation_recycles_only_fully_invisible_pages() {
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(11),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 3,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..3)
+            .map(|index| CacheBlockRef {
+                arena: arena_id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut cache =
+            PhysicalPagedKvCache::new(arena, vec![binding], blocks.clone(), 12).unwrap();
+
+        cache
+            .advance_sliding_window_for_append(12, 1, 8)
+            .unwrap();
+
+        assert_eq!(cache.window_start(), 4);
+        assert_eq!(cache.capacity_tokens(), 16);
+        assert_eq!(cache.slots_for_append(12, 1).unwrap()[0].block, blocks[0]);
     }
 }
