@@ -1286,7 +1286,7 @@ impl CandleAcceleratorKvArena {
             return Ok(output);
         }
 
-        let output = crate::kernels::cuda::paged_decode_attention(
+        let output = crate::kernels::cuda::paged_decode_attention_with_graph(
             args.queries,
             &layer.keys,
             &layer.values,
@@ -1302,6 +1302,7 @@ impl CandleAcceleratorKvArena {
             args.softcap,
             device_metadata.max_context,
             tuning.decode_partition_tuning,
+            tuning.decode_graph_allowed,
         )?;
         self.last_attention_provider
             .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);

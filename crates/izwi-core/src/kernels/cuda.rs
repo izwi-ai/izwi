@@ -7,6 +7,11 @@
 
 use candle_core::{CpuStorage, CustomOp3, DType, Layout, Shape, Tensor, D};
 
+#[cfg(feature = "cuda")]
+use std::cell::RefCell;
+#[cfg(feature = "cuda")]
+use std::collections::VecDeque;
+
 use crate::kernels::FusedSiluMulResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +710,45 @@ pub(crate) fn paged_decode_attention(
     max_context_len: usize,
     partition_tuning: Option<(usize, usize)>,
 ) -> candle_core::Result<Tensor> {
+    paged_decode_attention_with_graph(
+        queries,
+        keys,
+        values,
+        metadata,
+        batch,
+        query_heads,
+        kv_heads,
+        page_tokens,
+        max_blocks,
+        key_dim,
+        value_dim,
+        softmax_scale,
+        softcap,
+        max_context_len,
+        partition_tuning,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paged_decode_attention_with_graph(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    max_context_len: usize,
+    partition_tuning: Option<(usize, usize)>,
+    _allow_graph: bool,
+) -> candle_core::Result<Tensor> {
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
         || queries.device().location() != values.device().location()
@@ -783,9 +827,33 @@ pub(crate) fn paged_decode_attention(
     {
         candle_core::bail!("CUDA paged decode exceeds the signed 32-bit kernel index ABI")
     }
-    queries.contiguous()?.apply_op3_no_bwd(
-        &keys.contiguous()?,
-        &values.contiguous()?,
+    let queries = queries.contiguous()?;
+    let keys = keys.contiguous()?;
+    let values = values.contiguous()?;
+    #[cfg(feature = "cuda")]
+    if _allow_graph && strategy == CudaPagedDecodeStrategy::OnePass {
+        if let Some(output) = try_cuda_paged_decode_graph(
+            &queries,
+            &keys,
+            &values,
+            metadata,
+            batch,
+            query_heads,
+            kv_heads,
+            page_tokens,
+            max_blocks,
+            key_dim,
+            value_dim,
+            capacity_pages,
+            softmax_scale,
+            softcap,
+        )? {
+            return Ok(output);
+        }
+    }
+    queries.apply_op3_no_bwd(
+        &keys,
+        &values,
         &CudaPagedDecodeOp {
             metadata: metadata.clone(),
             batch,
@@ -802,6 +870,361 @@ pub(crate) fn paged_decode_attention(
             partition_tokens: partition_tuning.map(|(_, tokens)| tokens).unwrap_or(0),
         },
     )
+}
+
+#[cfg(feature = "cuda")]
+const CUDA_PAGED_DECODE_GRAPH_BUCKETS: usize = 64;
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CudaPagedDecodeGraphKey {
+    queries_dtype: DType,
+    keys_id: candle_core::TensorId,
+    values_id: candle_core::TensorId,
+    metadata_id: candle_core::TensorId,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    capacity_pages: usize,
+    softmax_scale_bits: u32,
+    softcap_bits: Option<u32>,
+}
+
+#[cfg(feature = "cuda")]
+enum CudaPagedDecodeGraphState {
+    Warm {
+        queries: Tensor,
+        output: Tensor,
+    },
+    Captured {
+        queries: Tensor,
+        output: Tensor,
+        graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
+    },
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    // cudarc graph objects are explicitly not thread safe. Keeping each graph
+    // in the worker thread that captured it also makes capture mode and replay
+    // ownership unambiguous.
+    static CUDA_PAGED_DECODE_GRAPHS: RefCell<VecDeque<(CudaPagedDecodeGraphKey, CudaPagedDecodeGraphState)>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_paged_decode_graph_key(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    capacity_pages: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+) -> CudaPagedDecodeGraphKey {
+    CudaPagedDecodeGraphKey {
+        queries_dtype: queries.dtype(),
+        keys_id: keys.id(),
+        values_id: values.id(),
+        metadata_id: metadata.id(),
+        batch,
+        query_heads,
+        kv_heads,
+        page_tokens,
+        max_blocks,
+        key_dim,
+        value_dim,
+        capacity_pages,
+        softmax_scale_bits: softmax_scale.to_bits(),
+        softcap_bits: softcap.map(f32::to_bits),
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_cuda_paged_decode_graph(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    capacity_pages: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+) -> candle_core::Result<Option<Tensor>> {
+    use candle_core::cuda_backend::cudarc::driver::sys::{
+        CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+    };
+
+    let key = cuda_paged_decode_graph_key(
+        queries,
+        keys,
+        values,
+        metadata,
+        batch,
+        query_heads,
+        kv_heads,
+        page_tokens,
+        max_blocks,
+        key_dim,
+        value_dim,
+        capacity_pages,
+        softmax_scale,
+        softcap,
+    );
+    CUDA_PAGED_DECODE_GRAPHS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let Some(index) = cache.iter().position(|(candidate, _)| *candidate == key) else {
+            let stable_queries = Tensor::zeros(queries.shape(), queries.dtype(), queries.device())?;
+            let output = Tensor::zeros(
+                (batch, query_heads, value_dim),
+                queries.dtype(),
+                queries.device(),
+            )?;
+            if cache.len() == CUDA_PAGED_DECODE_GRAPH_BUCKETS {
+                cache.pop_front();
+            }
+            cache.push_back((
+                key,
+                CudaPagedDecodeGraphState::Warm {
+                    queries: stable_queries,
+                    output,
+                },
+            ));
+            return Ok(None);
+        };
+
+        let (_, state) = cache.remove(index).expect("located CUDA graph bucket");
+        let result = match state {
+            CudaPagedDecodeGraphState::Captured {
+                queries: stable_queries,
+                output,
+                graph,
+            } => {
+                stable_queries.slice_set(queries, 0, 0)?;
+                if graph.launch().is_err() {
+                    // Dropping the failed bucket permanently restores the
+                    // eager provider for this call. A later call may warm a
+                    // fresh bucket after the driver error is cleared.
+                    return Ok(None);
+                }
+                let result = output.clone();
+                cache.push_back((
+                    key,
+                    CudaPagedDecodeGraphState::Captured {
+                        queries: stable_queries,
+                        output,
+                        graph,
+                    },
+                ));
+                Some(result)
+            }
+            CudaPagedDecodeGraphState::Warm {
+                queries: stable_queries,
+                output,
+            } => {
+                stable_queries.slice_set(queries, 0, 0)?;
+                let device = queries.device().as_cuda_device()?;
+                let stream = device.cuda_stream();
+                let _htod_cache = device.enable_cuda_graph_htod_cache();
+                if stream
+                    .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                    .is_err()
+                {
+                    return Ok(None);
+                }
+                let captured_launch = launch_cuda_paged_decode_one_pass_into(
+                    &stable_queries,
+                    keys,
+                    values,
+                    metadata,
+                    &output,
+                    batch,
+                    query_heads,
+                    kv_heads,
+                    page_tokens,
+                    max_blocks,
+                    key_dim,
+                    value_dim,
+                    capacity_pages,
+                    softmax_scale,
+                    softcap,
+                );
+                let captured_graph =
+                    stream.end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+                let Ok(()) = captured_launch else {
+                    return Ok(None);
+                };
+                let Ok(Some(graph)) = captured_graph else {
+                    return Ok(None);
+                };
+                if graph.launch().is_err() {
+                    return Ok(None);
+                }
+                let result = output.clone();
+                cache.push_back((
+                    key,
+                    CudaPagedDecodeGraphState::Captured {
+                        queries: stable_queries,
+                        output,
+                        graph,
+                    },
+                ));
+                Some(result)
+            }
+        };
+        Ok(result)
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_paged_decode_one_pass_into(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    output: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    key_dim: usize,
+    value_dim: usize,
+    capacity_pages: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+) -> candle_core::Result<()> {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+    let (query_storage, query_layout) = queries.storage_and_layout();
+    let (key_storage, key_layout) = keys.storage_and_layout();
+    let (value_storage, value_layout) = values.storage_and_layout();
+    let (metadata_storage, metadata_layout) = metadata.storage_and_layout();
+    let (output_storage, output_layout) = output.storage_and_layout();
+    let candle_core::Storage::Cuda(query_storage) = &*query_storage else {
+        candle_core::bail!("CUDA graph query storage is not CUDA")
+    };
+    let candle_core::Storage::Cuda(key_storage) = &*key_storage else {
+        candle_core::bail!("CUDA graph key storage is not CUDA")
+    };
+    let candle_core::Storage::Cuda(value_storage) = &*value_storage else {
+        candle_core::bail!("CUDA graph value storage is not CUDA")
+    };
+    let candle_core::Storage::Cuda(metadata_storage) = &*metadata_storage else {
+        candle_core::bail!("CUDA graph metadata storage is not CUDA")
+    };
+    let candle_core::Storage::Cuda(output_storage) = &*output_storage else {
+        candle_core::bail!("CUDA graph output storage is not CUDA")
+    };
+    let CudaStorageSlice::U32(metadata_slice) = &metadata_storage.slice else {
+        candle_core::bail!("CUDA graph metadata storage is not U32")
+    };
+    let Some((metadata_start, metadata_end)) = metadata_layout.contiguous_offsets() else {
+        candle_core::bail!("CUDA graph metadata must be contiguous")
+    };
+    let metadata_view = metadata_slice.slice(metadata_start..metadata_end);
+    let blocks =
+        u32::try_from(batch.checked_mul(query_heads).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA graph decode grid overflow".to_string())
+        })?)
+        .map_err(|_| candle_core::Error::Msg("CUDA graph decode grid overflow".to_string()))?;
+    let config = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+    };
+    let device = query_storage.device();
+
+    macro_rules! launch {
+        ($variant:ident, $function_name:literal) => {{
+            let CudaStorageSlice::$variant(query_slice) = &query_storage.slice else {
+                candle_core::bail!("CUDA graph query dtype mismatch")
+            };
+            let CudaStorageSlice::$variant(key_slice) = &key_storage.slice else {
+                candle_core::bail!("CUDA graph key dtype mismatch")
+            };
+            let CudaStorageSlice::$variant(value_slice) = &value_storage.slice else {
+                candle_core::bail!("CUDA graph value dtype mismatch")
+            };
+            let CudaStorageSlice::$variant(output_slice) = &output_storage.slice else {
+                candle_core::bail!("CUDA graph output dtype mismatch")
+            };
+            let Some((query_start, query_end)) = query_layout.contiguous_offsets() else {
+                candle_core::bail!("CUDA graph queries must be contiguous")
+            };
+            let Some((key_start, key_end)) = key_layout.contiguous_offsets() else {
+                candle_core::bail!("CUDA graph keys must be contiguous")
+            };
+            let Some((value_start, value_end)) = value_layout.contiguous_offsets() else {
+                candle_core::bail!("CUDA graph values must be contiguous")
+            };
+            let Some((output_start, output_end)) = output_layout.contiguous_offsets() else {
+                candle_core::bail!("CUDA graph output must be contiguous")
+            };
+            let query_view = query_slice.slice(query_start..query_end);
+            let key_view = key_slice.slice(key_start..key_end);
+            let value_view = value_slice.slice(value_start..value_end);
+            let output_view = output_slice.slice(output_start..output_end);
+            let function = device.get_or_load_custom_func(
+                $function_name,
+                "izwi_physical_state",
+                cuda_ptx::PHYSICAL_STATE,
+            )?;
+            let mut builder = function.builder();
+            builder.arg(&query_view);
+            builder.arg(&key_view);
+            builder.arg(&value_view);
+            builder.arg(&metadata_view);
+            builder.arg(&output_view);
+            candle_core::builder_arg!(
+                builder,
+                batch as i32,
+                query_heads as i32,
+                kv_heads as i32,
+                page_tokens as i32,
+                max_blocks as i32,
+                key_dim as i32,
+                value_dim as i32,
+                capacity_pages as i32,
+                softmax_scale,
+                softcap.unwrap_or(0.0)
+            );
+            // SAFETY: the same validated geometry used by the eager custom op
+            // binds these stable buffers for the complete graph lifetime.
+            unsafe { builder.launch(config) }.w()?;
+        }};
+    }
+
+    match &query_storage.slice {
+        CudaStorageSlice::F32(_) => launch!(F32, "physical_paged_decode_f32"),
+        CudaStorageSlice::F16(_) => launch!(F16, "physical_paged_decode_f16"),
+        CudaStorageSlice::BF16(_) => launch!(BF16, "physical_paged_decode_bf16"),
+        _ => candle_core::bail!("CUDA graph decode requires F32/F16/BF16 storage"),
+    }
+    Ok(())
 }
 
 pub fn try_lfm_shortconv_ring_sequence(

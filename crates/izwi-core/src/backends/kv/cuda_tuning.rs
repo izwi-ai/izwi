@@ -32,6 +32,7 @@ pub(crate) struct CudaPagedShapeKey {
 pub(crate) struct CudaPagedTuningPolicy {
     pub(crate) flash_attention_allowed: bool,
     pub(crate) decode_partition_tuning: Option<(usize, usize)>,
+    pub(crate) decode_graph_allowed: bool,
 }
 
 /// Resolve only conservative, architecture-safe defaults. Performance
@@ -60,6 +61,11 @@ pub(crate) fn resolve_cuda_paged_tuning(
             && nonempty_shape,
         decode_partition_tuning: (ampere_or_newer && supported_page && nonempty_shape)
             .then_some((2_048, 1_024)),
+        decode_graph_allowed: ampere_or_newer
+            && supported_page
+            && supported_dtype
+            && matched_dims
+            && nonempty_shape,
     }
 }
 
@@ -121,6 +127,7 @@ mod tests {
             );
             assert!(!policy.flash_attention_allowed);
             assert_eq!(policy.decode_partition_tuning, None);
+            assert!(!policy.decode_graph_allowed);
         }
     }
 
@@ -133,15 +140,19 @@ mod tests {
         let policy = resolve_cuda_paged_tuning(&identity, shape());
         assert!(policy.flash_attention_allowed);
         assert_eq!(policy.decode_partition_tuning, Some((2_048, 1_024)));
+        assert!(policy.decode_graph_allowed);
 
         let mut unsupported = shape();
         unsupported.page_tokens = 8;
         let policy = resolve_cuda_paged_tuning(&identity, unsupported);
         assert!(!policy.flash_attention_allowed);
         assert_eq!(policy.decode_partition_tuning, None);
+        assert!(!policy.decode_graph_allowed);
 
         unsupported = shape();
         unsupported.dtype = DType::F32;
-        assert!(!resolve_cuda_paged_tuning(&identity, unsupported).flash_attention_allowed);
+        let policy = resolve_cuda_paged_tuning(&identity, unsupported);
+        assert!(!policy.flash_attention_allowed);
+        assert!(!policy.decode_graph_allowed);
     }
 }
