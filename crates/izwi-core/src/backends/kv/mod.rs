@@ -147,6 +147,12 @@ pub struct KvArenaOperationStats {
     pub cuda_native_attention_dispatches: u64,
     pub cuda_flash_attention_dispatches: u64,
     pub metal_native_attention_dispatches: u64,
+    pub cuda_graph_warmups: u64,
+    pub cuda_graph_captures: u64,
+    pub cuda_graph_replays: u64,
+    pub cuda_graph_fallbacks: u64,
+    pub cuda_graph_backoff_hits: u64,
+    pub cuda_graph_evictions: u64,
     /// Provider that completed the most recent attention operation.
     pub last_attention_provider: Option<KvAttentionProvider>,
     /// Explicit device synchronization that blocks the calling host thread.

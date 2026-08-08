@@ -730,7 +730,20 @@ pub(crate) fn paged_decode_attention(
         max_context_len,
         partition_tuning,
         false,
+        0,
     )
+    .map(|(output, _)| output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaPagedDecodeGraphOutcome {
+    Disabled,
+    Warmed,
+    WarmedAfterEviction,
+    Captured,
+    Replayed,
+    Backoff,
+    EagerFallback,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -751,7 +764,8 @@ pub(crate) fn paged_decode_attention_with_graph(
     max_context_len: usize,
     partition_tuning: Option<(usize, usize)>,
     _allow_graph: bool,
-) -> candle_core::Result<Tensor> {
+    _backing_generation: u64,
+) -> candle_core::Result<(Tensor, CudaPagedDecodeGraphOutcome)> {
     let dense_kv = queries.dtype() == keys.dtype() && queries.dtype() == values.dtype();
     let fp8_kv = matches!(queries.dtype(), DType::F16 | DType::BF16)
         && keys.dtype() == DType::F8E4M3
@@ -837,27 +851,36 @@ pub(crate) fn paged_decode_attention_with_graph(
     let keys = keys.contiguous()?;
     let values = values.contiguous()?;
     #[cfg(feature = "cuda")]
-    if _allow_graph && dense_kv && strategy == CudaPagedDecodeStrategy::OnePass {
-        if let Some(output) = try_cuda_paged_decode_graph(
-            &queries,
-            &keys,
-            &values,
-            metadata,
-            batch,
-            query_heads,
-            kv_heads,
-            page_tokens,
-            max_blocks,
-            key_dim,
-            value_dim,
-            capacity_pages,
-            softmax_scale,
-            softcap,
-        )? {
-            return Ok(output);
+    let graph_outcome = {
+        if _allow_graph && dense_kv && strategy == CudaPagedDecodeStrategy::OnePass {
+            let (output, outcome) = try_cuda_paged_decode_graph(
+                &queries,
+                &keys,
+                &values,
+                metadata,
+                batch,
+                query_heads,
+                kv_heads,
+                page_tokens,
+                max_blocks,
+                key_dim,
+                value_dim,
+                capacity_pages,
+                softmax_scale,
+                softcap,
+                _backing_generation,
+            )?;
+            if let Some(output) = output {
+                return Ok((output, outcome));
+            }
+            outcome
+        } else {
+            CudaPagedDecodeGraphOutcome::Disabled
         }
-    }
-    queries.apply_op3_no_bwd(
+    };
+    #[cfg(not(feature = "cuda"))]
+    let graph_outcome = CudaPagedDecodeGraphOutcome::Disabled;
+    let output = queries.apply_op3_no_bwd(
         &keys,
         &values,
         &CudaPagedDecodeOp {
@@ -875,11 +898,15 @@ pub(crate) fn paged_decode_attention_with_graph(
             strategy,
             partition_tokens: partition_tuning.map(|(_, tokens)| tokens).unwrap_or(0),
         },
-    )
+    )?;
+    Ok((output, graph_outcome))
 }
 
 #[cfg(feature = "cuda")]
 const CUDA_PAGED_DECODE_GRAPH_BUCKETS: usize = 64;
+
+#[cfg(feature = "cuda")]
+const CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF: u8 = 8;
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -888,6 +915,7 @@ struct CudaPagedDecodeGraphKey {
     keys_id: candle_core::TensorId,
     values_id: candle_core::TensorId,
     metadata_id: candle_core::TensorId,
+    backing_generation: u64,
     batch: usize,
     query_heads: usize,
     kv_heads: usize,
@@ -904,12 +932,21 @@ struct CudaPagedDecodeGraphKey {
 enum CudaPagedDecodeGraphState {
     Warm {
         queries: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        metadata: Tensor,
         output: Tensor,
     },
     Captured {
         queries: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        metadata: Tensor,
         output: Tensor,
         graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
+    },
+    Backoff {
+        remaining_calls: u8,
     },
 }
 
@@ -939,12 +976,14 @@ fn cuda_paged_decode_graph_key(
     capacity_pages: usize,
     softmax_scale: f32,
     softcap: Option<f32>,
+    backing_generation: u64,
 ) -> CudaPagedDecodeGraphKey {
     CudaPagedDecodeGraphKey {
         queries_dtype: queries.dtype(),
         keys_id: keys.id(),
         values_id: values.id(),
         metadata_id: metadata.id(),
+        backing_generation,
         batch,
         query_heads,
         kv_heads,
@@ -975,7 +1014,8 @@ fn try_cuda_paged_decode_graph(
     capacity_pages: usize,
     softmax_scale: f32,
     softcap: Option<f32>,
-) -> candle_core::Result<Option<Tensor>> {
+    backing_generation: u64,
+) -> candle_core::Result<(Option<Tensor>, CudaPagedDecodeGraphOutcome)> {
     use candle_core::cuda_backend::cudarc::driver::sys::{
         CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
         CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
@@ -996,6 +1036,7 @@ fn try_cuda_paged_decode_graph(
         capacity_pages,
         softmax_scale,
         softcap,
+        backing_generation,
     );
     CUDA_PAGED_DECODE_GRAPHS.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -1006,49 +1047,79 @@ fn try_cuda_paged_decode_graph(
                 queries.dtype(),
                 queries.device(),
             )?;
-            if cache.len() == CUDA_PAGED_DECODE_GRAPH_BUCKETS {
+            let evicted = cache.len() == CUDA_PAGED_DECODE_GRAPH_BUCKETS;
+            if evicted {
                 cache.pop_front();
             }
             cache.push_back((
                 key,
                 CudaPagedDecodeGraphState::Warm {
                     queries: stable_queries,
+                    keys: keys.clone(),
+                    values: values.clone(),
+                    metadata: metadata.clone(),
                     output,
                 },
             ));
-            return Ok(None);
+            return Ok((
+                None,
+                if evicted {
+                    CudaPagedDecodeGraphOutcome::WarmedAfterEviction
+                } else {
+                    CudaPagedDecodeGraphOutcome::Warmed
+                },
+            ));
         };
 
         let (_, state) = cache.remove(index).expect("located CUDA graph bucket");
         let result = match state {
             CudaPagedDecodeGraphState::Captured {
                 queries: stable_queries,
+                keys,
+                values,
+                metadata,
                 output,
                 graph,
             } => {
-                stable_queries.slice_set(queries, 0, 0)?;
-                if graph.launch().is_err() {
-                    // Dropping the failed bucket permanently restores the
-                    // eager provider for this call. A later call may warm a
-                    // fresh bucket after the driver error is cleared.
-                    return Ok(None);
+                if stable_queries.slice_set(queries, 0, 0).is_err() || graph.launch().is_err() {
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF,
+                        },
+                    ));
+                    return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 }
                 let result = output.clone();
                 cache.push_back((
                     key,
                     CudaPagedDecodeGraphState::Captured {
                         queries: stable_queries,
+                        keys,
+                        values,
+                        metadata,
                         output,
                         graph,
                     },
                 ));
-                Some(result)
+                (Some(result), CudaPagedDecodeGraphOutcome::Replayed)
             }
             CudaPagedDecodeGraphState::Warm {
                 queries: stable_queries,
+                keys,
+                values,
+                metadata,
                 output,
             } => {
-                stable_queries.slice_set(queries, 0, 0)?;
+                if stable_queries.slice_set(queries, 0, 0).is_err() {
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF,
+                        },
+                    ));
+                    return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
+                }
                 let device = queries.device().as_cuda_device()?;
                 let stream = device.cuda_stream();
                 let _htod_cache = device.enable_cuda_graph_htod_cache();
@@ -1056,13 +1127,19 @@ fn try_cuda_paged_decode_graph(
                     .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                     .is_err()
                 {
-                    return Ok(None);
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF,
+                        },
+                    ));
+                    return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 }
                 let captured_launch = launch_cuda_paged_decode_one_pass_into(
                     &stable_queries,
-                    keys,
-                    values,
-                    metadata,
+                    &keys,
+                    &values,
+                    &metadata,
                     &output,
                     batch,
                     query_heads,
@@ -1078,24 +1155,56 @@ fn try_cuda_paged_decode_graph(
                 let captured_graph =
                     stream.end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
                 let Ok(()) = captured_launch else {
-                    return Ok(None);
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF,
+                        },
+                    ));
+                    return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 };
                 let Ok(Some(graph)) = captured_graph else {
-                    return Ok(None);
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF,
+                        },
+                    ));
+                    return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 };
                 if graph.launch().is_err() {
-                    return Ok(None);
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: CUDA_PAGED_DECODE_GRAPH_FAILURE_BACKOFF,
+                        },
+                    ));
+                    return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 }
                 let result = output.clone();
                 cache.push_back((
                     key,
                     CudaPagedDecodeGraphState::Captured {
                         queries: stable_queries,
+                        keys,
+                        values,
+                        metadata,
                         output,
                         graph,
                     },
                 ));
-                Some(result)
+                (Some(result), CudaPagedDecodeGraphOutcome::Captured)
+            }
+            CudaPagedDecodeGraphState::Backoff { remaining_calls } => {
+                if remaining_calls > 1 {
+                    cache.push_back((
+                        key,
+                        CudaPagedDecodeGraphState::Backoff {
+                            remaining_calls: remaining_calls - 1,
+                        },
+                    ));
+                }
+                (None, CudaPagedDecodeGraphOutcome::Backoff)
             }
         };
         Ok(result)

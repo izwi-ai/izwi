@@ -59,6 +59,12 @@ pub struct ManagedKvOperationSnapshot {
     pub cuda_native_attention_dispatches: u64,
     pub cuda_flash_attention_dispatches: u64,
     pub metal_native_attention_dispatches: u64,
+    pub cuda_graph_warmups: u64,
+    pub cuda_graph_captures: u64,
+    pub cuda_graph_replays: u64,
+    pub cuda_graph_fallbacks: u64,
+    pub cuda_graph_backoff_hits: u64,
+    pub cuda_graph_evictions: u64,
 }
 
 impl ManagedKvOperationSnapshot {
@@ -96,6 +102,24 @@ impl ManagedKvOperationSnapshot {
         self.metal_native_attention_dispatches = self
             .metal_native_attention_dispatches
             .saturating_add(other.metal_native_attention_dispatches);
+        self.cuda_graph_warmups = self
+            .cuda_graph_warmups
+            .saturating_add(other.cuda_graph_warmups);
+        self.cuda_graph_captures = self
+            .cuda_graph_captures
+            .saturating_add(other.cuda_graph_captures);
+        self.cuda_graph_replays = self
+            .cuda_graph_replays
+            .saturating_add(other.cuda_graph_replays);
+        self.cuda_graph_fallbacks = self
+            .cuda_graph_fallbacks
+            .saturating_add(other.cuda_graph_fallbacks);
+        self.cuda_graph_backoff_hits = self
+            .cuda_graph_backoff_hits
+            .saturating_add(other.cuda_graph_backoff_hits);
+        self.cuda_graph_evictions = self
+            .cuda_graph_evictions
+            .saturating_add(other.cuda_graph_evictions);
     }
 }
 
@@ -398,6 +422,12 @@ impl ManagedKvCacheManager {
                                 .cuda_flash_attention_dispatches,
                             metal_native_attention_dispatches: operation_stats
                                 .metal_native_attention_dispatches,
+                            cuda_graph_warmups: operation_stats.cuda_graph_warmups,
+                            cuda_graph_captures: operation_stats.cuda_graph_captures,
+                            cuda_graph_replays: operation_stats.cuda_graph_replays,
+                            cuda_graph_fallbacks: operation_stats.cuda_graph_fallbacks,
+                            cuda_graph_backoff_hits: operation_stats.cuda_graph_backoff_hits,
+                            cuda_graph_evictions: operation_stats.cuda_graph_evictions,
                         };
                         add_coordinator_stats(&mut totals.coordinator, &coordinator);
                         totals.operations.add_assign(operations.clone());

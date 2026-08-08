@@ -543,6 +543,12 @@ pub struct CandleAcceleratorKvArena {
     cuda_native_attention_dispatches: AtomicU64,
     cuda_flash_attention_dispatches: AtomicU64,
     metal_native_attention_dispatches: AtomicU64,
+    cuda_graph_warmups: AtomicU64,
+    cuda_graph_captures: AtomicU64,
+    cuda_graph_replays: AtomicU64,
+    cuda_graph_fallbacks: AtomicU64,
+    cuda_graph_backoff_hits: AtomicU64,
+    cuda_graph_evictions: AtomicU64,
     host_synchronizations: Arc<AtomicU64>,
 }
 
@@ -644,6 +650,12 @@ impl CandleAcceleratorKvArena {
             cuda_native_attention_dispatches: AtomicU64::new(0),
             cuda_flash_attention_dispatches: AtomicU64::new(0),
             metal_native_attention_dispatches: AtomicU64::new(0),
+            cuda_graph_warmups: AtomicU64::new(0),
+            cuda_graph_captures: AtomicU64::new(0),
+            cuda_graph_replays: AtomicU64::new(0),
+            cuda_graph_fallbacks: AtomicU64::new(0),
+            cuda_graph_backoff_hits: AtomicU64::new(0),
+            cuda_graph_evictions: AtomicU64::new(0),
             host_synchronizations,
         })
     }
@@ -1338,7 +1350,7 @@ impl CandleAcceleratorKvArena {
             return Ok(output);
         }
 
-        let output = crate::kernels::cuda::paged_decode_attention_with_graph(
+        let (output, graph_outcome) = crate::kernels::cuda::paged_decode_attention_with_graph(
             args.queries,
             &layer.keys,
             &layer.values,
@@ -1355,7 +1367,31 @@ impl CandleAcceleratorKvArena {
             device_metadata.max_context,
             tuning.decode_partition_tuning,
             tuning.decode_graph_allowed && self.cuda_kv_storage == CudaKvStorageFormat::Dense,
+            self.backing_generation.load(Ordering::Acquire),
         )?;
+        use crate::kernels::cuda::CudaPagedDecodeGraphOutcome;
+        match graph_outcome {
+            CudaPagedDecodeGraphOutcome::Disabled => {}
+            CudaPagedDecodeGraphOutcome::Warmed => {
+                self.cuda_graph_warmups.fetch_add(1, Ordering::Relaxed);
+            }
+            CudaPagedDecodeGraphOutcome::WarmedAfterEviction => {
+                self.cuda_graph_warmups.fetch_add(1, Ordering::Relaxed);
+                self.cuda_graph_evictions.fetch_add(1, Ordering::Relaxed);
+            }
+            CudaPagedDecodeGraphOutcome::Captured => {
+                self.cuda_graph_captures.fetch_add(1, Ordering::Relaxed);
+            }
+            CudaPagedDecodeGraphOutcome::Replayed => {
+                self.cuda_graph_replays.fetch_add(1, Ordering::Relaxed);
+            }
+            CudaPagedDecodeGraphOutcome::EagerFallback => {
+                self.cuda_graph_fallbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            CudaPagedDecodeGraphOutcome::Backoff => {
+                self.cuda_graph_backoff_hits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.record_attention_provider(KvAttentionProvider::CudaNative);
         Ok(output)
     }
@@ -1979,6 +2015,12 @@ impl KvArena for CandleAcceleratorKvArena {
             metal_native_attention_dispatches: self
                 .metal_native_attention_dispatches
                 .load(Ordering::Relaxed),
+            cuda_graph_warmups: self.cuda_graph_warmups.load(Ordering::Relaxed),
+            cuda_graph_captures: self.cuda_graph_captures.load(Ordering::Relaxed),
+            cuda_graph_replays: self.cuda_graph_replays.load(Ordering::Relaxed),
+            cuda_graph_fallbacks: self.cuda_graph_fallbacks.load(Ordering::Relaxed),
+            cuda_graph_backoff_hits: self.cuda_graph_backoff_hits.load(Ordering::Relaxed),
+            cuda_graph_evictions: self.cuda_graph_evictions.load(Ordering::Relaxed),
             last_attention_provider: KvAttentionProvider::from_code(
                 self.last_attention_provider.load(Ordering::Relaxed),
             ),

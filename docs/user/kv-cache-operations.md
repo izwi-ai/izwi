@@ -154,10 +154,13 @@ device the runtime automatically uses admission-grown KV slabs, resident decode
 metadata, shape/device-keyed Flash or native attention, batched page mutations,
 bounded device-side sampling, VRAM-tiered continuous batching, and stable
 one-pass decode graph buckets. A graph bucket is bound to the exact K/V and
-metadata tensor generations; arena growth creates a new generation. Capture or
-replay failure and partitioned decode use the same eager native kernel. Request
-cancellation is safe because replay mutates only graph-owned query/output
-scratch, never KV state. CPU and Metal behavior is unchanged.
+metadata tensor owners and the arena backing generation; arena growth creates a
+new generation. Capture or replay failure enters a bounded negative-cache
+backoff before capture is retried, while the request uses the same eager native
+kernel. Warmup, capture, replay, fallback, and backoff counts are exported with
+managed KV operation telemetry. Request cancellation is safe because replay
+mutates only graph-owned query/output scratch, never KV state. CPU and Metal
+behavior is unchanged.
 
 The source also contains authoritative FP8 E4M3 CUDA KV pages and mixed
 F16/BF16-query FP8-KV prefill/decode kernels. That path has no environment

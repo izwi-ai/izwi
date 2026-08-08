@@ -652,6 +652,12 @@ impl KvArena for CpuKvArena {
             cuda_native_attention_dispatches: 0,
             cuda_flash_attention_dispatches: 0,
             metal_native_attention_dispatches: 0,
+            cuda_graph_warmups: 0,
+            cuda_graph_captures: 0,
+            cuda_graph_replays: 0,
+            cuda_graph_fallbacks: 0,
+            cuda_graph_backoff_hits: 0,
+            cuda_graph_evictions: 0,
             last_attention_provider: KvAttentionProvider::from_code(
                 self.last_attention_provider.load(Ordering::Relaxed),
             ),
