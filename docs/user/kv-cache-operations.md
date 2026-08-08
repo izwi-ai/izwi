@@ -162,11 +162,11 @@ managed KV operation telemetry. Request cancellation is safe because replay
 mutates only graph-owned query/output scratch, never KV state. CPU and Metal
 behavior is unchanged.
 
-The source also contains authoritative FP8 E4M3 CUDA KV pages and mixed
-F16/BF16-query FP8-KV prefill/decode kernels. That path has no environment
-promotion switch. Its reviewed hardware/shape certification table is empty
-until NVIDIA numerical, quality, VRAM, and latency evidence is accepted, so all
-shipping routes continue to allocate dense KV.
+The source contains experimental FP8 E4M3 CUDA KV kernels, but they are not a
+complete storage format: scale storage, scale-aware mutation/accounting, and
+NVIDIA numerical evidence are still required. Both arena selection and direct
+prefill/decode dispatch therefore fail closed; all shipping routes allocate
+dense KV and no environment switch can enable the incomplete path.
 
 To force the Portable provider for an incident or comparison run:
 

@@ -606,13 +606,15 @@ pub(crate) fn paged_prefill_attention(
     window_tokens: Option<u32>,
 ) -> candle_core::Result<Tensor> {
     let dense_kv = queries.dtype() == keys.dtype() && queries.dtype() == values.dtype();
-    let fp8_kv = matches!(queries.dtype(), DType::F16 | DType::BF16)
-        && keys.dtype() == DType::F8E4M3
-        && values.dtype() == DType::F8E4M3;
+    if keys.dtype() == DType::F8E4M3 || values.dtype() == DType::F8E4M3 {
+        candle_core::bail!(
+            "CUDA FP8 KV is disabled until scaled storage, scale accounting, and NVIDIA evidence are complete"
+        )
+    }
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
         || queries.device().location() != values.device().location()
-        || (!dense_kv && !fp8_kv)
+        || !dense_kv
         || !matches!(queries.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
         candle_core::bail!(
@@ -767,17 +769,19 @@ pub(crate) fn paged_decode_attention_with_graph(
     _backing_generation: u64,
 ) -> candle_core::Result<(Tensor, CudaPagedDecodeGraphOutcome)> {
     let dense_kv = queries.dtype() == keys.dtype() && queries.dtype() == values.dtype();
-    let fp8_kv = matches!(queries.dtype(), DType::F16 | DType::BF16)
-        && keys.dtype() == DType::F8E4M3
-        && values.dtype() == DType::F8E4M3;
+    if keys.dtype() == DType::F8E4M3 || values.dtype() == DType::F8E4M3 {
+        candle_core::bail!(
+            "CUDA FP8 KV is disabled until scaled storage, scale accounting, and NVIDIA evidence are complete"
+        )
+    }
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
         || queries.device().location() != values.device().location()
-        || (!dense_kv && !fp8_kv)
+        || !dense_kv
         || !matches!(queries.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
         candle_core::bail!(
-            "CUDA paged decode requires dense F32/F16/BF16 or half-query/FP8-KV tensors on one CUDA device"
+            "CUDA paged decode requires matching F32/F16/BF16 tensors on one CUDA device"
         )
     }
     if queries.dims() != [batch, query_heads, key_dim]

@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::Result;
 #[cfg(feature = "cuda")]
 use candle_core::DeviceLocation;
 use candle_core::{DType, Device};
@@ -7,6 +7,11 @@ use candle_core::{DType, Device};
 pub(crate) enum CudaKvStorageFormat {
     Dense,
     Fp8E4M3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaFp8KvEvidence {
+    ScaleContractIncomplete,
 }
 
 impl CudaKvStorageFormat {
@@ -19,37 +24,21 @@ impl CudaKvStorageFormat {
 }
 
 pub(crate) fn resolve_cuda_kv_storage_format(
-    identity: &CudaDeviceIdentity,
-    logical_dtype: DType,
-    performance_certified: bool,
-) -> Result<CudaKvStorageFormat> {
-    if !performance_certified {
-        return Ok(CudaKvStorageFormat::Dense);
-    }
-    if !matches!(logical_dtype, DType::F16 | DType::BF16) {
-        return Err(Error::InvalidInput(
-            "certified CUDA FP8 KV requires F16 or BF16 model KV dtype".into(),
-        ));
-    }
-    if !identity
-        .compute_capability
-        .is_some_and(|(major, _)| major >= 9)
-    {
-        return Err(Error::InvalidInput(
-            "certified CUDA FP8 KV requires an observed compute capability of 9.0 or newer".into(),
-        ));
-    }
-    Ok(CudaKvStorageFormat::Fp8E4M3)
-}
-
-/// Only reviewed NVIDIA evidence may add an exact cell here. The empty table
-/// makes FP8 unreachable by default, and there is deliberately no environment
-/// override that can relabel an unverified route as certified.
-pub(crate) fn cuda_fp8_kv_cell_certified(
     _identity: &CudaDeviceIdentity,
     _logical_dtype: DType,
-) -> bool {
-    false
+    _evidence: CudaFp8KvEvidence,
+) -> Result<CudaKvStorageFormat> {
+    Ok(CudaKvStorageFormat::Dense)
+}
+
+/// The storage-scale contract is incomplete, so no device cell can currently
+/// be eligible. There is deliberately no environment override that can bypass
+/// this source-level blocker.
+pub(crate) fn cuda_fp8_kv_evidence(
+    _identity: &CudaDeviceIdentity,
+    _logical_dtype: DType,
+) -> CudaFp8KvEvidence {
+    CudaFp8KvEvidence::ScaleContractIncomplete
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,38 +196,36 @@ mod tests {
     }
 
     #[test]
-    fn fp8_storage_is_dense_until_exact_hopper_cell_is_certified() {
+    fn hopper_stays_dense_while_the_fp8_scale_contract_is_incomplete() {
         let hopper = CudaDeviceIdentity {
             device_name: Some("H100".into()),
             compute_capability: Some((9, 0)),
         };
         assert_eq!(
-            resolve_cuda_kv_storage_format(&hopper, DType::F16, false).unwrap(),
+            resolve_cuda_kv_storage_format(
+                &hopper,
+                DType::F16,
+                CudaFp8KvEvidence::ScaleContractIncomplete,
+            )
+            .unwrap(),
             CudaKvStorageFormat::Dense
         );
         assert_eq!(
-            resolve_cuda_kv_storage_format(&hopper, DType::BF16, true).unwrap(),
-            CudaKvStorageFormat::Fp8E4M3
+            cuda_fp8_kv_evidence(&hopper, DType::BF16),
+            CudaFp8KvEvidence::ScaleContractIncomplete
         );
-        assert!(!cuda_fp8_kv_cell_certified(&hopper, DType::BF16));
     }
 
     #[test]
-    fn fp8_certificate_fails_closed_without_supported_hardware_or_dtype() {
-        assert!(resolve_cuda_kv_storage_format(
-            &CudaDeviceIdentity::unobserved(),
-            DType::F16,
-            true
-        )
-        .is_err());
-        assert!(resolve_cuda_kv_storage_format(
-            &CudaDeviceIdentity {
-                device_name: Some("H100".into()),
-                compute_capability: Some((9, 0)),
-            },
-            DType::F32,
-            true
-        )
-        .is_err());
+    fn incomplete_fp8_scale_contract_never_selects_fp8_storage() {
+        assert_eq!(
+            resolve_cuda_kv_storage_format(
+                &CudaDeviceIdentity::unobserved(),
+                DType::F16,
+                CudaFp8KvEvidence::ScaleContractIncomplete,
+            )
+            .unwrap(),
+            CudaKvStorageFormat::Dense
+        );
     }
 }

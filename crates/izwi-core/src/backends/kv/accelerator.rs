@@ -11,7 +11,7 @@ use crate::runtime::rollout::KvProviderRollout;
 use crate::Result;
 
 use super::cuda_tuning::{
-    cuda_fp8_kv_cell_certified, observe_cuda_identity, resolve_cuda_kv_storage_format,
+    cuda_fp8_kv_evidence, observe_cuda_identity, resolve_cuda_kv_storage_format,
     resolve_cuda_paged_tuning, CudaDeviceIdentity, CudaKvStorageFormat, CudaPagedShapeKey,
 };
 #[cfg(feature = "cuda")]
@@ -566,7 +566,7 @@ impl CandleAcceleratorKvArena {
             resolve_cuda_kv_storage_format(
                 &cuda_identity,
                 config.dtype,
-                cuda_fp8_kv_cell_certified(&cuda_identity, config.dtype),
+                cuda_fp8_kv_evidence(&cuda_identity, config.dtype),
             )?
         } else {
             CudaKvStorageFormat::Dense
