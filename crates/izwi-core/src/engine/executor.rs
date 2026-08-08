@@ -532,6 +532,16 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             BackendRouter::resolve_context_for_kind(config.backend, BackendSelectionSource::Config);
         let backend_kind = backend_context.backend_kind;
         let num_threads = config.num_threads.max(1);
+        let max_tensor_batch_size = config
+            .max_batch_size
+            .min(Self::tensor_batch_cap(backend_kind))
+            .max(1);
+        let request_parallelism = Self::resolve_batch_request_parallelism(
+            backend_kind,
+            num_threads,
+            max_tensor_batch_size,
+            Self::request_parallelism_override(),
+        );
         Self {
             models_dir: config.models_dir.clone(),
             backend: backend_kind,
@@ -539,14 +549,11 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             dtype: "float32".to_string(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             num_threads,
-            request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
+            request_parallelism,
             kv_page_size: config.block_size.max(1),
             model_registry: None,
             resource_authority: None,
-            max_tensor_batch_size: config
-                .max_batch_size
-                .min(Self::tensor_batch_cap(backend_kind))
-                .max(1),
+            max_tensor_batch_size,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
         }
     }
@@ -597,6 +604,19 @@ impl WorkerConfig {
             num_threads,
             Self::request_parallelism_override(),
         )
+    }
+
+    fn resolve_batch_request_parallelism(
+        backend: BackendKind,
+        num_threads: usize,
+        max_tensor_batch_size: usize,
+        override_value: Option<usize>,
+    ) -> usize {
+        match override_value {
+            Some(value) => Self::resolve_request_parallelism(backend, num_threads, Some(value)),
+            None if backend == BackendKind::Cuda => max_tensor_batch_size.max(1),
+            None => Self::resolve_request_parallelism(backend, num_threads, None),
+        }
     }
 }
 
@@ -1783,6 +1803,18 @@ mod tests {
         );
         assert_eq!(
             WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, Some(3)),
+            1
+        );
+        assert_eq!(
+            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, 8, 32, None),
+            32
+        );
+        assert_eq!(
+            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, 8, 32, Some(4)),
+            4
+        );
+        assert_eq!(
+            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Metal, 8, 32, None),
             1
         );
     }

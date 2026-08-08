@@ -11,6 +11,7 @@ use candle_core::{DType, Device, Tensor, D};
 use crate::{Error, Result};
 
 const CUDA_SORT_CHUNK: usize = 1024;
+const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
 pub const CUDA_SAMPLING_CANDIDATE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -112,7 +113,7 @@ pub fn bounded_cuda_sampling_candidates(
     }
     let row = logits_row(logits)?;
     let vocab = row.dim(0)?.min(vocab_limit);
-    if vocab == 0 || top_k > CUDA_SORT_CHUNK {
+    if vocab == 0 || vocab > MAX_EXACT_F32_INTEGER || top_k > CUDA_SORT_CHUNK {
         return Ok(None);
     }
     if allowed_mask.is_some_and(|mask| mask.len() < vocab) {
@@ -146,17 +147,20 @@ pub fn bounded_cuda_sampling_candidates(
     .min(vocab);
     let (values, indices) = bounded_topk(&adjusted, requested)?;
     let logsumexp = if top_k == 0 {
-        Some(adjusted.log_sum_exp(D::Minus1)?.to_scalar::<f32>()?)
+        Some(adjusted.log_sum_exp(D::Minus1)?.reshape(1)?)
     } else {
         None
     };
-    let values = values.to_vec1::<f32>()?;
-    let indices = indices.to_vec1::<u32>()?;
-    crate::models::shared::telemetry::record_host_read(DType::F32, values.len());
-    crate::models::shared::telemetry::record_host_read(DType::U32, indices.len());
-    if logsumexp.is_some() {
-        crate::models::shared::telemetry::record_host_read(DType::F32, 1);
+    let indices_f32 = indices.to_dtype(DType::F32)?;
+    let mut packed_parts = vec![&values, &indices_f32];
+    if let Some(logsumexp) = &logsumexp {
+        packed_parts.push(logsumexp);
     }
+    let packed = Tensor::cat(&packed_parts, 0)?.to_vec1::<f32>()?;
+    crate::models::shared::telemetry::record_host_read(DType::F32, packed.len());
+    let candidate_count = values.dim(0)?;
+    let (values, indices, logsumexp) =
+        unpack_sampling_readback(&packed, candidate_count, logsumexp.is_some())?;
     if values.iter().any(|value| !value.is_finite()) {
         return Ok(None);
     }
@@ -165,6 +169,30 @@ pub fn bounded_cuda_sampling_candidates(
         indices,
         logsumexp,
     }))
+}
+
+fn unpack_sampling_readback(
+    packed: &[f32],
+    candidate_count: usize,
+    has_logsumexp: bool,
+) -> Result<(Vec<f32>, Vec<u32>, Option<f32>)> {
+    let expected = candidate_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(usize::from(has_logsumexp)))
+        .ok_or_else(|| Error::InferenceError("sampling readback size overflow".into()))?;
+    if packed.len() != expected {
+        return Err(Error::InferenceError(format!(
+            "sampling readback returned {} values, expected {expected}",
+            packed.len()
+        )));
+    }
+    let values = packed[..candidate_count].to_vec();
+    let indices = packed[candidate_count..candidate_count * 2]
+        .iter()
+        .map(|value| *value as u32)
+        .collect::<Vec<_>>();
+    let logsumexp = has_logsumexp.then(|| packed[candidate_count * 2]);
+    Ok((values, indices, logsumexp))
 }
 
 fn logits_row(logits: &Tensor) -> Result<Tensor> {
@@ -329,5 +357,15 @@ mod tests {
             ..candidates
         };
         assert!(device_candidates_cover_top_p(&explicit_top_k, 1.0));
+    }
+
+    #[test]
+    fn packed_candidate_readback_preserves_values_indices_and_normalizer() {
+        let (values, indices, logsumexp) =
+            unpack_sampling_readback(&[4.5, 3.0, 7.0, 1027.0, 5.25], 2, true).unwrap();
+        assert_eq!(values, vec![4.5, 3.0]);
+        assert_eq!(indices, vec![7, 1027]);
+        assert_eq!(logsumexp, Some(5.25));
+        assert!(unpack_sampling_readback(&[1.0], 2, false).is_err());
     }
 }
