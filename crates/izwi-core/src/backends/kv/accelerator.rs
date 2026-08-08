@@ -137,6 +137,35 @@ impl KvDeviceFence for CompletedAcceleratorFence {
     }
 }
 
+#[derive(Clone)]
+enum AcceleratorPageCleanliness {
+    Clean,
+    Dirty,
+    ZeroPending(DeviceFence),
+}
+
+impl std::fmt::Debug for AcceleratorPageCleanliness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Clean => "Clean",
+            Self::Dirty => "Dirty",
+            Self::ZeroPending(_) => "ZeroPending",
+        })
+    }
+}
+
+fn page_needs_zero(state: &mut AcceleratorPageCleanliness) -> bool {
+    match state.clone() {
+        AcceleratorPageCleanliness::Clean => false,
+        AcceleratorPageCleanliness::Dirty => true,
+        AcceleratorPageCleanliness::ZeroPending(fence) if fence.is_complete() => {
+            *state = AcceleratorPageCleanliness::Clean;
+            false
+        }
+        AcceleratorPageCleanliness::ZeroPending(_) => true,
+    }
+}
+
 fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
     // Candle does not expose the current Metal command buffer as a clonable
     // completion token. Complete this mutation before publishing its fence so
@@ -470,6 +499,7 @@ pub struct CandleAcceleratorKvArena {
     layers: RwLock<HashMap<KvLayerBinding, AcceleratorLayerStorage>>,
     resident_capacity_pages: AtomicU32,
     backing_generation: AtomicU64,
+    clean_pages: Mutex<Vec<AcceleratorPageCleanliness>>,
     mutation_lock: Mutex<()>,
     prefill_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedPrefillDeviceMetadata>>,
     decode_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedDecodeDeviceMetadata>>,
@@ -552,6 +582,10 @@ impl CandleAcceleratorKvArena {
             layers: RwLock::new(layers),
             resident_capacity_pages: AtomicU32::new(resident_capacity_pages),
             backing_generation: AtomicU64::new(1),
+            clean_pages: Mutex::new(vec![
+                AcceleratorPageCleanliness::Clean;
+                resident_capacity_pages as usize
+            ]),
             mutation_lock: Mutex::new(()),
             prefill_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
             decode_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
@@ -1429,6 +1463,13 @@ impl KvArena for CandleAcceleratorKvArena {
         }
         self.resident_capacity_pages
             .store(plan.target_pages, Ordering::Release);
+        self.clean_pages
+            .lock()
+            .map_err(|_| Error::InferenceError("accelerator KV cleanliness was poisoned".into()))?
+            .resize(
+                plan.target_pages as usize,
+                AcceleratorPageCleanliness::Clean,
+            );
         self.backing_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1474,6 +1515,18 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
+        let page_indices = {
+            let mut clean = self.clean_pages.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV cleanliness was poisoned".into())
+            })?;
+            page_indices
+                .into_iter()
+                .filter(|index| page_needs_zero(&mut clean[*index]))
+                .collect::<Vec<_>>()
+        };
+        if page_indices.is_empty() {
+            return Ok(Arc::new(CompletedAcceleratorFence));
+        }
         let layers = self
             .layers
             .read()
@@ -1554,6 +1607,13 @@ impl KvArena for CandleAcceleratorKvArena {
             pool.retire(workspace, retirement.clone());
         }
         dispatch_result?;
+        let mut clean = self
+            .clean_pages
+            .lock()
+            .map_err(|_| Error::InferenceError("accelerator KV cleanliness was poisoned".into()))?;
+        for page in page_indices {
+            clean[page] = AcceleratorPageCleanliness::ZeroPending(retirement.clone());
+        }
         Ok(retirement)
     }
 
@@ -1598,6 +1658,12 @@ impl KvArena for CandleAcceleratorKvArena {
                 // tensor is mutated, preserving parallel-copy chains and cycles.
                 copy_rows_parallel(&layer.keys, &source_indices, &destination_indices)?;
                 copy_rows_parallel(&layer.values, &source_indices, &destination_indices)?;
+            }
+            let mut clean = self.clean_pages.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV cleanliness was poisoned".into())
+            })?;
+            for (_, destination) in &lowered {
+                clean[*destination] = AcceleratorPageCleanliness::Dirty;
             }
         }
         self.page_copy_dispatches.fetch_add(1, Ordering::Relaxed);
@@ -1651,6 +1717,12 @@ impl KvArena for CandleAcceleratorKvArena {
         if !slots.flat_slots.is_empty() {
             scatter_rows(&flat_keys, &slots.device_indices, args.keys)?;
             scatter_rows(&flat_values, &slots.device_indices, args.values)?;
+            let mut clean = self.clean_pages.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV cleanliness was poisoned".into())
+            })?;
+            for slot in &slots.flat_slots {
+                clean[*slot / self.config.page_tokens as usize] = AcceleratorPageCleanliness::Dirty;
+            }
         }
         self.slot_write_dispatches.fetch_add(1, Ordering::Relaxed);
         let fence = self.mutation_fence()?;
@@ -2293,6 +2365,22 @@ mod tests {
     }
 
     #[test]
+    fn page_cleanliness_never_elides_an_in_flight_zero() {
+        let mut clean = AcceleratorPageCleanliness::Clean;
+        assert!(!page_needs_zero(&mut clean));
+
+        let mut dirty = AcceleratorPageCleanliness::Dirty;
+        assert!(page_needs_zero(&mut dirty));
+
+        let (pending, completion) = test_completion(false);
+        let mut zero_pending = AcceleratorPageCleanliness::ZeroPending(pending);
+        assert!(page_needs_zero(&mut zero_pending));
+        completion.store(true, Ordering::Release);
+        assert!(!page_needs_zero(&mut zero_pending));
+        assert!(matches!(zero_pending, AcceleratorPageCleanliness::Clean));
+    }
+
+    #[test]
     fn accelerator_workspace_pool_reuses_one_allocation_for_one_hundred_operations() -> Result<()> {
         let mut pool = AcceleratorWorkspacePool::new(64);
         let (completed, _) = test_completion(true);
@@ -2611,6 +2699,74 @@ mod tests {
         assert_eq!(cache_stats.evictions, 0);
         assert_eq!(cache_stats.device_uploads, 4);
         assert!(cache_stats.resident_bytes > 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn clean_page_tracking_elides_only_proven_redundant_zeroes() -> Result<()> {
+        let Ok(Ok(device)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
+            return Ok(());
+        };
+        let binding = KvLayerBinding {
+            model_layer: 0,
+            physical_layer: 0,
+        };
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(91),
+            backend: BackendKind::Metal,
+            device_ordinal: Some(0),
+            generation: 1,
+        };
+        let group = KvGroupId::new(0);
+        let arena = CandleAcceleratorKvArena::new_mutation_only(
+            KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 2,
+                capacity_pages: 2,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![super::super::KvLayerConfig {
+                    binding,
+                    num_kv_heads: 1,
+                    key_head_dim: 1,
+                    value_head_dim: 1,
+                }],
+            },
+            device.clone(),
+        )?;
+        let block = CacheBlockRef {
+            arena: arena_id,
+            group,
+            index: 0,
+            slot_generation: 1,
+        };
+
+        assert!(arena.zero_pages(&[block])?.is_complete());
+        assert_eq!(arena.operation_stats().page_zero_dispatches, 0);
+
+        let slots = arena.lower_slots(&[KvSlotRef { block, offset: 0 }])?;
+        let keys = Tensor::ones((1, 1, 1), DType::F32, &device)?;
+        let values = Tensor::ones((1, 1, 1), DType::F32, &device)?;
+        arena
+            .write_slots(
+                binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: slots.as_ref(),
+                },
+            )?
+            .wait()?;
+        arena.zero_pages(&[block])?.wait()?;
+        assert_eq!(arena.operation_stats().page_zero_dispatches, 1);
+        let (keys, values) = arena.layer_tensors(binding)?;
+        assert_eq!(keys.flatten_all()?.to_vec1::<f32>()?, vec![0.0; 4]);
+        assert_eq!(values.flatten_all()?.to_vec1::<f32>()?, vec![0.0; 4]);
+
+        assert!(arena.zero_pages(&[block])?.is_complete());
+        assert_eq!(arena.operation_stats().page_zero_dispatches, 1);
         Ok(())
     }
 
