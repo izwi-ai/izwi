@@ -556,4 +556,34 @@ mod tests {
         assert_eq!(shortconv.capacity_steps, 3);
         assert_eq!(shortconv.components_per_step.len(), 3);
     }
+
+    #[test]
+    fn production_context_cost_exposes_full_slot_multiplication_without_cuda() {
+        let config = Lfm2BackboneConfig {
+            architecture: "lfm2".into(),
+            block_count: 16,
+            context_length: 128_000,
+            embedding_length: 2_048,
+            embedding_length_out: None,
+            feed_forward_length: Some(10_496),
+            attention_head_count: 32,
+            attention_head_count_kv: vec![8, 0, 0, 8, 0, 8, 0, 0, 8, 0, 8, 0, 0, 8, 0, 0],
+            attention_layer_norm_rms_epsilon: 1e-5,
+            attention_sliding_window: None,
+            rope_freq_base: 1_000_000.0,
+            shortconv_l_cache: 3,
+        };
+        let layout = Lfm2StateLayout::from_config(&config).unwrap();
+        let contract =
+            lfm2_main_invocation_contract(&config, &layout, Lfm2StateIds::CANONICAL).unwrap();
+        let per_slot = paged_f32_invocation_bytes(&contract.domains[0], 128_000).unwrap();
+
+        const L40S_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+        const CONSERVATIVE_MODEL_BYTES: u64 = 1_200_000_000;
+
+        assert_eq!(per_slot, 3_151_503_360);
+        assert_eq!(per_slot * 16, 50_424_053_760);
+        assert!(per_slot + CONSERVATIVE_MODEL_BYTES < L40S_BYTES);
+        assert!(per_slot * 16 + CONSERVATIVE_MODEL_BYTES > L40S_BYTES);
+    }
 }
