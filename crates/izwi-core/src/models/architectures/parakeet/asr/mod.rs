@@ -7,7 +7,7 @@ mod preprocessor;
 use std::path::Path;
 use std::time::Instant;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops;
 use candle_nn::{
     batch_norm, layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module,
@@ -78,6 +78,7 @@ struct ParakeetDecodeCounters {
     tdt_emitted_tokens: usize,
     tdt_blank_steps: usize,
     host_argmax_reads: usize,
+    device_argmax_scalar_reads: usize,
 }
 
 pub struct ParakeetAsrModel {
@@ -442,6 +443,7 @@ fn parakeet_diagnostics_json(
             "tdt_emitted_tokens": decode.tdt_emitted_tokens,
             "tdt_blank_steps": decode.tdt_blank_steps,
             "host_argmax_reads": decode.host_argmax_reads,
+            "device_argmax_scalar_reads": decode.device_argmax_scalar_reads,
             "generated_tokens": decode.tdt_emitted_tokens,
             "max_symbols_per_frame": max_symbols,
         },
@@ -657,7 +659,8 @@ impl ParakeetNetwork {
             let duration_logits = logits.i((blank_idx + 1)..)?;
 
             counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
-            counters.host_argmax_reads = counters.host_argmax_reads.saturating_add(2);
+            counters.device_argmax_scalar_reads =
+                counters.device_argmax_scalar_reads.saturating_add(2);
             let mut label = argmax_1d(&token_logits)?;
             let duration_idx = argmax_1d(&duration_logits)?;
             let mut jump = duration_idx.min(num_durations.saturating_sub(1));
@@ -682,7 +685,8 @@ impl ParakeetNetwork {
                 let duration_logits = logits.i((blank_idx + 1)..)?;
 
                 counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
-                counters.host_argmax_reads = counters.host_argmax_reads.saturating_add(2);
+                counters.device_argmax_scalar_reads =
+                    counters.device_argmax_scalar_reads.saturating_add(2);
                 label = argmax_1d(&token_logits)?;
                 let duration_idx = argmax_1d(&duration_logits)?;
                 jump = duration_idx.min(num_durations.saturating_sub(1));
@@ -1492,16 +1496,21 @@ fn swish(x: &Tensor) -> Result<Tensor> {
 }
 
 fn argmax_1d(x: &Tensor) -> Result<usize> {
-    let v = x.to_vec1::<f32>()?;
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &val) in v.iter().enumerate() {
-        if val > best_val {
-            best_val = val;
-            best_idx = i;
-        }
+    let width = x.dims1()?;
+    if width == 0 {
+        return Err(Error::InferenceError(
+            "Parakeet argmax received empty logits".to_string(),
+        ));
     }
-    Ok(best_idx)
+    let idx = x.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
+    usize::try_from(idx)
+        .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
@@ -1522,4 +1531,30 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
         out.push(sample);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::argmax_1d;
+    use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn parakeet_argmax_selects_half_logits_on_device() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, -0.3, 0.8, 0.2], (4,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        assert_eq!(argmax_1d(&logits).unwrap(), 2);
+    }
+
+    #[test]
+    fn parakeet_argmax_rejects_empty_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        let err = argmax_1d(&logits).expect_err("empty logits should be rejected");
+
+        assert!(format!("{err}").contains("Parakeet argmax received empty logits"));
+    }
 }
