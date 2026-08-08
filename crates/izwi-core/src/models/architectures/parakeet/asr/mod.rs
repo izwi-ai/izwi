@@ -1508,6 +1508,8 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
     } else {
         idx.squeeze(0)?
     };
+    crate::models::shared::telemetry::record_dtype_cast();
+    crate::models::shared::telemetry::record_host_read(DType::U32, 1);
     let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
     usize::try_from(idx)
         .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))

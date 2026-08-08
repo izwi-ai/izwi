@@ -9,6 +9,10 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct KernelPathTelemetrySnapshot {
+    pub host_read_ops_total: u64,
+    pub host_read_bytes_total: u64,
+    pub dtype_cast_ops_total: u64,
+    pub layout_copy_ops_total: u64,
     pub prefill_token_mode_steps_total: u64,
     pub prefill_sequence_spans_total: u64,
     pub prefill_sequence_tokens_total: u64,
@@ -95,6 +99,10 @@ static CHUNK_ATTENTION_MASK_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static ROPE_KERNEL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ROPE_MANUAL_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HOST_READ_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HOST_READ_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DTYPE_CAST_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LAYOUT_COPY_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static FUSED_ATTENTION_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTENTION_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -132,6 +140,20 @@ pub fn record_decode_attention_path(path: DecodeAttentionPath) {
             DECODE_ATTENTION_PAGED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+pub fn record_host_read(dtype: candle_core::DType, elements: usize) {
+    HOST_READ_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let bytes = elements.saturating_mul(dtype.size_in_bytes()) as u64;
+    HOST_READ_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub fn record_dtype_cast() {
+    DTYPE_CAST_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_layout_copy() {
+    LAYOUT_COPY_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn record_chunk_attention_sequence(spans: usize, tokens: usize) {
@@ -224,6 +246,10 @@ pub fn record_fused_attention_fallback(reason: AttentionFallbackReason) {
 
 pub fn snapshot() -> KernelPathTelemetrySnapshot {
     KernelPathTelemetrySnapshot {
+        host_read_ops_total: HOST_READ_OPS_TOTAL.load(Ordering::Relaxed),
+        host_read_bytes_total: HOST_READ_BYTES_TOTAL.load(Ordering::Relaxed),
+        dtype_cast_ops_total: DTYPE_CAST_OPS_TOTAL.load(Ordering::Relaxed),
+        layout_copy_ops_total: LAYOUT_COPY_OPS_TOTAL.load(Ordering::Relaxed),
         prefill_token_mode_steps_total: PREFILL_TOKEN_MODE_STEPS_TOTAL.load(Ordering::Relaxed),
         prefill_sequence_spans_total: PREFILL_SEQUENCE_SPANS_TOTAL.load(Ordering::Relaxed),
         prefill_sequence_tokens_total: PREFILL_SEQUENCE_TOKENS_TOTAL.load(Ordering::Relaxed),
@@ -292,7 +318,11 @@ pub fn prometheus() -> String {
     ];
 
     let mut output = format!(
-        "# TYPE izwi_kernel_prefill_token_mode_steps_total counter\nizwi_kernel_prefill_token_mode_steps_total {}\n\
+        "# TYPE izwi_kernel_host_read_ops_total counter\nizwi_kernel_host_read_ops_total {}\n\
+# TYPE izwi_kernel_host_read_bytes_total counter\nizwi_kernel_host_read_bytes_total {}\n\
+# TYPE izwi_kernel_dtype_cast_ops_total counter\nizwi_kernel_dtype_cast_ops_total {}\n\
+# TYPE izwi_kernel_layout_copy_ops_total counter\nizwi_kernel_layout_copy_ops_total {}\n\
+# TYPE izwi_kernel_prefill_token_mode_steps_total counter\nizwi_kernel_prefill_token_mode_steps_total {}\n\
 # TYPE izwi_kernel_prefill_sequence_spans_total counter\nizwi_kernel_prefill_sequence_spans_total {}\n\
 # TYPE izwi_kernel_prefill_sequence_tokens_total counter\nizwi_kernel_prefill_sequence_tokens_total {}\n\
 # TYPE izwi_kernel_decode_attention_dense_total counter\nizwi_kernel_decode_attention_dense_total {}\n\
@@ -311,6 +341,10 @@ pub fn prometheus() -> String {
 # TYPE izwi_kernel_fused_attention_masked_attempts_total counter\nizwi_kernel_fused_attention_masked_attempts_total {}\n\
 # TYPE izwi_kernel_fused_attention_masked_success_total counter\nizwi_kernel_fused_attention_masked_success_total {}\n\
 # TYPE izwi_kernel_fused_attention_masked_fallback_total counter\nizwi_kernel_fused_attention_masked_fallback_total {}\n",
+        metrics.host_read_ops_total,
+        metrics.host_read_bytes_total,
+        metrics.dtype_cast_ops_total,
+        metrics.layout_copy_ops_total,
         metrics.prefill_token_mode_steps_total,
         metrics.prefill_sequence_spans_total,
         metrics.prefill_sequence_tokens_total,
@@ -385,6 +419,10 @@ fn fallback_total_for_reason(reason: AttentionFallbackReason) -> u64 {
 #[cfg(test)]
 pub fn reset_for_tests() {
     for counter in [
+        &HOST_READ_OPS_TOTAL,
+        &HOST_READ_BYTES_TOTAL,
+        &DTYPE_CAST_OPS_TOTAL,
+        &LAYOUT_COPY_OPS_TOTAL,
         &PREFILL_TOKEN_MODE_STEPS_TOTAL,
         &PREFILL_SEQUENCE_SPANS_TOTAL,
         &PREFILL_SEQUENCE_TOKENS_TOTAL,
@@ -417,5 +455,34 @@ pub fn reset_for_tests() {
         &FUSED_ATTN_FALLBACK_UNSUPPORTED_BACKEND_TOTAL,
     ] {
         counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_and_transform_counters_are_exported() {
+        let before = snapshot();
+        record_host_read(candle_core::DType::F16, 2);
+        record_dtype_cast();
+        record_layout_copy();
+        let after = snapshot();
+
+        assert!(after.host_read_ops_total >= before.host_read_ops_total + 1);
+        assert!(after.host_read_bytes_total >= before.host_read_bytes_total + 4);
+        assert!(after.dtype_cast_ops_total >= before.dtype_cast_ops_total + 1);
+        assert!(after.layout_copy_ops_total >= before.layout_copy_ops_total + 1);
+
+        let prometheus = prometheus();
+        for metric in [
+            "izwi_kernel_host_read_ops_total",
+            "izwi_kernel_host_read_bytes_total",
+            "izwi_kernel_dtype_cast_ops_total",
+            "izwi_kernel_layout_copy_ops_total",
+        ] {
+            assert!(prometheus.contains(metric), "missing {metric}");
+        }
     }
 }

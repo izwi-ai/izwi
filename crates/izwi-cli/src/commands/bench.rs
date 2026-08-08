@@ -174,6 +174,14 @@ struct RuntimeLatencyStats {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct KernelPathTelemetrySnapshot {
+    #[serde(default)]
+    host_read_ops_total: u64,
+    #[serde(default)]
+    host_read_bytes_total: u64,
+    #[serde(default)]
+    dtype_cast_ops_total: u64,
+    #[serde(default)]
+    layout_copy_ops_total: u64,
     prefill_token_mode_steps_total: u64,
     prefill_sequence_spans_total: u64,
     prefill_sequence_tokens_total: u64,

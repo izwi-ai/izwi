@@ -313,6 +313,7 @@ fn try_fused_self_attention_with_options_and_scale(
             CudaFlashAttentionDecision::Try => {
                 #[cfg(feature = "flash-attn")]
                 {
+                    record_flash_layout_copies();
                     let q = q.transpose(1, 2)?.contiguous()?;
                     let k = k.transpose(1, 2)?.contiguous()?;
                     let v = v.transpose(1, 2)?.contiguous()?;
@@ -388,6 +389,13 @@ fn try_fused_self_attention_with_options_and_scale(
     Ok(None)
 }
 
+#[cfg(feature = "flash-attn")]
+fn record_flash_layout_copies() {
+    for _ in 0..3 {
+        crate::models::shared::telemetry::record_layout_copy();
+    }
+}
+
 /// Try CUDA FlashAttention varlen for packed independent attention spans.
 ///
 /// Input/output layout: `[1, heads, total_seq, head_dim]`. The cumulative
@@ -434,6 +442,7 @@ pub fn try_fused_varlen_self_attention(
                 let device = q.device();
                 let scale = 1.0f32 / (head_dim as f32).sqrt();
                 let flash_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    record_flash_layout_copies();
                     let q = q.squeeze(0)?.transpose(0, 1)?.contiguous()?;
                     let k = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
                     let v = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;

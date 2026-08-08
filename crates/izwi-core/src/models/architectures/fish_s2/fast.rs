@@ -434,6 +434,8 @@ fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
         } else {
             idx.squeeze(0)?
         };
+        crate::models::shared::telemetry::record_dtype_cast();
+        crate::models::shared::telemetry::record_host_read(candle_core::DType::U32, 1);
         return idx
             .to_dtype(candle_core::DType::U32)?
             .to_scalar::<u32>()

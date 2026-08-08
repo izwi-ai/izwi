@@ -874,6 +874,8 @@ fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
     } else {
         idx.squeeze(0)?
     };
+    crate::models::shared::telemetry::record_dtype_cast();
+    crate::models::shared::telemetry::record_host_read(DType::U32, 1);
     idx.to_dtype(DType::U32)?
         .to_scalar::<u32>()
         .map_err(Error::from)
