@@ -1134,8 +1134,8 @@ impl DecoderLayer {
 
 /// Encoder-side normalized codebook.
 struct EncoderCodebook {
-    embeddings: Vec<f32>,
-    norms: Vec<f32>,
+    embeddings: Tensor,
+    norms: Tensor,
     codebook_size: usize,
     codebook_dim: usize,
 }
@@ -1146,41 +1146,60 @@ impl EncoderCodebook {
         let cluster_usage = vb
             .get((codebook_size,), "codebook.cluster_usage")?
             .clamp(1e-7f64, f64::MAX)?;
-        let embeddings = embedding_sum.broadcast_div(&cluster_usage.unsqueeze(1)?)?;
-        let embeddings_2d = embeddings.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        let mut flat = Vec::with_capacity(codebook_size * codebook_dim);
-        let mut norms = Vec::with_capacity(codebook_size);
-        for row in &embeddings_2d {
-            norms.push(row.iter().map(|v| v * v).sum());
-            flat.extend_from_slice(row);
+        let embeddings = embedding_sum
+            .broadcast_div(&cluster_usage.unsqueeze(1)?)?
+            .to_dtype(DType::F32)?;
+        Self::from_embeddings(embeddings, codebook_size, codebook_dim)
+    }
+
+    fn from_embeddings(
+        embeddings: Tensor,
+        codebook_size: usize,
+        codebook_dim: usize,
+    ) -> Result<Self> {
+        if embeddings.dims2()? != (codebook_size, codebook_dim) {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected speech tokenizer codebook shape {:?}; expected ({codebook_size}, {codebook_dim})",
+                embeddings.dims()
+            )));
         }
+        let embeddings = embeddings.to_dtype(DType::F32)?;
+        let norms = embeddings.sqr()?.sum(1)?;
         Ok(Self {
-            embeddings: flat,
+            embeddings,
             norms,
             codebook_size,
             codebook_dim,
         })
     }
 
-    fn embedding(&self, index: usize) -> &[f32] {
-        let start = index * self.codebook_dim;
-        &self.embeddings[start..start + self.codebook_dim]
-    }
-
-    fn nearest_index(&self, frame: &[f32]) -> usize {
-        let frame_norm: f32 = frame.iter().map(|v| v * v).sum();
-        let mut best_idx = 0usize;
-        let mut best_dist = f32::INFINITY;
-        for idx in 0..self.codebook_size {
-            let emb = self.embedding(idx);
-            let dot: f32 = frame.iter().zip(emb.iter()).map(|(a, b)| a * b).sum();
-            let dist = frame_norm + self.norms[idx] - 2.0 * dot;
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = idx;
-            }
+    fn quantize(&self, frames: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (frame_count, frame_dim) = frames.dims2()?;
+        if frame_dim != self.codebook_dim {
+            return Err(Error::InferenceError(format!(
+                "Speech tokenizer RVQ frame dim {frame_dim} does not match codebook dim {}",
+                self.codebook_dim
+            )));
         }
-        best_idx
+        if frame_count == 0 {
+            return Ok((
+                Tensor::zeros((0,), DType::U32, frames.device())?,
+                Tensor::zeros((0, self.codebook_dim), DType::F32, frames.device())?,
+            ));
+        }
+        let frames = frames.to_dtype(DType::F32)?;
+        let frame_norms = frames.sqr()?.sum_keepdim(1)?;
+        let distances = frame_norms
+            .broadcast_add(&self.norms.unsqueeze(0)?)?
+            .broadcast_sub(&(frames.matmul(&self.embeddings.t()?)? * 2.0)?)?;
+        let indices = distances.argmin(1)?;
+        if indices.dims1()? != frame_count {
+            return Err(Error::InferenceError(
+                "Speech tokenizer RVQ argmin returned an unexpected shape".to_string(),
+            ));
+        }
+        let quantized = self.embeddings.index_select(&indices, 0)?;
+        Ok((indices, quantized))
     }
 }
 
@@ -1250,24 +1269,26 @@ impl EncoderResidualVectorQuantizer {
 
         let mut all_indices = Vec::with_capacity(num_quantizers);
         for layer in self.codebooks.iter().take(num_quantizers) {
-            let residual_bt = residual.i(0)?.transpose(0, 1)?;
-            let frames = residual_bt.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-            let mut indices = Vec::with_capacity(seq_len);
-            let mut quantized = vec![0f32; dim * seq_len];
-
-            for (t, frame) in frames.iter().enumerate() {
-                let idx = layer.nearest_index(frame);
-                indices.push(idx as u32);
-                let emb = layer.embedding(idx);
-                for d in 0..dim {
-                    quantized[d * seq_len + t] = emb[d];
-                }
+            if layer.codebook_size == 0 || layer.codebook_dim != dim {
+                return Err(Error::InferenceError(format!(
+                    "Speech tokenizer RVQ codebook geometry ({}, {}) does not match residual dim {dim}",
+                    layer.codebook_size, layer.codebook_dim
+                )));
             }
-
-            let quantized = Tensor::from_vec(quantized, (1, dim, seq_len), residual.device())?
-                .to_dtype(residual.dtype())?;
+            crate::models::shared::telemetry::record_layout_copy();
+            let residual_bt = residual.i(0)?.transpose(0, 1)?.contiguous()?;
+            let (indices, quantized) = layer.quantize(&residual_bt)?;
+            crate::models::shared::telemetry::record_host_read(DType::U32, seq_len);
+            let indices_host = indices.to_vec1::<u32>()?;
+            let quantized = quantized.transpose(0, 1)?.unsqueeze(0)?;
+            let quantized = if quantized.dtype() == residual.dtype() {
+                quantized
+            } else {
+                crate::models::shared::telemetry::record_dtype_cast();
+                quantized.to_dtype(residual.dtype())?
+            };
             residual = residual.broadcast_sub(&quantized)?;
-            all_indices.push(indices);
+            all_indices.push(indices_host);
         }
         Ok(all_indices)
     }
@@ -1906,7 +1927,10 @@ fn normalized_codec_indices(
 ) -> Vec<i64> {
     let mut values = Vec::with_capacity(seq_len);
     for t in 0..seq_len {
-        let token = tokens.and_then(|tokens| tokens.get(t)).copied().unwrap_or(0);
+        let token = tokens
+            .and_then(|tokens| tokens.get(t))
+            .copied()
+            .unwrap_or(0);
         values.push(normalized_codec_index(token, codebook_size));
     }
     values
@@ -1983,5 +2007,44 @@ mod tests {
             resampled_audio_len(usize::MAX, 1, u32::MAX),
             Err(Error::Overloaded(_))
         ));
+    }
+
+    #[test]
+    fn encoder_codebook_quantizes_frames_with_candle_ops() {
+        let device = &Device::Cpu;
+        let codebook = EncoderCodebook::from_embeddings(
+            Tensor::from_vec(
+                vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 2.0],
+                (4, 2),
+                device,
+            )
+            .expect("embeddings"),
+            4,
+            2,
+        )
+        .expect("codebook");
+        let frames = Tensor::from_vec(vec![0.9f32, 0.1, 0.1, 0.8], (2, 2), device).expect("frames");
+
+        let (indices, quantized) = codebook.quantize(&frames).expect("quantize");
+        assert_eq!(indices.to_vec1::<u32>().expect("indices"), vec![1, 2]);
+        assert_eq!(
+            quantized.to_vec2::<f32>().expect("quantized"),
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+    }
+
+    #[test]
+    fn encoder_codebook_argmin_preserves_first_index_on_ties() {
+        let device = &Device::Cpu;
+        let codebook = EncoderCodebook::from_embeddings(
+            Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 0.0], (2, 2), device).expect("embeddings"),
+            2,
+            2,
+        )
+        .expect("codebook");
+        let frames = Tensor::from_vec(vec![1.0f32, 1.0], (1, 2), device).expect("frames");
+
+        let (indices, _) = codebook.quantize(&frames).expect("quantize");
+        assert_eq!(indices.to_vec1::<u32>().expect("indices"), vec![0]);
     }
 }
