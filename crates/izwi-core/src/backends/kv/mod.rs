@@ -126,6 +126,7 @@ pub struct KvPageCopy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvArenaOperationStats {
     pub slot_write_dispatches: u64,
+    pub paged_prefill_dispatches: u64,
     pub paged_decode_dispatches: u64,
     pub page_zero_dispatches: u64,
     pub page_copy_dispatches: u64,
@@ -141,6 +142,11 @@ pub struct KvArenaOperationStats {
     pub workspace_bytes: Option<u64>,
     /// Number of provider workspace allocations made by this arena.
     pub workspace_allocations: Option<u64>,
+    pub cpu_reference_attention_dispatches: u64,
+    pub portable_attention_dispatches: u64,
+    pub cuda_native_attention_dispatches: u64,
+    pub cuda_flash_attention_dispatches: u64,
+    pub metal_native_attention_dispatches: u64,
     /// Provider that completed the most recent attention operation.
     pub last_attention_provider: Option<KvAttentionProvider>,
     /// Explicit device synchronization that blocks the calling host thread.

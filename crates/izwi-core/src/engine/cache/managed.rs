@@ -49,10 +49,16 @@ use crate::kv::{InferenceStateCapability, KvArenaId, KvGroupId, KvStorageDType, 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ManagedKvOperationSnapshot {
     pub slot_write_dispatches: u64,
+    pub paged_prefill_dispatches: u64,
     pub paged_decode_dispatches: u64,
     pub page_zero_dispatches: u64,
     pub page_copy_dispatches: u64,
     pub host_synchronizations: u64,
+    pub cpu_reference_attention_dispatches: u64,
+    pub portable_attention_dispatches: u64,
+    pub cuda_native_attention_dispatches: u64,
+    pub cuda_flash_attention_dispatches: u64,
+    pub metal_native_attention_dispatches: u64,
 }
 
 impl ManagedKvOperationSnapshot {
@@ -63,6 +69,9 @@ impl ManagedKvOperationSnapshot {
         self.paged_decode_dispatches = self
             .paged_decode_dispatches
             .saturating_add(other.paged_decode_dispatches);
+        self.paged_prefill_dispatches = self
+            .paged_prefill_dispatches
+            .saturating_add(other.paged_prefill_dispatches);
         self.page_zero_dispatches = self
             .page_zero_dispatches
             .saturating_add(other.page_zero_dispatches);
@@ -72,6 +81,21 @@ impl ManagedKvOperationSnapshot {
         self.host_synchronizations = self
             .host_synchronizations
             .saturating_add(other.host_synchronizations);
+        self.cpu_reference_attention_dispatches = self
+            .cpu_reference_attention_dispatches
+            .saturating_add(other.cpu_reference_attention_dispatches);
+        self.portable_attention_dispatches = self
+            .portable_attention_dispatches
+            .saturating_add(other.portable_attention_dispatches);
+        self.cuda_native_attention_dispatches = self
+            .cuda_native_attention_dispatches
+            .saturating_add(other.cuda_native_attention_dispatches);
+        self.cuda_flash_attention_dispatches = self
+            .cuda_flash_attention_dispatches
+            .saturating_add(other.cuda_flash_attention_dispatches);
+        self.metal_native_attention_dispatches = self
+            .metal_native_attention_dispatches
+            .saturating_add(other.metal_native_attention_dispatches);
     }
 }
 
@@ -359,10 +383,21 @@ impl ManagedKvCacheManager {
                         let operation_stats = arena.operation_stats();
                         let operations = ManagedKvOperationSnapshot {
                             slot_write_dispatches: operation_stats.slot_write_dispatches,
+                            paged_prefill_dispatches: operation_stats.paged_prefill_dispatches,
                             paged_decode_dispatches: operation_stats.paged_decode_dispatches,
                             page_zero_dispatches: operation_stats.page_zero_dispatches,
                             page_copy_dispatches: operation_stats.page_copy_dispatches,
                             host_synchronizations: operation_stats.host_synchronizations,
+                            cpu_reference_attention_dispatches: operation_stats
+                                .cpu_reference_attention_dispatches,
+                            portable_attention_dispatches: operation_stats
+                                .portable_attention_dispatches,
+                            cuda_native_attention_dispatches: operation_stats
+                                .cuda_native_attention_dispatches,
+                            cuda_flash_attention_dispatches: operation_stats
+                                .cuda_flash_attention_dispatches,
+                            metal_native_attention_dispatches: operation_stats
+                                .metal_native_attention_dispatches,
                         };
                         add_coordinator_stats(&mut totals.coordinator, &coordinator);
                         totals.operations.add_assign(operations.clone());

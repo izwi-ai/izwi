@@ -20,7 +20,8 @@ use crate::models::shared::telemetry::{
 ///
 /// `Auto` retains the historical opportunistic behavior. `Force` is intended
 /// for external CUDA certification and fails instead of silently using the
-/// portable attention graph. The shipping default remains `Off`.
+/// portable attention graph. The shipping default is capability-gated `Auto`;
+/// `Off` remains the explicit rollback mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashAttentionMode {
     Off,

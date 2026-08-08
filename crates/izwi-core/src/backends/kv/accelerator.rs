@@ -534,10 +534,15 @@ pub struct CandleAcceleratorKvArena {
     attention_plan_device_uploads: AtomicU64,
     attention_plan_resident_bytes: AtomicU64,
     slot_write_dispatches: AtomicU64,
+    paged_prefill_dispatches: AtomicU64,
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
     page_copy_dispatches: AtomicU64,
     last_attention_provider: AtomicU64,
+    portable_attention_dispatches: AtomicU64,
+    cuda_native_attention_dispatches: AtomicU64,
+    cuda_flash_attention_dispatches: AtomicU64,
+    metal_native_attention_dispatches: AtomicU64,
     host_synchronizations: Arc<AtomicU64>,
 }
 
@@ -630,10 +635,15 @@ impl CandleAcceleratorKvArena {
             attention_plan_device_uploads: AtomicU64::new(0),
             attention_plan_resident_bytes: AtomicU64::new(0),
             slot_write_dispatches: AtomicU64::new(0),
+            paged_prefill_dispatches: AtomicU64::new(0),
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
             page_copy_dispatches: AtomicU64::new(0),
             last_attention_provider: AtomicU64::new(0),
+            portable_attention_dispatches: AtomicU64::new(0),
+            cuda_native_attention_dispatches: AtomicU64::new(0),
+            cuda_flash_attention_dispatches: AtomicU64::new(0),
+            metal_native_attention_dispatches: AtomicU64::new(0),
             host_synchronizations,
         })
     }
@@ -655,6 +665,19 @@ impl CandleAcceleratorKvArena {
             device_uploads: self.attention_plan_device_uploads.load(Ordering::Relaxed),
             resident_bytes: self.attention_plan_resident_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    fn record_attention_provider(&self, provider: KvAttentionProvider) {
+        self.last_attention_provider
+            .store(provider.code(), Ordering::Relaxed);
+        let counter = match provider {
+            KvAttentionProvider::Portable => &self.portable_attention_dispatches,
+            KvAttentionProvider::CudaNative => &self.cuda_native_attention_dispatches,
+            KvAttentionProvider::CudaFlashAttention => &self.cuda_flash_attention_dispatches,
+            KvAttentionProvider::MetalNative => &self.metal_native_attention_dispatches,
+            KvAttentionProvider::CpuReference => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn layer_from<'a>(
@@ -1311,10 +1334,7 @@ impl CandleAcceleratorKvArena {
                 self.config.page_tokens as usize,
                 args.softcap,
             )?;
-            self.last_attention_provider.store(
-                KvAttentionProvider::CudaFlashAttention.code(),
-                Ordering::Relaxed,
-            );
+            self.record_attention_provider(KvAttentionProvider::CudaFlashAttention);
             return Ok(output);
         }
 
@@ -1336,8 +1356,7 @@ impl CandleAcceleratorKvArena {
             tuning.decode_partition_tuning,
             tuning.decode_graph_allowed && self.cuda_kv_storage == CudaKvStorageFormat::Dense,
         )?;
-        self.last_attention_provider
-            .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
+        self.record_attention_provider(KvAttentionProvider::CudaNative);
         Ok(output)
     }
 
@@ -1810,9 +1829,9 @@ impl KvArena for CandleAcceleratorKvArena {
             })?;
             let layer = self.layer_from(&layers, binding)?;
             let output = self.metal_paged_prefill(layer, &args, &lowered)?;
-            self.last_attention_provider
-                .store(KvAttentionProvider::MetalNative.code(), Ordering::Relaxed);
-            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            self.record_attention_provider(KvAttentionProvider::MetalNative);
+            self.paged_prefill_dispatches
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
 
@@ -1844,11 +1863,9 @@ impl KvArena for CandleAcceleratorKvArena {
             })?;
             let layer = self.layer_from(&layers, binding)?;
             let output = self.cuda_flash_paged_prefill(layer, &args, &lowered)?;
-            self.last_attention_provider.store(
-                KvAttentionProvider::CudaFlashAttention.code(),
-                Ordering::Relaxed,
-            );
-            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            self.record_attention_provider(KvAttentionProvider::CudaFlashAttention);
+            self.paged_prefill_dispatches
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
 
@@ -1862,15 +1879,16 @@ impl KvArena for CandleAcceleratorKvArena {
             })?;
             let layer = self.layer_from(&layers, binding)?;
             let output = self.cuda_native_paged_prefill(layer, &args, &lowered)?;
-            self.last_attention_provider
-                .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
-            self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+            self.record_attention_provider(KvAttentionProvider::CudaNative);
+            self.paged_prefill_dispatches
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
 
         let output = super::portable_paged_prefill(self, binding, args)?;
-        self.last_attention_provider
-            .store(KvAttentionProvider::Portable.code(), Ordering::Relaxed);
+        self.record_attention_provider(KvAttentionProvider::Portable);
+        self.paged_prefill_dispatches
+            .fetch_add(1, Ordering::Relaxed);
         Ok(output)
     }
 
@@ -1901,8 +1919,7 @@ impl KvArena for CandleAcceleratorKvArena {
         #[cfg(feature = "metal")]
         if self.backend == BackendKind::Metal {
             let output = self.metal_paged_decode(layer, args)?;
-            self.last_attention_provider
-                .store(KvAttentionProvider::MetalNative.code(), Ordering::Relaxed);
+            self.record_attention_provider(KvAttentionProvider::MetalNative);
             self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
             return Ok(output);
         }
@@ -1927,6 +1944,7 @@ impl KvArena for CandleAcceleratorKvArena {
             .unwrap_or((None, None));
         KvArenaOperationStats {
             slot_write_dispatches: self.slot_write_dispatches.load(Ordering::Relaxed),
+            paged_prefill_dispatches: self.paged_prefill_dispatches.load(Ordering::Relaxed),
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
             page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
@@ -1948,6 +1966,19 @@ impl KvArena for CandleAcceleratorKvArena {
             }),
             workspace_bytes,
             workspace_allocations,
+            cpu_reference_attention_dispatches: 0,
+            portable_attention_dispatches: self
+                .portable_attention_dispatches
+                .load(Ordering::Relaxed),
+            cuda_native_attention_dispatches: self
+                .cuda_native_attention_dispatches
+                .load(Ordering::Relaxed),
+            cuda_flash_attention_dispatches: self
+                .cuda_flash_attention_dispatches
+                .load(Ordering::Relaxed),
+            metal_native_attention_dispatches: self
+                .metal_native_attention_dispatches
+                .load(Ordering::Relaxed),
             last_attention_provider: KvAttentionProvider::from_code(
                 self.last_attention_provider.load(Ordering::Relaxed),
             ),

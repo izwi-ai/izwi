@@ -679,7 +679,7 @@ impl ModelLifecycleController {
                                         .to_string(),
                                 )
                             })?;
-                            crate::runtime::rollout::certify_managed_state_plan(
+                            crate::runtime::rollout::validate_managed_state_plan_eligibility(
                                 variant,
                                 CapabilityKind::Chat,
                                 physical.state_plan_v2(),
@@ -791,7 +791,7 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                             )
                             .await?;
-                        crate::runtime::rollout::certify_managed_state_plan(
+                        crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Asr,
                             physical.state_plan_v2(),
@@ -1082,7 +1082,7 @@ impl ModelLifecycleController {
                             &physical_spec.retained,
                         )
                         .await?;
-                    crate::runtime::rollout::certify_managed_state_plan(
+                    crate::runtime::rollout::validate_managed_state_plan_eligibility(
                         variant,
                         capability,
                         retained.state_plan_v2(),

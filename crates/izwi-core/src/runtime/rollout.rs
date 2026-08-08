@@ -58,23 +58,23 @@ impl KvProviderRollout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KvProviderCertification {
-    PortableCertified,
-    OptimizedCertified,
+pub(crate) enum KvProviderEligibility {
+    PortableRouteValidated,
+    OptimizedEligibleUnverified,
 }
 
-/// Certify the exact loaded-model route after backend negotiation and before
-/// the model generation can become Ready.
+/// Validate that the loaded-model route has a complete provider after backend
+/// negotiation and before the model generation can become Ready.
 ///
-/// Backend negotiation has already validated dtype, page size, attention
-/// semantics, layout, and build availability. This final gate binds that
-/// exact physical plan to the model/capability cells migrated to managed v2.
-pub(crate) fn certify_managed_state_plan(
+/// An `Optimized` operation in the resolved plan is source/build eligibility,
+/// not CUDA runtime or performance evidence. Only retained NVIDIA artifacts
+/// may promote that separate evidence state.
+pub(crate) fn validate_managed_state_plan_eligibility(
     variant: ModelVariant,
     capability: CapabilityKind,
     plan: &ResolvedStatePlan,
-) -> Result<KvProviderCertification> {
-    let route_certified = matches!(
+) -> Result<KvProviderEligibility> {
+    let route_validated = matches!(
         (variant.family(), capability),
         (
             ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat | ModelFamily::Gemma3Chat,
@@ -85,9 +85,9 @@ pub(crate) fn certify_managed_state_plan(
                 CapabilityKind::Tts | CapabilityKind::StreamingTts
             )
     );
-    if !route_certified {
+    if !route_validated {
         return Err(Error::ModelLoadError(format!(
-            "managed KV provider is not certified for model {variant}, capability {}",
+            "managed KV provider route is not validated for model {variant}, capability {}",
             capability.as_str()
         )));
     }
@@ -100,15 +100,15 @@ pub(crate) fn certify_managed_state_plan(
     });
     if optimized && plan.backend != BackendKind::Cuda {
         return Err(Error::ModelLoadError(format!(
-            "optimized managed KV provider is not certified for {:?}",
+            "optimized managed KV provider is not eligible for {:?}",
             plan.backend
         )));
     }
 
     Ok(if optimized {
-        KvProviderCertification::OptimizedCertified
+        KvProviderEligibility::OptimizedEligibleUnverified
     } else {
-        KvProviderCertification::PortableCertified
+        KvProviderEligibility::PortableRouteValidated
     })
 }
 
@@ -170,16 +170,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            certify_managed_state_plan(ModelVariant::Qwen306B, CapabilityKind::Chat, &plan)
-                .unwrap(),
-            KvProviderCertification::PortableCertified
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Qwen306B,
+                CapabilityKind::Chat,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
         );
-        let error = certify_managed_state_plan(
+        let error = validate_managed_state_plan_eligibility(
             ModelVariant::WhisperLargeV3Turbo,
             CapabilityKind::Asr,
             &plan,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("not certified"));
+        assert!(error.to_string().contains("not validated"));
     }
 }

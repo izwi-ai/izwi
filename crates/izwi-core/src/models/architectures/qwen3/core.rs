@@ -3648,7 +3648,12 @@ mod tests {
         assert_tensor_close(&owned_prefill, &managed_prefill);
         assert_eq!(managed.context_len(), 3);
         assert_eq!(arena.operation_stats().slot_write_dispatches, 1);
-        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_prefill_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 0);
+        assert_eq!(
+            arena.operation_stats().cpu_reference_attention_dispatches,
+            1
+        );
         let prefill_completions = managed.take_completed_writes();
         assert_eq!(prefill_completions.len(), 1);
         assert_eq!(prefill_completions[0].slots_per_layer(), 3);
@@ -3659,7 +3664,12 @@ mod tests {
         assert_tensor_close(&owned_decode, &managed_decode);
         assert_eq!(managed.context_len(), 4);
         assert_eq!(arena.operation_stats().slot_write_dispatches, 2);
-        assert_eq!(arena.operation_stats().paged_decode_dispatches, 2);
+        assert_eq!(arena.operation_stats().paged_prefill_dispatches, 1);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
+        assert_eq!(
+            arena.operation_stats().cpu_reference_attention_dispatches,
+            2
+        );
         let decode_completions = managed.take_completed_writes();
         assert_eq!(decode_completions.len(), 1);
         assert_eq!(decode_completions[0].slots_per_layer(), 1);
@@ -3740,7 +3750,8 @@ mod tests {
         // Two prompt prefill calls plus one batched decode attention call per
         // layer, not one arena operation per ragged decode row.
         assert_eq!(arena.operation_stats().slot_write_dispatches, 3);
-        assert_eq!(arena.operation_stats().paged_decode_dispatches, 3);
+        assert_eq!(arena.operation_stats().paged_prefill_dispatches, 2);
+        assert_eq!(arena.operation_stats().paged_decode_dispatches, 1);
     }
 
     #[test]

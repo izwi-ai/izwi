@@ -165,7 +165,7 @@ promotion switch. Its reviewed hardware/shape certification table is empty
 until NVIDIA numerical, quality, VRAM, and latency evidence is accepted, so all
 shipping routes continue to allocate dense KV.
 
-To force the certified Portable provider for an incident or comparison run:
+To force the Portable provider for an incident or comparison run:
 
 ```bash
 IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1 izwi serve --backend cuda

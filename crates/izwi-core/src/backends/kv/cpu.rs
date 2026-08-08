@@ -81,10 +81,12 @@ pub struct CpuKvArena {
     layers: HashMap<KvLayerBinding, CpuLayerStorage>,
     mutation_lock: RwLock<()>,
     slot_write_dispatches: AtomicU64,
+    paged_prefill_dispatches: AtomicU64,
     paged_decode_dispatches: AtomicU64,
     page_zero_dispatches: AtomicU64,
     page_copy_dispatches: AtomicU64,
     last_attention_provider: AtomicU64,
+    cpu_reference_attention_dispatches: AtomicU64,
 }
 
 impl CpuKvArena {
@@ -125,10 +127,12 @@ impl CpuKvArena {
             layers,
             mutation_lock: RwLock::new(()),
             slot_write_dispatches: AtomicU64::new(0),
+            paged_prefill_dispatches: AtomicU64::new(0),
             paged_decode_dispatches: AtomicU64::new(0),
             page_zero_dispatches: AtomicU64::new(0),
             page_copy_dispatches: AtomicU64::new(0),
             last_attention_provider: AtomicU64::new(0),
+            cpu_reference_attention_dispatches: AtomicU64::new(0),
         })
     }
 
@@ -450,6 +454,8 @@ impl KvArena for CpuKvArena {
         )?
         .to_dtype(self.config.dtype)?;
         self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.cpu_reference_attention_dispatches
+            .fetch_add(1, Ordering::Relaxed);
         self.last_attention_provider
             .store(KvAttentionProvider::CpuReference.code(), Ordering::Relaxed);
         Ok(output)
@@ -615,7 +621,10 @@ impl KvArena for CpuKvArena {
         )?
         .to_dtype(self.config.dtype)
         .map_err(Error::from)?;
-        self.paged_decode_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.paged_prefill_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+        self.cpu_reference_attention_dispatches
+            .fetch_add(1, Ordering::Relaxed);
         self.last_attention_provider
             .store(KvAttentionProvider::CpuReference.code(), Ordering::Relaxed);
         Ok(output)
@@ -624,6 +633,7 @@ impl KvArena for CpuKvArena {
     fn operation_stats(&self) -> KvArenaOperationStats {
         KvArenaOperationStats {
             slot_write_dispatches: self.slot_write_dispatches.load(Ordering::Relaxed),
+            paged_prefill_dispatches: self.paged_prefill_dispatches.load(Ordering::Relaxed),
             paged_decode_dispatches: self.paged_decode_dispatches.load(Ordering::Relaxed),
             page_zero_dispatches: self.page_zero_dispatches.load(Ordering::Relaxed),
             page_copy_dispatches: self.page_copy_dispatches.load(Ordering::Relaxed),
@@ -635,6 +645,13 @@ impl KvArena for CpuKvArena {
             backing_allocations: Some((self.layers.len() * 2) as u64),
             workspace_bytes: Some(0),
             workspace_allocations: Some(0),
+            cpu_reference_attention_dispatches: self
+                .cpu_reference_attention_dispatches
+                .load(Ordering::Relaxed),
+            portable_attention_dispatches: 0,
+            cuda_native_attention_dispatches: 0,
+            cuda_flash_attention_dispatches: 0,
+            metal_native_attention_dispatches: 0,
             last_attention_provider: KvAttentionProvider::from_code(
                 self.last_attention_provider.load(Ordering::Relaxed),
             ),

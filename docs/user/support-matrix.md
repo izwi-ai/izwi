@@ -102,11 +102,12 @@ uncertified.
 | **CPU** | Supported | Portable | Dense F32/F16/BF16 KV policy; direct paged write, prefill, decode, zero, and copy. |
 | **Metal** | Supported when built with `metal` | Portable | Direct native Metal operations are intentionally classified Portable until a separately measured optimized cell is promoted. CPU and Metal share one unified-memory authority. |
 | **CUDA (`cuda-base`)** | Supported when built with CUDA | Portable | Native direct-page provider. CUDA compilation and device execution are separate release gates. |
-| **CUDA (`cuda` / `flash-attn`)** | Supported when built with CUDA and FlashAttention | Portable or Optimized per resolved cell | Optimized requires F16/BF16, full attention, page size divisible by 32, zero first-page offsets, and equal K/V head dimensions divisible by 8 and no larger than 512. Ineligible cells remain Portable. |
+| **CUDA (`cuda` / `flash-attn`)** | Supported when built with CUDA and FlashAttention | Portable, or Optimized-eligible per resolved cell | Optimized eligibility requires F16/BF16, full attention, page size divisible by 32, zero first-page offsets, and equal K/V head dimensions divisible by 8 and no larger than 512. Runtime and performance certification require retained NVIDIA evidence. Ineligible cells remain Portable. |
 
 The runtime fails model loading when a required ABI-v2 operation set or exact
-model/capability route is not certified. It does not silently switch back to a
-model-owned cache.
+model/capability route is incomplete. Source/build eligibility never upgrades
+a route to runtime-validated or performance-certified evidence. The runtime
+does not silently switch back to a model-owned cache.
 
 ### State topology by model family
 
@@ -114,11 +115,11 @@ The load path currently publishes ABI-v2 state as follows:
 
 | Model family / route | ABI-v2 topology | Provider-promotion status |
 |---|---|---|
-| **Qwen3 chat** | Retained paged KV | Portable certified; eligible CUDA cells may be Optimized |
-| **Qwen3.5 chat** | Composite retained paged/ring state | Portable certified; eligible CUDA paged cells may be Optimized |
-| **Gemma 3 chat** | Retained paged KV with model-declared attention semantics | Portable certified; eligible CUDA cells may be Optimized |
-| **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable certified; eligible CUDA cells may be Optimized |
-| **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable certified; eligible CUDA cells may be Optimized |
+| **Qwen3 chat** | Retained paged KV | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3.5 chat** | Composite retained paged/ring state | Portable route validated; eligible CUDA paged cells remain unverified until NVIDIA evidence is retained |
+| **Gemma 3 chat** | Retained paged KV with model-declared attention semantics | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **LFM2 chat; LFM2.5 Audio** | Bounded invocation-scoped paged/ring/composite state | ABI-v2 physical ownership; no Optimized attestation |
 | **Whisper, Parakeet, VibeVoice ASR, Granite Speech, Voxtral ASR** | Bounded invocation-scoped physical state; Granite publishes both ASR routes | ABI-v2 physical ownership; no Optimized attestation |
 | **Nemotron ASR** | Offline bounded invocation state and retained realtime tensor state | ABI-v2 physical ownership; no Optimized attestation |
