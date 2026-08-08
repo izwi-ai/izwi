@@ -375,7 +375,7 @@ pub(crate) fn paged_decode_attention(
     queries: &Tensor,
     keys: &Tensor,
     values: &Tensor,
-    metadata: Vec<u32>,
+    metadata: &Tensor,
     batch: usize,
     query_heads: usize,
     kv_heads: usize,
@@ -385,6 +385,7 @@ pub(crate) fn paged_decode_attention(
     value_dim: usize,
     softmax_scale: f32,
     softcap: Option<f32>,
+    max_context_len: usize,
 ) -> candle_core::Result<Tensor> {
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
@@ -420,8 +421,23 @@ pub(crate) fn paged_decode_attention(
         candle_core::bail!("CUDA paged decode received invalid tensor or attention geometry")
     }
     let capacity_pages = keys.dims()[0];
-    validate_cuda_paged_decode_metadata(&metadata, batch, page_tokens, max_blocks, capacity_pages)?;
-    let max_context_len = metadata[..batch].iter().copied().max().unwrap_or(0) as usize;
+    let metadata_len = batch
+        .checked_mul(2_usize.checked_add(max_blocks).ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            candle_core::Error::Msg("CUDA paged decode metadata overflow".to_string())
+        })?;
+    if metadata.device().location() != queries.device().location()
+        || metadata.dtype() != DType::U32
+        || metadata.dims() != [metadata_len]
+        || !metadata.layout().is_contiguous()
+    {
+        candle_core::bail!("CUDA paged decode metadata must be contiguous U32 on the query device")
+    }
+    if max_context_len == 0 {
+        candle_core::bail!("CUDA paged decode requires a non-empty validated context")
+    }
     let strategy = cuda_paged_decode_strategy(max_context_len, batch, query_heads, value_dim)?;
     let kernel_geometry = [
         batch,
@@ -432,7 +448,7 @@ pub(crate) fn paged_decode_attention(
         key_dim,
         value_dim,
         capacity_pages,
-        metadata.len(),
+        metadata_len,
         queries.elem_count(),
         keys.elem_count(),
         values.elem_count(),
@@ -447,7 +463,7 @@ pub(crate) fn paged_decode_attention(
         &keys.contiguous()?,
         &values.contiguous()?,
         &CudaPagedDecodeOp {
-            metadata,
+            metadata: metadata.clone(),
             batch,
             query_heads,
             kv_heads,
@@ -793,7 +809,7 @@ impl CustomOp3 for CudaGatedDeltaSequenceOp {
 }
 
 struct CudaPagedDecodeOp {
-    metadata: Vec<u32>,
+    metadata: Tensor,
     batch: usize,
     query_heads: usize,
     kv_heads: usize,
@@ -945,7 +961,17 @@ impl CustomOp3 for CudaPagedDecodeOp {
         use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
 
         let device = queries.device();
-        let metadata = device.clone_htod(&self.metadata)?;
+        let (metadata_storage, metadata_layout) = self.metadata.storage_and_layout();
+        let candle_core::Storage::Cuda(metadata_storage) = &*metadata_storage else {
+            candle_core::bail!("CUDA paged decode metadata storage is not CUDA")
+        };
+        let CudaStorageSlice::U32(metadata_slice) = &metadata_storage.slice else {
+            candle_core::bail!("CUDA paged decode metadata storage is not U32")
+        };
+        let Some((metadata_start, metadata_end)) = metadata_layout.contiguous_offsets() else {
+            candle_core::bail!("CUDA paged decode metadata must be contiguous")
+        };
+        let metadata = metadata_slice.slice(metadata_start..metadata_end);
         let output_elements = self
             .batch
             .checked_mul(self.query_heads)
@@ -1272,6 +1298,8 @@ mod tests {
         ];
 
         for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let device_metadata =
+                Tensor::from_vec(metadata.clone(), metadata.len(), &device).unwrap();
             let queries = Tensor::from_vec(query_data.clone(), (1, 1, 2), &device)
                 .unwrap()
                 .to_dtype(dtype)
@@ -1288,7 +1316,7 @@ mod tests {
                 &queries,
                 &keys,
                 &values,
-                metadata.clone(),
+                &device_metadata,
                 1,
                 1,
                 1,
@@ -1298,6 +1326,7 @@ mod tests {
                 2,
                 1.0,
                 Some(softcap),
+                2,
             )
             .unwrap()
             .to_dtype(DType::F32)

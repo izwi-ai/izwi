@@ -313,9 +313,24 @@ struct CachedPrefillDeviceMetadata {
 #[derive(Debug)]
 struct CachedDecodeDeviceMetadata {
     key: KvDecodeBatchMetadata,
+    host_cumulative_contexts: Vec<u32>,
+    host_block_table: Vec<u32>,
+    host_native_metadata: Vec<u32>,
     cumulative_queries: Tensor,
     cumulative_contexts: Tensor,
     block_table: Tensor,
+    native_metadata: Tensor,
+}
+
+#[derive(Debug)]
+struct DecodeDeviceMetadata {
+    cumulative_queries: Tensor,
+    cumulative_contexts: Tensor,
+    block_table: Tensor,
+    native_metadata: Tensor,
+    max_blocks: usize,
+    max_context: usize,
+    all_first_page_offsets_zero: bool,
 }
 
 const ATTENTION_PLAN_CACHE_BYTES_PER_KIND: usize = 4 * 1024 * 1024;
@@ -335,12 +350,42 @@ impl ResidentAttentionPlan for CachedPrefillDeviceMetadata {
     }
 }
 
+impl CachedDecodeDeviceMetadata {
+    fn device_metadata(&self) -> DecodeDeviceMetadata {
+        DecodeDeviceMetadata {
+            cumulative_queries: self.cumulative_queries.clone(),
+            cumulative_contexts: self.cumulative_contexts.clone(),
+            block_table: self.block_table.clone(),
+            native_metadata: self.native_metadata.clone(),
+            max_blocks: self.block_table.dims()[1],
+            max_context: self
+                .key
+                .sequences
+                .iter()
+                .map(|sequence| sequence.context_len as usize)
+                .max()
+                .unwrap_or(0),
+            all_first_page_offsets_zero: self
+                .key
+                .sequences
+                .iter()
+                .all(|sequence| sequence.first_page_offset == 0),
+        }
+    }
+
+    fn shape_compatible(&self, batch_size: usize, max_blocks: usize) -> bool {
+        self.key.sequences.len() == batch_size
+            && self.block_table.dims() == [batch_size, max_blocks]
+    }
+}
+
 impl ResidentAttentionPlan for CachedDecodeDeviceMetadata {
     fn resident_bytes(&self) -> usize {
         self.cumulative_queries
             .elem_count()
             .saturating_add(self.cumulative_contexts.elem_count())
             .saturating_add(self.block_table.elem_count())
+            .saturating_add(self.native_metadata.elem_count())
             .saturating_mul(std::mem::size_of::<u32>())
     }
 }
@@ -863,8 +908,9 @@ impl CandleAcceleratorKvArena {
         batch: &KvDecodeBatchMetadata,
         cumulative_contexts: &[u32],
         block_table: &[u32],
+        native_metadata: &[u32],
         max_blocks: usize,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    ) -> Result<DecodeDeviceMetadata> {
         let mut cache = self.decode_metadata_cache.lock().map_err(|_| {
             Error::InferenceError("accelerator decode metadata cache was poisoned".into())
         })?;
@@ -874,14 +920,62 @@ impl CandleAcceleratorKvArena {
             let cached = cache.promote(index).ok_or_else(|| {
                 Error::InferenceError("accelerator decode plan cache lost an entry".into())
             })?;
-            return Ok((
-                cached.cumulative_queries.clone(),
-                cached.cumulative_contexts.clone(),
-                cached.block_table.clone(),
-            ));
+            return Ok(cached.device_metadata());
         }
 
         let batch_size = batch.sequences.len();
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|cached| cached.shape_compatible(batch_size, max_blocks))
+        {
+            let cached = cache.entries.get_mut(index).ok_or_else(|| {
+                Error::InferenceError("accelerator decode plan cache lost an entry".into())
+            })?;
+            let mut updated = false;
+            updated |= update_u32_tensor(
+                &cached.cumulative_contexts,
+                &cached.host_cumulative_contexts,
+                cumulative_contexts,
+                &self.device,
+            )?;
+            updated |= update_u32_tensor(
+                &cached.block_table,
+                &cached.host_block_table,
+                block_table,
+                &self.device,
+            )?;
+            updated |= update_u32_tensor(
+                &cached.native_metadata,
+                &cached.host_native_metadata,
+                native_metadata,
+                &self.device,
+            )?;
+            cached.key = batch.clone();
+            cached.host_cumulative_contexts.clear();
+            cached
+                .host_cumulative_contexts
+                .extend_from_slice(cumulative_contexts);
+            cached.host_block_table.clear();
+            cached.host_block_table.extend_from_slice(block_table);
+            cached.host_native_metadata.clear();
+            cached
+                .host_native_metadata
+                .extend_from_slice(native_metadata);
+            let device_metadata = cached.device_metadata();
+            let entry = cache.entries.remove(index).ok_or_else(|| {
+                Error::InferenceError("accelerator decode plan cache lost an entry".into())
+            })?;
+            cache.entries.push_back(entry);
+            self.attention_plan_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            if updated {
+                self.attention_plan_device_uploads
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(device_metadata);
+        }
+
         let cumulative_queries = (0..=batch_size)
             .map(|value| {
                 u32::try_from(value).map_err(|_| {
@@ -891,19 +985,28 @@ impl CandleAcceleratorKvArena {
             .collect::<Result<Vec<_>>>()?;
         let cumulative_queries =
             Tensor::from_vec(cumulative_queries, batch_size + 1, &self.device)?;
-        let cumulative_contexts = Tensor::from_vec(
+        let cumulative_contexts_device = Tensor::from_vec(
             cumulative_contexts.to_vec(),
             cumulative_contexts.len(),
             &self.device,
         )?;
-        let block_table =
+        let block_table_device =
             Tensor::from_vec(block_table.to_vec(), (batch_size, max_blocks), &self.device)?;
+        let native_metadata_device = Tensor::from_vec(
+            native_metadata.to_vec(),
+            native_metadata.len(),
+            &self.device,
+        )?;
         let before_bytes = cache.resident_bytes;
         let evictions = cache.insert(CachedDecodeDeviceMetadata {
             key: batch.clone(),
+            host_cumulative_contexts: cumulative_contexts.to_vec(),
+            host_block_table: block_table.to_vec(),
+            host_native_metadata: native_metadata.to_vec(),
             cumulative_queries: cumulative_queries.clone(),
-            cumulative_contexts: cumulative_contexts.clone(),
-            block_table: block_table.clone(),
+            cumulative_contexts: cumulative_contexts_device.clone(),
+            block_table: block_table_device.clone(),
+            native_metadata: native_metadata_device.clone(),
         });
         update_resident_byte_gauge(
             &self.attention_plan_resident_bytes,
@@ -916,7 +1019,54 @@ impl CandleAcceleratorKvArena {
             .fetch_add(evictions as u64, Ordering::Relaxed);
         self.attention_plan_device_uploads
             .fetch_add(1, Ordering::Relaxed);
-        Ok((cumulative_queries, cumulative_contexts, block_table))
+        Ok(DecodeDeviceMetadata {
+            cumulative_queries,
+            cumulative_contexts: cumulative_contexts_device,
+            block_table: block_table_device,
+            native_metadata: native_metadata_device,
+            max_blocks,
+            max_context: batch
+                .sequences
+                .iter()
+                .map(|sequence| sequence.context_len as usize)
+                .max()
+                .unwrap_or(0),
+            all_first_page_offsets_zero: batch
+                .sequences
+                .iter()
+                .all(|sequence| sequence.first_page_offset == 0),
+        })
+    }
+
+    fn cached_cuda_decode_plan(
+        &self,
+        batch: &KvDecodeBatchMetadata,
+    ) -> Result<DecodeDeviceMetadata> {
+        {
+            let mut cache = self.decode_metadata_cache.lock().map_err(|_| {
+                Error::InferenceError("accelerator decode metadata cache was poisoned".into())
+            })?;
+            if let Some(index) = cache.entries.iter().position(|cached| cached.key == *batch) {
+                self.attention_plan_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                let cached = cache.promote(index).ok_or_else(|| {
+                    Error::InferenceError("accelerator decode plan cache lost an entry".into())
+                })?;
+                return Ok(cached.device_metadata());
+            }
+        }
+
+        let (table, cumulative_contexts, first_page_offsets, max_blocks, _) =
+            self.lower_decode_tables(batch)?;
+        let native_metadata =
+            packed_decode_metadata(&cumulative_contexts, &first_page_offsets, &table);
+        self.cached_decode_device_metadata(
+            batch,
+            &cumulative_contexts,
+            &table,
+            &native_metadata,
+            max_blocks,
+        )
     }
 
     #[cfg(all(feature = "cuda", feature = "flash-attn"))]
@@ -980,8 +1130,7 @@ impl CandleAcceleratorKvArena {
         args: PagedKvDecodeArgs<'_>,
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
-        let (table, seqlens_k, first_page_offsets, max_blocks, _max_context) =
-            self.lower_decode_tables(args.batch)?;
+        let device_metadata = self.cached_cuda_decode_plan(args.batch)?;
         #[cfg(feature = "flash-attn")]
         if self.optimized_provider_enabled
             && cuda_flash_paged_attention_eligible(
@@ -989,21 +1138,19 @@ impl CandleAcceleratorKvArena {
                 self.config.page_tokens,
                 layer.key_head_dim,
                 layer.value_head_dim,
-                first_page_offsets.iter().all(|offset| *offset == 0),
+                device_metadata.all_first_page_offsets_zero,
             )
         {
-            let (seqlens_q, seqlens_k, block_table) =
-                self.cached_decode_device_metadata(args.batch, &seqlens_k, &table, max_blocks)?;
             let output = candle_flash_attn::flash_attn_varlen_paged_windowed(
                 args.queries,
                 &layer.keys,
                 &layer.values,
-                &seqlens_q,
-                &seqlens_k,
-                &block_table,
+                &device_metadata.cumulative_queries,
+                &device_metadata.cumulative_contexts,
+                &device_metadata.block_table,
                 None,
                 1,
-                _max_context,
+                device_metadata.max_context,
                 args.softmax_scale,
                 None,
                 None,
@@ -1017,29 +1164,21 @@ impl CandleAcceleratorKvArena {
             return Ok(output);
         }
 
-        let context_lens = seqlens_k
-            .windows(2)
-            .map(|window| window[1] - window[0])
-            .collect::<Vec<_>>();
-        let mut metadata =
-            Vec::with_capacity(context_lens.len() + first_page_offsets.len() + table.len());
-        metadata.extend(context_lens);
-        metadata.extend(first_page_offsets);
-        metadata.extend(table);
         let output = crate::kernels::cuda::paged_decode_attention(
             args.queries,
             &layer.keys,
             &layer.values,
-            metadata,
+            &device_metadata.native_metadata,
             batch_size,
             args.queries.dims()[1],
             layer.num_kv_heads,
             self.config.page_tokens as usize,
-            max_blocks,
+            device_metadata.max_blocks,
             layer.key_head_dim,
             layer.value_head_dim,
             args.softmax_scale,
             args.softcap,
+            device_metadata.max_context,
         )?;
         self.last_attention_provider
             .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
@@ -1934,6 +2073,56 @@ fn scatter_rows(destination: &Tensor, indices: &Tensor, source: &Tensor) -> Resu
     Ok(())
 }
 
+fn update_u32_tensor(
+    destination: &Tensor,
+    previous: &[u32],
+    next: &[u32],
+    device: &Device,
+) -> Result<bool> {
+    if previous.len() != next.len() || destination.elem_count() != next.len() {
+        return Err(Error::InferenceError(
+            "accelerator attention metadata update changed its sealed shape".into(),
+        ));
+    }
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for (index, (&previous, &next)) in previous.iter().zip(next).enumerate() {
+        if previous != next {
+            indices.push(index);
+            values.push(next);
+        }
+    }
+    if indices.is_empty() {
+        return Ok(false);
+    }
+    let indices = accelerator_indices(&indices, device)?;
+    let value_count = values.len();
+    let values = Tensor::from_vec(values, value_count, device)?;
+    scatter_rows(&destination.flatten_all()?, &indices, &values)?;
+    Ok(true)
+}
+
+fn packed_decode_metadata(
+    cumulative_contexts: &[u32],
+    first_page_offsets: &[u32],
+    block_table: &[u32],
+) -> Vec<u32> {
+    let context_lens = cumulative_contexts
+        .windows(2)
+        .map(|window| window[1] - window[0]);
+    let mut metadata = Vec::with_capacity(
+        cumulative_contexts
+            .len()
+            .saturating_sub(1)
+            .saturating_add(first_page_offsets.len())
+            .saturating_add(block_table.len()),
+    );
+    metadata.extend(context_lens);
+    metadata.extend(first_page_offsets.iter().copied());
+    metadata.extend(block_table.iter().copied());
+    metadata
+}
+
 fn copy_rows_parallel(
     tensor: &Tensor,
     source_indices: &Tensor,
@@ -2284,25 +2473,26 @@ mod tests {
                 },
             ],
         };
-        let (table, cumulative, _, max_blocks, _) = arena.lower_decode_tables(&decode)?;
-        arena.cached_decode_device_metadata(&decode, &cumulative, &table, max_blocks)?;
-        arena.cached_decode_device_metadata(&decode, &cumulative, &table, max_blocks)?;
+        let (table, cumulative, offsets, max_blocks, _) = arena.lower_decode_tables(&decode)?;
+        let native = packed_decode_metadata(&cumulative, &offsets, &table);
+        arena.cached_decode_device_metadata(&decode, &cumulative, &table, &native, max_blocks)?;
+        arena.cached_cuda_decode_plan(&decode)?;
         let mut next_decode_generation = decode.clone();
         next_decode_generation.sequences[0].blocks[0].slot_generation = 2;
-        let (table, cumulative, _, max_blocks, _) =
-            arena.lower_decode_tables(&next_decode_generation)?;
-        arena.cached_decode_device_metadata(
-            &next_decode_generation,
-            &cumulative,
-            &table,
-            max_blocks,
-        )?;
+        arena.cached_cuda_decode_plan(&next_decode_generation)?;
+        let mut next_token = next_decode_generation.clone();
+        next_token.sequences[0].context_len += 1;
+        let (table, cumulative, offsets, _, _) = arena.lower_decode_tables(&next_token)?;
+        let native = packed_decode_metadata(&cumulative, &offsets, &table);
+        let updated = arena.cached_cuda_decode_plan(&next_token)?;
+        assert_eq!(updated.cumulative_contexts.to_vec1::<u32>()?, cumulative);
+        assert_eq!(updated.native_metadata.to_vec1::<u32>()?, native);
         let stats = arena.operation_stats();
-        assert_eq!(stats.attention_plan_cache_hits, 3);
-        assert_eq!(stats.attention_plan_cache_misses, 4);
+        assert_eq!(stats.attention_plan_cache_hits, 5);
+        assert_eq!(stats.attention_plan_cache_misses, 3);
         let cache_stats = arena.attention_plan_cache_stats();
-        assert_eq!(cache_stats.hits, 3);
-        assert_eq!(cache_stats.misses, 4);
+        assert_eq!(cache_stats.hits, 5);
+        assert_eq!(cache_stats.misses, 3);
         assert_eq!(cache_stats.evictions, 0);
         assert_eq!(cache_stats.device_uploads, 4);
         assert!(cache_stats.resident_bytes > 0);
