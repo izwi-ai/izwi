@@ -113,13 +113,14 @@ impl ResolvedKvPlan {
         let mut groups = Vec::with_capacity(state_plan.paged_attention.len());
         for (ordinal, resolved) in state_plan.paged_attention.iter().enumerate() {
             let capacity = allocation_plan.group_capacity(resolved.group, resolved.domain)?;
-            let CapacityStrategy::Fixed {
-                blocks: capacity_pages,
-            } = capacity.strategy
-            else {
-                return Err(invalid(
-                    "paged-attention capacity must use fully-backed fixed allocation",
-                ));
+            let capacity_pages = match capacity.strategy {
+                CapacityStrategy::Fixed { blocks } => blocks,
+                CapacityStrategy::AdmissionGrowable { max_blocks, .. } => max_blocks,
+                CapacityStrategy::BoundedLazy { .. } | CapacityStrategy::Reserved { .. } => {
+                    return Err(invalid(
+                        "paged-attention capacity must use fixed or admission-growable allocation",
+                    ));
+                }
             };
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_| invalid("physical KV group count exceeds u32"))?;
@@ -144,6 +145,7 @@ impl ResolvedKvPlan {
                 domain: resolved.domain,
                 page_tokens: resolved.page_tokens,
                 capacity_pages,
+                capacity_strategy: capacity.strategy,
                 bytes_per_page: resolved.bytes_per_page,
                 layout,
                 storage,
@@ -208,6 +210,11 @@ impl ResolvedKvPlan {
                 || group.page_tokens != resolved.page_tokens
                 || group.bytes_per_page != resolved.bytes_per_page
                 || group.capacity_pages == 0
+                || group.capacity_strategy.maximum_blocks() != group.capacity_pages
+                || !matches!(
+                    group.capacity_strategy,
+                    CapacityStrategy::Fixed { .. } | CapacityStrategy::AdmissionGrowable { .. }
+                )
                 || !same_layers
             {
                 return Err(invalid(
@@ -243,8 +250,8 @@ impl ResolvedKvPlan {
         }
         for (group, resolved) in self.groups.iter().zip(&state_plan.paged_attention) {
             let capacity = allocation_plan.group_capacity(resolved.group, resolved.domain)?;
-            if capacity.strategy.maximum_blocks() != group.capacity_pages
-                || !matches!(capacity.strategy, CapacityStrategy::Fixed { .. })
+            if capacity.strategy != group.capacity_strategy
+                || capacity.strategy.maximum_blocks() != group.capacity_pages
             {
                 return Err(invalid(
                     "physical KV group capacity diverges from its runtime allocation plan",
@@ -291,6 +298,7 @@ pub struct ResolvedKvGroup {
     pub domain: StateDomainId,
     pub page_tokens: u32,
     pub capacity_pages: u32,
+    pub(crate) capacity_strategy: CapacityStrategy,
     pub bytes_per_page: u64,
     pub layout: KvPhysicalLayout,
     pub storage: KvStorageFormat,
@@ -424,5 +432,53 @@ mod tests {
         assert!(plan
             .validate_against_allocation(&state_plan, &other)
             .is_err());
+    }
+
+    #[test]
+    fn admission_growable_capacity_survives_resolution_and_validation() {
+        let state_plan = negotiate_state_plan(
+            &test_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let model_instance = ModelInstanceId::new(43);
+        let strategy = CapacityStrategy::AdmissionGrowable {
+            initial_blocks: 64,
+            growth_quantum: 64,
+            max_blocks: 640,
+        };
+        let allocation = StateRuntimeAllocationPlan::build_exact(
+            &state_plan,
+            model_instance,
+            state_plan
+                .paged_attention
+                .iter()
+                .map(|group| GroupCapacityRequest {
+                    group: group.group,
+                    domain: group.domain,
+                    strategy,
+                })
+                .collect(),
+            WorkspaceContract {
+                fixed_bytes: 0,
+                dimensions: vec![],
+                terms: vec![],
+                placement: WorkspacePlacement::Host,
+                concurrency_slots: 1,
+            },
+            &StateBackendRegistry::new(BackendKind::Cpu, None).unwrap(),
+        )
+        .unwrap();
+
+        let plan = ResolvedKvPlan::from_runtime_allocation(9, &state_plan, &allocation).unwrap();
+        assert_eq!(plan.groups[0].capacity_pages, 640);
+        assert_eq!(plan.groups[0].capacity_strategy, strategy);
+        plan.validate_against_allocation(&state_plan, &allocation)
+            .unwrap();
     }
 }

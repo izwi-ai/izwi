@@ -619,7 +619,7 @@ impl ManagedKvCacheManager {
         let resources = managed_state_resources(backend, maximum_state_resources)?;
         let initial_authorization = if backend == BackendKind::Cuda {
             let deferred_paged_bytes = plan.groups.iter().try_fold(0_u64, |total, group| {
-                let initial_pages = cuda_paged_growth_geometry(group.capacity_pages).initial_pages;
+                let initial_pages = group.capacity_strategy.initial_blocks();
                 let deferred_pages = group.capacity_pages.saturating_sub(initial_pages);
                 total
                     .checked_add(
@@ -2065,15 +2065,22 @@ fn arena_config(
         group: group.id,
         page_tokens: group.page_tokens,
         capacity_pages: group.capacity_pages,
-        growth: (group.arena.backend == BackendKind::Cuda && group.capacity_pages > 64).then(
-            || {
-                let geometry = cuda_paged_growth_geometry(group.capacity_pages);
-                KvArenaGrowthConfig {
-                    initial_pages: geometry.initial_pages,
-                    growth_quantum_pages: geometry.growth_quantum_pages,
-                }
-            },
-        ),
+        growth: match group.capacity_strategy {
+            CapacityStrategy::Fixed { .. } => None,
+            CapacityStrategy::AdmissionGrowable {
+                initial_blocks,
+                growth_quantum,
+                ..
+            } => Some(KvArenaGrowthConfig {
+                initial_pages: initial_blocks,
+                growth_quantum_pages: growth_quantum,
+            }),
+            CapacityStrategy::BoundedLazy { .. } | CapacityStrategy::Reserved { .. } => {
+                return Err(Error::InferenceError(
+                    "resolved paged KV plan contains a non-arena capacity strategy".into(),
+                ));
+            }
+        },
         dtype: candle_dtype(group.storage.dtype())?,
         layers,
     })
