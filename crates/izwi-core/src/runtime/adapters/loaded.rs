@@ -78,10 +78,13 @@ fn output_visibility_for(
 }
 
 fn scalar_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
-    if backend_kind == BackendKind::Metal {
-        1
-    } else {
-        configured.max(1)
+    match backend_kind {
+        BackendKind::Cpu => configured.max(1),
+        // Metal serializes scalar model access. CUDA keeps scalar/per-row
+        // invocation state at one resident slot as well: the wider automatic
+        // tier belongs to native tensor batches, not to N fully-backed copies
+        // of a model's maximum-context workspace.
+        BackendKind::Metal | BackendKind::Cuda => 1,
     }
 }
 
@@ -2318,6 +2321,26 @@ mod tests {
         .unwrap();
         let contract = metal.contract(CapabilityKind::Tts, false).unwrap();
         assert_eq!(contract.execution_profile.max_batch_size, 1);
+        assert_eq!(
+            contract.execution_profile.concurrency,
+            ConcurrencyClass::Exclusive
+        );
+
+        let cuda = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(10),
+            ModelInstanceId::new(1_000),
+            ModelVariant::Lfm2512BThinkingGguf,
+            BackendKind::Cuda,
+        )
+        .unwrap();
+        let contract = cuda
+            .execution_contracts(CapabilityKind::Chat)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(contract.execution_profile.max_batch_size, 1);
+        assert_eq!(contract.stages[0].max_batch_size, 1);
         assert_eq!(
             contract.execution_profile.concurrency,
             ConcurrencyClass::Exclusive
