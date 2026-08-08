@@ -229,7 +229,10 @@ if ! jq -e '
             select(
                 .variant_id == $case.report.config.model and
                 .backend_kind == "cuda" and
-                .actual_device_kind == "cuda"
+                .actual_device_kind == "cuda" and
+                (.actual_compute_dtype == "f16" or
+                 .actual_compute_dtype == "bf16" or
+                 .actual_compute_dtype == "f32")
             )] | length > 0
     ] | all(. == true)) and
     ([.reports[] |
@@ -284,13 +287,36 @@ jq -n \
             selected_dtype: $health[0].runtime.dtype_policy.selected_dtype
         },
         cases: [
-            $report[0].reports[] | {
+            $report[0].reports[] |
+            . as $case |
+            ([($case.report.telemetry.after.models // [])[] |
+                select(
+                    .variant_id == $case.report.config.model and
+                    .backend_kind == "cuda" and
+                    .actual_device_kind == "cuda"
+                )] | first) as $runtime |
+            {
                 name: .name,
                 command: .report.command,
                 model: .report.config.model,
                 samples: (.report.samples | length),
                 quality_failed: .report.summary.quality_gates.failed,
-                telemetry_delta_available: .report.telemetry.delta_available
+                telemetry_delta_available: .report.telemetry.delta_available,
+                backend_kind: $runtime.backend_kind,
+                actual_device_kind: $runtime.actual_device_kind,
+                actual_compute_dtype: $runtime.actual_compute_dtype,
+                kernel_delta: {
+                    host_read_ops: ((.report.telemetry.after.kernel_path.host_read_ops_total // 0) - (.report.telemetry.before.kernel_path.host_read_ops_total // 0)),
+                    host_read_bytes: ((.report.telemetry.after.kernel_path.host_read_bytes_total // 0) - (.report.telemetry.before.kernel_path.host_read_bytes_total // 0)),
+                    dtype_cast_ops: ((.report.telemetry.after.kernel_path.dtype_cast_ops_total // 0) - (.report.telemetry.before.kernel_path.dtype_cast_ops_total // 0)),
+                    layout_copy_ops: ((.report.telemetry.after.kernel_path.layout_copy_ops_total // 0) - (.report.telemetry.before.kernel_path.layout_copy_ops_total // 0)),
+                    rope_kernel: ((.report.telemetry.after.kernel_path.rope_kernel_total // 0) - (.report.telemetry.before.kernel_path.rope_kernel_total // 0)),
+                    rope_manual: ((.report.telemetry.after.kernel_path.rope_manual_total // 0) - (.report.telemetry.before.kernel_path.rope_manual_total // 0)),
+                    fused_attention_attempts: ((.report.telemetry.after.kernel_path.fused_attention_attempts_total // 0) - (.report.telemetry.before.kernel_path.fused_attention_attempts_total // 0)),
+                    fused_attention_success: ((.report.telemetry.after.kernel_path.fused_attention_success_total // 0) - (.report.telemetry.before.kernel_path.fused_attention_success_total // 0)),
+                    fused_attention_fallback: ((.report.telemetry.after.kernel_path.fused_attention_fallback_total // 0) - (.report.telemetry.before.kernel_path.fused_attention_fallback_total // 0)),
+                    decode_attention_paged: ((.report.telemetry.after.kernel_path.decode_attention_paged_total // 0) - (.report.telemetry.before.kernel_path.decode_attention_paged_total // 0))
+                }
             }
         ],
         artifacts: {
