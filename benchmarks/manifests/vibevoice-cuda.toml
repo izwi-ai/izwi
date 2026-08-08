@@ -1,7 +1,7 @@
 # VibeVoice CUDA benchmark matrix.
 #
 # Run against a CUDA server with:
-#   IZWI_BACKEND=cuda IZWI_USE_FLASH_ATTENTION=1 izwi bench run benchmarks/manifests/vibevoice-cuda.toml
+#   IZWI_BACKEND=cuda izwi bench run benchmarks/manifests/vibevoice-cuda.toml
 #
 # The TTS case uses the small fox fixture as both reference audio and
 # transcript so benchmark client setup stays deterministic.

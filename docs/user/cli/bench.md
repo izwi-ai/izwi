@@ -163,11 +163,12 @@ IZWI_CUDA_FEATURES=cuda,cudnn scripts/ci/check-backend-truth.sh cargo-cuda
 IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn scripts/ci/check-backend-truth.sh cargo-cuda
 ```
 
-Run FlashAttention experiments with both the build feature and runtime opt-in:
+FlashAttention activates automatically when the build and runtime device are
+eligible. Use `IZWI_USE_FLASH_ATTENTION=force` for fail-closed certification:
 
 ```bash
 IZWI_BACKEND=cuda \
-IZWI_USE_FLASH_ATTENTION=1 \
+IZWI_USE_FLASH_ATTENTION=force \
 IZWI_WHISPER_PROFILE_SYNC=1 \
 izwi --output-format json bench asr \
   --model Whisper-Large-v3-Turbo \
@@ -236,7 +237,7 @@ izwi --output-format json bench asr \
 
 ```bash
 IZWI_BACKEND=cuda \
-IZWI_USE_FLASH_ATTENTION=1 \
+IZWI_USE_FLASH_ATTENTION=force \
 IZWI_QWEN3_DENSE_DECODE_ATTENTION=1 \
 IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT=1 \
 izwi --output-format json bench asr \
@@ -252,9 +253,10 @@ tokens, fused attention attempt/success/fallback counts, chunk attention
 fused/unfused/fallback counts, dense vs paged decode share, and Qwen
 `execution` diagnostics for device, dtypes, dense decode, FlashAttention, and
 text projection backend. FlashAttention
-experiments require both the `flash-attn` build feature and
-`IZWI_USE_FLASH_ATTENTION=1`; unsupported CUDA shapes must fall back through the
-existing Candle path with telemetry rather than failing the request.
+automatic execution requires the `flash-attn` build feature and a supported
+runtime route. `IZWI_USE_FLASH_ATTENTION=force` makes unsupported or failed
+CUDA execution fail closed for certification; normal `auto` mode falls back
+through the existing Candle path with telemetry.
 When validating audio chunk varlen FlashAttention specifically, also set
 `IZWI_QWEN_ASR_SMOKE_REQUIRE_FUSED_CHUNKS=1` so the smoke script fails if the
 runtime chunk-attention counters do not show fused spans.

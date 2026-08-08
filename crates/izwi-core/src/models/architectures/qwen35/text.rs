@@ -1726,7 +1726,7 @@ fn qwen35_rope_kernel_policy(
         return override_enabled.unwrap_or(true);
     }
     if is_cuda {
-        return override_enabled.unwrap_or(false);
+        return override_enabled.unwrap_or(true);
     }
     false
 }
@@ -2130,9 +2130,9 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_cuda_rope_kernel_is_explicit_and_default_off() {
+    fn qwen35_cuda_rope_kernel_defaults_on_with_explicit_rollback() {
         assert!(qwen35_rope_kernel_policy(true, false, None));
-        assert!(!qwen35_rope_kernel_policy(false, true, None));
+        assert!(qwen35_rope_kernel_policy(false, true, None));
         assert!(qwen35_rope_kernel_policy(false, true, Some(true)));
         assert!(!qwen35_rope_kernel_policy(true, false, Some(false)));
         assert!(!qwen35_rope_kernel_policy(false, false, Some(true)));

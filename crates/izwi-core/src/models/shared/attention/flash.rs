@@ -46,7 +46,8 @@ fn parse_flash_attention_mode(value: Option<&str>) -> FlashAttentionMode {
     match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("force") => FlashAttentionMode::Force,
         Some("auto" | "1" | "true" | "yes" | "on") => FlashAttentionMode::Auto,
-        Some("off" | "0" | "false" | "no") | None => FlashAttentionMode::Off,
+        None => FlashAttentionMode::Auto,
+        Some("off" | "0" | "false" | "no") => FlashAttentionMode::Off,
         Some(_) => FlashAttentionMode::Off,
     }
 }
@@ -781,8 +782,8 @@ mod tests {
     use candle_core::{Device, Tensor};
 
     #[test]
-    fn flash_attention_mode_is_explicit_and_defaults_off() {
-        assert_eq!(parse_flash_attention_mode(None), FlashAttentionMode::Off);
+    fn flash_attention_mode_defaults_to_auto_with_explicit_rollback() {
+        assert_eq!(parse_flash_attention_mode(None), FlashAttentionMode::Auto);
         for value in ["off", "0", "false", "no", "invalid"] {
             assert_eq!(
                 parse_flash_attention_mode(Some(value)),

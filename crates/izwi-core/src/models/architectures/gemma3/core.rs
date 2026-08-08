@@ -73,7 +73,7 @@ fn gemma_cuda_rms_norm_enabled(device: &Device) -> bool {
 }
 
 fn gemma_cuda_rms_norm_policy(is_cuda: bool, override_enabled: Option<bool>) -> bool {
-    is_cuda && override_enabled.unwrap_or(false)
+    is_cuda && override_enabled.unwrap_or(true)
 }
 
 #[derive(Debug, Clone)]
@@ -745,8 +745,8 @@ mod tests {
     }
 
     #[test]
-    fn gemma_cuda_rms_norm_is_explicit_and_default_off() {
-        assert!(!gemma_cuda_rms_norm_policy(true, None));
+    fn gemma_cuda_rms_norm_defaults_on_with_explicit_rollback() {
+        assert!(gemma_cuda_rms_norm_policy(true, None));
         assert!(gemma_cuda_rms_norm_policy(true, Some(true)));
         assert!(!gemma_cuda_rms_norm_policy(true, Some(false)));
         assert!(!gemma_cuda_rms_norm_policy(false, Some(true)));
