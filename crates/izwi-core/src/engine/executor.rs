@@ -556,7 +556,9 @@ impl WorkerConfig {
     fn tensor_batch_cap(backend: BackendKind) -> usize {
         match backend {
             BackendKind::Cpu | BackendKind::Metal => 2,
-            BackendKind::Cuda => 8,
+            // Runtime CUDA defaults remain VRAM-tiered and resource-admitted;
+            // this is only the hard kernel/metadata width ceiling.
+            BackendKind::Cuda => 32,
         }
     }
 
@@ -1789,7 +1791,7 @@ mod tests {
     fn tensor_batch_caps_are_backend_conservative() {
         assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 2);
         assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 2);
-        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 8);
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 32);
     }
 
     #[test]
