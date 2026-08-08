@@ -162,6 +162,11 @@ can lower that window but cannot raise it above 60 minutes. See the
 [Voxtral deployment](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/voxtral_tts.yaml),
 and [VibeVoice ASR model card](https://huggingface.co/microsoft/VibeVoice-ASR).
 
+Qwen3 ASR accepts up to 1,200 seconds per CUDA transcription chunk, while the
+forced-aligner route accepts up to 180 seconds and rejects longer inputs
+explicitly. CPU and Metal retain the checkpoint preprocessor window. Neither
+CUDA route silently truncates audio at the portable preprocessor limit.
+
 Voxtral Realtime CUDA offline decoding uses the loaded model position range
 (131,072 tokens in the current checkpoint) instead of the portable 1,024-frame
 service limit. Its physical paged cache rotates the 8,192-token attention
@@ -179,9 +184,9 @@ buffers while the runtime orchestrates longer inputs.
 |---|---|---|
 | Dense `float16`, `bfloat16`, `float32` KV | Supported by configuration boundary | Backend/model negotiation can still reject an exact incompatible cell. |
 | `int8` / `q4` KV | Unsupported | Parsed for migration diagnostics, then rejected before model readiness. |
-| CUDA FP8 E4M3 KV | Implemented, not promoted | Device-native storage and fused attention dequantization are present, but the reviewed certification table is empty. Dense KV remains the runtime default. |
+| CUDA FP8 E4M3 KV | Experimental, blocked | Kernel experiments exist, but scaled storage, scale-aware mutation/accounting, and NVIDIA evidence are incomplete. Arena and direct dispatch both fail closed to dense KV. |
 | Prefix reuse | Opt-in | Disabled by default; requires a non-empty isolation namespace and an independently bounded page budget. |
-| Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to a certified Portable provider. |
+| Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to the validated Portable route. |
 | Tiered/offloaded or distributed KV | Not supported | No production ownership or eviction contract is published for these modes. |
 
 Eligible CUDA routes automatically use resident block-table metadata,

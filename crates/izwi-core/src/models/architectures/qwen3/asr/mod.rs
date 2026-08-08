@@ -546,6 +546,60 @@ impl Qwen3AsrDiagnostics {
 
 const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
 const ASR_INCREMENTAL_DECODE_RESYNC_TOKENS: usize = 32;
+const QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS: usize = 1_200;
+const QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS: usize = 180;
+
+fn qwen3_asr_effective_max_frames(
+    cuda_device_observed: bool,
+    forced_aligner: bool,
+    configured_max_frames: usize,
+    sample_rate: usize,
+    hop_length: usize,
+) -> usize {
+    if !cuda_device_observed {
+        return configured_max_frames;
+    }
+    let seconds = if forced_aligner {
+        QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS
+    } else {
+        QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS
+    };
+    seconds
+        .saturating_mul(sample_rate.max(1))
+        .checked_div(hop_length.max(1))
+        .unwrap_or(0)
+}
+
+fn qwen3_asr_admit_frames(
+    frames: usize,
+    cuda_device_observed: bool,
+    forced_aligner: bool,
+    configured_max_frames: usize,
+    sample_rate: usize,
+    hop_length: usize,
+) -> Result<usize> {
+    let maximum = qwen3_asr_effective_max_frames(
+        cuda_device_observed,
+        forced_aligner,
+        configured_max_frames,
+        sample_rate,
+        hop_length,
+    );
+    if maximum == 0 || frames <= maximum {
+        return Ok(frames);
+    }
+    if cuda_device_observed {
+        let route = if forced_aligner {
+            "forced alignment"
+        } else {
+            "transcription"
+        };
+        return Err(Error::InvalidInput(format!(
+            "Qwen3 ASR CUDA {route} input has {frames} mel frames, exceeding the explicit {maximum}-frame limit"
+        )));
+    }
+    Ok(maximum)
+}
 
 impl Qwen3AsrModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
@@ -876,9 +930,16 @@ impl Qwen3AsrModel {
     /// Upper-bound hint for chunk sizing in long-form ASR orchestration.
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         let sample_rate = self.mel.config().sample_rate.max(1) as f32;
-        if self.preprocessor.nb_max_frames > 0 {
+        let maximum_frames = qwen3_asr_effective_max_frames(
+            self.device.device.is_cuda(),
+            self.is_forced_aligner,
+            self.preprocessor.nb_max_frames,
+            self.mel.config().sample_rate,
+            self.mel.config().hop_length,
+        );
+        if maximum_frames > 0 {
             let hop = self.mel.config().hop_length.max(1) as f32;
-            return Some(self.preprocessor.nb_max_frames as f32 * hop / sample_rate);
+            return Some(maximum_frames as f32 * hop / sample_rate);
         }
         if self.preprocessor.n_samples > 0 {
             return Some(self.preprocessor.n_samples as f32 / sample_rate);
@@ -911,9 +972,14 @@ impl Qwen3AsrModel {
         if qwen_asr_drop_last_mel_frame() && frames > 0 {
             frames -= 1;
         }
-        if self.preprocessor.nb_max_frames > 0 {
-            frames = frames.min(self.preprocessor.nb_max_frames);
-        }
+        frames = qwen3_asr_admit_frames(
+            frames,
+            self.device.device.is_cuda(),
+            false,
+            self.preprocessor.nb_max_frames,
+            self.mel.config().sample_rate,
+            self.mel.config().hop_length,
+        )?;
         if frames == 0 {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -1124,9 +1190,14 @@ impl Qwen3AsrModel {
             frames -= 1;
         }
         let mel_frames_before_truncate = frames;
-        if self.preprocessor.nb_max_frames > 0 && frames > self.preprocessor.nb_max_frames {
-            frames = self.preprocessor.nb_max_frames;
-        }
+        frames = qwen3_asr_admit_frames(
+            frames,
+            self.device.device.is_cuda(),
+            false,
+            self.preprocessor.nb_max_frames,
+            self.mel.config().sample_rate,
+            self.mel.config().hop_length,
+        )?;
         flat.truncate(frames * n_mels);
         let mel_ms = elapsed_ms(mel_started);
 
@@ -1413,9 +1484,15 @@ impl Qwen3AsrModel {
         };
 
         let mut mel_spec = self.mel.compute(&audio)?;
-        if self.preprocessor.nb_max_frames > 0 && mel_spec.len() > self.preprocessor.nb_max_frames {
-            mel_spec.truncate(self.preprocessor.nb_max_frames);
-        }
+        let admitted_frames = qwen3_asr_admit_frames(
+            mel_spec.len(),
+            self.device.device.is_cuda(),
+            true,
+            self.preprocessor.nb_max_frames,
+            self.mel.config().sample_rate,
+            self.mel.config().hop_length,
+        )?;
+        mel_spec.truncate(admitted_frames);
 
         let n_mels = self.mel.config().n_mels;
         if mel_spec.is_empty() {
@@ -3072,6 +3149,29 @@ mod tests {
         StageId, StageShapePolicy, StageWorkSelector,
     };
     use crate::kv::v2::{InvocationWorkspaceSet, RetainedStateCapability};
+
+    #[test]
+    fn cuda_audio_limits_expand_without_changing_portable_truncation() {
+        let configured = 3_000;
+        assert_eq!(
+            qwen3_asr_admit_frames(3_001, false, false, configured, 16_000, 160).unwrap(),
+            configured
+        );
+        assert_eq!(
+            qwen3_asr_effective_max_frames(true, false, configured, 16_000, 160),
+            120_000
+        );
+        assert_eq!(
+            qwen3_asr_effective_max_frames(true, true, configured, 16_000, 160),
+            18_000
+        );
+        assert_eq!(
+            qwen3_asr_admit_frames(120_000, true, false, configured, 16_000, 160).unwrap(),
+            120_000
+        );
+        assert!(qwen3_asr_admit_frames(120_001, true, false, configured, 16_000, 160).is_err());
+        assert!(qwen3_asr_admit_frames(18_001, true, true, configured, 16_000, 160).is_err());
+    }
 
     fn physical_spec_stage(id: u32, progress: StageProgressKind) -> StageDescriptor {
         StageDescriptor {
