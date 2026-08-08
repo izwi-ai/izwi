@@ -748,6 +748,7 @@ mod tests {
                 group,
                 page_tokens: 4,
                 capacity_pages: 1,
+                growth: None,
                 dtype: DType::F32,
                 layers: bindings
                     .iter()
@@ -803,6 +804,7 @@ mod tests {
                 group,
                 page_tokens: 4,
                 capacity_pages: 4,
+                growth: None,
                 dtype: DType::F32,
                 layers: vec![KvLayerConfig {
                     binding,
@@ -858,6 +860,7 @@ mod tests {
                 group,
                 page_tokens: 4,
                 capacity_pages: 3,
+                growth: None,
                 dtype: DType::F32,
                 layers: vec![KvLayerConfig {
                     binding,

@@ -2506,6 +2506,7 @@ mod tests {
                 group: KvGroupId::new(resolved.group.get()),
                 page_tokens: resolved.page_tokens,
                 capacity_pages: 1,
+                growth: None,
                 dtype: DType::F32,
                 layers: resolved
                     .layers

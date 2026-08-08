@@ -316,6 +316,9 @@ impl StateResourceRegistry for StateBackendRegistry {
                 ResolvedCapacityDomain::Paged(_),
                 CapacityStrategy::Fixed { .. }
             ) | (
+                ResolvedCapacityDomain::Paged(_),
+                CapacityStrategy::AdmissionGrowable { .. }
+            ) | (
                 ResolvedCapacityDomain::NonPaged(_),
                 CapacityStrategy::BoundedLazy { .. }
             )
@@ -340,21 +343,14 @@ impl StateResourceRegistry for StateBackendRegistry {
             }
         }
 
-        // The fixed arena allocates one immutable logical backing whose Candle
-        // tensor extents exactly equal `blocks * bytes_per_page`. Driver
-        // residency is reported separately by AllocationReceipt and is never
-        // guessed here.
+        // Fixed arenas allocate one immutable logical backing. CUDA admission-
+        // grown arenas replace that backing only at a maintenance barrier and
+        // publish a cumulative receipt for each whole growth-quantum range.
+        // Driver residency remains observation-only.
         Ok(ResolvedGroupResourceEnvelope {
             allocator_alignment_bytes: 1,
             allocator_overhead_per_allocation: 0,
-            max_backing_allocations: if matches!(
-                query.strategy,
-                CapacityStrategy::BoundedLazy { .. }
-            ) {
-                0
-            } else {
-                1
-            },
+            max_backing_allocations: query.strategy.minimum_backing_allocations(),
             reservation_metadata_bytes: 0,
             metadata_bytes_per_block: 0,
             pinned_bytes_per_block: 0,

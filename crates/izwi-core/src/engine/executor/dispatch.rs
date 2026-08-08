@@ -622,6 +622,7 @@ mod tests {
             group: block.group,
             page_tokens: 4,
             capacity_pages: 4,
+            growth: None,
             dtype: DType::F32,
             layers: vec![KvLayerConfig {
                 binding,
@@ -727,6 +728,7 @@ mod tests {
             group: KvGroupId::new(2),
             page_tokens: 4,
             capacity_pages: 2,
+            growth: None,
             dtype: DType::F32,
             layers: vec![KvLayerConfig {
                 binding,

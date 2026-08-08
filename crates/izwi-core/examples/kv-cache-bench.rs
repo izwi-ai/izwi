@@ -468,6 +468,7 @@ fn create_runtime(options: &Options, capacity_pages: u32) -> Result<Option<Runti
         group: GROUP,
         page_tokens: options.page_tokens,
         capacity_pages,
+        growth: None,
         dtype,
         layers: vec![KvLayerConfig {
             binding: LAYER,
@@ -746,6 +747,7 @@ fn certify_attention(
         group: GROUP,
         page_tokens: options.page_tokens,
         capacity_pages: workload.used_pages + 4,
+        growth: None,
         dtype: options.dtype,
         layers: vec![KvLayerConfig {
             binding: LAYER,

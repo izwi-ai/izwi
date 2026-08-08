@@ -327,6 +327,7 @@ pub(super) fn test_physical_cache(
             group,
             page_tokens: u32::try_from(page_tokens).expect("test page tokens"),
             capacity_pages: u32::try_from(capacity_pages).expect("test capacity pages"),
+            growth: None,
             dtype: DType::F32,
             layers: bindings
                 .iter()

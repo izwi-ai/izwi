@@ -3531,6 +3531,7 @@ mod tests {
             group: KvGroupId::new(0),
             page_tokens: 2,
             capacity_pages: 8,
+            growth: None,
             dtype: DType::F32,
             layers: vec![KvLayerConfig {
                 binding,

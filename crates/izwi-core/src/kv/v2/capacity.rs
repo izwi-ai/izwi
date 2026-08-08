@@ -93,7 +93,7 @@ impl CapacityStrategy {
         }
     }
 
-    const fn initial_blocks(self) -> u32 {
+    pub(crate) const fn initial_blocks(self) -> u32 {
         match self {
             Self::Fixed { blocks } => blocks,
             Self::BoundedLazy { .. } => 0,
@@ -112,7 +112,7 @@ impl CapacityStrategy {
         }
     }
 
-    const fn minimum_backing_allocations(self) -> u32 {
+    pub(crate) const fn minimum_backing_allocations(self) -> u32 {
         match self {
             Self::BoundedLazy { .. } => 0,
             Self::Fixed { .. } | Self::Reserved { .. } => 1,
@@ -906,7 +906,14 @@ impl StateAllocationLedger {
                     return Err(invalid("fixed state capacity cannot grow after Ready"));
                 }
                 CapacityStrategy::Reserved { .. } => receipt_blocks,
-                CapacityStrategy::AdmissionGrowable { growth_quantum, .. } => growth_quantum,
+                CapacityStrategy::AdmissionGrowable { growth_quantum, .. } => {
+                    if receipt_blocks == 0 || receipt_blocks % growth_quantum != 0 {
+                        return Err(invalid(
+                            "admission-grown allocation receipt must contain whole growth quanta",
+                        ));
+                    }
+                    receipt_blocks
+                }
             }
         };
         if receipt_blocks != expected_blocks {

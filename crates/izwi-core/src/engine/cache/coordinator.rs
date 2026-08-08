@@ -1128,7 +1128,10 @@ impl KvCacheCoordinator {
     }
 
     fn allocate_block(&mut self, group: KvGroupId, txn_id: PlanId) -> CacheBlockRef {
-        let index = self.free.pop_back().expect("capacity prevalidated");
+        // Allocate the lowest currently free logical page first. CUDA arenas
+        // can then materialize a compact resident prefix instead of being
+        // forced to grow to the logical maximum on their first reservation.
+        let index = self.free.pop_front().expect("capacity prevalidated");
         let slot = &mut self.slots[index as usize];
         slot.generation = slot
             .generation
@@ -1347,6 +1350,22 @@ mod tests {
         assert_eq!(coordinator.stats().allocated_pages, 0);
         assert_eq!(coordinator.stats().free_pages, 4);
         coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn fresh_reservations_consume_low_pages_first() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 128);
+        let initial = coordinator
+            .register_table(session("low-first", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 11, initial, 3, 48);
+        let prepared = coordinator.prepare(11).unwrap();
+        let indices = prepared
+            .provisional_groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.index))
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 1, 2]);
     }
 
     #[test]
@@ -1659,6 +1678,7 @@ mod tests {
             group: KvGroupId::new(0),
             page_tokens: 2,
             capacity_pages: 2,
+            growth: None,
             dtype: DType::F32,
             layers: vec![KvLayerConfig {
                 binding: LAYER,

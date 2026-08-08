@@ -22,7 +22,8 @@ use crate::backends::kv::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
 use crate::backends::kv::MetalKvBackendRuntime;
 use crate::backends::kv::{
-    CpuKvBackendRuntime, KvArena, KvArenaConfig, KvBackendRuntime, KvLayerConfig,
+    cuda_paged_growth_geometry, CpuKvBackendRuntime, KvArena, KvArenaConfig, KvArenaGrowthConfig,
+    KvBackendRuntime, KvLayerConfig,
 };
 use crate::backends::state::{
     negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
@@ -148,7 +149,7 @@ pub(crate) struct ManagedKvModelRuntime {
     allocation_plan: Arc<StateRuntimeAllocationPlan>,
     arenas: HashMap<KvArenaId, Arc<dyn KvArena>>,
     tensor_state: Option<Arc<TensorStateArena>>,
-    physical_bytes: u64,
+    non_paged_physical_bytes: u64,
 }
 
 impl fmt::Debug for ManagedKvModelRuntime {
@@ -159,7 +160,7 @@ impl fmt::Debug for ManagedKvModelRuntime {
             .field("state_plan_v2", &self.state_plan_v2.id)
             .field("allocation_plan", &self.allocation_plan.id)
             .field("arena_count", &self.arenas.len())
-            .field("physical_bytes", &self.physical_bytes)
+            .field("physical_bytes", &self.physical_bytes())
             .finish()
     }
 }
@@ -186,7 +187,11 @@ impl ManagedKvModelRuntime {
     }
 
     pub(crate) fn physical_bytes(&self) -> u64 {
-        self.physical_bytes
+        self.arenas
+            .values()
+            .fold(self.non_paged_physical_bytes, |total, arena| {
+                total.saturating_add(arena.resident_bytes())
+            })
     }
 }
 
@@ -199,6 +204,7 @@ struct ManagedKvModelState {
     registered_sessions: HashSet<SessionKey>,
     tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
     resource_lease: Option<ResourceLease>,
+    allocation_ledger: StateAllocationLedger,
 }
 
 #[derive(Clone)]
@@ -322,7 +328,7 @@ impl ManagedKvCacheManager {
                     .saturating_add(usize_to_u64(state.registered_sessions.len()));
                 totals.physical_bytes = totals
                     .physical_bytes
-                    .saturating_add(state.runtime.physical_bytes);
+                    .saturating_add(state.runtime.physical_bytes());
                 let mut arenas = state
                     .runtime
                     .plan
@@ -368,9 +374,7 @@ impl ManagedKvCacheManager {
                             device_ordinal: group.arena.device_ordinal,
                             page_tokens: group.page_tokens,
                             bytes_per_page: group.bytes_per_page,
-                            physical_bytes: group
-                                .bytes_per_page
-                                .saturating_mul(u64::from(group.capacity_pages)),
+                            physical_bytes: arena.resident_bytes(),
                             coordinator,
                             operations,
                         }
@@ -387,7 +391,7 @@ impl ManagedKvCacheManager {
                         .to_string(),
                     backend: state.runtime.plan.backend,
                     device_ordinal: state.runtime.plan.device_ordinal,
-                    physical_bytes: state.runtime.physical_bytes,
+                    physical_bytes: state.runtime.physical_bytes(),
                     registered_sessions: usize_to_u64(state.registered_sessions.len()),
                     arenas,
                 }
@@ -547,14 +551,39 @@ impl ManagedKvCacheManager {
             .map(Arc::new);
 
         let maximum_state_resources = allocation_plan.maximum_resources(&state_plan_v2)?;
-        let initial_state_resources = allocation_plan.initial_state_resources(&state_plan_v2)?;
-        let physical_bytes = state_resource_total(maximum_state_resources)?;
         let resources = managed_state_resources(backend, maximum_state_resources)?;
-        let materialized_resources = managed_state_resources(backend, initial_state_resources)?;
+        let initial_authorization = if backend == BackendKind::Cuda {
+            let deferred_paged_bytes = plan.groups.iter().try_fold(0_u64, |total, group| {
+                let initial_pages = cuda_paged_growth_geometry(group.capacity_pages).initial_pages;
+                let deferred_pages = group.capacity_pages.saturating_sub(initial_pages);
+                total
+                    .checked_add(
+                        group
+                            .bytes_per_page
+                            .checked_mul(u64::from(deferred_pages))
+                            .ok_or_else(|| {
+                                Error::Overloaded(
+                                    "managed CUDA deferred KV byte total overflow".into(),
+                                )
+                            })?,
+                    )
+                    .ok_or_else(|| {
+                        Error::Overloaded("managed CUDA deferred KV byte total overflow".into())
+                    })
+            })?;
+            let mut deferred = ResourceVector::zero();
+            deferred.device_bytes = ResourceAmount::Known(deferred_paged_bytes);
+            resources.checked_sub(deferred)?
+        } else {
+            resources
+        };
+        let materialized_resources = initial_authorization;
         let resource_lease = self
             .resource_authority
             .as_ref()
-            .map(|authority| reserve_managed_arena(authority, model_instance, backend, resources))
+            .map(|authority| {
+                reserve_managed_arena(authority, model_instance, backend, initial_authorization)
+            })
             .transpose()?;
         let mut arenas = HashMap::with_capacity(plan.groups.len());
         let mut coordinators = HashMap::with_capacity(plan.groups.len());
@@ -577,6 +606,7 @@ impl ManagedKvCacheManager {
                     self.worker_device_location
                 )));
             }
+            let resident_pages = arena.resident_capacity_pages();
             if arenas.insert(group.arena, arena).is_some() {
                 return Err(Error::InferenceError(
                     "resolved KV plan reused one arena identity".to_string(),
@@ -584,7 +614,7 @@ impl ManagedKvCacheManager {
             }
             let requested_owned_bytes = group
                 .bytes_per_page
-                .checked_mul(u64::from(group.capacity_pages))
+                .checked_mul(u64::from(resident_pages))
                 .ok_or_else(|| Error::Overloaded("managed KV byte total overflow".into()))?;
             allocation_ledger.reconcile_group_receipt(
                 &allocation_plan,
@@ -612,18 +642,25 @@ impl ManagedKvCacheManager {
         }
         allocation_ledger.ensure_ready(&allocation_plan)?;
         if let Some(lease) = resource_lease.as_ref() {
-            // Paged arenas preallocate their backing. Tensor capacity is a
-            // hard authorization for demand-allocated Candle tensors and must
-            // not be reported as already materialized at model load.
+            // CUDA paged arenas materialize only their sealed initial growth
+            // quantum. CPU/Metal remain fully backed; tensor capacity remains
+            // demand allocated.
             lease.record_materialized_usage(materialized_resources)?;
         }
+        // Tensor-state capacity is independently authorized and may materialize
+        // lazily. Keep that sealed envelope in model accounting while paged
+        // CUDA backing reports only its current resident extent.
+        let non_paged_physical_bytes = tensor_state
+            .as_ref()
+            .map(|arena| arena.capacity().authorized_bytes())
+            .unwrap_or(0);
         let runtime = Arc::new(ManagedKvModelRuntime {
             plan: Arc::new(plan),
             state_plan_v2: Arc::new(state_plan_v2),
             allocation_plan: Arc::new(allocation_plan),
             arenas,
             tensor_state,
-            physical_bytes,
+            non_paged_physical_bytes,
         });
         self.models.insert(
             model_instance,
@@ -636,6 +673,7 @@ impl ManagedKvCacheManager {
                 registered_sessions: HashSet::new(),
                 tensor_sequences: HashMap::new(),
                 resource_lease,
+                allocation_ledger,
             },
         );
         self.next_arena_generation = first_arena_generation
@@ -851,6 +889,93 @@ impl ManagedKvCacheManager {
                     return Err(coordinator_error(error));
                 }
             };
+            let required_resident_pages = prepared
+                .provisional_groups
+                .iter()
+                .flat_map(|group| group.blocks.iter())
+                .map(|block| block.index.saturating_add(1))
+                .max()
+                .unwrap_or(0);
+            let arena = runtime
+                .arena(group.arena)
+                .expect("resolved arena allocated");
+            let growth_result = (|| -> Result<()> {
+                if let Some(growth) = arena.plan_resident_growth(required_resident_pages)? {
+                    let added_bytes = group
+                        .bytes_per_page
+                        .checked_mul(u64::from(growth.added_pages()))
+                        .ok_or_else(|| {
+                            Error::Overloaded("managed KV growth byte total overflow".into())
+                        })?;
+                    let previous_authorization =
+                        state.resource_lease.as_ref().map(ResourceLease::resources);
+                    let final_authorization = previous_authorization
+                        .map(|current| {
+                            let mut delta = ResourceVector::zero();
+                            delta.device_bytes = ResourceAmount::Known(added_bytes);
+                            current.checked_add(delta)
+                        })
+                        .transpose()?;
+                    // Replacing a contiguous Candle tensor keeps the old arena
+                    // alive while allocating the complete target arena. Reserve
+                    // that admission-only peak before touching device memory,
+                    // then shrink the lease to the final resident footprint.
+                    let target_bytes = group
+                        .bytes_per_page
+                        .checked_mul(u64::from(growth.target_pages))
+                        .ok_or_else(|| {
+                            Error::Overloaded("managed KV growth peak byte total overflow".into())
+                        })?;
+                    let peak_authorization = previous_authorization
+                        .map(|current| {
+                            let mut delta = ResourceVector::zero();
+                            delta.device_bytes = ResourceAmount::Known(target_bytes);
+                            current.checked_add(delta)
+                        })
+                        .transpose()?;
+                    if let (Some(lease), Some(peak)) =
+                        (state.resource_lease.as_mut(), peak_authorization)
+                    {
+                        lease.resize(peak)?;
+                    }
+                    if let Err(error) = arena.grow_resident_pages(growth) {
+                        if let (Some(lease), Some(previous)) =
+                            (state.resource_lease.as_mut(), previous_authorization)
+                        {
+                            let _ = lease.resize(previous);
+                        }
+                        return Err(error);
+                    }
+                    if let (Some(lease), Some(final_resources)) =
+                        (state.resource_lease.as_mut(), final_authorization)
+                    {
+                        lease.resize(final_resources)?;
+                    }
+                    state.allocation_ledger.reconcile_group_receipt(
+                        runtime.allocation_plan(),
+                        crate::kv::v2::StateGroupId::new(group.id.get()),
+                        group.domain,
+                        AllocationReceipt {
+                            requested_owned_bytes: added_bytes,
+                            committed_owned_bytes: added_bytes,
+                            allocator_overhead_bytes: 0,
+                            residency: ResidencyMeasurement::Unknown,
+                        },
+                    )?;
+                    if let (Some(lease), Some(final_resources)) =
+                        (state.resource_lease.as_ref(), final_authorization)
+                    {
+                        lease.record_materialized_usage(final_resources)?;
+                    }
+                    self.telemetry.record_backing_allocation();
+                }
+                Ok(())
+            })();
+            if let Err(error) = growth_result {
+                let _ = coordinator.abort(txn_id);
+                abort_domains(state, txn_id, &domains);
+                return Err(error);
+            }
             let old = prepared
                 .expected
                 .groups
@@ -1442,10 +1567,11 @@ fn plan_managed_state_capacity(
         let blocks = u32::try_from(token_reach.div_ceil(u64::from(group.page_tokens)))
             .map_err(|_| Error::InvalidInput("managed KV group capacity exceeds u32".into()))?;
         sequence_capacity = sequence_capacity.min(blocks);
+        let strategy = managed_paged_capacity_strategy(state_plan.backend, blocks);
         groups.push(GroupCapacityRequest {
             group: group.group,
             domain: group.domain,
-            strategy: CapacityStrategy::Fixed { blocks },
+            strategy,
         });
     }
     let transaction_capacity = request.max_transaction_rows.min(sequence_capacity);
@@ -1497,13 +1623,17 @@ fn plan_managed_state_capacity(
     Ok((allocation_plan, tensor_capacity))
 }
 
-fn state_resource_total(resources: StateResourceVector) -> Result<u64> {
-    resources
-        .host_bytes
-        .checked_add(resources.device_bytes)
-        .and_then(|total| total.checked_add(resources.pinned_bytes))
-        .and_then(|total| total.checked_add(resources.metadata_bytes))
-        .ok_or_else(|| Error::Overloaded("managed state byte total overflow".into()))
+fn managed_paged_capacity_strategy(backend: BackendKind, blocks: u32) -> CapacityStrategy {
+    if backend == BackendKind::Cuda && blocks > 64 {
+        let growth = cuda_paged_growth_geometry(blocks);
+        CapacityStrategy::AdmissionGrowable {
+            initial_blocks: growth.initial_pages,
+            growth_quantum: growth.growth_quantum_pages,
+            max_blocks: blocks,
+        }
+    } else {
+        CapacityStrategy::Fixed { blocks }
+    }
 }
 
 fn managed_state_resources(
@@ -1870,6 +2000,15 @@ fn arena_config(
         group: group.id,
         page_tokens: group.page_tokens,
         capacity_pages: group.capacity_pages,
+        growth: (group.arena.backend == BackendKind::Cuda && group.capacity_pages > 64).then(
+            || {
+                let geometry = cuda_paged_growth_geometry(group.capacity_pages);
+                KvArenaGrowthConfig {
+                    initial_pages: geometry.initial_pages,
+                    growth_quantum_pages: geometry.growth_quantum_pages,
+                }
+            },
+        ),
         dtype: candle_dtype(group.storage.dtype())?,
         layers,
     })
@@ -2201,6 +2340,21 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn capacity_planner_grows_cuda_paged_state_but_keeps_cpu_fixed() {
+        for (backend, expected_initial) in
+            [(BackendKind::Cuda, 64_u32), (BackendKind::Cpu, 256_u32)]
+        {
+            let strategy = managed_paged_capacity_strategy(backend, 256);
+            assert_eq!(strategy.initial_blocks(), expected_initial);
+            assert_eq!(strategy.maximum_blocks(), 256);
+            assert_eq!(
+                matches!(strategy, CapacityStrategy::AdmissionGrowable { .. }),
+                backend == BackendKind::Cuda
+            );
+        }
     }
 
     #[test]

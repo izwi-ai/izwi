@@ -1175,6 +1175,7 @@ mod tests {
             group: GROUP,
             page_tokens: 2,
             capacity_pages: 3,
+            growth: None,
             dtype,
             layers: vec![KvLayerConfig {
                 binding: LAYER,

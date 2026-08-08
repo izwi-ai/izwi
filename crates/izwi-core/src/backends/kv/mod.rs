@@ -58,8 +58,60 @@ pub struct KvArenaConfig {
     pub group: KvGroupId,
     pub page_tokens: u32,
     pub capacity_pages: u32,
+    /// CUDA-only physical growth geometry. `None` keeps the complete logical
+    /// capacity resident from construction, as required by CPU, Metal, and
+    /// invocation-owned fixed arenas.
+    pub growth: Option<KvArenaGrowthConfig>,
     pub dtype: DType,
     pub layers: Vec<KvLayerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvArenaGrowthConfig {
+    pub initial_pages: u32,
+    pub growth_quantum_pages: u32,
+}
+
+const CUDA_PAGED_GROWTH_QUANTUM_PAGES: u32 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CudaPagedGrowthGeometry {
+    pub initial_pages: u32,
+    pub growth_quantum_pages: u32,
+}
+
+/// Resolve one deterministic CUDA growth geometry from a logical maximum.
+///
+/// The initial allocation is congruent with the maximum modulo the growth
+/// quantum, so every later admission can add complete quanta without a special
+/// terminal allocation. CPU and Metal never use this policy.
+pub(crate) const fn cuda_paged_growth_geometry(maximum_pages: u32) -> CudaPagedGrowthGeometry {
+    let quantum = CUDA_PAGED_GROWTH_QUANTUM_PAGES;
+    let remainder = maximum_pages % quantum;
+    let initial_pages = if maximum_pages <= quantum {
+        maximum_pages
+    } else if remainder == 0 {
+        quantum
+    } else {
+        remainder
+    };
+    CudaPagedGrowthGeometry {
+        initial_pages,
+        growth_quantum_pages: quantum,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvArenaGrowthPlan {
+    pub arena: KvArenaId,
+    pub previous_pages: u32,
+    pub target_pages: u32,
+}
+
+impl KvArenaGrowthPlan {
+    pub fn added_pages(self) -> u32 {
+        self.target_pages.saturating_sub(self.previous_pages)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +536,53 @@ pub trait KvArena: Send + Sync {
     fn device_location(&self) -> DeviceLocation;
     fn config(&self) -> &KvArenaConfig;
 
+    /// Physically materialized page count. The logical capacity remains the
+    /// immutable `config().capacity_pages` envelope.
+    fn resident_capacity_pages(&self) -> u32 {
+        self.config().capacity_pages
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        let per_page = self.config().layers.iter().fold(0_u64, |total, layer| {
+            let heads = u64::from(layer.num_kv_heads);
+            let width =
+                u64::from(layer.key_head_dim).saturating_add(u64::from(layer.value_head_dim));
+            total.saturating_add(
+                u64::from(self.config().page_tokens)
+                    .saturating_mul(heads)
+                    .saturating_mul(width)
+                    .saturating_mul(self.config().dtype.size_in_bytes() as u64),
+            )
+        });
+        per_page.saturating_mul(u64::from(self.resident_capacity_pages()))
+    }
+
+    /// Plan physical growth without allocating. Callers must authorize the
+    /// returned byte delta before invoking `grow_resident_pages`.
+    fn plan_resident_growth(&self, required_pages: u32) -> Result<Option<KvArenaGrowthPlan>> {
+        if required_pages > self.config().capacity_pages {
+            return Err(Error::Backpressure(format!(
+                "KV arena requires {required_pages} pages but its logical capacity is {}",
+                self.config().capacity_pages
+            )));
+        }
+        if required_pages <= self.resident_capacity_pages() {
+            Ok(None)
+        } else {
+            Err(Error::Backpressure(
+                "KV arena backing is fixed and cannot grow".to_string(),
+            ))
+        }
+    }
+
+    /// Materialize an exactly pre-authorized growth plan at an admission
+    /// barrier. Implementations must reject stale plans.
+    fn grow_resident_pages(&self, _plan: KvArenaGrowthPlan) -> Result<()> {
+        Err(Error::Backpressure(
+            "KV arena backing is fixed and cannot grow".to_string(),
+        ))
+    }
+
     /// Validate arena identity and bounds, then lower to backend slot indices.
     /// Slot generations must already have been validated by the control plane.
     fn lower_slots(&self, slots: &[KvSlotRef]) -> Result<Arc<dyn KvSlotMap>>;
@@ -635,6 +734,31 @@ mod tests {
     use super::*;
     use crate::engine::ModelInstanceId;
 
+    #[test]
+    fn cuda_growth_geometry_reaches_the_exact_logical_maximum() {
+        assert_eq!(
+            cuda_paged_growth_geometry(4_096),
+            CudaPagedGrowthGeometry {
+                initial_pages: 64,
+                growth_quantum_pages: 64,
+            }
+        );
+        assert_eq!(
+            cuda_paged_growth_geometry(2_000),
+            CudaPagedGrowthGeometry {
+                initial_pages: 16,
+                growth_quantum_pages: 64,
+            }
+        );
+        assert_eq!(
+            cuda_paged_growth_geometry(40),
+            CudaPagedGrowthGeometry {
+                initial_pages: 40,
+                growth_quantum_pages: 64,
+            }
+        );
+    }
+
     struct RecordingDecodeArena {
         config: KvArenaConfig,
         calls: AtomicUsize,
@@ -781,6 +905,7 @@ mod tests {
             group: KvGroupId::new(1),
             page_tokens: 4,
             capacity_pages: 4,
+            growth: None,
             dtype: DType::F32,
             layers: layers
                 .iter()

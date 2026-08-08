@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use candle_core::{DType, Device, DeviceLocation, Tensor};
 
@@ -13,9 +13,9 @@ use crate::Result;
 #[cfg(feature = "cuda")]
 use super::KvBackendRuntime;
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats, KvAttentionProvider, KvDeviceFence,
-    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
-    PagedKvPrefillRow,
+    DeviceFence, KvArena, KvArenaConfig, KvArenaGrowthPlan, KvArenaOperationStats,
+    KvAttentionProvider, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion,
+    PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -408,7 +408,9 @@ pub struct CandleAcceleratorKvArena {
     backend: BackendKind,
     device: Device,
     optimized_provider_enabled: bool,
-    layers: HashMap<KvLayerBinding, AcceleratorLayerStorage>,
+    layers: RwLock<HashMap<KvLayerBinding, AcceleratorLayerStorage>>,
+    resident_capacity_pages: AtomicU32,
+    backing_generation: AtomicU64,
     mutation_lock: Mutex<()>,
     prefill_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedPrefillDeviceMetadata>>,
     decode_metadata_cache: Mutex<ResidentAttentionPlanCache<CachedDecodeDeviceMetadata>>,
@@ -443,10 +445,14 @@ impl CandleAcceleratorKvArena {
             )));
         }
 
+        let resident_capacity_pages = config
+            .growth
+            .map(|growth| growth.initial_pages)
+            .unwrap_or(config.capacity_pages);
         let mut layers = HashMap::with_capacity(config.layers.len());
         for layer in &config.layers {
             let common = (
-                config.capacity_pages as usize,
+                resident_capacity_pages as usize,
                 config.page_tokens as usize,
                 layer.num_kv_heads as usize,
             );
@@ -478,7 +484,9 @@ impl CandleAcceleratorKvArena {
             backend,
             device,
             optimized_provider_enabled,
-            layers,
+            layers: RwLock::new(layers),
+            resident_capacity_pages: AtomicU32::new(resident_capacity_pages),
+            backing_generation: AtomicU64::new(1),
             mutation_lock: Mutex::new(()),
             prefill_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
             decode_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
@@ -500,7 +508,11 @@ impl CandleAcceleratorKvArena {
     }
 
     pub fn layer_tensors(&self, binding: KvLayerBinding) -> Result<(Tensor, Tensor)> {
-        let layer = self.layer(binding)?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
         Ok((layer.keys.clone(), layer.values.clone()))
     }
 
@@ -514,8 +526,12 @@ impl CandleAcceleratorKvArena {
         }
     }
 
-    fn layer(&self, binding: KvLayerBinding) -> Result<&AcceleratorLayerStorage> {
-        self.layers.get(&binding).ok_or_else(|| {
+    fn layer_from<'a>(
+        &self,
+        layers: &'a HashMap<KvLayerBinding, AcceleratorLayerStorage>,
+        binding: KvLayerBinding,
+    ) -> Result<&'a AcceleratorLayerStorage> {
+        layers.get(&binding).ok_or_else(|| {
             Error::InferenceError(format!(
                 "KV layer binding {} is not present in arena {:?}",
                 binding.physical_layer, self.config.id
@@ -538,10 +554,10 @@ impl CandleAcceleratorKvArena {
             )));
         }
         let page = block.index as usize;
-        if page >= self.config.capacity_pages as usize {
+        let resident_pages = self.resident_capacity_pages() as usize;
+        if page >= resident_pages {
             return Err(Error::InferenceError(format!(
-                "KV block index {page} is outside arena capacity {}",
-                self.config.capacity_pages
+                "KV block index {page} is outside resident arena capacity {resident_pages}"
             )));
         }
         if block.slot_generation == 0 {
@@ -1084,6 +1100,111 @@ impl KvArena for CandleAcceleratorKvArena {
         &self.config
     }
 
+    fn resident_capacity_pages(&self) -> u32 {
+        self.resident_capacity_pages.load(Ordering::Acquire)
+    }
+
+    fn plan_resident_growth(&self, required_pages: u32) -> Result<Option<KvArenaGrowthPlan>> {
+        if required_pages > self.config.capacity_pages {
+            return Err(Error::Backpressure(format!(
+                "KV arena requires {required_pages} pages but its logical capacity is {}",
+                self.config.capacity_pages
+            )));
+        }
+        let previous_pages = self.resident_capacity_pages();
+        if required_pages <= previous_pages {
+            return Ok(None);
+        }
+        if self.backend != BackendKind::Cuda {
+            return Err(Error::Backpressure(
+                "only CUDA paged arenas support admission growth".into(),
+            ));
+        }
+        let geometry = self.config.growth.ok_or_else(|| {
+            Error::Backpressure("CUDA KV arena was not configured for admission growth".into())
+        })?;
+        let missing = required_pages - previous_pages;
+        let rounded_missing = missing
+            .div_ceil(geometry.growth_quantum_pages)
+            .saturating_mul(geometry.growth_quantum_pages);
+        let rounded_target = previous_pages.saturating_add(rounded_missing);
+        // Amortize maintenance-barrier copies while retaining the sealed
+        // quantum geometry required by the allocation ledger.
+        let amortized_addition = previous_pages
+            .max(geometry.growth_quantum_pages)
+            .div_ceil(geometry.growth_quantum_pages)
+            .saturating_mul(geometry.growth_quantum_pages);
+        let doubled = previous_pages
+            .saturating_add(amortized_addition)
+            .min(self.config.capacity_pages);
+        let target_pages = rounded_target.max(doubled).min(self.config.capacity_pages);
+        Ok(Some(KvArenaGrowthPlan {
+            arena: self.config.id,
+            previous_pages,
+            target_pages,
+        }))
+    }
+
+    fn grow_resident_pages(&self, plan: KvArenaGrowthPlan) -> Result<()> {
+        if self.backend != BackendKind::Cuda || plan.arena != self.config.id {
+            return Err(Error::InvalidInput(
+                "KV growth plan targets a different or fixed arena".into(),
+            ));
+        }
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let current = self.resident_capacity_pages();
+        if current != plan.previous_pages
+            || plan.target_pages <= current
+            || plan.target_pages > self.config.capacity_pages
+        {
+            return Err(Error::Backpressure(
+                "KV growth plan is stale or exceeds the sealed arena".into(),
+            ));
+        }
+        let target = plan.target_pages as usize;
+        let mut layers = self
+            .layers
+            .write()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let mut replacements = HashMap::with_capacity(layers.len());
+        let current_rows = (0..current as usize).collect::<Vec<_>>();
+        let current_indices = accelerator_indices(&current_rows, &self.device)?;
+        for (binding, layer) in layers.iter() {
+            let common = (target, self.config.page_tokens as usize, layer.num_kv_heads);
+            let keys = Tensor::zeros(
+                (common.0, common.1, common.2, layer.key_head_dim),
+                self.config.dtype,
+                &self.device,
+            )?;
+            let values = Tensor::zeros(
+                (common.0, common.1, common.2, layer.value_head_dim),
+                self.config.dtype,
+                &self.device,
+            )?;
+            scatter_rows(&keys, &current_indices, &layer.keys)?;
+            scatter_rows(&values, &current_indices, &layer.values)?;
+            replacements.insert(*binding, (keys, values));
+        }
+        // The old backing must remain alive until every device copy into the
+        // replacement has completed. Growth is an admission barrier, so this
+        // synchronization is never part of steady decode.
+        self.device.synchronize()?;
+        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+        for (binding, (keys, values)) in replacements {
+            let layer = layers.get_mut(&binding).ok_or_else(|| {
+                Error::InferenceError("KV layer disappeared during growth".into())
+            })?;
+            layer.keys = keys;
+            layer.values = values;
+        }
+        self.resident_capacity_pages
+            .store(plan.target_pages, Ordering::Release);
+        self.backing_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn lower_slots(&self, slots: &[KvSlotRef]) -> Result<Arc<dyn KvSlotMap>> {
         let mut flat_slots = Vec::with_capacity(slots.len());
         let mut unique = HashSet::with_capacity(slots.len());
@@ -1125,11 +1246,15 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
         let mut workspaces = Vec::new();
         let mut dispatch_result = Ok(());
         if !page_indices.is_empty() {
             let page_indices = accelerator_indices(&page_indices, &self.device)?;
-            for layer in self.layers.values() {
+            for layer in layers.values() {
                 let key_shape = [
                     page_indices.elem_count(),
                     self.config.page_tokens as usize,
@@ -1221,6 +1346,10 @@ impl KvArena for CandleAcceleratorKvArena {
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
         if !lowered.is_empty() {
             let source_indices = accelerator_indices(
                 &lowered
@@ -1236,7 +1365,7 @@ impl KvArena for CandleAcceleratorKvArena {
                     .collect::<Vec<_>>(),
                 &self.device,
             )?;
-            for layer in self.layers.values() {
+            for layer in layers.values() {
                 // index_select snapshots every source before either destination
                 // tensor is mutated, preserving parallel-copy chains and cycles.
                 copy_rows_parallel(&layer.keys, &source_indices, &destination_indices)?;
@@ -1253,7 +1382,14 @@ impl KvArena for CandleAcceleratorKvArena {
         args: KvWriteArgs<'_>,
     ) -> Result<KvWriteCompletion> {
         let slots = self.accelerator_slots(args.slots)?;
-        let layer = self.layer(binding)?;
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
         validate_write_tensor(
             args.keys,
             slots.len(),
@@ -1284,9 +1420,6 @@ impl KvArena for CandleAcceleratorKvArena {
             layer
                 .values
                 .reshape((flat_capacity, layer.num_kv_heads, layer.value_head_dim))?;
-        let _guard = self.mutation_lock.lock().map_err(|_| {
-            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
-        })?;
         if !slots.flat_slots.is_empty() {
             scatter_rows(&flat_keys, &slots.device_indices, args.keys)?;
             scatter_rows(&flat_values, &slots.device_indices, args.values)?;
@@ -1306,8 +1439,14 @@ impl KvArena for CandleAcceleratorKvArena {
         binding: KvLayerBinding,
         args: PagedKvPrefillArgs<'_>,
     ) -> Result<Tensor> {
-        let layer = self.layer(binding)?;
-        validate_prefill_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
+        let (_key_head_dim, _value_head_dim) = {
+            let layers = self.layers.read().map_err(|_| {
+                Error::InferenceError("accelerator KV layer map was poisoned".into())
+            })?;
+            let layer = self.layer_from(&layers, binding)?;
+            validate_prefill_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
+            (layer.key_head_dim, layer.value_head_dim)
+        };
         let lowered = self.lower_prefill_metadata(&args)?;
 
         #[cfg(feature = "metal")]
@@ -1317,6 +1456,10 @@ impl KvArena for CandleAcceleratorKvArena {
             let _guard = self.mutation_lock.lock().map_err(|_| {
                 Error::InferenceError("accelerator KV mutation lock was poisoned".into())
             })?;
+            let layers = self.layers.read().map_err(|_| {
+                Error::InferenceError("accelerator KV layer map was poisoned".into())
+            })?;
+            let layer = self.layer_from(&layers, binding)?;
             let output = self.metal_paged_prefill(layer, &args, &lowered)?;
             self.last_attention_provider
                 .store(KvAttentionProvider::MetalNative.code(), Ordering::Relaxed);
@@ -1330,14 +1473,18 @@ impl KvArena for CandleAcceleratorKvArena {
             && cuda_flash_paged_attention_eligible(
                 self.config.dtype,
                 self.config.page_tokens,
-                layer.key_head_dim,
-                layer.value_head_dim,
+                _key_head_dim,
+                _value_head_dim,
                 lowered.all_first_page_offsets_zero,
             )
         {
             let _guard = self.mutation_lock.lock().map_err(|_| {
                 Error::InferenceError("accelerator KV mutation lock was poisoned".into())
             })?;
+            let layers = self.layers.read().map_err(|_| {
+                Error::InferenceError("accelerator KV layer map was poisoned".into())
+            })?;
+            let layer = self.layer_from(&layers, binding)?;
             let output = self.cuda_flash_paged_prefill(layer, &args, &lowered)?;
             self.last_attention_provider.store(
                 KvAttentionProvider::CudaFlashAttention.code(),
@@ -1360,11 +1507,15 @@ impl KvArena for CandleAcceleratorKvArena {
                 self.backend
             )));
         }
-        let layer = self.layer(binding)?;
-        validate_decode_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
         let _guard = self.mutation_lock.lock().map_err(|_| {
             Error::InferenceError("accelerator KV mutation lock was poisoned".into())
         })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let layer = self.layer_from(&layers, binding)?;
+        validate_decode_query(layer, &args, self.config.dtype, &self.device, self.backend)?;
 
         #[cfg(feature = "cuda")]
         if self.backend == BackendKind::Cuda {
@@ -1416,7 +1567,11 @@ impl KvArena for CandleAcceleratorKvArena {
             attention_plan_resident_bytes: self
                 .attention_plan_resident_bytes
                 .load(Ordering::Relaxed),
-            backing_allocations: Some((self.layers.len() * 2) as u64),
+            backing_allocations: self.layers.read().ok().map(|layers| {
+                (layers.len() as u64)
+                    .saturating_mul(2)
+                    .saturating_mul(self.backing_generation.load(Ordering::Relaxed))
+            }),
             workspace_bytes,
             workspace_allocations,
             last_attention_provider: KvAttentionProvider::from_code(
@@ -2051,6 +2206,7 @@ mod tests {
             group,
             page_tokens: 2,
             capacity_pages: 4,
+            growth: None,
             dtype: DType::F32,
             layers: vec![super::super::KvLayerConfig {
                 binding,
@@ -2190,6 +2346,7 @@ mod tests {
                     group,
                     page_tokens: 2,
                     capacity_pages: 4,
+                    growth: None,
                     dtype,
                     layers: vec![layer_config],
                 };
@@ -2491,6 +2648,7 @@ mod tests {
                     group,
                     page_tokens: 2,
                     capacity_pages: 4,
+                    growth: None,
                     dtype,
                     layers: vec![layer_config],
                 };
