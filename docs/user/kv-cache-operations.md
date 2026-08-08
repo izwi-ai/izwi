@@ -149,6 +149,22 @@ Eligibility is resolved for the exact dtype, page size, attention pattern, head
 geometry, offset, build, device, and model-capability route. Inspect health and
 KV operation telemetry rather than inferring provider choice from the binary.
 
+CUDA-native optimizations require no promotion flag. On a supported observed
+device the runtime automatically uses admission-grown KV slabs, resident decode
+metadata, shape/device-keyed Flash or native attention, batched page mutations,
+bounded device-side sampling, VRAM-tiered continuous batching, and stable
+one-pass decode graph buckets. A graph bucket is bound to the exact K/V and
+metadata tensor generations; arena growth creates a new generation. Capture or
+replay failure and partitioned decode use the same eager native kernel. Request
+cancellation is safe because replay mutates only graph-owned query/output
+scratch, never KV state. CPU and Metal behavior is unchanged.
+
+The source also contains authoritative FP8 E4M3 CUDA KV pages and mixed
+F16/BF16-query FP8-KV prefill/decode kernels. That path has no environment
+promotion switch. Its reviewed hardware/shape certification table is empty
+until NVIDIA numerical, quality, VRAM, and latency evidence is accepted, so all
+shipping routes continue to allocate dense KV.
+
 To force the certified Portable provider for an incident or comparison run:
 
 ```bash
@@ -213,7 +229,9 @@ fails. Do not bypass that failure with a model-local cache.
 
 ## Known unsupported or uncertified areas
 
-- Quantized `int8` and `q4` physical KV storage and attention kernels.
+- Configurable `int8` and `q4` physical KV storage and attention kernels.
+- FP8 E4M3 CUDA KV promotion; the implementation is source-complete but no
+  hardware/shape cell is certified yet, so dense KV remains authoritative.
 - Cross-namespace or cross-tenant prefix sharing.
 - Host-offloaded/tiered KV storage and distributed/multi-node cache ownership.
 - Treating native release binaries for Linux or Windows as CUDA builds; those

@@ -81,3 +81,25 @@ Missing hardware fails by default. `--allow-unsupported` is only for local
 exploration and emits an explicit unsupported certificate; hardware CI must not
 use it. The runner never downloads models and rejects remote servers unless
 `--allow-remote` is explicit.
+
+## Required NVIDIA CUDA/KV matrix
+
+Before promoting a CUDA provider or adding an FP8 cell to the source-reviewed
+certification table, retain both the KV JSONL and model evidence bundle for the
+exact Git SHA. At minimum cover:
+
+- `cuda-base`, product `cuda`/FlashAttention, and `cudnn` builds;
+- SM 8.0 and newer for graph/partition policy, plus SM 9.0 or newer for FP8;
+- F16 and BF16; page sizes 16, 32, and 64; MQA/GQA; equal 64/128/256 head
+  dimensions; ragged batches; non-zero first-page offsets; windows and softcap;
+- contexts immediately below, at, and above the 2,048-token partition boundary,
+  then the loaded model maximum and an admission-overflow rejection;
+- first eager call, graph warm/capture/replay, cancellation, arena growth, graph
+  generation invalidation, and eager recovery after an injected capture error;
+- dense-versus-FP8 logits/output quality, peak VRAM, host reads, dtype/layout
+  copies, p50/p95 prefill and decode latency, and continuous-batch throughput.
+
+Every model case must report `actual_device_kind=cuda`, strict quality success,
+no worker panic/restart/request-failure delta, and the expected observed
+provider. Compile-only CI and an `unsupported` record cannot promote a runtime
+cell.

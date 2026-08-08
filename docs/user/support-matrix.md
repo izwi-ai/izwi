@@ -178,9 +178,18 @@ buffers while the runtime orchestrates longer inputs.
 |---|---|---|
 | Dense `float16`, `bfloat16`, `float32` KV | Supported by configuration boundary | Backend/model negotiation can still reject an exact incompatible cell. |
 | `int8` / `q4` KV | Unsupported | Parsed for migration diagnostics, then rejected before model readiness. |
+| CUDA FP8 E4M3 KV | Implemented, not promoted | Device-native storage and fused attention dequantization are present, but the reviewed certification table is empty. Dense KV remains the runtime default. |
 | Prefix reuse | Opt-in | Disabled by default; requires a non-empty isolation namespace and an independently bounded page budget. |
 | Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to a certified Portable provider. |
 | Tiered/offloaded or distributed KV | Not supported | No production ownership or eviction contract is published for these modes. |
+
+Eligible CUDA routes automatically use resident block-table metadata,
+admission-grown physical backing, device/shape-keyed attention selection,
+bounded sampling readback, VRAM-tiered continuous batches, and stable one-pass
+decode graph buckets. Graph keys include exact K/V and metadata tensor
+identities, geometry, dtype, scale, and softcap. Partitioned decode, FP8
+storage, unobserved/pre-Ampere devices, and any capture/replay failure retain
+eager native decode. CPU and Metal do not enter this policy.
 
 For configuration, counters, benchmarks, and rollback, see
 [KV Cache Operations](/kv-cache-operations).
