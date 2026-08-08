@@ -227,7 +227,9 @@ impl AttentionLayer {
             .contiguous()?;
         let query_states = query_states.contiguous()?;
         let key_states = key_states.contiguous()?;
-        let (query_states, key_states) = if seq_len == 1 && query_states.device().is_metal() {
+        let (query_states, key_states) = if seq_len == 1
+            && (query_states.device().is_metal() || query_states.device().is_cuda())
+        {
             if let Some((query_states, key_states)) = try_fused_qk_rms_norm(
                 &query_states,
                 &key_states,

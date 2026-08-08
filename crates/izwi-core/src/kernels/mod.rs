@@ -119,6 +119,10 @@ pub fn try_fused_qk_rms_norm(
         return None;
     }
 
+    if q.device().is_cuda() {
+        return cuda::try_fused_qk_rms_norm(q, k, qk_weight, eps);
+    }
+
     if q.device().is_metal() {
         return metal::try_fused_qk_rms_norm(q, k, qk_weight, eps);
     }
@@ -167,6 +171,10 @@ pub fn try_fused_rope_pair_bshd(
         return None;
     }
 
+    if q.device().is_cuda() {
+        return cuda::try_fused_rope_pair_bshd(q, k, cos_sin);
+    }
+
     if q.device().is_metal() {
         return metal::try_fused_rope_pair_bshd(q, k, cos_sin);
     }
@@ -185,6 +193,18 @@ pub fn try_fused_decode_gqa_attention(
 ) -> Option<Tensor> {
     if !use_fused_kernels_for_device(q.device()) {
         return None;
+    }
+
+    if q.device().is_cuda() {
+        return cuda::try_fused_decode_gqa_attention(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        );
     }
 
     if q.device().is_metal() {
@@ -216,6 +236,19 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
         return None;
     }
 
+    if q.device().is_cuda() {
+        return cuda::try_fused_decode_gqa_attention_with_kv_len(
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+            scale,
+        );
+    }
+
     if q.device().is_metal() {
         return metal::try_fused_decode_gqa_attention_with_kv_len(
             q,
@@ -237,6 +270,10 @@ pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> 
         return None;
     }
 
+    if cache.device().is_cuda() {
+        return cuda::try_lfm_shortconv_decode3(cache, bx, conv);
+    }
+
     if cache.device().is_metal() {
         return metal::try_lfm_shortconv_decode3(cache, bx, conv);
     }
@@ -249,6 +286,10 @@ pub fn try_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> 
         return None;
     }
 
+    if cache.device().is_cuda() {
+        return cuda::try_lfm_shortconv_update3(cache, bx);
+    }
+
     if cache.device().is_metal() {
         return metal::try_lfm_shortconv_update3(cache, bx);
     }
@@ -259,6 +300,10 @@ pub fn try_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> 
 pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
     if !use_fused_kernels_for_device(bx.device()) {
         return None;
+    }
+
+    if bx.device().is_cuda() {
+        return cuda::try_lfm_shortconv_sequence3(bx, conv);
     }
 
     if bx.device().is_metal() {

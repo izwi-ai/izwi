@@ -2645,14 +2645,20 @@ fn granite_decode_gqa_kernel_enabled(device: &Device, dtype: DType, total_len: u
     let override_enabled = std::env::var("IZWI_GRANITE_DECODE_GQA_KERNEL")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    if !granite_decode_gqa_kernel_policy(device.is_metal(), override_enabled) {
+    if !granite_decode_gqa_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
         return false;
     }
-    total_len > 0 && total_len <= 2048 && matches!(dtype, DType::F16 | DType::F32)
+    total_len > 0
+        && total_len <= 2048
+        && (matches!(dtype, DType::F16 | DType::F32) || (device.is_cuda() && dtype == DType::BF16))
 }
 
-fn granite_decode_gqa_kernel_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(is_metal)
+fn granite_decode_gqa_kernel_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal || is_cuda)
 }
 
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
@@ -3779,11 +3785,12 @@ mod tests {
     }
 
     #[test]
-    fn granite_decode_gqa_kernel_defaults_to_metal_only() {
-        assert!(granite_decode_gqa_kernel_policy(true, None));
-        assert!(!granite_decode_gqa_kernel_policy(false, None));
-        assert!(granite_decode_gqa_kernel_policy(false, Some(true)));
-        assert!(!granite_decode_gqa_kernel_policy(true, Some(false)));
+    fn granite_decode_gqa_kernel_defaults_to_accelerators() {
+        assert!(granite_decode_gqa_kernel_policy(true, false, None));
+        assert!(granite_decode_gqa_kernel_policy(false, true, None));
+        assert!(!granite_decode_gqa_kernel_policy(false, false, None));
+        assert!(granite_decode_gqa_kernel_policy(false, false, Some(true)));
+        assert!(!granite_decode_gqa_kernel_policy(true, false, Some(false)));
     }
 
     #[test]

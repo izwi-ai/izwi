@@ -84,6 +84,211 @@ pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<T
     candle_nn::ops::rms_norm(input, weight, eps as f32).ok()
 }
 
+pub fn try_fused_qk_rms_norm(
+    q: &Tensor,
+    k: &Tensor,
+    qk_weight: &Tensor,
+    eps: f64,
+) -> Option<(Tensor, Tensor)> {
+    if !cuda_tensor_pair_supported(q, k) || !cuda_tensor_pair_supported(q, qk_weight) {
+        return None;
+    }
+    candle_qk_rms_norm(q, k, qk_weight, eps)
+}
+
+fn candle_qk_rms_norm(
+    q: &Tensor,
+    k: &Tensor,
+    qk_weight: &Tensor,
+    eps: f64,
+) -> Option<(Tensor, Tensor)> {
+    let (q_batch, q_sequence, _q_heads, head_dim) = q.dims4().ok()?;
+    let (k_batch, k_sequence, _k_heads, k_head_dim) = k.dims4().ok()?;
+    if q_batch != k_batch
+        || q_sequence != k_sequence
+        || head_dim == 0
+        || head_dim != k_head_dim
+        || q.dtype() != k.dtype()
+        || q.dtype() != qk_weight.dtype()
+        || q.device().location() != k.device().location()
+        || q.device().location() != qk_weight.device().location()
+        || qk_weight.dims() != [head_dim.checked_mul(2)?]
+    {
+        return None;
+    }
+    let q_weight = qk_weight.narrow(0, 0, head_dim).ok()?;
+    let k_weight = qk_weight.narrow(0, head_dim, head_dim).ok()?;
+    Some((
+        candle_nn::ops::rms_norm(q, &q_weight, eps as f32).ok()?,
+        candle_nn::ops::rms_norm(k, &k_weight, eps as f32).ok()?,
+    ))
+}
+
+pub fn try_fused_rope_pair_bshd(
+    q: &Tensor,
+    k: &Tensor,
+    cos_sin: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !cuda_tensor_pair_supported(q, k) || !cuda_tensor_pair_supported(q, cos_sin) {
+        return None;
+    }
+    candle_rope_pair_bshd(q, k, cos_sin)
+}
+
+fn candle_rope_pair_bshd(q: &Tensor, k: &Tensor, cos_sin: &Tensor) -> Option<(Tensor, Tensor)> {
+    let (q_batch, sequence, _q_heads, head_dim) = q.dims4().ok()?;
+    let (k_batch, k_sequence, _k_heads, k_head_dim) = k.dims4().ok()?;
+    if q_batch != k_batch
+        || sequence == 0
+        || sequence != k_sequence
+        || head_dim == 0
+        || head_dim % 2 != 0
+        || head_dim != k_head_dim
+        || q.dtype() != k.dtype()
+        || q.dtype() != cos_sin.dtype()
+        || q.device().location() != k.device().location()
+        || q.device().location() != cos_sin.device().location()
+        || cos_sin.dims() != [sequence, head_dim]
+    {
+        return None;
+    }
+    let half_dim = head_dim / 2;
+    let cos = cos_sin
+        .narrow(1, 0, half_dim)
+        .ok()?
+        .reshape((1, sequence, 1, half_dim))
+        .ok()?;
+    let sin = cos_sin
+        .narrow(1, half_dim, half_dim)
+        .ok()?
+        .reshape((1, sequence, 1, half_dim))
+        .ok()?;
+    let rotate = |input: &Tensor| -> Option<Tensor> {
+        let first = input.narrow(D::Minus1, 0, half_dim).ok()?;
+        let second = input.narrow(D::Minus1, half_dim, half_dim).ok()?;
+        let rotated_first = first
+            .broadcast_mul(&cos)
+            .ok()?
+            .broadcast_sub(&second.broadcast_mul(&sin).ok()?)
+            .ok()?;
+        let rotated_second = first
+            .broadcast_mul(&sin)
+            .ok()?
+            .broadcast_add(&second.broadcast_mul(&cos).ok()?)
+            .ok()?;
+        Tensor::cat(&[&rotated_first, &rotated_second], D::Minus1).ok()
+    };
+    Some((rotate(q)?, rotate(k)?))
+}
+
+pub fn try_fused_decode_gqa_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Option<Tensor> {
+    let kv_len = k.dims4().ok()?.2;
+    try_fused_decode_gqa_attention_with_kv_len(
+        q,
+        k,
+        v,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_len,
+        scale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_fused_decode_gqa_attention_with_kv_len(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(q, k) || !cuda_tensor_pair_supported(q, v) {
+        return None;
+    }
+    candle_decode_gqa_attention(q, k, v, num_heads, num_kv_heads, head_dim, kv_len, scale)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn candle_decode_gqa_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Option<Tensor> {
+    let (q_batch, q_heads, q_sequence, q_dim) = q.dims4().ok()?;
+    let (k_batch, k_heads, k_capacity, k_dim) = k.dims4().ok()?;
+    let (v_batch, v_heads, v_capacity, v_dim) = v.dims4().ok()?;
+    if q_batch != 1
+        || k_batch != 1
+        || v_batch != 1
+        || q_sequence != 1
+        || q_heads != num_heads
+        || k_heads != num_kv_heads
+        || v_heads != num_kv_heads
+        || q_dim != head_dim
+        || k_dim != head_dim
+        || v_dim != head_dim
+        || k_capacity != v_capacity
+        || kv_len == 0
+        || kv_len > k_capacity
+        || num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || !scale.is_finite()
+        || scale <= 0.0
+        || q.dtype() != k.dtype()
+        || q.dtype() != v.dtype()
+        || q.device().location() != k.device().location()
+        || q.device().location() != v.device().location()
+    {
+        return None;
+    }
+    let groups = num_heads / num_kv_heads;
+    let queries = q.reshape((num_kv_heads, groups, 1, head_dim)).ok()?;
+    let keys = k
+        .narrow(2, 0, kv_len)
+        .ok()?
+        .squeeze(0)
+        .ok()?
+        .unsqueeze(1)
+        .ok()?
+        .transpose(2, 3)
+        .ok()?;
+    let scores = (queries.broadcast_matmul(&keys).ok()? * scale as f64).ok()?;
+    let probabilities = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32).ok()?)
+        .ok()?
+        .to_dtype(q.dtype())
+        .ok()?;
+    let values = v
+        .narrow(2, 0, kv_len)
+        .ok()?
+        .squeeze(0)
+        .ok()?
+        .unsqueeze(1)
+        .ok()?;
+    probabilities
+        .broadcast_matmul(&values)
+        .ok()?
+        .reshape((1, num_heads, 1, head_dim))
+        .ok()
+}
+
 pub fn try_fused_gated_rms_norm(
     hidden: &Tensor,
     gate: &Tensor,
@@ -644,6 +849,89 @@ pub fn try_lfm_shortconv_ring_sequence(
         },
     )
     .ok()
+}
+
+pub fn try_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(cache, bx) || !cuda_tensor_pair_supported(cache, conv) {
+        return None;
+    }
+    candle_lfm_shortconv_decode3(cache, bx, conv)
+}
+
+fn candle_lfm_shortconv_decode3(cache: &Tensor, bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
+    let (batch, hidden, cache_len) = cache.dims3().ok()?;
+    let (input_batch, input_hidden, input_len) = bx.dims3().ok()?;
+    if cache_len != 3
+        || input_len != 1
+        || batch != input_batch
+        || hidden != input_hidden
+        || conv.dims() != [hidden, 3]
+        || cache.dtype() != bx.dtype()
+        || cache.dtype() != conv.dtype()
+        || cache.device().location() != bx.device().location()
+        || cache.device().location() != conv.device().location()
+    {
+        return None;
+    }
+    let state = candle_lfm_shortconv_update3(cache, bx)?;
+    state
+        .broadcast_mul(&conv.unsqueeze(0).ok()?)
+        .ok()?
+        .sum_keepdim(2)
+        .ok()
+}
+
+pub fn try_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(cache, bx) {
+        return None;
+    }
+    candle_lfm_shortconv_update3(cache, bx)
+}
+
+fn candle_lfm_shortconv_update3(cache: &Tensor, bx: &Tensor) -> Option<Tensor> {
+    let (batch, hidden, cache_len) = cache.dims3().ok()?;
+    let (input_batch, input_hidden, input_len) = bx.dims3().ok()?;
+    if cache_len != 3
+        || input_len != 1
+        || batch != input_batch
+        || hidden != input_hidden
+        || cache.dtype() != bx.dtype()
+        || cache.device().location() != bx.device().location()
+    {
+        return None;
+    }
+    Tensor::cat(&[&cache.narrow(2, 1, 2).ok()?, bx], 2).ok()
+}
+
+pub fn try_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(bx, conv) {
+        return None;
+    }
+    candle_lfm_shortconv_sequence3(bx, conv)
+}
+
+fn candle_lfm_shortconv_sequence3(bx: &Tensor, conv: &Tensor) -> Option<Tensor> {
+    let (batch, hidden, sequence) = bx.dims3().ok()?;
+    if sequence == 0
+        || conv.dims() != [hidden, 3]
+        || bx.dtype() != conv.dtype()
+        || bx.device().location() != conv.device().location()
+    {
+        return None;
+    }
+    let zeros = Tensor::zeros((batch, hidden, 2), bx.dtype(), bx.device()).ok()?;
+    let padded = Tensor::cat(&[&zeros, bx], 2).ok()?;
+    let weights = conv.reshape((1, hidden, 3, 1)).ok()?;
+    let windows = Tensor::stack(
+        &[
+            &padded.narrow(2, 0, sequence).ok()?,
+            &padded.narrow(2, 1, sequence).ok()?,
+            &padded.narrow(2, 2, sequence).ok()?,
+        ],
+        2,
+    )
+    .ok()?;
+    windows.broadcast_mul(&weights).ok()?.sum(2).ok()
 }
 
 fn cuda_tensor_supported(tensor: &Tensor) -> bool {
@@ -1479,6 +1767,81 @@ mod tests {
         .is_err());
         assert!(try_fused_rms_norm(&lhs, &rhs, 1e-6).is_none());
         assert!(try_fused_gated_rms_norm(&lhs, &rhs, &rhs, 1e-6).is_none());
+    }
+
+    #[test]
+    fn candle_cuda_fallback_primitives_match_cpu_references() {
+        let device = candle_core::Device::Cpu;
+
+        let q = Tensor::from_vec(vec![3.0f32, 4.0], (1, 1, 1, 2), &device).unwrap();
+        let k = Tensor::from_vec(vec![0.0f32, 5.0], (1, 1, 1, 2), &device).unwrap();
+        let weights = Tensor::ones(4, DType::F32, &device).unwrap();
+        let (q_norm, k_norm) = candle_qk_rms_norm(&q, &k, &weights, 0.0).unwrap();
+        let root_two = 2.0f32.sqrt();
+        let q_actual = q_norm.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let k_actual = k_norm.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (actual, expected) in q_actual
+            .iter()
+            .zip([3.0 * root_two / 5.0, 4.0 * root_two / 5.0])
+        {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+        for (actual, expected) in k_actual.iter().zip([0.0, root_two]) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+
+        let rope_input =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 1, 1, 4), &device).unwrap();
+        let cos_sin = Tensor::from_vec(vec![0.0f32, 0.0, 1.0, 1.0], (1, 4), &device).unwrap();
+        let (q_rope, k_rope) = candle_rope_pair_bshd(&rope_input, &rope_input, &cos_sin).unwrap();
+        let expected_rope = vec![-3.0f32, -4.0, 1.0, 2.0];
+        assert_eq!(
+            q_rope.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected_rope
+        );
+        assert_eq!(
+            k_rope.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected_rope
+        );
+
+        let bx = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 1, 3), &device).unwrap();
+        let conv = Tensor::from_vec(vec![1.0f32, 10.0, 100.0], (1, 3), &device).unwrap();
+        let sequence = candle_lfm_shortconv_sequence3(&bx, &conv).unwrap();
+        assert_eq!(
+            sequence.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![100.0, 210.0, 321.0]
+        );
+        let cache = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 1, 3), &device).unwrap();
+        let next = Tensor::from_vec(vec![4.0f32], (1, 1, 1), &device).unwrap();
+        let decode = candle_lfm_shortconv_decode3(&cache, &next, &conv).unwrap();
+        assert_eq!(
+            decode.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![432.0]
+        );
+    }
+
+    #[test]
+    fn candle_cuda_gqa_fallback_preserves_grouped_query_semantics() {
+        let device = candle_core::Device::Cpu;
+        let q = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (1, 2, 1, 2), &device).unwrap();
+        let k = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (1, 1, 2, 2), &device).unwrap();
+        let v = Tensor::from_vec(vec![2.0f32, 4.0, 6.0, 8.0], (1, 1, 2, 2), &device).unwrap();
+        let output = candle_decode_gqa_attention(&q, &k, &v, 2, 1, 2, 2, 1.0).unwrap();
+        let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let high = std::f32::consts::E / (std::f32::consts::E + 1.0);
+        let low = 1.0 / (std::f32::consts::E + 1.0);
+        let expected = [
+            high * 2.0 + low * 6.0,
+            high * 4.0 + low * 8.0,
+            low * 2.0 + high * 6.0,
+            low * 4.0 + high * 8.0,
+        ];
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "GQA mismatch at {index}: {actual} != {expected}"
+            );
+        }
     }
 
     #[test]

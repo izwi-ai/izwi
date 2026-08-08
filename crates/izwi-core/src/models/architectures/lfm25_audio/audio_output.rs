@@ -694,7 +694,7 @@ impl DepthAttention {
             .contiguous()?;
 
         // norm on last dim (head_dim), then RoPE
-        let (q, k) = if seq_len == 1 && q.device().is_metal() {
+        let (q, k) = if seq_len == 1 && (q.device().is_metal() || q.device().is_cuda()) {
             if let Some((q, k)) =
                 try_fused_qk_rms_norm(&q, &k, &self.qk_norm_weight, self.q_norm.eps())
             {

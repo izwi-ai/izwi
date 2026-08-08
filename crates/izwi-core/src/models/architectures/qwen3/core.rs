@@ -712,11 +712,15 @@ fn qwen3_qk_rms_norm_fusion_enabled(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_QWEN3_QK_RMS_NORM_FUSION")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    qwen3_qk_rms_norm_fusion_policy(device.is_metal(), override_enabled)
+    qwen3_qk_rms_norm_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
-fn qwen3_qk_rms_norm_fusion_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(is_metal)
+fn qwen3_qk_rms_norm_fusion_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    override_enabled.unwrap_or(is_metal || is_cuda)
 }
 
 fn qwen3_quantized_projection_grouping_enabled(device: &Device, cfg: &Qwen3Config) -> bool {
@@ -4025,11 +4029,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_qk_rms_norm_fusion_defaults_to_metal_only() {
-        assert!(qwen3_qk_rms_norm_fusion_policy(true, None));
-        assert!(!qwen3_qk_rms_norm_fusion_policy(false, None));
-        assert!(qwen3_qk_rms_norm_fusion_policy(false, Some(true)));
-        assert!(!qwen3_qk_rms_norm_fusion_policy(true, Some(false)));
+    fn qwen3_qk_rms_norm_fusion_defaults_to_accelerators() {
+        assert!(qwen3_qk_rms_norm_fusion_policy(true, false, None));
+        assert!(qwen3_qk_rms_norm_fusion_policy(false, true, None));
+        assert!(!qwen3_qk_rms_norm_fusion_policy(false, false, None));
+        assert!(qwen3_qk_rms_norm_fusion_policy(false, false, Some(true)));
+        assert!(!qwen3_qk_rms_norm_fusion_policy(true, false, Some(false)));
     }
 
     #[test]
