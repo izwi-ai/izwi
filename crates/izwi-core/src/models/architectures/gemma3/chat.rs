@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::gemma3::Config as Gemma3Config;
 use serde_json::Value;
@@ -857,20 +857,26 @@ fn strip_unused_placeholders(input: &str) -> String {
 }
 
 fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
-    let values = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let capped = vocab_limit.min(values.len());
+    let capped = vocab_limit.min(logits.dim(0)?);
     if capped == 0 {
         return Err(Error::InferenceError(
             "No valid logits in constrained vocabulary".to_string(),
         ));
     }
-    let (idx, _) = values
-        .iter()
-        .take(capped)
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .ok_or_else(|| Error::InferenceError("Empty logits".to_string()))?;
-    Ok(idx as u32)
+    let logits = if capped < logits.dim(0)? {
+        logits.narrow(0, 0, capped)?
+    } else {
+        logits.clone()
+    };
+    let idx = logits.argmax(D::Minus1)?;
+    let idx = if idx.rank() == 0 {
+        idx
+    } else {
+        idx.squeeze(0)?
+    };
+    idx.to_dtype(DType::U32)?
+        .to_scalar::<u32>()
+        .map_err(Error::from)
 }
 
 fn select_next_token(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
@@ -909,9 +915,9 @@ fn text_delta(previous: &str, current: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_gemma3_dense_dtype, strip_unused_placeholders};
+    use super::{argmax, select_gemma3_dense_dtype, select_next_token, strip_unused_placeholders};
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn strip_unused_placeholders_removes_marker_tokens() {
@@ -944,5 +950,34 @@ mod tests {
             select_gemma3_dense_dtype(&profile, Some(DType::F32)),
             DType::F32
         );
+    }
+
+    #[test]
+    fn gemma3_argmax_stays_inside_the_constrained_vocabulary() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, 0.8, 0.4, 10.0], (4,), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        assert_eq!(argmax(&logits, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn gemma3_selects_from_the_last_sequence_position() {
+        let device = Device::Cpu;
+        let logits =
+            Tensor::from_vec(vec![0.9f32, 0.1, 0.0, -0.2, 0.4, 0.7], (2, 3), &device).unwrap();
+
+        assert_eq!(select_next_token(&logits, 3).unwrap(), 2);
+    }
+
+    #[test]
+    fn gemma3_argmax_rejects_an_empty_vocabulary() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, 0.2], (2,), &device).unwrap();
+        let err = argmax(&logits, 0).expect_err("zero vocabulary should be rejected");
+
+        assert!(format!("{err}").contains("No valid logits"));
     }
 }
