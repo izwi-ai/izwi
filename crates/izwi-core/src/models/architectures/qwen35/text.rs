@@ -1707,7 +1707,28 @@ fn qwen35_tiled_recurrence_enabled() -> bool {
 }
 
 fn qwen35_rope_kernel_enabled(device: &Device) -> bool {
-    device.is_metal() && qwen35_env_bool("IZWI_QWEN35_ROPE_KERNEL", true)
+    let override_enabled = std::env::var("IZWI_QWEN35_ROPE_KERNEL")
+        .ok()
+        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        });
+    qwen35_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
+}
+
+fn qwen35_rope_kernel_policy(
+    is_metal: bool,
+    is_cuda: bool,
+    override_enabled: Option<bool>,
+) -> bool {
+    if is_metal {
+        return override_enabled.unwrap_or(true);
+    }
+    if is_cuda {
+        return override_enabled.unwrap_or(false);
+    }
+    false
 }
 
 fn qwen35_tiled_recurrence_tile_size_override() -> Option<usize> {
@@ -1811,8 +1832,8 @@ fn recurrent_gated_delta(
 mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
-        recurrent_domain_v2, repeat_head_states, repeat_head_states_seq, softplus, ConvRingState,
-        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
+        softplus, ConvRingState, Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2106,6 +2127,15 @@ mod tests {
         for (manual, kernel) in manual_vals.iter().zip(kernel_vals.iter()) {
             assert!((manual - kernel).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn qwen35_cuda_rope_kernel_is_explicit_and_default_off() {
+        assert!(qwen35_rope_kernel_policy(true, false, None));
+        assert!(!qwen35_rope_kernel_policy(false, true, None));
+        assert!(qwen35_rope_kernel_policy(false, true, Some(true)));
+        assert!(!qwen35_rope_kernel_policy(true, false, Some(false)));
+        assert!(!qwen35_rope_kernel_policy(false, false, Some(true)));
     }
 
     fn synthetic_decode_state(

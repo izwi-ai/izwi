@@ -3300,7 +3300,20 @@ fn qwen3_env_bool(name: &str, default: bool) -> bool {
 }
 
 fn qwen3_rope_kernel_enabled(device: &Device) -> bool {
-    device.is_metal() && qwen3_env_bool("IZWI_QWEN3_ROPE_KERNEL", true)
+    let override_enabled = std::env::var("IZWI_QWEN3_ROPE_KERNEL")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw));
+    qwen3_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
+}
+
+fn qwen3_rope_kernel_policy(is_metal: bool, is_cuda: bool, override_enabled: Option<bool>) -> bool {
+    if is_metal {
+        return override_enabled.unwrap_or(true);
+    }
+    if is_cuda {
+        return override_enabled.unwrap_or(false);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -4085,6 +4098,15 @@ mod tests {
         for (lhs, rhs) in kernel_vals.iter().zip(manual_vals.iter()) {
             assert!((lhs - rhs).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn qwen3_cuda_rope_kernel_is_explicit_and_default_off() {
+        assert!(qwen3_rope_kernel_policy(true, false, None));
+        assert!(!qwen3_rope_kernel_policy(false, true, None));
+        assert!(qwen3_rope_kernel_policy(false, true, Some(true)));
+        assert!(!qwen3_rope_kernel_policy(true, false, Some(false)));
+        assert!(!qwen3_rope_kernel_policy(false, false, Some(true)));
     }
 
     #[test]
