@@ -99,6 +99,13 @@ jobs:
 
       - name: Run strict CUDA model evidence
         run: |
+          scripts/bench/run-cuda-model-load-evidence.sh \
+            --manifest benchmarks/manifests/cuda-family-load.txt \
+            --server http://127.0.0.1:18082 \
+            --output target/cuda-model-evidence/loads
+
+      - name: Run strict CUDA model inference evidence
+        run: |
           scripts/bench/run-cuda-model-evidence.sh \
             --manifest "${IZWI_CUDA_CERT_MANIFEST}" \
             --server http://127.0.0.1:18082 \

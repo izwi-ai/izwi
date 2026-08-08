@@ -402,6 +402,7 @@ run_hygiene() {
     bash -n scripts/ci/*.sh scripts/bench/*.sh
     scripts/bench/test-run-kv-cache-matrix.sh
     scripts/bench/test-run-cuda-model-evidence.sh
+    scripts/bench/test-run-cuda-model-load-evidence.sh
 }
 
 run_cargo_cuda_compile() {

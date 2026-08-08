@@ -92,6 +92,12 @@ The protected workflow runs this stricter check separately from broad family
 coverage so generic Candle CUDA execution is not mislabeled as an optimized
 custom kernel.
 
+The same workflow first runs `run-cuda-model-load-evidence.sh` against one
+representative from every registered implementation family. This closes the
+load-only coverage gap for forced alignment, diarization, and the standalone
+speech tokenizer while keeping their evidence distinct from inference and
+kernel certification.
+
 ## Required NVIDIA CUDA/KV matrix
 
 Before promoting a CUDA provider, retain both the KV JSONL and model evidence bundle for the
