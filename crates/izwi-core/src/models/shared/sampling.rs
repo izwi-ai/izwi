@@ -4,7 +4,8 @@
 //! fixed-size chunks and recursively merges their exact top-k candidates, so a
 //! large vocabulary never becomes one oversized CUDA sort or a full host copy.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, VecDeque};
 
 use candle_core::{DType, Device, Tensor, D};
 
@@ -12,7 +13,70 @@ use crate::{Error, Result};
 
 const CUDA_SORT_CHUNK: usize = 1024;
 const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
+const CUDA_SAMPLING_TENSOR_CACHE_ENTRIES: usize = 8;
 pub const CUDA_SAMPLING_CANDIDATE_LIMIT: usize = 256;
+
+#[derive(Clone)]
+enum SamplingTensorCacheInput {
+    Mask(Vec<u8>),
+    Indices(Vec<u32>),
+}
+
+struct SamplingTensorCacheEntry {
+    device: candle_core::DeviceLocation,
+    input: SamplingTensorCacheInput,
+    tensor: Tensor,
+}
+
+thread_local! {
+    static CUDA_SAMPLING_TENSOR_CACHE: RefCell<VecDeque<SamplingTensorCacheEntry>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
+fn cached_sampling_tensor(device: &Device, input: SamplingTensorCacheInput) -> Result<Tensor> {
+    CUDA_SAMPLING_TENSOR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let location = device.location();
+        if let Some(index) = cache.iter().position(|entry| {
+            entry.device == location
+                && match (&entry.input, &input) {
+                    (
+                        SamplingTensorCacheInput::Mask(left),
+                        SamplingTensorCacheInput::Mask(right),
+                    ) => left == right,
+                    (
+                        SamplingTensorCacheInput::Indices(left),
+                        SamplingTensorCacheInput::Indices(right),
+                    ) => left == right,
+                    _ => false,
+                }
+        }) {
+            let entry = cache
+                .remove(index)
+                .expect("located CUDA sampling tensor cache entry");
+            let tensor = entry.tensor.clone();
+            cache.push_back(entry);
+            return Ok(tensor);
+        }
+        let tensor = match &input {
+            SamplingTensorCacheInput::Mask(values) => {
+                Tensor::from_vec(values.clone(), values.len(), device)?
+            }
+            SamplingTensorCacheInput::Indices(values) => {
+                Tensor::from_vec(values.clone(), values.len(), device)?
+            }
+        };
+        if cache.len() == CUDA_SAMPLING_TENSOR_CACHE_ENTRIES {
+            cache.pop_front();
+        }
+        cache.push_back(SamplingTensorCacheEntry {
+            device: location,
+            input,
+            tensor: tensor.clone(),
+        });
+        Ok(tensor)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct DeviceSamplingCandidates {
@@ -125,13 +189,14 @@ pub fn bounded_cuda_sampling_candidates(
     let mut adjusted = row.narrow(0, 0, vocab)?.to_dtype(DType::F32)?;
     adjusted = sanitize_finite(&adjusted)?;
     if let Some(mask) = allowed_mask {
-        let mask = Tensor::from_vec(
-            mask[..vocab]
-                .iter()
-                .map(|allowed| u8::from(*allowed))
-                .collect::<Vec<_>>(),
-            vocab,
+        let mask = cached_sampling_tensor(
             adjusted.device(),
+            SamplingTensorCacheInput::Mask(
+                mask[..vocab]
+                    .iter()
+                    .map(|allowed| u8::from(*allowed))
+                    .collect(),
+            ),
         )?;
         let negative = negative_infinity(adjusted.device())?.broadcast_as(adjusted.shape())?;
         adjusted = mask.where_cond(&adjusted, &negative)?;
@@ -241,8 +306,8 @@ fn apply_history_penalties(
     if indices.is_empty() {
         return Ok(values.clone());
     }
-    let index_count = indices.len();
-    let indices = Tensor::from_vec(indices, index_count, values.device())?;
+    let indices =
+        cached_sampling_tensor(values.device(), SamplingTensorCacheInput::Indices(indices))?;
     let mut replacements = values.index_select(&indices, 0)?;
     if repetition_penalty > 1.0 {
         let positive = replacements.gt(0.0f64)?;
@@ -367,5 +432,20 @@ mod tests {
         assert_eq!(indices, vec![7, 1027]);
         assert_eq!(logsumexp, Some(5.25));
         assert!(unpack_sampling_readback(&[1.0], 2, false).is_err());
+    }
+
+    #[test]
+    fn sampling_tensor_cache_reuses_equal_masks_and_histories() {
+        CUDA_SAMPLING_TENSOR_CACHE.with(|cache| cache.borrow_mut().clear());
+        let device = Device::Cpu;
+        let first =
+            cached_sampling_tensor(&device, SamplingTensorCacheInput::Mask(vec![1, 0, 1])).unwrap();
+        let second =
+            cached_sampling_tensor(&device, SamplingTensorCacheInput::Mask(vec![1, 0, 1])).unwrap();
+        assert_eq!(first.id(), second.id());
+        let indices =
+            cached_sampling_tensor(&device, SamplingTensorCacheInput::Indices(vec![3, 7])).unwrap();
+        assert_eq!(indices.to_vec1::<u32>().unwrap(), vec![3, 7]);
+        CUDA_SAMPLING_TENSOR_CACHE.with(|cache| assert_eq!(cache.borrow().len(), 2));
     }
 }
