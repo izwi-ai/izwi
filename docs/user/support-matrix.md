@@ -131,6 +131,41 @@ hardware performance certification. The exact model revision, capability,
 backend, dtype, page geometry, attention semantics, and build feature cell must
 pass its release lane.
 
+### CUDA context policy
+
+CUDA uses the native context reported by the loaded chat checkpoint. CPU and
+Metal retain the configured sequence limit (4,096 tokens by default). The
+current native CUDA ceilings are:
+
+| Model | CUDA ceiling | Source |
+|---|---:|---|
+| Qwen3 chat | 40,960 tokens | [Official Qwen3 config](https://huggingface.co/Qwen/Qwen3-4B/blob/main/config.json) |
+| Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
+| LFM2.5 chat | 128,000 tokens | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
+| Gemma 3 1B / 4B | 32,768 / 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
+
+Optional YaRN extensions are not included: the local adapters do not implement
+their scaling parameters. CUDA reserves enough paged KV capacity for the
+largest native context before publishing a model as ready. This can require
+substantial VRAM and may make model loading fail on a smaller GPU rather than
+silently reducing the context.
+
+For audio generation, automatic output budgets remain bounded. Explicit CUDA
+requests can use the 32,768-token LFM2.5 Audio and Fish S2 contexts; Voxtral TTS
+accepts the upstream deployment ceiling of 2,048 output frames. CPU and Metal
+retain their existing limits. VibeVoice ASR uses its documented 60-minute
+single-pass window on CUDA by default; `IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS`
+can lower that window but cannot raise it above 60 minutes. See the
+[LFM2.5 Audio model card](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B),
+[Fish S2 config](https://huggingface.co/fishaudio/s2-pro/blob/main/config.json),
+[Voxtral deployment](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/voxtral_tts.yaml),
+and [VibeVoice ASR model card](https://huggingface.co/microsoft/VibeVoice-ASR).
+
+Architectural processing windows are not expanded. Whisper still processes
+30-second encoder windows, Kokoro still uses at most 510 phonemes per model
+chunk, and streaming ASR/diarization families retain their bounded working
+buffers while the runtime orchestrates longer inputs.
+
 ### Cache policy support
 
 | Policy | Status | Notes |

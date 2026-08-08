@@ -35,7 +35,6 @@ use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
-const DEFAULT_CUDA_MAX_AUDIO_SECONDS: f32 = 2.0 * 60.0;
 const CUDA_MAX_AUDIO_SECONDS_ENV: &str = "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS";
 const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
 
@@ -1098,7 +1097,8 @@ fn vibevoice_asr_max_audio_seconds_hint_for(
 
     cuda_override
         .and_then(parse_positive_finite_f32)
-        .unwrap_or(DEFAULT_CUDA_MAX_AUDIO_SECONDS)
+        .unwrap_or(DEFAULT_MAX_AUDIO_SECONDS)
+        .min(DEFAULT_MAX_AUDIO_SECONDS)
 }
 
 fn parse_positive_finite_f32(raw: &str) -> Option<f32> {
@@ -1188,10 +1188,10 @@ mod tests {
     }
 
     #[test]
-    fn max_audio_seconds_hint_limits_cuda_window_by_default() {
+    fn max_audio_seconds_hint_uses_full_cuda_window_by_default() {
         assert_eq!(
             vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, None),
-            DEFAULT_CUDA_MAX_AUDIO_SECONDS
+            DEFAULT_MAX_AUDIO_SECONDS
         );
     }
 
@@ -1208,9 +1208,17 @@ mod tests {
         for raw in ["", "0", "-1", "nan", "inf", "not-a-number"] {
             assert_eq!(
                 vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, Some(raw)),
-                DEFAULT_CUDA_MAX_AUDIO_SECONDS
+                DEFAULT_MAX_AUDIO_SECONDS
             );
         }
+    }
+
+    #[test]
+    fn max_audio_seconds_hint_caps_cuda_override_to_model_window() {
+        assert_eq!(
+            vibevoice_asr_max_audio_seconds_hint_for(DeviceKind::Cuda, Some("7200")),
+            DEFAULT_MAX_AUDIO_SECONDS
+        );
     }
 
     #[test]
