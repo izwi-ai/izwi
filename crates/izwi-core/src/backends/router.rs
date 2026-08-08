@@ -5,6 +5,10 @@ use crate::kernels::cuda;
 use crate::models::shared::attention::flash::cuda_flash_attention_capabilities;
 
 use super::capabilities::BackendCapabilities;
+use super::cuda_plan::{
+    evaluate_cuda_plan_eligibility, resolve_cuda_execution_plan, CudaExecutionPlan,
+    CudaRuntimeObservation,
+};
 use super::device::{DeviceProfile, DeviceSelector};
 use super::types::{BackendContext, BackendPreference, BackendSelectionSource, ExecutionBackend};
 
@@ -134,6 +138,23 @@ impl BackendRouter {
         self.context.execution_backend
     }
 
+    pub fn cuda_execution_plan(&self, variant: ModelVariant) -> CudaExecutionPlan {
+        let eligibility =
+            evaluate_cuda_plan_eligibility(variant.cuda_support(), variant.cuda_quantization());
+        let device = &self.context.device;
+        resolve_cuda_execution_plan(
+            eligibility,
+            CudaRuntimeObservation {
+                cuda_compiled: self.context.capabilities.cuda_compiled,
+                cuda_backend_selected: self.context.execution_backend
+                    == ExecutionBackend::CandleCuda,
+                cuda_device_observed: device.device.is_cuda(),
+                device_name: device.capabilities.cuda_device_name.clone(),
+                compute_capability: device.capabilities.cuda_compute_capability,
+            },
+        )
+    }
+
     pub fn select(&self, variant: ModelVariant) -> BackendPlan {
         let default_desc = match self.context.execution_backend {
             ExecutionBackend::CandleMetal => "Metal backend",
@@ -142,8 +163,13 @@ impl BackendRouter {
         };
         let cuda_support = variant.cuda_support();
         let cuda_quantization = variant.cuda_quantization();
-        let diagnostics =
-            self.cuda_diagnostics_for_selection(variant, cuda_support, cuda_quantization);
+        let cuda_execution_plan = self.cuda_execution_plan(variant);
+        let diagnostics = self.cuda_diagnostics_for_selection(
+            variant,
+            cuda_support,
+            cuda_quantization,
+            &cuda_execution_plan,
+        );
 
         match variant.backend_hint() {
             InferenceBackendHint::CandleNative => BackendPlan {
@@ -168,6 +194,7 @@ impl BackendRouter {
         variant: ModelVariant,
         cuda_support: CudaSupportInfo,
         cuda_quantization: CudaQuantizationInfo,
+        cuda_execution_plan: &CudaExecutionPlan,
     ) -> Vec<String> {
         if self.context.execution_backend != ExecutionBackend::CandleCuda {
             return Vec::new();
@@ -183,6 +210,19 @@ impl BackendRouter {
                 "unavailable"
             },
             kernel_status.reason
+        ));
+        diagnostics.push(format!(
+            "CUDA runtime plan for {} is eligible={}, executable={}, catalog_blocker={}, runtime_blocker={}",
+            variant.dir_name(),
+            cuda_execution_plan.eligibility.eligible,
+            cuda_execution_plan.executable,
+            cuda_execution_plan
+                .eligibility
+                .blocker
+                .map_or("none", |blocker| blocker.as_str()),
+            cuda_execution_plan
+                .runtime_blocker
+                .map_or("none", |blocker| blocker.as_str())
         ));
 
         let flash = cuda_flash_attention_capabilities();
@@ -408,6 +448,46 @@ mod tests {
             plan.reason.contains("dense dequantized fallback"),
             "reason should carry CUDA quantization diagnostics: {}",
             plan.reason
+        );
+    }
+
+    #[test]
+    fn synthetic_cuda_kind_does_not_count_as_an_observed_cuda_device() {
+        let context = BackendContext::new(
+            BackendPreference::Cuda,
+            BackendSelectionSource::Config,
+            BackendCapabilities {
+                cpu_compiled: true,
+                metal_compiled: false,
+                cuda_compiled: true,
+            },
+            DeviceProfile {
+                device: candle_core::Device::Cpu,
+                kind: crate::backends::DeviceKind::Cuda,
+                capabilities: crate::backends::DeviceCapabilities {
+                    cuda_device_name: Some("synthetic gpu".to_string()),
+                    cuda_compute_capability: Some((8, 0)),
+                    ..Default::default()
+                },
+                memory_pool: None,
+            },
+            "Synthetic CUDA profile",
+        );
+        let router = BackendRouter::from_context(context);
+        let plan = router.cuda_execution_plan(ModelVariant::Qwen34BGguf);
+
+        assert!(plan.eligibility.eligible);
+        assert!(!plan.executable);
+        assert!(!plan.cuda_device_observed);
+        assert_eq!(plan.device_name, None);
+        assert_eq!(plan.compute_capability, None);
+        assert_eq!(
+            plan.runtime_blocker,
+            Some(crate::backends::CudaPlanBlocker::CudaDeviceNotObserved)
+        );
+        assert_eq!(
+            plan.eligibility.evidence,
+            crate::catalog::CudaEvidenceLevel::SourceReviewed
         );
     }
 }
