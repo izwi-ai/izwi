@@ -221,6 +221,8 @@ struct KernelPathTelemetrySnapshot {
     #[serde(default)]
     fused_attention_fallback_flash_dtype_mismatch_total: u64,
     #[serde(default)]
+    fused_attention_fallback_flash_compute_capability_unsupported_total: u64,
+    #[serde(default)]
     fused_attention_fallback_flash_runtime_error_total: u64,
     #[serde(default)]
     fused_attention_fallback_metal_sdpa_runtime_error_total: u64,

@@ -37,6 +37,7 @@ pub struct KernelPathTelemetrySnapshot {
     pub fused_attention_fallback_flash_mask_unsupported_total: u64,
     pub fused_attention_fallback_flash_dtype_unsupported_total: u64,
     pub fused_attention_fallback_flash_dtype_mismatch_total: u64,
+    pub fused_attention_fallback_flash_compute_capability_unsupported_total: u64,
     pub fused_attention_fallback_flash_runtime_error_total: u64,
     pub fused_attention_fallback_metal_sdpa_runtime_error_total: u64,
     pub fused_attention_fallback_metal_sdpa_mask_policy_disabled_total: u64,
@@ -58,6 +59,7 @@ pub enum AttentionFallbackReason {
     FlashMaskUnsupported,
     FlashDTypeUnsupported,
     FlashDTypeMismatch,
+    FlashComputeCapabilityUnsupported,
     FlashRuntimeError,
     MetalSdpaRuntimeError,
     MetalSdpaMaskPolicyDisabled,
@@ -74,6 +76,7 @@ impl AttentionFallbackReason {
             Self::FlashMaskUnsupported => "flash_mask_unsupported",
             Self::FlashDTypeUnsupported => "flash_dtype_unsupported",
             Self::FlashDTypeMismatch => "flash_dtype_mismatch",
+            Self::FlashComputeCapabilityUnsupported => "flash_compute_capability_unsupported",
             Self::FlashRuntimeError => "flash_runtime_error",
             Self::MetalSdpaRuntimeError => "metal_sdpa_runtime_error",
             Self::MetalSdpaMaskPolicyDisabled => "metal_sdpa_mask_policy_disabled",
@@ -115,6 +118,8 @@ static FUSED_ATTN_FALLBACK_FLASH_NOT_COMPILED_TOTAL: AtomicU64 = AtomicU64::new(
 static FUSED_ATTN_FALLBACK_FLASH_MASK_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_FLASH_DTYPE_UNSUPPORTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_FLASH_DTYPE_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FUSED_ATTN_FALLBACK_FLASH_COMPUTE_CAPABILITY_UNSUPPORTED_TOTAL: AtomicU64 =
+    AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_FLASH_RUNTIME_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_METAL_SDPA_RUNTIME_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_POLICY_DISABLED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -220,6 +225,10 @@ pub fn record_fused_attention_fallback(reason: AttentionFallbackReason) {
         AttentionFallbackReason::FlashDTypeMismatch => {
             FUSED_ATTN_FALLBACK_FLASH_DTYPE_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
+        AttentionFallbackReason::FlashComputeCapabilityUnsupported => {
+            FUSED_ATTN_FALLBACK_FLASH_COMPUTE_CAPABILITY_UNSUPPORTED_TOTAL
+                .fetch_add(1, Ordering::Relaxed);
+        }
         AttentionFallbackReason::FlashRuntimeError => {
             FUSED_ATTN_FALLBACK_FLASH_RUNTIME_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
@@ -286,6 +295,8 @@ pub fn snapshot() -> KernelPathTelemetrySnapshot {
             FUSED_ATTN_FALLBACK_FLASH_DTYPE_UNSUPPORTED_TOTAL.load(Ordering::Relaxed),
         fused_attention_fallback_flash_dtype_mismatch_total:
             FUSED_ATTN_FALLBACK_FLASH_DTYPE_MISMATCH_TOTAL.load(Ordering::Relaxed),
+        fused_attention_fallback_flash_compute_capability_unsupported_total:
+            FUSED_ATTN_FALLBACK_FLASH_COMPUTE_CAPABILITY_UNSUPPORTED_TOTAL.load(Ordering::Relaxed),
         fused_attention_fallback_flash_runtime_error_total:
             FUSED_ATTN_FALLBACK_FLASH_RUNTIME_ERROR_TOTAL.load(Ordering::Relaxed),
         fused_attention_fallback_metal_sdpa_runtime_error_total:
@@ -309,6 +320,7 @@ pub fn prometheus() -> String {
         AttentionFallbackReason::FlashMaskUnsupported,
         AttentionFallbackReason::FlashDTypeUnsupported,
         AttentionFallbackReason::FlashDTypeMismatch,
+        AttentionFallbackReason::FlashComputeCapabilityUnsupported,
         AttentionFallbackReason::FlashRuntimeError,
         AttentionFallbackReason::MetalSdpaRuntimeError,
         AttentionFallbackReason::MetalSdpaMaskPolicyDisabled,
@@ -395,6 +407,9 @@ fn fallback_total_for_reason(reason: AttentionFallbackReason) -> u64 {
         AttentionFallbackReason::FlashDTypeMismatch => {
             FUSED_ATTN_FALLBACK_FLASH_DTYPE_MISMATCH_TOTAL.load(Ordering::Relaxed)
         }
+        AttentionFallbackReason::FlashComputeCapabilityUnsupported => {
+            FUSED_ATTN_FALLBACK_FLASH_COMPUTE_CAPABILITY_UNSUPPORTED_TOTAL.load(Ordering::Relaxed)
+        }
         AttentionFallbackReason::FlashRuntimeError => {
             FUSED_ATTN_FALLBACK_FLASH_RUNTIME_ERROR_TOTAL.load(Ordering::Relaxed)
         }
@@ -447,6 +462,7 @@ pub fn reset_for_tests() {
         &FUSED_ATTN_FALLBACK_FLASH_MASK_UNSUPPORTED_TOTAL,
         &FUSED_ATTN_FALLBACK_FLASH_DTYPE_UNSUPPORTED_TOTAL,
         &FUSED_ATTN_FALLBACK_FLASH_DTYPE_MISMATCH_TOTAL,
+        &FUSED_ATTN_FALLBACK_FLASH_COMPUTE_CAPABILITY_UNSUPPORTED_TOTAL,
         &FUSED_ATTN_FALLBACK_FLASH_RUNTIME_ERROR_TOTAL,
         &FUSED_ATTN_FALLBACK_METAL_SDPA_RUNTIME_ERROR_TOTAL,
         &FUSED_ATTN_FALLBACK_METAL_SDPA_MASK_POLICY_DISABLED_TOTAL,
