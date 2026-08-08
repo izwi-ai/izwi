@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/backend-truth.yml"
       - ".github/workflows/cuda-flash-attn.yml"
+      - ".github/workflows/cuda-model-evidence.yml"
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -21,6 +22,7 @@ on:
     paths:
       - ".github/workflows/backend-truth.yml"
       - ".github/workflows/cuda-flash-attn.yml"
+      - ".github/workflows/cuda-model-evidence.yml"
       - ".github/workflows/release.yml"
       - "Cargo.toml"
       - "Cargo.lock"

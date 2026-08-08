@@ -1,0 +1,105 @@
+name: CUDA Model Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: Strict benchmark manifest to certify
+        required: true
+        default: benchmarks/manifests/vibevoice-cuda.toml
+        type: string
+  schedule:
+    - cron: "41 3 * * 1"
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/cuda-model-evidence.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "benchmarks/manifests/**"
+      - "scripts/bench/run-cuda-model-evidence.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-model-evidence
+  cancel-in-progress: false
+
+jobs:
+  certify-models:
+    name: CUDA Model Runtime Evidence
+    runs-on: [self-hosted, linux, x64, nvidia]
+    environment: cuda-certification
+    timeout-minutes: 240
+    env:
+      CUDA_COMPUTE_CAP: "80"
+      IZWI_CUDA_FEATURES: "cuda,cudnn"
+      IZWI_CUDA_CERT_MODELS_DIR: ${{ vars.IZWI_CUDA_CERT_MODELS_DIR }}
+      IZWI_CUDA_CERT_MANIFEST: ${{ inputs.manifest || 'benchmarks/manifests/vibevoice-cuda.toml' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Require preprovisioned model storage
+        run: |
+          if [[ -z "${IZWI_CUDA_CERT_MODELS_DIR}" || ! -d "${IZWI_CUDA_CERT_MODELS_DIR}" ]]; then
+            echo "IZWI_CUDA_CERT_MODELS_DIR must name preprovisioned model storage" >&2
+            exit 1
+          fi
+
+      - name: Build the checked-out CUDA server and CLI
+        run: |
+          cargo build --locked --release -p izwi-server --features "${IZWI_CUDA_FEATURES}"
+          cargo build --locked --release -p izwi-cli --features "${IZWI_CUDA_FEATURES}"
+
+      - name: Start the checked-out CUDA server
+        run: |
+          mkdir -p target/cuda-model-evidence
+          IZWI_MODELS_DIR="${IZWI_CUDA_CERT_MODELS_DIR}" \
+          IZWI_PRELOAD_MODELS= \
+          IZWI_WARMUP_PRELOADED_MODELS=0 \
+          target/release/izwi-server \
+            --host 127.0.0.1 \
+            --port 18082 \
+            --backend cuda \
+            >target/cuda-model-evidence/server.log 2>&1 &
+          echo "$!" >target/cuda-model-evidence/server.pid
+          for _ in {1..120}; do
+            if curl -fsS http://127.0.0.1:18082/v1/health >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "CUDA server did not become healthy; evidence runner will record the failure" >&2
+
+      - name: Run strict CUDA model evidence
+        run: |
+          scripts/bench/run-cuda-model-evidence.sh \
+            --manifest "${IZWI_CUDA_CERT_MANIFEST}" \
+            --server http://127.0.0.1:18082 \
+            --izwi-bin target/release/izwi \
+            --output target/cuda-model-evidence
+
+      - name: Stop CUDA server
+        if: always()
+        run: |
+          if [[ -f target/cuda-model-evidence/server.pid ]]; then
+            kill "$(cat target/cuda-model-evidence/server.pid)" >/dev/null 2>&1 || true
+          fi
+
+      - name: Retain CUDA model evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-model-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/cuda-model-evidence
+          if-no-files-found: error
+          retention-days: 90

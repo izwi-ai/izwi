@@ -400,6 +400,7 @@ run_hygiene() {
     cargo check --locked --workspace --all-targets
     bash -n scripts/ci/*.sh scripts/bench/*.sh
     scripts/bench/test-run-kv-cache-matrix.sh
+    scripts/bench/test-run-cuda-model-evidence.sh
 }
 
 run_cargo_cuda_compile() {
