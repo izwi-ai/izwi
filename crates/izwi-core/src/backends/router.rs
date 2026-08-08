@@ -1,5 +1,5 @@
 use crate::catalog::{
-    CudaQuantizationInfo, CudaSupportInfo, CudaSupportLevel, InferenceBackendHint, ModelVariant,
+    CudaExecutionStatus, CudaQuantizationInfo, CudaSupportInfo, InferenceBackendHint, ModelVariant,
 };
 use crate::kernels::cuda;
 use crate::models::shared::attention::flash::cuda_flash_attention_capabilities;
@@ -197,21 +197,29 @@ impl BackendRouter {
             flash.supports_varlen
         ));
 
-        match cuda_support.level {
-            CudaSupportLevel::CpuOnly | CudaSupportLevel::Disabled | CudaSupportLevel::Unknown => {
-                diagnostics.push(format!(
-                    "CUDA support for {} is {}: {}",
-                    variant.dir_name(),
-                    cuda_support.level.as_str(),
-                    cuda_support.reason
-                ));
-            }
-            CudaSupportLevel::CandleCudaGeneric => diagnostics.push(format!(
-                "CUDA support for {} is generic Candle CUDA and needs smoke validation: {}",
+        diagnostics.push(format!(
+            "CUDA execution for {} is {} with {} evidence (legacy level={}): {}",
+            variant.dir_name(),
+            cuda_support.execution_status.as_str(),
+            cuda_support.evidence.as_str(),
+            cuda_support.level.as_str(),
+            cuda_support.reason
+        ));
+        if !cuda_support.evidence_is_sufficient() {
+            diagnostics.push(format!(
+                "CUDA execution claim for {} is inconsistent: {} status is not supported by {} evidence",
                 variant.dir_name(),
-                cuda_support.reason
-            )),
-            CudaSupportLevel::NativeCuda => {}
+                cuda_support.execution_status.as_str(),
+                cuda_support.evidence.as_str()
+            ));
+        } else if matches!(
+            cuda_support.execution_status,
+            CudaExecutionStatus::Portable | CudaExecutionStatus::EligibleUnverified
+        ) {
+            diagnostics.push(format!(
+                "CUDA optimized provider for {} remains unverified; keep the portable provider and rollback available",
+                variant.dir_name()
+            ));
         }
 
         if !cuda_quantization.is_allowed_for_cuda() {
@@ -245,7 +253,7 @@ fn append_diagnostics(mut reason: String, diagnostics: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CudaQuantizationSupportLevel, ModelVariant};
+    use crate::catalog::{CudaQuantizationSupportLevel, CudaSupportLevel, ModelVariant};
     use crate::env_test_lock;
 
     #[test]

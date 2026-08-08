@@ -29,15 +29,142 @@ impl CudaSupportLevel {
     }
 }
 
+/// Runtime maturity of the CUDA execution path advertised for a model.
+///
+/// This is intentionally independent from [`CudaSupportLevel`]. The legacy
+/// level describes what kind of implementation exists, while this status says
+/// how far that implementation has progressed through validation and rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaExecutionStatus {
+    Unsupported,
+    /// Portable Candle CUDA tensor graph; this is a provider class, not proof
+    /// that CUDA compilation or execution was observed on the current host.
+    Portable,
+    /// An optimized provider is source-eligible but lacks runtime validation.
+    EligibleUnverified,
+    CandleOptimized,
+    CustomOptimized,
+    Certified,
+}
+
+impl CudaExecutionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Portable => "portable",
+            Self::EligibleUnverified => "eligible_unverified",
+            Self::CandleOptimized => "candle_optimized",
+            Self::CustomOptimized => "custom_optimized",
+            Self::Certified => "certified",
+        }
+    }
+
+    pub const fn is_optimized(self) -> bool {
+        matches!(
+            self,
+            Self::CandleOptimized | Self::CustomOptimized | Self::Certified
+        )
+    }
+}
+
+/// Highest CUDA evidence state actually observed for a support claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaEvidenceLevel {
+    NotObserved,
+    SourceReviewed,
+    PortableVerified,
+    CudaCompiled,
+    CudaRuntimeValidated,
+    CudaPerformanceCertified,
+}
+
+impl CudaEvidenceLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::SourceReviewed => "source_reviewed",
+            Self::PortableVerified => "portable_verified",
+            Self::CudaCompiled => "cuda_compiled",
+            Self::CudaRuntimeValidated => "cuda_runtime_validated",
+            Self::CudaPerformanceCertified => "cuda_performance_certified",
+        }
+    }
+
+    pub const fn proves_cuda_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::CudaRuntimeValidated | Self::CudaPerformanceCertified
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CudaSupportInfo {
+    /// Legacy implementation classification retained for API compatibility.
     pub level: CudaSupportLevel,
+    pub execution_status: CudaExecutionStatus,
+    pub evidence: CudaEvidenceLevel,
     pub reason: &'static str,
 }
 
 impl CudaSupportInfo {
     pub const fn new(level: CudaSupportLevel, reason: &'static str) -> Self {
-        Self { level, reason }
+        let (execution_status, evidence) = match level {
+            CudaSupportLevel::NativeCuda | CudaSupportLevel::CandleCudaGeneric => (
+                CudaExecutionStatus::EligibleUnverified,
+                CudaEvidenceLevel::SourceReviewed,
+            ),
+            CudaSupportLevel::CpuOnly | CudaSupportLevel::Disabled => (
+                CudaExecutionStatus::Unsupported,
+                CudaEvidenceLevel::SourceReviewed,
+            ),
+            CudaSupportLevel::Unknown => (
+                CudaExecutionStatus::Unsupported,
+                CudaEvidenceLevel::NotObserved,
+            ),
+        };
+        Self {
+            level,
+            execution_status,
+            evidence,
+            reason,
+        }
+    }
+
+    pub const fn try_with_evidence(
+        level: CudaSupportLevel,
+        execution_status: CudaExecutionStatus,
+        evidence: CudaEvidenceLevel,
+        reason: &'static str,
+    ) -> Option<Self> {
+        let info = Self {
+            level,
+            execution_status,
+            evidence,
+            reason,
+        };
+        if info.evidence_is_sufficient() {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub const fn evidence_is_sufficient(self) -> bool {
+        match self.execution_status {
+            CudaExecutionStatus::Unsupported => true,
+            CudaExecutionStatus::Portable | CudaExecutionStatus::EligibleUnverified => {
+                !matches!(self.evidence, CudaEvidenceLevel::NotObserved)
+            }
+            CudaExecutionStatus::CandleOptimized | CudaExecutionStatus::CustomOptimized => {
+                self.evidence.proves_cuda_runtime()
+            }
+            CudaExecutionStatus::Certified => {
+                matches!(self.evidence, CudaEvidenceLevel::CudaPerformanceCertified)
+            }
+        }
     }
 }
 
@@ -283,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_inference_families_report_candle_cuda_kernel_coverage() {
+    fn enabled_inference_families_report_source_reviewed_unverified_cuda() {
         for variant in ModelVariant::all()
             .iter()
             .copied()
@@ -292,9 +419,14 @@ mod tests {
         {
             let info = variant.cuda_support();
             assert_eq!(
-                info.level,
-                CudaSupportLevel::CandleCudaGeneric,
-                "{variant} should use the Candle CUDA support class"
+                info.execution_status,
+                CudaExecutionStatus::EligibleUnverified,
+                "{variant} must not claim CUDA validation from source review"
+            );
+            assert_eq!(
+                info.evidence,
+                CudaEvidenceLevel::SourceReviewed,
+                "{variant} should not claim unobserved CUDA runtime evidence"
             );
             assert!(
                 info.reason.contains("Candle CUDA"),
@@ -302,6 +434,56 @@ mod tests {
                 info.reason
             );
         }
+    }
+
+    #[test]
+    fn support_metadata_serializes_execution_and_evidence_independently() {
+        let value = serde_json::to_value(ModelVariant::Qwen34BGguf.cuda_support())
+            .expect("serialize CUDA support");
+
+        assert_eq!(value["level"], "candle_cuda_generic");
+        assert_eq!(value["execution_status"], "eligible_unverified");
+        assert_eq!(value["evidence"], "source_reviewed");
+    }
+
+    #[test]
+    fn default_support_metadata_does_not_invent_cuda_evidence() {
+        let info = CudaSupportInfo::default();
+        assert_eq!(info.execution_status, CudaExecutionStatus::Unsupported);
+        assert_eq!(info.evidence, CudaEvidenceLevel::NotObserved);
+        assert!(!info.evidence.proves_cuda_runtime());
+    }
+
+    #[test]
+    fn optimized_status_requires_runtime_evidence_by_contract() {
+        for status in [
+            CudaExecutionStatus::CandleOptimized,
+            CudaExecutionStatus::CustomOptimized,
+            CudaExecutionStatus::Certified,
+        ] {
+            assert!(status.is_optimized());
+        }
+        assert!(!CudaExecutionStatus::EligibleUnverified.is_optimized());
+        assert!(CudaEvidenceLevel::CudaRuntimeValidated.proves_cuda_runtime());
+        assert!(CudaEvidenceLevel::CudaPerformanceCertified.proves_cuda_runtime());
+        assert!(!CudaEvidenceLevel::CudaCompiled.proves_cuda_runtime());
+
+        let invalid = CudaSupportInfo::try_with_evidence(
+            CudaSupportLevel::NativeCuda,
+            CudaExecutionStatus::CandleOptimized,
+            CudaEvidenceLevel::CudaCompiled,
+            "compile-only evidence",
+        );
+        assert!(invalid.is_none());
+
+        let certified = CudaSupportInfo::try_with_evidence(
+            CudaSupportLevel::NativeCuda,
+            CudaExecutionStatus::Certified,
+            CudaEvidenceLevel::CudaPerformanceCertified,
+            "runtime and performance evidence",
+        )
+        .expect("performance evidence should permit a certified claim");
+        assert!(certified.evidence_is_sufficient());
     }
 
     #[test]

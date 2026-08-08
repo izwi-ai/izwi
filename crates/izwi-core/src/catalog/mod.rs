@@ -10,7 +10,8 @@ mod metadata;
 mod variant;
 
 pub use cuda_support::{
-    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
+    CudaEvidenceLevel, CudaExecutionStatus, CudaQuantizationInfo, CudaQuantizationSupportLevel,
+    CudaSupportInfo, CudaSupportLevel,
 };
 pub use metadata::{ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities};
 pub use variant::{

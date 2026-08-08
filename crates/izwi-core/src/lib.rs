@@ -107,9 +107,9 @@ pub use artifacts::{
 };
 pub use catalog::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, resolve_diarization_model_variant, CudaQuantizationInfo,
-    CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel, ModelInfo, ModelStatus,
-    ModelVariant, SpeechModelCapabilities,
+    resolve_asr_model_variant, resolve_diarization_model_variant, CudaEvidenceLevel,
+    CudaExecutionStatus, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,
+    CudaSupportLevel, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole,
