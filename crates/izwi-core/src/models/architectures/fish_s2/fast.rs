@@ -10,6 +10,9 @@ use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::contracts::semantic_code_from_token_id;
 use crate::models::architectures::qwen3::core::build_rope_cache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::sampling::{
+    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2FastConfig {
@@ -440,6 +443,25 @@ fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
             .to_dtype(candle_core::DType::U32)?
             .to_scalar::<u32>()
             .map_err(Error::from);
+    }
+
+    if let Some(candidates) = bounded_cuda_sampling_candidates(
+        row,
+        row.dim(0)?,
+        0,
+        sampler.temperature,
+        &[],
+        1.0,
+        0.0,
+        None,
+    )? {
+        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
+            if let Some(sampled) =
+                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
+            {
+                return Ok(sampled);
+            }
+        }
     }
 
     let values = row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;

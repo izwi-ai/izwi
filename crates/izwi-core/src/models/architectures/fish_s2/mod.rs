@@ -13,6 +13,9 @@ use crate::catalog::ModelVariant;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::sampling::{
+    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 
 pub mod artifacts;
 pub mod codec;
@@ -470,12 +473,11 @@ fn sample_semantic_token(
     sampler: &mut FishS2SemanticSampler,
 ) -> Result<u32> {
     let row = last_logits_row(logits)?;
-    let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    if values.len() != allowed_mask.len() {
+    if row.dim(0)? != allowed_mask.len() {
         return Err(Error::InferenceError(format!(
             "Fish S2 semantic mask length {} does not match logits length {}",
             allowed_mask.len(),
-            values.len()
+            row.dim(0)?
         )));
     }
 
@@ -489,6 +491,66 @@ fn sample_semantic_token(
         }
         &first_frame_mask
     };
+
+    if let Some(candidates) = bounded_cuda_sampling_candidates(
+        &row,
+        row.dim(0)?,
+        0,
+        sampler.temperature,
+        &[],
+        1.0,
+        0.0,
+        Some(sampling_mask),
+    )? {
+        if device_candidates_cover_top_p(&candidates, sampler.top_p) {
+            if let Some(mut sampled) =
+                sample_device_candidates(&candidates, sampler.top_p, sampler.rng.r#gen::<f32>())
+            {
+                if sampled != im_end_token_id
+                    && previous_semantic_tokens.contains(&sampled)
+                    && sampling_mask
+                        .get(sampled as usize)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    let retry = bounded_cuda_sampling_candidates(
+                        &row,
+                        row.dim(0)?,
+                        0,
+                        RAS_HIGH_TEMP,
+                        &[],
+                        1.0,
+                        0.0,
+                        Some(sampling_mask),
+                    )?;
+                    let retry_sample = retry.as_ref().and_then(|retry| {
+                        device_candidates_cover_top_p(retry, RAS_HIGH_TOP_P).then(|| {
+                            sample_device_candidates(
+                                &retry,
+                                RAS_HIGH_TOP_P,
+                                sampler.rng.r#gen::<f32>(),
+                            )
+                        })?
+                    });
+                    if let Some(retry_sample) = retry_sample {
+                        sampled = retry_sample;
+                    } else {
+                        let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                        return sample_masked_values(
+                            &values,
+                            sampling_mask,
+                            RAS_HIGH_TEMP,
+                            RAS_HIGH_TOP_P,
+                            &mut sampler.rng,
+                        );
+                    }
+                }
+                return Ok(sampled);
+            }
+        }
+    }
+
+    let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
     let mut sampled = sample_masked_values(
         &values,

@@ -22,6 +22,9 @@ use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::sampling::{
+    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
@@ -1361,6 +1364,25 @@ fn sample_next_token(
         && config.top_p >= 1.0;
     if deterministic_greedy {
         return argmax_clamped(logits, vocab_size);
+    }
+
+    if let Some(candidates) = bounded_cuda_sampling_candidates(
+        logits,
+        vocab_size,
+        config.top_k,
+        config.temperature,
+        history,
+        config.repetition_penalty,
+        config.presence_penalty,
+        None,
+    )? {
+        if device_candidates_cover_top_p(&candidates, config.top_p) {
+            if let Some(sampled) =
+                sample_device_candidates(&candidates, config.top_p, rng.next_f32())
+            {
+                return Ok(sampled);
+            }
+        }
     }
 
     let mut values = logits_to_vec(logits)?;
