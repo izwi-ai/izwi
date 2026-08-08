@@ -639,11 +639,12 @@ impl ResourceAuthority {
                 let physical = self.normalized_physical_snapshot();
                 state.ledger.update_capacity(physical.capacity);
                 let pending = resources.positive_growth_over(materialized)?;
-                let live_claim = state.pending_resources()?.checked_add(pending)?;
+                let existing_pending = state.pending_resources()?;
+                let live_claim = existing_pending.checked_add(pending)?;
                 if !live_claim.fits_within(physical.available) {
                     return Err(Error::Overloaded(format!(
-                        "insufficient live physical capacity for {}",
-                        owner.key
+                        "insufficient live physical capacity for {}: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}",
+                        owner.key, physical.available, physical.capacity
                     )));
                 }
                 state.ledger.reserve(resources)?
@@ -702,9 +703,10 @@ impl ResourceAuthority {
             let physical = self.normalized_physical_snapshot();
             state.ledger.update_capacity(physical.capacity);
             if !live_claim.fits_within(physical.available) {
-                return Err(Error::Overloaded(
-                    "insufficient live physical capacity for resource lease growth".to_string(),
-                ));
+                return Err(Error::Overloaded(format!(
+                    "insufficient live physical capacity for resource lease growth: next_pending={next_pending:?}, other_pending={other_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}",
+                    physical.available, physical.capacity
+                )));
             }
             state.ledger.resize(id, resources)?
         } else {
@@ -1119,12 +1121,17 @@ mod tests {
             },
         });
         let authority = Arc::new(ResourceAuthority::new(provider));
-        assert!(authority
+        let error = authority
             .reserve(
                 ReservationOwner::new(ReservationClass::Request, "request"),
                 slots(1),
             )
-            .is_err());
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("new_pending="));
+        assert!(message.contains("existing_pending="));
+        assert!(message.contains("physical_available="));
+        assert!(message.contains("physical_capacity="));
         assert_eq!(authority.snapshot().reserved, slots(0));
     }
 
