@@ -65,6 +65,10 @@ pub struct DeviceCapabilities {
     pub recommended_batch_size: usize,
     /// Available memory in bytes (if detectable)
     pub available_memory_bytes: Option<usize>,
+    /// Total physical memory for the selected CUDA device.
+    pub cuda_total_memory_bytes: Option<usize>,
+    /// Ordinal used to select the CUDA device.
+    pub cuda_device_ordinal: Option<usize>,
     /// CUDA compute capability for NVIDIA devices
     pub cuda_compute_capability: Option<(u32, u32)>,
     /// CUDA device name when reported by the runtime
@@ -81,6 +85,8 @@ impl Default for DeviceCapabilities {
             has_unified_memory: false,
             recommended_batch_size: 1,
             available_memory_bytes: None,
+            cuda_total_memory_bytes: None,
+            cuda_device_ordinal: None,
             cuda_compute_capability: None,
             cuda_device_name: None,
         }
@@ -618,6 +624,8 @@ impl DeviceSelector {
                     has_unified_memory: true, // Apple Silicon has unified memory
                     recommended_batch_size: 4, // Conservative for unified memory
                     available_memory_bytes: None, // Could be detected via system APIs
+                    cuda_total_memory_bytes: None,
+                    cuda_device_ordinal: None,
                     cuda_compute_capability: None,
                     cuda_device_name: None,
                 },
@@ -629,11 +637,12 @@ impl DeviceSelector {
     }
 
     fn try_cuda() -> Option<DeviceProfile> {
-        let device = std::panic::catch_unwind(|| Device::cuda_if_available(0))
+        let ordinal = configured_cuda_ordinal();
+        let device = std::panic::catch_unwind(|| Device::cuda_if_available(ordinal))
             .ok()?
             .ok()?;
         if device.is_cuda() {
-            let cuda_capabilities = Self::detect_cuda_capabilities(0);
+            let cuda_capabilities = Self::detect_cuda_capabilities(ordinal);
             let supports_bf16 = cuda_capabilities
                 .compute_capability
                 .is_some_and(cuda_compute_capability_supports_bf16);
@@ -654,7 +663,9 @@ impl DeviceSelector {
                     supports_int8_tensor_cores,
                     has_unified_memory: false,
                     recommended_batch_size: 8, // CUDA can handle larger batches
-                    available_memory_bytes: cuda_capabilities.total_memory_bytes,
+                    available_memory_bytes: cuda_capabilities.free_memory_bytes,
+                    cuda_total_memory_bytes: cuda_capabilities.total_memory_bytes,
+                    cuda_device_ordinal: Some(ordinal),
                     cuda_compute_capability: cuda_capabilities.compute_capability,
                     cuda_device_name: cuda_capabilities.device_name,
                 },
@@ -727,6 +738,7 @@ impl DeviceSelector {
 #[derive(Debug, Clone, Default)]
 struct CudaProbe {
     compute_capability: Option<(u32, u32)>,
+    free_memory_bytes: Option<usize>,
     total_memory_bytes: Option<usize>,
     device_name: Option<String>,
 }
@@ -741,6 +753,26 @@ pub fn parse_dtype_name(raw: &str) -> Option<DType> {
         "float16" | "f16" | "fp16" | "half" => Some(DType::F16),
         "float32" | "float" | "f32" | "fp32" => Some(DType::F32),
         _ => None,
+    }
+}
+
+fn parse_cuda_ordinal(raw: Option<&str>) -> Option<usize> {
+    raw.map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn configured_cuda_ordinal() -> usize {
+    let raw = std::env::var("IZWI_CUDA_DEVICE_ORDINAL").ok();
+    match raw.as_deref() {
+        None => 0,
+        Some(value) => match parse_cuda_ordinal(Some(value)) {
+            Some(ordinal) => ordinal,
+            None => {
+                warn!("Ignoring invalid IZWI_CUDA_DEVICE_ORDINAL={value:?}; using CUDA device 0");
+                0
+            }
+        },
     }
 }
 
@@ -766,11 +798,17 @@ fn detect_cuda_capabilities(ordinal: usize) -> CudaProbe {
                 .compute_capability()
                 .ok()
                 .map(|(major, minor)| (major.max(0) as u32, minor.max(0) as u32));
-            let total_memory_bytes = unsafe { result::device::total_mem(context.cu_device()).ok() };
+            let (free_memory_bytes, total_memory_bytes) = result::mem_get_info()
+                .map(|(free, total)| (Some(free), Some(total)))
+                .unwrap_or_else(|_| {
+                    let total = unsafe { result::device::total_mem(context.cu_device()).ok() };
+                    (None, total)
+                });
             let device_name = context.name().ok().map(|name| name.trim().to_string());
 
             CudaProbe {
                 compute_capability,
+                free_memory_bytes,
                 total_memory_bytes,
                 device_name: device_name.filter(|name| !name.is_empty()),
             }
@@ -790,6 +828,15 @@ fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_ordinal_parser_is_deterministic() {
+        assert_eq!(parse_cuda_ordinal(None), None);
+        assert_eq!(parse_cuda_ordinal(Some("")), None);
+        assert_eq!(parse_cuda_ordinal(Some(" 2 ")), Some(2));
+        assert_eq!(parse_cuda_ordinal(Some("-1")), None);
+        assert_eq!(parse_cuda_ordinal(Some("gpu0")), None);
+    }
 
     #[test]
     fn test_detect_with_cpu_preference_returns_cpu() {

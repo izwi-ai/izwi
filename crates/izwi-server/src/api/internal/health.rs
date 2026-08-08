@@ -52,6 +52,8 @@ pub struct DetectedDeviceResponse {
     pub has_unified_memory: bool,
     pub recommended_batch_size: usize,
     pub available_memory_bytes: Option<usize>,
+    pub cuda_total_memory_bytes: Option<usize>,
+    pub cuda_device_ordinal: Option<usize>,
     pub cuda_compute_capability: Option<String>,
     pub cuda_device_name: Option<String>,
 }
@@ -112,6 +114,8 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
                 has_unified_memory: device.capabilities.has_unified_memory,
                 recommended_batch_size: device.capabilities.recommended_batch_size,
                 available_memory_bytes: device.capabilities.available_memory_bytes,
+                cuda_total_memory_bytes: device.capabilities.cuda_total_memory_bytes,
+                cuda_device_ordinal: device.capabilities.cuda_device_ordinal,
                 cuda_compute_capability: device
                     .capabilities
                     .cuda_compute_capability
@@ -218,6 +222,8 @@ mod tests {
                 has_unified_memory: false,
                 recommended_batch_size: 1,
                 available_memory_bytes: None,
+                cuda_total_memory_bytes: None,
+                cuda_device_ordinal: Some(0),
                 cuda_compute_capability: Some("8.9".to_string()),
                 cuda_device_name: Some("CUDA Device".to_string()),
             },

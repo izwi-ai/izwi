@@ -44,6 +44,8 @@ struct DetectedDeviceStatus {
     has_unified_memory: Option<bool>,
     recommended_batch_size: Option<usize>,
     available_memory_bytes: Option<usize>,
+    cuda_total_memory_bytes: Option<usize>,
+    cuda_device_ordinal: Option<usize>,
     cuda_compute_capability: Option<String>,
     cuda_device_name: Option<String>,
 }
@@ -247,6 +249,9 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                 if let Some(name) = device.cuda_device_name.as_deref() {
                     println!("  CUDA name: {}", name);
                 }
+                if let Some(ordinal) = device.cuda_device_ordinal {
+                    println!("  CUDA dev:  {}", ordinal);
+                }
                 if let Some(capability) = device.cuda_compute_capability.as_deref() {
                     println!("  CUDA cc:   {}", capability);
                 }
@@ -270,7 +275,13 @@ async fn show_status(server: &str, detailed: bool) -> Result<()> {
                 }
                 if let Some(memory_bytes) = device.available_memory_bytes {
                     println!(
-                        "  Memory:    {}",
+                        "  Free mem:  {}",
+                        humansize::format_size(memory_bytes, humansize::BINARY)
+                    );
+                }
+                if let Some(memory_bytes) = device.cuda_total_memory_bytes {
+                    println!(
+                        "  Total mem: {}",
                         humansize::format_size(memory_bytes, humansize::BINARY)
                     );
                 }

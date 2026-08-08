@@ -282,8 +282,11 @@ jq -n \
             cuda_compiled: $health[0].runtime.compiled_backends.cuda,
             driver_available: $health[0].runtime.cuda_runtime.driver_available,
             device_usable: $health[0].runtime.cuda_runtime.device_usable,
+            ordinal: $health[0].runtime.detected_device.cuda_device_ordinal,
             name: $health[0].runtime.detected_device.cuda_device_name,
             compute_capability: $health[0].runtime.detected_device.cuda_compute_capability,
+            free_memory_bytes: $health[0].runtime.detected_device.available_memory_bytes,
+            total_memory_bytes: $health[0].runtime.detected_device.cuda_total_memory_bytes,
             selected_dtype: $health[0].runtime.dtype_policy.selected_dtype
         },
         cases: [

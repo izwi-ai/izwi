@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_selection_reports_cpu_only_models() {
+    fn cuda_selection_reports_neural_tokenizer_without_inventing_device_evidence() {
         let context = BackendContext::new(
             BackendPreference::Cuda,
             BackendSelectionSource::Config,
@@ -392,9 +392,10 @@ mod tests {
         let plan = router.select(ModelVariant::Qwen3TtsTokenizer12Hz);
 
         assert_eq!(plan.backend, ExecutionBackend::CandleCuda);
-        assert_eq!(plan.cuda_support.level, CudaSupportLevel::CpuOnly);
+        assert_eq!(plan.cuda_support.level, CudaSupportLevel::CandleCudaGeneric);
         assert!(
-            plan.reason.contains("cpu_only"),
+            plan.reason.contains("eligible_unverified")
+                && plan.reason.contains("cuda_device_not_observed"),
             "reason should carry CUDA support diagnostics: {}",
             plan.reason
         );
