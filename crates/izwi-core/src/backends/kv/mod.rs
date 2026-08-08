@@ -8,6 +8,7 @@
 #[cfg(any(feature = "cuda", feature = "metal"))]
 mod accelerator;
 mod cpu;
+mod cuda_tuning;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};

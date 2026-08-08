@@ -10,6 +10,9 @@ use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding,
 use crate::runtime::rollout::KvProviderRollout;
 use crate::Result;
 
+use super::cuda_tuning::{
+    observe_cuda_identity, resolve_cuda_paged_tuning, CudaDeviceIdentity, CudaPagedShapeKey,
+};
 #[cfg(feature = "cuda")]
 use super::KvBackendRuntime;
 use super::{
@@ -463,6 +466,7 @@ pub struct CandleAcceleratorKvArena {
     backend: BackendKind,
     device: Device,
     optimized_provider_enabled: bool,
+    cuda_identity: CudaDeviceIdentity,
     layers: RwLock<HashMap<KvLayerBinding, AcceleratorLayerStorage>>,
     resident_capacity_pages: AtomicU32,
     backing_generation: AtomicU64,
@@ -492,6 +496,11 @@ impl CandleAcceleratorKvArena {
         let backend = backend_for_device(&device)?;
         let optimized_provider_enabled =
             KvProviderRollout::from_process_env()?.optimized_provider_enabled();
+        let cuda_identity = if backend == BackendKind::Cuda {
+            observe_cuda_identity(&device)
+        } else {
+            CudaDeviceIdentity::unobserved()
+        };
         validate_config(&config, backend, &device)?;
         let support = candle_accelerator_kv_support(backend);
         if !support.in_place_zero || !support.device_page_copy || !support.in_place_slot_write {
@@ -539,6 +548,7 @@ impl CandleAcceleratorKvArena {
             backend,
             device,
             optimized_provider_enabled,
+            cuda_identity,
             layers: RwLock::new(layers),
             resident_capacity_pages: AtomicU32::new(resident_capacity_pages),
             backing_generation: AtomicU64::new(1),
@@ -592,6 +602,28 @@ impl CandleAcceleratorKvArena {
                 binding.physical_layer, self.config.id
             ))
         })
+    }
+
+    fn cuda_paged_tuning(
+        &self,
+        key_head_dim: usize,
+        value_head_dim: usize,
+        batch: usize,
+        query_heads: usize,
+        max_context_tokens: usize,
+    ) -> super::cuda_tuning::CudaPagedTuningPolicy {
+        resolve_cuda_paged_tuning(
+            &self.cuda_identity,
+            CudaPagedShapeKey {
+                dtype: self.config.dtype,
+                page_tokens: self.config.page_tokens,
+                key_head_dim,
+                value_head_dim,
+                batch,
+                query_heads,
+                max_context_tokens,
+            },
+        )
     }
 
     fn validate_block(&self, block: CacheBlockRef) -> Result<usize> {
@@ -1179,8 +1211,16 @@ impl CandleAcceleratorKvArena {
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
         let device_metadata = self.cached_cuda_decode_plan(args.batch)?;
+        let tuning = self.cuda_paged_tuning(
+            layer.key_head_dim,
+            layer.value_head_dim,
+            batch_size,
+            args.queries.dims()[1],
+            device_metadata.max_context,
+        );
         #[cfg(feature = "flash-attn")]
         if self.optimized_provider_enabled
+            && tuning.flash_attention_allowed
             && cuda_flash_paged_attention_eligible(
                 self.config.dtype,
                 self.config.page_tokens,
@@ -1227,6 +1267,7 @@ impl CandleAcceleratorKvArena {
             args.softmax_scale,
             args.softcap,
             device_metadata.max_context,
+            tuning.decode_partition_tuning,
         )?;
         self.last_attention_provider
             .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
@@ -1657,6 +1698,15 @@ impl KvArena for CandleAcceleratorKvArena {
         #[cfg(all(feature = "cuda", feature = "flash-attn"))]
         if self.backend == BackendKind::Cuda
             && self.optimized_provider_enabled
+            && self
+                .cuda_paged_tuning(
+                    _key_head_dim,
+                    _value_head_dim,
+                    lowered.sequence_count,
+                    args.queries.dims()[1],
+                    lowered.max_context_len,
+                )
+                .flash_attention_allowed
             && cuda_flash_paged_attention_eligible(
                 self.config.dtype,
                 self.config.page_tokens,

@@ -345,11 +345,18 @@ fn cuda_paged_decode_strategy(
     batch: usize,
     query_heads: usize,
     value_dim: usize,
+    tuning: Option<(usize, usize)>,
 ) -> candle_core::Result<CudaPagedDecodeStrategy> {
-    if max_context_len <= CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS {
+    let Some((split_threshold, partition_tokens)) = tuning else {
+        return Ok(CudaPagedDecodeStrategy::OnePass);
+    };
+    if split_threshold == 0 || partition_tokens == 0 {
+        candle_core::bail!("CUDA paged decode tuning contains a zero threshold")
+    }
+    if max_context_len <= split_threshold {
         return Ok(CudaPagedDecodeStrategy::OnePass);
     }
-    let partitions = max_context_len.div_ceil(CUDA_PAGED_DECODE_PARTITION_TOKENS);
+    let partitions = max_context_len.div_ceil(partition_tokens);
     if partitions > CUDA_PAGED_DECODE_MAX_PARTITIONS {
         candle_core::bail!(
             "CUDA paged decode requires {partitions} partitions, exceeding the kernel grid limit"
@@ -491,6 +498,7 @@ pub(crate) fn paged_decode_attention(
     softmax_scale: f32,
     softcap: Option<f32>,
     max_context_len: usize,
+    partition_tuning: Option<(usize, usize)>,
 ) -> candle_core::Result<Tensor> {
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
@@ -543,7 +551,13 @@ pub(crate) fn paged_decode_attention(
     if max_context_len == 0 {
         candle_core::bail!("CUDA paged decode requires a non-empty validated context")
     }
-    let strategy = cuda_paged_decode_strategy(max_context_len, batch, query_heads, value_dim)?;
+    let strategy = cuda_paged_decode_strategy(
+        max_context_len,
+        batch,
+        query_heads,
+        value_dim,
+        partition_tuning,
+    )?;
     let kernel_geometry = [
         batch,
         query_heads,
@@ -580,6 +594,7 @@ pub(crate) fn paged_decode_attention(
             softmax_scale,
             softcap,
             strategy,
+            partition_tokens: partition_tuning.map(|(_, tokens)| tokens).unwrap_or(0),
         },
     )
 }
@@ -926,6 +941,7 @@ struct CudaPagedDecodeOp {
     softmax_scale: f32,
     softcap: Option<f32>,
     strategy: CudaPagedDecodeStrategy,
+    partition_tokens: usize,
 }
 
 struct CudaPagedPrefillOp {
@@ -1357,7 +1373,7 @@ impl CustomOp3 for CudaPagedDecodeOp {
                             self.key_dim as i32,
                             self.value_dim as i32,
                             self.capacity_pages as i32,
-                            CUDA_PAGED_DECODE_PARTITION_TOKENS as i32,
+                            self.partition_tokens as i32,
                             partitions as i32,
                             self.softmax_scale,
                             self.softcap.unwrap_or(0.0)
@@ -1498,17 +1514,34 @@ mod tests {
 
     #[test]
     fn cuda_paged_decode_routes_only_long_contexts_to_partitions() {
+        let tuned = Some((
+            CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS,
+            CUDA_PAGED_DECODE_PARTITION_TOKENS,
+        ));
         assert_eq!(
-            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS, 1, 1, 1).unwrap(),
+            cuda_paged_decode_strategy(16_384, 1, 1, 1, None).unwrap(),
+            CudaPagedDecodeStrategy::OnePass,
+            "an unobserved GPU must retain eager decode"
+        );
+        assert_eq!(
+            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS, 1, 1, 1, tuned,)
+                .unwrap(),
             CudaPagedDecodeStrategy::OnePass
         );
         assert_eq!(
-            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS + 1, 1, 1, 1)
-                .unwrap(),
+            cuda_paged_decode_strategy(
+                CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS + 1,
+                1,
+                1,
+                1,
+                tuned,
+            )
+            .unwrap(),
             CudaPagedDecodeStrategy::Partitioned { partitions: 3 }
         );
         assert_eq!(
-            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_PARTITION_TOKENS * 9, 1, 1, 1).unwrap(),
+            cuda_paged_decode_strategy(CUDA_PAGED_DECODE_PARTITION_TOKENS * 9, 1, 1, 1, tuned,)
+                .unwrap(),
             CudaPagedDecodeStrategy::Partitioned { partitions: 9 }
         );
         assert!(cuda_paged_decode_strategy(
@@ -1516,6 +1549,7 @@ mod tests {
             1,
             1,
             1,
+            tuned,
         )
         .is_err());
         assert_eq!(
@@ -1524,6 +1558,7 @@ mod tests {
                 512,
                 512,
                 512,
+                tuned,
             )
             .unwrap(),
             CudaPagedDecodeStrategy::OnePass,
@@ -1599,6 +1634,10 @@ mod tests {
                 1.0,
                 Some(softcap),
                 2,
+                Some((
+                    CUDA_PAGED_DECODE_SPLIT_THRESHOLD_TOKENS,
+                    CUDA_PAGED_DECODE_PARTITION_TOKENS,
+                )),
             )
             .unwrap()
             .to_dtype(DType::F32)
