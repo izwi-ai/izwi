@@ -528,77 +528,6 @@ fn commit_sortformer_streaming_state(
     )
 }
 
-fn hydrate_sortformer_streaming_state(
-    lease: &InvocationTensorLease,
-    cfg: SortformerStreamingConfig,
-) -> Result<SortformerStreamingState> {
-    let snapshot = lease.read_snapshot()?;
-    if snapshot.components.len() != 6
-        || snapshot
-            .components
-            .iter()
-            .enumerate()
-            .any(|(index, value)| value.component != StateComponentId::new((index + 1) as u32))
-    {
-        return Err(Error::InferenceError(
-            "Sortformer physical snapshot has non-canonical components".into(),
-        ));
-    }
-    let control = snapshot.components[5].tensor.to_vec1::<f32>()?;
-    if control.len() != 4 {
-        return Err(Error::InferenceError(
-            "Sortformer physical control state is incomplete".into(),
-        ));
-    }
-    let exact_count = |value: f32, capacity: usize, name: &str| -> Result<usize> {
-        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > capacity as f32 {
-            return Err(Error::InferenceError(format!(
-                "Sortformer physical {name} is outside its bound"
-            )));
-        }
-        Ok(value as usize)
-    };
-    let speaker_len = exact_count(control[0], cfg.spkcache_len, "speaker-cache length")?;
-    let fifo_len = exact_count(control[1], cfg.fifo_len, "FIFO length")?;
-    let has_speaker_preds = match control[2] {
-        0.0 => false,
-        1.0 => true,
-        _ => {
-            return Err(Error::InferenceError(
-                "Sortformer physical prediction flag is invalid".into(),
-            ))
-        }
-    };
-    let n_sil_frames = exact_count(control[3], 16_777_216, "silence-frame count")?;
-    let speaker_rows = snapshot.components[0].tensor.to_vec2::<f32>()?;
-    let speaker_pred_rows = snapshot.components[1].tensor.to_vec2::<f32>()?;
-    let fifo_rows = snapshot.components[2].tensor.to_vec2::<f32>()?;
-    let fifo_pred_rows = snapshot.components[3].tensor.to_vec2::<f32>()?;
-    let prediction_rows = |rows: Vec<Vec<f32>>, count: usize| -> Result<Vec<[f32; 4]>> {
-        rows.into_iter()
-            .take(count)
-            .map(|row| {
-                row.try_into().map_err(|row: Vec<f32>| {
-                    Error::InferenceError(format!(
-                        "Sortformer physical prediction row has width {}",
-                        row.len()
-                    ))
-                })
-            })
-            .collect()
-    };
-    Ok(SortformerStreamingState {
-        spkcache: speaker_rows.into_iter().take(speaker_len).collect(),
-        spkcache_preds: has_speaker_preds
-            .then(|| prediction_rows(speaker_pred_rows, speaker_len))
-            .transpose()?,
-        fifo: fifo_rows.into_iter().take(fifo_len).collect(),
-        fifo_preds: prediction_rows(fifo_pred_rows, fifo_len)?,
-        mean_sil_emb: snapshot.components[4].tensor.to_vec1::<f32>()?,
-        n_sil_frames,
-    })
-}
-
 fn padded_embedding_tensor(
     rows: &[Vec<f32>],
     capacity: usize,
@@ -1383,7 +1312,7 @@ impl SortformerInferenceModel {
             )?;
             state = if let Some(lease) = physical_state.as_deref_mut() {
                 commit_sortformer_streaming_state(lease, cfg, &updated_state, &self.device)?;
-                hydrate_sortformer_streaming_state(lease, cfg)?
+                updated_state
             } else {
                 updated_state
             };
@@ -1522,6 +1451,7 @@ fn tensor_to_embedding_rows(tensor: &Tensor, row_count: usize) -> Result<Vec<Vec
 
     let view = tensor.i((0, ..row_count, ..))?;
     let (_, emb_dim) = view.dims2()?;
+    crate::models::shared::telemetry::record_host_read(DType::F32, row_count * emb_dim);
     let values = view.flatten_all()?.to_vec1::<f32>()?;
     Ok(values
         .chunks(emb_dim)
@@ -1545,6 +1475,10 @@ fn tensor_to_probability_rows(
             speaker_dim, MAX_SUPPORTED_SPEAKERS
         )));
     }
+    crate::models::shared::telemetry::record_host_read(
+        DType::F32,
+        row_count * MAX_SUPPORTED_SPEAKERS,
+    );
     let values = view.flatten_all()?.to_vec1::<f32>()?;
     Ok(values
         .chunks(MAX_SUPPORTED_SPEAKERS)
