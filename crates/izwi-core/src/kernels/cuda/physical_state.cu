@@ -2,6 +2,11 @@
 #include <cuda_fp16.h>
 #include <math.h>
 
+#if __has_include(<cuda_fp8.h>)
+#include <cuda_fp8.h>
+#define IZWI_CUDA_HAS_FP8 1
+#endif
+
 template <typename T>
 __device__ inline float izwi_to_float(T value);
 
@@ -20,6 +25,14 @@ __device__ inline float izwi_to_float<__nv_bfloat16>(
     __nv_bfloat16 value) {
   return __bfloat162float(value);
 }
+
+#if defined(IZWI_CUDA_HAS_FP8)
+template <>
+__device__ inline float izwi_to_float<__nv_fp8_e4m3>(
+    __nv_fp8_e4m3 value) {
+  return static_cast<float>(value);
+}
+#endif
 
 template <typename T>
 __device__ inline T izwi_from_float(float value);
@@ -47,11 +60,11 @@ __device__ inline __nv_bfloat16 izwi_from_float<__nv_bfloat16>(
 // offset select the visible logical sequence. Online softmax keeps memory
 // bounded independently of context length and GQA maps each query head to its
 // source KV head without expanding KV tensors.
-template <typename T>
+template <typename T, typename KV = T>
 __device__ void izwi_paged_decode_attention(
     const T* __restrict__ queries,
-    const T* __restrict__ keys,
-    const T* __restrict__ values,
+    const KV* __restrict__ keys,
+    const KV* __restrict__ values,
     const unsigned int* __restrict__ metadata,
     T* __restrict__ output,
     int batch,
@@ -202,11 +215,11 @@ __device__ void izwi_paged_decode_attention(
 // (query start/length, final context length, first-page offset) followed by a
 // rectangular physical block table. This avoids expanding prefill into one
 // host-authored decode row per query token when FlashAttention is ineligible.
-template <typename T>
+template <typename T, typename KV = T>
 __device__ void izwi_paged_prefill_attention(
     const T* __restrict__ queries,
-    const T* __restrict__ keys,
-    const T* __restrict__ values,
+    const KV* __restrict__ keys,
+    const KV* __restrict__ values,
     const unsigned int* __restrict__ metadata,
     T* __restrict__ output,
     int sequences,
@@ -386,11 +399,11 @@ __device__ void izwi_paged_prefill_attention(
 // online-softmax state for each token partition. The second pass combines those
 // states with the same max-rescaling identity, so no materialized score tensor
 // is required and arbitrary first-page offsets retain the one-pass semantics.
-template <typename T>
+template <typename T, typename KV = T>
 __device__ void izwi_paged_decode_attention_partition(
     const T* __restrict__ queries,
-    const T* __restrict__ keys,
-    const T* __restrict__ values,
+    const KV* __restrict__ keys,
+    const KV* __restrict__ values,
     const unsigned int* __restrict__ metadata,
     float* __restrict__ partials,
     int batch,
@@ -639,6 +652,25 @@ IZWI_DEFINE_PAGED_DECODE_PARTITION(f32, float)
 IZWI_DEFINE_PAGED_DECODE_PARTITION(f16, __half)
 IZWI_DEFINE_PAGED_DECODE_PARTITION(bf16, __nv_bfloat16)
 
+#if defined(IZWI_CUDA_HAS_FP8)
+#define IZWI_DEFINE_PAGED_DECODE_PARTITION_FP8(SUFFIX, TYPE)                   \
+  extern "C" __global__ void physical_paged_decode_partition_##SUFFIX##_fp8( \
+      const TYPE* queries, const __nv_fp8_e4m3* keys,                          \
+      const __nv_fp8_e4m3* values, const unsigned int* metadata,               \
+      float* partials, int batch, int query_heads, int kv_heads,               \
+      int page_tokens, int max_blocks, int key_dim, int value_dim,             \
+      int capacity_pages, int partition_tokens, int num_partitions,            \
+      float softmax_scale, float softcap) {                                    \
+    izwi_paged_decode_attention_partition<TYPE, __nv_fp8_e4m3>(                \
+        queries, keys, values, metadata, partials, batch, query_heads,         \
+        kv_heads, page_tokens, max_blocks, key_dim, value_dim, capacity_pages, \
+        partition_tokens, num_partitions, softmax_scale, softcap);             \
+  }
+
+IZWI_DEFINE_PAGED_DECODE_PARTITION_FP8(f16, __half)
+IZWI_DEFINE_PAGED_DECODE_PARTITION_FP8(bf16, __nv_bfloat16)
+#endif
+
 extern "C" __global__ void physical_paged_decode_f32(
     const float* queries,
     const float* keys,
@@ -705,6 +737,24 @@ extern "C" __global__ void physical_paged_decode_bf16(
       softmax_scale, softcap);
 }
 
+#if defined(IZWI_CUDA_HAS_FP8)
+#define IZWI_DEFINE_PAGED_DECODE_FP8(SUFFIX, TYPE)                            \
+  extern "C" __global__ void physical_paged_decode_##SUFFIX##_fp8(          \
+      const TYPE* queries, const __nv_fp8_e4m3* keys,                         \
+      const __nv_fp8_e4m3* values, const unsigned int* metadata, TYPE* output,\
+      int batch, int query_heads, int kv_heads, int page_tokens,              \
+      int max_blocks, int key_dim, int value_dim, int capacity_pages,         \
+      float softmax_scale, float softcap) {                                   \
+    izwi_paged_decode_attention<TYPE, __nv_fp8_e4m3>(                         \
+        queries, keys, values, metadata, output, batch, query_heads, kv_heads,\
+        page_tokens, max_blocks, key_dim, value_dim, capacity_pages,          \
+        softmax_scale, softcap);                                              \
+  }
+
+IZWI_DEFINE_PAGED_DECODE_FP8(f16, __half)
+IZWI_DEFINE_PAGED_DECODE_FP8(bf16, __nv_bfloat16)
+#endif
+
 #define IZWI_DEFINE_PAGED_PREFILL(SUFFIX, TYPE)                              \
   extern "C" __global__ void physical_paged_prefill_##SUFFIX(              \
       const TYPE* queries, const TYPE* keys, const TYPE* values,              \
@@ -721,6 +771,25 @@ extern "C" __global__ void physical_paged_decode_bf16(
 IZWI_DEFINE_PAGED_PREFILL(f32, float)
 IZWI_DEFINE_PAGED_PREFILL(f16, __half)
 IZWI_DEFINE_PAGED_PREFILL(bf16, __nv_bfloat16)
+
+#if defined(IZWI_CUDA_HAS_FP8)
+#define IZWI_DEFINE_PAGED_PREFILL_FP8(SUFFIX, TYPE)                           \
+  extern "C" __global__ void physical_paged_prefill_##SUFFIX##_fp8(         \
+      const TYPE* queries, const __nv_fp8_e4m3* keys,                         \
+      const __nv_fp8_e4m3* values, const unsigned int* metadata, TYPE* output,\
+      int sequences, int total_queries, int query_heads, int kv_heads,        \
+      int page_tokens, int max_blocks, int key_dim, int value_dim,            \
+      int capacity_pages, int window_tokens, float softmax_scale,             \
+      float softcap) {                                                        \
+    izwi_paged_prefill_attention<TYPE, __nv_fp8_e4m3>(                        \
+        queries, keys, values, metadata, output, sequences, total_queries,   \
+        query_heads, kv_heads, page_tokens, max_blocks, key_dim, value_dim,   \
+        capacity_pages, window_tokens, softmax_scale, softcap);               \
+  }
+
+IZWI_DEFINE_PAGED_PREFILL_FP8(f16, __half)
+IZWI_DEFINE_PAGED_PREFILL_FP8(bf16, __nv_bfloat16)
+#endif
 
 // Consume a physical circular ShortConv ring directly. The ring layout is
 // [capacity, batch, hidden], while input/output use [batch, hidden, steps].

@@ -605,11 +605,14 @@ pub(crate) fn paged_prefill_attention(
     softcap: Option<f32>,
     window_tokens: Option<u32>,
 ) -> candle_core::Result<Tensor> {
+    let dense_kv = queries.dtype() == keys.dtype() && queries.dtype() == values.dtype();
+    let fp8_kv = matches!(queries.dtype(), DType::F16 | DType::BF16)
+        && keys.dtype() == DType::F8E4M3
+        && values.dtype() == DType::F8E4M3;
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
         || queries.device().location() != values.device().location()
-        || queries.dtype() != keys.dtype()
-        || queries.dtype() != values.dtype()
+        || (!dense_kv && !fp8_kv)
         || !matches!(queries.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
         candle_core::bail!(
@@ -749,15 +752,18 @@ pub(crate) fn paged_decode_attention_with_graph(
     partition_tuning: Option<(usize, usize)>,
     _allow_graph: bool,
 ) -> candle_core::Result<Tensor> {
+    let dense_kv = queries.dtype() == keys.dtype() && queries.dtype() == values.dtype();
+    let fp8_kv = matches!(queries.dtype(), DType::F16 | DType::BF16)
+        && keys.dtype() == DType::F8E4M3
+        && values.dtype() == DType::F8E4M3;
     if !queries.device().is_cuda()
         || queries.device().location() != keys.device().location()
         || queries.device().location() != values.device().location()
-        || queries.dtype() != keys.dtype()
-        || queries.dtype() != values.dtype()
+        || (!dense_kv && !fp8_kv)
         || !matches!(queries.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
         candle_core::bail!(
-            "CUDA paged decode requires matching F32/F16/BF16 tensors on one CUDA device"
+            "CUDA paged decode requires dense F32/F16/BF16 or half-query/FP8-KV tensors on one CUDA device"
         )
     }
     if queries.dims() != [batch, query_heads, key_dim]
@@ -831,7 +837,7 @@ pub(crate) fn paged_decode_attention_with_graph(
     let keys = keys.contiguous()?;
     let values = values.contiguous()?;
     #[cfg(feature = "cuda")]
-    if _allow_graph && strategy == CudaPagedDecodeStrategy::OnePass {
+    if _allow_graph && dense_kv && strategy == CudaPagedDecodeStrategy::OnePass {
         if let Some(output) = try_cuda_paged_decode_graph(
             &queries,
             &keys,
@@ -1841,14 +1847,14 @@ impl CustomOp3 for CudaPagedPrefillOp {
         };
 
         macro_rules! launch {
-            ($variant:ident, $ty:ty, $function_name:literal) => {{
-                let CudaStorageSlice::$variant(query_slice) = &queries.slice else {
+            ($query_variant:ident, $kv_variant:ident, $ty:ty, $function_name:literal) => {{
+                let CudaStorageSlice::$query_variant(query_slice) = &queries.slice else {
                     candle_core::bail!("CUDA paged prefill query storage dtype mismatch")
                 };
-                let CudaStorageSlice::$variant(key_slice) = &keys.slice else {
+                let CudaStorageSlice::$kv_variant(key_slice) = &keys.slice else {
                     candle_core::bail!("CUDA paged prefill key storage dtype mismatch")
                 };
-                let CudaStorageSlice::$variant(value_slice) = &values.slice else {
+                let CudaStorageSlice::$kv_variant(value_slice) = &values.slice else {
                     candle_core::bail!("CUDA paged prefill value storage dtype mismatch")
                 };
                 let Some((query_start, query_end)) = queries_layout.contiguous_offsets() else {
@@ -1896,20 +1902,32 @@ impl CustomOp3 for CudaPagedPrefillOp {
                 // native paged-prefill kernel ABI.
                 unsafe { builder.launch(config) }.w()?;
                 candle_core::CudaStorage {
-                    slice: CudaStorageSlice::$variant(output),
+                    slice: CudaStorageSlice::$query_variant(output),
                     device: device.clone(),
                 }
             }};
         }
 
-        let output = match &queries.slice {
-            CudaStorageSlice::F32(_) => launch!(F32, f32, "physical_paged_prefill_f32"),
-            CudaStorageSlice::F16(_) => {
-                launch!(F16, half::f16, "physical_paged_prefill_f16")
+        let output = match (&queries.slice, &keys.slice, &values.slice) {
+            (CudaStorageSlice::F32(_), CudaStorageSlice::F32(_), CudaStorageSlice::F32(_)) => {
+                launch!(F32, F32, f32, "physical_paged_prefill_f32")
             }
-            CudaStorageSlice::BF16(_) => {
-                launch!(BF16, half::bf16, "physical_paged_prefill_bf16")
+            (CudaStorageSlice::F16(_), CudaStorageSlice::F16(_), CudaStorageSlice::F16(_)) => {
+                launch!(F16, F16, half::f16, "physical_paged_prefill_f16")
             }
+            (CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_)) => {
+                launch!(BF16, BF16, half::bf16, "physical_paged_prefill_bf16")
+            }
+            (
+                CudaStorageSlice::F16(_),
+                CudaStorageSlice::F8E4M3(_),
+                CudaStorageSlice::F8E4M3(_),
+            ) => launch!(F16, F8E4M3, half::f16, "physical_paged_prefill_f16_fp8"),
+            (
+                CudaStorageSlice::BF16(_),
+                CudaStorageSlice::F8E4M3(_),
+                CudaStorageSlice::F8E4M3(_),
+            ) => launch!(BF16, F8E4M3, half::bf16, "physical_paged_prefill_bf16_fp8"),
             _ => candle_core::bail!("CUDA paged prefill requires F32/F16/BF16 storage"),
         };
         Ok((
@@ -1986,14 +2004,14 @@ impl CustomOp3 for CudaPagedDecodeOp {
         };
 
         macro_rules! launch {
-            ($variant:ident, $ty:ty, $function_name:literal, $partition_name:literal, $reduce_name:literal) => {{
-                let CudaStorageSlice::$variant(query_slice) = &queries.slice else {
+            ($query_variant:ident, $kv_variant:ident, $ty:ty, $function_name:literal, $partition_name:literal, $reduce_name:literal) => {{
+                let CudaStorageSlice::$query_variant(query_slice) = &queries.slice else {
                     candle_core::bail!("CUDA paged decode query storage dtype mismatch")
                 };
-                let CudaStorageSlice::$variant(key_slice) = &keys.slice else {
+                let CudaStorageSlice::$kv_variant(key_slice) = &keys.slice else {
                     candle_core::bail!("CUDA paged decode key storage dtype mismatch")
                 };
-                let CudaStorageSlice::$variant(value_slice) = &values.slice else {
+                let CudaStorageSlice::$kv_variant(value_slice) = &values.slice else {
                     candle_core::bail!("CUDA paged decode value storage dtype mismatch")
                 };
                 let Some((query_start, query_end)) = queries_layout.contiguous_offsets() else {
@@ -2113,22 +2131,26 @@ impl CustomOp3 for CudaPagedDecodeOp {
                     }
                 }
                 candle_core::CudaStorage {
-                    slice: CudaStorageSlice::$variant(output),
+                    slice: CudaStorageSlice::$query_variant(output),
                     device: device.clone(),
                 }
             }};
         }
 
-        let output = match &queries.slice {
-            CudaStorageSlice::F32(_) => launch!(
-                F32,
-                f32,
-                "physical_paged_decode_f32",
-                "physical_paged_decode_partition_f32",
-                "physical_paged_decode_reduce_f32"
-            ),
-            CudaStorageSlice::F16(_) => {
+        let output = match (&queries.slice, &keys.slice, &values.slice) {
+            (CudaStorageSlice::F32(_), CudaStorageSlice::F32(_), CudaStorageSlice::F32(_)) => {
                 launch!(
+                    F32,
+                    F32,
+                    f32,
+                    "physical_paged_decode_f32",
+                    "physical_paged_decode_partition_f32",
+                    "physical_paged_decode_reduce_f32"
+                )
+            }
+            (CudaStorageSlice::F16(_), CudaStorageSlice::F16(_), CudaStorageSlice::F16(_)) => {
+                launch!(
+                    F16,
                     F16,
                     half::f16,
                     "physical_paged_decode_f16",
@@ -2136,12 +2158,41 @@ impl CustomOp3 for CudaPagedDecodeOp {
                     "physical_paged_decode_reduce_f16"
                 )
             }
-            CudaStorageSlice::BF16(_) => {
+            (CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_)) => {
                 launch!(
+                    BF16,
                     BF16,
                     half::bf16,
                     "physical_paged_decode_bf16",
                     "physical_paged_decode_partition_bf16",
+                    "physical_paged_decode_reduce_bf16"
+                )
+            }
+            (
+                CudaStorageSlice::F16(_),
+                CudaStorageSlice::F8E4M3(_),
+                CudaStorageSlice::F8E4M3(_),
+            ) => {
+                launch!(
+                    F16,
+                    F8E4M3,
+                    half::f16,
+                    "physical_paged_decode_f16_fp8",
+                    "physical_paged_decode_partition_f16_fp8",
+                    "physical_paged_decode_reduce_f16"
+                )
+            }
+            (
+                CudaStorageSlice::BF16(_),
+                CudaStorageSlice::F8E4M3(_),
+                CudaStorageSlice::F8E4M3(_),
+            ) => {
+                launch!(
+                    BF16,
+                    F8E4M3,
+                    half::bf16,
+                    "physical_paged_decode_bf16_fp8",
+                    "physical_paged_decode_partition_bf16_fp8",
                     "physical_paged_decode_reduce_bf16"
                 )
             }

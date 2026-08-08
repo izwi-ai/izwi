@@ -1,6 +1,56 @@
+use crate::{Error, Result};
 #[cfg(feature = "cuda")]
 use candle_core::DeviceLocation;
 use candle_core::{DType, Device};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaKvStorageFormat {
+    Dense,
+    Fp8E4M3,
+}
+
+impl CudaKvStorageFormat {
+    pub(crate) const fn dtype(self, logical_dtype: DType) -> DType {
+        match self {
+            Self::Dense => logical_dtype,
+            Self::Fp8E4M3 => DType::F8E4M3,
+        }
+    }
+}
+
+pub(crate) fn resolve_cuda_kv_storage_format(
+    identity: &CudaDeviceIdentity,
+    logical_dtype: DType,
+    performance_certified: bool,
+) -> Result<CudaKvStorageFormat> {
+    if !performance_certified {
+        return Ok(CudaKvStorageFormat::Dense);
+    }
+    if !matches!(logical_dtype, DType::F16 | DType::BF16) {
+        return Err(Error::InvalidInput(
+            "certified CUDA FP8 KV requires F16 or BF16 model KV dtype".into(),
+        ));
+    }
+    if !identity
+        .compute_capability
+        .is_some_and(|(major, _)| major >= 9)
+    {
+        return Err(Error::InvalidInput(
+            "certified CUDA FP8 KV requires an observed compute capability of 9.0 or newer".into(),
+        ));
+    }
+    Ok(CudaKvStorageFormat::Fp8E4M3)
+}
+
+/// Only reviewed NVIDIA evidence may add an exact cell here. The empty table
+/// makes FP8 unreachable by default, and there is deliberately no environment
+/// override that can relabel an unverified route as certified.
+pub(crate) fn cuda_fp8_kv_cell_certified(
+    _identity: &CudaDeviceIdentity,
+    _logical_dtype: DType,
+) -> bool {
+    false
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CudaDeviceIdentity {
@@ -154,5 +204,41 @@ mod tests {
         let policy = resolve_cuda_paged_tuning(&identity, unsupported);
         assert!(!policy.flash_attention_allowed);
         assert!(!policy.decode_graph_allowed);
+    }
+
+    #[test]
+    fn fp8_storage_is_dense_until_exact_hopper_cell_is_certified() {
+        let hopper = CudaDeviceIdentity {
+            device_name: Some("H100".into()),
+            compute_capability: Some((9, 0)),
+        };
+        assert_eq!(
+            resolve_cuda_kv_storage_format(&hopper, DType::F16, false).unwrap(),
+            CudaKvStorageFormat::Dense
+        );
+        assert_eq!(
+            resolve_cuda_kv_storage_format(&hopper, DType::BF16, true).unwrap(),
+            CudaKvStorageFormat::Fp8E4M3
+        );
+        assert!(!cuda_fp8_kv_cell_certified(&hopper, DType::BF16));
+    }
+
+    #[test]
+    fn fp8_certificate_fails_closed_without_supported_hardware_or_dtype() {
+        assert!(resolve_cuda_kv_storage_format(
+            &CudaDeviceIdentity::unobserved(),
+            DType::F16,
+            true
+        )
+        .is_err());
+        assert!(resolve_cuda_kv_storage_format(
+            &CudaDeviceIdentity {
+                device_name: Some("H100".into()),
+                compute_capability: Some((9, 0)),
+            },
+            DType::F32,
+            true
+        )
+        .is_err());
     }
 }

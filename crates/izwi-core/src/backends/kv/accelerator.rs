@@ -11,7 +11,8 @@ use crate::runtime::rollout::KvProviderRollout;
 use crate::Result;
 
 use super::cuda_tuning::{
-    observe_cuda_identity, resolve_cuda_paged_tuning, CudaDeviceIdentity, CudaPagedShapeKey,
+    cuda_fp8_kv_cell_certified, observe_cuda_identity, resolve_cuda_kv_storage_format,
+    resolve_cuda_paged_tuning, CudaDeviceIdentity, CudaKvStorageFormat, CudaPagedShapeKey,
 };
 #[cfg(feature = "cuda")]
 use super::KvBackendRuntime;
@@ -496,6 +497,8 @@ pub struct CandleAcceleratorKvArena {
     device: Device,
     optimized_provider_enabled: bool,
     cuda_identity: CudaDeviceIdentity,
+    cuda_kv_storage: CudaKvStorageFormat,
+    storage_dtype: DType,
     layers: RwLock<HashMap<KvLayerBinding, AcceleratorLayerStorage>>,
     resident_capacity_pages: AtomicU32,
     backing_generation: AtomicU64,
@@ -531,6 +534,16 @@ impl CandleAcceleratorKvArena {
         } else {
             CudaDeviceIdentity::unobserved()
         };
+        let cuda_kv_storage = if backend == BackendKind::Cuda {
+            resolve_cuda_kv_storage_format(
+                &cuda_identity,
+                config.dtype,
+                cuda_fp8_kv_cell_certified(&cuda_identity, config.dtype),
+            )?
+        } else {
+            CudaKvStorageFormat::Dense
+        };
+        let storage_dtype = cuda_kv_storage.dtype(config.dtype);
         validate_config(&config, backend, &device)?;
         let support = candle_accelerator_kv_support(backend);
         if !support.in_place_zero || !support.device_page_copy || !support.in_place_slot_write {
@@ -552,12 +565,12 @@ impl CandleAcceleratorKvArena {
             );
             let keys = Tensor::zeros(
                 (common.0, common.1, common.2, layer.key_head_dim as usize),
-                config.dtype,
+                storage_dtype,
                 &device,
             )?;
             let values = Tensor::zeros(
                 (common.0, common.1, common.2, layer.value_head_dim as usize),
-                config.dtype,
+                storage_dtype,
                 &device,
             )?;
             layers.insert(
@@ -579,6 +592,8 @@ impl CandleAcceleratorKvArena {
             device,
             optimized_provider_enabled,
             cuda_identity,
+            cuda_kv_storage,
+            storage_dtype,
             layers: RwLock::new(layers),
             resident_capacity_pages: AtomicU32::new(resident_capacity_pages),
             backing_generation: AtomicU64::new(1),
@@ -1256,7 +1271,7 @@ impl CandleAcceleratorKvArena {
         if self.optimized_provider_enabled
             && tuning.flash_attention_allowed
             && cuda_flash_paged_attention_eligible(
-                self.config.dtype,
+                self.storage_dtype,
                 self.config.page_tokens,
                 layer.key_head_dim,
                 layer.value_head_dim,
@@ -1302,7 +1317,7 @@ impl CandleAcceleratorKvArena {
             args.softcap,
             device_metadata.max_context,
             tuning.decode_partition_tuning,
-            tuning.decode_graph_allowed,
+            tuning.decode_graph_allowed && self.cuda_kv_storage == CudaKvStorageFormat::Dense,
         )?;
         self.last_attention_provider
             .store(KvAttentionProvider::CudaNative.code(), Ordering::Relaxed);
@@ -1438,12 +1453,12 @@ impl KvArena for CandleAcceleratorKvArena {
             let common = (target, self.config.page_tokens as usize, layer.num_kv_heads);
             let keys = Tensor::zeros(
                 (common.0, common.1, common.2, layer.key_head_dim),
-                self.config.dtype,
+                self.storage_dtype,
                 &self.device,
             )?;
             let values = Tensor::zeros(
                 (common.0, common.1, common.2, layer.value_head_dim),
-                self.config.dtype,
+                self.storage_dtype,
                 &self.device,
             )?;
             scatter_rows(&keys, &current_indices, &layer.keys)?;
@@ -1553,8 +1568,8 @@ impl KvArena for CandleAcceleratorKvArena {
                     let mut pool = self.workspace_pool.lock().map_err(|_| {
                         Error::InferenceError("accelerator workspace pool was poisoned".into())
                     })?;
-                    let keys = pool.acquire(&key_shape, self.config.dtype, &self.device)?;
-                    match pool.acquire(&value_shape, self.config.dtype, &self.device) {
+                    let keys = pool.acquire(&key_shape, self.storage_dtype, &self.device)?;
+                    match pool.acquire(&value_shape, self.storage_dtype, &self.device) {
                         Ok(values) => Ok((keys, values)),
                         Err(error) => {
                             pool.discard(keys);
@@ -1716,8 +1731,18 @@ impl KvArena for CandleAcceleratorKvArena {
                 .values
                 .reshape((flat_capacity, layer.num_kv_heads, layer.value_head_dim))?;
         if !slots.flat_slots.is_empty() {
-            scatter_rows(&flat_keys, &slots.device_indices, args.keys)?;
-            scatter_rows(&flat_values, &slots.device_indices, args.values)?;
+            let stored_keys = if self.storage_dtype == self.config.dtype {
+                args.keys.clone()
+            } else {
+                args.keys.to_dtype(self.storage_dtype)?
+            };
+            let stored_values = if self.storage_dtype == self.config.dtype {
+                args.values.clone()
+            } else {
+                args.values.to_dtype(self.storage_dtype)?
+            };
+            scatter_rows(&flat_keys, &slots.device_indices, &stored_keys)?;
+            scatter_rows(&flat_values, &slots.device_indices, &stored_values)?;
             let mut clean = self.clean_pages.lock().map_err(|_| {
                 Error::InferenceError("accelerator KV cleanliness was poisoned".into())
             })?;
@@ -1781,7 +1806,7 @@ impl KvArena for CandleAcceleratorKvArena {
                 )
                 .flash_attention_allowed
             && cuda_flash_paged_attention_eligible(
-                self.config.dtype,
+                self.storage_dtype,
                 self.config.page_tokens,
                 _key_head_dim,
                 _value_head_dim,
