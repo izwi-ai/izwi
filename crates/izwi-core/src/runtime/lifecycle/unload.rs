@@ -23,6 +23,21 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 impl ModelLifecycleController {
+    fn release_resident_slot_and_refresh_capacity(&self, variant: ModelVariant) {
+        self.remove_resident_slot(variant);
+        let physical = self
+            .coordinator
+            .resource_authority()
+            .refresh_physical_capacity_after_release();
+        tracing::debug!(
+            model = %variant,
+            source = ?physical.source,
+            available = ?physical.available,
+            capacity = ?physical.capacity,
+            "Refreshed physical capacity after model release"
+        );
+    }
+
     async fn remove_registry_and_auxiliary_state(&self, variant: ModelVariant) {
         #[cfg(test)]
         self.wait_at_unload_test_barrier().await;
@@ -107,7 +122,7 @@ impl ModelLifecycleController {
         }
         self.model_manager.unload_model(variant).await?;
         self.remove_registry_and_auxiliary_state(variant).await;
-        self.remove_resident_slot(variant);
+        self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
         Ok(())
     }
@@ -184,8 +199,10 @@ impl ModelLifecycleController {
         }
 
         // Dropping the slot is the final step: it releases physical resource
-        // accounting only after every published handle has been removed.
-        self.remove_resident_slot(variant);
+        // accounting only after every published handle has been removed. A
+        // synchronous post-release observation replaces any cached device
+        // sample taken while the model was still resident.
+        self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
         Ok(())
     }

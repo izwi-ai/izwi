@@ -814,11 +814,27 @@ impl SharedHostUnifiedCapacityProvider {
 
 impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
     fn snapshot(&self) -> PhysicalCapacitySnapshot {
+        self.combined_snapshot(false)
+    }
+
+    fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
+        self.combined_snapshot(true)
+    }
+}
+
+impl SharedHostUnifiedCapacityProvider {
+    fn combined_snapshot(&self, refresh_after_release: bool) -> PhysicalCapacitySnapshot {
         let providers = self
             .providers
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut snapshots = providers.values().map(|provider| provider.snapshot());
+        let mut snapshots = providers.values().map(|provider| {
+            if refresh_after_release {
+                provider.refresh_after_release()
+            } else {
+                provider.snapshot()
+            }
+        });
         let Some(first) = snapshots.next() else {
             return PhysicalCapacitySnapshot {
                 capacity: shared_host_unified_vector(ResourceAmount::Unknown),
@@ -1232,13 +1248,33 @@ impl CapacitySampleCache {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(snapshot) = snapshot {
+        if let Some(snapshot) =
+            snapshot.filter(|_| state.sample.is_none_or(|current| now >= current.sampled_at))
+        {
             state.sample = Some(CachedCapacitySample {
                 snapshot,
                 sampled_at: now,
             });
         }
         state.refresh_in_flight = false;
+        drop(state);
+        self.refreshed.notify_all();
+    }
+
+    fn publish_sample(&self, snapshot: PhysicalCapacitySnapshot, sampled_at: Instant) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let should_publish = state
+            .sample
+            .is_none_or(|current| sampled_at >= current.sampled_at);
+        if should_publish {
+            state.sample = Some(CachedCapacitySample {
+                snapshot,
+                sampled_at,
+            });
+        }
         drop(state);
         self.refreshed.notify_all();
     }
@@ -1432,8 +1468,9 @@ impl DeviceCapacityProvider {
             .name(format!("izwi-capacity-{:?}", probe.backend).to_lowercase())
             .spawn(move || {
                 while requests.recv().is_ok() {
+                    let sampled_at = Instant::now();
                     let sample = guarded_capacity_sample(|| refresh_probe.sample());
-                    refresh_cache.finish_refresh(sample, Instant::now());
+                    refresh_cache.finish_refresh(sample, sampled_at);
                 }
             })
             .map_err(|err| {
@@ -1472,6 +1509,14 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
             .snapshot
             .or_else(|| self.cache.wait_for_refresh(CAPACITY_REFRESH_WAIT))
             .unwrap_or_else(|| self.probe.unavailable_snapshot())
+    }
+
+    fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
+        let sampled_at = Instant::now();
+        let snapshot = guarded_capacity_sample(|| self.probe.sample())
+            .unwrap_or_else(|| self.probe.unavailable_snapshot());
+        self.cache.publish_sample(snapshot, sampled_at);
+        snapshot
     }
 }
 
@@ -2182,6 +2227,27 @@ Pages free: 10.\n";
         let concurrent = cache.decision(expired_at + Duration::from_millis(1));
         assert_eq!(concurrent.snapshot, None);
         assert!(!concurrent.request_refresh);
+    }
+
+    #[test]
+    fn older_async_refresh_cannot_overwrite_post_release_sample() {
+        let started = Instant::now();
+        let initial = host_capacity_snapshot(10);
+        let stale_worker_sample = host_capacity_snapshot(20);
+        let released = host_capacity_snapshot(100);
+        let cache = CapacitySampleCache::new(Some(initial), started);
+        let stale_worker_started = started + Duration::from_millis(1);
+        let release_sampled_at = started + Duration::from_millis(2);
+
+        cache.publish_sample(released, release_sampled_at);
+        cache.finish_refresh(Some(stale_worker_sample), stale_worker_started);
+
+        assert_eq!(
+            cache
+                .decision(release_sampled_at + Duration::from_millis(1))
+                .snapshot,
+            Some(released)
+        );
     }
 
     #[test]

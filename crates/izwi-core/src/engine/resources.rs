@@ -413,6 +413,13 @@ pub struct PhysicalCapacitySnapshot {
 
 pub trait PhysicalCapacityProvider: std::fmt::Debug + Send + Sync {
     fn snapshot(&self) -> PhysicalCapacitySnapshot;
+
+    /// Refresh physical headroom after an owner has dropped device-backed
+    /// allocations. Cached providers override this so the next admission does
+    /// not inherit a pre-release sample.
+    fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
+        self.snapshot()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +516,20 @@ impl ResourceAuthority {
             reserved: state.ledger.used(),
             reservations: state.owners.len(),
         }
+    }
+
+    /// Publish a post-release physical observation before another guarded
+    /// reservation is admitted. The reservation ledger remains authoritative;
+    /// this only prevents a cached provider from hiding newly freed memory.
+    pub(crate) fn refresh_physical_capacity_after_release(&self) -> PhysicalCapacitySnapshot {
+        let physical =
+            self.normalized_physical_snapshot_from(self.provider.refresh_after_release());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.ledger.update_capacity(physical.capacity);
+        physical
     }
 
     pub fn reserve(
@@ -801,7 +822,13 @@ impl ResourceAuthority {
     }
 
     fn normalized_physical_snapshot(&self) -> PhysicalCapacitySnapshot {
-        let physical = self.provider.snapshot();
+        self.normalized_physical_snapshot_from(self.provider.snapshot())
+    }
+
+    fn normalized_physical_snapshot_from(
+        &self,
+        physical: PhysicalCapacitySnapshot,
+    ) -> PhysicalCapacitySnapshot {
         PhysicalCapacitySnapshot {
             capacity: normalize_physical_resource_domains(physical.capacity, self.domain_policy),
             available: normalize_physical_resource_domains(physical.available, self.domain_policy),
@@ -958,6 +985,33 @@ mod tests {
         available: AtomicU64,
     }
 
+    #[derive(Debug)]
+    struct ReleaseAwareProvider {
+        capacity: u64,
+        cached_available: AtomicU64,
+        released_available: AtomicU64,
+        refreshes: AtomicU64,
+    }
+
+    impl PhysicalCapacityProvider for ReleaseAwareProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: slots(self.capacity),
+                available: slots(self.cached_available.load(Ordering::Acquire)),
+                source: CapacitySource::Test,
+            }
+        }
+
+        fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
+            self.refreshes.fetch_add(1, Ordering::AcqRel);
+            self.cached_available.store(
+                self.released_available.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            self.snapshot()
+        }
+    }
+
     impl LiveProvider {
         fn set_available(&self, available: u64) {
             self.available.store(available, Ordering::Release);
@@ -1047,6 +1101,35 @@ mod tests {
         assert_eq!(authority.snapshot().reserved, slots(2));
         drop((model, request));
         assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn post_release_refresh_makes_freed_capacity_visible_to_next_admission() {
+        let provider = Arc::new(ReleaseAwareProvider {
+            capacity: 2,
+            cached_available: AtomicU64::new(0),
+            released_available: AtomicU64::new(2),
+            refreshes: AtomicU64::new(0),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+
+        assert!(authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "before-release"),
+                slots(1),
+            )
+            .is_err());
+        let refreshed = authority.refresh_physical_capacity_after_release();
+        assert_eq!(refreshed.available, slots(2));
+        assert_eq!(provider.refreshes.load(Ordering::Acquire), 1);
+
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "after-release"),
+                slots(1),
+            )
+            .unwrap();
+        drop(lease);
     }
 
     #[test]
