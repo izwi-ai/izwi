@@ -100,6 +100,7 @@ impl ModelLifecycleController {
         let _ = self.core_engine.abort_requests_for_variant(variant).await;
         self.purge_executor_model_cache(variant).await?;
         if let Some(model_instance) = model_instance {
+            self.retire_loaded_model_bundle(variant, model_instance)?;
             self.core_engine
                 .unload_managed_model_cache(model_instance)
                 .await?;
@@ -144,12 +145,16 @@ impl ModelLifecycleController {
             return Err(error);
         }
         if let Some(model_instance) = model_instance {
+            if let Err(error) = self.retire_loaded_model_bundle(variant, model_instance) {
+                self.mark_slot_cleanup_required(variant);
+                return Err(error);
+            }
             if let Err(error) = self
                 .core_engine
                 .unload_managed_model_cache(model_instance)
                 .await
             {
-                self.restore_ready_slot_after_failed_unload(variant);
+                self.mark_slot_cleanup_required(variant);
                 return Err(error);
             }
         }
@@ -158,7 +163,7 @@ impl ModelLifecycleController {
         // handle. The authoritative slot remains Unloading and retains its
         // resource lease until the handle is gone.
         if let Err(error) = self.model_manager.unload_model(variant).await {
-            self.restore_ready_slot_after_failed_unload(variant);
+            self.mark_slot_cleanup_required(variant);
             return Err(error);
         }
 
@@ -315,7 +320,10 @@ mod tests {
         CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ReservationClass,
         ReservationOwner, ResourceAmount, ResourceAuthority, ResourceVector,
     };
+    use crate::kv::InferenceStateCapability;
+    use crate::runtime::adapters::{CapabilityKind, LoadedStatePublication};
     use crate::runtime::lifecycle::controller::ResidentPhase;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Barrier;
@@ -336,6 +344,87 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn managed_bundle_retirement_releases_state_and_model_claims_across_reload_cycles() {
+        let models_dir = std::env::temp_dir().join(format!(
+            "izwi-runtime-managed-reload-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Qwen306B;
+        let authority = runtime.coordinator.resource_authority();
+        let contract = crate::kv::test_contract();
+
+        for cycle in 0..3 {
+            let model_lease = authority
+                .track_model(
+                    format!("managed-reload-model-{cycle}"),
+                    ResourceVector::zero(),
+                )
+                .unwrap();
+            let model_instance = runtime
+                .model_lifecycle
+                .install_loading_slot(variant, model_lease)
+                .unwrap();
+            let physical = runtime
+                .core_engine
+                .load_managed_model_cache(
+                    model_instance,
+                    &InferenceStateCapability::Managed(contract.clone()),
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("managed physical state");
+            let bundle = runtime
+                .model_lifecycle
+                .bind_loaded_model_bundle_with_state_publications(
+                    variant,
+                    model_instance,
+                    HashMap::from([(
+                        CapabilityKind::Chat,
+                        LoadedStatePublication::ManagedV2 {
+                            contract: contract.clone(),
+                            physical: physical.clone(),
+                        },
+                    )]),
+                )
+                .unwrap();
+            runtime
+                .model_lifecycle
+                .mark_slot_ready_for_instance(variant, model_instance)
+                .unwrap();
+            drop(bundle);
+            drop(physical);
+
+            runtime
+                .model_lifecycle
+                .begin_unloading_slot(variant)
+                .unwrap();
+            assert!(runtime
+                .model_lifecycle
+                .retire_loaded_model_bundle(variant, model_instance)
+                .unwrap());
+            assert!(runtime
+                .core_engine
+                .unload_managed_model_cache(model_instance)
+                .await
+                .unwrap());
+            assert_eq!(authority.snapshot().reservations, 1);
+            assert!(runtime.model_lifecycle.remove_resident_slot(variant));
+            assert_eq!(authority.snapshot().reservations, 0);
+            assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+        }
+
+        std::fs::remove_dir_all(models_dir).unwrap();
     }
 
     #[tokio::test]

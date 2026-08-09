@@ -450,6 +450,43 @@ impl ModelLifecycleController {
         }
     }
 
+    /// Remove the immutable execution/state bundle before physical arenas are
+    /// drained. Retiring the publication first prevents new adapter selection
+    /// from racing teardown and drops any publication-owned state handles
+    /// before their authoritative managers perform ownership checks.
+    pub(super) fn retire_loaded_model_bundle(
+        &self,
+        variant: ModelVariant,
+        model_instance_id: ModelInstanceId,
+    ) -> Result<bool> {
+        let bundle = {
+            let mut state = self.state();
+            let slot = state.residents.get_mut(&variant).ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "model {variant} lost its lifecycle slot before physical-state retirement"
+                ))
+            })?;
+            if slot.model_instance_id != model_instance_id {
+                return Err(Error::ModelLoadError(format!(
+                    "model {variant} changed generation before physical-state retirement"
+                )));
+            }
+            if !matches!(
+                slot.phase,
+                ResidentPhase::Loading | ResidentPhase::Unloading | ResidentPhase::CleanupRequired
+            ) {
+                return Err(Error::ModelLoadError(format!(
+                    "model {variant} cannot retire its execution bundle while {:?}",
+                    slot.phase
+                )));
+            }
+            slot.bundle.take()
+        };
+        let retired = bundle.is_some();
+        drop(bundle);
+        Ok(retired)
+    }
+
     pub(super) fn remove_resident_slot(&self, variant: ModelVariant) -> bool {
         let removed = self.state().residents.remove(&variant);
         let was_resident = removed.is_some();
