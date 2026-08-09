@@ -2353,6 +2353,57 @@ mod tests {
         contract
     }
 
+    fn qwen35_9b_tensor_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
+        let recurrent_domain = CacheDomainId::new(2);
+        let convolution_domain = CacheDomainId::new(3);
+        let tensor_domain = |domain: CacheDomainId, role: TensorRole, elements: u64| {
+            StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: domain,
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: crate::kv::v2::PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: crate::kv::v2::CheckpointPolicy::Transactional,
+                },
+                // Qwen3.5 9B has 24 linear-attention layers. Each recurrent
+                // layer owns 128 * 4,096 F32 cells and a 24,576-cell
+                // convolution history.
+                components: (1..=24)
+                    .map(|id| TensorComponentSpec {
+                        id: StateComponentId::new(id),
+                        role: role.clone(),
+                        shape: BoundedShape {
+                            dimensions: vec![ShapeDimension {
+                                axis: ShapeAxis::Hidden,
+                                extent: ShapeExtent::Fixed { value: elements },
+                            }],
+                        },
+                        accepted_dtypes: vec![KvStorageDType::F32],
+                    })
+                    .collect(),
+            })
+        };
+        contract.domains.push(tensor_domain(
+            recurrent_domain,
+            TensorRole::RecurrentHidden,
+            524_288,
+        ));
+        contract.domains.push(tensor_domain(
+            convolution_domain,
+            TensorRole::ConvolutionState,
+            24_576,
+        ));
+        contract.groups = vec![StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(1),
+            domains: vec![CacheDomainId::new(1), recurrent_domain, convolution_domain],
+            prefix_shareable: false,
+        }];
+        contract.validate().unwrap();
+        contract
+    }
+
     fn heterogeneous_paged_contract() -> InferenceStateContract {
         let mut contract = test_contract();
         let StateDomainSpec::PagedAttention(first) = &contract.domains[0] else {
@@ -2538,7 +2589,7 @@ mod tests {
     #[test]
     fn long_context_pages_do_not_multiply_retained_tensor_sequences() {
         let state_plan = negotiate_state_plan(
-            &composite_tensor_contract(),
+            &qwen35_9b_tensor_contract(),
             &StateBackendPlanRequest {
                 backend: BackendKind::Cpu,
                 device_ordinal: None,
@@ -2562,6 +2613,19 @@ mod tests {
         assert_eq!(tensor.sequence_capacity(), 16);
         assert_eq!(tensor.transaction_capacity(), 16);
         assert_eq!(tensor.authorized_bytes(), tensor.per_sequence_bytes() * 32);
+        assert_eq!(tensor.per_sequence_bytes(), 52_690_944);
+        let initial_paged_bytes = 128 * 1024 * 1024;
+        let legacy_claim = tensor
+            .per_sequence_bytes()
+            .checked_mul(4_096 + 16)
+            .unwrap()
+            .checked_add(initial_paged_bytes)
+            .unwrap();
+        assert_eq!(legacy_claim, 216_799_379_456);
+        assert_eq!(
+            tensor.authorized_bytes() + initial_paged_bytes,
+            1_820_327_936
+        );
         let non_paged = &state_plan.non_paged[0];
         assert_eq!(
             allocation
