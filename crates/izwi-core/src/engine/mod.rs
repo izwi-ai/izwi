@@ -25,6 +25,8 @@
 //! ```
 
 mod cache;
+#[cfg(test)]
+pub(crate) use cache::managed::{plan_managed_state_capacity, ManagedStateCapacityRequest};
 mod config;
 mod core;
 pub mod execution;

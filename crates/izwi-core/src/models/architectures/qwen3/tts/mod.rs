@@ -2717,6 +2717,9 @@ pub fn load_model(model_path: &Path, device: DeviceProfile) -> Result<Qwen3TtsMo
 mod tests {
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind};
+    use crate::engine::{
+        plan_managed_state_capacity, ManagedStateCapacityRequest, ModelInstanceId,
+    };
 
     use super::config::{CodePredictorConfig, TalkerConfig};
     use super::*;
@@ -2881,6 +2884,82 @@ mod tests {
             .components
             .iter()
             .all(|component| component.accepted_dtypes == vec![StateDType::F32]));
+    }
+
+    #[test]
+    fn cuda_context_pages_do_not_multiply_qwen_tts_retained_rows() {
+        let full =
+            qwen3_tts_inference_state_contract(&cache_test_config(), DType::F16, DType::F32, 64)
+                .expect("managed contract");
+        let mut retained = InferenceStateContract {
+            abi: full.abi,
+            domains: vec![full.domains[0].clone()],
+            groups: vec![full.groups[0].clone()],
+        };
+        let StateDomainSpec::PagedAttention(talker) = &mut retained.domains[0] else {
+            panic!("talker domain must be paged attention");
+        };
+        talker.header.prefix = PrefixPolicy::Disabled;
+        talker.header.checkpoint = CheckpointPolicy::Transactional;
+        retained.groups[0].prefix_shareable = false;
+        let retained =
+            qwen3_tts_retained_state_contract(retained, &cache_test_config(), DType::F16)
+                .expect("retained state contract");
+        let state_plan = negotiate_state_plan(
+            &retained,
+            &StateBackendPlanRequest {
+                // Capacity planning is backend-pure. CPU lets this regression
+                // verify CUDA geometry on a host without an NVIDIA device.
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: Some(StateDType::F16),
+            },
+        )
+        .expect("state plan");
+        let (allocation, tensor) = plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(804),
+            ManagedStateCapacityRequest {
+                total_paged_pages: 512,
+                logical_token_reach: Some(32_768),
+                max_transaction_rows: 16,
+            },
+        )
+        .expect("capacity plan");
+        let tensor = tensor.expect("Qwen3 TTS has retained tensor state");
+
+        assert_eq!(tensor.sequence_capacity(), 16);
+        assert_eq!(tensor.transaction_capacity(), 16);
+        assert_eq!(tensor.per_sequence_bytes(), 67_119_104);
+        assert_eq!(tensor.authorized_bytes(), 2_147_811_328);
+
+        // Before the shared page/row fix, the 512 pages needed by one 32K
+        // context were treated as 512 retained sequences and added to the 16
+        // transaction rows. That 35.4 GB state claim alone can reject a model
+        // load on a 48 GB L40S after weights are resident.
+        let legacy_authorization = tensor.per_sequence_bytes() * (512 + 16);
+        assert_eq!(legacy_authorization, 35_438_886_912);
+        assert_eq!(
+            allocation
+                .group_capacity(
+                    state_plan.paged_attention[0].group,
+                    state_plan.paged_attention[0].domain,
+                )
+                .expect("paged capacity")
+                .strategy
+                .maximum_blocks(),
+            512
+        );
+        let non_paged = &state_plan.non_paged[0];
+        assert_eq!(
+            allocation
+                .group_capacity(non_paged.group(), non_paged.domain())
+                .expect("tensor capacity")
+                .strategy
+                .maximum_blocks(),
+            32
+        );
     }
 
     #[test]

@@ -1591,7 +1591,9 @@ pub(super) fn managed_device_ordinal(device: &Device) -> Option<u32> {
     }
 }
 
-fn plan_managed_state_capacity(
+// Kept crate-visible so model-owned contract tests can run the exact shared
+// capacity planner without allocating a backend arena.
+pub(crate) fn plan_managed_state_capacity(
     state_plan: &ResolvedStatePlan,
     model_instance: ModelInstanceId,
     request: ManagedStateCapacityRequest,
