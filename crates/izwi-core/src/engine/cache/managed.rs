@@ -1651,11 +1651,15 @@ fn plan_managed_state_capacity(
     };
     let mut groups =
         Vec::with_capacity(state_plan.paged_attention.len() + state_plan.non_paged.len());
-    let mut sequence_capacity = u32::MAX;
+    let mut paged_sequence_capacity = u32::MAX;
     for group in &state_plan.paged_attention {
         let blocks = u32::try_from(token_reach.div_ceil(u64::from(group.page_tokens)))
             .map_err(|_| Error::InvalidInput("managed KV group capacity exceeds u32".into()))?;
-        sequence_capacity = sequence_capacity.min(blocks);
+        // One retained sequence needs at least one page in every paged group,
+        // but a page is not a sequence slot. In particular, the thousands of
+        // pages needed for one long-context request must never multiply the
+        // per-sequence recurrent/convolution state authorization.
+        paged_sequence_capacity = paged_sequence_capacity.min(blocks);
         let strategy = managed_paged_capacity_strategy(state_plan.backend, blocks);
         groups.push(GroupCapacityRequest {
             group: group.group,
@@ -1663,7 +1667,8 @@ fn plan_managed_state_capacity(
             strategy,
         });
     }
-    let transaction_capacity = request.max_transaction_rows.min(sequence_capacity);
+    let sequence_capacity = request.max_transaction_rows.min(paged_sequence_capacity);
+    let transaction_capacity = sequence_capacity;
     let lazy_blocks = sequence_capacity
         .checked_add(transaction_capacity)
         .ok_or_else(|| Error::InvalidInput("managed tensor state capacity overflow".into()))?;
@@ -2517,7 +2522,7 @@ mod tests {
             .validate_against_allocation(runtime.state_plan_v2(), runtime.allocation_plan())
             .unwrap();
         let tensor = runtime.tensor_state().unwrap().capacity();
-        assert_eq!(tensor.sequence_capacity(), 4);
+        assert_eq!(tensor.sequence_capacity(), 2);
         assert_eq!(tensor.transaction_capacity(), 2);
         let non_paged = &runtime.state_plan_v2().non_paged[0];
         assert_eq!(
@@ -2526,7 +2531,55 @@ mod tests {
                 .group_capacity(non_paged.group(), non_paged.domain())
                 .unwrap()
                 .strategy,
-            CapacityStrategy::BoundedLazy { max_blocks: 6 }
+            CapacityStrategy::BoundedLazy { max_blocks: 4 }
+        );
+    }
+
+    #[test]
+    fn long_context_pages_do_not_multiply_retained_tensor_sequences() {
+        let state_plan = negotiate_state_plan(
+            &composite_tensor_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let (allocation, tensor) = plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(803),
+            ManagedStateCapacityRequest {
+                total_paged_pages: 4_096,
+                logical_token_reach: Some(262_144),
+                max_transaction_rows: 16,
+            },
+        )
+        .unwrap();
+        let tensor = tensor.expect("composite state has retained tensors");
+
+        assert_eq!(tensor.sequence_capacity(), 16);
+        assert_eq!(tensor.transaction_capacity(), 16);
+        assert_eq!(tensor.authorized_bytes(), tensor.per_sequence_bytes() * 32);
+        let non_paged = &state_plan.non_paged[0];
+        assert_eq!(
+            allocation
+                .group_capacity(non_paged.group(), non_paged.domain())
+                .unwrap()
+                .strategy,
+            CapacityStrategy::BoundedLazy { max_blocks: 32 }
+        );
+        assert_eq!(
+            allocation
+                .group_capacity(
+                    state_plan.paged_attention[0].group,
+                    state_plan.paged_attention[0].domain,
+                )
+                .unwrap()
+                .strategy
+                .maximum_blocks(),
+            4_096
         );
     }
 
