@@ -156,6 +156,12 @@ pub struct ManagedKvModelRuntimeSnapshot {
     pub state_plan_v2_fingerprint: String,
     pub backend: BackendKind,
     pub device_ordinal: Option<u32>,
+    /// Resident paged-attention backing observed from the backend arena.
+    pub resident_paged_bytes: u64,
+    /// Maximum retained tensor-state envelope authorized for committed and
+    /// staged rows. Tensor values are materialized on demand.
+    pub authorized_tensor_bytes: u64,
+    /// Compatibility total: resident paged bytes plus authorized tensor bytes.
     pub physical_bytes: u64,
     pub registered_sessions: u64,
     pub arenas: Vec<ManagedKvArenaRuntimeSnapshot>,
@@ -166,6 +172,9 @@ pub struct ManagedKvRuntimeTotalsSnapshot {
     pub models: u64,
     pub arenas: u64,
     pub registered_sessions: u64,
+    pub resident_paged_bytes: u64,
+    pub authorized_tensor_bytes: u64,
+    /// Compatibility total: resident paged bytes plus authorized tensor bytes.
     pub physical_bytes: u64,
     pub coordinator: ManagedKvCoordinatorSnapshot,
     pub operations: ManagedKvOperationSnapshot,
@@ -182,7 +191,7 @@ pub struct ManagedKvRuntimeSnapshot {
 impl Default for ManagedKvRuntimeSnapshot {
     fn default() -> Self {
         Self {
-            memory_accounting: "physical_arena_backing",
+            memory_accounting: "resident_paged_plus_authorized_tensor",
             totals: ManagedKvRuntimeTotalsSnapshot::default(),
             counters: ManagedKvTelemetrySnapshot::default(),
             models: Vec::new(),
@@ -235,11 +244,18 @@ impl ManagedKvModelRuntime {
     }
 
     pub(crate) fn physical_bytes(&self) -> u64 {
-        self.arenas
-            .values()
-            .fold(self.non_paged_physical_bytes, |total, arena| {
-                total.saturating_add(arena.resident_bytes())
-            })
+        self.resident_paged_bytes()
+            .saturating_add(self.authorized_tensor_bytes())
+    }
+
+    pub(crate) fn resident_paged_bytes(&self) -> u64 {
+        self.arenas.values().fold(0_u64, |total, arena| {
+            total.saturating_add(arena.resident_bytes())
+        })
+    }
+
+    pub(crate) const fn authorized_tensor_bytes(&self) -> u64 {
+        self.non_paged_physical_bytes
     }
 }
 
@@ -386,6 +402,12 @@ impl ManagedKvCacheManager {
                 totals.physical_bytes = totals
                     .physical_bytes
                     .saturating_add(state.runtime.physical_bytes());
+                totals.resident_paged_bytes = totals
+                    .resident_paged_bytes
+                    .saturating_add(state.runtime.resident_paged_bytes());
+                totals.authorized_tensor_bytes = totals
+                    .authorized_tensor_bytes
+                    .saturating_add(state.runtime.authorized_tensor_bytes());
                 let mut arenas = state
                     .runtime
                     .plan
@@ -465,6 +487,8 @@ impl ManagedKvCacheManager {
                         .to_string(),
                     backend: state.runtime.plan.backend,
                     device_ordinal: state.runtime.plan.device_ordinal,
+                    resident_paged_bytes: state.runtime.resident_paged_bytes(),
+                    authorized_tensor_bytes: state.runtime.authorized_tensor_bytes(),
                     physical_bytes: state.runtime.physical_bytes(),
                     registered_sessions: usize_to_u64(state.registered_sessions.len()),
                     arenas,
@@ -475,7 +499,7 @@ impl ManagedKvCacheManager {
         let mut counters = self.telemetry.snapshot();
         counters.prefix_retained_pages = totals.coordinator.prefix_refs;
         ManagedKvRuntimeSnapshot {
-            memory_accounting: "physical_arena_backing",
+            memory_accounting: "resident_paged_plus_authorized_tensor",
             totals,
             counters,
             models,
@@ -2608,6 +2632,22 @@ mod tests {
                 .strategy,
             CapacityStrategy::BoundedLazy { max_blocks: 4 }
         );
+        let snapshot = manager.runtime_snapshot();
+        assert_eq!(
+            snapshot.totals.resident_paged_bytes,
+            runtime.resident_paged_bytes()
+        );
+        assert_eq!(
+            snapshot.totals.authorized_tensor_bytes,
+            tensor.authorized_bytes()
+        );
+        assert_eq!(
+            snapshot.totals.physical_bytes,
+            snapshot
+                .totals
+                .resident_paged_bytes
+                .saturating_add(snapshot.totals.authorized_tensor_bytes)
+        );
     }
 
     #[test]
@@ -2886,10 +2926,18 @@ mod tests {
             .expect("reservation");
 
         let prepared = manager.runtime_snapshot();
-        assert_eq!(prepared.memory_accounting, "physical_arena_backing");
+        assert_eq!(
+            prepared.memory_accounting,
+            "resident_paged_plus_authorized_tensor"
+        );
         assert_eq!(prepared.totals.models, 1);
         assert_eq!(prepared.totals.arenas, 1);
         assert_eq!(prepared.totals.physical_bytes, runtime.physical_bytes());
+        assert_eq!(
+            prepared.totals.resident_paged_bytes,
+            runtime.resident_paged_bytes()
+        );
+        assert_eq!(prepared.totals.authorized_tensor_bytes, 0);
         assert_eq!(prepared.totals.coordinator.capacity_pages, 2);
         assert_eq!(prepared.totals.coordinator.allocated_pages, 1);
         assert_eq!(prepared.totals.coordinator.active_transactions, 1);
@@ -2903,7 +2951,10 @@ mod tests {
         );
 
         let encoded = serde_json::to_value(&prepared).expect("serialize managed KV telemetry");
-        assert_eq!(encoded["memory_accounting"], "physical_arena_backing");
+        assert_eq!(
+            encoded["memory_accounting"],
+            "resident_paged_plus_authorized_tensor"
+        );
         assert_eq!(encoded["totals"]["coordinator"]["allocated_pages"], 1);
         assert_eq!(encoded["models"][0]["backend"], "cpu");
 

@@ -57,7 +57,10 @@ fn public_kv_observability_types_remain_constructible_and_serializable() {
     let snapshot = ManagedKvRuntimeSnapshot::default();
     let json = serde_json::to_value(snapshot).unwrap();
 
-    assert_eq!(json["memory_accounting"], "physical_arena_backing");
+    assert_eq!(
+        json["memory_accounting"],
+        "resident_paged_plus_authorized_tensor"
+    );
     assert!(json["totals"].is_object());
     assert!(json["counters"].is_object());
     assert!(json["models"].is_array());

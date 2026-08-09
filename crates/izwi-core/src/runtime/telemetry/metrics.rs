@@ -1180,7 +1180,7 @@ mod tests {
         let value = serde_json::to_value(snapshot).expect("serialize engine telemetry");
         assert_eq!(
             value["kv_cache"]["memory_accounting"],
-            "physical_arena_backing"
+            "resident_paged_plus_authorized_tensor"
         );
         assert!(value["kv_cache"].get("totals").is_some());
         assert!(value.get("managed_kv_cache").is_none());

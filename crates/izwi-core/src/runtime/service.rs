@@ -2755,7 +2755,7 @@ impl RuntimeService {
             ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
             "accounting",
             &[(
-                "physical_arena_backing",
+                snapshot.kv_cache.memory_accounting,
                 snapshot.kv_cache.totals.physical_bytes,
             )],
         );
@@ -4477,10 +4477,11 @@ mod tests {
         assert!(payload
             .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}"));
         assert!(payload.contains(
-            "izwi_engine_kv_cache_memory_capacity_bytes{accounting=\"physical_arena_backing\"}"
+            "izwi_engine_kv_cache_memory_capacity_bytes{accounting=\"resident_paged_plus_authorized_tensor\"}"
         ));
         assert!(payload.contains("allocated physical KV-cache pages"));
-        assert!(payload.contains("Exact physical backing bytes"));
+        assert!(payload
+            .contains("Resident managed KV pages plus authorized retained tensor-state bytes"));
         assert!(!payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
         assert!(!payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
@@ -4517,7 +4518,7 @@ mod tests {
         assert_eq!(snapshot.coordinator, runtime.coordinator_snapshot());
         assert_eq!(
             snapshot.engine.kv_cache.memory_accounting,
-            "physical_arena_backing"
+            "resident_paged_plus_authorized_tensor"
         );
         assert_eq!(snapshot.engine.kv_cache.totals.models, 0);
         assert_eq!(
@@ -4572,6 +4573,8 @@ mod tests {
             state_plan_v2_fingerprint: format!("state-plan-v2-{model_instance}"),
             backend,
             device_ordinal: Some(0),
+            resident_paged_bytes: 1_280,
+            authorized_tensor_bytes: 0,
             physical_bytes: 1_280,
             registered_sessions: 1,
             arenas: vec![arena(allocated_pages)],

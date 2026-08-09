@@ -118,7 +118,7 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES,
-        description: "Exact physical backing bytes allocated for managed KV arenas.",
+        description: "Resident managed KV pages plus authorized retained tensor-state bytes.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
