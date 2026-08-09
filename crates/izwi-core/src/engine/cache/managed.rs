@@ -288,8 +288,13 @@ pub(crate) struct ManagedStateCapacityRequest {
     /// Exact logical token reach carried by a loaded CUDA model. Portable
     /// backends leave this unset and retain the configured aggregate budget.
     pub(crate) logical_token_reach: Option<u64>,
-    /// Maximum number of concurrently staged retained-state transactions.
-    pub(crate) max_transaction_rows: u32,
+    /// Maximum number of retained sequences that may remain registered while
+    /// the scheduler interleaves their execution.
+    pub(crate) retained_sequence_rows: u32,
+    /// Maximum number of retained-state transactions that may be staged at
+    /// once. This is an independent axis even when the current scheduler sets
+    /// it equal to `retained_sequence_rows`.
+    pub(crate) staged_transaction_rows: u32,
 }
 
 impl Default for ManagedKvCacheManager {
@@ -498,7 +503,10 @@ impl ManagedKvCacheManager {
                 Error::InvalidInput("managed KV page capacity exceeds u32".to_string())
             })?,
             logical_token_reach: None,
-            max_transaction_rows: u32::try_from(capacity_pages).map_err(|_| {
+            retained_sequence_rows: u32::try_from(capacity_pages).map_err(|_| {
+                Error::InvalidInput("managed KV sequence capacity exceeds u32".to_string())
+            })?,
+            staged_transaction_rows: u32::try_from(capacity_pages).map_err(|_| {
                 Error::InvalidInput("managed KV transaction capacity exceeds u32".to_string())
             })?,
         };
@@ -529,7 +537,8 @@ impl ManagedKvCacheManager {
             ManagedStateCapacityRequest {
                 total_paged_pages: capacity_pages,
                 logical_token_reach: None,
-                max_transaction_rows: capacity_pages,
+                retained_sequence_rows: capacity_pages,
+                staged_transaction_rows: capacity_pages,
             },
             page_tokens_hint,
             contract,
@@ -1598,9 +1607,18 @@ pub(crate) fn plan_managed_state_capacity(
     model_instance: ModelInstanceId,
     request: ManagedStateCapacityRequest,
 ) -> Result<(StateRuntimeAllocationPlan, Option<TensorStateCapacity>)> {
-    if request.total_paged_pages == 0 || request.max_transaction_rows == 0 {
+    if request.total_paged_pages == 0
+        || request.retained_sequence_rows == 0
+        || request.staged_transaction_rows == 0
+    {
         return Err(Error::InvalidInput(
-            "managed state capacity requires non-zero page and transaction limits".into(),
+            "managed state capacity requires non-zero page, sequence, and transaction limits"
+                .into(),
+        ));
+    }
+    if request.staged_transaction_rows > request.retained_sequence_rows {
+        return Err(Error::InvalidInput(
+            "managed state transaction rows cannot exceed retained sequence rows".into(),
         ));
     }
     if state_plan.paged_attention.is_empty() {
@@ -1669,8 +1687,8 @@ pub(crate) fn plan_managed_state_capacity(
             strategy,
         });
     }
-    let sequence_capacity = request.max_transaction_rows.min(paged_sequence_capacity);
-    let transaction_capacity = sequence_capacity;
+    let sequence_capacity = request.retained_sequence_rows.min(paged_sequence_capacity);
+    let transaction_capacity = request.staged_transaction_rows.min(sequence_capacity);
     let lazy_blocks = sequence_capacity
         .checked_add(transaction_capacity)
         .ok_or_else(|| Error::InvalidInput("managed tensor state capacity overflow".into()))?;
@@ -2449,7 +2467,8 @@ mod tests {
             ManagedStateCapacityRequest {
                 total_paged_pages: 7,
                 logical_token_reach: None,
-                max_transaction_rows: 3,
+                retained_sequence_rows: 3,
+                staged_transaction_rows: 3,
             },
         )
         .unwrap();
@@ -2492,7 +2511,8 @@ mod tests {
             ManagedStateCapacityRequest {
                 total_paged_pages: 1,
                 logical_token_reach: None,
-                max_transaction_rows: 1,
+                retained_sequence_rows: 1,
+                staged_transaction_rows: 1,
             },
         )
         .is_err());
@@ -2541,7 +2561,8 @@ mod tests {
                     // the largest catalog context.
                     total_paged_pages: 4_096,
                     logical_token_reach: Some(model_context),
-                    max_transaction_rows: 8,
+                    retained_sequence_rows: 8,
+                    staged_transaction_rows: 8,
                 },
             )
             .unwrap();
@@ -2563,7 +2584,8 @@ mod tests {
                 ManagedStateCapacityRequest {
                     total_paged_pages: 4,
                     logical_token_reach: None,
-                    max_transaction_rows: 2,
+                    retained_sequence_rows: 2,
+                    staged_transaction_rows: 2,
                 },
                 16,
                 &CacheCapability::Managed(composite_tensor_contract()),
@@ -2589,6 +2611,85 @@ mod tests {
     }
 
     #[test]
+    fn logical_reach_sequence_rows_and_transaction_rows_are_independent_axes() {
+        let state_plan = negotiate_state_plan(
+            &composite_tensor_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+
+        for (logical_tokens, expected_pages) in [(32_768_u64, 512_u32), (262_144_u64, 4_096_u32)] {
+            let (allocation, tensor) = plan_managed_state_capacity(
+                &state_plan,
+                ModelInstanceId::new(logical_tokens),
+                ManagedStateCapacityRequest {
+                    total_paged_pages: expected_pages,
+                    logical_token_reach: Some(logical_tokens),
+                    retained_sequence_rows: 8,
+                    staged_transaction_rows: 3,
+                },
+            )
+            .unwrap();
+            let tensor = tensor.expect("composite state has retained tensors");
+            assert_eq!(tensor.sequence_capacity(), 8);
+            assert_eq!(tensor.transaction_capacity(), 3);
+            assert_eq!(tensor.authorized_bytes(), tensor.per_sequence_bytes() * 11);
+            assert_eq!(
+                allocation
+                    .group_capacity(
+                        state_plan.paged_attention[0].group,
+                        state_plan.paged_attention[0].domain,
+                    )
+                    .unwrap()
+                    .strategy
+                    .maximum_blocks(),
+                expected_pages
+            );
+            let non_paged = &state_plan.non_paged[0];
+            assert_eq!(
+                allocation
+                    .group_capacity(non_paged.group(), non_paged.domain())
+                    .unwrap()
+                    .strategy,
+                CapacityStrategy::BoundedLazy { max_blocks: 11 }
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_rows_cannot_exceed_retained_sequence_rows() {
+        let state_plan = negotiate_state_plan(
+            &composite_tensor_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let error = plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(805),
+            ManagedStateCapacityRequest {
+                total_paged_pages: 64,
+                logical_token_reach: Some(4_096),
+                retained_sequence_rows: 1,
+                staged_transaction_rows: 2,
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("transaction rows cannot exceed retained sequence rows"));
+    }
+
+    #[test]
     fn long_context_pages_do_not_multiply_retained_tensor_sequences() {
         let state_plan = negotiate_state_plan(
             &qwen35_9b_tensor_contract(),
@@ -2606,7 +2707,8 @@ mod tests {
             ManagedStateCapacityRequest {
                 total_paged_pages: 4_096,
                 logical_token_reach: Some(262_144),
-                max_transaction_rows: 16,
+                retained_sequence_rows: 16,
+                staged_transaction_rows: 16,
             },
         )
         .unwrap();

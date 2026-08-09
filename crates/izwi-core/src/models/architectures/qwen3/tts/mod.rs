@@ -2923,7 +2923,8 @@ mod tests {
             ManagedStateCapacityRequest {
                 total_paged_pages: 512,
                 logical_token_reach: Some(32_768),
-                max_transaction_rows: 16,
+                retained_sequence_rows: 16,
+                staged_transaction_rows: 16,
             },
         )
         .expect("capacity plan");

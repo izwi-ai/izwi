@@ -2740,8 +2740,15 @@ impl EngineCore {
                         Error::InvalidInput("managed KV page budget exceeds u32".into())
                     })?,
                     logical_token_reach: self.managed_cuda_token_reach(logical_context_tokens)?,
-                    max_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
-                        |_| Error::InvalidInput("managed state batch limit exceeds u32".into()),
+                    retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
+                        |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
+                    )?,
+                    staged_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
+                        |_| {
+                            Error::InvalidInput(
+                                "managed state transaction limit exceeds u32".into(),
+                            )
+                        },
                     )?,
                 },
                 self.config.block_size,
@@ -2770,9 +2777,12 @@ impl EngineCore {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
                 logical_token_reach: self.managed_cuda_token_reach(logical_context_tokens)?,
-                max_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(|_| {
-                    Error::InvalidInput("managed state batch limit exceeds u32".into())
-                })?,
+                retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
+                    |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
+                )?,
+                staged_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
+                    |_| Error::InvalidInput("managed state transaction limit exceeds u32".into()),
+                )?,
             },
             self.config.block_size,
             retained_state,
@@ -5869,7 +5879,7 @@ mod tests {
             None,
             4,
         )
-            .unwrap();
+        .unwrap();
         assert!(core
             .add_request(full)
             .expect_err("a full context must leave no output allocation")
