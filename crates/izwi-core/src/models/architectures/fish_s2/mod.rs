@@ -526,7 +526,7 @@ fn sample_semantic_token(
                     let retry_sample = retry.as_ref().and_then(|retry| {
                         device_candidates_cover_top_p(retry, RAS_HIGH_TOP_P).then(|| {
                             sample_device_candidates(
-                                &retry,
+                                retry,
                                 RAS_HIGH_TOP_P,
                                 sampler.rng.r#gen::<f32>(),
                             )

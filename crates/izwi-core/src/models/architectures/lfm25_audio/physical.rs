@@ -199,9 +199,11 @@ fn depthformer_domain(config: &Lfm25AudioDecoderConfig) -> Result<StateDomainSpe
     if config.codebooks == 0
         || config.depthformer_layers == 0
         || config.depthformer_dim == 0
-        || config.depthformer_dim % LFM25_DEPTHFORMER_QUERY_HEADS != 0
-        || (config.depthformer_dim / LFM25_DEPTHFORMER_QUERY_HEADS) % 2 != 0
-        || LFM25_DEPTHFORMER_QUERY_HEADS % LFM25_DEPTHFORMER_KV_HEADS != 0
+        || !config
+            .depthformer_dim
+            .is_multiple_of(LFM25_DEPTHFORMER_QUERY_HEADS)
+        || !(config.depthformer_dim / LFM25_DEPTHFORMER_QUERY_HEADS).is_multiple_of(2)
+        || !LFM25_DEPTHFORMER_QUERY_HEADS.is_multiple_of(LFM25_DEPTHFORMER_KV_HEADS)
     {
         return Err(Error::ModelLoadError(
             "LFM2.5 Audio physical state received invalid Depthformer geometry".into(),

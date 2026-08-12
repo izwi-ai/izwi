@@ -29,7 +29,7 @@ pub fn resample_mono_high_quality(
         return Ok(Vec::new());
     }
 
-    let chunk_frames = samples.len().min(DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES).max(1);
+    let chunk_frames = samples.len().clamp(1, DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES);
     let mut resampler =
         FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, chunk_frames, 1)
             .map_err(|err| Error::AudioError(format!("Failed to construct resampler: {err}")))?;

@@ -1166,7 +1166,7 @@ impl Qwen3AsrModel {
         system_prompt: Option<&str>,
         max_new_tokens: usize,
         managed_cache: Option<PhysicalPagedKvCache>,
-        mut invocation_cache: Option<&mut PhysicalPagedKvCache>,
+        invocation_cache: Option<&mut PhysicalPagedKvCache>,
     ) -> Result<AsrDecodeState> {
         if self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -1252,7 +1252,7 @@ impl Qwen3AsrModel {
             )
         };
         let prefill_started = Instant::now();
-        let forward_cache = if let Some(cache) = invocation_cache.as_deref_mut() {
+        let forward_cache = if let Some(cache) = invocation_cache {
             AsrForwardCache::Managed(cache)
         } else {
             AsrForwardCache::Managed(cache.as_mut().expect("retained Qwen3 ASR cache"))
@@ -1373,7 +1373,7 @@ impl Qwen3AsrModel {
         &self,
         state: &mut AsrDecodeState,
         emit_delta: bool,
-        mut invocation_cache: Option<&mut PhysicalPagedKvCache>,
+        invocation_cache: Option<&mut PhysicalPagedKvCache>,
     ) -> Result<AsrDecodeStep> {
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
@@ -1388,7 +1388,7 @@ impl Qwen3AsrModel {
 
         if let Some(pending) = state.pending_token.take() {
             let next_tensor = Tensor::from_vec(vec![pending], (1, 1), &self.device.device)?;
-            state.unconsumed_output = Some(if let Some(cache) = invocation_cache.as_deref_mut() {
+            state.unconsumed_output = Some(if let Some(cache) = invocation_cache {
                 self.text_model
                     .forward_managed(&next_tensor, state.pos, cache)?
             } else {
@@ -1895,16 +1895,12 @@ fn resolve_qwen_asr_gguf_path(model_dir: &Path, variant: ModelVariant) -> Option
         }
     }
 
-    for candidate in [
+    [
         model_dir.join("qwen3_asr_0.6b_q8_0.gguf"),
         model_dir.join("qwen3_asr_1.7b_q8_0.gguf"),
-    ] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
 }
 
 fn qwen_asr_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
@@ -2428,7 +2424,7 @@ fn validate_quantization_config(config: &Qwen3AsrConfig) -> Result<()> {
     let quant = config
         .quantization_config
         .as_ref()
-        .or_else(|| config.quantization.as_ref());
+        .or(config.quantization.as_ref());
     let Some(quant) = quant else {
         return Ok(());
     };
@@ -2680,10 +2676,10 @@ fn split_language_prefixed_output(rest: &str) -> Option<(Option<String>, String)
 
     // Fallback for GGUF decode where `<asr_text>` is not in tokenizer vocab and
     // the language token glues directly to text, e.g. "EnglishThe quick ...".
-    let mut chars = rest.char_indices().peekable();
+    let chars = rest.char_indices().peekable();
     let mut split_idx = None;
     let mut prev_is_lower = false;
-    while let Some((idx, ch)) = chars.next() {
+    for (idx, ch) in chars {
         if idx == 0 {
             prev_is_lower = ch.is_ascii_lowercase();
             continue;

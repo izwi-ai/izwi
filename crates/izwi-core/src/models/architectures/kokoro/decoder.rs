@@ -159,35 +159,12 @@ impl KokoroDecoder {
             root.pp("encode"),
         )?;
 
-        let mut decode = Vec::with_capacity(4);
-        decode.push(AdainResBlk1d::load(
-            1024 + 2 + 64,
-            1024,
-            style_dim,
-            false,
-            root.pp("decode.0"),
-        )?);
-        decode.push(AdainResBlk1d::load(
-            1024 + 2 + 64,
-            1024,
-            style_dim,
-            false,
-            root.pp("decode.1"),
-        )?);
-        decode.push(AdainResBlk1d::load(
-            1024 + 2 + 64,
-            1024,
-            style_dim,
-            false,
-            root.pp("decode.2"),
-        )?);
-        decode.push(AdainResBlk1d::load(
-            1024 + 2 + 64,
-            512,
-            style_dim,
-            true,
-            root.pp("decode.3"),
-        )?);
+        let decode = vec![
+            AdainResBlk1d::load(1024 + 2 + 64, 1024, style_dim, false, root.pp("decode.0"))?,
+            AdainResBlk1d::load(1024 + 2 + 64, 1024, style_dim, false, root.pp("decode.1"))?,
+            AdainResBlk1d::load(1024 + 2 + 64, 1024, style_dim, false, root.pp("decode.2"))?,
+            AdainResBlk1d::load(1024 + 2 + 64, 512, style_dim, true, root.pp("decode.3"))?,
+        ];
 
         let conv_stride2_cfg = Conv1dConfig {
             padding: 1,
@@ -392,7 +369,7 @@ impl KokoroIstftGenerator {
                     .iter()
                     .copied()
                     .product::<usize>();
-                let padding = (stride_f0 + 1) / 2;
+                let padding = stride_f0.div_ceil(2);
                 noise_convs.push(load_plain_conv1d(
                     vb.pp(format!("noise_convs.{i}")),
                     Conv1dConfig {
@@ -514,7 +491,7 @@ impl KokoroIstftGenerator {
                 log_kokoro_profile(&format!("generator.stage.{i}.leaky_relu"), t.elapsed());
             }
             let t_stage_branches = if profile { Some(Instant::now()) } else { None };
-            let (x_up, x_source) = self.run_stage_branches(i, &x, &har, style)?;
+            let (x_up, x_source) = self.run_stage_branches(i, &x, har, style)?;
             if let Some(t) = t_stage_branches {
                 sync_kokoro_profile_tensor(&x_up);
                 sync_kokoro_profile_tensor(&x_source);

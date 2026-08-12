@@ -17,32 +17,24 @@ use std::time::Instant;
 use uuid::Uuid;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RequestPriority {
     Background,
+    #[default]
     Normal,
     Interactive,
     Critical,
 }
 
-impl Default for RequestPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RuntimeStreamPolicy {
+    #[default]
     FailOnFull,
-    BlockWithDeadline { timeout_ms: u64 },
+    BlockWithDeadline {
+        timeout_ms: u64,
+    },
     DropNewest,
-}
-
-impl Default for RuntimeStreamPolicy {
-    fn default() -> Self {
-        Self::FailOnFull
-    }
 }
 
 impl From<RuntimeStreamPolicy> for EngineStreamPolicy {
@@ -674,10 +666,14 @@ mod tests {
             role: ChatRole::User,
             content: "hello".to_string(),
         }];
-        let mut params = GenerationParams::default();
-        params.max_tokens = 12;
-        let mut chat_config = ChatRequestConfig::default();
-        chat_config.enable_thinking = Some(false);
+        let params = GenerationParams {
+            max_tokens: 12,
+            ..Default::default()
+        };
+        let chat_config = ChatRequestConfig {
+            enable_thinking: Some(false),
+            ..Default::default()
+        };
 
         let runtime_request = ChatRuntimeRequest::from_messages(
             ModelVariant::Qwen38BGguf,

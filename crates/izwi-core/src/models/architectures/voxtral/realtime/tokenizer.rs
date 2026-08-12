@@ -111,7 +111,7 @@ impl AudioConfig {
     /// Compute number of audio tokens for a given raw audio length.
     pub fn num_audio_tokens(&self, audio_length: usize) -> usize {
         let samples_per_frame = self.sampling_rate / self.frame_rate as usize;
-        (audio_length + samples_per_frame - 1) / samples_per_frame
+        audio_length.div_ceil(samples_per_frame)
     }
 
     pub fn raw_audio_length_per_tok(&self) -> usize {

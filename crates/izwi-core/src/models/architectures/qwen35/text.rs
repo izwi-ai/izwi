@@ -338,7 +338,8 @@ impl Qwen35TextModel {
                 cfg.attention_key_length, cfg.attention_value_length
             )));
         }
-        if cfg.ssm_time_step_rank == 0 || cfg.ssm_inner_size % cfg.ssm_time_step_rank != 0 {
+        if cfg.ssm_time_step_rank == 0 || !cfg.ssm_inner_size.is_multiple_of(cfg.ssm_time_step_rank)
+        {
             return Err(Error::ModelLoadError(format!(
                 "Invalid Qwen3.5 linear attention dims: inner_size={}, time_step_rank={}",
                 cfg.ssm_inner_size, cfg.ssm_time_step_rank
@@ -605,34 +606,33 @@ impl Qwen35Layer {
         state: &mut Qwen35LayerRuntimeState,
         device: &Device,
     ) -> Result<()> {
-        match (&self.mixer, state) {
-            (
-                Qwen35Mixer::Linear(mixer),
-                Qwen35LayerRuntimeState::Linear {
-                    conv_state,
-                    recurrent_state,
-                },
-            ) => {
-                if conv_state.is_none() && mixer.kernel_size > 1 {
-                    // Persistent runtime state cannot outlive a released scratch-pool
-                    // lease. Independent exact-size slots allow O(1) replacement
-                    // without retaining dead regions of a shared backing buffer.
-                    let history_len = mixer.kernel_size - 1;
-                    let mut slots = Vec::with_capacity(history_len);
-                    for _ in 0..history_len {
-                        slots.push(owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device)?);
-                    }
-                    *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+        if let (
+            Qwen35Mixer::Linear(mixer),
+            Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            },
+        ) = (&self.mixer, state)
+        {
+            if conv_state.is_none() && mixer.kernel_size > 1 {
+                // Persistent runtime state cannot outlive a released scratch-pool
+                // lease. Independent exact-size slots allow O(1) replacement
+                // without retaining dead regions of a shared backing buffer.
+                let history_len = mixer.kernel_size - 1;
+                let mut slots = Vec::with_capacity(history_len);
+                for _ in 0..history_len {
+                    slots.push(owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device)?);
                 }
-                if recurrent_state.is_none() {
-                    *recurrent_state = Some(owned_zero_tensor(
-                        &[1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim],
-                        DType::F32,
-                        device,
-                    )?);
-                }
+                *conv_state = Some(ConvRingState { slots, next_idx: 0 });
             }
-            _ => {} // Full attention layers don't need pre-init
+            if recurrent_state.is_none() {
+                *recurrent_state = Some(owned_zero_tensor(
+                    &[1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim],
+                    DType::F32,
+                    device,
+                )?);
+            }
+            // Full attention layers don't need pre-initialization.
         }
         Ok(())
     }
@@ -954,7 +954,7 @@ impl Qwen35FullAttention {
         if !self.rope_kernel_enabled {
             return false;
         }
-        if self.rope_dim == 0 || self.rope_dim % 2 != 0 {
+        if self.rope_dim == 0 || !self.rope_dim.is_multiple_of(2) {
             return false;
         }
         matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
@@ -2087,7 +2087,7 @@ mod tests {
     #[test]
     fn rotary_emb_manual_matches_rope_thd() {
         let x = Tensor::from_vec(
-            (0..(1 * 3 * 2 * 8))
+            (0..(3 * 2 * 8))
                 .map(|v| v as f32 / 10.0)
                 .collect::<Vec<_>>(),
             (1, 3, 2, 8),

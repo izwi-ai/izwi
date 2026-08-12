@@ -897,9 +897,7 @@ impl Qwen3Projection {
             .map(|name| qwen3_gguf_tensor_name(loader, name).unwrap_or_else(|| (*name).to_string()))
             .collect::<Vec<_>>();
         let resolved = resolved.iter().map(String::as_str).collect::<Vec<_>>();
-        packed_quantized_qmatmul(loader, device, &resolved)
-            .map(Self::Quantized)
-            .map_err(Error::from)
+        packed_quantized_qmatmul(loader, device, &resolved).map(Self::Quantized)
     }
 
     fn tied_dense(weight: Tensor) -> Self {
@@ -1784,7 +1782,7 @@ impl Qwen3Attention {
         if !self.rope_kernel_enabled {
             return false;
         }
-        if self.head_dim == 0 || self.head_dim % 2 != 0 {
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
             return false;
         }
         matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
@@ -2951,11 +2949,10 @@ impl Qwen3Model {
         &self,
         embeds: &Tensor,
         start_pos: usize,
-        mut cache: Option<&mut Qwen3Cache>,
+        cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let hidden =
-            self.forward_hidden_with_embeds(embeds, start_pos, cache.as_deref_mut(), position_ids)?;
+        let hidden = self.forward_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
         self.logits_from_hidden(&hidden)
     }
 

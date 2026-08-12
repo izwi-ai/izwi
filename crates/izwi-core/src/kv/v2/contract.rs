@@ -378,7 +378,7 @@ impl PageSizeConstraint {
         page_tokens >= self.min_tokens
             && page_tokens <= self.max_tokens
             && self.multiple_of != 0
-            && page_tokens % self.multiple_of == 0
+            && page_tokens.is_multiple_of(self.multiple_of)
     }
 
     fn validate(self) -> Result<()> {
@@ -772,7 +772,7 @@ impl StaticAttentionLayerSpec {
             || self.kv_heads == 0
             || self.key_head_dim == 0
             || self.value_head_dim == 0
-            || self.query_heads % self.kv_heads != 0
+            || !self.query_heads.is_multiple_of(self.kv_heads)
         {
             return Err(invalid(format!(
                 "static-attention layer {} has invalid geometry",
@@ -810,7 +810,7 @@ impl PagedAttentionLayerSpec {
                 self.model_layer
             )));
         }
-        if self.query_heads % self.kv_heads != 0 {
+        if !self.query_heads.is_multiple_of(self.kv_heads) {
             return Err(invalid(format!(
                 "paged-attention layer {} query heads are not divisible by KV heads",
                 self.model_layer
@@ -1094,14 +1094,16 @@ mod tests {
             .is_none());
         let decoded: InferenceStateContract = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
-        assert_eq!(decoded.fingerprint().unwrap(), contract.fingerprint().unwrap());
+        assert_eq!(
+            decoded.fingerprint().unwrap(),
+            contract.fingerprint().unwrap()
+        );
 
         let mut softcapped = contract.clone();
         let StateDomainSpec::PagedAttention(domain) = &mut softcapped.domains[0] else {
             unreachable!()
         };
-        domain.layers[0].attention_logit_softcap =
-            Some(AttentionLogitSoftcap::new(30.0).unwrap());
+        domain.layers[0].attention_logit_softcap = Some(AttentionLogitSoftcap::new(30.0).unwrap());
         assert_ne!(
             contract.fingerprint().unwrap(),
             softcapped.fingerprint().unwrap()

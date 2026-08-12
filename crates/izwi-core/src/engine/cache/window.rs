@@ -94,7 +94,7 @@ pub fn plan_window_step(
 
     let old_tail_is_retained = retained_pages != 0 && old_end > new_first;
     let writable_retained_page = (new_committed_tokens > old_committed_tokens
-        && old_committed_tokens % page_tokens != 0
+        && !old_committed_tokens.is_multiple_of(page_tokens)
         && old_tail_is_retained)
         .then_some(retained_pages - 1);
 

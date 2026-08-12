@@ -530,7 +530,7 @@ fn decode_wav_pcm16_mono_with_metadata(
     }
 
     let data = &wav_bytes[data_range];
-    if error_mode.is_strict() && data.len() % block_align != 0 {
+    if error_mode.is_strict() && !data.len().is_multiple_of(block_align) {
         return Err(Error::InferenceError(format!(
             "WAV PCM16 data length {} is not aligned to {block_align}-byte frames",
             data.len()

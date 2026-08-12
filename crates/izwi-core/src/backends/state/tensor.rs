@@ -409,7 +409,7 @@ impl TensorStateArena {
                     .state
                     .domains
                     .get(domain)
-                    .map_or(true, |snapshot| snapshot.cursor != expected_cursor)
+                    .is_none_or(|snapshot| snapshot.cursor != expected_cursor)
         }) {
             return Err(invalid(
                 "physical state transaction did not stage every domain at the target cursor",

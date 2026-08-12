@@ -371,7 +371,7 @@ fn exercise_windowed_ragged_rows(
 }
 
 fn run_cycle(cycle: u64, next_txn: &mut u64) {
-    let page_tokens = if cycle % 2 == 0 { 16 } else { 32 };
+    let page_tokens = if cycle.is_multiple_of(2) { 16 } else { 32 };
     let prefix_model = ModelInstanceId::new(cycle * 2 + 1);
     let window_model = ModelInstanceId::new(cycle * 2 + 2);
     let mut manager = ManagedKvCacheManager::with_prefix_cache_policy(None, Some([0x5a; 32]), 2);

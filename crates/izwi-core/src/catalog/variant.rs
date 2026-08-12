@@ -188,15 +188,12 @@ pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVa
 pub fn parse_chat_model_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    match input.unwrap_or("Qwen3-8B-GGUF") {
-        id => {
-            let variant = parse_model_variant(id)?;
-            if variant.is_chat() {
-                Ok(variant)
-            } else {
-                Err(ParseModelVariantError::new(id))
-            }
-        }
+    let id = input.unwrap_or("Qwen3-8B-GGUF");
+    let variant = parse_model_variant(id)?;
+    if variant.is_chat() {
+        Ok(variant)
+    } else {
+        Err(ParseModelVariantError::new(id))
     }
 }
 
@@ -205,15 +202,12 @@ pub fn parse_chat_model_variant(
 pub fn resolve_diarization_llm_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    match input.unwrap_or("Qwen3.5-4B") {
-        id => {
-            let variant = parse_model_variant(id)?;
-            if variant == ModelVariant::Qwen354BGguf || variant == ModelVariant::Qwen317BGguf {
-                Ok(variant)
-            } else {
-                Err(ParseModelVariantError::new(id))
-            }
-        }
+    let id = input.unwrap_or("Qwen3.5-4B");
+    let variant = parse_model_variant(id)?;
+    if variant == ModelVariant::Qwen354BGguf || variant == ModelVariant::Qwen317BGguf {
+        Ok(variant)
+    } else {
+        Err(ParseModelVariantError::new(id))
     }
 }
 
@@ -246,8 +240,6 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 WhisperLargeV3Turbo
             } else if let Some(qwen_asr) = resolve_qwen3_asr_variant(&normalized) {
                 qwen_asr
-            } else if normalized.contains("parakeet") {
-                ParakeetTdt06BV3
             } else {
                 ParakeetTdt06BV3
             }
@@ -265,14 +257,7 @@ pub fn resolve_diarization_model_variant(input: Option<&str>) -> ModelVariant {
     match parse_model_variant(raw) {
         Ok(variant) if variant.is_diarization() => variant,
         Ok(_) => DiarStreamingSortformer4SpkV21,
-        Err(_) => {
-            let normalized = normalize_identifier(raw);
-            if normalized.contains("sortformer") || normalized.contains("diar") {
-                DiarStreamingSortformer4SpkV21
-            } else {
-                DiarStreamingSortformer4SpkV21
-            }
-        }
+        Err(_) => DiarStreamingSortformer4SpkV21,
     }
 }
 
@@ -612,11 +597,7 @@ fn matches_variant_alias(variant: ModelVariant, raw: &str, normalized: &str) -> 
         return true;
     }
 
-    let maybe_compact = raw
-        .trim()
-        .replace('_', "-")
-        .replace(' ', "-")
-        .to_ascii_lowercase();
+    let maybe_compact = raw.trim().replace(['_', ' '], "-").to_ascii_lowercase();
 
     variant.dir_name().eq_ignore_ascii_case(&maybe_compact)
         || variant.repo_id().eq_ignore_ascii_case(&maybe_compact)

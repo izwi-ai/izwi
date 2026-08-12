@@ -254,7 +254,7 @@ fn candle_decode_gqa_attention(
         || kv_len > k_capacity
         || num_heads == 0
         || num_kv_heads == 0
-        || num_heads % num_kv_heads != 0
+        || !num_heads.is_multiple_of(num_kv_heads)
         || !scale.is_finite()
         || scale <= 0.0
         || q.dtype() != k.dtype()
@@ -639,7 +639,7 @@ pub(crate) fn paged_prefill_attention(
         || total_queries == 0
         || query_heads == 0
         || kv_heads == 0
-        || query_heads % kv_heads != 0
+        || !query_heads.is_multiple_of(kv_heads)
         || page_tokens == 0
         || max_blocks == 0
         || key_dim == 0
@@ -793,7 +793,7 @@ pub(crate) fn paged_decode_attention_with_graph(
         || batch == 0
         || query_heads == 0
         || kv_heads == 0
-        || query_heads % kv_heads != 0
+        || !query_heads.is_multiple_of(kv_heads)
         || key_dim == 0
         || key_dim > 512
         || value_dim == 0

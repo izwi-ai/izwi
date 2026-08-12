@@ -69,7 +69,7 @@ impl VoxtralCodecConfig {
 
     pub fn frame_count_for_samples_ceil(&self, samples: usize) -> Result<usize> {
         let factor = self.downsample_factor()?;
-        Ok((samples + factor - 1) / factor)
+        Ok(samples.div_ceil(factor))
     }
 
     pub fn chunk_ranges(&self, frames: usize) -> Vec<Range<usize>> {
@@ -964,7 +964,7 @@ fn load_layer_scale(
     if vb.contains_tensor(name) {
         return Ok(Some(vb.get((args.dim,), name)?));
     }
-    let init = args.layer_scale_init.unwrap_or_else(|| {
+    let init = args.layer_scale_init.unwrap_or({
         if layer_idx < 18 {
             0.1
         } else if layer_idx <= 24 {

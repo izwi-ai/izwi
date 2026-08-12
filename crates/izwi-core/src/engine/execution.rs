@@ -79,6 +79,10 @@ impl InputRange {
     pub fn len(self) -> usize {
         self.end.saturating_sub(self.start)
     }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1242,8 +1246,7 @@ impl PhysicalBatch {
 
         let mut keys = HashSet::with_capacity(self.rows.len());
         let mut cost = WorkCost::default();
-        let mut row_count = 0usize;
-        for row in &self.rows {
+        for (row_count, row) in self.rows.iter().enumerate() {
             if row.lane != self.lane {
                 return Err(Error::InvalidInput(
                     "physical batch contains an incompatible lane".to_string(),
@@ -1262,7 +1265,6 @@ impl PhysicalBatch {
             cost = cost.checked_add(row.cost).ok_or_else(|| {
                 Error::InvalidInput("physical batch work accounting overflowed".to_string())
             })?;
-            row_count += 1;
         }
 
         if self.materialized_tensor_elements < cost.tensor_elements {

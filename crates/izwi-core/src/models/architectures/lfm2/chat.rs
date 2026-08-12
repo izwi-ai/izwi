@@ -722,7 +722,7 @@ fn has_suffix_repeat(ids: &[u32], span: usize, repeats: usize) -> bool {
 }
 
 fn should_check_repetition_loop(len: usize) -> bool {
-    len >= 48 && len % 4 == 0
+    len >= 48 && len.is_multiple_of(4)
 }
 
 fn has_token_repetition_loop(ids: &[u32]) -> bool {
@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn detects_token_repetition_loop() {
         let mut ids = Vec::new();
-        let phrase = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let phrase = [1, 2, 3, 4, 5, 6, 7, 8];
         for _ in 0..5 {
             ids.extend(phrase.iter().copied());
         }

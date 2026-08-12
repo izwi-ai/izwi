@@ -109,12 +109,13 @@ impl ServeRuntimeConfig {
     }
 
     pub fn engine_config(&self) -> EngineConfig {
-        let mut config = EngineConfig::default();
-        config.models_dir = self.models_dir.clone();
-        config.max_batch_size = self.max_batch_size.max(1);
-        config.backend = self.backend;
-        config.num_threads = self.num_threads.max(1);
-        config
+        EngineConfig {
+            models_dir: self.models_dir.clone(),
+            max_batch_size: self.max_batch_size.max(1),
+            backend: self.backend,
+            num_threads: self.num_threads.max(1),
+            ..Default::default()
+        }
     }
 }
 

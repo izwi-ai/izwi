@@ -569,7 +569,7 @@ impl Scheduler {
             && !self.waiting_members.is_empty()
             && total_budget > 0
         {
-            reserved_prefill_budget = total_budget.min(32).max(1);
+            reserved_prefill_budget = total_budget.clamp(1, 32);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
         }
         let mut remaining_decode_budget = decode_budget;

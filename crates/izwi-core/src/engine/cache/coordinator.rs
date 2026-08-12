@@ -251,7 +251,7 @@ impl TableKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct BlockSlot {
     generation: u32,
     group: Option<KvGroupId>,
@@ -263,23 +263,6 @@ struct BlockSlot {
     transfer_pins: usize,
     reservations: usize,
     writer: Option<PlanId>,
-}
-
-impl Default for BlockSlot {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            group: None,
-            allocated: false,
-            retired: false,
-            table_refs: 0,
-            prefix_refs: 0,
-            execution_pins: 0,
-            transfer_pins: 0,
-            reservations: 0,
-            writer: None,
-        }
-    }
 }
 
 impl BlockSlot {
@@ -461,7 +444,10 @@ impl KvCacheCoordinator {
                 };
                 blocks.push(intent);
             }
-            blocks.extend(std::iter::repeat(KvBlockIntent::Fresh).take(page_plan.fresh_pages));
+            blocks.extend(std::iter::repeat_n(
+                KvBlockIntent::Fresh,
+                page_plan.fresh_pages,
+            ));
             groups.push(KvGroupReservation {
                 group: expected_group.group,
                 blocks,

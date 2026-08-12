@@ -288,7 +288,7 @@ fn granite_rope_kernel_enabled(device: &Device, dtype: DType, head_dim: usize) -
     if !granite_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
         return false;
     }
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return false;
     }
     matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
@@ -301,7 +301,7 @@ fn granite_rope_bhtd_kernel_enabled(device: &Device, dtype: DType, head_dim: usi
     if !granite_rope_bhtd_kernel_policy(device.is_metal(), override_enabled) {
         return false;
     }
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return false;
     }
     matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
@@ -314,7 +314,7 @@ fn granite_rope_pair_bshd_kernel_enabled(device: &Device, dtype: DType, head_dim
     if !granite_rope_pair_bshd_kernel_policy(device.is_metal(), override_enabled) {
         return false;
     }
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return false;
     }
     matches!(dtype, DType::F16 | DType::F32)
@@ -1508,8 +1508,10 @@ impl GraniteConformerConv {
     fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let hidden = config.hidden_dim;
         let inner = hidden * config.conv_expansion_factor;
-        let mut depth_cfg = Conv1dConfig::default();
-        depth_cfg.groups = inner;
+        let depth_cfg = Conv1dConfig {
+            groups: inner,
+            ..Default::default()
+        };
         Ok(Self {
             norm: layer_norm(hidden, 1e-5, vb.pp("norm"))?,
             up_conv: conv1d(
@@ -1684,7 +1686,8 @@ impl GraniteQFormerLayer {
     fn load(config: &GraniteSpeechConfig, idx: usize, vb: VarBuilder) -> Result<Self> {
         let hidden = config.projector_config.hidden_size;
         let intermediate = config.projector_config.intermediate_size;
-        let has_cross = idx % config.projector_config.cross_attention_frequency.max(1) == 0;
+        let has_cross =
+            idx.is_multiple_of(config.projector_config.cross_attention_frequency.max(1));
         Ok(Self {
             attention: GraniteQFormerAttention::load(config, false, vb.pp("attention"))?,
             crossattention: if has_cross {
@@ -2135,7 +2138,7 @@ impl GraniteLanguageModel {
             self.lm_head
                 .forward(&hidden.to_dtype(self.lm_head.weight().dtype())?)?
         };
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.profile.forward.lm_head += profile_elapsed(lm_head_start);
         }
         let logits = if granite_native_greedy_logits_enabled() {
@@ -2245,7 +2248,7 @@ impl GraniteDecoderLayer {
         let residual_start = profile_start(profiling);
         let mlp = self.scale_residual_branch(mlp)?;
         let out = residual.broadcast_add(&mlp)?;
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.residual += profile_elapsed(residual_start);
         }
         Ok(out)
@@ -2608,7 +2611,7 @@ impl GraniteTextAttention {
         let out = out.reshape((batch, seq_len, self.num_heads * self.head_dim))?;
         let output_start = profile_start(profiling);
         let out = self.output_projection(&out, x.dtype())?;
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.output += profile_elapsed(output_start);
         }
         Ok(out)
@@ -3132,7 +3135,7 @@ impl GraniteTextMlp {
         }
         let down_start = profile_start(profiling);
         let out = down_proj.forward(&hidden)?;
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.down += profile_elapsed(down_start);
         }
         Ok(out)

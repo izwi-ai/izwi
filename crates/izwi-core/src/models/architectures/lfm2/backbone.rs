@@ -434,7 +434,8 @@ impl ShortConvLayer {
             } else {
                 None
             };
-            let out = if let Some(out) = out {
+
+            if let Some(out) = out {
                 out
             } else {
                 let conv = Conv1d::new(
@@ -449,9 +450,7 @@ impl ShortConvLayer {
                     },
                 );
                 conv.forward(&bx)?.narrow(2, 0, seq_len)?
-            };
-
-            out
+            }
         };
 
         let conv_out = (&c * &conv_out)?.transpose(1, 2)?.contiguous()?;
@@ -885,7 +884,7 @@ impl QuantizedLfm2Backbone {
                 let hidden = layer.mlp.forward(&hidden)?;
                 hidden_states = (&hidden + &residual)?;
             }
-            self.norm.forward(&hidden_states).map_err(Error::from)
+            self.norm.forward(&hidden_states)
         })?;
         cache.commit_prepared(prepared)?;
         Ok(output)
@@ -921,7 +920,7 @@ impl QuantizedLfm2Backbone {
             let hidden = layer.mlp.forward(&hidden)?;
             hidden_states = (&hidden + &residual)?;
         }
-        self.norm.forward(&hidden_states).map_err(Error::from)
+        self.norm.forward(&hidden_states)
     }
 
     fn mask(&self, seq_len: usize, device: &Device) -> Result<Tensor> {

@@ -677,7 +677,7 @@ impl ModelDownloader {
                 .unwrap()
                 .progress_chars("##-"),
         );
-        overall_pb.set_message(format!("{}", variant.display_name()));
+        overall_pb.set_message(variant.display_name().to_string());
 
         let mut downloaded_bytes: u64 = 0;
 

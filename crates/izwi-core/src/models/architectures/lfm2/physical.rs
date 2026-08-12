@@ -356,14 +356,16 @@ fn validate_config(config: &Lfm2BackboneConfig) -> Result<()> {
         || config.context_length == 0
         || config.embedding_length == 0
         || config.attention_head_count == 0
-        || config.embedding_length % config.attention_head_count != 0
+        || !config
+            .embedding_length
+            .is_multiple_of(config.attention_head_count)
         || config.attention_head_count_kv.len() != config.block_count
         || config.shortconv_l_cache == 0
         || config.attention_sliding_window == Some(0)
         || config
             .attention_head_count_kv
             .iter()
-            .any(|kv_heads| *kv_heads > 0 && config.attention_head_count % *kv_heads != 0)
+            .any(|kv_heads| *kv_heads > 0 && !config.attention_head_count.is_multiple_of(*kv_heads))
     {
         return Err(Error::ModelLoadError(
             "LFM2 physical state received invalid loaded backbone geometry".into(),

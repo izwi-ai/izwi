@@ -320,8 +320,10 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<ChatGeneration> {
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens.max(1);
+        let params = GenerationParams {
+            max_tokens: max_new_tokens.max(1),
+            ..Default::default()
+        };
         let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
@@ -471,8 +473,10 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens.max(1);
+        let params = GenerationParams {
+            max_tokens: max_new_tokens.max(1),
+            ..Default::default()
+        };
         let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,

@@ -421,8 +421,7 @@ fn generate_chunked_kokoro(
             })?;
 
         let pause_samples = if idx + 1 < chunks.len() {
-            let pause_samples = ((current_sample_rate as f32) * 0.04).round() as usize;
-            pause_samples
+            ((current_sample_rate as f32) * 0.04).round() as usize
         } else {
             0
         };
@@ -699,18 +698,20 @@ fn pick_readable_split_point(text: &str, max_chars: usize) -> usize {
     }
 
     let preferred_min = (max_chars * 2) / 3;
-    for candidate in [last_sentence_break, last_clause_break, last_whitespace] {
-        if let Some(pos) = candidate {
-            if pos >= preferred_min && pos <= max_chars {
-                return pos;
-            }
+    for pos in [last_sentence_break, last_clause_break, last_whitespace]
+        .into_iter()
+        .flatten()
+    {
+        if pos >= preferred_min && pos <= max_chars {
+            return pos;
         }
     }
-    for candidate in [last_sentence_break, last_clause_break, last_whitespace] {
-        if let Some(pos) = candidate {
-            if pos > 0 && pos <= max_chars {
-                return pos;
-            }
+    for pos in [last_sentence_break, last_clause_break, last_whitespace]
+        .into_iter()
+        .flatten()
+    {
+        if pos > 0 && pos <= max_chars {
+            return pos;
         }
     }
     max_chars

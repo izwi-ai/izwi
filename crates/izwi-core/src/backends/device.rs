@@ -93,18 +93,13 @@ impl Default for DeviceCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DTypeSelectionPolicy {
+    #[default]
     Default,
     PreferF32,
     PreferF16,
     PreferBf16,
-}
-
-impl Default for DTypeSelectionPolicy {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -648,7 +643,7 @@ impl DeviceSelector {
                 .is_some_and(cuda_compute_capability_supports_bf16);
             let supports_f16 = cuda_capabilities
                 .compute_capability
-                .map_or(true, cuda_compute_capability_supports_f16);
+                .is_none_or(cuda_compute_capability_supports_f16);
             let supports_int8_tensor_cores = cuda_capabilities
                 .compute_capability
                 .is_some_and(cuda_compute_capability_supports_int8_tensor_cores);

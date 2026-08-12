@@ -62,9 +62,9 @@ pub use cache::managed::{
 pub(crate) use cache::physical::PhysicalStateManager;
 pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
-pub use config::EngineCoreConfig;
 pub(crate) use config::resolve_backend_model_context;
 pub(crate) use config::tts_explicit_output_limit;
+pub use config::EngineCoreConfig;
 pub use core::EngineCore;
 pub use execution::{
     AdapterAbiRevision, AdapterBindingKey, AdapterInstanceId, BatchBudget, BatchDispatch,
@@ -327,10 +327,11 @@ impl OwnedStepContext {
     ) -> std::result::Result<executor::CommittedStreamDelivery, executor::StreamDeliveryFailure>
     {
         let session = progress.session.clone();
-        match {
+        let res = {
             let mut core = self.core.write().await;
             core.commit_incremental_stream_progress(progress)
-        } {
+        };
+        match res {
             Ok(delivery) => Ok(delivery),
             Err(error) => {
                 warn!(

@@ -283,9 +283,8 @@ impl InferenceCoordinator {
                 ),
                 None => self.resources.reserve(owner, effective_resources),
             })
-            .map_err(|err| {
+            .inspect_err(|_err| {
                 self.rejected_total.fetch_add(1, Ordering::Relaxed);
-                err
             })?;
         self.active_jobs.fetch_add(1, Ordering::Relaxed);
         self.admitted_total.fetch_add(1, Ordering::Relaxed);

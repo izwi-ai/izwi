@@ -406,20 +406,17 @@ impl VoxtralRealtimeModel {
         let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
         let prompt_len = prompt_tokens.len();
-        let max_frames = voxtral_realtime_offline_frame_limit(
-            backend,
-            audio_frames,
-            model_context_limit,
-        )?;
+        let max_frames =
+            voxtral_realtime_offline_frame_limit(backend, audio_frames, model_context_limit)?;
         if prompt_len > max_frames {
             return Err(Error::InferenceError(format!(
                 "Voxtral prompt length ({prompt_len}) exceeds available audio frames ({max_frames})"
             )));
         }
         let page_tokens = default_kv_page_size();
-        let resident_tokens = cache.capacity_tokens().saturating_sub(
-            cache.window_start().div_euclid(page_tokens) * page_tokens,
-        );
+        let resident_tokens = cache
+            .capacity_tokens()
+            .saturating_sub(cache.window_start().div_euclid(page_tokens) * page_tokens);
         let required_resident_tokens = attention_window_tokens
             .checked_add(page_tokens)
             .ok_or_else(|| Error::ModelLoadError("Voxtral cache capacity overflow".into()))?;
@@ -821,8 +818,8 @@ impl WhisperEncoder {
         }
 
         // Final layer norm
-        if self.ln_post_rms.is_some() {
-            self.ln_post_rms.as_ref().unwrap().forward(&x)
+        if let Some(ln_post_rms) = &self.ln_post_rms {
+            ln_post_rms.forward(&x)
         } else {
             self.ln_post.as_ref().unwrap().forward(&x)
         }
@@ -1544,9 +1541,7 @@ mod tests {
             voxtral_realtime_offline_frame_limit(BackendKind::Cuda, 131_072, 131_072).unwrap(),
             131_072
         );
-        assert!(
-            voxtral_realtime_offline_frame_limit(BackendKind::Cuda, 131_073, 131_072).is_err()
-        );
+        assert!(voxtral_realtime_offline_frame_limit(BackendKind::Cuda, 131_073, 131_072).is_err());
     }
 
     #[test]

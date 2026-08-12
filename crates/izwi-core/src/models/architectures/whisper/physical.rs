@@ -245,7 +245,10 @@ fn validate_config(config: &Config) -> Result<()> {
             "Whisper physical state requires non-zero decoder geometry and capacities",
         ));
     }
-    if config.d_model % config.decoder_attention_heads != 0 {
+    if !config
+        .d_model
+        .is_multiple_of(config.decoder_attention_heads)
+    {
         return Err(model_load(
             "Whisper decoder width is not divisible by its attention-head count",
         ));
@@ -448,9 +451,13 @@ mod tests {
             ),
         ] {
             let execution = stage(0);
-            let spec =
-                whisper_physical_state_spec(&config(), dtype, backend, &[&[execution.clone()]])
-                    .expect("physical state");
+            let spec = whisper_physical_state_spec(
+                &config(),
+                dtype,
+                backend,
+                &[std::slice::from_ref(&execution)],
+            )
+            .expect("physical state");
             assert!(matches!(
                 &spec.descriptor.retained,
                 RetainedStateCapability::Stateless
@@ -542,7 +549,7 @@ mod tests {
             &config(),
             DType::F32,
             BackendKind::Cpu,
-            &[&[execution.clone()]],
+            &[std::slice::from_ref(&execution)],
         )
         .expect("physical state");
         let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
@@ -645,14 +652,14 @@ mod tests {
             &invalid,
             DType::F32,
             BackendKind::Cpu,
-            &[&[execution.clone()]],
+            &[std::slice::from_ref(&execution)],
         )
         .is_err());
         assert!(whisper_physical_state_spec(
             &config(),
             DType::BF16,
             BackendKind::Metal,
-            &[&[execution.clone()]],
+            &[std::slice::from_ref(&execution)],
         )
         .is_err());
         assert!(whisper_physical_state_spec(

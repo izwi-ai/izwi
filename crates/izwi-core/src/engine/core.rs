@@ -1469,7 +1469,7 @@ impl EngineCore {
             OutputProcessor::new(config.sample_rate).with_chunk_size(config.streaming_chunk_size);
         let managed_prefix_salt = config
             .enable_prefix_caching
-            .then(|| config.managed_prefix_cache_salt.as_deref())
+            .then_some(config.managed_prefix_cache_salt.as_deref())
             .flatten()
             .map(|salt| Sha256::digest(salt.as_bytes()).into());
         let max_prefix_cache_pages = match cache_policy.effective.prefix {
@@ -4113,6 +4113,9 @@ mod tests {
     }
 
     #[test]
+    // Explicitly dropping the closure releases its captured request Arc before
+    // the test asserts unique ownership through Arc::get_mut.
+    #[allow(clippy::drop_non_drop)]
     fn incremental_progress_requires_exact_batch_plan_session_lane_and_sequence() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
@@ -5318,12 +5321,11 @@ mod tests {
         );
         let metrics_after = crate::engine::engine_batch_metrics_snapshot();
         assert!(
-            metrics_after.dispatch_states.not_started
-                >= metrics_before.dispatch_states.not_started + 1
+            metrics_after.dispatch_states.not_started > metrics_before.dispatch_states.not_started
         );
         assert!(
             metrics_after.deadline_phases.scheduler_queue
-                >= metrics_before.deadline_phases.scheduler_queue + 1
+                > metrics_before.deadline_phases.scheduler_queue
         );
         assert!(!core.has_request(&"expired".to_string()));
         assert_eq!(
@@ -5873,13 +5875,8 @@ mod tests {
             content: "full".to_string(),
         }])
         .with_model_variant(ModelVariant::Qwen306B);
-        full.install_chat_execution_preparation(
-            ModelVariant::Qwen306B,
-            vec![1, 2, 3, 4],
-            None,
-            4,
-        )
-        .unwrap();
+        full.install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3, 4], None, 4)
+            .unwrap();
         assert!(core
             .add_request(full)
             .expect_err("a full context must leave no output allocation")

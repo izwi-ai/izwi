@@ -1451,19 +1451,11 @@ impl ModelExecutor for NativeExecutor {
                     PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
                 });
         }
-        let result = if execution.is_prefill() {
-            self.execute_requests_with_rows(
-                execution.requests,
-                execution.scheduled,
-                Some(&execution.batch.rows),
-            )
-        } else {
-            self.execute_requests_with_rows(
-                execution.requests,
-                execution.scheduled,
-                Some(&execution.batch.rows),
-            )
-        };
+        let result = self.execute_requests_with_rows(
+            execution.requests,
+            execution.scheduled,
+            Some(&execution.batch.rows),
+        );
         result.map_err(|error| {
             PhysicalDispatchError::started(error, expected_dispatch, FailureOrigin::Model)
         })
@@ -1771,8 +1763,10 @@ mod tests {
 
     #[test]
     fn test_worker_config_from_engine_config_uses_backend_context() {
-        let mut engine = EngineCoreConfig::default();
-        engine.backend = BackendKind::Cpu;
+        let engine = EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..Default::default()
+        };
 
         let config = WorkerConfig::from(&engine);
         assert_eq!(config.backend, config.backend_context.backend_kind);
@@ -1991,9 +1985,11 @@ mod tests {
     #[test]
     fn unloaded_models_cannot_claim_native_batch_capability() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            let mut config = WorkerConfig::default();
-            config.backend = backend;
-            config.request_parallelism = 4;
+            let config = WorkerConfig {
+                backend,
+                request_parallelism: 4,
+                ..Default::default()
+            };
             let executor = NativeExecutor::new(config);
             let mut request = EngineCoreRequest::tts("batch me");
             request.model_variant = Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice);

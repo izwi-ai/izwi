@@ -23,6 +23,18 @@
 //! let output = engine.generate(request).await?;
 //! ```
 #![allow(dead_code)]
+// Inference entry points intentionally expose the complete tensor/state contract,
+// model registries intentionally store heterogeneous implementations inline, and
+// numerical kernels use explicit index loops where coordinates participate in
+// multiple tensor strides. Refactoring these solely to satisfy shape/style lints
+// would add indirection to hot paths without improving correctness; all other
+// Clippy warnings remain denied.
+#![allow(
+    clippy::large_enum_variant,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 pub mod artifacts;
 pub mod audio;

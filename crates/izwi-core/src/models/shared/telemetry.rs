@@ -486,10 +486,10 @@ mod tests {
         record_layout_copy();
         let after = snapshot();
 
-        assert!(after.host_read_ops_total >= before.host_read_ops_total + 1);
+        assert!(after.host_read_ops_total > before.host_read_ops_total);
         assert!(after.host_read_bytes_total >= before.host_read_bytes_total + 4);
-        assert!(after.dtype_cast_ops_total >= before.dtype_cast_ops_total + 1);
-        assert!(after.layout_copy_ops_total >= before.layout_copy_ops_total + 1);
+        assert!(after.dtype_cast_ops_total > before.dtype_cast_ops_total);
+        assert!(after.layout_copy_ops_total > before.layout_copy_ops_total);
 
         let prometheus = prometheus();
         for metric in [

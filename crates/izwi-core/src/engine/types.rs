@@ -316,11 +316,14 @@ impl EngineMetrics {
 }
 
 /// Priority level for requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum Priority {
     /// Low priority (background tasks)
     Low = 0,
     /// Normal priority (default)
+    #[default]
     Normal = 1,
     /// High priority (user-facing)
     High = 2,
@@ -328,16 +331,11 @@ pub enum Priority {
     Critical = 3,
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 /// Task type for the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum TaskType {
     /// Text-to-speech
+    #[default]
     TTS,
     /// Automatic speech recognition
     ASR,
@@ -345,10 +343,4 @@ pub enum TaskType {
     Chat,
     /// Speech-to-speech generation.
     SpeechToSpeech,
-}
-
-impl Default for TaskType {
-    fn default() -> Self {
-        Self::TTS
-    }
 }

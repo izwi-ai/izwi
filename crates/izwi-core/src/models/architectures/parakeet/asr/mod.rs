@@ -840,7 +840,7 @@ fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
 
 fn subsampled_len_3x(mut len: usize) -> usize {
     for _ in 0..3 {
-        len = (len + 1) / 2;
+        len = len.div_ceil(2);
     }
     len
 }

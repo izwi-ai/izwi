@@ -81,7 +81,7 @@ fn normalize_affine_params(
         )));
     };
 
-    if groups == 0 || in_dim % groups != 0 {
+    if groups == 0 || !in_dim.is_multiple_of(groups) {
         return Err(Error::ModelLoadError(format!(
             "Invalid quantization groups: in_dim={in_dim}, groups={groups}"
         )));
@@ -117,13 +117,13 @@ fn quant_bits_from_packing(
             "Invalid packed shape for quantized weight".to_string(),
         ));
     }
-    if expected_in_dim % packed_in_dim != 0 {
+    if !expected_in_dim.is_multiple_of(packed_in_dim) {
         return Err(Error::ModelLoadError(format!(
             "Quantized weight has incompatible input dim: expected_in={expected_in_dim}, packed_in={packed_in_dim}"
         )));
     }
     let pack_factor = expected_in_dim / packed_in_dim;
-    if word_bits % pack_factor != 0 {
+    if !word_bits.is_multiple_of(pack_factor) {
         return Err(Error::ModelLoadError(format!(
             "Invalid quant packing factor: word_bits={word_bits}, pack_factor={pack_factor}"
         )));
@@ -328,7 +328,7 @@ pub fn load_conv1d_no_bias(
     cfg: Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
-    if cfg.groups == 0 || in_channels % cfg.groups != 0 {
+    if cfg.groups == 0 || !in_channels.is_multiple_of(cfg.groups) {
         return Err(Error::ModelLoadError(format!(
             "Invalid Conv1d groups for shape inference: in_channels={in_channels}, groups={}",
             cfg.groups
@@ -371,7 +371,7 @@ pub fn load_conv1d(
     cfg: Conv1dConfig,
     vb: VarBuilder,
 ) -> Result<Conv1d> {
-    if cfg.groups == 0 || in_channels % cfg.groups != 0 {
+    if cfg.groups == 0 || !in_channels.is_multiple_of(cfg.groups) {
         return Err(Error::ModelLoadError(format!(
             "Invalid Conv1d groups for shape inference: in_channels={in_channels}, groups={}",
             cfg.groups
@@ -424,7 +424,7 @@ mod tests {
         let biases = vec![vec![-1.0, 0.5]];
         let out = dequantize_affine_u32(packed, scales, Some(biases), 1, 8).unwrap();
 
-        let expected = vec![
+        let expected = [
             -1.0 + 0.0 * 0.1,
             -1.0 + 1.0 * 0.1,
             -1.0 + 2.0 * 0.1,
@@ -446,7 +446,7 @@ mod tests {
         let biases = vec![vec![0.0, -1.0]];
         let out = dequantize_affine_u8(packed, scales, Some(biases), 1, 4).unwrap();
 
-        let expected = vec![0.5, 1.0, 5.0, 7.0];
+        let expected = [0.5, 1.0, 5.0, 7.0];
         for (a, b) in out.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
@@ -458,7 +458,7 @@ mod tests {
         let scales = vec![vec![0.1, 0.2]];
         let out = dequantize_affine_u32(packed, scales, None, 1, 8).unwrap();
 
-        let expected = vec![
+        let expected = [
             0.0 * 0.1,
             1.0 * 0.1,
             2.0 * 0.1,
@@ -479,7 +479,7 @@ mod tests {
         let scales = vec![vec![0.5, 2.0]];
         let out = dequantize_affine_u8(packed, scales, None, 1, 4).unwrap();
 
-        let expected = vec![0.5, 1.0, 6.0, 8.0];
+        let expected = [0.5, 1.0, 6.0, 8.0];
         for (a, b) in out.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6);
         }

@@ -363,7 +363,7 @@ impl KvArena for CpuKvArena {
                 query_dims[2], layer.key_head_dim
             )));
         }
-        if query_heads == 0 || query_heads % layer.num_kv_heads != 0 {
+        if query_heads == 0 || !query_heads.is_multiple_of(layer.num_kv_heads) {
             return Err(Error::InferenceError(format!(
                 "CPU paged decode query heads {query_heads} are not divisible by KV heads {}",
                 layer.num_kv_heads
@@ -475,7 +475,7 @@ impl KvArena for CpuKvArena {
             )));
         }
         let query_heads = query_dims[1];
-        if query_heads == 0 || query_heads % layer.num_kv_heads != 0 {
+        if query_heads == 0 || !query_heads.is_multiple_of(layer.num_kv_heads) {
             return Err(Error::InferenceError(
                 "CPU paged prefill query heads are incompatible with KV heads".into(),
             ));

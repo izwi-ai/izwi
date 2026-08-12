@@ -89,7 +89,7 @@ pub(crate) fn resolve_cuda_paged_tuning(
     let matched_dims = shape.key_head_dim == shape.value_head_dim
         && shape.key_head_dim != 0
         && shape.key_head_dim <= 512
-        && shape.key_head_dim % 8 == 0;
+        && shape.key_head_dim.is_multiple_of(8);
     let nonempty_shape = shape.batch > 0 && shape.query_heads > 0 && shape.max_context_tokens > 0;
 
     CudaPagedTuningPolicy {

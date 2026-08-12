@@ -212,11 +212,9 @@ fn logits_row(logits: &Tensor) -> Result<Tensor> {
             }
             Ok(logits.i(0)?)
         }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected LFM2.5 Audio logits rank for sampling: {rank}"
-            )));
-        }
+        rank => Err(Error::InferenceError(format!(
+            "Unexpected LFM2.5 Audio logits rank for sampling: {rank}"
+        ))),
     }
 }
 

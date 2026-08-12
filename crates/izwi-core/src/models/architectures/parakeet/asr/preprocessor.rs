@@ -126,9 +126,9 @@ impl ParakeetPreprocessor {
         // torch.stft(center=True, pad_mode="constant")
         let center_pad = N_FFT / 2;
         let mut padded = Vec::with_capacity(x.len() + center_pad * 2);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
         padded.extend_from_slice(&x);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
 
         let frame_count = if padded.len() >= N_FFT {
             (padded.len() - N_FFT) / HOP_LENGTH + 1

@@ -539,7 +539,8 @@ mod tests {
         let contract = invocation_contract(1);
         let execution = stage();
         let descriptor =
-            vibevoice_invocation_descriptor(&[&[execution.clone()]], &contract, 4096).unwrap();
+            vibevoice_invocation_descriptor(&[std::slice::from_ref(&execution)], &contract, 4096)
+                .unwrap();
         assert!(descriptor.is_stateless());
         let InvocationWorkspaceSet::Bounded { profiles } = &descriptor.invocation else {
             panic!("ASR invocation pages must be bounded");

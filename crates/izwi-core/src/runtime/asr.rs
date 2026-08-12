@@ -66,7 +66,7 @@ impl AsrAudioInput<'_> {
             Self::Base64(audio) => {
                 validate_base64_audio_retained_size(audio.len(), MAX_AUDIO_SOURCE_BYTES)
             }
-            Self::Bytes(audio) if audio.is_empty() => Err(Error::InvalidInput(
+            Self::Bytes([]) => Err(Error::InvalidInput(
                 "ASR request missing audio bytes".to_string(),
             )),
             Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
@@ -1330,12 +1330,12 @@ impl RuntimeService {
         streaming: bool,
     ) -> Result<AdmittedEngineRequest> {
         let audio_bytes = match audio_input {
-            AsrAudioInput::Base64(audio) if audio.is_empty() => {
+            AsrAudioInput::Base64("") => {
                 return Err(Error::InvalidInput(
                     "ASR request missing audio input".to_string(),
                 ));
             }
-            AsrAudioInput::Bytes(audio) if audio.is_empty() => {
+            AsrAudioInput::Bytes([]) => {
                 return Err(Error::InvalidInput(
                     "ASR request missing audio bytes".to_string(),
                 ));
@@ -3057,16 +3057,18 @@ fn granite_saa_should_use_single_pass(duration_secs: f32, model_limit_secs: Opti
 }
 
 fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> AsrLongFormConfig {
-    let mut cfg = AsrLongFormConfig::default();
-    cfg.target_chunk_secs = GRANITE_SAA_TARGET_CHUNK_SECS;
-    cfg.hard_max_chunk_secs = GRANITE_SAA_HARD_MAX_CHUNK_SECS;
-    cfg.overlap_secs = GRANITE_SAA_OVERLAP_SECS;
-    cfg.min_chunk_secs = GRANITE_SAA_MIN_CHUNK_SECS;
-    cfg.silence_search_secs = GRANITE_SAA_SILENCE_SEARCH_SECS;
-    cfg.min_word_overlap = GRANITE_SAA_MIN_OVERLAP_WORDS;
-    cfg.max_word_overlap = GRANITE_SAA_MAX_OVERLAP_WORDS;
-    cfg.min_context_replay_words = GRANITE_SAA_MIN_OVERLAP_WORDS;
-    cfg.max_context_replay_words = GRANITE_SAA_MAX_OVERLAP_WORDS;
+    let mut cfg = AsrLongFormConfig {
+        target_chunk_secs: GRANITE_SAA_TARGET_CHUNK_SECS,
+        hard_max_chunk_secs: GRANITE_SAA_HARD_MAX_CHUNK_SECS,
+        overlap_secs: GRANITE_SAA_OVERLAP_SECS,
+        min_chunk_secs: GRANITE_SAA_MIN_CHUNK_SECS,
+        silence_search_secs: GRANITE_SAA_SILENCE_SEARCH_SECS,
+        min_word_overlap: GRANITE_SAA_MIN_OVERLAP_WORDS,
+        max_word_overlap: GRANITE_SAA_MAX_OVERLAP_WORDS,
+        min_context_replay_words: GRANITE_SAA_MIN_OVERLAP_WORDS,
+        max_context_replay_words: GRANITE_SAA_MAX_OVERLAP_WORDS,
+        ..Default::default()
+    };
 
     if let Some(limit) = model_limit_secs.filter(|value| value.is_finite() && *value > 0.0) {
         cfg.hard_max_chunk_secs = cfg.hard_max_chunk_secs.min(limit * 0.95);
@@ -3895,11 +3897,10 @@ mod tests {
     #[test]
     fn oversized_realtime_packet_is_rejected_before_copy_or_model_work() {
         let side_effects = AtomicUsize::new(0);
-        let result = validate_realtime_input_copy(4_801, 4_800).and_then(|()| {
+        let result = validate_realtime_input_copy(4_801, 4_800).map(|()| {
             side_effects.fetch_add(1, Ordering::Relaxed);
             let _owned = vec![0.0_f32; 4_801];
             side_effects.fetch_add(1, Ordering::Relaxed);
-            Ok(())
         });
 
         assert!(matches!(result, Err(Error::InvalidInput(_))));
@@ -4460,6 +4461,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The guard intentionally serializes process-global environment access for
+    // the complete asynchronous load attempt in this test.
+    #[allow(clippy::await_holding_lock)]
     async fn parakeet_load_rejects_invalid_nemo_archive() {
         let _guard = env_lock().lock().expect("env lock poisoned");
 
@@ -4468,9 +4472,11 @@ mod tests {
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("parakeet-tdt-0.6b-v3.nemo"), b"mock-nemo").unwrap();
 
-        let mut config = EngineConfig::default();
-        config.models_dir = root.clone();
-        config.backend = BackendPreference::Cpu;
+        let config = EngineConfig {
+            models_dir: root.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        };
 
         let engine = RuntimeService::new(config).unwrap();
         let err = engine

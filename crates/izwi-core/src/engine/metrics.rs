@@ -1008,8 +1008,8 @@ mod tests {
         let parallel_before = engine_request_parallel_batches_total();
         record_engine_batch_dispatch(BatchDispatch::new(BatchDispatchKind::TensorStatic, 3));
         record_engine_batch_dispatch(BatchDispatch::new(BatchDispatchKind::RequestParallel, 4));
-        assert!(engine_tensor_batches_total() >= tensor_before + 1);
-        assert!(engine_request_parallel_batches_total() >= parallel_before + 1);
+        assert!(engine_tensor_batches_total() > tensor_before);
+        assert!(engine_request_parallel_batches_total() > parallel_before);
         assert!(engine_tensor_batch_max_width() >= 3);
     }
 
@@ -1027,18 +1027,13 @@ mod tests {
         record_engine_execution_outcome(OutcomeProvenance::produced_output());
         let after = engine_batch_metrics_snapshot();
 
-        assert!(after.dispatch_states.not_started >= before.dispatch_states.not_started + 1);
-        assert!(after.dispatch_states.started >= before.dispatch_states.started + 1);
+        assert!(after.dispatch_states.not_started > before.dispatch_states.not_started);
+        assert!(after.dispatch_states.started > before.dispatch_states.started);
+        assert!(after.dispatch_states.produced_output > before.dispatch_states.produced_output);
         assert!(
-            after.dispatch_states.produced_output >= before.dispatch_states.produced_output + 1
+            after.failure_origins.workspace_admission > before.failure_origins.workspace_admission
         );
-        assert!(
-            after.failure_origins.workspace_admission
-                >= before.failure_origins.workspace_admission + 1
-        );
-        assert!(
-            after.deadline_phases.model_execution >= before.deadline_phases.model_execution + 1
-        );
+        assert!(after.deadline_phases.model_execution > before.deadline_phases.model_execution);
         assert_eq!(after.failure_origins.labeled_values().len(), 9);
         assert_eq!(after.deadline_phases.labeled_values().len(), 5);
     }
@@ -1105,7 +1100,7 @@ mod tests {
             BatchDispatch::new(BatchDispatchKind::TensorStatic, 2),
         );
         let dispatched = engine_batch_metrics_snapshot();
-        assert!(dispatched.tensor_static_batches_total >= before.tensor_static_batches_total + 1);
+        assert!(dispatched.tensor_static_batches_total > before.tensor_static_batches_total);
         assert!(dispatched.tensor_batch_rows_total >= before.tensor_batch_rows_total + 2);
         assert!(
             dispatched.tensor_batch_capacity_rows_total
@@ -1120,7 +1115,7 @@ mod tests {
                 >= before.tensor_batch_materialized_elements_total + 30
         );
         assert!(dispatched.batch_workspace_bytes_total >= before.batch_workspace_bytes_total + 8);
-        assert!(dispatched.workspace_domains.host >= before.workspace_domains.host + 1);
+        assert!(dispatched.workspace_domains.host > before.workspace_domains.host);
         assert!(dispatched.workspace_domains.device >= before.workspace_domains.device + 2);
         assert!(dispatched.workspace_domains.unified >= before.workspace_domains.unified + 3);
         assert!(dispatched.workspace_domains.temporary >= before.workspace_domains.temporary + 2);
@@ -1128,8 +1123,7 @@ mod tests {
         record_engine_physical_batch(&batch, BatchDispatch::not_dispatched(2));
         let rejected = engine_batch_metrics_snapshot();
         assert!(
-            rejected.physical_batch_rejections_total
-                >= dispatched.physical_batch_rejections_total + 1
+            rejected.physical_batch_rejections_total > dispatched.physical_batch_rejections_total
         );
         assert!(rejected.batch_workspace_bytes_total >= dispatched.batch_workspace_bytes_total);
     }

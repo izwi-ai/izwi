@@ -268,9 +268,12 @@ fn var_builder_from_safetensors(
         if model_path.exists() {
             // Single file
             let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[model_path.clone()], dtype, device).map_err(
-                    |e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)),
-                )?
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&model_path),
+                    dtype,
+                    device,
+                )
+                .map_err(|e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)))?
             };
             Ok(vb)
         } else if index_path.exists() {

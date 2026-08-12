@@ -819,7 +819,7 @@ fn resolve_paged_operation_capabilities(
             let flash_compatible = optimized_provider_enabled
                 && cuda_flash_attention_compiled
                 && policy.page_tokens != 0
-                && policy.page_tokens % 32 == 0
+                && policy.page_tokens.is_multiple_of(32)
                 && matches!(policy.storage.dtype(), StateDType::F16 | StateDType::Bf16)
                 && semantic.layers.iter().all(|layer| {
                     layer.key_head_dim == layer.value_head_dim

@@ -204,11 +204,8 @@ impl MultiHeadAttention {
         let can_try_fused =
             q.device().is_cuda() || (q.device().is_metal() && whisper_metal_sdpa_enabled());
         if can_try_fused {
-            match try_fused_self_attention(&q, &k, &v, None, head_dim, false) {
-                Ok(Some(wv)) => {
-                    return Ok(wv.transpose(1, 2)?.flatten_from(2)?);
-                }
-                Ok(None) | Err(_) => {}
+            if let Ok(Some(wv)) = try_fused_self_attention(q, k, v, None, head_dim, false) {
+                return Ok(wv.transpose(1, 2)?.flatten_from(2)?);
             }
         }
 
@@ -224,7 +221,7 @@ impl MultiHeadAttention {
         };
         let wv = {
             let _enter = self.matmul_span.enter();
-            w.matmul(&v)?
+            w.matmul(v)?
         }
         .transpose(1, 2)?
         .flatten_from(2)?;

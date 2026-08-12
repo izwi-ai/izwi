@@ -126,7 +126,7 @@ mod legacy {
                     let num_elements = tensor.elem_count();
                     let (values, scales, target_dtype) = quantize_tensor_q4_0(&tensor)?;
                     let num_blocks = scales.elem_count();
-                    let expected_blocks = (num_elements + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE;
+                    let expected_blocks = num_elements.div_ceil(Q4_0_BLOCK_SIZE);
                     if num_elements == 0 || num_blocks != expected_blocks {
                         return Err(Error::InvalidInput(
                             "Invalid Q4_0 quantization metadata".to_string(),
@@ -264,7 +264,7 @@ mod legacy {
         let flat = tensor_f32.flatten_all()?;
         let numel = flat.elem_count();
 
-        let num_blocks = (numel + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE;
+        let num_blocks = numel.div_ceil(Q4_0_BLOCK_SIZE);
 
         // Get raw data
         let data = flat.to_vec1::<f32>()?;
@@ -331,12 +331,12 @@ mod legacy {
     ) -> Result<Tensor> {
         let device = values.device();
         if num_elements == 0 {
-            return Ok(Tensor::zeros(0, target_dtype, device).map_err(Error::from)?);
+            return Tensor::zeros(0, target_dtype, device).map_err(Error::from);
         }
 
         let packed = values.to_vec1::<u8>()?;
         let scales_f32 = scales.to_vec1::<f32>()?;
-        let expected_num_blocks = (num_elements + Q4_0_BLOCK_SIZE - 1) / Q4_0_BLOCK_SIZE;
+        let expected_num_blocks = num_elements.div_ceil(Q4_0_BLOCK_SIZE);
         let expected_packed_len = expected_num_blocks * (Q4_0_BLOCK_SIZE / 2);
 
         if scales_f32.len() != expected_num_blocks {
@@ -733,7 +733,7 @@ mod legacy {
             let int8 = KvPage::from_dense(tensor.clone(), KvCacheQuantization::Int8).unwrap();
             let q4 = KvPage::from_dense(tensor, KvCacheQuantization::Q4_0).unwrap();
 
-            assert_eq!(dense.storage_bytes(), 1 * 5 * 2 * 4 * 4);
+            assert_eq!(dense.storage_bytes(), 5 * 2 * 4 * 4);
             assert!(int8.storage_bytes() < dense.storage_bytes());
             assert!(q4.storage_bytes() < int8.storage_bytes());
         }

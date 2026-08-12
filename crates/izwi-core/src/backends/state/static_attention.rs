@@ -959,7 +959,7 @@ pub(super) fn static_plan_is_supported(
                 && resolved.placement == ResolvedPlacement::BackendLocal
                 && matches!(resolved.storage.dtype(), StateDType::F16 | StateDType::Bf16)
                 && u32::try_from(semantic.max_memory_tokens).is_ok()
-                && semantic.max_memory_tokens % 32 == 0
+                && semantic.max_memory_tokens.is_multiple_of(32)
                 && semantic.layers.iter().all(|layer| {
                     layer.key_head_dim == layer.value_head_dim
                         && layer.key_head_dim % 8 == 0

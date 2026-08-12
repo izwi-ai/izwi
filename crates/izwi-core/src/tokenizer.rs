@@ -152,7 +152,7 @@ impl Tokenizer {
             .and_then(|cfg| cfg.add_prefix_space)
             .unwrap_or(true);
         let byte_level = ByteLevel::new(add_prefix_space, true, true);
-        inner.with_pre_tokenizer(Some(byte_level.clone()));
+        inner.with_pre_tokenizer(Some(byte_level));
         let decoder = DecoderWrapper::Sequence(DecoderSequence::new(vec![
             DecoderWrapper::ByteFallback(ByteFallback::new()),
             DecoderWrapper::ByteLevel(byte_level),
@@ -292,13 +292,13 @@ impl Tokenizer {
             let byte_level = ByteLevel::new(add_prefix_space, false, false);
             let sequence = PreTokenizerSequence::new(vec![
                 PreTokenizerWrapper::Split(split),
-                PreTokenizerWrapper::ByteLevel(byte_level.clone()),
+                PreTokenizerWrapper::ByteLevel(byte_level),
             ]);
             inner.with_pre_tokenizer(Some(sequence));
             byte_level
         } else {
             let byte_level = ByteLevel::new(add_prefix_space, true, true);
-            inner.with_pre_tokenizer(Some(byte_level.clone()));
+            inner.with_pre_tokenizer(Some(byte_level));
             byte_level
         };
 

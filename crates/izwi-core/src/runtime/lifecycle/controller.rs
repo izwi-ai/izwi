@@ -689,15 +689,19 @@ mod tests {
     #[tokio::test]
     async fn concurrent_waiters_join_the_same_generation() {
         let (first_tx, first_rx) = watch::channel(None);
-        let mut state = LifecycleState::default();
-        state.next_generation = 7;
-        state.loads.insert(
+        let mut loads = HashMap::new();
+        loads.insert(
             ModelVariant::Kokoro82M,
             InFlightLoad {
                 generation: 7,
                 completion: first_tx.clone(),
             },
         );
+        let state = LifecycleState {
+            next_generation: 7,
+            loads,
+            ..Default::default()
+        };
         let first = LoadWaiter {
             completion: first_rx,
         };

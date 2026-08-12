@@ -520,9 +520,11 @@ mod tests {
             (BackendKind::Metal, BatchDispatchKind::Serial),
             (BackendKind::Cuda, BatchDispatchKind::RequestParallel),
         ] {
-            let mut config = super::super::WorkerConfig::default();
-            config.backend = backend;
-            config.request_parallelism = 2;
+            let config = super::super::WorkerConfig {
+                backend,
+                request_parallelism: 2,
+                ..Default::default()
+            };
             let executor = NativeExecutor::new(config);
             let mut first = EngineCoreRequest::tts("first");
             first.id = "parallel-first".to_string();

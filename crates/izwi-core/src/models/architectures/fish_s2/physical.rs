@@ -424,8 +424,9 @@ mod tests {
     fn descriptor_leases_slow_context_and_one_fast_codebook_frame() {
         let config = current_config();
         let execution = stage();
-        let spec = fish_s2_physical_state_spec(&config, DType::F16, &[&[execution.clone()]])
-            .expect("physical state");
+        let spec =
+            fish_s2_physical_state_spec(&config, DType::F16, &[std::slice::from_ref(&execution)])
+                .expect("physical state");
         let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
             panic!("Fish S2 invocation pages must be bounded");
         };

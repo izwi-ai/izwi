@@ -2409,7 +2409,7 @@ fn sample_semantic(
         .iter()
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
         .map(|(idx, _)| *idx)
-        .or_else(|| Some(if allow_eos { eos_token_id } else { 0 }))
+        .or(Some(if allow_eos { eos_token_id } else { 0 }))
         .ok_or_else(|| Error::InferenceError("Failed to sample semantic token".to_string()))
 }
 
@@ -2557,7 +2557,7 @@ fn sample_semantic_reference(
         .iter()
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
         .map(|(idx, _)| *idx as u32)
-        .or_else(|| Some(if allow_eos { eos_token_id } else { 0 }))
+        .or(Some(if allow_eos { eos_token_id } else { 0 }))
         .ok_or_else(|| Error::InferenceError("Failed to sample semantic token".to_string()))
 }
 

@@ -309,7 +309,9 @@ impl GroupCapacityPlan {
         }
         receipt.validate()?;
         if receipt.requested_owned_bytes == 0
-            || receipt.requested_owned_bytes % self.bytes_per_block != 0
+            || !receipt
+                .requested_owned_bytes
+                .is_multiple_of(self.bytes_per_block)
         {
             return Err(invalid(
                 "allocation receipt must request a non-zero whole number of blocks",

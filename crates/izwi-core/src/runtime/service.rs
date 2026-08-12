@@ -2195,12 +2195,8 @@ impl RuntimeService {
             self.record_engine_error_observation(&observation_request, false, err.to_string());
             return Err(err);
         }
-        if let Err(err) = self
-            .bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
-            .await
-        {
-            return Err(err);
-        }
+        self.bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
+            .await?;
         waiter_guard.disarm();
         self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
@@ -2477,16 +2473,12 @@ impl RuntimeService {
             let err = Error::Timeout(stream_request_id.clone());
             return Err(self.defer_streaming_failure(&mut guard, &observation_request, err));
         }
-        if let Err(err) = self
-            .bind_waiter(
-                &stream_request_id,
-                waiter_registration_id,
-                guard.session.epoch,
-            )
-            .await
-        {
-            return Err(err);
-        }
+        self.bind_waiter(
+            &stream_request_id,
+            waiter_registration_id,
+            guard.session.epoch,
+        )
+        .await?;
         waiter_guard.disarm();
         self.telemetry.record_request_queued(&request_id).await;
         self.step_driver_wakeup.notify_one();
@@ -2516,7 +2508,7 @@ impl RuntimeService {
                         ));
                     }
 
-                    if let Err(err) = self
+                    self
                         .deliver_streaming_chunk_before_deadline(
                             &mut on_chunk,
                             chunk,
@@ -2525,10 +2517,7 @@ impl RuntimeService {
                             &observation_request,
                             &mut guard,
                         )
-                        .await
-                    {
-                        return Err(err);
-                    }
+                        .await?
                 }
                 completion = &mut completion_rx, if completion_result.is_none() => {
                     let completion = match completion {
@@ -4579,12 +4568,14 @@ mod tests {
             registered_sessions: 1,
             arenas: vec![arena(allocated_pages)],
         };
-        let mut snapshot = crate::engine::ManagedKvRuntimeSnapshot::default();
-        snapshot.models = vec![
-            model(1, BackendKind::Cpu, 3),
-            model(2, BackendKind::Metal, 4),
-            model(3, BackendKind::Cuda, 5),
-        ];
+        let snapshot = crate::engine::ManagedKvRuntimeSnapshot {
+            models: vec![
+                model(1, BackendKind::Cpu, 3),
+                model(2, BackendKind::Metal, 4),
+                model(3, BackendKind::Cuda, 5),
+            ],
+            ..Default::default()
+        };
 
         assert_eq!(managed_kv_used_bytes(&snapshot), 12 * 128);
         assert_eq!(managed_kv_device_pages(&snapshot), 9);

@@ -193,7 +193,7 @@ fn find_usize_by_keys(value: &Value, keys: &[&str]) -> Option<usize> {
         Value::Mapping(map) => {
             for (key, child) in map {
                 if let Some(name) = scalar_key(key) {
-                    if keys.iter().any(|candidate| *candidate == name) {
+                    if keys.contains(&name) {
                         if let Some(value) = value_to_usize(child) {
                             return Some(value);
                         }
@@ -223,7 +223,7 @@ fn find_value_by_keys<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> 
         Value::Mapping(map) => {
             for (key, child) in map {
                 if let Some(name) = scalar_key(key) {
-                    if keys.iter().any(|candidate| *candidate == name) {
+                    if keys.contains(&name) {
                         return Some(child);
                     }
                 }
@@ -272,7 +272,7 @@ fn find_string_by_keys(value: &Value, keys: &[&str]) -> Option<String> {
         Value::Mapping(map) => {
             for (key, child) in map {
                 if let Some(name) = scalar_key(key) {
-                    if keys.iter().any(|candidate| *candidate == name) {
+                    if keys.contains(&name) {
                         if let Some(value) = child.as_str() {
                             return Some(value.to_string());
                         }

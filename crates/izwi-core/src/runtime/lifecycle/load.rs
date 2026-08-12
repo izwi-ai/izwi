@@ -1635,10 +1635,12 @@ mod tests {
         missing_contract.domains.pop();
         missing_contract.groups[0].domains.pop();
         missing_contract.validate().unwrap();
-        assert!(
-            plan_invocation_allocations(&descriptor, &missing_contract, &[execution.clone()])
-                .is_err()
-        );
+        assert!(plan_invocation_allocations(
+            &descriptor,
+            &missing_contract,
+            std::slice::from_ref(&execution),
+        )
+        .is_err());
 
         let mut missing_descriptor = descriptor.clone();
         let InvocationWorkspaceSet::Bounded { profiles } = &mut missing_descriptor.invocation
@@ -1647,10 +1649,12 @@ mod tests {
         };
         profiles[0].stages[0].domains.pop();
         profiles[0].stages[0].groups[0].domains.pop();
-        assert!(
-            plan_invocation_allocations(&missing_descriptor, &contract, &[execution.clone()])
-                .is_err()
-        );
+        assert!(plan_invocation_allocations(
+            &missing_descriptor,
+            &contract,
+            std::slice::from_ref(&execution),
+        )
+        .is_err());
 
         let foreign_execution = invocation_execution(2);
         assert!(plan_invocation_allocations(

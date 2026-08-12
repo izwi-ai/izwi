@@ -100,7 +100,7 @@ pub const fn cuda_flash_attention_capabilities() -> CudaFlashAttentionCapabiliti
 pub const fn cuda_flash_attention_head_dim_supported(head_dim: usize) -> bool {
     head_dim > 0
         && head_dim <= CUDA_FLASH_ATTENTION_MAX_HEAD_DIM
-        && head_dim % CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE == 0
+        && head_dim.is_multiple_of(CUDA_FLASH_ATTENTION_HEAD_DIM_MULTIPLE)
 }
 
 pub const fn cuda_flash_attention_compute_capability_supported(
@@ -123,23 +123,12 @@ fn observed_cuda_compute_capability(device: &candle_core::Device) -> Option<(u32
     None
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CudaFlashAttentionOptions<'a> {
     pub window_size_left: Option<usize>,
     pub window_size_right: Option<usize>,
     pub alibi_slopes: Option<&'a Tensor>,
     pub softcap: Option<f32>,
-}
-
-impl Default for CudaFlashAttentionOptions<'_> {
-    fn default() -> Self {
-        Self {
-            window_size_left: None,
-            window_size_right: None,
-            alibi_slopes: None,
-            softcap: None,
-        }
-    }
 }
 
 fn cuda_flash_attention_window(
@@ -150,7 +139,7 @@ fn cuda_flash_attention_window(
         options.window_size_left,
         options
             .window_size_right
-            .or_else(|| if causal { Some(0) } else { None }),
+            .or(if causal { Some(0) } else { None }),
     )
 }
 
@@ -685,7 +674,7 @@ fn metal_sdpa_shape_supported(
     if v_heads != kv_heads {
         return false;
     }
-    if q_heads % kv_heads != 0 {
+    if !q_heads.is_multiple_of(kv_heads) {
         return false;
     }
     if q_seq > k_seq {

@@ -746,7 +746,7 @@ impl KokoroTtsModel {
         input_ids: &Tensor,
         prepared: &KokoroPreparedRequest,
     ) -> Result<KokoroProsodyDebugOutput> {
-        let bert_hidden = self.bert.forward(&input_ids, None)?;
+        let bert_hidden = self.bert.forward(input_ids, None)?;
         let d_en = self
             .bert_encoder
             .forward(&bert_hidden)
@@ -834,7 +834,6 @@ impl KokoroTtsModel {
             let text_handle = scope.spawn(|| {
                 self.text_encoder
                     .forward(input_ids)
-                    .map_err(Error::from)
                     .map_err(|e| e.to_string())
             });
 

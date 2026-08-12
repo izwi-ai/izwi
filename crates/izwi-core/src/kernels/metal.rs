@@ -5597,10 +5597,7 @@ mod tests {
         // Reference implementation
         let sq_sum: f32 = [1.0f32, 2.0, 3.0, 4.0].iter().map(|x| x * x).sum();
         let norm = sq_sum.sqrt();
-        let expected = vec![
-            vec![1.0f32 / norm, 2.0 / norm],
-            vec![3.0 / norm, 4.0 / norm],
-        ];
+        let expected = [[1.0f32 / norm, 2.0 / norm], [3.0 / norm, 4.0 / norm]];
 
         // Fused implementation (falls back to CPU for non-Metal)
         let eps = 1e-6;

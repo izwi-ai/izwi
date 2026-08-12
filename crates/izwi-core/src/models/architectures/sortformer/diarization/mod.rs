@@ -567,7 +567,7 @@ struct SortformerCacheCandidate {
     score: f32,
 }
 
-const SORTFORMER_SCORE_BOOST_DELTA: f32 = 0.693_147_2;
+const SORTFORMER_SCORE_BOOST_DELTA: f32 = std::f32::consts::LN_2;
 
 pub struct SortformerDiarizerModel {
     variant: ModelVariant,
@@ -824,7 +824,7 @@ impl SortformerDiarizerModel {
         let mut gated_probs = speaker_probs;
         let frame_count = gated_probs.len();
         let vad_mask = sortformer_vad_frame_mask(
-            &samples,
+            samples,
             frame_count,
             frame_stride_samples,
             min_speech_ms,
@@ -1950,9 +1950,9 @@ impl SortformerPreprocessor {
 
         let center_pad = self.n_fft / 2;
         let mut padded = Vec::with_capacity(x.len() + center_pad * 2);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
         padded.extend_from_slice(&x);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
 
         let frame_count = if padded.len() >= self.n_fft {
             (padded.len() - self.n_fft) / self.hop_length + 1

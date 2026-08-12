@@ -168,7 +168,7 @@ mod tests {
     fn realtime_buffer_grows_for_large_audio_chunk() {
         let mut buffer = tiny_buffer();
 
-        buffer.write_audio(&vec![1.0; 20]);
+        buffer.write_audio(&[1.0; 20]);
 
         assert_eq!(buffer.filled_len, 20);
         assert!(buffer.buffer.len() >= 20);

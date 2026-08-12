@@ -286,7 +286,7 @@ impl DiarizationAudioInput<'_> {
             Self::Base64(audio) => {
                 validate_base64_audio_retained_size(audio.len(), MAX_AUDIO_SOURCE_BYTES)
             }
-            Self::Bytes(audio) if audio.is_empty() => Err(Error::InvalidInput(
+            Self::Bytes([]) => Err(Error::InvalidInput(
                 "diarization request missing audio bytes".to_string(),
             )),
             Self::Bytes(audio) if audio.len() > MAX_AUDIO_SOURCE_BYTES => {
@@ -1251,7 +1251,7 @@ fn fallback_word_timings_from_words(
     let step = (duration_ms as f32 / words.len() as f32).max(1.0);
 
     words
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(idx, word)| {
             let start = ((idx as f32) * step).round() as u32;
@@ -1402,7 +1402,7 @@ fn alignment_is_suspicious(
 
     let duration_ms = secs_to_ms(duration_secs).max(1);
     let tail_start = duration_ms.saturating_sub(ALIGNMENT_COLLAPSE_TAIL_MS);
-    let prefix_window_end = ((duration_ms / 50).max(250)).min(ALIGNMENT_PREFIX_CLUSTER_MS_CAP);
+    let prefix_window_end = (duration_ms / 50).clamp(250, ALIGNMENT_PREFIX_CLUSTER_MS_CAP);
 
     let mut min_start = u32::MAX;
     let mut max_end = 0u32;

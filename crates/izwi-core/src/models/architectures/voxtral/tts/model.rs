@@ -614,7 +614,10 @@ fn voxtral_audio_embedding_codebook_sizes(config: &VoxtralTtsConfig) -> Result<V
         .ok_or_else(|| {
             Error::ConfigError("Voxtral acoustic codebook size overflowed".to_string())
         })? as u32;
-    sizes.extend(std::iter::repeat(acoustic_size).take(config.n_acoustic_codebooks()));
+    sizes.extend(std::iter::repeat_n(
+        acoustic_size,
+        config.n_acoustic_codebooks(),
+    ));
     Ok(sizes)
 }
 

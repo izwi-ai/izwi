@@ -140,51 +140,29 @@ impl KokoroProsodyPredictor {
         .map_err(Error::from)?;
         let shared_lstm = BiLstm1::load(hidden_dim + style_dim, hidden_dim / 2, root.pp("shared"))?;
 
-        let mut f0_blocks = Vec::with_capacity(3);
-        f0_blocks.push(AdainResBlk1d::load(
-            hidden_dim,
-            hidden_dim,
-            style_dim,
-            false,
-            root.pp("F0.0"),
-        )?);
-        f0_blocks.push(AdainResBlk1d::load(
-            hidden_dim,
-            hidden_dim / 2,
-            style_dim,
-            true,
-            root.pp("F0.1"),
-        )?);
-        f0_blocks.push(AdainResBlk1d::load(
-            hidden_dim / 2,
-            hidden_dim / 2,
-            style_dim,
-            false,
-            root.pp("F0.2"),
-        )?);
+        let f0_blocks = vec![
+            AdainResBlk1d::load(hidden_dim, hidden_dim, style_dim, false, root.pp("F0.0"))?,
+            AdainResBlk1d::load(hidden_dim, hidden_dim / 2, style_dim, true, root.pp("F0.1"))?,
+            AdainResBlk1d::load(
+                hidden_dim / 2,
+                hidden_dim / 2,
+                style_dim,
+                false,
+                root.pp("F0.2"),
+            )?,
+        ];
 
-        let mut n_blocks = Vec::with_capacity(3);
-        n_blocks.push(AdainResBlk1d::load(
-            hidden_dim,
-            hidden_dim,
-            style_dim,
-            false,
-            root.pp("N.0"),
-        )?);
-        n_blocks.push(AdainResBlk1d::load(
-            hidden_dim,
-            hidden_dim / 2,
-            style_dim,
-            true,
-            root.pp("N.1"),
-        )?);
-        n_blocks.push(AdainResBlk1d::load(
-            hidden_dim / 2,
-            hidden_dim / 2,
-            style_dim,
-            false,
-            root.pp("N.2"),
-        )?);
+        let n_blocks = vec![
+            AdainResBlk1d::load(hidden_dim, hidden_dim, style_dim, false, root.pp("N.0"))?,
+            AdainResBlk1d::load(hidden_dim, hidden_dim / 2, style_dim, true, root.pp("N.1"))?,
+            AdainResBlk1d::load(
+                hidden_dim / 2,
+                hidden_dim / 2,
+                style_dim,
+                false,
+                root.pp("N.2"),
+            )?,
+        ];
 
         let f0_proj = load_plain_conv1d(root.pp("F0_proj"), Conv1dConfig::default())?;
         let n_proj = load_plain_conv1d(root.pp("N_proj"), Conv1dConfig::default())?;
@@ -1077,10 +1055,14 @@ pub(crate) struct BiLstm1 {
 
 impl BiLstm1 {
     pub(crate) fn load(input_dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let mut cfg_f = LSTMConfig::default();
-        cfg_f.direction = Direction::Forward;
-        let mut cfg_b = LSTMConfig::default();
-        cfg_b.direction = Direction::Backward;
+        let cfg_f = LSTMConfig {
+            direction: Direction::Forward,
+            ..Default::default()
+        };
+        let cfg_b = LSTMConfig {
+            direction: Direction::Backward,
+            ..Default::default()
+        };
         Ok(Self {
             fwd: candle_nn::lstm(input_dim, hidden_dim, cfg_f, vb.clone()).map_err(Error::from)?,
             bwd: candle_nn::lstm(input_dim, hidden_dim, cfg_b, vb).map_err(Error::from)?,

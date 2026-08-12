@@ -593,7 +593,7 @@ fn strip_think_blocks(input: &str) -> String {
     let close = "</think>";
 
     if let Some(close_idx) = output.find(close) {
-        let has_open_before_close = output[..close_idx].find(open).is_some();
+        let has_open_before_close = output[..close_idx].contains(open);
         if !has_open_before_close {
             let start = close_idx + close.len();
             output = output[start..].to_string();

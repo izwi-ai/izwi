@@ -49,20 +49,15 @@ pub enum RequestStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EngineStreamPolicy {
+    #[default]
     FailOnFull,
     BlockWithDeadline {
         timeout_ms: u64,
     },
     /// Drop the newly produced output when the bounded queue is full.
     DropNewest,
-}
-
-impl Default for EngineStreamPolicy {
-    fn default() -> Self {
-        Self::FailOnFull
-    }
 }
 
 impl EngineStreamPolicy {
@@ -82,6 +77,7 @@ impl EngineStreamPolicy {
 /// Coarse workload class used by admission and latency-aware scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WorkloadClass {
     /// Realtime voice or transcription work where first output latency matters most.
     Realtime,
@@ -90,17 +86,12 @@ pub enum WorkloadClass {
     /// User-visible streaming work such as chat or TTS over SSE/websocket.
     Streaming,
     /// Default online API work.
+    #[default]
     Online,
     /// Offline batch jobs.
     Batch,
     /// Opportunistic background work.
     Background,
-}
-
-impl Default for WorkloadClass {
-    fn default() -> Self {
-        Self::Online
-    }
 }
 
 impl WorkloadClass {
@@ -902,7 +893,7 @@ impl EngineCoreRequest {
             (EngineTask::SpeechToSpeech(input), TaskType::SpeechToSpeech) => &input.audio,
             _ => return None,
         };
-        (!audio.is_empty()).then(|| match audio {
+        (!audio.is_empty()).then_some(match audio {
             EngineAudioInput::Base64(value) => BorrowedEngineAudioInput::Base64(value),
             EngineAudioInput::Bytes(value) => BorrowedEngineAudioInput::Bytes(value),
         })
@@ -924,7 +915,7 @@ impl EngineCoreRequest {
     fn selected_asr_language(&self) -> Option<&String> {
         self.language
             .as_ref()
-            .or_else(|| match (&self.task, self.task_type) {
+            .or(match (&self.task, self.task_type) {
                 (EngineTask::Asr(input), TaskType::ASR) => input.language.as_ref(),
                 _ => None,
             })
@@ -933,7 +924,7 @@ impl EngineCoreRequest {
     fn selected_asr_prompt(&self) -> Option<&String> {
         self.asr_prompt
             .as_ref()
-            .or_else(|| match (&self.task, self.task_type) {
+            .or(match (&self.task, self.task_type) {
                 (EngineTask::Asr(input), TaskType::ASR) => input.prompt.as_ref(),
                 _ => None,
             })
@@ -964,7 +955,7 @@ impl EngineCoreRequest {
     fn selected_speech_system_prompt(&self) -> Option<&String> {
         self.system_prompt
             .as_ref()
-            .or_else(|| match (&self.task, self.task_type) {
+            .or(match (&self.task, self.task_type) {
                 (EngineTask::SpeechToSpeech(input), TaskType::SpeechToSpeech) => {
                     input.system_prompt.as_ref()
                 }
@@ -1692,6 +1683,7 @@ impl EngineCoreRequest {
         }) else {
             return Ok(None);
         };
+        #[allow(clippy::infallible_destructuring_match)]
         let model = match model {
             PreparedChatModel::Exact(model) => model,
             #[cfg(test)]
@@ -3875,7 +3867,7 @@ mod tests {
             None,
             5,
         )
-            .unwrap();
+        .unwrap();
         assert!(matches!(
             full.enforce_chat_context_window(5),
             Err(Error::InvalidInput(message)) if message.contains("leaves no output capacity")

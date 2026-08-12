@@ -142,15 +142,11 @@ impl StateOperationSet {
 /// changing operation names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub(crate) enum PagedOperationImplementation {
+    #[default]
     Portable,
     Optimized,
-}
-
-impl Default for PagedOperationImplementation {
-    fn default() -> Self {
-        Self::Portable
-    }
 }
 
 /// Fingerprinted implementation plan for the three paged-attention ABIs.

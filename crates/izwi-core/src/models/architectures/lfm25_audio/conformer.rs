@@ -1243,7 +1243,7 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 
 pub fn subsampled_len_3x(mut len: usize) -> usize {
     for _ in 0..3 {
-        len = (len + 1) / 2;
+        len = len.div_ceil(2);
     }
     len
 }

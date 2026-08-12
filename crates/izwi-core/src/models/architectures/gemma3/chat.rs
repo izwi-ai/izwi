@@ -247,7 +247,7 @@ fn parse_gemma3_config(
         "max_position_embeddings",
         Value::from(defaults.max_position_embeddings as u64),
     );
-    let resolved_vocab_size = checkpoint_vocab_size.unwrap_or_else(|| {
+    let resolved_vocab_size = checkpoint_vocab_size.unwrap_or({
         if has_text_config {
             262_208
         } else {

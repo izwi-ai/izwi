@@ -6,6 +6,8 @@
 //! - Hugging Face `transformers`: language/task prompt handling and suppress token
 //!   masks from `generation_config.json`.
 
+#![allow(clippy::items_after_test_module)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -235,14 +237,12 @@ enum WhisperModel {
 
 impl WhisperModel {
     fn load(vb: &VarBuilder, config: WhisperConfig) -> Result<Self> {
-        LocalWhisper::load(vb, config)
-            .map(Self::Local)
-            .map_err(Error::from)
+        LocalWhisper::load(vb, config).map(Self::Local)
     }
 
     fn encoder_forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model.encoder.forward(x).map_err(Error::from),
+            Self::Local(model) => model.encoder.forward(x),
         }
     }
 
@@ -253,10 +253,11 @@ impl WhisperModel {
         cross_kv: &mut InvocationStaticAttentionLease,
     ) -> Result<()> {
         match self {
-            Self::Local(model) => model
-                .decoder
-                .install_cross_attention_memory(audio_features, source_identity, cross_kv)
-                .map_err(Error::from),
+            Self::Local(model) => model.decoder.install_cross_attention_memory(
+                audio_features,
+                source_identity,
+                cross_kv,
+            ),
         }
     }
 
@@ -268,16 +269,17 @@ impl WhisperModel {
         cross_kv: &InvocationStaticAttentionLease,
     ) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model
-                .decoder
-                .forward_physical_at(x, position_offset, self_kv, cross_kv)
-                .map_err(Error::from),
+            Self::Local(model) => {
+                model
+                    .decoder
+                    .forward_physical_at(x, position_offset, self_kv, cross_kv)
+            }
         }
     }
 
     fn decoder_final_linear(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Local(model) => model.decoder.final_linear(x).map_err(Error::from),
+            Self::Local(model) => model.decoder.final_linear(x),
         }
     }
 }

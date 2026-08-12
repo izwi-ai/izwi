@@ -2061,7 +2061,7 @@ fn reservation_for_group(
         ));
     }
     for (index, block) in existing.iter().take(required_pages).copied().enumerate() {
-        let is_partial_tail = snapshot.committed_tokens % page_tokens != 0
+        let is_partial_tail = !snapshot.committed_tokens.is_multiple_of(page_tokens)
             && index + 1 == existing.len()
             && target_tokens > snapshot.committed_tokens;
         blocks.push(if is_partial_tail {
@@ -2070,9 +2070,10 @@ fn reservation_for_group(
             KvBlockIntent::Existing(block)
         });
     }
-    blocks.extend(
-        std::iter::repeat(KvBlockIntent::Fresh).take(required_pages.saturating_sub(blocks.len())),
-    );
+    blocks.extend(std::iter::repeat_n(
+        KvBlockIntent::Fresh,
+        required_pages.saturating_sub(blocks.len()),
+    ));
     Ok(KvGroupReservation { group, blocks })
 }
 

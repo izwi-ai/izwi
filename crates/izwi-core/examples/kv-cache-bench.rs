@@ -113,11 +113,13 @@ impl Default for Options {
     }
 }
 
+type LayerReader = dyn Fn(KvLayerBinding) -> Result<(Tensor, Tensor), String>;
+
 struct Runtime {
     arena: Arc<dyn KvArena>,
     device: Device,
     dtype: DType,
-    read_layer: Box<dyn Fn(KvLayerBinding) -> Result<(Tensor, Tensor), String>>,
+    read_layer: Box<LayerReader>,
 }
 
 struct Workload {

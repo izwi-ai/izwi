@@ -803,7 +803,10 @@ mod tests {
         let second_stage = named_stage("second", 0);
         let mut profiles = vec![
             InvocationWorkspaceProfile {
-                stage_graph_fingerprint: stage_graph_fingerprint(&[first_stage.clone()]).unwrap(),
+                stage_graph_fingerprint: stage_graph_fingerprint(std::slice::from_ref(
+                    &first_stage,
+                ))
+                .unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
                     lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -812,7 +815,10 @@ mod tests {
                 }],
             },
             InvocationWorkspaceProfile {
-                stage_graph_fingerprint: stage_graph_fingerprint(&[second_stage.clone()]).unwrap(),
+                stage_graph_fingerprint: stage_graph_fingerprint(std::slice::from_ref(
+                    &second_stage,
+                ))
+                .unwrap(),
                 stages: vec![InvocationStageWorkspace {
                     stage: StageId::new(1),
                     lease_scope: InvocationLeaseScope::PerStageBatch,
@@ -832,7 +838,7 @@ mod tests {
             },
         };
         assert!(noncanonical
-            .validate_against_stages(&[first_stage.clone()])
+            .validate_against_stages(std::slice::from_ref(&first_stage))
             .is_err());
 
         let descriptor = CapabilityStateDescriptorV2 {
@@ -841,13 +847,15 @@ mod tests {
             invocation: InvocationWorkspaceSet::Bounded { profiles },
         };
         descriptor
-            .validate_against_stages(&[first_stage.clone()])
+            .validate_against_stages(std::slice::from_ref(&first_stage))
             .unwrap();
         descriptor.validate_against_stages(&[second_stage]).unwrap();
         assert!(descriptor.is_stateless());
         assert!(descriptor.validate_against_stages(&[stage(1)]).is_err());
         assert_eq!(
-            descriptor.fingerprint(&[first_stage.clone()]).unwrap(),
+            descriptor
+                .fingerprint(std::slice::from_ref(&first_stage))
+                .unwrap(),
             descriptor.fingerprint(&[first_stage]).unwrap()
         );
     }
@@ -877,7 +885,10 @@ mod tests {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
                 profiles: vec![InvocationWorkspaceProfile {
-                    stage_graph_fingerprint: stage_graph_fingerprint(&[execution.clone()]).unwrap(),
+                    stage_graph_fingerprint: stage_graph_fingerprint(std::slice::from_ref(
+                        &execution,
+                    ))
+                    .unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
                         lease_scope: InvocationLeaseScope::PerRow,
@@ -901,7 +912,10 @@ mod tests {
             retained: RetainedStateCapability::Stateless,
             invocation: InvocationWorkspaceSet::Bounded {
                 profiles: vec![InvocationWorkspaceProfile {
-                    stage_graph_fingerprint: stage_graph_fingerprint(&[execution.clone()]).unwrap(),
+                    stage_graph_fingerprint: stage_graph_fingerprint(std::slice::from_ref(
+                        &execution,
+                    ))
+                    .unwrap(),
                     stages: vec![InvocationStageWorkspace {
                         stage: StageId::new(1),
                         lease_scope: InvocationLeaseScope::PerRow,

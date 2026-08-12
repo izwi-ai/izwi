@@ -122,7 +122,9 @@ impl MetalMemoryPool {
         if size_bytes > self.config.max_pool_size {
             return None; // Don't pool very large tensors
         }
-        if self.config.bucket_increment > 1 && size_bytes % self.config.bucket_increment != 0 {
+        if self.config.bucket_increment > 1
+            && !size_bytes.is_multiple_of(self.config.bucket_increment)
+        {
             return None; // Enforce alignment if configured
         }
 
