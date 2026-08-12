@@ -235,6 +235,24 @@ impl ManagedKvModelRuntime {
         &self.allocation_plan
     }
 
+    pub(crate) fn logical_token_reach(&self) -> u64 {
+        self.plan
+            .groups
+            .iter()
+            .map(|group| u64::from(group.capacity_pages) * u64::from(group.page_tokens))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Make asynchronous accelerator allocation/zeroing failures observable
+    /// before the lifecycle publishes this generation as Ready.
+    pub(crate) fn synchronize_backing(&self) -> Result<()> {
+        for arena in self.arenas.values() {
+            arena.drain()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn arena(&self, id: KvArenaId) -> Option<&Arc<dyn KvArena>> {
         self.arenas.get(&id)
     }
@@ -350,6 +368,87 @@ impl ManagedKvCacheManager {
             backend_runtime,
             backend_unavailable,
         }
+    }
+
+    /// Resolve the largest portable logical reach whose exact managed-state
+    /// plan fits the stable shared-memory envelope. CUDA deliberately bypasses
+    /// this path and keeps admission-growable arenas.
+    pub(crate) fn fit_portable_logical_token_reach(
+        &self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        maximum_tokens: u64,
+        safety_reserve_bytes: u64,
+        page_tokens_hint: usize,
+        retained_sequence_rows: u32,
+        staged_transaction_rows: u32,
+    ) -> Result<u64> {
+        if self.worker_backend == BackendKind::Cuda || maximum_tokens == 0 {
+            return Ok(maximum_tokens);
+        }
+        let Some(authority) = self.resource_authority.as_ref() else {
+            return Ok(maximum_tokens.min(4_096));
+        };
+        let ResourceAmount::Known(headroom_bytes) =
+            authority.planning_headroom_bytes(self.worker_backend)?
+        else {
+            return Ok(maximum_tokens.min(4_096));
+        };
+        let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let page_tokens_hint = u32::try_from(page_tokens_hint)
+            .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
+        let state_plan = negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: self.worker_backend,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: Some(page_tokens_hint),
+                storage_dtype_hint: None,
+            },
+        )?;
+        let required_bytes = |tokens: u64| -> Result<u64> {
+            let (allocation, _) = plan_managed_state_capacity(
+                &state_plan,
+                model_instance,
+                ManagedStateCapacityRequest {
+                    total_paged_pages: u32::MAX,
+                    logical_token_reach: Some(tokens),
+                    retained_sequence_rows,
+                    staged_transaction_rows,
+                },
+            )?;
+            let resources = managed_state_resources(
+                self.worker_backend,
+                allocation.maximum_resources(&state_plan)?,
+            )?;
+            match self.worker_backend {
+                BackendKind::Cpu => known_resource_bytes(resources.host_bytes, "host"),
+                BackendKind::Metal => known_resource_bytes(resources.unified_bytes, "unified"),
+                BackendKind::Cuda => unreachable!("CUDA bypassed portable fitting"),
+            }
+        };
+
+        let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
+        let minimum_bytes = required_bytes(minimum_tokens)?;
+        if minimum_bytes > budget_bytes {
+            return Err(Error::ModelLoadError(format!(
+                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+            )));
+        }
+        if required_bytes(maximum_tokens)? <= budget_bytes {
+            return Ok(maximum_tokens);
+        }
+
+        let (mut low, mut high) = (minimum_tokens, maximum_tokens);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if required_bytes(middle)? <= budget_bytes {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        Ok(low)
     }
 
     pub(crate) fn with_prefix_cache_salt(
@@ -1774,6 +1873,15 @@ fn managed_paged_capacity_strategy(backend: BackendKind, blocks: u32) -> Capacit
     }
 }
 
+fn known_resource_bytes(amount: ResourceAmount, domain: &str) -> Result<u64> {
+    match amount {
+        ResourceAmount::Known(bytes) => Ok(bytes),
+        ResourceAmount::Unknown => Err(Error::ModelLoadError(format!(
+            "portable context planning has unknown {domain} capacity"
+        ))),
+    }
+}
+
 fn managed_state_resources(
     backend: BackendKind,
     state: StateResourceVector,
@@ -2194,8 +2302,8 @@ mod tests {
     };
     use crate::kv::v2::{
         BoundedShape, PageSizeConstraint, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
-        StateComponentId, StateDomainHeader, StateGroupSpec, StateScope, TensorComponentSpec,
-        TensorRole, TensorStateDomainSpec,
+        StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateGroupId,
+        StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
     };
     use crate::kv::{
         test_contract, CacheBlockRef, InferenceStateCapability as CacheCapability, KvSlotRef,
@@ -2612,6 +2720,106 @@ mod tests {
                 .unwrap();
             assert_eq!(capacity.strategy.maximum_blocks(), expected_pages);
         }
+    }
+
+    #[test]
+    fn portable_auto_fit_selects_the_largest_exact_page_reach() {
+        const RESERVE: u64 = 1024 * 1024 * 1024;
+        let contract = test_contract();
+        let state_plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let (allocation, _) = plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(900),
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::MAX,
+                logical_token_reach: Some(4_096),
+                retained_sequence_rows: 8,
+                staged_transaction_rows: 8,
+            },
+        )
+        .unwrap();
+        let exact = managed_state_resources(
+            BackendKind::Cpu,
+            allocation.maximum_resources(&state_plan).unwrap(),
+        )
+        .unwrap();
+        let ResourceAmount::Known(exact_bytes) = exact.host_bytes else {
+            panic!("test plan must have known host bytes");
+        };
+        let manager = ManagedKvCacheManager::for_worker(
+            Some(advisory_authority_with_capacity(RESERVE + exact_bytes)),
+            BackendKind::Cpu,
+            Device::Cpu,
+        );
+        assert_eq!(
+            manager
+                .fit_portable_logical_token_reach(
+                    ModelInstanceId::new(900),
+                    &contract,
+                    40_960,
+                    RESERVE,
+                    64,
+                    8,
+                    8,
+                )
+                .unwrap(),
+            4_096
+        );
+    }
+
+    #[test]
+    fn qwen3_four_and_eight_billion_geometry_materializes_576_mib_at_4096() {
+        let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!("test contract is paged")
+        };
+        let layer = domain.layers[0].clone();
+        domain.layers = (0..36)
+            .map(|model_layer| crate::kv::v2::PagedAttentionLayerSpec {
+                model_layer,
+                query_heads: 32,
+                kv_heads: 8,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                ..layer.clone()
+            })
+            .collect();
+        let state_plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: Some(StateDType::F16),
+            },
+        )
+        .unwrap();
+        let (allocation, _) = plan_managed_state_capacity(
+            &state_plan,
+            ModelInstanceId::new(901),
+            ManagedStateCapacityRequest {
+                total_paged_pages: 1_024,
+                logical_token_reach: Some(4_096),
+                retained_sequence_rows: 8,
+                staged_transaction_rows: 8,
+            },
+        )
+        .unwrap();
+        let resources = allocation.maximum_resources(&state_plan).unwrap();
+        assert_eq!(resources.host_bytes, 576 * 1024 * 1024);
+        let capacity = allocation
+            .group_capacity(StateGroupId::new(1), StateDomainId::new(1))
+            .unwrap();
+        assert_eq!(capacity.strategy.maximum_blocks(), 64);
     }
 
     #[test]

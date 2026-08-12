@@ -103,9 +103,8 @@ impl<'de> Deserialize<'de> for ContextLengthPreference {
             where
                 E: serde::de::Error,
             {
-                let value = usize::try_from(value).map_err(|_| {
-                    E::invalid_value(serde::de::Unexpected::Unsigned(value), &self)
-                })?;
+                let value = usize::try_from(value)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))?;
                 NonZeroUsize::new(value)
                     .map(ContextLengthPreference::Explicit)
                     .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(0), &self))
@@ -325,6 +324,11 @@ pub struct EngineConfig {
     #[serde(default)]
     pub max_sequence_length: ContextLengthPreference,
 
+    /// Memory kept outside fitted model/state plans for allocator and backend
+    /// command-buffer overhead.
+    #[serde(default = "default_portable_context_reserve_bytes")]
+    pub portable_context_reserve_bytes: u64,
+
     /// Chunk size for streaming (in audio tokens)
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
@@ -366,6 +370,7 @@ impl Default for EngineConfig {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_sequence_length: ContextLengthPreference::Auto,
+            portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
             chunk_size: default_chunk_size(),
             kv_cache_dtype: default_kv_cache_dtype(),
             kv_page_size: default_kv_page_size(),
@@ -406,6 +411,10 @@ fn default_models_dir() -> PathBuf {
 
 fn default_max_batch_size() -> usize {
     8
+}
+
+fn default_portable_context_reserve_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 fn default_chunk_size() -> usize {
@@ -700,20 +709,14 @@ mod managed_kv_default_tests {
     #[test]
     fn context_length_defaults_to_auto_when_absent() {
         let config: EngineConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(
-            config.max_sequence_length,
-            ContextLengthPreference::Auto
-        );
+        assert_eq!(config.max_sequence_length, ContextLengthPreference::Auto);
     }
 
     #[test]
     fn context_length_accepts_auto_and_legacy_positive_numbers() {
         let automatic: EngineConfig =
             serde_json::from_str(r#"{"max_sequence_length":"auto"}"#).unwrap();
-        assert_eq!(
-            automatic.max_sequence_length,
-            ContextLengthPreference::Auto
-        );
+        assert_eq!(automatic.max_sequence_length, ContextLengthPreference::Auto);
 
         let explicit: EngineConfig =
             serde_json::from_str(r#"{"max_sequence_length":2048}"#).unwrap();
@@ -745,7 +748,10 @@ mod managed_kv_default_tests {
             r#"{"max_sequence_length":"4096"}"#,
             r#"{"max_sequence_length":"native"}"#,
         ] {
-            assert!(serde_json::from_str::<EngineConfig>(invalid).is_err(), "{invalid}");
+            assert!(
+                serde_json::from_str::<EngineConfig>(invalid).is_err(),
+                "{invalid}"
+            );
         }
     }
 }

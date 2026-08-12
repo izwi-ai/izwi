@@ -209,6 +209,15 @@ impl ModelLifecycleController {
             .map(|slot| slot.model_instance_id)
     }
 
+    pub(super) fn resident_variant_for_instance(
+        &self,
+        model_instance_id: ModelInstanceId,
+    ) -> Option<ModelVariant> {
+        self.state().residents.iter().find_map(|(variant, slot)| {
+            (slot.model_instance_id == model_instance_id).then_some(*variant)
+        })
+    }
+
     pub(crate) fn try_get_ready_bundle(
         &self,
         variant: ModelVariant,

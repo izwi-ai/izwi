@@ -98,6 +98,7 @@ impl ModelLifecycleController {
                 *codec_guard = AudioCodec::new();
             }
         }
+        self.model_registry.clear_effective_context(variant);
     }
 
     async fn purge_executor_model_cache(&self, variant: ModelVariant) -> Result<()> {
@@ -373,6 +374,7 @@ mod tests {
         let runtime = RuntimeService::new(EngineConfig {
             models_dir: models_dir.clone(),
             backend: BackendPreference::Cpu,
+            max_sequence_length: crate::config::ContextLengthPreference::explicit(4096).unwrap(),
             ..EngineConfig::default()
         })
         .unwrap();
@@ -399,7 +401,7 @@ mod tests {
                 .load_managed_model_cache(
                     model_instance,
                     &InferenceStateCapability::Managed(contract.clone()),
-                    None,
+                    Some(4096),
                 )
                 .await
                 .unwrap()

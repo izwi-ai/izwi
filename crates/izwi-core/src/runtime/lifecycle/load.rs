@@ -17,8 +17,8 @@ use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
     InvocationStateCapacity, InvocationWorkspaceBindingV2, InvocationWorkspaceDomain,
     InvocationWorkspaceKeyV2, InvocationWorkspaceRuntimeV2, InvocationWorkspaceSet,
-    RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2, StateDomainId,
-    StateDomainSpec, StateScope,
+    RetainedStateCapability, RetainedStateRuntimeV2, RetainedStateUseV2, StateCapacityAxis,
+    StateDomainId, StateDomainSpec, StateScope,
 };
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
@@ -327,12 +327,12 @@ fn plan_invocation_allocations(
                     || matches!(
                         (state, capacity),
                         (
-                        StateDomainSpec::StaticAttention(_)
-                            | StateDomainSpec::Tensor(_)
-                            | StateDomainSpec::Append(_)
-                            | StateDomainSpec::Ring(_)
-                            | StateDomainSpec::StaticTensor(_),
-                        InvocationStateCapacity::SemanticBounded
+                            StateDomainSpec::StaticAttention(_)
+                                | StateDomainSpec::Tensor(_)
+                                | StateDomainSpec::Append(_)
+                                | StateDomainSpec::Ring(_)
+                                | StateDomainSpec::StaticTensor(_),
+                            InvocationStateCapacity::SemanticBounded
                         )
                     );
                 if !capacity_matches {
@@ -392,15 +392,135 @@ fn plan_invocation_allocations(
 }
 
 impl ModelLifecycleController {
+    fn fit_invocation_decoder_context(
+        &self,
+        variant: ModelVariant,
+        descriptor: &mut CapabilityStateDescriptorV2,
+        invocation_contract: &InferenceStateContract,
+        executions: &[LoadedExecutionContract],
+    ) -> Result<()> {
+        let safety_reserve_bytes = self.config.portable_context_reserve_bytes;
+        let Some((minimum, maximum)) =
+            descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext)
+        else {
+            return Ok(());
+        };
+        if let Some(selected) = self.model_registry.effective_context(variant) {
+            descriptor.resolve_capacity_axis(
+                StateCapacityAxis::DecoderContext,
+                maximum.min(selected as u64),
+            )?;
+            return Ok(());
+        }
+        let backend = self.backend_router.context().backend_kind;
+        if backend == BackendKind::Cuda {
+            return Ok(());
+        }
+        let ResourceAmount::Known(headroom_bytes) = self
+            .coordinator
+            .resource_authority()
+            .planning_headroom_bytes(backend)?
+        else {
+            let fallback = self
+                .config
+                .max_sequence_length
+                .explicit_tokens()
+                .map_or(maximum.min(4_096), |tokens| maximum.min(tokens as u64));
+            descriptor.resolve_capacity_axis(StateCapacityAxis::DecoderContext, fallback)?;
+            self.model_registry
+                .publish_effective_context(variant, fallback)?;
+            return Ok(());
+        };
+        let budget = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let publication_multiplicity =
+            u64::try_from(self.adapter_registry.capabilities_for(variant).len().max(1))
+                .map_err(|_| Error::ModelLoadError("capability count exceeds u64".into()))?;
+        let required = |tokens: u64| -> Result<u64> {
+            let mut candidate = descriptor.clone();
+            candidate.resolve_capacity_axis(StateCapacityAxis::DecoderContext, tokens)?;
+            plan_invocation_allocations(&candidate, invocation_contract, executions)?
+                .into_iter()
+                .try_fold(0_u64, |total, allocation| {
+                    total
+                        .checked_add(
+                            allocation
+                                .domain
+                                .maximum_bytes()?
+                                .checked_mul(u64::from(allocation.slot_count))
+                                .ok_or_else(|| {
+                                    Error::ModelLoadError(
+                                        "invocation context byte plan overflow".into(),
+                                    )
+                                })?,
+                        )
+                        .ok_or_else(|| {
+                            Error::ModelLoadError("invocation context byte plan overflow".into())
+                        })
+                })?
+                .checked_mul(publication_multiplicity)
+                .ok_or_else(|| {
+                    Error::ModelLoadError("aggregate capability state plan overflow".into())
+                })
+        };
+        let selected = if let Some(explicit) = self.config.max_sequence_length.explicit_tokens() {
+            let selected = maximum.min(explicit as u64);
+            let bytes = required(selected)?;
+            if bytes > budget {
+                return Err(Error::ModelLoadError(format!(
+                    "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                )));
+            }
+            selected
+        } else {
+            let minimum_bytes = required(minimum)?;
+            if minimum_bytes > budget {
+                return Err(Error::ModelLoadError(format!(
+                    "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                )));
+            }
+            let (mut low, mut high) = (minimum, maximum);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if required(middle)? <= budget {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            low
+        };
+        descriptor.resolve_capacity_axis(StateCapacityAxis::DecoderContext, selected)?;
+        let published = self
+            .model_registry
+            .effective_context(variant)
+            .map_or(selected, |current| selected.min(current as u64));
+        self.model_registry
+            .publish_effective_context(variant, published)?;
+        Ok(())
+    }
+
     async fn load_invocation_workspace_publication(
         &self,
         model_instance_id: crate::engine::ModelInstanceId,
         executions: &[LoadedExecutionContract],
-        descriptor: CapabilityStateDescriptorV2,
+        mut descriptor: CapabilityStateDescriptorV2,
         invocation_contract: &InferenceStateContract,
         retained: Option<RetainedStateRuntimeV2>,
         retained_uses: HashMap<[u8; 32], RetainedStateUseV2>,
     ) -> Result<LoadedStatePublication> {
+        let variant = self
+            .resident_variant_for_instance(model_instance_id)
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "invocation state lost its authoritative model generation".into(),
+                )
+            })?;
+        self.fit_invocation_decoder_context(
+            variant,
+            &mut descriptor,
+            invocation_contract,
+            executions,
+        )?;
         validate_physical_publication_backing(
             &descriptor,
             executions,
@@ -679,6 +799,10 @@ impl ModelLifecycleController {
                                         .to_string(),
                                 )
                             })?;
+                            self.model_registry.publish_effective_context(
+                                variant,
+                                physical.logical_token_reach(),
+                            )?;
                             crate::runtime::rollout::validate_managed_state_plan_eligibility(
                                 variant,
                                 CapabilityKind::Chat,
@@ -792,6 +916,10 @@ impl ModelLifecycleController {
                                 Some(physical_spec.retained_max_tokens),
                             )
                             .await?;
+                        self.model_registry.publish_effective_context(
+                            variant,
+                            physical.logical_token_reach(),
+                        )?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Asr,
@@ -1084,6 +1212,10 @@ impl ModelLifecycleController {
                             Some(physical_spec.retained_max_tokens),
                         )
                         .await?;
+                    self.model_registry.publish_effective_context(
+                        variant,
+                        retained.logical_token_reach(),
+                    )?;
                     crate::runtime::rollout::validate_managed_state_plan_eligibility(
                         variant,
                         capability,

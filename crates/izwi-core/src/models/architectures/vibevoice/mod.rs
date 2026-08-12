@@ -272,7 +272,7 @@ pub(crate) fn vibevoice_invocation_descriptor(
                     let (fixed_bytes, capacity) = match &state {
                         StateDomainSpec::PagedAttention(_) => (
                             vibevoice_paged_invocation_bytes(&state, max_tokens)?,
-                            InvocationStateCapacity::PagedTokens { max_tokens },
+                            InvocationStateCapacity::decoder_context(max_tokens)?,
                         ),
                         StateDomainSpec::Tensor(_) => (
                             vibevoice_tensor_invocation_bytes(&state)?,
@@ -549,17 +549,14 @@ mod tests {
         assert_eq!(workspace.lease_scope, InvocationLeaseScope::PerRow);
         assert_eq!(workspace.groups.len(), 1);
         assert_eq!(workspace.domains.len(), 1);
-        assert!(matches!(
-            &workspace.domains[0],
-            InvocationWorkspaceDomain::State {
-                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 4096 },
-                formula: WorkspaceFormula {
-                    fixed_bytes: 1_048_576,
-                    ..
-                },
-                ..
-            }
-        ));
+        let InvocationWorkspaceDomain::State {
+            capacity, formula, ..
+        } = &workspace.domains[0]
+        else {
+            panic!("expected paged state")
+        };
+        assert_eq!(capacity.paged_max_tokens(), Some(4096));
+        assert_eq!(formula.fixed_bytes, 1_048_576);
         descriptor.validate_against_stages(&[execution]).unwrap();
     }
 
@@ -590,17 +587,11 @@ mod tests {
         let workspace = &profiles[0].stages[0];
         assert_eq!(workspace.groups, contract.groups);
         assert_eq!(workspace.domains.len(), 2);
-        assert!(workspace.domains.iter().all(|domain| matches!(
-            domain,
-            InvocationWorkspaceDomain::State {
-                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 8192 },
-                formula: WorkspaceFormula {
-                    fixed_bytes: 2_097_152,
-                    ..
-                },
-                ..
-            }
-        )));
+        assert!(workspace.domains.iter().all(|domain| {
+            matches!(domain, InvocationWorkspaceDomain::State { capacity, formula, .. }
+                if capacity.paged_max_tokens() == Some(8192)
+                    && formula.fixed_bytes == 2_097_152)
+        }));
     }
 
     #[test]

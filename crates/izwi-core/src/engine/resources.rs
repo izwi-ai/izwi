@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 
 /// A resource quantity whose capacity may be unavailable from the backend.
@@ -477,6 +478,38 @@ impl ResourceAuthority {
             reserved: state.ledger.used(),
             reservations: state.owners.len(),
         }
+    }
+
+    /// Stable backend planning headroom for load-time sizing. Unlike guarded
+    /// admission this deliberately ignores a volatile live-available sample:
+    /// CPU compression/swap and Metal working-set accounting make that sample
+    /// unsuitable as a context-size contract. Explicit operator budgets remain
+    /// hard and are preferred over the physical total.
+    pub(crate) fn planning_headroom(&self) -> Result<ResourceVector> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let ceiling = match self.provider.configured_budget() {
+            Some(budget) => normalize_resource_domains(budget, self.domain_policy)?,
+            None => self.normalized_physical_snapshot().capacity,
+        };
+        ceiling.positive_growth_over(state.ledger.used())
+    }
+
+    /// Return planning headroom in the backend's canonical memory domain.
+    /// CPU and Metal share one unified ledger in production, so CPU must not
+    /// read the now-zero host alias from that normalized vector.
+    pub(crate) fn planning_headroom_bytes(&self, backend: BackendKind) -> Result<ResourceAmount> {
+        let headroom = self.planning_headroom()?;
+        Ok(match (self.domain_policy, backend) {
+            (ResourceDomainPolicy::SharedHostUnified, BackendKind::Cpu | BackendKind::Metal) => {
+                headroom.unified_bytes
+            }
+            (_, BackendKind::Cpu) => headroom.host_bytes,
+            (_, BackendKind::Metal) => headroom.unified_bytes,
+            (_, BackendKind::Cuda) => headroom.device_bytes,
+        })
     }
 
     /// Publish a post-release physical observation before another guarded
@@ -1242,6 +1275,58 @@ mod tests {
         drop((workspace, pipeline, cache, request, model));
         assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
         assert_eq!(authority.snapshot().reservations, 0);
+    }
+
+    #[test]
+    fn portable_planning_uses_stable_total_not_volatile_live_available() {
+        let capacity = host_bytes(100);
+        let authority = Arc::new(ResourceAuthority::new_advisory(Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity,
+                available: host_bytes(0),
+                source: CapacitySource::Test,
+            },
+        })));
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "resident"),
+                host_bytes(30),
+            )
+            .unwrap();
+        assert_eq!(authority.planning_headroom().unwrap(), host_bytes(70));
+        drop(lease);
+        assert_eq!(authority.planning_headroom().unwrap(), host_bytes(100));
+    }
+
+    #[test]
+    fn shared_host_unified_planning_uses_one_canonical_domain_for_cpu_and_metal() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(TestProvider {
+                snapshot: PhysicalCapacitySnapshot {
+                    capacity: host_bytes(100),
+                    available: ResourceVector::zero(),
+                    source: CapacitySource::Test,
+                },
+            }),
+        ));
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "resident"),
+                host_bytes(30),
+            )
+            .unwrap();
+
+        assert_eq!(
+            authority.planning_headroom_bytes(BackendKind::Cpu).unwrap(),
+            ResourceAmount::Known(70)
+        );
+        assert_eq!(
+            authority
+                .planning_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            ResourceAmount::Known(70)
+        );
+        drop(lease);
     }
 
     #[test]

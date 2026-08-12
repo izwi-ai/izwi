@@ -144,11 +144,14 @@ fn resolve_managed_token_reach(
     configured_context: usize,
     loaded_context: Option<usize>,
 ) -> Result<Option<u64>> {
-    let loaded_context = loaded_context.ok_or_else(|| {
-        Error::ModelLoadError(format!(
-            "{backend:?} managed state requires a positive loaded-model context limit"
-        ))
-    })?;
+    let Some(loaded_context) = loaded_context else {
+        if backend == BackendKind::Cuda {
+            return Err(Error::ModelLoadError(
+                "CUDA managed state requires a positive loaded-model context limit".into(),
+            ));
+        }
+        return Ok(None);
+    };
     let effective = loaded_context.min(configured_context);
     if effective == 0 {
         let backend = if backend == BackendKind::Cuda {
@@ -160,16 +163,14 @@ fn resolve_managed_token_reach(
             "{backend} managed state resolved a zero loaded-model context limit"
         )));
     }
-    u64::try_from(effective)
-        .map(Some)
-        .map_err(|_| {
-            let backend = if backend == BackendKind::Cuda {
-                "CUDA"
-            } else {
-                "portable"
-            };
-            Error::ModelLoadError(format!("{backend} model context exceeds u64"))
-        })
+    u64::try_from(effective).map(Some).map_err(|_| {
+        let backend = if backend == BackendKind::Cuda {
+            "CUDA"
+        } else {
+            "portable"
+        };
+        Error::ModelLoadError(format!("{backend} model context exceeds u64"))
+    })
 }
 
 impl PhysicalBatchAssembly {
@@ -2759,10 +2760,16 @@ impl EngineCore {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
-        if capability.managed_contract().is_none() {
+        let Some(contract) = capability.managed_contract() else {
             return Ok(None);
-        }
+        };
         let backend = self.managed_kv_cache.worker_backend();
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+            backend,
+            model_instance,
+            contract,
+            logical_context_tokens,
+        )?;
         let runtime = self
             .managed_kv_cache
             .bind_request_with_capacity(
@@ -2772,11 +2779,7 @@ impl EngineCore {
                     total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
                         Error::InvalidInput("managed KV page budget exceeds u32".into())
                     })?,
-                    logical_token_reach: resolve_managed_token_reach(
-                        backend,
-                        self.config.max_seq_len,
-                        logical_context_tokens,
-                    )?,
+                    logical_token_reach,
                     retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
                         |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
                     )?,
@@ -2796,6 +2799,7 @@ impl EngineCore {
                     "managed KV load did not install a physical runtime".to_string(),
                 )
             })?;
+        runtime.synchronize_backing()?;
         Ok(Some(runtime))
     }
 
@@ -2806,18 +2810,20 @@ impl EngineCore {
         logical_context_tokens: Option<usize>,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let backend = self.managed_kv_cache.worker_backend();
-        self.managed_kv_cache.bind_model_state_with_capacity(
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+            backend,
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+        )?;
+        let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
             backend,
             ManagedStateCapacityRequest {
                 total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
-                logical_token_reach: resolve_managed_token_reach(
-                    backend,
-                    self.config.max_seq_len,
-                    logical_context_tokens,
-                )?,
+                logical_token_reach,
                 retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
                     |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
                 )?,
@@ -2827,7 +2833,50 @@ impl EngineCore {
             },
             self.config.block_size,
             retained_state,
-        )
+        )?;
+        runtime.synchronize_backing()?;
+        Ok(runtime)
+    }
+
+    fn resolve_managed_token_reach_for_contract(
+        &self,
+        backend: BackendKind,
+        model_instance: super::ModelInstanceId,
+        contract: &crate::kv::v2::InferenceStateContract,
+        loaded_context: Option<usize>,
+    ) -> Result<Option<u64>> {
+        if !self.config.portable_context_auto
+            && backend != BackendKind::Cuda
+            && loaded_context.is_none()
+        {
+            return Ok(None);
+        }
+        let loaded_context = loaded_context.ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "{backend:?} managed state requires a positive loaded-model context limit"
+            ))
+        })?;
+        if self.config.portable_context_auto && backend != BackendKind::Cuda {
+            let maximum_tokens = u64::try_from(loaded_context)
+                .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
+            return self
+                .managed_kv_cache
+                .fit_portable_logical_token_reach(
+                    model_instance,
+                    contract,
+                    maximum_tokens,
+                    self.config.portable_context_reserve_bytes,
+                    self.config.block_size,
+                    u32::try_from(self.config.max_batch_size).map_err(|_| {
+                        Error::InvalidInput("managed state sequence limit exceeds u32".into())
+                    })?,
+                    u32::try_from(self.config.max_batch_size).map_err(|_| {
+                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                    })?,
+                )
+                .map(Some);
+        }
+        resolve_managed_token_reach(backend, self.config.max_seq_len, Some(loaded_context))
     }
 
     pub(crate) fn load_retained_tensor_state(
@@ -2979,11 +3028,15 @@ mod tests {
     }
 
     #[test]
-    fn managed_token_reach_rejects_missing_or_zero_model_context_on_every_backend() {
+    fn managed_token_reach_rejects_zero_and_cuda_requires_model_context() {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
-            assert!(resolve_managed_token_reach(backend, 4_096, None).is_err());
             assert!(resolve_managed_token_reach(backend, 4_096, Some(0)).is_err());
         }
+        assert_eq!(
+            resolve_managed_token_reach(BackendKind::Cpu, 4_096, None).unwrap(),
+            None
+        );
+        assert!(resolve_managed_token_reach(BackendKind::Cuda, 4_096, None).is_err());
     }
 
     fn scheduled_prefill(request_id: &str, sequence_id: u64) -> ScheduledRequest {

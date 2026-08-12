@@ -893,11 +893,14 @@ impl Engine {
                 let model = registry.blocking_get_chat(variant).ok_or_else(|| {
                     Error::ModelNotFound(format!("Chat model {variant} is not loaded"))
                 })?;
-                let context_limit = resolve_backend_model_context(
-                    backend,
-                    configured_context_limit,
-                    model.max_context_tokens()?,
-                )?;
+                let context_limit =
+                    registry
+                        .effective_context(variant)
+                        .unwrap_or(resolve_backend_model_context(
+                            backend,
+                            configured_context_limit,
+                            model.max_context_tokens()?,
+                        )?);
                 let (prompt_tokens, prepared_qwen35_prompt) = model
                     .prepare_prompt_for_execution(messages, &request.chat_generation_config())?;
                 Ok((
@@ -966,10 +969,10 @@ impl Engine {
                         ))
                     })??;
                     request = prepared.0;
-                    request.install_prepared_sequence_input_tokens(
-                        prepared.1,
-                        self.config.max_seq_len,
-                    )?;
+                    let context_limit = registry
+                        .effective_context(variant)
+                        .unwrap_or(self.config.max_seq_len);
+                    request.install_prepared_sequence_input_tokens(prepared.1, context_limit)?;
                 }
                 request.install_asr_execution_model(variant, model)?;
             }
@@ -1014,11 +1017,14 @@ impl Engine {
                 } else {
                     None
                 };
+                let context_limit = registry
+                    .effective_context(variant)
+                    .unwrap_or(self.config.max_seq_len);
                 request.install_qwen_tts_execution_model(
                     variant,
                     model,
                     reference,
-                    self.config.max_seq_len,
+                    context_limit,
                 )?;
             }
             TaskType::ASR | TaskType::TTS | TaskType::Chat | TaskType::SpeechToSpeech => {}

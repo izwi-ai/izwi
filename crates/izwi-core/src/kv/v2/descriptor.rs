@@ -147,6 +147,16 @@ pub(crate) enum InvocationStateCapacity {
 }
 
 impl InvocationStateCapacity {
+    pub(crate) fn decoder_context(maximum_tokens: u64) -> Result<Self> {
+        Ok(Self::AxisBoundPagedTokens {
+            binding: StateCapacityBinding::new(
+                StateCapacityAxis::DecoderContext,
+                1,
+                maximum_tokens,
+            )?,
+        })
+    }
+
     pub(crate) const fn paged_max_tokens(self) -> Option<u64> {
         match self {
             Self::PagedTokens { max_tokens } => Some(max_tokens),
@@ -200,6 +210,52 @@ pub(crate) struct WorkspaceFormula {
 }
 
 impl CapabilityStateDescriptorV2 {
+    pub(crate) fn capacity_axis_bounds(&self, axis: StateCapacityAxis) -> Option<(u64, u64)> {
+        let InvocationWorkspaceSet::Bounded { profiles } = &self.invocation else {
+            return None;
+        };
+        let mut minimum = 0_u64;
+        let mut maximum = u64::MAX;
+        let mut found = false;
+        for domain in profiles
+            .iter()
+            .flat_map(|profile| &profile.stages)
+            .flat_map(|stage| &stage.domains)
+        {
+            let InvocationWorkspaceDomain::State {
+                capacity: InvocationStateCapacity::AxisBoundPagedTokens { binding },
+                ..
+            } = domain
+            else {
+                continue;
+            };
+            if binding.axis == axis {
+                found = true;
+                minimum = minimum.max(binding.minimum_units);
+                maximum = maximum.min(binding.maximum_units);
+            }
+        }
+        found.then_some((minimum, maximum))
+    }
+
+    pub(crate) fn resolve_capacity_axis(
+        &mut self,
+        axis: StateCapacityAxis,
+        available_units: u64,
+    ) -> Result<()> {
+        let InvocationWorkspaceSet::Bounded { profiles } = &mut self.invocation else {
+            return Ok(());
+        };
+        for domain in profiles
+            .iter_mut()
+            .flat_map(|profile| &mut profile.stages)
+            .flat_map(|stage| &mut stage.domains)
+        {
+            domain.resolve_capacity_axis(axis, available_units)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_against_stages(&self, stages: &[StageDescriptor]) -> Result<()> {
         if self.abi != CURRENT_INFERENCE_STATE_ABI {
             return Err(invalid("unsupported capability state descriptor ABI"));
@@ -553,6 +609,29 @@ impl InvocationStageWorkspace {
 }
 
 impl InvocationWorkspaceDomain {
+    /// Apply one fitted capacity axis and recompute the exact per-slot backing
+    /// formula before lifecycle planning or physical allocation.
+    pub(crate) fn resolve_capacity_axis(
+        &mut self,
+        axis: StateCapacityAxis,
+        available_units: u64,
+    ) -> Result<()> {
+        let Self::State {
+            state,
+            capacity,
+            formula,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        *capacity = capacity.resolve_axis(axis, available_units)?;
+        if matches!(state, StateDomainSpec::PagedAttention(_)) {
+            formula.fixed_bytes = minimum_physical_bytes_for_capacity(state, *capacity)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn id(&self) -> StateDomainId {
         match self {
             Self::Scratch { id, .. } => *id,
@@ -560,7 +639,7 @@ impl InvocationWorkspaceDomain {
         }
     }
 
-    fn maximum_bytes(&self) -> Result<u64> {
+    pub(crate) fn maximum_bytes(&self) -> Result<u64> {
         match self {
             Self::Scratch {
                 id,
@@ -596,7 +675,8 @@ impl InvocationWorkspaceDomain {
                     StateDomainSpec::PagedAttention(_)
                         if capacity.paged_max_tokens().is_some_and(|tokens| tokens > 0) =>
                     {
-                        if let InvocationStateCapacity::AxisBoundPagedTokens { binding } = capacity {
+                        if let InvocationStateCapacity::AxisBoundPagedTokens { binding } = capacity
+                        {
                             binding.validate()?;
                         }
                     }

@@ -175,7 +175,7 @@ pub(crate) fn lfm2_physical_state_spec(
                     let (fixed_bytes, capacity) = match &state {
                         StateDomainSpec::PagedAttention(_) => (
                             paged_f32_invocation_bytes(&state, max_tokens)?,
-                            InvocationStateCapacity::PagedTokens { max_tokens },
+                            InvocationStateCapacity::decoder_context(max_tokens)?,
                         ),
                         StateDomainSpec::Ring(_) => (
                             ring_f32_invocation_bytes(&state)?,

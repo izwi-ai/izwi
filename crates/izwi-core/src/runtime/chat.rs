@@ -165,11 +165,13 @@ impl RuntimeService {
                 let model = registry
                     .blocking_get_chat(variant)
                     .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
-                let context_limit = resolve_backend_model_context(
-                    backend,
-                    configured_context_limit,
-                    model.max_context_tokens()?,
-                )?;
+                let context_limit = registry.effective_context(variant).unwrap_or(
+                    resolve_backend_model_context(
+                        backend,
+                        configured_context_limit,
+                        model.max_context_tokens()?,
+                    )?,
+                );
                 let original_messages = messages;
                 let initial =
                     model.prepare_prompt_for_execution(&original_messages, &prompt_config)?;

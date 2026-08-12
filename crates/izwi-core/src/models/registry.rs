@@ -3070,6 +3070,7 @@ pub struct ModelRegistry {
     fish_s2_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<FishS2TtsModel>>>>>>,
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<OnceCell<Arc<KokoroTtsModel>>>>>>,
+    effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
 }
 
 /// Explicit name for the in-memory registry of loaded native model handles.
@@ -3093,6 +3094,8 @@ pub struct LoadedModelDiagnostics {
     pub actual_compute_dtype: Option<String>,
     pub default_compute_dtype: String,
     pub default_dtype_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_context_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_incremental_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3155,6 +3158,7 @@ fn loaded_model_diagnostics_entry(
         actual_compute_dtype: actual_runtime.compute_dtype,
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
+        effective_context_tokens: None,
         supports_incremental_decode,
         supports_realtime_stream_decode,
         family_diagnostics,
@@ -3268,7 +3272,42 @@ impl ModelRegistry {
             fish_s2_tts_models: Arc::new(RwLock::new(HashMap::new())),
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
+            effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn publish_effective_context(
+        &self,
+        variant: ModelVariant,
+        tokens: u64,
+    ) -> Result<()> {
+        let tokens = usize::try_from(tokens)
+            .map_err(|_| Error::ModelLoadError("effective context exceeds usize".into()))?;
+        if tokens == 0 {
+            return Err(Error::ModelLoadError(
+                "effective context must be greater than zero".into(),
+            ));
+        }
+        self.effective_contexts
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(variant, tokens);
+        Ok(())
+    }
+
+    pub(crate) fn effective_context(&self, variant: ModelVariant) -> Option<usize> {
+        self.effective_contexts
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&variant)
+            .copied()
+    }
+
+    pub(crate) fn clear_effective_context(&self, variant: ModelVariant) {
+        self.effective_contexts
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant);
     }
 
     pub fn device(&self) -> &DeviceProfile {
@@ -3497,6 +3536,16 @@ impl ModelRegistry {
             }
         }
 
+        for entry in &mut diagnostics {
+            entry.effective_context_tokens = self
+                .effective_contexts
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .find_map(|(variant, tokens)| {
+                    (variant.dir_name() == entry.variant_id).then_some(*tokens)
+                });
+        }
         diagnostics.sort_by(|left, right| {
             left.variant_id
                 .cmp(&right.variant_id)

@@ -590,7 +590,7 @@ fn granite_speech_physical_state_spec(
                             terms: vec![],
                         },
                         state,
-                        capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+                        capacity: InvocationStateCapacity::decoder_context(max_tokens)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;

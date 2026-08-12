@@ -94,9 +94,7 @@ pub(crate) fn whisper_physical_state_spec(
                     placement: self_state.header().placement,
                     formula: fixed_formula(self_bytes),
                     state: self_state.clone(),
-                    capacity: InvocationStateCapacity::PagedTokens {
-                        max_tokens: self_capacity,
-                    },
+                    capacity: InvocationStateCapacity::decoder_context(self_capacity)?,
                 },
                 InvocationWorkspaceDomain::State {
                     placement: cross_state.header().placement,
@@ -563,13 +561,10 @@ mod tests {
             &workspace.domains[0],
             InvocationWorkspaceDomain::State {
                 state: StateDomainSpec::PagedAttention(_),
-                capacity: InvocationStateCapacity::PagedTokens { max_tokens: 65 },
-                formula: WorkspaceFormula {
-                    fixed_bytes: 32_768,
-                    ..
-                },
+                capacity,
+                formula: WorkspaceFormula { fixed_bytes: 32_768, .. },
                 ..
-            }
+            } if capacity.paged_max_tokens() == Some(65)
         ));
         assert!(matches!(
             &workspace.domains[1],

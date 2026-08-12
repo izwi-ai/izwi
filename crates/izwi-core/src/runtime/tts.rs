@@ -539,15 +539,22 @@ impl RuntimeService {
             .get_audio_chat(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No LFM2.5 Audio model loaded".to_string()))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or_else(|| self.config.portable_context_ceiling());
         let max_new_tokens = if request.config.options.max_tokens == 0 {
-            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS
-                .min(self.config.portable_context_ceiling().max(1))
+            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(context_limit.max(1))
         } else {
-            request.config.options.max_tokens.min(tts_explicit_output_limit(
-                self.backend_router.context().backend_kind,
-                variant,
-                self.config.portable_context_ceiling(),
-            ))
+            request
+                .config
+                .options
+                .max_tokens
+                .min(tts_explicit_output_limit(
+                    self.backend_router.context().backend_kind,
+                    variant,
+                    context_limit,
+                ))
         };
         let requested_speaker = request
             .config
@@ -637,10 +644,14 @@ impl RuntimeService {
             .get_voxtral_tts(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No Voxtral TTS model loaded".to_string()))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or_else(|| self.config.portable_context_ceiling());
         let explicit_max_frames = tts_explicit_output_limit(
             self.backend_router.context().backend_kind,
             variant,
-            self.config.portable_context_ceiling(),
+            context_limit,
         );
         let request_id = request.id;
         let config = request.config;
@@ -665,11 +676,12 @@ impl RuntimeService {
                                 "Voxtral TTS model exposes no preset voices".to_string(),
                             )
                         })?;
-                    let params = VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
-                        &config,
-                        &text,
-                        explicit_max_frames,
-                    );
+                    let params =
+                        VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
+                            &config,
+                            &text,
+                            explicit_max_frames,
+                        );
                     let started = Instant::now();
                     let domains = leases.domains().collect::<Vec<_>>();
                     let [domain] = domains.as_slice() else {
@@ -859,10 +871,14 @@ impl RuntimeService {
             .get_fish_s2_tts(variant)
             .await
             .ok_or_else(|| Error::InferenceError("No Fish S2 TTS model loaded".to_string()))?;
+        let context_limit = self
+            .model_registry
+            .effective_context(variant)
+            .unwrap_or_else(|| self.config.portable_context_ceiling());
         let explicit_max_frames = tts_explicit_output_limit(
             self.backend_router.context().backend_kind,
             variant,
-            self.config.portable_context_ceiling(),
+            context_limit,
         );
         self.coordinator
             .run_loaded_blocking_stage_with_invocation_paged(
@@ -1271,14 +1287,13 @@ mod tests {
     fn direct_lfm_tts_caps_untrusted_output_budget_to_runtime_sequence_limit() {
         let mut request = GenerationRequest::new("bounded LFM output");
         request.config.options.max_tokens = usize::MAX;
-        let shape =
-            direct_tts_generation_shape(
-                BackendKind::Cpu,
-                &request,
-                ModelVariant::Lfm25Audio15BGguf,
-                4096,
-            )
-            .unwrap();
+        let shape = direct_tts_generation_shape(
+            BackendKind::Cpu,
+            &request,
+            ModelVariant::Lfm25Audio15BGguf,
+            4096,
+        )
+        .unwrap();
 
         assert_eq!(shape.units, 4096);
         assert_eq!(shape.max_output_samples, 4096 * 1_920);
@@ -1313,14 +1328,13 @@ mod tests {
     #[test]
     fn direct_lfm_tts_caps_default_output_budget_to_runtime_sequence_limit() {
         let request = GenerationRequest::new("bounded LFM default output");
-        let shape =
-            direct_tts_generation_shape(
-                BackendKind::Cpu,
-                &request,
-                ModelVariant::Lfm25Audio15BGguf,
-                64,
-            )
-            .unwrap();
+        let shape = direct_tts_generation_shape(
+            BackendKind::Cpu,
+            &request,
+            ModelVariant::Lfm25Audio15BGguf,
+            64,
+        )
+        .unwrap();
 
         assert_eq!(shape.units, 64);
     }
@@ -1332,14 +1346,13 @@ mod tests {
         let mut request = GenerationRequest::new("x".repeat(max_text_chars));
         request.config.options.speed = 0.5;
         let budget = kokoro_output_budget(&request.text, request.config.options.speed).unwrap();
-        let shape =
-            direct_tts_generation_shape(
-                BackendKind::Cpu,
-                &request,
-                ModelVariant::Kokoro82M,
-                max_sequence_length,
-            )
-                .unwrap();
+        let shape = direct_tts_generation_shape(
+            BackendKind::Cpu,
+            &request,
+            ModelVariant::Kokoro82M,
+            max_sequence_length,
+        )
+        .unwrap();
 
         let expected_frames = budget
             .max_model_tokens

@@ -76,6 +76,11 @@ pub(crate) fn fish_s2_physical_state_spec(
                             ))
                         }
                     };
+                    let capacity = if state.id() == FISH_S2_SLOW_STATE_DOMAIN {
+                        InvocationStateCapacity::decoder_context(max_tokens)?
+                    } else {
+                        InvocationStateCapacity::PagedTokens { max_tokens }
+                    };
                     Ok(InvocationWorkspaceDomain::State {
                         placement: state.header().placement,
                         formula: WorkspaceFormula {
@@ -84,7 +89,7 @@ pub(crate) fn fish_s2_physical_state_spec(
                             terms: vec![],
                         },
                         state,
-                        capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+                        capacity,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -435,13 +440,14 @@ mod tests {
         assert_eq!(workspace.domains.len(), 2);
         let InvocationWorkspaceDomain::State {
             state: slow,
-            capacity: InvocationStateCapacity::PagedTokens { max_tokens: 4096 },
+            capacity: slow_capacity,
             formula: slow_formula,
             ..
         } = &workspace.domains[0]
         else {
             panic!("slow workspace must have the full semantic capacity");
         };
+        assert_eq!(slow_capacity.paged_max_tokens(), Some(4096));
         assert_eq!(
             slow_formula.fixed_bytes,
             fish_s2_paged_invocation_bytes(slow, 4096).expect("slow bytes")

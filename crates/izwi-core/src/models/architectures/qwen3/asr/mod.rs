@@ -176,6 +176,7 @@ fn qwen3_asr_physical_state_spec(
     let invocation_domain = invocation_contract.domains[0].clone();
     let invocation_group = invocation_contract.groups[0].clone();
     let physical_bytes = qwen3_asr_invocation_workspace_bytes(&invocation_domain, max_tokens)?;
+    let decoder_capacity = InvocationStateCapacity::decoder_context(max_tokens)?;
 
     let mut profiles = Vec::with_capacity(stage_graphs.len());
     let mut has_invocation_state = false;
@@ -195,7 +196,7 @@ fn qwen3_asr_physical_state_spec(
                     domains: atomic
                         .then(|| InvocationWorkspaceDomain::State {
                             state: invocation_domain.clone(),
-                            capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+                            capacity: decoder_capacity,
                             placement: invocation_domain.header().placement,
                             formula: WorkspaceFormula {
                                 fixed_bytes: physical_bytes,

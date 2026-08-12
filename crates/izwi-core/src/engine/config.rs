@@ -49,14 +49,10 @@ pub(crate) fn tts_explicit_output_limit(
             crate::catalog::ModelFamily::VoxtralTts => {
                 ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES
             }
-            _ => variant
-                .tts_max_output_frames_hint()
-                .unwrap_or(configured),
+            _ => variant.tts_max_output_frames_hint().unwrap_or(configured),
         };
     }
-    variant
-        .tts_max_output_frames_hint()
-        .unwrap_or(configured)
+    variant.tts_max_output_frames_hint().unwrap_or(configured)
 }
 
 /// Configuration for the engine core.
@@ -73,6 +69,14 @@ pub struct EngineCoreConfig {
     /// Maximum sequence length (tokens)
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
+
+    /// Resolve portable context from the load-time memory plan. CUDA ignores
+    /// this flag and preserves its native-context behavior.
+    #[serde(default)]
+    pub(crate) portable_context_auto: bool,
+
+    #[serde(default = "default_portable_context_reserve_bytes")]
+    pub(crate) portable_context_reserve_bytes: u64,
 
     /// Maximum number of tokens per step (token budget)
     #[serde(default = "default_max_tokens_per_step")]
@@ -304,6 +308,9 @@ fn default_enable_decode_quanta() -> bool {
 fn default_max_decode_tokens_per_request() -> usize {
     2
 }
+fn default_portable_context_reserve_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
 fn default_enable_prefix_caching() -> bool {
     false
 }
@@ -320,6 +327,8 @@ impl Default for EngineCoreConfig {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_seq_len: default_max_seq_len(),
+            portable_context_auto: false,
+            portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
             max_tokens_per_step: default_max_tokens_per_step(),
             block_size: default_block_size(),
             kv_cache_dtype: default_kv_cache_dtype(),
@@ -361,7 +370,11 @@ impl EngineCoreConfig {
     /// sequence and cache defaults exactly.
     pub(crate) fn apply_backend_context_capacity(&mut self, configured_max_seq_len: usize) {
         if self.backend != BackendKind::Cuda {
-            self.max_seq_len = configured_max_seq_len.max(1);
+            self.max_seq_len = if self.portable_context_auto {
+                CUDA_MAX_NATIVE_CONTEXT_TOKENS
+            } else {
+                configured_max_seq_len.max(1)
+            };
             return;
         }
 
@@ -396,8 +409,8 @@ impl EngineCoreConfig {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        resolve_backend_model_context, EngineCoreConfig, CUDA_MAX_NATIVE_CONTEXT_TOKENS,
-        tts_explicit_output_limit,
+        resolve_backend_model_context, tts_explicit_output_limit, EngineCoreConfig,
+        CUDA_MAX_NATIVE_CONTEXT_TOKENS,
     };
     use crate::backends::BackendKind;
     use crate::config::{KvCacheDtype, PrefixCachePolicy};
@@ -447,6 +460,20 @@ mod managed_kv_default_tests {
     }
 
     #[test]
+    fn portable_auto_keeps_a_native_upper_bound_until_model_fit() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let mut config = EngineCoreConfig {
+                backend,
+                portable_context_auto: true,
+                ..EngineCoreConfig::default()
+            };
+            config.apply_backend_context_capacity(4096);
+            assert_eq!(config.max_seq_len, CUDA_MAX_NATIVE_CONTEXT_TOKENS);
+            assert_eq!(config.max_blocks, 1024);
+        }
+    }
+
+    #[test]
     fn loaded_model_context_is_cuda_only() {
         assert_eq!(
             resolve_backend_model_context(BackendKind::Cuda, 4096, 40_960).unwrap(),
@@ -466,11 +493,7 @@ mod managed_kv_default_tests {
     #[test]
     fn cuda_unlocks_explicit_audio_generation_contexts_only() {
         assert_eq!(
-            tts_explicit_output_limit(
-                BackendKind::Cuda,
-                ModelVariant::Lfm25Audio15BGguf,
-                4096,
-            ),
+            tts_explicit_output_limit(BackendKind::Cuda, ModelVariant::Lfm25Audio15BGguf, 4096,),
             32_768
         );
         assert_eq!(
