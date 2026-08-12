@@ -281,7 +281,7 @@ impl CustomOp3 for DepthwiseConv1dBiasSwishOp {
         encoder.set_bytes(10, &(self.stride as u32));
         encoder.set_bytes(11, &(self.dilation as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -388,7 +388,7 @@ impl CustomOp2 for DepthwiseConv1dOp {
         encoder.set_bytes(9, &(self.stride as u32));
         encoder.set_bytes(10, &(self.dilation as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -506,7 +506,7 @@ impl CustomOp2 for DepthwiseConv2dOp {
         encoder.set_bytes(12, &(self.stride as u32));
         encoder.set_bytes(13, &(self.dilation as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,

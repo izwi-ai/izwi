@@ -93,12 +93,12 @@ fn cuda_flash_paged_attention_eligible(
 ) -> bool {
     matches!(dtype, DType::F16 | DType::BF16)
         && page_tokens != 0
-        && page_tokens % 32 == 0
+        && page_tokens.is_multiple_of(32)
         && all_first_page_offsets_zero
         && key_head_dim == value_head_dim
         && key_head_dim != 0
         && key_head_dim <= 512
-        && key_head_dim % 8 == 0
+        && key_head_dim.is_multiple_of(8)
 }
 
 #[cfg(feature = "cuda")]
@@ -2289,7 +2289,7 @@ fn validate_decode_query(
             layer.key_head_dim
         )));
     }
-    if dims[1] == 0 || dims[1] % layer.num_kv_heads != 0 {
+    if dims[1] == 0 || !dims[1].is_multiple_of(layer.num_kv_heads) {
         return Err(Error::InferenceError(format!(
             "{backend:?} query heads {} are not divisible by KV heads {}",
             dims[1], layer.num_kv_heads
@@ -2338,7 +2338,7 @@ fn validate_prefill_query(
             layer.key_head_dim
         )));
     }
-    if dims[1] == 0 || dims[1] % layer.num_kv_heads != 0 {
+    if dims[1] == 0 || !dims[1].is_multiple_of(layer.num_kv_heads) {
         return Err(Error::InferenceError(format!(
             "{backend:?} paged prefill query heads {} are not divisible by KV heads {}",
             dims[1], layer.num_kv_heads

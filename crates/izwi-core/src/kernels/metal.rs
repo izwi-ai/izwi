@@ -1779,7 +1779,7 @@ impl CustomOp2 for SiluMulOp {
         encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -1943,8 +1943,7 @@ impl CustomOp3 for QkRmsNormOp {
             .head_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: rows,
@@ -2090,8 +2089,7 @@ impl CustomOp2 for RmsNormOp {
             .hidden_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(1024)
-            .max(1);
+            .clamp(1, 1024);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: self.rows,
@@ -2206,7 +2204,7 @@ impl CustomOp3 for RopePairBshdOp {
             || self.q_heads == 0
             || self.k_heads == 0
             || self.head_dim == 0
-            || self.head_dim % 2 != 0
+            || !self.head_dim.is_multiple_of(2)
         {
             bail!("izwi-rope-pair-bshd-metal requires non-empty even head_dim")
         }
@@ -2219,10 +2217,10 @@ impl CustomOp3 for RopePairBshdOp {
         if cos_sin_layout.shape().elem_count() != self.seq_len.saturating_mul(self.head_dim) {
             bail!("izwi-rope-pair-bshd-metal packed cos/sin shape mismatch")
         }
-        if self.q_rows % self.q_heads != 0
-            || self.k_rows % self.k_heads != 0
-            || (self.q_rows / self.q_heads) % self.seq_len != 0
-            || (self.k_rows / self.k_heads) % self.seq_len != 0
+        if !self.q_rows.is_multiple_of(self.q_heads)
+            || !self.k_rows.is_multiple_of(self.k_heads)
+            || !(self.q_rows / self.q_heads).is_multiple_of(self.seq_len)
+            || !(self.k_rows / self.k_heads).is_multiple_of(self.seq_len)
         {
             bail!("izwi-rope-pair-bshd-metal rows do not match heads/seq_len")
         }
@@ -2270,7 +2268,7 @@ impl CustomOp3 for RopePairBshdOp {
         encoder.set_bytes(8, &(self.k_heads as u32));
         encoder.set_bytes(9, &(self.head_dim as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -2451,7 +2449,7 @@ impl CustomOp3 for DecodeGqaAttentionOp {
             || self.kv_len > self.kv_capacity_len
             || self.kv_len > 2048
             || self.head_dim == 0
-            || self.num_heads % self.num_kv_heads != 0
+            || !self.num_heads.is_multiple_of(self.num_kv_heads)
         {
             bail!("izwi-decode-gqa-attention-metal unsupported shape")
         }
@@ -2510,8 +2508,7 @@ impl CustomOp3 for DecodeGqaAttentionOp {
             .head_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: self.num_heads,
@@ -2616,7 +2613,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
         if self.batch_size == 0
             || self.num_heads == 0
             || self.num_kv_heads == 0
-            || self.num_heads % self.num_kv_heads != 0
+            || !self.num_heads.is_multiple_of(self.num_kv_heads)
             || self.page_tokens == 0
             || self.max_blocks == 0
             || self.key_head_dim == 0
@@ -2707,8 +2704,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             .key_head_dim
             .max(self.value_head_dim)
             .next_power_of_two()
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         let base_workgroups = self.batch_size.saturating_mul(self.num_heads);
         let use_split_kv = max_context_len > METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT
             && base_workgroups <= METAL_PAGED_ATTENTION_SPLIT_MAX_BASE_WORKGROUPS;
@@ -2995,7 +2991,7 @@ impl CustomOp3 for PagedPrefillAttentionOp {
             || self.total_queries == 0
             || self.num_heads == 0
             || self.num_kv_heads == 0
-            || self.num_heads % self.num_kv_heads != 0
+            || !self.num_heads.is_multiple_of(self.num_kv_heads)
             || self.page_tokens == 0
             || self.max_blocks == 0
             || self.key_head_dim == 0
@@ -3112,8 +3108,7 @@ impl CustomOp3 for PagedPrefillAttentionOp {
             .key_head_dim
             .max(self.value_head_dim)
             .next_power_of_two()
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         let base_workgroups = self.total_queries.saturating_mul(self.num_heads);
         let use_split_kv = max_attention_len > METAL_PAGED_PREFILL_SPLIT_MIN_CONTEXT
             && base_workgroups <= METAL_PAGED_PREFILL_SPLIT_MAX_BASE_WORKGROUPS;
@@ -3431,7 +3426,7 @@ impl CustomOp3 for LfmShortConvDecode3Op {
         encoder.set_bytes(4, &(self.hidden_size as u32));
         encoder.set_bytes(5, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -3554,7 +3549,7 @@ impl CustomOp2 for LfmShortConvUpdate3Op {
         encoder.set_bytes(3, &(self.hidden_size as u32));
         encoder.set_bytes(4, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -3680,7 +3675,7 @@ impl CustomOp2 for LfmShortConvSequence3Op {
         encoder.set_bytes(4, &(self.seq_len as u32));
         encoder.set_bytes(5, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -3844,7 +3839,7 @@ impl CustomOp3 for LfmShortConvRingOp {
         encoder.set_bytes(9, &self.valid_length);
         encoder.set_bytes(10, &(elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
@@ -4008,7 +4003,7 @@ impl CustomOp3 for Qwen35CausalConvSequenceOp {
         encoder.set_bytes(7, &(output_elem_count as u32));
         encoder.set_bytes(8, &(total_elem_count as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: total_elem_count,
@@ -4118,7 +4113,7 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
             || self.tile_size == 0
             || self.num_k_heads != 16
             || !matches!(self.num_v_heads, 16 | 32)
-            || self.num_v_heads % self.num_k_heads != 0
+            || !self.num_v_heads.is_multiple_of(self.num_k_heads)
             || self.head_k_dim == 0
             || self.head_v_dim == 0
             || self.head_v_dim > 256
@@ -4227,8 +4222,7 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
             .head_v_dim
             .next_power_of_two()
             .min(pipeline.max_total_threads_per_threadgroup())
-            .min(256)
-            .max(1);
+            .clamp(1, 256);
         let threadgroups = objc2_metal::MTLSize {
             width: self.num_v_heads,
             height: 1,
@@ -4733,7 +4727,7 @@ pub fn try_fused_decode_gqa_attention_with_kv_len(
             || kv_len > 2048
             || num_heads == 0
             || num_kv_heads == 0
-            || num_heads % num_kv_heads != 0
+            || !num_heads.is_multiple_of(num_kv_heads)
             || head_dim == 0
             || !q.device().is_metal()
             || !k.device().is_metal()
@@ -6426,9 +6420,9 @@ mod tests {
         let out = try_lfm_shortconv_decode3(&cache, &bx, &conv)
             .expect("shortconv decode3 should run on Metal");
         let actual = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let expected = vec![
+        let expected = [
             2.0 * 0.5 + 3.0 * 1.5 + 7.0 * 2.5,
-            5.0 * -1.0 + 6.0 * 0.25 + 8.0 * 0.75,
+            -5.0 + 6.0 * 0.25 + 8.0 * 0.75,
         ];
         for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -6535,7 +6529,7 @@ mod tests {
         let output = try_lfm_shortconv_ring_sequence(&ring, &input, &weight, 4, 3)
             .expect("physical ShortConv ring kernel should run on Metal");
         let actual = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let expected = vec![
+        let expected = [
             11.0 + 12.0 * 10.0 + 13.0 * 100.0,
             12.0 + 13.0 * 10.0 + 14.0 * 100.0,
             -21.0 + 22.0 * 0.5 + 23.0 * 2.0,

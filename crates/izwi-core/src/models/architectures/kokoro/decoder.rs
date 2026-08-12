@@ -975,7 +975,7 @@ impl CustomOp3 for KokoroConvTranspose1dStrideMetalOp {
         encoder.set_bytes(10, &(self.stride as u32));
         encoder.set_bytes(11, &(self.padding as u32));
 
-        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().min(256).max(1);
+        let threads_per_threadgroup = pipeline.max_total_threads_per_threadgroup().clamp(1, 256);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: elem_count,
