@@ -2769,6 +2769,7 @@ impl EngineCore {
             model_instance,
             contract,
             logical_context_tokens,
+            1,
         )?;
         let runtime = self
             .managed_kv_cache
@@ -2809,12 +2810,28 @@ impl EngineCore {
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        self.load_managed_model_state_with_portable_copies(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            1,
+        )
+    }
+
+    pub(crate) fn load_managed_model_state_with_portable_copies(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let backend = self.managed_kv_cache.worker_backend();
         let logical_token_reach = self.resolve_managed_token_reach_for_contract(
             backend,
             model_instance,
             retained_state,
             logical_context_tokens,
+            portable_state_copies,
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -2844,6 +2861,7 @@ impl EngineCore {
         model_instance: super::ModelInstanceId,
         contract: &crate::kv::v2::InferenceStateContract,
         loaded_context: Option<usize>,
+        portable_state_copies: u32,
     ) -> Result<Option<u64>> {
         if !self.config.portable_context_auto
             && backend != BackendKind::Cuda
@@ -2873,6 +2891,7 @@ impl EngineCore {
                     u32::try_from(self.config.max_batch_size).map_err(|_| {
                         Error::InvalidInput("managed state transaction limit exceeds u32".into())
                     })?,
+                    portable_state_copies,
                 )
                 .map(Some);
         }

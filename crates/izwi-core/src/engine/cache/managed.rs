@@ -382,9 +382,15 @@ impl ManagedKvCacheManager {
         page_tokens_hint: usize,
         retained_sequence_rows: u32,
         staged_transaction_rows: u32,
+        portable_state_copies: u32,
     ) -> Result<u64> {
         if self.worker_backend == BackendKind::Cuda || maximum_tokens == 0 {
             return Ok(maximum_tokens);
+        }
+        if portable_state_copies == 0 {
+            return Err(Error::InvalidInput(
+                "portable managed-state copy count must be positive".into(),
+            ));
         }
         let Some(authority) = self.resource_authority.as_ref() else {
             return Ok(maximum_tokens.min(4_096));
@@ -421,11 +427,16 @@ impl ManagedKvCacheManager {
                 self.worker_backend,
                 allocation.maximum_resources(&state_plan)?,
             )?;
-            match self.worker_backend {
+            let bytes = match self.worker_backend {
                 BackendKind::Cpu => known_resource_bytes(resources.host_bytes, "host"),
                 BackendKind::Metal => known_resource_bytes(resources.unified_bytes, "unified"),
                 BackendKind::Cuda => unreachable!("CUDA bypassed portable fitting"),
-            }
+            }?;
+            bytes
+                .checked_mul(u64::from(portable_state_copies))
+                .ok_or_else(|| {
+                    Error::ModelLoadError("aggregate managed-state byte plan overflow".into())
+                })
         };
 
         let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
@@ -2770,10 +2781,31 @@ mod tests {
                     64,
                     8,
                     8,
+                    1,
                 )
                 .unwrap(),
             4_096
         );
+
+        let duplicated = ManagedKvCacheManager::for_worker(
+            Some(advisory_authority_with_capacity(RESERVE + exact_bytes)),
+            BackendKind::Cpu,
+            Device::Cpu,
+        );
+        let selected = duplicated
+            .fit_portable_logical_token_reach(
+                ModelInstanceId::new(901),
+                &contract,
+                40_960,
+                RESERVE,
+                64,
+                8,
+                8,
+                2,
+            )
+            .unwrap();
+        assert!(selected < 4_096);
+        assert!(selected >= 64);
     }
 
     #[test]

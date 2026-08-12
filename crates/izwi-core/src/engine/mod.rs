@@ -1484,6 +1484,25 @@ impl Engine {
         )
     }
 
+    pub(crate) async fn load_managed_model_state_with_portable_copies(
+        &self,
+        model_instance: ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .load_managed_model_state_with_portable_copies(
+                model_instance,
+                retained_state,
+                logical_context_tokens,
+                portable_state_copies,
+            )
+    }
+
     pub(crate) async fn load_retained_tensor_state(
         &self,
         model_instance: ModelInstanceId,

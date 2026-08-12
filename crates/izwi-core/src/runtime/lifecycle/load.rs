@@ -400,27 +400,19 @@ impl ModelLifecycleController {
         executions: &[LoadedExecutionContract],
     ) -> Result<()> {
         let safety_reserve_bytes = self.config.portable_context_reserve_bytes;
-        let Some((minimum, maximum)) =
-            descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext)
-        else {
-            return Ok(());
-        };
-        if let Some(selected) = self.model_registry.effective_context(variant) {
-            descriptor.resolve_capacity_axis(
-                StateCapacityAxis::DecoderContext,
-                maximum.min(selected as u64),
-            )?;
-            return Ok(());
-        }
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
             return Ok(());
         }
+        let axis_bounds = descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext);
         let ResourceAmount::Known(headroom_bytes) = self
             .coordinator
             .resource_authority()
             .planning_headroom_bytes(backend)?
         else {
+            let Some((_, maximum)) = axis_bounds else {
+                return Ok(());
+            };
             let fallback = self
                 .config
                 .max_sequence_length
@@ -432,12 +424,11 @@ impl ModelLifecycleController {
             return Ok(());
         };
         let budget = headroom_bytes.saturating_sub(safety_reserve_bytes);
-        let publication_multiplicity =
-            u64::try_from(self.adapter_registry.capabilities_for(variant).len().max(1))
-                .map_err(|_| Error::ModelLoadError("capability count exceeds u64".into()))?;
-        let required = |tokens: u64| -> Result<u64> {
+        let required = |tokens: Option<u64>| -> Result<u64> {
             let mut candidate = descriptor.clone();
-            candidate.resolve_capacity_axis(StateCapacityAxis::DecoderContext, tokens)?;
+            if let Some(tokens) = tokens {
+                candidate.resolve_capacity_axis(StateCapacityAxis::DecoderContext, tokens)?;
+            }
             plan_invocation_allocations(&candidate, invocation_contract, executions)?
                 .into_iter()
                 .try_fold(0_u64, |total, allocation| {
@@ -456,15 +447,31 @@ impl ModelLifecycleController {
                         .ok_or_else(|| {
                             Error::ModelLoadError("invocation context byte plan overflow".into())
                         })
-                })?
-                .checked_mul(publication_multiplicity)
-                .ok_or_else(|| {
-                    Error::ModelLoadError("aggregate capability state plan overflow".into())
                 })
         };
+        let Some((minimum, maximum)) = axis_bounds else {
+            let bytes = required(None)?;
+            if bytes > budget {
+                return Err(Error::ModelLoadError(format!(
+                    "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                )));
+            }
+            return Ok(());
+        };
+        if let Some(selected) = self.model_registry.effective_context(variant) {
+            let selected = maximum.min(selected as u64);
+            let bytes = required(Some(selected))?;
+            if bytes > budget {
+                return Err(Error::ModelLoadError(format!(
+                    "aggregate portable state does not fit the selected context: context={selected}, invocation_state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                )));
+            }
+            descriptor.resolve_capacity_axis(StateCapacityAxis::DecoderContext, selected)?;
+            return Ok(());
+        }
         let selected = if let Some(explicit) = self.config.max_sequence_length.explicit_tokens() {
             let selected = maximum.min(explicit as u64);
-            let bytes = required(selected)?;
+            let bytes = required(Some(selected))?;
             if bytes > budget {
                 return Err(Error::ModelLoadError(format!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
@@ -472,7 +479,7 @@ impl ModelLifecycleController {
             }
             selected
         } else {
-            let minimum_bytes = required(minimum)?;
+            let minimum_bytes = required(Some(minimum))?;
             if minimum_bytes > budget {
                 return Err(Error::ModelLoadError(format!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
@@ -481,7 +488,7 @@ impl ModelLifecycleController {
             let (mut low, mut high) = (minimum, maximum);
             while low < high {
                 let middle = low + (high - low).div_ceil(2);
-                if required(middle)? <= budget {
+                if required(Some(middle))? <= budget {
                     low = middle;
                 } else {
                     high = middle - 1;
@@ -910,10 +917,11 @@ impl ModelLifecycleController {
                         let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
                         let physical = self
                             .core_engine
-                            .load_managed_model_state(
+                            .load_managed_model_state_with_portable_copies(
                                 model_instance_id,
                                 &physical_spec.retained,
                                 Some(physical_spec.retained_max_tokens),
+                                2,
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
