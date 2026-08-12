@@ -139,6 +139,39 @@ struct ActiveStreamBatch {
     rows: HashMap<u64, super::SessionKey>,
 }
 
+fn resolve_managed_token_reach(
+    backend: BackendKind,
+    configured_context: usize,
+    loaded_context: Option<usize>,
+) -> Result<Option<u64>> {
+    let loaded_context = loaded_context.ok_or_else(|| {
+        Error::ModelLoadError(format!(
+            "{backend:?} managed state requires a positive loaded-model context limit"
+        ))
+    })?;
+    let effective = loaded_context.min(configured_context);
+    if effective == 0 {
+        let backend = if backend == BackendKind::Cuda {
+            "CUDA"
+        } else {
+            "portable"
+        };
+        return Err(Error::ModelLoadError(format!(
+            "{backend} managed state resolved a zero loaded-model context limit"
+        )));
+    }
+    u64::try_from(effective)
+        .map(Some)
+        .map_err(|_| {
+            let backend = if backend == BackendKind::Cuda {
+                "CUDA"
+            } else {
+                "portable"
+            };
+            Error::ModelLoadError(format!("{backend} model context exceeds u64"))
+        })
+}
+
 impl PhysicalBatchAssembly {
     fn materialized_tensor_elements(
         shape_policy: StageShapePolicy,
@@ -2739,7 +2772,11 @@ impl EngineCore {
                     total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
                         Error::InvalidInput("managed KV page budget exceeds u32".into())
                     })?,
-                    logical_token_reach: self.managed_cuda_token_reach(logical_context_tokens)?,
+                    logical_token_reach: resolve_managed_token_reach(
+                        backend,
+                        self.config.max_seq_len,
+                        logical_context_tokens,
+                    )?,
                     retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
                         |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
                     )?,
@@ -2776,7 +2813,11 @@ impl EngineCore {
                 total_paged_pages: u32::try_from(self.config.max_blocks).map_err(|_| {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
-                logical_token_reach: self.managed_cuda_token_reach(logical_context_tokens)?,
+                logical_token_reach: resolve_managed_token_reach(
+                    backend,
+                    self.config.max_seq_len,
+                    logical_context_tokens,
+                )?,
                 retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
                     |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
                 )?,
@@ -2787,26 +2828,6 @@ impl EngineCore {
             self.config.block_size,
             retained_state,
         )
-    }
-
-    fn managed_cuda_token_reach(&self, loaded_context: Option<usize>) -> Result<Option<u64>> {
-        if self.managed_kv_cache.worker_backend() != BackendKind::Cuda {
-            return Ok(None);
-        }
-        let loaded_context = loaded_context.ok_or_else(|| {
-            Error::ModelLoadError(
-                "CUDA managed state requires a positive loaded-model context limit".into(),
-            )
-        })?;
-        let effective = loaded_context.min(self.config.max_seq_len);
-        if effective == 0 {
-            return Err(Error::ModelLoadError(
-                "CUDA managed state resolved a zero loaded-model context limit".into(),
-            ));
-        }
-        u64::try_from(effective)
-            .map(Some)
-            .map_err(|_| Error::ModelLoadError("CUDA model context exceeds u64".into()))
     }
 
     pub(crate) fn load_retained_tensor_state(
@@ -2942,6 +2963,28 @@ mod tests {
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn managed_token_reach_honors_portable_context_and_preserves_cuda_ceiling() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(
+                resolve_managed_token_reach(backend, 4_096, Some(40_960)).unwrap(),
+                Some(4_096)
+            );
+            assert_eq!(
+                resolve_managed_token_reach(backend, 262_144, Some(40_960)).unwrap(),
+                Some(40_960)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_token_reach_rejects_missing_or_zero_model_context_on_every_backend() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert!(resolve_managed_token_reach(backend, 4_096, None).is_err());
+            assert!(resolve_managed_token_reach(backend, 4_096, Some(0)).is_err());
+        }
+    }
 
     fn scheduled_prefill(request_id: &str, sequence_id: u64) -> ScheduledRequest {
         ScheduledRequest {
