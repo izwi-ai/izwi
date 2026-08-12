@@ -105,11 +105,15 @@ impl InferenceCoordinator {
     #[cfg(test)]
     pub fn new(backend: BackendKind, execution_parallelism: usize, max_queued_jobs: usize) -> Self {
         let provider = Arc::new(DeviceCapacityProvider::for_tests(backend));
+        let authority = match backend {
+            BackendKind::Cpu | BackendKind::Metal => ResourceAuthority::new_advisory(provider),
+            BackendKind::Cuda => ResourceAuthority::new(provider),
+        };
         Self::with_resource_authority(
             backend,
             execution_parallelism,
             max_queued_jobs,
-            Arc::new(ResourceAuthority::new(provider)),
+            Arc::new(authority),
         )
     }
 
@@ -816,6 +820,26 @@ impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
         self.combined_snapshot(false)
     }
 
+    fn configured_budget(&self) -> Option<ResourceVector> {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let budget = providers
+            .values()
+            .filter_map(|provider| provider.configured_budget())
+            .map(shared_host_unified_amount)
+            .try_fold(None, |minimum, amount| match amount {
+                ResourceAmount::Known(amount) => Ok(Some(
+                    minimum.map_or(amount, |current: u64| current.min(amount)),
+                )),
+                ResourceAmount::Unknown => Err(()),
+            })
+            .ok()
+            .flatten()?;
+        Some(shared_host_unified_vector(ResourceAmount::Known(budget)))
+    }
+
     fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
         self.combined_snapshot(true)
     }
@@ -917,7 +941,7 @@ impl ResourceAuthorityRegistry {
                 }
                 let shared_provider = Arc::new(SharedHostUnifiedCapacityProvider::default());
                 shared_provider.register(location, provider);
-                let authority = Arc::new(ResourceAuthority::new_shared_host_unified(
+                let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
                     shared_provider.clone(),
                 ));
                 state.host_unified = Some(SharedAuthorityRegistration {
@@ -1510,6 +1534,12 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
             .unwrap_or_else(|| self.probe.unavailable_snapshot())
     }
 
+    fn configured_budget(&self) -> Option<ResourceVector> {
+        self.probe
+            .configured_cap
+            .map(|capacity| self.probe.vector(ResourceAmount::Known(capacity)))
+    }
+
     fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
         let sampled_at = Instant::now();
         let snapshot = guarded_capacity_sample(|| self.probe.sample())
@@ -1705,6 +1735,7 @@ mod tests {
     struct MutableCapacityProvider {
         capacity: ResourceVector,
         available: Mutex<ResourceVector>,
+        configured_budget: Option<ResourceVector>,
     }
 
     impl MutableCapacityProvider {
@@ -1712,7 +1743,13 @@ mod tests {
             Self {
                 capacity,
                 available: Mutex::new(capacity),
+                configured_budget: None,
             }
+        }
+
+        fn with_configured_budget(mut self, configured_budget: ResourceVector) -> Self {
+            self.configured_budget = Some(configured_budget);
+            self
         }
 
         fn set_available(&self, available: ResourceVector) {
@@ -1733,6 +1770,10 @@ mod tests {
                     .unwrap_or_else(|poison| poison.into_inner()),
                 source: CapacitySource::Test,
             }
+        }
+
+        fn configured_budget(&self) -> Option<ResourceVector> {
+            self.configured_budget
         }
     }
 
@@ -1890,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn same_physical_device_identity_shares_authority_and_reservations() {
+    fn shared_authority_applies_backend_capacity_policy() {
         for (index, location) in [
             DeviceLocation::Cpu,
             DeviceLocation::Metal { gpu_id: 7 },
@@ -1917,16 +1958,30 @@ mod tests {
                     resources_for_location(location, 60),
                 )
                 .unwrap();
-            assert!(matches!(
-                second.reserve(
-                    ReservationOwner::new(
-                        ReservationClass::Request,
-                        format!("shared-device-second-{index}"),
-                    ),
-                    resources_for_location(location, 50),
+            let second_reservation = second.reserve(
+                ReservationOwner::new(
+                    ReservationClass::Request,
+                    format!("shared-device-second-{index}"),
                 ),
-                Err(Error::Overloaded(_))
-            ));
+                resources_for_location(location, 50),
+            );
+            match location {
+                DeviceLocation::Cpu | DeviceLocation::Metal { .. } => {
+                    let _second = second_reservation
+                        .expect("shared host/unified physical capacity is advisory");
+                    assert_eq!(
+                        second.snapshot().reserved,
+                        authority_resources_for_location(location, 110)
+                    );
+                }
+                DeviceLocation::Cuda { .. } => {
+                    assert!(matches!(second_reservation, Err(Error::Overloaded(_))));
+                    assert_eq!(
+                        second.snapshot().reserved,
+                        authority_resources_for_location(location, 60)
+                    );
+                }
+            }
             assert_eq!(
                 second.snapshot().physical.capacity,
                 authority_resources_for_location(location, 100),
@@ -1970,16 +2025,60 @@ mod tests {
                 resources_for_location(DeviceLocation::Cpu, 60),
             )
             .unwrap();
-        assert!(matches!(
-            metal.reserve(
+        let _metal_lease = metal
+            .reserve(
                 ReservationOwner::new(ReservationClass::Request, "shared-metal"),
                 resources_for_location(DeviceLocation::Metal { gpu_id: 0 }, 30),
+            )
+            .expect("shared host/unified physical capacity is advisory");
+        assert_eq!(
+            metal.snapshot().reserved,
+            shared_host_unified_vector(ResourceAmount::Known(90))
+        );
+    }
+
+    #[test]
+    fn shared_cpu_and_metal_claims_jointly_observe_the_smallest_explicit_budget() {
+        let registry = ResourceAuthorityRegistry::default();
+        let cpu_provider = Arc::new(
+            MutableCapacityProvider::new(resources_for_location(DeviceLocation::Cpu, 1_000))
+                .with_configured_budget(resources_for_location(DeviceLocation::Cpu, 100)),
+        );
+        let metal_location = DeviceLocation::Metal { gpu_id: 0 };
+        let metal_provider = Arc::new(
+            MutableCapacityProvider::new(resources_for_location(metal_location, 1_000))
+                .with_configured_budget(resources_for_location(metal_location, 80)),
+        );
+        let cpu = registry
+            .authority_for(DeviceLocation::Cpu, cpu_provider)
+            .unwrap();
+        let metal = registry
+            .authority_for(metal_location, metal_provider)
+            .unwrap();
+        assert!(Arc::ptr_eq(&cpu, &metal));
+
+        let _cpu = cpu
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "budgeted-cpu"),
+                resources_for_location(DeviceLocation::Cpu, 60),
+            )
+            .unwrap();
+        assert!(matches!(
+            metal.reserve(
+                ReservationOwner::new(ReservationClass::Request, "over-shared-budget"),
+                resources_for_location(metal_location, 21),
             ),
             Err(Error::Overloaded(_))
         ));
+        let _metal = metal
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "within-shared-budget"),
+                resources_for_location(metal_location, 20),
+            )
+            .unwrap();
         assert_eq!(
             metal.snapshot().reserved,
-            shared_host_unified_vector(ResourceAmount::Known(60))
+            shared_host_unified_vector(ResourceAmount::Known(80))
         );
     }
 
@@ -3135,12 +3234,82 @@ Pages free: 10.\n";
     }
 
     #[tokio::test]
-    async fn resource_rejection_is_counted() {
-        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
-        let mut oversized = job("oversized");
-        oversized.resources.host_bytes = ResourceAmount::Known(u64::MAX);
+    async fn observed_request_capacity_policy_is_backend_aware() {
+        const PHYSICAL_CAPACITY: u64 = 12_713_115_648;
+        const AUTHORIZATION: u64 = 67_112_288;
+        const INPUT_BYTES: u64 = 428;
+        const EXPECTED_PENDING: u64 = 67_111_860;
 
-        assert!(coordinator.admit(oversized).await.is_err());
-        assert_eq!(coordinator.snapshot().rejected_total, 1);
+        let guarded_metal_provider =
+            provider_for_location(DeviceLocation::Metal { gpu_id: 99 }, PHYSICAL_CAPACITY);
+        guarded_metal_provider.set_available(resources_for_location(
+            DeviceLocation::Metal { gpu_id: 99 },
+            0,
+        ));
+        let guarded_metal = Arc::new(InferenceCoordinator::with_resource_authority(
+            BackendKind::Metal,
+            1,
+            4,
+            Arc::new(ResourceAuthority::new(guarded_metal_provider)),
+        ));
+        let guarded_error = guarded_metal
+            .admit_observed(
+                JobSpec {
+                    resources: resources_for_location(
+                        DeviceLocation::Metal { gpu_id: 99 },
+                        AUTHORIZATION,
+                    ),
+                    ..job("reported-arithmetic-control")
+                },
+                JobResourceObservation::host(INPUT_BYTES),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(guarded_error.contains(&format!("unified_bytes: Known({EXPECTED_PENDING})")));
+
+        for (backend, location) in [
+            (BackendKind::Cpu, DeviceLocation::Cpu),
+            (BackendKind::Metal, DeviceLocation::Metal { gpu_id: 0 }),
+            (BackendKind::Cuda, DeviceLocation::Cuda { gpu_id: 0 }),
+        ] {
+            let provider = provider_for_location(location, PHYSICAL_CAPACITY);
+            provider.set_available(resources_for_location(location, 0));
+            let registry = ResourceAuthorityRegistry::default();
+            let authority = registry.authority_for(location, provider).unwrap();
+            let coordinator = Arc::new(InferenceCoordinator::with_resource_authority(
+                backend, 1, 4, authority,
+            ));
+            let mut resources = resources_for_location(location, AUTHORIZATION);
+            if backend == BackendKind::Cuda {
+                resources.host_bytes = ResourceAmount::Known(INPUT_BYTES);
+            }
+            let spec = JobSpec {
+                resources,
+                ..job("reported-capacity-regression")
+            };
+            let result = coordinator
+                .admit_observed(spec, JobResourceObservation::host(INPUT_BYTES))
+                .await;
+
+            match backend {
+                BackendKind::Cpu | BackendKind::Metal => {
+                    let lease = result.expect("shared-memory live capacity is advisory");
+                    assert_eq!(coordinator.snapshot().reserved_memory_bytes, AUTHORIZATION);
+                    assert_eq!(coordinator.snapshot().rejected_total, 0);
+                    drop(lease);
+                    assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+                }
+                BackendKind::Cuda => {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("device_bytes: Known({AUTHORIZATION})")),
+                        "unexpected CUDA rejection: {error}"
+                    );
+                    assert_eq!(coordinator.snapshot().rejected_total, 1);
+                    assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+                }
+            }
+        }
     }
 }
