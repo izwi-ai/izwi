@@ -1343,7 +1343,7 @@ impl NemotronStreamingFeatureState {
             return 0;
         }
         if self.input_finished {
-            return ((self.preemphasized.len() + HOP_LENGTH - 1) / HOP_LENGTH).max(1);
+            return self.preemphasized.len().div_ceil(HOP_LENGTH).max(1);
         }
 
         let center_pad = N_FFT / 2;
@@ -1715,9 +1715,9 @@ impl NemotronPreprocessor {
 
         let center_pad = N_FFT / 2;
         let mut padded = Vec::with_capacity(x.len() + center_pad * 2);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
         padded.extend_from_slice(&x);
-        padded.extend(std::iter::repeat(0.0).take(center_pad));
+        padded.extend(std::iter::repeat_n(0.0, center_pad));
 
         let frame_count = if padded.len() >= N_FFT {
             (padded.len() - N_FFT) / HOP_LENGTH + 1
@@ -1758,9 +1758,7 @@ impl NemotronPreprocessor {
             }
         }
 
-        let valid_frames = ((audio.len() + HOP_LENGTH - 1) / HOP_LENGTH)
-            .max(1)
-            .min(frame_count);
+        let valid_frames = audio.len().div_ceil(HOP_LENGTH).max(1).min(frame_count);
         if self.normalize == FeatureNormalize::PerFeature {
             normalize_per_feature(&mut mel, N_MELS, frame_count, valid_frames);
         }
@@ -2542,13 +2540,14 @@ impl PromptKernel {
             prompt_id,
             dtype: encoded.dtype(),
         };
-        let base = if let Some(cached) = self
-            .prompt_cache
-            .lock()
-            .map_err(|_| Error::InferenceError("Nemotron prompt cache lock poisoned".into()))?
-            .get(&key)
-            .cloned()
-        {
+        let cached = {
+            self.prompt_cache
+                .lock()
+                .map_err(|_| Error::InferenceError("Nemotron prompt cache lock poisoned".into()))?
+                .get(&key)
+                .cloned()
+        };
+        let base = if let Some(cached) = cached {
             cached
         } else {
             let tensor = build_prompt_one_hot(prompt_id, encoded.device(), encoded.dtype())?;
