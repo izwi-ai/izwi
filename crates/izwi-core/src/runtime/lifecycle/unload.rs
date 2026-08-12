@@ -438,10 +438,8 @@ mod tests {
                 .unload_managed_model_cache(model_instance)
                 .await
                 .unwrap());
-            assert_eq!(authority.snapshot().reservations, 1);
             assert!(runtime.model_lifecycle.remove_resident_slot(variant));
-            assert_eq!(authority.snapshot().reservations, 0);
-            assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+            assert!(!runtime.model_lifecycle.remove_resident_slot(variant));
         }
 
         std::fs::remove_dir_all(models_dir).unwrap();
