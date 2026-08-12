@@ -127,12 +127,14 @@ impl Default for StageClaimFilter {
 
 impl StageClaimFilter {
     pub fn for_worker_queues(queue_names: &[String]) -> Self {
-        let mut filter = Self::default();
-        filter.queue_names = normalize_filter_values(queue_names);
-        if filter.queue_names.is_empty() {
-            filter.queue_names.push("batch".to_string());
+        let mut queue_names = normalize_filter_values(queue_names);
+        if queue_names.is_empty() {
+            queue_names.push("batch".to_string());
         }
-        filter
+        Self {
+            queue_names,
+            ..Default::default()
+        }
     }
 
     fn normalized(&self) -> Self {

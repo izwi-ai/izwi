@@ -26,32 +26,24 @@ const DEFAULT_LIST_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TranscriptionSummaryStatus {
+    #[default]
     NotRequested,
     Pending,
     Ready,
     Failed,
 }
 
-impl Default for TranscriptionSummaryStatus {
-    fn default() -> Self {
-        Self::NotRequested
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TranscriptionProcessingStatus {
+    #[default]
     Pending,
     Processing,
     Ready,
     Failed,
-}
-
-impl Default for TranscriptionProcessingStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl TranscriptionProcessingStatus {
@@ -67,15 +59,11 @@ impl TranscriptionProcessingStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TranscriptionRecordMode {
+    #[default]
     Transcription,
     SpeakerAttributedAsr,
-}
-
-impl Default for TranscriptionRecordMode {
-    fn default() -> Self {
-        Self::Transcription
-    }
 }
 
 impl TranscriptionRecordMode {
@@ -89,17 +77,13 @@ impl TranscriptionRecordMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SpeakerAttributedAsrStatus {
+    #[default]
     NotRequested,
     Ready,
     Warning,
     Failed,
-}
-
-impl Default for SpeakerAttributedAsrStatus {
-    fn default() -> Self {
-        Self::NotRequested
-    }
 }
 
 impl SpeakerAttributedAsrStatus {

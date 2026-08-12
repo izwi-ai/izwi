@@ -25,11 +25,7 @@ impl OpenAiCompatibilityProfile {
 /// - `strict` (default)
 /// - `relaxed`
 pub fn compatibility_profile() -> OpenAiCompatibilityProfile {
-    parse_profile(
-        std::env::var("IZWI_OPENAI_COMPAT_PROFILE")
-            .ok()
-            .as_deref(),
-    )
+    parse_profile(std::env::var("IZWI_OPENAI_COMPAT_PROFILE").ok().as_deref())
 }
 
 pub fn strict_guardrail_message(feature: &str) -> String {
@@ -39,7 +35,10 @@ pub fn strict_guardrail_message(feature: &str) -> String {
 }
 
 fn parse_profile(raw: Option<&str>) -> OpenAiCompatibilityProfile {
-    match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("relaxed") => OpenAiCompatibilityProfile::Relaxed,
         _ => OpenAiCompatibilityProfile::Strict,
     }

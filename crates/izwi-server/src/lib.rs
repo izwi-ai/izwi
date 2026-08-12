@@ -1,5 +1,17 @@
 //! Izwi TTS Server - HTTP API for Qwen3-TTS inference
 
+// HTTP orchestration boundaries intentionally carry the complete request/job
+// context, and realtime alignment uses explicit word-coordinate indexing.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+// Async tests hold a process-wide environment lock across awaits so parallel
+// tests cannot observe transient environment overrides. Production code keeps
+// the stricter lint enabled.
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
+
 use clap::{Parser, ValueEnum};
 use std::io::Cursor;
 use std::path::Path;

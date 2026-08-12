@@ -34,8 +34,10 @@ impl ChatExecutionRequest {
 
     fn resolved_generation_params(&self) -> GenerationParams {
         let max_new_tokens = self.resolved_max_new_tokens();
-        let mut params = GenerationParams::default();
-        params.max_tokens = max_new_tokens;
+        let mut params = GenerationParams {
+            max_tokens: max_new_tokens,
+            ..Default::default()
+        };
 
         if let Some(temperature) = self.temperature {
             params.temperature = temperature;

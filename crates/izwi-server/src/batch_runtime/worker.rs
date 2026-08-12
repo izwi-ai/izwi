@@ -691,12 +691,8 @@ impl BatchWorkerRunner {
         };
         tokio::pin!(deadline_wait);
         let renewal_interval = Duration::from_millis(
-            u64::try_from(
-                (self.config.lease_duration.as_millis() / 3)
-                    .max(1)
-                    .min(30_000),
-            )
-            .unwrap_or(30_000),
+            u64::try_from((self.config.lease_duration.as_millis() / 3).clamp(1, 30_000))
+                .unwrap_or(30_000),
         );
         let execution_result = loop {
             tokio::select! {

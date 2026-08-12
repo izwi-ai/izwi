@@ -1,10 +1,10 @@
 use axum::{
-    Router,
     extract::Request,
     http::{HeaderValue, StatusCode},
     middleware,
     response::Response,
     routing::get,
+    Router,
 };
 use izwi_core::ServeRuntimeConfig;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-use tracing::{Span, field, info, info_span, warn};
+use tracing::{field, info, info_span, warn, Span};
 
 use crate::api::request_context::attach_enterprise_request_context;
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
@@ -151,7 +151,7 @@ fn build_cors_layer(serve_config: &ServeRuntimeConfig) -> Option<CorsLayer> {
         for origin in &serve_config.cors_origins {
             match HeaderValue::from_str(origin) {
                 Ok(value) => {
-                    if !allowed_origins.iter().any(|existing| existing == &value) {
+                    if !allowed_origins.contains(&value) {
                         allowed_origins.push(value);
                     }
                 }
@@ -185,14 +185,14 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         body::Body,
-        http::{Method, Request, StatusCode, header},
+        http::{header, Method, Request, StatusCode},
         response::Response,
         routing::get,
     };
     use base64::Engine;
     use izwi_core::{
-        RuntimeService,
         audio::{AudioEncoder, AudioFormat},
+        RuntimeService,
     };
     use izwi_hooks::{
         AuthorizationDecision, AuthorizationRequest, EnterpriseHooks, HookResult, PolicyEngine,
@@ -251,12 +251,10 @@ mod tests {
         )
         .await;
 
-        assert!(
-            response
-                .headers()
-                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .is_none()
-        );
+        assert!(response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
     }
 
     #[tokio::test]
@@ -1488,11 +1486,7 @@ mod tests {
 
         let artifacts = send_request(
             app.clone(),
-            build_request(
-                Method::GET,
-                &format!("/v1/jobs/{}/artifacts", job.id),
-                None,
-            ),
+            build_request(Method::GET, &format!("/v1/jobs/{}/artifacts", job.id), None),
         )
         .await;
         assert_eq!(artifacts.status(), StatusCode::OK);
@@ -1523,10 +1517,7 @@ mod tests {
         assert_eq!(retry.status(), StatusCode::OK);
         let retry_body = read_json(retry).await;
         assert_eq!(retry_body["job"]["status"].as_str(), Some("queued"));
-        assert_eq!(
-            retry_body["stages"][0]["status"].as_str(),
-            Some("retrying")
-        );
+        assert_eq!(retry_body["stages"][0]["status"].as_str(), Some("retrying"));
 
         drop(temp_dir);
     }
@@ -1621,13 +1612,11 @@ mod tests {
             tts_model["route_capabilities"]["voice_realtime_modular_tts"].as_bool(),
             Some(true)
         );
-        assert!(
-            tts_model["modalities"]
-                .as_array()
-                .expect("modalities should be an array")
-                .iter()
-                .any(|modality| modality.as_str() == Some("audio_output"))
-        );
+        assert!(tts_model["modalities"]
+            .as_array()
+            .expect("modalities should be an array")
+            .iter()
+            .any(|modality| modality.as_str() == Some("audio_output")));
 
         let fish_s2_model = find_model("FishAudio-S2-Pro");
         assert_eq!(fish_s2_model["enabled"].as_bool(), Some(true));
@@ -1645,13 +1634,11 @@ mod tests {
             aligner_model["route_capabilities"]["forced_alignment"].as_bool(),
             Some(true)
         );
-        assert!(
-            aligner_model["modalities"]
-                .as_array()
-                .expect("modalities should be an array")
-                .iter()
-                .any(|modality| modality.as_str() == Some("timestamps"))
-        );
+        assert!(aligner_model["modalities"]
+            .as_array()
+            .expect("modalities should be an array")
+            .iter()
+            .any(|modality| modality.as_str() == Some("timestamps")));
 
         let diarization_model = find_model("diar_streaming_sortformer_4spk-v2.1");
         assert_eq!(
@@ -1675,16 +1662,12 @@ mod tests {
         let granite_modalities = granite_model["modalities"]
             .as_array()
             .expect("Granite modalities should be an array");
-        assert!(
-            granite_modalities
-                .iter()
-                .any(|modality| modality.as_str() == Some("speaker_labels"))
-        );
-        assert!(
-            !granite_modalities
-                .iter()
-                .any(|modality| modality.as_str() == Some("timestamps"))
-        );
+        assert!(granite_modalities
+            .iter()
+            .any(|modality| modality.as_str() == Some("speaker_labels")));
+        assert!(!granite_modalities
+            .iter()
+            .any(|modality| modality.as_str() == Some("timestamps")));
 
         let voxtral_model = find_model("Voxtral-Mini-4B-Realtime-2602");
         assert_eq!(
@@ -1710,21 +1693,15 @@ mod tests {
         let voxtral_modalities = voxtral_model["modalities"]
             .as_array()
             .expect("Voxtral modalities should be an array");
-        assert!(
-            voxtral_modalities
-                .iter()
-                .any(|modality| modality.as_str() == Some("audio_input"))
-        );
-        assert!(
-            voxtral_modalities
-                .iter()
-                .any(|modality| modality.as_str() == Some("text_output"))
-        );
-        assert!(
-            !voxtral_modalities
-                .iter()
-                .any(|modality| modality.as_str() == Some("audio_output"))
-        );
+        assert!(voxtral_modalities
+            .iter()
+            .any(|modality| modality.as_str() == Some("audio_input")));
+        assert!(voxtral_modalities
+            .iter()
+            .any(|modality| modality.as_str() == Some("text_output")));
+        assert!(!voxtral_modalities
+            .iter()
+            .any(|modality| modality.as_str() == Some("audio_output")));
 
         drop(temp_dir);
     }
@@ -1802,11 +1779,9 @@ mod tests {
         let body = axum::body::to_bytes(export.into_body(), usize::MAX)
             .await
             .expect("export body");
-        assert!(
-            std::str::from_utf8(&body)
-                .expect("text export")
-                .contains(&session_id)
-        );
+        assert!(std::str::from_utf8(&body)
+            .expect("text export")
+            .contains(&session_id));
 
         let delete = send_request(
             app.clone(),
@@ -1860,13 +1835,11 @@ mod tests {
         let response = send_request(app, build_request(Method::GET, "/docs", None)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/html"))
-        );
+        assert!(response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html")));
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

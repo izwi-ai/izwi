@@ -1887,11 +1887,12 @@ async fn generate_transcription_summary_attempt(
 }
 
 fn transcription_summary_params() -> GenerationParams {
-    let mut params = GenerationParams::default();
-    params.max_tokens = DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS;
-    params.temperature = 0.2;
-    params.top_p = 0.9;
-    params
+    GenerationParams {
+        max_tokens: DEFAULT_TRANSCRIPTION_SUMMARY_MAX_TOKENS,
+        temperature: 0.2,
+        top_p: 0.9,
+        ..Default::default()
+    }
 }
 
 fn transcription_summary_messages(transcription: &str) -> Vec<ChatMessage> {

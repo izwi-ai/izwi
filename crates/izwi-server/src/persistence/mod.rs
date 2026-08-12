@@ -3,7 +3,7 @@ use crate::{
     db::{migrator::Migrator, schema_contract::validate_provider_managed_schema},
     storage_layout,
 };
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use izwi_hooks::{
     DatabaseBackend, DatabaseConnectionDecision, DatabaseMigrationMode, DatabaseProviderDecision,
     DatabaseProviderRequest, EnterpriseHooks, HookError, HookMetadata, HookResult,
@@ -591,13 +591,11 @@ mod tests {
 
     #[test]
     fn izwi_managed_migrations_are_restricted_to_sqlite() {
-        assert!(
-            validate_migration_mode_for_backend(
-                &DatabaseBackend::Sqlite,
-                &DatabaseMigrationMode::IzwiManaged,
-            )
-            .is_ok()
-        );
+        assert!(validate_migration_mode_for_backend(
+            &DatabaseBackend::Sqlite,
+            &DatabaseMigrationMode::IzwiManaged,
+        )
+        .is_ok());
 
         let error = validate_migration_mode_for_backend(
             &DatabaseBackend::Postgres,
@@ -612,20 +610,16 @@ mod tests {
             "{error}"
         );
 
-        assert!(
-            validate_migration_mode_for_backend(
-                &DatabaseBackend::Postgres,
-                &DatabaseMigrationMode::ProviderManaged,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_migration_mode_for_backend(
-                &DatabaseBackend::Mysql,
-                &DatabaseMigrationMode::Disabled,
-            )
-            .is_ok()
-        );
+        assert!(validate_migration_mode_for_backend(
+            &DatabaseBackend::Postgres,
+            &DatabaseMigrationMode::ProviderManaged,
+        )
+        .is_ok());
+        assert!(validate_migration_mode_for_backend(
+            &DatabaseBackend::Mysql,
+            &DatabaseMigrationMode::Disabled,
+        )
+        .is_ok());
     }
 
     #[test]

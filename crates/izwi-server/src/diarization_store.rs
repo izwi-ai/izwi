@@ -24,17 +24,13 @@ const DEFAULT_LIST_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DiarizationProcessingStatus {
     Pending,
     Processing,
+    #[default]
     Ready,
     Failed,
-}
-
-impl Default for DiarizationProcessingStatus {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 impl DiarizationProcessingStatus {
@@ -50,17 +46,13 @@ impl DiarizationProcessingStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DiarizationSummaryStatus {
+    #[default]
     NotRequested,
     Pending,
     Ready,
     Failed,
-}
-
-impl Default for DiarizationSummaryStatus {
-    fn default() -> Self {
-        Self::NotRequested
-    }
 }
 
 impl DiarizationSummaryStatus {

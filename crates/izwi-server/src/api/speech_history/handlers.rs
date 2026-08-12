@@ -2020,6 +2020,45 @@ fn to_stream_json(event: SpeechStreamEvent) -> String {
     serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())
 }
 
+fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
+    let mut response = Response::builder().status(StatusCode::OK);
+
+    if let Ok(content_type) = HeaderValue::from_str(audio.audio_mime_type.as_str()) {
+        response = response.header(header::CONTENT_TYPE, content_type);
+    }
+
+    let disposition = if as_attachment {
+        audio
+            .audio_filename
+            .as_deref()
+            .map(|filename| format!("attachment; filename=\"{}\"", filename.replace('"', "")))
+            .unwrap_or_else(|| "attachment".to_string())
+    } else if let Some(filename) = audio.audio_filename.as_deref() {
+        format!("inline; filename=\"{}\"", filename.replace('"', ""))
+    } else {
+        "inline".to_string()
+    };
+    if let Ok(value) = HeaderValue::from_str(disposition.as_str()) {
+        response = response.header(header::CONTENT_DISPOSITION, value);
+    }
+
+    response
+        .body(Body::from(audio.audio_bytes))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn map_store_error(err: anyhow::Error) -> ApiError {
+    ApiError::internal(format!("Speech history storage error: {err}"))
+}
+
+fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
+    if err.is_invalid_input() {
+        ApiError::bad_request(err.to_string())
+    } else {
+        ApiError::internal(format!("Speech reference media ingest error: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2290,44 +2329,5 @@ mod tests {
         .expect("request should normalize");
 
         assert_eq!(normalized.speed, None);
-    }
-}
-
-fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
-    let mut response = Response::builder().status(StatusCode::OK);
-
-    if let Ok(content_type) = HeaderValue::from_str(audio.audio_mime_type.as_str()) {
-        response = response.header(header::CONTENT_TYPE, content_type);
-    }
-
-    let disposition = if as_attachment {
-        audio
-            .audio_filename
-            .as_deref()
-            .map(|filename| format!("attachment; filename=\"{}\"", filename.replace('"', "")))
-            .unwrap_or_else(|| "attachment".to_string())
-    } else if let Some(filename) = audio.audio_filename.as_deref() {
-        format!("inline; filename=\"{}\"", filename.replace('"', ""))
-    } else {
-        "inline".to_string()
-    };
-    if let Ok(value) = HeaderValue::from_str(disposition.as_str()) {
-        response = response.header(header::CONTENT_DISPOSITION, value);
-    }
-
-    response
-        .body(Body::from(audio.audio_bytes))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Speech history storage error: {err}"))
-}
-
-fn map_media_ingest_error(err: MediaIngestError) -> ApiError {
-    if err.is_invalid_input() {
-        ApiError::bad_request(err.to_string())
-    } else {
-        ApiError::internal(format!("Speech reference media ingest error: {err}"))
     }
 }

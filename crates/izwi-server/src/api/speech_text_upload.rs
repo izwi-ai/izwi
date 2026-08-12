@@ -93,7 +93,7 @@ Ensure `Content-Type` includes a valid boundary (let your HTTP client set it aut
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES, resolve_source_audio_mime_type};
+    use super::{resolve_source_audio_mime_type, FIRST_PARTY_AUDIO_UPLOAD_LIMIT_BYTES};
 
     #[test]
     fn first_party_upload_limit_stays_bounded_while_ingestion_is_buffered() {

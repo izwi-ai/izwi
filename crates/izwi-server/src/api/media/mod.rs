@@ -2,7 +2,7 @@
 
 mod handlers;
 
-use axum::{Router, extract::DefaultBodyLimit, routing::get};
+use axum::{extract::DefaultBodyLimit, routing::get, Router};
 
 use crate::api::openai::audio::resolve_audio_upload_limit_bytes;
 use crate::state::AppState;

@@ -1270,10 +1270,10 @@ fn ingest_audio_frame(
             MAX_FRAME_BYTES
         ));
     }
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return Err("PCM16 payload length must be even".to_string());
     }
-    if sample_rate < 8_000 || sample_rate > 192_000 {
+    if !(8_000..=192_000).contains(&sample_rate) {
         return Err(format!("Invalid input sample_rate {sample_rate}"));
     }
 

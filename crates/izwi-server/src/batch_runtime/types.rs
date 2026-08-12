@@ -6,7 +6,9 @@ pub const WORKER_HEARTBEAT_DETAILS_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum QueueClass {
+    #[default]
     Batch,
     InteractiveAsr,
     BatchAsr,
@@ -49,15 +51,11 @@ impl QueueClass {
     }
 }
 
-impl Default for QueueClass {
-    fn default() -> Self {
-        Self::Batch
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ResourceTarget {
+    #[default]
     Any,
     Cpu,
     Gpu,
@@ -115,12 +113,6 @@ impl ResourceTarget {
             "gpu" => Some(Self::Gpu),
             _ => None,
         }
-    }
-}
-
-impl Default for ResourceTarget {
-    fn default() -> Self {
-        Self::Any
     }
 }
 
@@ -234,7 +226,9 @@ pub struct RuntimeWorkerHeartbeatDetails {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RuntimeJobStatus {
+    #[default]
     Created,
     Queued,
     Running,
@@ -280,15 +274,11 @@ impl RuntimeJobStatus {
     }
 }
 
-impl Default for RuntimeJobStatus {
-    fn default() -> Self {
-        Self::Created
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RuntimeStageStatus {
+    #[default]
     Created,
     Queued,
     Running,
@@ -334,12 +324,6 @@ impl RuntimeStageStatus {
             "skipped" => Some(Self::Skipped),
             _ => None,
         }
-    }
-}
-
-impl Default for RuntimeStageStatus {
-    fn default() -> Self {
-        Self::Created
     }
 }
 

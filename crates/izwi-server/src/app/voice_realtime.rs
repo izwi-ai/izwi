@@ -988,7 +988,7 @@ impl StreamingInputState {
         sample_rate: u32,
         payload: &[u8],
     ) -> Result<StreamingFrameResult, String> {
-        if sample_rate < 8_000 || sample_rate > 192_000 {
+        if !(8_000..=192_000).contains(&sample_rate) {
             return Err(format!("Invalid input sample_rate {sample_rate}"));
         }
         let sequence_gap = if let Some(last) = self.frame_seq_last {
@@ -1012,7 +1012,7 @@ impl StreamingInputState {
                 finalized_utterance: None,
             });
         }
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             return Err("PCM16 payload length must be even".to_string());
         }
 
@@ -1896,7 +1896,7 @@ async fn handle_binary_message(
                 );
             }
 
-            return Ok(());
+            Ok(())
         }
     }
 }
@@ -2405,11 +2405,15 @@ async fn stream_tts_to_socket(
         }),
     );
 
-    let mut gen_config = GenerationConfig::default();
-    gen_config.streaming = true;
-    gen_config.options.max_tokens = 0;
-    gen_config.options.speaker = speaker.clone();
-    gen_config.options.voice = speaker;
+    let gen_config = GenerationConfig {
+        streaming: true,
+        options: GenerationParams {
+            max_tokens: 0,
+            speaker: speaker.clone(),
+            voice: speaker,
+            ..Default::default()
+        },
+    };
 
     let gen_request = GenerationRequest {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2573,10 +2577,12 @@ async fn stream_unified_s2s_to_socket(
 
     let encoder = AudioEncoder::new(24_000, 1);
     let delivery_error = Arc::new(Mutex::new(None::<String>));
-    let mut params = GenerationParams::default();
-    params.max_tokens = max_output_tokens.clamp(1, 4096);
-    params.speaker = speaker.clone();
-    params.voice = speaker;
+    let params = GenerationParams {
+        max_tokens: max_output_tokens.clamp(1, 4096),
+        speaker: speaker.clone(),
+        voice: speaker,
+        ..Default::default()
+    };
 
     let generation = state
         .runtime

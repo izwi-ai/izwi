@@ -650,7 +650,8 @@ pub async fn completions(
     };
 
     if req.stream.unwrap_or(false) {
-        let stream_response = complete_stream(state, req, execution_request, compat_profile).await?;
+        let stream_response =
+            complete_stream(state, req, execution_request, compat_profile).await?;
         return Ok(stream_response.into_response());
     }
 
@@ -1140,12 +1141,10 @@ mod tests {
                 .and_then(|function| function.name.as_deref()),
             Some("get_weather")
         );
-        assert!(
-            deltas[0]
-                .function
-                .as_ref()
-                .and_then(|function| function.arguments.as_deref())
-                .is_some_and(|args| args.contains("Harare"))
-        );
+        assert!(deltas[0]
+            .function
+            .as_ref()
+            .and_then(|function| function.arguments.as_deref())
+            .is_some_and(|args| args.contains("Harare")));
     }
 }

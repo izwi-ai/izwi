@@ -51,17 +51,13 @@ impl SpeechRouteKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SpeechHistoryProcessingStatus {
     Pending,
     Processing,
+    #[default]
     Ready,
     Failed,
-}
-
-impl Default for SpeechHistoryProcessingStatus {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 impl SpeechHistoryProcessingStatus {
