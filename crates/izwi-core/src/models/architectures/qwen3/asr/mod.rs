@@ -618,7 +618,7 @@ impl Qwen3AsrModel {
             None
         };
         let config = if let Some(loader) = gguf_loader.as_ref() {
-            parse_qwen3_asr_config_from_gguf(loader)?
+            parse_qwen3_asr_config_from_gguf(loader, model_dir, variant)?
         } else {
             let config_path = model_dir.join("config.json");
             let config_str = fs::read_to_string(config_path)?;
@@ -1912,7 +1912,11 @@ fn qwen_asr_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     }
 }
 
-fn parse_qwen3_asr_config_from_gguf(loader: &GgufLoader) -> Result<Qwen3AsrConfig> {
+fn parse_qwen3_asr_config_from_gguf(
+    loader: &GgufLoader,
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<Qwen3AsrConfig> {
     let rope_theta = required_f64_metadata(loader, "qwen3_asr.text.rope_theta")?;
     let mrope_section = required_usize_array_metadata(loader, "qwen3_asr.text.mrope_section")?;
 
@@ -1922,8 +1926,12 @@ fn parse_qwen3_asr_config_from_gguf(loader: &GgufLoader) -> Result<Qwen3AsrConfi
         num_attention_heads: required_usize_metadata(loader, "qwen3_asr.text.num_attention_heads")?,
         num_hidden_layers: required_usize_metadata(loader, "qwen3_asr.text.num_hidden_layers")?,
         num_key_value_heads: required_usize_metadata(loader, "qwen3_asr.text.num_key_value_heads")?,
-        max_position_embeddings: optional_usize_metadata(loader, "qwen3_asr.text.context_length")
-            .or_else(|| optional_usize_metadata(loader, "qwen3_asr.context_length")),
+        max_position_embeddings: Some(resolve_qwen3_asr_context(
+            optional_usize_metadata(loader, "qwen3_asr.text.context_length")
+                .or_else(|| optional_usize_metadata(loader, "qwen3_asr.context_length")),
+            qwen3_asr_sidecar_context(model_dir)?,
+            variant,
+        )?),
         head_dim: Some(required_usize_metadata(loader, "qwen3_asr.text.head_dim")?),
         rms_norm_eps: required_f64_metadata(loader, "qwen3_asr.text.rms_norm_eps")?,
         rope_theta,
@@ -1977,6 +1985,69 @@ fn parse_qwen3_asr_config_from_gguf(loader: &GgufLoader) -> Result<Qwen3AsrConfi
         timestamp_token_id: None,
         timestamp_segment_time: None,
     })
+}
+
+fn qwen3_asr_sidecar_context(model_dir: &Path) -> Result<Option<usize>> {
+    let path = model_dir.join("config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read_to_string(&path).map_err(|error| {
+        Error::ModelLoadError(format!(
+            "failed to read Qwen3 ASR sidecar {}: {error}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&data).map_err(|error| {
+        Error::ModelLoadError(format!(
+            "failed to parse Qwen3 ASR sidecar {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(value
+        .pointer("/thinker_config/text_config/max_position_embeddings")
+        .or_else(|| value.pointer("/text_config/max_position_embeddings"))
+        .or_else(|| value.pointer("/max_position_embeddings"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|tokens| usize::try_from(tokens).ok()))
+}
+
+fn resolve_qwen3_asr_context(
+    embedded: Option<usize>,
+    sidecar: Option<usize>,
+    variant: ModelVariant,
+) -> Result<usize> {
+    let manifest = variant.artifact_context_manifest();
+    let manifest_tokens = manifest.map(|entry| entry.native_context_tokens);
+    let selected = embedded.or(sidecar).or(manifest_tokens).ok_or_else(|| {
+        Error::ModelLoadError(
+            "Qwen3 ASR text context is absent from GGUF metadata, config.json, and the variant artifact manifest"
+                .to_string(),
+        )
+    })?;
+    if selected == 0 {
+        return Err(Error::ModelLoadError(
+            "Qwen3 ASR text context must be positive".to_string(),
+        ));
+    }
+    for (source, candidate) in [("GGUF metadata", embedded), ("config.json", sidecar)] {
+        if let Some(candidate) = candidate {
+            if candidate != selected {
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3 ASR context conflict: {source} declares {candidate} tokens but another authoritative source declares {selected}"
+                )));
+            }
+        }
+    }
+    if let Some(manifest) = manifest {
+        if manifest.native_context_tokens != selected {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3 ASR context conflict: artifact manifest {} declares {} tokens but artifact metadata declares {selected}",
+                manifest.evidence, manifest.native_context_tokens
+            )));
+        }
+    }
+    Ok(selected)
 }
 
 fn qwen3_asr_gguf_tensor_prefix(loader: &GgufLoader) -> &str {
@@ -3151,6 +3222,26 @@ mod tests {
     };
     use crate::kv::v2::{InvocationWorkspaceSet, RetainedStateCapability};
 
+    #[test]
+    fn gguf_context_falls_back_to_revisioned_variant_manifest() {
+        assert_eq!(
+            resolve_qwen3_asr_context(None, None, ModelVariant::Qwen3Asr06BGguf).unwrap(),
+            65_536
+        );
+        assert_eq!(
+            resolve_qwen3_asr_context(None, Some(65_536), ModelVariant::Qwen3Asr17BGguf).unwrap(),
+            65_536
+        );
+    }
+
+    #[test]
+    fn gguf_context_rejects_conflicting_artifact_sources() {
+        let error =
+            resolve_qwen3_asr_context(Some(32_768), Some(32_768), ModelVariant::Qwen3Asr06BGguf)
+                .unwrap_err();
+        assert!(error.to_string().contains("context conflict"));
+        assert!(error.to_string().contains("Qwen/Qwen3-ASR-0.6B"));
+    }
     #[test]
     fn cuda_audio_limits_expand_without_changing_portable_truncation() {
         let configured = 3_000;

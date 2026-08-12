@@ -5,6 +5,14 @@ use std::path::PathBuf;
 
 use super::{CudaQuantizationInfo, CudaSupportInfo};
 
+/// Revision-pinned model limits used when converted artifacts omit otherwise
+/// authoritative configuration metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactContextManifest {
+    pub native_context_tokens: usize,
+    pub evidence: &'static str,
+}
+
 /// Available TTS model variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelVariant {
@@ -255,6 +263,23 @@ impl ModelVariant {
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
+
+    /// Return a revision-pinned native context for artifacts whose conversion
+    /// format is known to omit it. Embedded and sidecar metadata must still be
+    /// checked for conflicts before this value is used.
+    pub fn artifact_context_manifest(self) -> Option<ArtifactContextManifest> {
+        match self {
+            Self::Qwen3Asr06BGguf => Some(ArtifactContextManifest {
+                native_context_tokens: 65_536,
+                evidence: "Qwen/Qwen3-ASR-0.6B@9ba1d4a/config.json",
+            }),
+            Self::Qwen3Asr17BGguf => Some(ArtifactContextManifest {
+                native_context_tokens: 65_536,
+                evidence: "Qwen/Qwen3-ASR-1.7B@c85e7e3/config.json",
+            }),
+            _ => None,
+        }
+    }
 
     /// Get HuggingFace repository ID
     pub fn repo_id(&self) -> &'static str {
