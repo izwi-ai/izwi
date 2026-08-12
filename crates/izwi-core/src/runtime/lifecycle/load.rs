@@ -322,20 +322,19 @@ fn plan_invocation_allocations(
                     // has no persistent typed backing to allocate here.
                     continue;
                 };
-                let capacity_matches = matches!(
-                    (state, capacity),
-                    (
-                        StateDomainSpec::PagedAttention(_),
-                        InvocationStateCapacity::PagedTokens { .. }
-                    ) | (
+                let capacity_matches = matches!(state, StateDomainSpec::PagedAttention(_))
+                    && capacity.paged_max_tokens().is_some()
+                    || matches!(
+                        (state, capacity),
+                        (
                         StateDomainSpec::StaticAttention(_)
                             | StateDomainSpec::Tensor(_)
                             | StateDomainSpec::Append(_)
                             | StateDomainSpec::Ring(_)
                             | StateDomainSpec::StaticTensor(_),
                         InvocationStateCapacity::SemanticBounded
-                    )
-                );
+                        )
+                    );
                 if !capacity_matches {
                     return Err(invalid_invocation_publication(
                         "physical invocation descriptor uses a capacity incompatible with its state domain",

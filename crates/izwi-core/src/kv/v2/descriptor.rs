@@ -67,13 +67,108 @@ pub(crate) enum InvocationLeaseScope {
     PerRow,
 }
 
+/// A model-neutral axis that a physical state capacity may follow.
+///
+/// This is intentionally separate from [`StateClock`]. A clock describes how
+/// a state's cursor advances, while this axis declares which runtime capacity
+/// decision is allowed to resize its physical envelope. For example, a
+/// convolution ring may advance on decoder tokens while remaining fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateCapacityAxis {
+    DecoderContext,
+    EncoderContext,
+    AudioSamples,
+    AudioFrames,
+    CodecFrames,
+    CodebookSteps,
+}
+
+/// A sealed model-authored range for one adaptive capacity axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StateCapacityBinding {
+    pub(crate) axis: StateCapacityAxis,
+    pub(crate) minimum_units: u64,
+    pub(crate) maximum_units: u64,
+}
+
+impl StateCapacityBinding {
+    pub(crate) fn new(
+        axis: StateCapacityAxis,
+        minimum_units: u64,
+        maximum_units: u64,
+    ) -> Result<Self> {
+        let binding = Self {
+            axis,
+            minimum_units,
+            maximum_units,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.minimum_units == 0 || self.minimum_units > self.maximum_units {
+            return Err(invalid(
+                "state capacity binding requires 0 < minimum <= maximum",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve(self, axis: StateCapacityAxis, available_units: u64) -> Result<Self> {
+        self.validate()?;
+        if self.axis != axis {
+            return Ok(self);
+        }
+        if available_units < self.minimum_units {
+            return Err(invalid(
+                "available state capacity is below the model-authored minimum",
+            ));
+        }
+        Ok(Self {
+            maximum_units: available_units.min(self.maximum_units),
+            ..self
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum InvocationStateCapacity {
     /// Exact logical cursor bound for a paged-attention invocation domain.
     PagedTokens { max_tokens: u64 },
+    /// Paged state whose maximum may be reduced by a model-neutral capacity
+    /// decision before physical allocation. Until resolved it retains the
+    /// authored maximum, preserving existing load behavior.
+    AxisBoundPagedTokens { binding: StateCapacityBinding },
     /// The state domain's own bounded shape is the complete capacity contract.
     SemanticBounded,
+}
+
+impl InvocationStateCapacity {
+    pub(crate) const fn paged_max_tokens(self) -> Option<u64> {
+        match self {
+            Self::PagedTokens { max_tokens } => Some(max_tokens),
+            Self::AxisBoundPagedTokens { binding } => Some(binding.maximum_units),
+            Self::SemanticBounded => None,
+        }
+    }
+
+    pub(crate) fn resolve_axis(
+        self,
+        axis: StateCapacityAxis,
+        available_units: u64,
+    ) -> Result<Self> {
+        match self {
+            Self::AxisBoundPagedTokens { binding } => Ok(Self::AxisBoundPagedTokens {
+                binding: binding.resolve(axis, available_units)?,
+            }),
+            // Exact/fixed and semantic-bounded capacities never change merely
+            // because their state clock resembles the selected axis.
+            fixed => Ok(fixed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,18 +592,21 @@ impl InvocationWorkspaceDomain {
                         "invocation workspace placement disagrees with its state domain",
                     ));
                 }
-                match (state, capacity) {
-                    (
-                        StateDomainSpec::PagedAttention(_),
-                        InvocationStateCapacity::PagedTokens { max_tokens },
-                    ) if *max_tokens > 0 => {}
-                    (StateDomainSpec::PagedAttention(_), _) => {
+                match state {
+                    StateDomainSpec::PagedAttention(_)
+                        if capacity.paged_max_tokens().is_some_and(|tokens| tokens > 0) =>
+                    {
+                        if let InvocationStateCapacity::AxisBoundPagedTokens { binding } = capacity {
+                            binding.validate()?;
+                        }
+                    }
+                    StateDomainSpec::PagedAttention(_) => {
                         return Err(invalid(
                             "paged invocation workspace requires a non-zero token capacity",
                         ));
                     }
-                    (_, InvocationStateCapacity::SemanticBounded) => {}
-                    (_, InvocationStateCapacity::PagedTokens { .. }) => {
+                    _ if matches!(capacity, InvocationStateCapacity::SemanticBounded) => {}
+                    _ => {
                         return Err(invalid(
                             "non-paged invocation workspace cannot use a paged token capacity",
                         ));
@@ -531,11 +629,10 @@ fn minimum_physical_bytes_for_capacity(
     state: &StateDomainSpec,
     capacity: InvocationStateCapacity,
 ) -> Result<u64> {
-    let (
-        StateDomainSpec::PagedAttention(spec),
-        InvocationStateCapacity::PagedTokens { max_tokens },
-    ) = (state, capacity)
-    else {
+    let StateDomainSpec::PagedAttention(spec) = state else {
+        return minimum_physical_bytes(state);
+    };
+    let Some(max_tokens) = capacity.paged_max_tokens() else {
         return minimum_physical_bytes(state);
     };
     let page_tokens = u64::from(spec.page_size.preferred_tokens);
@@ -719,6 +816,39 @@ mod tests {
         StateClock, StateComponentId, StateDType, StateDomainHeader, StateGroupId,
         StaticTensorDomainSpec, TensorComponentSpec, TensorRole, WorkspaceAxis,
     };
+
+    #[test]
+    fn adaptive_capacity_resolves_only_its_authored_axis() {
+        let capacity = InvocationStateCapacity::AxisBoundPagedTokens {
+            binding: StateCapacityBinding::new(StateCapacityAxis::DecoderContext, 64, 128_000)
+                .unwrap(),
+        };
+        assert_eq!(
+            capacity
+                .resolve_axis(StateCapacityAxis::EncoderContext, 4_096)
+                .unwrap()
+                .paged_max_tokens(),
+            Some(128_000)
+        );
+        assert_eq!(
+            capacity
+                .resolve_axis(StateCapacityAxis::DecoderContext, 4_096)
+                .unwrap()
+                .paged_max_tokens(),
+            Some(4_096)
+        );
+        assert!(capacity
+            .resolve_axis(StateCapacityAxis::DecoderContext, 63)
+            .is_err());
+
+        let fixed = InvocationStateCapacity::PagedTokens { max_tokens: 16 };
+        assert_eq!(
+            fixed
+                .resolve_axis(StateCapacityAxis::DecoderContext, 4_096)
+                .unwrap(),
+            fixed
+        );
+    }
 
     fn stage(max_workspace_bytes: u64) -> StageDescriptor {
         StageDescriptor {

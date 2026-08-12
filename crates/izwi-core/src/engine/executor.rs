@@ -341,9 +341,9 @@ fn invocation_paged_stage_and_domains<'a>(
         .filter_map(|domain| match domain {
             crate::kv::v2::InvocationWorkspaceDomain::State {
                 state: crate::kv::v2::StateDomainSpec::PagedAttention(state),
-                capacity: crate::kv::v2::InvocationStateCapacity::PagedTokens { .. },
+                capacity,
                 ..
-            } => Some(state.header.id),
+            } if capacity.paged_max_tokens().is_some() => Some(state.header.id),
             _ => None,
         })
         .collect::<Vec<_>>();

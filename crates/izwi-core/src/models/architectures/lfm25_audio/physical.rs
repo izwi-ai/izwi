@@ -7,9 +7,9 @@ use crate::kv::v2::{
     InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
     InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
     InvocationWorkspaceSet, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
-    PagedAttentionLayerSpec, PlacementPolicy, RetainedStateCapability, StateClock, StateDType,
-    StateDomainId, StateDomainSpec, StateGroupId, StateGroupSpec, WorkspaceFormula,
-    CURRENT_INFERENCE_STATE_ABI,
+    PagedAttentionLayerSpec, PlacementPolicy, RetainedStateCapability, StateCapacityAxis,
+    StateCapacityBinding, StateClock, StateDType, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, WorkspaceFormula, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::architectures::lfm2::physical::{
     invocation_header, lfm2_main_invocation_contract, paged_f32_invocation_bytes,
@@ -112,14 +112,25 @@ pub(crate) fn lfm25_audio_physical_state_spec(
                 .map(|state| {
                     let (fixed_bytes, capacity) = match &state {
                         StateDomainSpec::PagedAttention(_) => {
-                            let max_tokens = if state.id() == LFM25_DEPTHFORMER_STATE_DOMAIN {
-                                codebook_steps
+                            let capacity = if state.id() == LFM25_DEPTHFORMER_STATE_DOMAIN {
+                                InvocationStateCapacity::PagedTokens {
+                                    max_tokens: codebook_steps,
+                                }
                             } else {
-                                main_tokens
+                                InvocationStateCapacity::AxisBoundPagedTokens {
+                                    binding: StateCapacityBinding::new(
+                                        StateCapacityAxis::DecoderContext,
+                                        1,
+                                        main_tokens,
+                                    )?,
+                                }
                             };
                             (
-                                paged_f32_invocation_bytes(&state, max_tokens)?,
-                                InvocationStateCapacity::PagedTokens { max_tokens },
+                                paged_f32_invocation_bytes(
+                                    &state,
+                                    capacity.paged_max_tokens().expect("paged capacity"),
+                                )?,
+                                capacity,
                             )
                         }
                         StateDomainSpec::Ring(_) => (

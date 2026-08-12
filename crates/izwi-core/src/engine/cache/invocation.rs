@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::backends::kv::{KvArena, KvWriteBatchCompletion};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    InvocationStateCapacity, InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
+    InvocationWorkspaceDomain, ResolvedStatePlan, StateDType,
     StateDomainId, StateDomainSpec, StateGroupId, StatePhysicalLayout, StatePlanId, StateScope,
 };
 use crate::kv::{CacheBlockRef, KvArenaId, KvLayerBinding, KvSlotRef};
@@ -128,7 +128,7 @@ impl InvocationPagedKvPoolOwner {
     ) -> Result<Self> {
         let InvocationWorkspaceDomain::State {
             state: StateDomainSpec::PagedAttention(semantic),
-            capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+            capacity,
             placement,
             formula,
         } = workspace_domain
@@ -137,6 +137,11 @@ impl InvocationPagedKvPoolOwner {
                 "invocation paged workspace requires a typed invocation paged-attention domain",
             ));
         };
+        let max_tokens = capacity.paged_max_tokens().ok_or_else(|| {
+            invalid(
+                "invocation paged workspace requires a typed invocation paged-attention domain",
+            )
+        })?;
         let domain = semantic.header.id;
         if domain.get() == 0
             || arena.id().generation == 0

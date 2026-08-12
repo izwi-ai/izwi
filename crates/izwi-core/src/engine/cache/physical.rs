@@ -595,7 +595,7 @@ impl PhysicalStateManager {
             .ok_or_else(|| invalid("invocation paged domain is absent from its resolved plan"))?;
         let InvocationWorkspaceDomain::State {
             state: StateDomainSpec::PagedAttention(semantic),
-            capacity: InvocationStateCapacity::PagedTokens { max_tokens },
+            capacity,
             ..
         } = workspace_domain
         else {
@@ -603,7 +603,10 @@ impl PhysicalStateManager {
                 "physical paged allocator requires a paged token-capacity domain",
             ));
         };
-        let pages_per_slot = pages_for_tokens(*max_tokens, resolved.page_tokens)?;
+        let max_tokens = capacity.paged_max_tokens().ok_or_else(|| {
+            invalid("physical paged allocator requires a paged token-capacity domain")
+        })?;
+        let pages_per_slot = pages_for_tokens(max_tokens, resolved.page_tokens)?;
         let capacity_pages = pages_per_slot
             .checked_mul(slot_count)
             .ok_or_else(|| invalid("invocation paged arena capacity overflow"))?;
@@ -833,20 +836,19 @@ fn validate_invocation_allocation(
             "invocation workspace is not the canonical invocation-scoped contract domain",
         ));
     }
-    let capacity_matches = matches!(
-        (state, capacity),
-        (
-            StateDomainSpec::PagedAttention(_),
-            InvocationStateCapacity::PagedTokens { .. }
-        ) | (
+    let capacity_matches = matches!(state, StateDomainSpec::PagedAttention(_))
+        && capacity.paged_max_tokens().is_some()
+        || matches!(
+            (state, capacity),
+            (
             StateDomainSpec::StaticAttention(_)
                 | StateDomainSpec::Tensor(_)
                 | StateDomainSpec::Append(_)
                 | StateDomainSpec::Ring(_)
                 | StateDomainSpec::StaticTensor(_),
             InvocationStateCapacity::SemanticBounded
-        )
-    );
+            )
+        );
     if !capacity_matches {
         return Err(invalid(
             "invocation workspace capacity does not match its semantic domain",
