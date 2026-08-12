@@ -152,6 +152,35 @@ impl GgufLoader {
         self.tensor_count
     }
 
+    /// Return exact stored tensor payload bytes and the largest individual
+    /// tensor without materializing checkpoint data.
+    pub fn tensor_storage_inventory(&self) -> Result<(u64, u64)> {
+        self.content
+            .tensor_infos
+            .values()
+            .try_fold((0_u64, 0_u64), |(total, largest), info| {
+                let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
+                })?;
+                let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
+                })?;
+                let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
+                })?;
+                let bytes = elements
+                    .checked_div(block)
+                    .and_then(|blocks| blocks.checked_mul(type_bytes))
+                    .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
+                Ok((
+                    total.checked_add(bytes).ok_or_else(|| {
+                        Error::ModelLoadError("GGUF tensor inventory overflow".into())
+                    })?,
+                    largest.max(bytes),
+                ))
+            })
+    }
+
     /// Get a raw metadata value.
     pub fn metadata_value(&self, key: &str) -> Option<&GgufValue> {
         self.metadata.get(key)

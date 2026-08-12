@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,6 +139,126 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
             .checked_add(memo_bytes)
             .expect("catalog model residency estimate overflowed"),
     }
+}
+
+fn collect_checkpoint_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>) -> Result<()> {
+    if path.is_file() {
+        files.push(path.to_path_buf());
+        return Ok(());
+    }
+    if depth == 0 || !path.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_checkpoint_files(&child, depth - 1, files)?;
+        } else {
+            files.push(child);
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
+    let mut files = Vec::new();
+    collect_checkpoint_files(path, 3, &mut files)?;
+    let mut total = 0_u64;
+    let mut largest = 0_u64;
+    let mut found = false;
+    let mut container_fallback = 0_u64;
+    for file in files {
+        let extension = file.extension().and_then(|value| value.to_str());
+        let inventory = match extension {
+            Some("gguf") => {
+                let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&file)?;
+                Some(loader.tensor_storage_inventory()?)
+            }
+            Some("safetensors") => {
+                // SAFETY: Candle owns the read-only mapping for the lifetime of
+                // the parsed tensor views returned below.
+                let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(&file) }?;
+                Some(tensors.tensors().into_iter().try_fold(
+                    (0_u64, 0_u64),
+                    |(sum, max), (_, tensor)| {
+                        let bytes = u64::try_from(tensor.data().len()).map_err(|_| {
+                            Error::ModelLoadError("safetensors tensor size exceeds u64".into())
+                        })?;
+                        Ok::<_, Error>((
+                            sum.checked_add(bytes).ok_or_else(|| {
+                                Error::ModelLoadError("safetensors inventory overflow".into())
+                            })?,
+                            max.max(bytes),
+                        ))
+                    },
+                )?)
+            }
+            Some("pth" | "ckpt") => {
+                let parsed = candle_core::pickle::read_pth_tensor_info(&file, false, None)
+                    .ok()
+                    .map(|infos| {
+                        infos.into_iter().fold((0_u64, 0_u64), |(sum, max), info| {
+                            let bytes = u64::try_from(info.layout.shape().elem_count())
+                                .unwrap_or(u64::MAX)
+                                .saturating_mul(info.dtype.size_in_bytes() as u64);
+                            (sum.saturating_add(bytes), max.max(bytes))
+                        })
+                    });
+                if parsed.is_none() {
+                    container_fallback = container_fallback.max(file.metadata()?.len());
+                }
+                parsed
+            }
+            // NeMo is a zip container. Its compressed artifact size is a
+            // conservative lower bound until the repacked PTH header exists.
+            Some("nemo") => {
+                let bytes = file.metadata()?.len();
+                container_fallback = container_fallback.max(bytes);
+                None
+            }
+            _ => None,
+        };
+        if let Some((file_total, file_largest)) = inventory {
+            found = true;
+            total = total.checked_add(file_total).ok_or_else(|| {
+                Error::ModelLoadError("checkpoint tensor inventory overflow".into())
+            })?;
+            largest = largest.max(file_largest);
+        }
+    }
+    if !found && container_fallback > 0 {
+        return Ok(Some((container_fallback, container_fallback)));
+    }
+    Ok(found.then_some((total, largest)))
+}
+
+fn estimate_from_tensor_inventory(
+    catalog: ModelMemoryEstimate,
+    inventory: Option<(u64, u64)>,
+) -> Result<ModelMemoryEstimate> {
+    let Some((resident_bytes, largest_tensor_bytes)) = inventory else {
+        return Ok(catalog);
+    };
+    let load_peak_bytes = resident_bytes
+        .checked_add(
+            largest_tensor_bytes
+                .checked_next_power_of_two()
+                .unwrap_or(largest_tensor_bytes),
+        )
+        .ok_or_else(|| Error::ModelLoadError("portable model load estimate overflow".into()))?;
+    Ok(ModelMemoryEstimate {
+        load_peak_bytes,
+        resident_bytes,
+    })
+}
+
+fn portable_model_memory_estimate(
+    variant: ModelVariant,
+    model_path: &Path,
+) -> Result<ModelMemoryEstimate> {
+    let catalog = model_memory_estimate(variant);
+    estimate_from_tensor_inventory(catalog, checkpoint_tensor_inventory(model_path)?)
 }
 
 fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> ModelResourcePlan {
@@ -638,11 +759,68 @@ impl ModelLifecycleController {
         }
     }
 
-    fn model_resource_plan(&self, variant: ModelVariant) -> ModelResourcePlan {
-        model_resource_plan(
-            self.backend_router.context().backend_kind,
-            model_memory_estimate(variant),
-        )
+    fn model_resource_plan(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+    ) -> Result<ModelResourcePlan> {
+        let backend = self.backend_router.context().backend_kind;
+        let estimate = if backend == BackendKind::Cuda {
+            model_memory_estimate(variant)
+        } else {
+            portable_model_memory_estimate(variant, model_path)?
+        };
+        Ok(model_resource_plan(backend, estimate))
+    }
+
+    async fn ensure_portable_memory_before_load(
+        &self,
+        requested_variant: ModelVariant,
+        required_bytes: u64,
+    ) -> Result<()> {
+        let backend = self.backend_router.context().backend_kind;
+        if backend == BackendKind::Cuda {
+            return Ok(());
+        }
+        loop {
+            let ResourceAmount::Known(headroom) = self
+                .coordinator
+                .resource_authority()
+                .planning_headroom_bytes(backend)?
+            else {
+                return Ok(());
+            };
+            if required_bytes <= headroom {
+                return Ok(());
+            }
+            let resident_variants = self.known_resident_variants().await;
+            let mut active_variants = self.core_engine.active_model_variants().await;
+            active_variants.extend(
+                resident_variants
+                    .iter()
+                    .copied()
+                    .filter(|variant| self.model_manager.active_residency_leases(*variant) > 0),
+            );
+            let last_used = self.model_last_used.lock().await.clone();
+            let Some(victim) = select_lru_eviction_candidate(
+                &resident_variants,
+                requested_variant,
+                &active_variants,
+                &last_used,
+            ) else {
+                return Err(Error::ModelLoadError(format!(
+                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={headroom}, backend={backend:?}; no idle resident model is available for eviction"
+                )));
+            };
+            info!(
+                requested_variant = %requested_variant,
+                victim = %victim,
+                required_bytes,
+                planning_headroom = headroom,
+                "Evicting idle model before portable tensor allocation"
+            );
+            self.unload_model_locked(victim).await?;
+        }
     }
 
     async fn reserve_model_resources(
@@ -713,7 +891,16 @@ impl ModelLifecycleController {
 
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
-        let resource_plan = self.model_resource_plan(variant);
+        let resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
+        let portable_load_bytes = match self.backend_router.context().backend_kind {
+            BackendKind::Cpu => resource_plan.load_authorization.host_bytes,
+            BackendKind::Metal => resource_plan.load_authorization.unified_bytes,
+            BackendKind::Cuda => ResourceAmount::Known(0),
+        };
+        if let ResourceAmount::Known(required_bytes) = portable_load_bytes {
+            self.ensure_portable_memory_before_load(variant, required_bytes)
+                .await?;
+        }
         let resource_lease = self
             .reserve_model_resources(variant, resource_plan.load_authorization)
             .await?;
@@ -1502,9 +1689,9 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        loaded_asr_state_publication_route, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, residency_budget_has_capacity, select_lru_eviction_candidate,
-        LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
+        estimate_from_tensor_inventory, loaded_asr_state_publication_route, model_memory_estimate,
+        model_resource_plan, plan_invocation_allocations, residency_budget_has_capacity,
+        select_lru_eviction_candidate, LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1572,6 +1759,22 @@ mod tests {
             execution_profile: profile,
             stages: Arc::from([stage]),
         }
+    }
+
+    #[test]
+    fn portable_tensor_inventory_replaces_catalog_guess_and_accounts_load_overlap() {
+        let catalog = ModelMemoryEstimate {
+            load_peak_bytes: 12 * 1024 * 1024 * 1024,
+            resident_bytes: 12 * 1024 * 1024 * 1024,
+        };
+        let estimate =
+            estimate_from_tensor_inventory(catalog, Some((2_400_000_000, 160_000_000))).unwrap();
+        assert_eq!(estimate.resident_bytes, 2_400_000_000);
+        assert_eq!(estimate.load_peak_bytes, 2_668_435_456);
+        assert_eq!(
+            estimate_from_tensor_inventory(catalog, None).unwrap(),
+            catalog
+        );
     }
 
     fn invocation_contract(domain_count: u32) -> crate::kv::v2::InferenceStateContract {
