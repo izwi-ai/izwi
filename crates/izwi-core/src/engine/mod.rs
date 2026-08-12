@@ -1454,6 +1454,11 @@ impl Engine {
         self.core.write().await.purge_model_cache(variant).await
     }
 
+    pub(crate) async fn synchronize_worker_device(&self) -> Result<()> {
+        let _step = self.step_gate.lock().await;
+        self.core.read().await.synchronize_worker_device()
+    }
+
     /// Admit and allocate managed physical state before the model generation
     /// becomes Ready.
     pub(crate) async fn load_managed_model_cache(

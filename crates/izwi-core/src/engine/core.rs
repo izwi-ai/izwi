@@ -359,6 +359,9 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
+    pub(crate) fn synchronize_worker_device(&self) -> Result<()> {
+        self.managed_kv_cache.synchronize_worker()
+    }
     fn force_scalar_execution(mut profile: ExecutionProfile) -> ExecutionProfile {
         profile.prefill_batch = NativeBatchMode::None;
         profile.decode_batch = NativeBatchMode::None;

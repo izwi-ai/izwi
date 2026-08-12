@@ -338,6 +338,9 @@ impl Default for ManagedKvCacheManager {
 }
 
 impl ManagedKvCacheManager {
+    pub(crate) fn synchronize_worker(&self) -> Result<()> {
+        self.worker_device.synchronize().map_err(Error::from)
+    }
     #[cfg(test)]
     pub(crate) fn model_count(&self) -> usize {
         self.models.len()

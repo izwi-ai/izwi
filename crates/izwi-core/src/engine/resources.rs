@@ -367,6 +367,7 @@ struct AuthorityState {
     /// provider's used-memory reading. The remainder is pending allocation and
     /// must be subtracted from live headroom before admitting more work.
     materialized: HashMap<ReservationId, ResourceVector>,
+    poisoned: Option<String>,
 }
 
 impl AuthorityState {
@@ -463,6 +464,7 @@ impl ResourceAuthority {
                 ledger: ResourceLedger::new(capacity),
                 owners: HashMap::new(),
                 materialized: HashMap::new(),
+                poisoned: None,
             }),
         }
     }
@@ -480,6 +482,26 @@ impl ResourceAuthority {
         }
     }
 
+    /// Permanently fail new work after a backend-fatal asynchronous error.
+    /// Metal command-buffer OOM can leave queued command/fence bookkeeping in
+    /// an unusable state, so process/device recreation is required.
+    pub(crate) fn poison(&self, reason: impl Into<String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.poisoned.get_or_insert_with(|| reason.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_reason(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .poisoned
+            .clone()
+    }
+
     /// Stable backend planning headroom for load-time sizing. Unlike guarded
     /// admission this deliberately ignores a volatile live-available sample:
     /// CPU compression/swap and Metal working-set accounting make that sample
@@ -490,6 +512,11 @@ impl ResourceAuthority {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(reason) = state.poisoned.as_ref() {
+            return Err(Error::InferenceError(format!(
+                "backend resource authority is poisoned and must be recreated: {reason}"
+            )));
+        }
         let ceiling = match self.provider.configured_budget() {
             Some(budget) => normalize_resource_domains(budget, self.domain_policy)?,
             None => self.normalized_physical_snapshot().capacity,
@@ -615,6 +642,11 @@ impl ResourceAuthority {
             .state
             .lock()
             .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        if let Some(reason) = state.poisoned.as_ref() {
+            return Err(Error::InferenceError(format!(
+                "backend resource authority is poisoned and must be recreated: {reason}"
+            )));
+        }
         let reservation = match self.capacity_enforcement {
             CapacityEnforcement::Guarded => {
                 // Serialize the observation with ledger mutation. `available`
@@ -671,6 +703,11 @@ impl ResourceAuthority {
             .state
             .lock()
             .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        if let Some(reason) = state.poisoned.as_ref() {
+            return Err(Error::InferenceError(format!(
+                "backend resource authority is poisoned and must be recreated: {reason}"
+            )));
+        }
         let current = state.ledger.reservation(id).ok_or_else(|| {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
@@ -1109,6 +1146,37 @@ mod tests {
             .is_err());
         assert_eq!(authority.snapshot().reserved, slots(2));
         drop((model, request));
+        assert_eq!(authority.snapshot().reserved, slots(0));
+    }
+
+    #[test]
+    fn poisoned_authority_rejects_new_work_but_still_releases_existing_leases() {
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: slots(2),
+                available: slots(2),
+                source: CapacitySource::Test,
+            },
+        })));
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "loaded"),
+                slots(1),
+            )
+            .unwrap();
+        authority.poison("Metal command buffer OOM");
+        assert_eq!(
+            authority.poison_reason().as_deref(),
+            Some("Metal command buffer OOM")
+        );
+        let error = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "new"),
+                slots(1),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("must be recreated"));
+        drop(lease);
         assert_eq!(authority.snapshot().reserved, slots(0));
     }
 

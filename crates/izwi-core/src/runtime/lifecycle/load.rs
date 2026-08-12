@@ -36,6 +36,14 @@ fn now_unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_metal_command_buffer_oom(error: &Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("metal error")
+        && (message.contains("insufficient memory")
+            || message.contains("commandbuffercallbackerroroutofmemory")
+            || message.contains("kiogpucommandbuffercallbackerroroutofmemory"))
+}
+
 fn select_lru_eviction_candidate(
     resident_variants: &[ModelVariant],
     requested_variant: ModelVariant,
@@ -930,6 +938,10 @@ impl ModelLifecycleController {
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
             let instantiated = self.instantiate_model(acquired).await?;
+            // Metal records many tensor uploads asynchronously. Flush them
+            // before publishing the model so an allocation failure is owned by
+            // this load transaction rather than a later state/request fence.
+            self.core_engine.synchronize_worker_device().await?;
             self.publish_loaded_model(instantiated).await?;
             // Model tensors are now visible in the backend provider's used
             // memory. Reconcile the lease before reserving any retained or
@@ -1572,6 +1584,13 @@ impl ModelLifecycleController {
         .await;
 
         if let Err(error) = publication {
+            if self.backend_router.context().backend_kind == BackendKind::Metal
+                && is_metal_command_buffer_oom(&error)
+            {
+                self.coordinator.resource_authority().poison(format!(
+                    "Metal command-buffer OOM while loading {variant}: {error}"
+                ));
+            }
             if let Err(rollback_error) = self.rollback_model_locked(variant).await {
                 self.mark_slot_cleanup_required(variant);
                 tracing::error!(
@@ -1689,9 +1708,10 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_from_tensor_inventory, loaded_asr_state_publication_route, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, residency_budget_has_capacity,
-        select_lru_eviction_candidate, LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
+        estimate_from_tensor_inventory, is_metal_command_buffer_oom,
+        loaded_asr_state_publication_route, model_memory_estimate, model_resource_plan,
+        plan_invocation_allocations, residency_budget_has_capacity, select_lru_eviction_candidate,
+        LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1775,6 +1795,16 @@ mod tests {
             estimate_from_tensor_inventory(catalog, None).unwrap(),
             catalog
         );
+    }
+
+    #[test]
+    fn metal_command_buffer_oom_is_backend_fatal_but_other_errors_are_not() {
+        assert!(is_metal_command_buffer_oom(&Error::InferenceError(
+            "Metal error Command buffer had following error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)".into(),
+        )));
+        assert!(!is_metal_command_buffer_oom(&Error::ModelLoadError(
+            "portable context minimum does not fit".into(),
+        )));
     }
 
     fn invocation_contract(domain_count: u32) -> crate::kv::v2::InferenceStateContract {
