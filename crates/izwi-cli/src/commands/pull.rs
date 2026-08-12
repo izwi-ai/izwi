@@ -142,44 +142,6 @@ fn post_download_usage_label(model: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn post_download_hint_for_voxtral_uses_transcribe() {
-        let model = "Voxtral-Mini-4B-Realtime-2602";
-
-        assert_eq!(post_download_usage_label(model), "Transcribe audio");
-        assert_eq!(
-            post_download_usage_command(model),
-            "izwi transcribe audio.wav --model Voxtral-Mini-4B-Realtime-2602"
-        );
-    }
-
-    #[test]
-    fn post_download_hint_for_tts_still_uses_tts() {
-        let model = "Kokoro-82M";
-
-        assert_eq!(post_download_usage_label(model), "Generate speech");
-        assert_eq!(
-            post_download_usage_command(model),
-            "izwi tts 'Hello' -m Kokoro-82M"
-        );
-    }
-
-    #[test]
-    fn post_download_hint_for_voxtral_tts_uses_tts() {
-        let model = "Voxtral-4B-TTS-2603";
-
-        assert_eq!(post_download_usage_label(model), "Generate speech");
-        assert_eq!(
-            post_download_usage_command(model),
-            "izwi tts 'Hello' -m Voxtral-4B-TTS-2603"
-        );
-    }
-}
-
 fn post_download_usage_command(model: &str) -> String {
     match parse_model_variant(model).ok() {
         Some(variant) if variant.is_asr() || variant.is_voxtral() => {
@@ -365,5 +327,43 @@ async fn wait_for_download_poll(server: &str, model: &str) -> Result<()> {
             .unwrap_or_else(|| "-".to_string());
         pb.set_message(format!("status={} progress={}", state.status, progress));
         tokio::time::sleep(DOWNLOAD_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_download_hint_for_voxtral_uses_transcribe() {
+        let model = "Voxtral-Mini-4B-Realtime-2602";
+
+        assert_eq!(post_download_usage_label(model), "Transcribe audio");
+        assert_eq!(
+            post_download_usage_command(model),
+            "izwi transcribe audio.wav --model Voxtral-Mini-4B-Realtime-2602"
+        );
+    }
+
+    #[test]
+    fn post_download_hint_for_tts_still_uses_tts() {
+        let model = "Kokoro-82M";
+
+        assert_eq!(post_download_usage_label(model), "Generate speech");
+        assert_eq!(
+            post_download_usage_command(model),
+            "izwi tts 'Hello' -m Kokoro-82M"
+        );
+    }
+
+    #[test]
+    fn post_download_hint_for_voxtral_tts_uses_tts() {
+        let model = "Voxtral-4B-TTS-2603";
+
+        assert_eq!(post_download_usage_label(model), "Generate speech");
+        assert_eq!(
+            post_download_usage_command(model),
+            "izwi tts 'Hello' -m Voxtral-4B-TTS-2603"
+        );
     }
 }

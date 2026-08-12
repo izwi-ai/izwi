@@ -1,8 +1,8 @@
-use crate::TranscriptFormat;
 use crate::error::{CliError, Result};
 use crate::http;
-use base64::Engine;
+use crate::TranscriptFormat;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -177,7 +177,7 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
     if let Some(output_path) = output {
         tokio::fs::write(&output_path, result)
             .await
-            .map_err(|e| CliError::Io(e))?;
+            .map_err(CliError::Io)?;
         println!("Diarization saved to: {}", output_path.display());
     } else {
         println!("{}", result);

@@ -212,7 +212,11 @@ impl Config {
                 .port
                 .map(|value| toml::Value::Integer(value.into())),
             "server.cors" => self.server.cors.map(toml::Value::Boolean),
-            "server.cors_origins" => self.server.cors_origins.as_ref().map(string_array_value),
+            "server.cors_origins" => self
+                .server
+                .cors_origins
+                .as_ref()
+                .map(|values| string_array_value(values)),
             "models.dir" => self
                 .models
                 .dir
@@ -345,7 +349,7 @@ fn parse_string_list(value: &str) -> Result<Vec<String>> {
     }
 }
 
-fn string_array_value(values: &Vec<String>) -> toml::Value {
+fn string_array_value(values: &[String]) -> toml::Value {
     toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
 }
 
