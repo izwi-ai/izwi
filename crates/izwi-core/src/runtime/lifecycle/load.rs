@@ -179,10 +179,6 @@ fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> M
     }
 }
 
-fn model_load_capacity_is_guarded(backend: BackendKind) -> bool {
-    backend == BackendKind::Cuda
-}
-
 #[derive(Debug, Clone)]
 struct InvocationAllocationV2 {
     adapter_instance: AdapterInstanceId,
@@ -528,13 +524,6 @@ impl ModelLifecycleController {
         requested_variant: ModelVariant,
         load_authorization: ResourceVector,
     ) -> Result<ResourceLease> {
-        if !model_load_capacity_is_guarded(self.backend_router.context().backend_kind) {
-            return self
-                .coordinator
-                .resource_authority()
-                .track_model(requested_variant.to_string(), load_authorization);
-        }
-
         loop {
             match self.coordinator.resource_authority().reserve(
                 ReservationOwner::new(ReservationClass::Model, requested_variant.to_string()),
@@ -1374,9 +1363,9 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        loaded_asr_state_publication_route, model_load_capacity_is_guarded, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, residency_budget_has_capacity,
-        select_lru_eviction_candidate, LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
+        loaded_asr_state_publication_route, model_memory_estimate, model_resource_plan,
+        plan_invocation_allocations, residency_budget_has_capacity, select_lru_eviction_candidate,
+        LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1831,13 +1820,6 @@ mod tests {
                 ..ResourceVector::zero()
             }
         );
-    }
-
-    #[test]
-    fn only_cuda_model_loads_are_capacity_guarded() {
-        assert!(!model_load_capacity_is_guarded(BackendKind::Cpu));
-        assert!(!model_load_capacity_is_guarded(BackendKind::Metal));
-        assert!(model_load_capacity_is_guarded(BackendKind::Cuda));
     }
 
     #[test]

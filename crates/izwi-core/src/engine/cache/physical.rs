@@ -939,10 +939,7 @@ fn reserve_arena(
             key.domain.get()
         ),
     );
-    match backend {
-        BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources),
-        BackendKind::Cuda => authority.reserve(owner, resources),
-    }
+    authority.reserve(owner, resources)
 }
 
 fn reserve_retained_tensor(
@@ -955,10 +952,7 @@ fn reserve_retained_tensor(
         ReservationClass::Model,
         format!("retained-tensor-state:{}:{backend:?}", model_instance.get()),
     );
-    match backend {
-        BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources),
-        BackendKind::Cuda => authority.reserve(owner, resources),
-    }
+    authority.reserve(owner, resources)
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -1750,7 +1744,10 @@ mod tests {
             capacity,
         })));
         let saturated = authority
-            .track_model("saturated-test-ledger", capacity)
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "saturated-test-ledger"),
+                capacity,
+            )
             .unwrap();
         let mut manager = PhysicalStateManager::cpu(Some(authority.clone()));
         let generation = manager.next_allocation_generation;
@@ -1783,7 +1780,10 @@ mod tests {
             capacity,
         })));
         let saturated = authority
-            .track_model("saturated-static-test-ledger", capacity)
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "saturated-static-test-ledger"),
+                capacity,
+            )
             .unwrap();
         let mut manager = PhysicalStateManager::cpu(Some(authority.clone()));
         let generation = manager.next_allocation_generation;

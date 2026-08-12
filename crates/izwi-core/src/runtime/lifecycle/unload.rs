@@ -382,8 +382,11 @@ mod tests {
 
         for cycle in 0..3 {
             let model_lease = authority
-                .track_model(
-                    format!("managed-reload-model-{cycle}"),
+                .reserve(
+                    ReservationOwner::new(
+                        ReservationClass::Model,
+                        format!("managed-reload-model-{cycle}"),
+                    ),
                     ResourceVector::zero(),
                 )
                 .unwrap();

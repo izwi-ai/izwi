@@ -1815,10 +1815,7 @@ fn reserve_managed_arena(
         ReservationClass::Model,
         format!("managed-kv:{}:{backend:?}", model_instance.get()),
     );
-    match backend {
-        BackendKind::Cpu | BackendKind::Metal => authority.track_advisory(owner, resources),
-        BackendKind::Cuda => authority.reserve(owner, resources),
-    }
+    authority.reserve(owner, resources)
 }
 
 fn ensure_session_tables(state: &mut ManagedKvModelState, session: &SessionKey) -> Result<()> {
@@ -2232,6 +2229,24 @@ mod tests {
                 source: CapacitySource::Test,
             },
         })))
+    }
+
+    fn advisory_authority_with_capacity(bytes: u64) -> Arc<ResourceAuthority> {
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(bytes),
+            device_bytes: ResourceAmount::Known(bytes),
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        };
+        Arc::new(ResourceAuthority::new_advisory(Arc::new(
+            TestCapacityProvider {
+                snapshot: PhysicalCapacitySnapshot {
+                    capacity,
+                    available: capacity,
+                    source: CapacitySource::Test,
+                },
+            },
+        )))
     }
 
     #[test]
@@ -3570,7 +3585,7 @@ mod tests {
     #[test]
     fn cuda_arena_accounting_is_guarded_while_cpu_and_metal_are_advisory() {
         for backend in [BackendKind::Cpu, BackendKind::Metal] {
-            let authority = authority_with_capacity(1);
+            let authority = advisory_authority_with_capacity(1);
             let resources = managed_state_resources(
                 backend,
                 StateResourceVector {
