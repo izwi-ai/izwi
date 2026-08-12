@@ -140,7 +140,7 @@ impl RuntimeService {
         }
         let correlation_id = correlation_id.map(ToOwned::to_owned);
         let backend = self.backend_router.context().backend_kind;
-        let configured_context_limit = self.config.max_sequence_length;
+        let configured_context_limit = self.config.portable_context_ceiling();
         let input_bytes = retained_chat_preparation_input_bytes(
             &messages,
             messages.capacity(),

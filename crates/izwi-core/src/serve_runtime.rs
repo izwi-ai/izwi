@@ -2,13 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::BackendPreference;
-use crate::config::EngineConfig;
+use crate::config::{ContextLengthPreference, EngineConfig};
 
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
 pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
+pub const ENV_MAX_SEQUENCE_LENGTH: &str = "IZWI_MAX_SEQUENCE_LENGTH";
 pub const ENV_NUM_THREADS: &str = "IZWI_NUM_THREADS";
 pub const ENV_MAX_CONCURRENT: &str = "IZWI_MAX_CONCURRENT";
 pub const ENV_TIMEOUT: &str = "IZWI_TIMEOUT";
@@ -27,6 +28,7 @@ pub struct ServeRuntimeConfig {
     pub models_dir: PathBuf,
     pub backend: BackendPreference,
     pub max_batch_size: usize,
+    pub max_sequence_length: ContextLengthPreference,
     pub num_threads: usize,
     pub max_concurrent_requests: usize,
     pub request_timeout_secs: u64,
@@ -44,6 +46,7 @@ impl Default for ServeRuntimeConfig {
             models_dir: default_models_dir(),
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
+            max_sequence_length: ContextLengthPreference::Auto,
             num_threads: default_num_threads(),
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout_secs: default_request_timeout_secs(),
@@ -83,6 +86,9 @@ impl ServeRuntimeConfig {
         if let Some(max_batch_size) = overrides.max_batch_size {
             self.max_batch_size = max_batch_size;
         }
+        if let Some(max_sequence_length) = overrides.max_sequence_length {
+            self.max_sequence_length = max_sequence_length;
+        }
         if let Some(num_threads) = overrides.num_threads {
             self.num_threads = num_threads;
         }
@@ -112,6 +118,7 @@ impl ServeRuntimeConfig {
         EngineConfig {
             models_dir: self.models_dir.clone(),
             max_batch_size: self.max_batch_size.max(1),
+            max_sequence_length: self.max_sequence_length,
             backend: self.backend,
             num_threads: self.num_threads.max(1),
             ..Default::default()
@@ -126,6 +133,7 @@ pub struct ServeRuntimeConfigOverrides {
     pub models_dir: Option<PathBuf>,
     pub backend: Option<BackendPreference>,
     pub max_batch_size: Option<usize>,
+    pub max_sequence_length: Option<ContextLengthPreference>,
     pub num_threads: Option<usize>,
     pub max_concurrent_requests: Option<usize>,
     pub request_timeout_secs: Option<u64>,
@@ -143,6 +151,7 @@ impl ServeRuntimeConfigOverrides {
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),
             backend: read_env_backend(ENV_BACKEND, &[]),
             max_batch_size: read_env_usize(ENV_MAX_BATCH_SIZE, &[]),
+            max_sequence_length: read_env_context(ENV_MAX_SEQUENCE_LENGTH, &[]),
             num_threads: read_env_usize(ENV_NUM_THREADS, &[]),
             max_concurrent_requests: read_env_usize(ENV_MAX_CONCURRENT, LEGACY_ENV_MAX_CONCURRENT),
             request_timeout_secs: read_env_u64(ENV_TIMEOUT, LEGACY_ENV_TIMEOUT),
@@ -245,6 +254,13 @@ fn read_env_usize(primary: &str, aliases: &[&str]) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn read_env_context(
+    primary: &str,
+    aliases: &[&str],
+) -> Option<ContextLengthPreference> {
+    first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
+}
+
 fn read_env_bool(primary: &str, aliases: &[&str]) -> Option<bool> {
     first_non_empty_env(primary, aliases).and_then(|value| {
         match value.to_ascii_lowercase().as_str() {
@@ -276,6 +292,7 @@ mod tests {
         ENV_MODELS_DIR,
         ENV_BACKEND,
         ENV_MAX_BATCH_SIZE,
+        ENV_MAX_SEQUENCE_LENGTH,
         ENV_NUM_THREADS,
         ENV_MAX_CONCURRENT,
         ENV_TIMEOUT,
@@ -304,6 +321,32 @@ mod tests {
 
         assert_eq!(overrides.max_concurrent_requests, Some(77));
         assert_eq!(overrides.request_timeout_secs, Some(555));
+        clear_env();
+    }
+
+    #[test]
+    fn context_preference_survives_env_precedence_and_engine_config() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+        std::env::set_var(ENV_MAX_SEQUENCE_LENGTH, "8192");
+        let env = ServeRuntimeConfigOverrides::from_env();
+        let cli = ServeRuntimeConfigOverrides {
+            max_sequence_length: Some(ContextLengthPreference::Auto),
+            ..ServeRuntimeConfigOverrides::default()
+        };
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides {
+                max_sequence_length: Some(ContextLengthPreference::explicit(2048).unwrap()),
+                ..ServeRuntimeConfigOverrides::default()
+            },
+            &env,
+            &cli,
+        );
+        assert_eq!(resolved.max_sequence_length, ContextLengthPreference::Auto);
+        assert_eq!(
+            resolved.engine_config().max_sequence_length,
+            ContextLengthPreference::Auto
+        );
         clear_env();
     }
 

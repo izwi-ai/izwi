@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use izwi_core::backends::BackendPreference;
-use izwi_core::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
+use izwi_core::{ContextLengthPreference, ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -58,6 +58,8 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sequence_length: Option<ContextLengthPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
@@ -69,6 +71,7 @@ impl RuntimeConfig {
     fn is_empty(&self) -> bool {
         self.backend.is_none()
             && self.max_batch_size.is_none()
+            && self.max_sequence_length.is_none()
             && self.threads.is_none()
             && self.max_concurrent.is_none()
             && self.timeout.is_none()
@@ -145,6 +148,7 @@ impl Config {
             runtime: RuntimeConfig {
                 backend: Some(defaults.backend),
                 max_batch_size: Some(defaults.max_batch_size),
+                max_sequence_length: Some(defaults.max_sequence_length),
                 threads: Some(defaults.num_threads),
                 max_concurrent: Some(defaults.max_concurrent_requests),
                 timeout: Some(defaults.request_timeout_secs),
@@ -171,6 +175,7 @@ impl Config {
             models_dir: self.models.dir.clone(),
             backend: self.runtime.backend,
             max_batch_size: self.runtime.max_batch_size,
+            max_sequence_length: self.runtime.max_sequence_length,
             num_threads: self.runtime.threads,
             max_concurrent_requests: self.runtime.max_concurrent,
             request_timeout_secs: self.runtime.timeout,
@@ -190,6 +195,13 @@ impl Config {
             "models.dir" => self.models.dir = Some(parse_path(value)?),
             "runtime.backend" => self.runtime.backend = Some(parse_backend(value)?),
             "runtime.max_batch_size" => self.runtime.max_batch_size = Some(parse_usize(value)?),
+            "runtime.max_sequence_length" => {
+                self.runtime.max_sequence_length = Some(
+                    value
+                        .parse::<ContextLengthPreference>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
             "runtime.threads" => self.runtime.threads = Some(parse_usize(value)?),
             "runtime.max_concurrent" => self.runtime.max_concurrent = Some(parse_usize(value)?),
             "runtime.timeout" => self.runtime.timeout = Some(parse_u64(value)?),
@@ -230,6 +242,12 @@ impl Config {
                 .runtime
                 .max_batch_size
                 .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_sequence_length" => self.runtime.max_sequence_length.map(|value| {
+                value.explicit_tokens().map_or_else(
+                    || toml::Value::String("auto".to_string()),
+                    |tokens| toml::Value::Integer(tokens as i64),
+                )
+            }),
             "runtime.threads" => self
                 .runtime
                 .threads
@@ -373,6 +391,7 @@ mod tests {
             runtime: RuntimeConfig {
                 backend: Some(BackendPreference::Cpu),
                 max_batch_size: Some(12),
+                max_sequence_length: Some(ContextLengthPreference::Auto),
                 threads: Some(6),
                 max_concurrent: Some(48),
                 timeout: Some(720),

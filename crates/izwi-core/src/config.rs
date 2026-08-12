@@ -1,10 +1,129 @@
 //! Configuration types for the Izwi TTS engine
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use crate::backends::{BackendPreference, BackendRouter};
 use crate::{Error, Result};
+
+/// Operator intent for selecting a model's maximum context length.
+///
+/// Automatic context is resolved only after the backend, model geometry, and
+/// available physical memory are known. Positive numeric configuration values
+/// retain the historical meaning of an explicit fixed token limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextLengthPreference {
+    #[default]
+    Auto,
+    Explicit(NonZeroUsize),
+}
+
+impl ContextLengthPreference {
+    pub fn explicit(tokens: usize) -> Result<Self> {
+        NonZeroUsize::new(tokens)
+            .map(Self::Explicit)
+            .ok_or_else(|| Error::ConfigError("context length must be greater than zero".into()))
+    }
+
+    pub const fn explicit_tokens(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Explicit(tokens) => Some(tokens.get()),
+        }
+    }
+}
+
+impl fmt::Display for ContextLengthPreference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("auto"),
+            Self::Explicit(tokens) => tokens.fmt(formatter),
+        }
+    }
+}
+
+impl FromStr for ContextLengthPreference {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let tokens = value.parse::<usize>().map_err(|_| {
+            Error::ConfigError(format!(
+                "invalid context length {value:?}; expected 'auto' or a positive integer"
+            ))
+        })?;
+        Self::explicit(tokens)
+    }
+}
+
+impl Serialize for ContextLengthPreference {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Explicit(tokens) => serializer.serialize_u64(tokens.get() as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextLengthPreference {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ContextLengthVisitor;
+
+        impl serde::de::Visitor<'_> for ContextLengthVisitor {
+            type Value = ContextLengthPreference;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("\"auto\" or a positive integer context length")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.trim().eq_ignore_ascii_case("auto") {
+                    Ok(ContextLengthPreference::Auto)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = usize::try_from(value).map_err(|_| {
+                    E::invalid_value(serde::de::Unexpected::Unsigned(value), &self)
+                })?;
+                NonZeroUsize::new(value)
+                    .map(ContextLengthPreference::Explicit)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(0), &self))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = u64::try_from(value)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))?;
+                self.visit_u64(value)
+            }
+        }
+
+        deserializer.deserialize_any(ContextLengthVisitor)
+    }
+}
 
 /// Requested storage dtype for retained KV state.
 ///
@@ -202,9 +321,9 @@ pub struct EngineConfig {
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
 
-    /// Maximum sequence length (tokens)
-    #[serde(default = "default_max_sequence_length")]
-    pub max_sequence_length: usize,
+    /// Automatic or explicitly fixed maximum sequence length.
+    #[serde(default)]
+    pub max_sequence_length: ContextLengthPreference,
 
     /// Chunk size for streaming (in audio tokens)
     #[serde(default = "default_chunk_size")]
@@ -246,7 +365,7 @@ impl Default for EngineConfig {
         Self {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
-            max_sequence_length: default_max_sequence_length(),
+            max_sequence_length: ContextLengthPreference::Auto,
             chunk_size: default_chunk_size(),
             kv_cache_dtype: default_kv_cache_dtype(),
             kv_page_size: default_kv_page_size(),
@@ -289,10 +408,6 @@ fn default_max_batch_size() -> usize {
     8
 }
 
-fn default_max_sequence_length() -> usize {
-    4096
-}
-
 fn default_chunk_size() -> usize {
     128
 }
@@ -306,6 +421,13 @@ fn default_kv_page_size() -> usize {
 }
 
 impl EngineConfig {
+    /// Numeric portable ceiling used until model load resolves an automatic
+    /// context against the concrete memory plan. Explicit operator intent is
+    /// preserved; Auto starts from the historical safe portable baseline.
+    pub(crate) fn portable_context_ceiling(&self) -> usize {
+        self.max_sequence_length.explicit_tokens().unwrap_or(4096)
+    }
+
     /// Validate cache settings and report requested versus effective policy.
     pub fn resolved_kv_cache_policy(
         &self,
@@ -318,7 +440,9 @@ impl EngineConfig {
             self.managed_prefix_cache_salt.as_deref(),
             self.max_prefix_cache_pages,
             total_capacity_pages,
-            self.max_sequence_length,
+            // Portable automatic context is resolved during model loading. Keep
+            // the historical reserve until that effective value is available.
+            self.portable_context_ceiling(),
         )
     }
 }
@@ -498,7 +622,7 @@ fn get_num_cpus() -> usize {
 
 #[cfg(test)]
 mod managed_kv_default_tests {
-    use super::{EngineConfig, KvCacheDtype, PrefixCachePolicy};
+    use super::{ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy};
 
     #[test]
     fn managed_prefix_reuse_is_fail_closed_for_normal_runtime_config() {
@@ -536,7 +660,7 @@ mod managed_kv_default_tests {
             .contains("explicit non-empty"));
 
         let config = EngineConfig {
-            max_sequence_length: 512,
+            max_sequence_length: ContextLengthPreference::explicit(512).unwrap(),
             enable_prefix_caching: true,
             managed_prefix_cache_salt: Some("tenant-a".to_string()),
             max_prefix_cache_pages: 100,
@@ -571,5 +695,57 @@ mod managed_kv_default_tests {
             .unwrap_err()
             .to_string()
             .contains("managed_prefix_cache_salt"));
+    }
+
+    #[test]
+    fn context_length_defaults_to_auto_when_absent() {
+        let config: EngineConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.max_sequence_length,
+            ContextLengthPreference::Auto
+        );
+    }
+
+    #[test]
+    fn context_length_accepts_auto_and_legacy_positive_numbers() {
+        let automatic: EngineConfig =
+            serde_json::from_str(r#"{"max_sequence_length":"auto"}"#).unwrap();
+        assert_eq!(
+            automatic.max_sequence_length,
+            ContextLengthPreference::Auto
+        );
+
+        let explicit: EngineConfig =
+            serde_json::from_str(r#"{"max_sequence_length":2048}"#).unwrap();
+        assert_eq!(explicit.max_sequence_length.explicit_tokens(), Some(2048));
+
+        let toml: EngineConfig = toml::from_str("max_sequence_length = 8192").unwrap();
+        assert_eq!(toml.max_sequence_length.explicit_tokens(), Some(8192));
+    }
+
+    #[test]
+    fn context_length_serializes_canonically() {
+        let automatic = serde_json::to_value(EngineConfig::default()).unwrap();
+        assert_eq!(automatic["max_sequence_length"], "auto");
+
+        let explicit = EngineConfig {
+            max_sequence_length: ContextLengthPreference::explicit(4096).unwrap(),
+            ..EngineConfig::default()
+        };
+        let explicit = serde_json::to_value(explicit).unwrap();
+        assert_eq!(explicit["max_sequence_length"], 4096);
+    }
+
+    #[test]
+    fn context_length_rejects_invalid_values() {
+        for invalid in [
+            r#"{"max_sequence_length":0}"#,
+            r#"{"max_sequence_length":-1}"#,
+            r#"{"max_sequence_length":1.5}"#,
+            r#"{"max_sequence_length":"4096"}"#,
+            r#"{"max_sequence_length":"native"}"#,
+        ] {
+            assert!(serde_json::from_str::<EngineConfig>(invalid).is_err(), "{invalid}");
+        }
     }
 }

@@ -1,7 +1,9 @@
 //! Downstream-facing compile and serialized-configuration compatibility fixture.
 
 use izwi_core::backends::BackendPreference;
-use izwi_core::config::{EngineConfig, KvCacheDtype, PrefixCachePolicy};
+use izwi_core::config::{
+    ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy,
+};
 use izwi_core::ManagedKvRuntimeSnapshot;
 
 const BETA17_CONFIG: &str = include_str!("fixtures/engine-config-beta17.json");
@@ -10,6 +12,10 @@ const BETA18_CONFIG: &str = include_str!("fixtures/engine-config-beta18.json");
 #[test]
 fn beta17_config_loads_with_safe_kv_defaults() {
     let config: EngineConfig = serde_json::from_str(BETA17_CONFIG).unwrap();
+    assert_eq!(
+        config.max_sequence_length,
+        ContextLengthPreference::explicit(2048).unwrap()
+    );
     assert_eq!(config.kv_page_size, 64);
     assert_eq!(config.backend, BackendPreference::Auto);
     assert!(!config.enable_prefix_caching);
@@ -26,6 +32,10 @@ fn beta17_config_loads_with_safe_kv_defaults() {
 #[test]
 fn beta18_config_reports_requested_and_effective_prefix_capacity() {
     let config: EngineConfig = serde_json::from_str(BETA18_CONFIG).unwrap();
+    assert_eq!(
+        config.max_sequence_length,
+        ContextLengthPreference::explicit(2048).unwrap()
+    );
     let policy = config.resolved_kv_cache_policy(40).unwrap();
 
     assert_eq!(policy.requested.page_size, 64);

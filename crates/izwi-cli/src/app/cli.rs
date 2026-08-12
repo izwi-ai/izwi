@@ -103,6 +103,10 @@ pub enum Commands {
         #[arg(long)]
         max_batch_size: Option<usize>,
 
+        /// Portable context length (`auto` or a positive token count)
+        #[arg(long, value_name = "AUTO_OR_TOKENS")]
+        max_sequence_length: Option<izwi_core::ContextLengthPreference>,
+
         /// Backend preference (`auto`, `cpu`, `metal`, `cuda`)
         #[arg(long, value_enum)]
         backend: Option<Backend>,

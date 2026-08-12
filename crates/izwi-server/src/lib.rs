@@ -82,6 +82,10 @@ struct ServerArgs {
     #[arg(long, value_enum, env = "IZWI_BACKEND")]
     backend: Option<BackendArg>,
 
+    /// Portable context length (`auto` or a positive token count)
+    #[arg(long, value_name = "AUTO_OR_TOKENS")]
+    max_sequence_length: Option<izwi_core::ContextLengthPreference>,
+
     /// Log output format (`text`, `json`)
     #[arg(long, value_enum, env = "IZWI_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
@@ -446,6 +450,7 @@ fn resolve_serve_runtime_config(args: &ServerArgs) -> ServeRuntimeConfig {
         host: args.host.clone(),
         port: args.port,
         backend: args.backend.as_ref().map(BackendArg::as_preference),
+        max_sequence_length: args.max_sequence_length,
         ..ServeRuntimeConfigOverrides::default()
     };
     let env = ServeRuntimeConfigOverrides::from_env();

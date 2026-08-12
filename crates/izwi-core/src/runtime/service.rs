@@ -1182,7 +1182,7 @@ impl RuntimeService {
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
-        core_config.apply_backend_context_capacity(config.max_sequence_length);
+        core_config.apply_backend_context_capacity(config.portable_context_ceiling());
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
@@ -4891,7 +4891,7 @@ mod tests {
         reference_tts.reference_text = Some("reference transcript".to_string());
         let mut canonical_reference_tts = reference_tts.clone();
         canonical_reference_tts
-            .canonicalize_direct_payloads(runtime.config.max_sequence_length)
+            .canonicalize_direct_payloads(runtime.config.portable_context_ceiling())
             .expect("canonical TTS reference");
         assert!(canonical_reference_tts.reference_audio.is_none());
         assert!(canonical_reference_tts.has_tts_reference_for_execution());

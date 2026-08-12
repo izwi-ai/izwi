@@ -35,6 +35,7 @@ pub async fn execute(args: ServeArgs) -> Result<()> {
     );
     println!("  Models dir:     {}", args.runtime.models_dir.display());
     println!("  Max batch:      {}", args.runtime.max_batch_size);
+    println!("  Context:        {}", args.runtime.max_sequence_length);
     println!("  Max concurrent: {}", args.runtime.max_concurrent_requests);
     println!("  Timeout:        {}s", args.runtime.request_timeout_secs);
     println!("  Backend:        {}", args.runtime.backend.as_str());
@@ -169,6 +170,10 @@ fn set_server_env(args: &ServeArgs) {
     std::env::set_var(
         "IZWI_MAX_BATCH_SIZE",
         args.runtime.max_batch_size.to_string(),
+    );
+    std::env::set_var(
+        "IZWI_MAX_SEQUENCE_LENGTH",
+        args.runtime.max_sequence_length.to_string(),
     );
     std::env::set_var("IZWI_BACKEND", args.runtime.backend.as_str());
     std::env::set_var("IZWI_NUM_THREADS", args.runtime.num_threads.to_string());
@@ -577,6 +582,7 @@ mod tests {
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
                 max_batch_size: 8,
+                max_sequence_length: izwi_core::ContextLengthPreference::Auto,
                 backend: BackendPreference::Auto,
                 num_threads: 4,
                 max_concurrent_requests: 100,

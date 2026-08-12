@@ -540,12 +540,13 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("No LFM2.5 Audio model loaded".to_string()))?;
         let max_new_tokens = if request.config.options.max_tokens == 0 {
-            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(self.config.max_sequence_length.max(1))
+            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS
+                .min(self.config.portable_context_ceiling().max(1))
         } else {
             request.config.options.max_tokens.min(tts_explicit_output_limit(
                 self.backend_router.context().backend_kind,
                 variant,
-                self.config.max_sequence_length,
+                self.config.portable_context_ceiling(),
             ))
         };
         let requested_speaker = request
@@ -639,7 +640,7 @@ impl RuntimeService {
         let explicit_max_frames = tts_explicit_output_limit(
             self.backend_router.context().backend_kind,
             variant,
-            self.config.max_sequence_length,
+            self.config.portable_context_ceiling(),
         );
         let request_id = request.id;
         let config = request.config;
@@ -861,7 +862,7 @@ impl RuntimeService {
         let explicit_max_frames = tts_explicit_output_limit(
             self.backend_router.context().backend_kind,
             variant,
-            self.config.max_sequence_length,
+            self.config.portable_context_ceiling(),
         );
         self.coordinator
             .run_loaded_blocking_stage_with_invocation_paged(
@@ -986,7 +987,7 @@ impl RuntimeService {
                 self.backend_router.context().backend_kind,
                 &request,
                 resolved_variant,
-                self.config.max_sequence_length,
+                self.config.portable_context_ceiling(),
             )?)?;
             let job = self
                 .coordinator
@@ -1067,7 +1068,7 @@ impl RuntimeService {
                 self.backend_router.context().backend_kind,
                 &request,
                 resolved_variant,
-                self.config.max_sequence_length,
+                self.config.portable_context_ceiling(),
             )?)?;
             let job = self
                 .coordinator
