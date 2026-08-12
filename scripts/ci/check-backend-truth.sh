@@ -383,6 +383,13 @@ run_cargo_metal() {
 run_hygiene() {
     require_command cargo
 
+    # Tauri validates bundle resources from platform overlays during build-script
+    # execution, even though Clippy/check do not create an application bundle.
+    # Release builds still use the real configuration and bundle the prebuilt CLI
+    # and server; hygiene clears only those resource entries so a clean checkout
+    # can lint the desktop crate without synthetic release binaries.
+    local tauri_check_config='{"bundle":{"resources":null,"linux":{"deb":{"files":{}}}}}'
+
     git diff --check
     # The repository still has a documented, pre-existing workspace rustfmt
     # backlog. Gate the production KV surface touched by this rollout without
@@ -397,8 +404,10 @@ run_hygiene() {
         crates/izwi-core/src/engine/cache/managed_stress.rs \
         crates/izwi-core/examples/kv-cache-bench.rs \
         crates/izwi-core/tests/kv_public_compatibility.rs
-    cargo clippy --locked --workspace --all-targets -- -D warnings
-    cargo check --locked --workspace --all-targets
+    TAURI_CONFIG="${tauri_check_config}" \
+        cargo clippy --locked --workspace --all-targets -- -D warnings
+    TAURI_CONFIG="${tauri_check_config}" \
+        cargo check --locked --workspace --all-targets
     bash -n scripts/ci/*.sh scripts/bench/*.sh
     scripts/bench/test-run-kv-cache-matrix.sh
     scripts/bench/test-run-cuda-model-evidence.sh
