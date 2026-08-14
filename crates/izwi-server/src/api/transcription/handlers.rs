@@ -1873,8 +1873,7 @@ async fn generate_transcription_summary_attempt(
             transcription_summary_params(),
             ChatRequestConfig {
                 enable_thinking,
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             correlation_id,
             runtime_context,

@@ -10,17 +10,17 @@ use axum::{
 };
 
 use crate::api::request_context::RequestContext;
-use crate::app::chat::{generate_chat, spawn_chat_stream, ChatExecutionRequest, ChatStreamEvent};
+use crate::app::chat::{
+    generate_chat, resolve_chat_request_config, spawn_chat_stream, ChatExecutionRequest,
+    ChatStreamEvent,
+};
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
 use crate::ids::new_uuid;
 use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
-use izwi_core::{
-    parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole,
-    ModelVariant,
-};
+use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole, ModelVariant};
 
 use super::dto::{
     ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputContent,
@@ -70,6 +70,14 @@ pub async fn create_response(
         ));
     }
 
+    let chat_config = resolve_chat_request_config(
+        req.enable_thinking,
+        req.reasoning_effort,
+        req.preserve_thinking,
+        req.chat_template_kwargs.as_ref(),
+        req.tools.clone().unwrap_or_default(),
+        media_inputs,
+    )?;
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages,
@@ -77,12 +85,10 @@ pub async fn create_response(
         max_tokens: None,
         temperature: req.temperature,
         top_p: req.top_p,
-        presence_penalty: None,
-        chat_config: ChatRequestConfig {
-            enable_thinking: req.enable_thinking,
-            tools: req.tools.clone().unwrap_or_default(),
-            media_inputs,
-        },
+        top_k: req.top_k,
+        repetition_penalty: req.repetition_penalty,
+        presence_penalty: req.presence_penalty,
+        chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
 

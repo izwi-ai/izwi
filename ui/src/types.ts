@@ -186,7 +186,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
   chat: {
     id: "chat",
     label: "Chat",
-    description: "Text and multimodal chat with Qwen3, Qwen3.5, LFM2.5, and Gemma 3",
+    description: "Text and multimodal chat with Qwen3, Qwen3.5, Qwen3.8, LFM2.5, and Gemma 3",
     icon: "MessageSquare",
     modelFilter: (variant) =>
       variant === "Qwen3-0.6B-GGUF" ||
@@ -197,13 +197,14 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       variant === "Qwen3.5-2B" ||
       variant === "Qwen3.5-4B" ||
       variant === "Qwen3.5-9B" ||
+      variant === "Qwen3.8-27B-FP8" ||
       variant === "LFM2.5-1.2B-Instruct-GGUF" ||
       variant === "LFM2.5-1.2B-Thinking-GGUF" ||
       variant === "Gemma-3-1b-it" ||
       variant === "Gemma-3-4b-it",
     emptyStateTitle: "No Chat Model Loaded",
     emptyStateDescription:
-      "Load a Qwen3, Qwen3.5, LFM2.5, or Gemma chat model (including GGUF variants) to start chatting",
+      "Load a Qwen3, Qwen3.5, Qwen3.8, LFM2.5, or Gemma chat model (including GGUF variants) to start chatting",
   },
 };
 

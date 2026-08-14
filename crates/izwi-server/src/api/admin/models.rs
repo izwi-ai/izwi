@@ -796,6 +796,7 @@ mod tests {
             actual_compute_dtype: Some("f16".to_string()),
             default_compute_dtype: "bf16".to_string(),
             default_dtype_reason: "CUDA policy prefers BF16".to_string(),
+            effective_context_tokens: None,
             supports_incremental_decode: Some(true),
             supports_realtime_stream_decode: None,
             family_diagnostics: None,

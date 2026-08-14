@@ -304,7 +304,7 @@ pub enum Commands {
     /// Interactive chat with audio understanding capabilities.
     #[command(name = "chat")]
     Chat {
-        /// Model to use (e.g., qwen3-0.6b, qwen3-0.6b-4bit, qwen3-1.7b, gemma-3-1b-it)
+        /// Model to use (for example Qwen3-8B-GGUF, Qwen3.8-27B-FP8, or Gemma-3-1b-it)
         #[arg(short, long, default_value = "qwen3-0.6b-4bit")]
         model: String,
 
@@ -750,6 +750,23 @@ impl Backend {
             Self::Cpu => BackendPreference::Cpu,
             Self::Metal => BackendPreference::Metal,
             Self::Cuda => BackendPreference::Cuda,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn chat_model_accepts_qwen38_catalog_id_as_free_form_input() {
+        let cli = Cli::try_parse_from(["izwi", "chat", "--model", "Qwen3.8-27B-FP8"])
+            .expect("Qwen3.8 catalog id should parse");
+
+        match cli.command {
+            Commands::Chat { model, .. } => assert_eq!(model, "Qwen3.8-27B-FP8"),
+            _ => panic!("expected chat command"),
         }
     }
 }

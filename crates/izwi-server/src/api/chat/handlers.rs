@@ -12,8 +12,8 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, spawn_chat_stream_with_keepalive, ChatExecutionRequest,
-    ChatStreamEvent,
+    generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream_with_keepalive,
+    ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -21,7 +21,7 @@ use crate::app::chat_content::{
 use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{ChatMediaInput, ChatMessage, ChatRequestConfig, ChatRole};
+use izwi_core::{ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs};
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 
@@ -81,6 +81,18 @@ pub struct CreateThreadMessageRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -289,6 +301,14 @@ pub async fn create_thread_message(
         .await
         .map_err(map_store_or_not_found)?;
 
+    let chat_config = resolve_chat_request_config(
+        req.enable_thinking,
+        req.reasoning_effort,
+        req.preserve_thinking,
+        req.chat_template_kwargs.as_ref(),
+        Vec::new(),
+        media_inputs,
+    )?;
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages: runtime_messages,
@@ -296,12 +316,10 @@ pub async fn create_thread_message(
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
-        presence_penalty: None,
-        chat_config: ChatRequestConfig {
-            enable_thinking: req.enable_thinking,
-            tools: Vec::new(),
-            media_inputs,
-        },
+        top_k: req.top_k,
+        repetition_penalty: req.repetition_penalty,
+        presence_penalty: req.presence_penalty,
+        chat_config,
         correlation_id: Some(ctx.correlation_id),
     };
 

@@ -12,8 +12,22 @@ import {
   isThinkingChatModel,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
+import { getModelProviderLabel, MODEL_DETAILS } from "./modelMetadata";
 
 describe("route model catalog", () => {
+  it("keeps Qwen3.8 discoverable without making the 27B model the default", () => {
+    expect(CHAT_PREFERRED_MODELS).toContain("Qwen3.8-27B-FP8");
+    expect(CHAT_PREFERRED_MODELS[0]).toBe("Qwen3-8B-GGUF");
+  });
+
+  it("describes Qwen3.8 as a text-only Qwen chat model", () => {
+    expect(getModelProviderLabel("Qwen3.8-27B-FP8")).toBe("Qwen");
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.category).toBe("chat");
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.capabilities).not.toContain(
+      "Multimodal",
+    );
+  });
+
   it("prioritizes Qwen3-8B as the default chat pick", () => {
     const selected = resolvePreferredRouteModel({
       models: [
@@ -125,6 +139,7 @@ describe("route model catalog", () => {
 
   it("treats Qwen3.5 models as thinking-capable chat models", () => {
     expect(isThinkingChatModel("Qwen3.5-4B")).toBe(true);
+    expect(isThinkingChatModel("Qwen3.8-27B-FP8")).toBe(true);
     expect(isThinkingChatModel("Parakeet-TDT-0.6B-v3")).toBe(false);
   });
 
@@ -137,6 +152,9 @@ describe("route model catalog", () => {
     );
     expect(getChatRouteModelLabel("Qwen3.5-4B")).toBe(
       "Qwen3.5 4B GGUF (Q4_K_M)",
+    );
+    expect(getChatRouteModelLabel("Qwen3.8-27B-FP8")).toBe(
+      "Qwen3.8 27B (FP8)",
     );
   });
 });

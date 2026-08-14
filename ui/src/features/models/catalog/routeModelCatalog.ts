@@ -61,6 +61,7 @@ export const CHAT_PREFERRED_MODELS = [
   "Qwen3-4B-GGUF",
   "Qwen3.5-9B",
   "Qwen3.5-4B",
+  "Qwen3.8-27B-FP8",
   "Qwen3-1.7B-GGUF",
   "Qwen3.5-2B",
   "Qwen3-0.6B-GGUF",
@@ -168,6 +169,9 @@ export function getChatRouteModelLabel(variant: string): string {
   if (variant === "Qwen3.5-9B") {
     return "Qwen3.5 9B GGUF (Q4_K_M)";
   }
+  if (variant === "Qwen3.8-27B-FP8") {
+    return "Qwen3.8 27B (FP8)";
+  }
   if (variant === "LFM2.5-1.2B-Instruct-GGUF") {
     return "LFM2.5 1.2B Instruct GGUF (Q4_K_M)";
   }
@@ -186,7 +190,9 @@ export function getChatRouteModelLabel(variant: string): string {
 export function isThinkingChatModel(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   const isQwenThinkingFamily =
-    (normalized.startsWith("qwen3-") || normalized.startsWith("qwen3.5-")) &&
+    (normalized.startsWith("qwen3-") ||
+      normalized.startsWith("qwen3.5-") ||
+      normalized.startsWith("qwen3.8-")) &&
     !normalized.includes("-asr-") &&
     !normalized.includes("-tts-") &&
     !normalized.includes("forcedaligner");

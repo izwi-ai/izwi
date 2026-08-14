@@ -137,6 +137,7 @@ streaming sequence.
 |--------|--------|
 | Qwen3 | `Qwen3-0.6B-GGUF`, `Qwen3-1.7B-GGUF`, `Qwen3-4B-GGUF`, `Qwen3-8B-GGUF` |
 | Qwen3.5 | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
+| Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | Gemma | `Gemma-3-1b-it` |
 
@@ -146,14 +147,14 @@ streaming sequence.
 
 - Multimodal media chat is currently limited to **Qwen3.5 GGUF** models.
 - **Video inputs are not yet implemented**.
-- Non-Qwen3.5 chat variants currently support text-only requests.
+- Non-Qwen3.5 chat variants, including `Qwen3.8-27B-FP8`, currently support text-only requests.
 
 ---
 
 ## Tips
 
 1. Use `izwi list` to pick a currently enabled model ID.
-2. Use stronger models (`Qwen3-8B-GGUF`, `Qwen3.5-9B`) for harder tasks.
+2. Use stronger models (`Qwen3-8B-GGUF`, `Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory.
 3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`) for low-latency usage.
 
 ---

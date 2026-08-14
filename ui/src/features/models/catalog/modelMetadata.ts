@@ -13,7 +13,11 @@ export const PROVIDER_ORDER = [
 ] as const;
 
 export function getModelProviderLabel(variant: string): string {
-  if (variant.startsWith("Qwen3-") || variant.startsWith("Qwen3.5-")) {
+  if (
+    variant.startsWith("Qwen3-") ||
+    variant.startsWith("Qwen3.5-") ||
+    variant.startsWith("Qwen3.8-")
+  ) {
     return "Qwen";
   }
   if (variant.startsWith("Whisper-")) return "OpenAI";
@@ -285,6 +289,14 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "chat",
     capabilities: ["Chat", "Multimodal", "GGUF", "Q4_K_M"],
     size: "6.60 GB",
+  },
+  "Qwen3.8-27B-FP8": {
+    shortName: "Qwen3.8 27B",
+    fullName: "Qwen3.8 27B (Block FP8)",
+    description: "Large Qwen3.8 reasoning model with block-scaled FP8 weights",
+    category: "chat",
+    capabilities: ["Text Chat", "Thinking", "Tool Calling", "FP8"],
+    size: "28.74 GiB",
   },
   "LFM2.5-1.2B-Instruct-GGUF": {
     shortName: "LFM2.5 1.2B Instruct",

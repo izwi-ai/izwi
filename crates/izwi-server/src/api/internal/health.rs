@@ -274,6 +274,7 @@ mod tests {
                 actual_compute_dtype: Some("f16".to_string()),
                 default_compute_dtype: "bf16".to_string(),
                 default_dtype_reason: "CUDA default uses BF16".to_string(),
+                effective_context_tokens: None,
                 supports_incremental_decode: None,
                 supports_realtime_stream_decode: None,
                 family_diagnostics: Some(serde_json::json!({

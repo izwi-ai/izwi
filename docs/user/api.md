@@ -187,11 +187,14 @@ Supported request fields:
 | `max_tokens`, `max_completion_tokens` | Optional output budgets. |
 | `stream` | `true` returns SSE chat chunks. |
 | `stream_options.include_usage` | Adds usage to the terminal stream chunk. |
-| `temperature`, `top_p`, `presence_penalty` | Passed to runtime where supported. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. |
 | `frequency_penalty`, `stop` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | `tools`, `tool_choice` | Accepted for tool-call prompting. Strict mode only allows `tool_choice` as `auto`, `none`, or `null`. |
-| `enable_thinking` | Izwi extension for thinking-capable local models. |
+| `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 defaults to `true`. |
+| `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
+| `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
+| `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
 | `user` | Accepted for compatibility; not used for local auth. |
 
 Compatibility profile:
@@ -455,9 +458,9 @@ Request fields:
 | `max_output_tokens` | Optional output limit. |
 | `stream` | `true` returns SSE events. |
 | `metadata`, `user` | Stored or accepted for compatibility. |
-| `temperature`, `top_p` | Optional runtime controls. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
-| `tools`, `tool_choice`, `enable_thinking` | Same behavior as chat completions. |
+| `tools`, `tool_choice`, `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. |
 
 Stored records are process-local:
 
@@ -741,6 +744,8 @@ Send-message request fields:
 | `stream` | `true` emits SSE events. |
 | `system_prompt` | Optional per-request system prompt. |
 | `enable_thinking` | Izwi extension for thinking-capable models. |
+| `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Qwen3.8 reasoning controls; compatible kwargs must not conflict with direct fields. |
+| `top_k`, `repetition_penalty`, `presence_penalty` | Optional sampling controls. |
 
 Streaming thread events:
 
