@@ -69,6 +69,7 @@ const QWEN35_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen352BGguf,
     ModelVariant::Qwen354BGguf,
     ModelVariant::Qwen359BGguf,
+    ModelVariant::Qwen3827BFp8,
 ];
 const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Lfm2512BInstructGguf,

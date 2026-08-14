@@ -8,8 +8,8 @@ use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
 
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 50;
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 72;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 51;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 73;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConformanceCapability {
@@ -600,7 +600,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Managed)
                 .count(),
-            54
+            55
         );
         assert_eq!(
             manifest
@@ -614,6 +614,15 @@ mod tests {
             manifest_case(
                 &manifest,
                 ModelVariant::Qwen306BGguf,
+                ConformanceCapability::Chat,
+            )
+            .retained_state,
+            Managed
+        );
+        assert_eq!(
+            manifest_case(
+                &manifest,
+                ModelVariant::Qwen3827BFp8,
                 ConformanceCapability::Chat,
             )
             .retained_state,
