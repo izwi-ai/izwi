@@ -2,6 +2,7 @@
 
 mod cache;
 pub mod chat;
+pub mod native;
 mod text;
 mod vision;
 
