@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{ops, rotary_emb, Embedding};
+use candle_nn::{ops, rotary_emb, Embedding, Linear};
 use candle_transformers::models::with_tracing::QMatMul;
 
 use crate::backends::state::{
@@ -291,7 +291,7 @@ struct Qwen35Mlp {
 
 enum Qwen35Projection {
     Quantized(QMatMul),
-    Dense(Tensor),
+    Dense(Linear),
 }
 
 struct Qwen35RmsNorm {
@@ -309,7 +309,7 @@ impl Module for Qwen35Projection {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Self::Quantized(projection) => projection.forward(input),
-            Self::Dense(weight) => input.matmul(&weight.t()?),
+            Self::Dense(projection) => projection.forward(input),
         }
     }
 }
@@ -1770,7 +1770,7 @@ fn load_native_projection(
 ) -> Result<Qwen35Projection> {
     tensors
         .materialize_projection(name, shape, block, target, device)
-        .map(Qwen35Projection::Dense)
+        .map(|weight| Qwen35Projection::Dense(Linear::new(weight, None)))
 }
 
 fn load_native_zero_centered_norm(
@@ -2285,7 +2285,7 @@ mod tests {
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
         repeat_interleave_head_states, repeat_interleave_head_states_seq, softplus, ConvRingState,
-        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        Linear, Qwen35LayerRuntimeState, Qwen35Projection, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2436,6 +2436,23 @@ mod tests {
                 .to_vec3::<f32>()
                 .unwrap(),
             vec![vec![vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]]]
+        );
+    }
+
+    #[test]
+    fn dense_projection_supports_batched_sequence_inputs() {
+        use candle_nn::Module;
+
+        let projection = Qwen35Projection::Dense(Linear::new(
+            Tensor::from_vec(vec![1f32, 0.0, 0.0, 1.0, 1.0, 1.0], (3, 2), &Device::Cpu).unwrap(),
+            None,
+        ));
+        let input = Tensor::from_vec(vec![2f32, 3.0, 4.0, 5.0], (1, 2, 2), &Device::Cpu).unwrap();
+        let output = projection.forward(&input).unwrap();
+        assert_eq!(output.dims3().unwrap(), (1, 2, 3));
+        assert_eq!(
+            output.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0, 3.0, 5.0, 4.0, 5.0, 9.0]
         );
     }
 
