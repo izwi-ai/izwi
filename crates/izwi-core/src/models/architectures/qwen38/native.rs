@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Tensor};
 use half::{bf16, f16};
 use memmap2::MmapOptions;
@@ -659,6 +661,50 @@ impl IndexedSafetensors {
         })
     }
 
+    /// Materialize a block-scaled FP8 projection as packed Q8_0 weights.
+    ///
+    /// The upstream inverse scale is applied while decoding to CPU F32 before
+    /// the values are requantized. Constructing the `QMatMul::QTensor` variant
+    /// directly is intentional: `QMatMul::from_qtensor` honors Candle's global
+    /// dequantization environment switches, which would silently violate the
+    /// packed-residency contract used by CUDA admission.
+    pub fn materialize_q8_projection(
+        &self,
+        weight_name: &str,
+        expected_shape: [usize; 2],
+        block_shape: [usize; 2],
+        device: &Device,
+    ) -> Result<QMatMul> {
+        let info = self.tensor_info(weight_name)?;
+        if info.dtype != SafeDType::F8_E4M3 {
+            return Err(Error::ModelLoadError(format!(
+                "Native Q8_0 projection `{weight_name}` must use F8_E4M3 storage, found {:?}",
+                info.dtype
+            )));
+        }
+        let q8_block = GgmlDType::Q8_0.block_size();
+        if !expected_shape[1].is_multiple_of(q8_block) {
+            return Err(Error::ModelLoadError(format!(
+                "Native Q8_0 projection `{weight_name}` inner dimension {} is not divisible by {q8_block}",
+                expected_shape[1]
+            )));
+        }
+
+        let values = self.load_block_fp8_f32(weight_name, expected_shape, block_shape)?;
+        let source = Tensor::from_vec(values, &expected_shape, &Device::Cpu).map_err(|err| {
+            Error::ModelLoadError(format!(
+                "Failed to stage native projection `{weight_name}` for Q8_0 quantization: {err}"
+            ))
+        })?;
+        let quantized =
+            QTensor::quantize_onto(&source, GgmlDType::Q8_0, device).map_err(|err| {
+                Error::ModelLoadError(format!(
+                    "Failed to quantize native projection `{weight_name}` as Q8_0: {err}"
+                ))
+            })?;
+        Ok(QMatMul::QTensor(Arc::new(quantized)))
+    }
+
     /// Materialize an ordinary BF16/F16/F32 tensor of any rank.
     ///
     /// This covers embeddings, normalization vectors, convolution kernels,
@@ -1061,6 +1107,7 @@ fn decode_e4m3fn(bits: u8) -> f32 {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use candle_core::Module;
     use safetensors::tensor::TensorView;
     use serde_json::json;
 
@@ -1332,6 +1379,65 @@ mod tests {
             tensor.to_vec2::<f32>().unwrap(),
             vec![vec![0.5, 1.0], vec![-0.5, -1.0]]
         );
+    }
+
+    #[test]
+    fn indexed_q8_materialization_applies_fp8_scales_before_quantizing() {
+        let dir = TestDir::new("q8-projection");
+        let weight_name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        let scale_name = "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv";
+        let mut weights = vec![0x38; 32]; // +1.0
+        weights.extend(std::iter::repeat_n(0x40, 32)); // +2.0
+        let scales = bf16_bytes(&[3.0]);
+        write_safetensors(
+            &dir.path().join("layers-0.safetensors"),
+            &[
+                (weight_name, SafeDType::F8_E4M3, vec![2, 32], &weights),
+                (scale_name, SafeDType::BF16, vec![1, 1], &scales),
+            ],
+        );
+        write_index(
+            dir.path(),
+            json!({
+                "model.language_model.layers.0.mlp.gate_proj.weight": "layers-0.safetensors",
+                "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv": "layers-0.safetensors"
+            }),
+        );
+
+        let source = IndexedSafetensors::open(dir.path()).unwrap();
+        let scale_exact = source
+            .load_block_fp8_f32(weight_name, [2, 32], [128, 128])
+            .unwrap();
+        assert!(scale_exact[..32].iter().all(|value| *value == 3.0));
+        assert!(scale_exact[32..].iter().all(|value| *value == 6.0));
+
+        let projection = source
+            .materialize_q8_projection(weight_name, [2, 32], [128, 128], &Device::Cpu)
+            .unwrap();
+        let QMatMul::QTensor(weight) = &projection else {
+            panic!("Q8 materialization must retain packed QTensor storage")
+        };
+        assert_eq!(weight.dtype(), GgmlDType::Q8_0);
+        assert_eq!(weight.shape().dims(), [2, 32]);
+        assert!(weight.device().is_cpu());
+        let requantized = weight
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (actual, expected) in requantized.iter().zip(&scale_exact) {
+            assert!((actual - expected).abs() < 0.02, "{actual} != {expected}");
+        }
+
+        let input = Tensor::ones((1, 2, 32), DType::F32, &Device::Cpu).unwrap();
+        let output = projection.forward(&input).unwrap();
+        assert_eq!(output.dims3().unwrap(), (1, 2, 2));
+        for row in output.to_vec3::<f32>().unwrap()[0].iter() {
+            assert!((row[0] - 96.0).abs() < 0.5, "{} != 96", row[0]);
+            assert!((row[1] - 192.0).abs() < 0.5, "{} != 192", row[1]);
+        }
     }
 
     #[test]

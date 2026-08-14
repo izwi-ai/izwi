@@ -1,5 +1,7 @@
+use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding, Linear};
+use safetensors::Dtype as SafeDType;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
@@ -25,11 +27,31 @@ use crate::models::shared::telemetry::{
 
 pub struct Qwen38TextModel {
     device: Device,
+    projection_representation: Qwen38ProjectionRepresentation,
     token_embeddings: Embedding,
     layers: Vec<Qwen38Layer>,
     output_norm: Qwen38RmsNorm,
     output: Qwen38Projection,
     finite_diagnostics_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen38ProjectionRepresentation {
+    ExpandedF32,
+    ExpandedF16,
+    ExpandedBf16,
+    PackedQ8WithDenseBf16,
+}
+
+impl Qwen38ProjectionRepresentation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExpandedF32 => "expanded_f32",
+            Self::ExpandedF16 => "expanded_f16",
+            Self::ExpandedBf16 => "expanded_bf16",
+            Self::PackedQ8WithDenseBf16 => "q8_0_requantized_projections_with_dense_bf16",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +307,7 @@ struct Qwen38Mlp {
 }
 
 enum Qwen38Projection {
+    Quantized(QMatMul),
     Dense(Linear),
 }
 
@@ -302,6 +325,7 @@ impl Module for Qwen38RmsNorm {
 impl Module for Qwen38Projection {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         match self {
+            Self::Quantized(projection) => projection.forward(input),
             Self::Dense(projection) => projection.forward(input),
         }
     }
@@ -358,6 +382,7 @@ impl Qwen38TextModel {
     ) -> Result<Self> {
         let cfg = &native.text;
         let target = native_projection_target(device);
+        let projection_representation = native_projection_representation(device, target);
         let block = native.block_fp8.block_shape;
         let embedding_weights = tensors.materialize_dense_tensor(
             "model.language_model.embed_tokens.weight",
@@ -422,6 +447,7 @@ impl Qwen38TextModel {
         }
         Ok(Self {
             device: device.clone(),
+            projection_representation,
             token_embeddings,
             layers,
             output_norm,
@@ -438,6 +464,10 @@ impl Qwen38TextModel {
 
     pub fn hidden_size(&self) -> usize {
         self.token_embeddings.hidden_size()
+    }
+
+    pub fn projection_representation(&self) -> Qwen38ProjectionRepresentation {
+        self.projection_representation
     }
 
     pub(crate) fn forward_token_id_at_physical(
@@ -1550,6 +1580,20 @@ fn native_projection_target(device: &Device) -> ProjectionMaterialization {
     }
 }
 
+fn native_projection_representation(
+    device: &Device,
+    target: ProjectionMaterialization,
+) -> Qwen38ProjectionRepresentation {
+    if device.is_cuda() {
+        return Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16;
+    }
+    match target {
+        ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,
+        ProjectionMaterialization::F16 => Qwen38ProjectionRepresentation::ExpandedF16,
+        ProjectionMaterialization::BF16 => Qwen38ProjectionRepresentation::ExpandedBf16,
+    }
+}
+
 fn load_native_projection(
     tensors: &IndexedSafetensors,
     name: &str,
@@ -1558,6 +1602,11 @@ fn load_native_projection(
     target: ProjectionMaterialization,
     device: &Device,
 ) -> Result<Qwen38Projection> {
+    if device.is_cuda() && tensors.tensor_info(name)?.dtype == SafeDType::F8_E4M3 {
+        return tensors
+            .materialize_q8_projection(name, shape, block, device)
+            .map(Qwen38Projection::Quantized);
+    }
     tensors
         .materialize_projection(name, shape, block, target, device)
         .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))
@@ -1990,6 +2039,7 @@ mod tests {
     use crate::models::architectures::qwen38::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
     use std::collections::HashSet;
@@ -2107,6 +2157,38 @@ mod tests {
             output.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![2.0, 3.0, 5.0, 4.0, 5.0, 9.0]
         );
+    }
+
+    #[test]
+    fn q8_projection_supports_model_rank_batched_sequence_inputs() {
+        use candle_nn::Module;
+
+        let mut weights = vec![1.0_f32; 32];
+        weights.extend(std::iter::repeat_n(2.0, 32));
+        weights.extend(std::iter::repeat_n(-1.0, 32));
+        let weight = Tensor::from_vec(weights, (3, 32), &Device::Cpu).unwrap();
+        let quantized = QTensor::quantize(&weight, GgmlDType::Q8_0).unwrap();
+        let projection = Qwen38Projection::Quantized(QMatMul::QTensor(Arc::new(quantized)));
+        let input = Tensor::ones((2, 3, 32), DType::F32, &Device::Cpu).unwrap();
+        let output = projection.forward(&input).unwrap();
+        assert_eq!(output.dims3().unwrap(), (2, 3, 3));
+        for batch in output.to_vec3::<f32>().unwrap() {
+            for token in batch {
+                assert!((token[0] - 32.0).abs() < 0.5, "{} != 32", token[0]);
+                assert!((token[1] - 64.0).abs() < 0.5, "{} != 64", token[1]);
+                assert!((token[2] + 32.0).abs() < 0.5, "{} != -32", token[2]);
+            }
+        }
+    }
+
+    #[test]
+    fn native_projection_inner_dimensions_satisfy_q8_block_geometry() {
+        // Every projection K dimension is one of the model width, MLP width,
+        // or attention/DeltaNet output width. The loader also validates each
+        // concrete tensor before quantizing it.
+        for inner_dim in [5_120_usize, 17_408, 6_144] {
+            assert!(inner_dim.is_multiple_of(GgmlDType::Q8_0.block_size()));
+        }
     }
 
     #[test]
