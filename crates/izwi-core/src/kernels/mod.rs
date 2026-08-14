@@ -367,6 +367,26 @@ pub fn try_qwen35_causal_conv_sequence(
     None
 }
 
+pub fn try_qwen38_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(input.device()) {
+        return None;
+    }
+
+    if input.device().is_cuda() {
+        return cuda::try_qwen38_causal_conv_sequence(input, weight, history);
+    }
+
+    if input.device().is_metal() {
+        return metal::try_qwen38_causal_conv_sequence(input, weight, history);
+    }
+
+    None
+}
+
 pub fn try_fused_gated_rms_norm(
     hidden: &Tensor,
     gate: &Tensor,

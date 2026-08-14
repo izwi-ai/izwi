@@ -1,17 +1,18 @@
-use std::sync::Arc;
-
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{ops, rotary_emb, Embedding};
-use candle_transformers::models::with_tracing::QMatMul;
-use candle_transformers::quantized_nn::RmsNorm;
+use candle_nn::{ops, rotary_emb, Embedding, Linear};
 
+use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
+use super::chat::Qwen38TextConfig;
+use super::native::{
+    IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
+};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
-    try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
+    try_fused_silu_mul, try_qwen38_causal_conv_sequence, try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -21,31 +22,27 @@ use crate::models::shared::memory::accounting::{
 use crate::models::shared::telemetry::{
     record_prefill_sequence_span, record_rope_kernel, record_rope_manual,
 };
-use crate::models::shared::weights::gguf::GgufLoader;
 
-use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
-use super::chat::Qwen35TextConfig;
-
-pub struct Qwen35TextModel {
+pub struct Qwen38TextModel {
     device: Device,
     token_embeddings: Embedding,
-    layers: Vec<Qwen35Layer>,
-    output_norm: RmsNorm,
-    output: QMatMul,
+    layers: Vec<Qwen38Layer>,
+    output_norm: Qwen38RmsNorm,
+    output: Qwen38Projection,
     finite_diagnostics_enabled: bool,
 }
 
 #[derive(Clone)]
-pub struct Qwen35TextRuntimeState {
-    layers: Vec<Qwen35LayerRuntimeState>,
+pub struct Qwen38TextRuntimeState {
+    layers: Vec<Qwen38LayerRuntimeState>,
 }
 
-impl Qwen35TextRuntimeState {
+impl Qwen38TextRuntimeState {
     /// Backing allocations retained by the per-request text runtime state.
     ///
     /// This intentionally excludes model-global caches (notably full-attention
     /// RoPE windows), so callers requiring a complete scheduler claim must keep
-    /// Qwen3.5 fail-closed until those caches are independently bounded.
+    /// Qwen3.8 fail-closed until those caches are independently bounded.
     pub fn allocated_session_bytes(&self) -> Option<u64> {
         let mut accounting = TensorStorageAccounting::default();
         self.account_storage(&mut accounting)?;
@@ -55,7 +52,7 @@ impl Qwen35TextRuntimeState {
     pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
         for layer in &self.layers {
             match layer {
-                Qwen35LayerRuntimeState::Linear {
+                Qwen38LayerRuntimeState::Linear {
                     conv_state,
                     recurrent_state,
                 } => {
@@ -68,7 +65,7 @@ impl Qwen35TextRuntimeState {
                         accounting.add_tensor(recurrent_state)?;
                     }
                 }
-                Qwen35LayerRuntimeState::Full => {}
+                Qwen38LayerRuntimeState::Full => {}
             }
         }
         Some(())
@@ -85,15 +82,15 @@ impl Qwen35TextRuntimeState {
             return Ok(());
         }
         let recurrent = recurrent.ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 recurrent state is missing its convolution peer".into())
+            Error::InferenceError("Qwen3.8 recurrent state is missing its convolution peer".into())
         })?;
         let convolution = convolution.ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 convolution state is missing its recurrent peer".into())
+            Error::InferenceError("Qwen3.8 convolution state is missing its recurrent peer".into())
         })?;
         let mut recurrent_components = recurrent.components.iter();
         let mut convolution_components = convolution.components.iter();
         for layer in &mut self.layers {
-            let Qwen35LayerRuntimeState::Linear {
+            let Qwen38LayerRuntimeState::Linear {
                 conv_state,
                 recurrent_state,
             } = layer
@@ -101,16 +98,16 @@ impl Qwen35TextRuntimeState {
                 continue;
             };
             let recurrent = recurrent_components.next().ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 recurrent component coverage is incomplete".into())
+                Error::InferenceError("Qwen3.8 recurrent component coverage is incomplete".into())
             })?;
             let convolution = convolution_components.next().ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 convolution component coverage is incomplete".into())
+                Error::InferenceError("Qwen3.8 convolution component coverage is incomplete".into())
             })?;
             let recurrent_tensor = recurrent.tensor.as_ref().ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 recurrent component is absent".into())
+                Error::InferenceError("Qwen3.8 recurrent component is absent".into())
             })?;
             let convolution_tensor = convolution.tensor.as_ref().ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 convolution component is absent".into())
+                Error::InferenceError("Qwen3.8 convolution component is absent".into())
             })?;
             *recurrent_state = Some(recurrent_tensor.clone());
             let history_len = convolution_tensor.dim(0)?;
@@ -121,7 +118,7 @@ impl Qwen35TextRuntimeState {
         }
         if recurrent_components.next().is_some() || convolution_components.next().is_some() {
             return Err(Error::InferenceError(
-                "Qwen3.5 tensor state has components for unknown layers".into(),
+                "Qwen3.8 tensor state has components for unknown layers".into(),
             ));
         }
         Ok(())
@@ -144,7 +141,7 @@ impl Qwen35TextRuntimeState {
         let mut recurrent = Vec::new();
         let mut convolution = Vec::new();
         for layer in &self.layers {
-            let Qwen35LayerRuntimeState::Linear {
+            let Qwen38LayerRuntimeState::Linear {
                 conv_state,
                 recurrent_state,
             } = layer
@@ -152,14 +149,14 @@ impl Qwen35TextRuntimeState {
                 continue;
             };
             let recurrent_tensor = recurrent_state.as_ref().ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 recurrent state was not initialized".into())
+                Error::InferenceError("Qwen3.8 recurrent state was not initialized".into())
             })?;
             let ring = conv_state.as_ref().ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 convolution state was not initialized".into())
+                Error::InferenceError("Qwen3.8 convolution state was not initialized".into())
             })?;
             if ring.slots.is_empty() || ring.next_idx >= ring.slots.len() {
                 return Err(Error::InferenceError(
-                    "Qwen3.5 convolution ring is invalid at the physical boundary".into(),
+                    "Qwen3.8 convolution ring is invalid at the physical boundary".into(),
                 ));
             }
             let ordered = (0..ring.slots.len())
@@ -167,7 +164,7 @@ impl Qwen35TextRuntimeState {
                 .collect::<Vec<_>>();
             let ring_tensor = Tensor::stack(&ordered, 0)?;
             let component = u32::try_from(recurrent.len() + 1)
-                .map_err(|_| Error::InvalidInput("Qwen3.5 state component overflow".into()))?;
+                .map_err(|_| Error::InvalidInput("Qwen3.8 state component overflow".into()))?;
             recurrent.push(StateComponentValue {
                 component: StateComponentId::new(component),
                 tensor: Some(recurrent_tensor.clone()),
@@ -195,7 +192,7 @@ impl Qwen35TextRuntimeState {
         // as control metadata between quanta so engine abort cannot expose a
         // partially drained model state.
         for layer in &mut self.layers {
-            if let Qwen35LayerRuntimeState::Linear {
+            if let Qwen38LayerRuntimeState::Linear {
                 conv_state,
                 recurrent_state,
             } = layer
@@ -249,7 +246,7 @@ impl ConvRingState {
     fn push_decode(&mut self, current: &Tensor) -> Result<()> {
         if self.slots.is_empty() || self.next_idx >= self.slots.len() {
             return Err(Error::InferenceError(format!(
-                "Invalid Qwen3.5 convolution ring: slots={}, next_idx={}",
+                "Invalid Qwen3.8 convolution ring: slots={}, next_idx={}",
                 self.slots.len(),
                 self.next_idx
             )));
@@ -261,7 +258,7 @@ impl ConvRingState {
 }
 
 #[derive(Clone)]
-enum Qwen35LayerRuntimeState {
+enum Qwen38LayerRuntimeState {
     Linear {
         conv_state: Option<ConvRingState>,
         recurrent_state: Option<Tensor>,
@@ -269,31 +266,54 @@ enum Qwen35LayerRuntimeState {
     Full,
 }
 
-struct Qwen35Layer {
-    attn_norm: RmsNorm,
-    mixer: Qwen35Mixer,
-    post_attention_norm: RmsNorm,
-    mlp: Qwen35Mlp,
+struct Qwen38Layer {
+    attn_norm: Qwen38RmsNorm,
+    mixer: Qwen38Mixer,
+    post_attention_norm: Qwen38RmsNorm,
+    mlp: Qwen38Mlp,
 }
 
-enum Qwen35Mixer {
-    Linear(Qwen35LinearAttention),
-    Full(Qwen35FullAttention),
+enum Qwen38Mixer {
+    Linear(Qwen38LinearAttention),
+    Full(Qwen38FullAttention),
 }
 
-struct Qwen35Mlp {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+struct Qwen38Mlp {
+    gate: Qwen38Projection,
+    up: Qwen38Projection,
+    down: Qwen38Projection,
 }
 
-struct Qwen35FullAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+enum Qwen38Projection {
+    Dense(Linear),
+}
+
+struct Qwen38RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl Module for Qwen38RmsNorm {
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32)
+    }
+}
+
+impl Module for Qwen38Projection {
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(projection) => projection.forward(input),
+        }
+    }
+}
+
+struct Qwen38FullAttention {
+    q_proj: Qwen38Projection,
+    k_proj: Qwen38Projection,
+    v_proj: Qwen38Projection,
+    o_proj: Qwen38Projection,
+    q_norm: Qwen38RmsNorm,
+    k_norm: Qwen38RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -304,17 +324,17 @@ struct Qwen35FullAttention {
     rope_inv_freqs: Vec<f32>,
 }
 
-struct Qwen35LinearAttention {
-    qkv_proj: QMatMul,
-    gate_proj: QMatMul,
-    beta_proj: QMatMul,
-    alpha_proj: QMatMul,
+struct Qwen38LinearAttention {
+    qkv_proj: Qwen38Projection,
+    gate_proj: Qwen38Projection,
+    beta_proj: Qwen38Projection,
+    alpha_proj: Qwen38Projection,
     dt_bias: Tensor,
     a: Tensor,
     conv_kernel: Tensor,
     conv_kernel_slices: Vec<Tensor>,
-    norm: Qwen35GatedRmsNorm,
-    out_proj: QMatMul,
+    norm: Qwen38GatedRmsNorm,
+    out_proj: Qwen38Projection,
     num_k_heads: usize,
     num_v_heads: usize,
     head_k_dim: usize,
@@ -325,68 +345,75 @@ struct Qwen35LinearAttention {
     tiled_recurrence_tile_size_override: Option<usize>,
 }
 
-struct Qwen35GatedRmsNorm {
+struct Qwen38GatedRmsNorm {
     weight: Tensor,
     eps: f64,
 }
 
-impl Qwen35TextModel {
-    pub fn load(loader: &GgufLoader, cfg: &Qwen35TextConfig, device: &Device) -> Result<Self> {
-        if cfg.attention_key_length != cfg.attention_value_length {
-            return Err(Error::ModelLoadError(format!(
-                "Qwen3.5 full attention currently requires key/value head dims to match, found {} and {}",
-                cfg.attention_key_length, cfg.attention_value_length
-            )));
-        }
-        if cfg.ssm_time_step_rank == 0 || !cfg.ssm_inner_size.is_multiple_of(cfg.ssm_time_step_rank)
-        {
-            return Err(Error::ModelLoadError(format!(
-                "Invalid Qwen3.5 linear attention dims: inner_size={}, time_step_rank={}",
-                cfg.ssm_inner_size, cfg.ssm_time_step_rank
-            )));
-        }
-
-        let embedding_weights = loader
-            .load_qtensor("token_embd.weight", device)?
-            .dequantize(device)
-            .map_err(Error::from)?;
-        let (vocab_size, hidden_size) = embedding_weights.dims2()?;
-        if hidden_size != cfg.embedding_length {
-            return Err(Error::ModelLoadError(format!(
-                "Qwen3.5 token embedding width mismatch: GGUF has {hidden_size}, metadata says {}",
-                cfg.embedding_length
-            )));
-        }
-        let _ = vocab_size;
-
-        let token_embeddings = Embedding::new(embedding_weights, hidden_size);
-        let output_norm = load_rms_norm(loader, device, "output_norm.weight", cfg)?;
-        let output = if loader.has_tensor("output.weight") {
-            load_qmatmul(loader, device, "output.weight")?
-        } else {
-            load_qmatmul(loader, device, "token_embd.weight")?
-        };
-        let finite_diagnostics_enabled = qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
+impl Qwen38TextModel {
+    pub fn load_native(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        let cfg = &native.text;
+        let target = native_projection_target(device);
+        let block = native.block_fp8.block_shape;
+        let embedding_weights = tensors.materialize_dense_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[native.vocab_size, cfg.embedding_length],
+            target,
+            device,
+        )?;
+        let token_embeddings = Embedding::new(embedding_weights, cfg.embedding_length);
+        let output_norm = load_native_zero_centered_norm(
+            tensors,
+            "model.language_model.norm.weight",
+            cfg.embedding_length,
+            cfg.attention_layer_norm_rms_epsilon,
+            target,
+            device,
+        )?;
+        let output = load_native_projection(
+            tensors,
+            "lm_head.weight",
+            [native.vocab_size, cfg.embedding_length],
+            block,
+            target,
+            device,
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.block_count);
-        for layer_idx in 0..cfg.block_count {
-            let prefix = format!("blk.{layer_idx}");
-            let attn_norm =
-                load_rms_norm(loader, device, &format!("{prefix}.attn_norm.weight"), cfg)?;
-            let post_attention_norm = load_rms_norm(
-                loader,
+        for (layer_idx, layer_type) in native.layer_types.iter().copied().enumerate() {
+            let prefix = format!("model.language_model.layers.{layer_idx}");
+            let attn_norm = load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.input_layernorm.weight"),
+                cfg.embedding_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
                 device,
-                &format!("{prefix}.post_attention_norm.weight"),
-                cfg,
             )?;
-            let mlp = Qwen35Mlp::load(loader, device, &prefix)?;
-            let mixer = if is_full_attention_layer(layer_idx, cfg.full_attention_interval) {
-                Qwen35Mixer::Full(Qwen35FullAttention::load(loader, device, &prefix, cfg)?)
-            } else {
-                Qwen35Mixer::Linear(Qwen35LinearAttention::load(loader, device, &prefix, cfg)?)
+            let post_attention_norm = load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                cfg.embedding_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?;
+            let mlp = Qwen38Mlp::load_native(tensors, device, &prefix, cfg, block, target)?;
+            let mixer = match layer_type {
+                Qwen38LayerType::FullAttention => Qwen38Mixer::Full(
+                    Qwen38FullAttention::load_native(tensors, device, &prefix, cfg, block, target)?,
+                ),
+                Qwen38LayerType::LinearAttention => {
+                    Qwen38Mixer::Linear(Qwen38LinearAttention::load_native(
+                        tensors, device, &prefix, cfg, block, target,
+                    )?)
+                }
             };
-
-            layers.push(Qwen35Layer {
+            layers.push(Qwen38Layer {
                 attn_norm,
                 mixer,
                 post_attention_norm,
@@ -399,13 +426,13 @@ impl Qwen35TextModel {
             layers,
             output_norm,
             output,
-            finite_diagnostics_enabled,
+            finite_diagnostics_enabled: qwen38_env_bool("IZWI_QWEN38_FINITE_DIAGNOSTICS", false),
         })
     }
 
-    pub fn new_state(&self) -> Qwen35TextRuntimeState {
-        Qwen35TextRuntimeState {
-            layers: self.layers.iter().map(Qwen35Layer::new_state).collect(),
+    pub fn new_state(&self) -> Qwen38TextRuntimeState {
+        Qwen38TextRuntimeState {
+            layers: self.layers.iter().map(Qwen38Layer::new_state).collect(),
         }
     }
 
@@ -417,7 +444,7 @@ impl Qwen35TextModel {
         &self,
         token_id: u32,
         position_ids: [usize; 3],
-        state: &mut Qwen35TextRuntimeState,
+        state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
@@ -430,7 +457,7 @@ impl Qwen35TextModel {
         &self,
         token_ids: &[u32],
         position_ids: &[[usize; 3]],
-        state: &mut Qwen35TextRuntimeState,
+        state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
         compute_logits: bool,
     ) -> Result<Option<Tensor>> {
@@ -439,7 +466,7 @@ impl Qwen35TextModel {
         }
         if token_ids.len() != position_ids.len() {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.5 physical prefill span mismatch: {} token ids for {} position ids",
+                "Qwen3.8 physical prefill span mismatch: {} token ids for {} position ids",
                 token_ids.len(),
                 position_ids.len()
             )));
@@ -459,7 +486,7 @@ impl Qwen35TextModel {
         &self,
         input_embedding: &Tensor,
         position_ids: [usize; 3],
-        state: &mut Qwen35TextRuntimeState,
+        state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
         let hidden =
@@ -471,7 +498,7 @@ impl Qwen35TextModel {
         &self,
         input: &Tensor,
         position_ids: &[[usize; 3]],
-        state: &mut Qwen35TextRuntimeState,
+        state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
         self.validate_runtime_state(state)?;
@@ -481,7 +508,7 @@ impl Qwen35TextModel {
             || hidden_size != self.hidden_size()
         {
             return Err(Error::InvalidInput(
-                "Qwen3.5 physical hidden span does not match its positions or model width".into(),
+                "Qwen3.8 physical hidden span does not match its positions or model width".into(),
             ));
         }
         let sparse_layers = self
@@ -489,15 +516,15 @@ impl Qwen35TextModel {
             .iter()
             .enumerate()
             .filter_map(|(index, layer)| {
-                matches!(layer.mixer, Qwen35Mixer::Full(_)).then_some(index as u32)
+                matches!(layer.mixer, Qwen38Mixer::Full(_)).then_some(index as u32)
             })
             .collect::<Vec<_>>();
         let first_full = self.layers.iter().find_map(|layer| match &layer.mixer {
-            Qwen35Mixer::Full(attention) => Some(attention),
-            Qwen35Mixer::Linear(_) => None,
+            Qwen38Mixer::Full(attention) => Some(attention),
+            Qwen38Mixer::Linear(_) => None,
         });
         let first_full = first_full.ok_or_else(|| {
-            Error::InferenceError("Qwen3.5 model has no full-attention layer".into())
+            Error::InferenceError("Qwen3.8 model has no full-attention layer".into())
         })?;
         cache.validate_sparse_model(
             &sparse_layers,
@@ -523,7 +550,7 @@ impl Qwen35TextModel {
                 &mut prepared,
                 &mut physical_layer,
             )?;
-            validate_qwen35_finite_tensor(
+            validate_qwen38_finite_tensor(
                 &hidden,
                 layer_index,
                 if sequence_len == 1 {
@@ -536,7 +563,7 @@ impl Qwen35TextModel {
         }
         if physical_layer != sparse_layers.len() {
             return Err(Error::InferenceError(
-                "Qwen3.5 physical attention did not cover every sparse layer".into(),
+                "Qwen3.8 physical attention did not cover every sparse layer".into(),
             ));
         }
         cache.commit_prepared(prepared)?;
@@ -545,7 +572,7 @@ impl Qwen35TextModel {
 
     pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.output_norm.forward(hidden)?;
-        validate_qwen35_finite_tensor(
+        validate_qwen38_finite_tensor(
             &hidden,
             self.layers.len(),
             "output.norm",
@@ -553,7 +580,7 @@ impl Qwen35TextModel {
         )?;
         let logits = self.output.forward(&hidden)?;
         let logits = logits.i((0, 0))?;
-        validate_qwen35_finite_tensor(
+        validate_qwen38_finite_tensor(
             &logits,
             self.layers.len(),
             "output.logits",
@@ -562,10 +589,10 @@ impl Qwen35TextModel {
         Ok(logits)
     }
 
-    fn validate_runtime_state(&self, state: &Qwen35TextRuntimeState) -> Result<()> {
+    fn validate_runtime_state(&self, state: &Qwen38TextRuntimeState) -> Result<()> {
         if state.layers.len() != self.layers.len() {
             return Err(Error::InferenceError(format!(
-                "Qwen3.5 runtime state layer mismatch: state has {}, model has {}",
+                "Qwen3.8 runtime state layer mismatch: state has {}, model has {}",
                 state.layers.len(),
                 self.layers.len()
             )));
@@ -574,28 +601,28 @@ impl Qwen35TextModel {
     }
 }
 
-impl Qwen35Layer {
+impl Qwen38Layer {
     fn decode_diagnostic_path(&self) -> &'static str {
         match self.mixer {
-            Qwen35Mixer::Linear(_) => "decode.linear_layer_output",
-            Qwen35Mixer::Full(_) => "decode.full_attention_layer_output",
+            Qwen38Mixer::Linear(_) => "decode.linear_layer_output",
+            Qwen38Mixer::Full(_) => "decode.full_attention_layer_output",
         }
     }
 
     fn prefill_diagnostic_path(&self) -> &'static str {
         match self.mixer {
-            Qwen35Mixer::Linear(_) => "prefill.linear_layer_output",
-            Qwen35Mixer::Full(_) => "prefill.full_attention_layer_output",
+            Qwen38Mixer::Linear(_) => "prefill.linear_layer_output",
+            Qwen38Mixer::Full(_) => "prefill.full_attention_layer_output",
         }
     }
 
-    fn new_state(&self) -> Qwen35LayerRuntimeState {
+    fn new_state(&self) -> Qwen38LayerRuntimeState {
         match self.mixer {
-            Qwen35Mixer::Linear(_) => Qwen35LayerRuntimeState::Linear {
+            Qwen38Mixer::Linear(_) => Qwen38LayerRuntimeState::Linear {
                 conv_state: None,
                 recurrent_state: None,
             },
-            Qwen35Mixer::Full(_) => Qwen35LayerRuntimeState::Full,
+            Qwen38Mixer::Full(_) => Qwen38LayerRuntimeState::Full,
         }
     }
 
@@ -603,12 +630,12 @@ impl Qwen35Layer {
     /// does not happen inside the per-token hot loop during prefill.
     fn ensure_state_initialized(
         &self,
-        state: &mut Qwen35LayerRuntimeState,
+        state: &mut Qwen38LayerRuntimeState,
         device: &Device,
     ) -> Result<()> {
         if let (
-            Qwen35Mixer::Linear(mixer),
-            Qwen35LayerRuntimeState::Linear {
+            Qwen38Mixer::Linear(mixer),
+            Qwen38LayerRuntimeState::Linear {
                 conv_state,
                 recurrent_state,
             },
@@ -640,7 +667,7 @@ impl Qwen35Layer {
     fn forward_physical(
         &self,
         hidden_states: &Tensor,
-        state: &mut Qwen35LayerRuntimeState,
+        state: &mut Qwen38LayerRuntimeState,
         position_ids: &[[usize; 3]],
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
@@ -649,14 +676,14 @@ impl Qwen35Layer {
         let residual = hidden_states.clone();
         let normalized = self.attn_norm.forward(hidden_states)?;
         let mixed = match &self.mixer {
-            Qwen35Mixer::Linear(mixer) => {
+            Qwen38Mixer::Linear(mixer) => {
                 if normalized.dim(1)? == 1 {
                     mixer.forward(&normalized, state)?
                 } else {
                     mixer.forward_sequence(&normalized, state)?
                 }
             }
-            Qwen35Mixer::Full(mixer) => {
+            Qwen38Mixer::Full(mixer) => {
                 let output = mixer.forward_physical(
                     &normalized,
                     position_ids,
@@ -665,7 +692,7 @@ impl Qwen35Layer {
                     *physical_layer,
                 )?;
                 *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
-                    Error::InvalidInput("Qwen3.5 physical layer ordinal overflow".into())
+                    Error::InvalidInput("Qwen3.8 physical layer ordinal overflow".into())
                 })?;
                 output
             }
@@ -678,12 +705,40 @@ impl Qwen35Layer {
     }
 }
 
-impl Qwen35Mlp {
-    fn load(loader: &GgufLoader, device: &Device, prefix: &str) -> Result<Self> {
+impl Qwen38Mlp {
+    fn load_native(
+        tensors: &IndexedSafetensors,
+        device: &Device,
+        prefix: &str,
+        cfg: &Qwen38TextConfig,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
+    ) -> Result<Self> {
         Ok(Self {
-            gate: load_qmatmul(loader, device, &format!("{prefix}.ffn_gate.weight"))?,
-            up: load_qmatmul(loader, device, &format!("{prefix}.ffn_up.weight"))?,
-            down: load_qmatmul(loader, device, &format!("{prefix}.ffn_down.weight"))?,
+            gate: load_native_projection(
+                tensors,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                [cfg.feed_forward_length, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            up: load_native_projection(
+                tensors,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                [cfg.feed_forward_length, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            down: load_native_projection(
+                tensors,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                [cfg.embedding_length, cfg.feed_forward_length],
+                block,
+                target,
+                device,
+            )?,
         })
     }
 
@@ -703,20 +758,76 @@ impl Qwen35Mlp {
     }
 }
 
-impl Qwen35FullAttention {
-    fn load(
-        loader: &GgufLoader,
+impl Qwen38FullAttention {
+    fn load_native(
+        tensors: &IndexedSafetensors,
         device: &Device,
         prefix: &str,
-        cfg: &Qwen35TextConfig,
+        cfg: &Qwen38TextConfig,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
     ) -> Result<Self> {
+        let q_width = cfg
+            .attention_head_count
+            .checked_mul(cfg.attention_key_length)
+            .and_then(|width| width.checked_mul(2))
+            .ok_or_else(|| Error::ModelLoadError("Qwen3.8 Q projection width overflow".into()))?;
+        let kv_width = cfg
+            .attention_head_count_kv
+            .checked_mul(cfg.attention_key_length)
+            .ok_or_else(|| Error::ModelLoadError("Qwen3.8 KV projection width overflow".into()))?;
         Ok(Self {
-            q_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_q.weight"))?,
-            k_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_k.weight"))?,
-            v_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_v.weight"))?,
-            o_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_output.weight"))?,
-            q_norm: load_rms_norm(loader, device, &format!("{prefix}.attn_q_norm.weight"), cfg)?,
-            k_norm: load_rms_norm(loader, device, &format!("{prefix}.attn_k_norm.weight"), cfg)?,
+            q_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                [q_width, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            k_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                [kv_width, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            v_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                [kv_width, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            o_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                [
+                    cfg.embedding_length,
+                    cfg.attention_head_count * cfg.attention_value_length,
+                ],
+                block,
+                target,
+                device,
+            )?,
+            q_norm: load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                cfg.attention_key_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?,
+            k_norm: load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                cfg.attention_key_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?,
             num_heads: cfg.attention_head_count,
             num_kv_heads: cfg.attention_head_count_kv,
             head_dim: cfg.attention_key_length,
@@ -729,7 +840,7 @@ impl Qwen35FullAttention {
                 .filter(|section| *section > 0)
                 .take(3)
                 .collect(),
-            rope_kernel_enabled: qwen35_rope_kernel_enabled(device),
+            rope_kernel_enabled: qwen38_rope_kernel_enabled(device),
             rope_inv_freqs: build_rope_inv_freqs(
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
@@ -748,7 +859,7 @@ impl Qwen35FullAttention {
         let seq_len = hidden_states.dim(1)?;
         if seq_len == 0 || seq_len != position_ids.len() {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.5 physical attention received {} tokens and {} positions",
+                "Qwen3.8 physical attention received {} tokens and {} positions",
                 seq_len,
                 position_ids.len()
             )));
@@ -870,7 +981,7 @@ impl Qwen35FullAttention {
         let seq_len = query_states.dim(1)?;
         if seq_len != position_ids.len() {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.5 rotary sequence mismatch: seq_len={}, position_ids={}",
+                "Qwen3.8 rotary sequence mismatch: seq_len={}, position_ids={}",
                 seq_len,
                 position_ids.len()
             )));
@@ -961,98 +1072,146 @@ impl Qwen35FullAttention {
     }
 }
 
-impl Qwen35LinearAttention {
-    fn load(
-        loader: &GgufLoader,
+impl Qwen38LinearAttention {
+    fn load_native(
+        tensors: &IndexedSafetensors,
         device: &Device,
         prefix: &str,
-        cfg: &Qwen35TextConfig,
+        cfg: &Qwen38TextConfig,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
     ) -> Result<Self> {
         let num_k_heads = cfg.ssm_group_count;
         let num_v_heads = cfg.ssm_time_step_rank;
         let head_k_dim = cfg.ssm_state_size;
         let head_v_dim = cfg.ssm_inner_size / cfg.ssm_time_step_rank;
         let conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-
-        let dt_bias_name = if loader.has_tensor(&format!("{prefix}.ssm_dt.bias")) {
-            format!("{prefix}.ssm_dt.bias")
-        } else {
-            format!("{prefix}.ssm_dt")
-        };
-        let dt_bias = load_vector(loader, device, &dt_bias_name, num_v_heads)?.reshape((
-            1,
-            1,
-            num_v_heads,
-        ))?;
-        let a = load_vector(loader, device, &format!("{prefix}.ssm_a"), num_v_heads)?.reshape((
-            1,
-            1,
-            num_v_heads,
-        ))?;
-        let conv_kernel = normalize_conv_kernel(
-            load_dense(
-                loader,
+        let linear = format!("{prefix}.linear_attn");
+        let dt_bias = tensors
+            .materialize_dense_tensor(
+                &format!("{linear}.dt_bias"),
+                &[num_v_heads],
+                ProjectionMaterialization::F32,
                 device,
-                &format!("{prefix}.ssm_conv1d.weight"),
-                Some(DType::F32),
+            )?
+            .reshape((1, 1, num_v_heads))?;
+        let a_log = tensors.materialize_dense_tensor(
+            &format!("{linear}.A_log"),
+            &[num_v_heads],
+            ProjectionMaterialization::F32,
+            device,
+        )?;
+        let a = a_log.exp()?.neg()?.reshape((1, 1, num_v_heads))?;
+        let conv_kernel = normalize_conv_kernel(
+            tensors.materialize_dense_tensor(
+                &format!("{linear}.conv1d.weight"),
+                &[conv_dim, 1, cfg.ssm_conv_kernel],
+                ProjectionMaterialization::F32,
+                device,
             )?,
             conv_dim,
             cfg.ssm_conv_kernel,
         )?;
         let conv_kernel_slices = pre_slice_conv_kernel(&conv_kernel, cfg.ssm_conv_kernel)?;
-        let norm = Qwen35GatedRmsNorm {
-            weight: load_vector(
-                loader,
+        let norm = Qwen38GatedRmsNorm {
+            weight: tensors.materialize_dense_tensor(
+                &format!("{linear}.norm.weight"),
+                &[head_v_dim],
+                ProjectionMaterialization::F32,
                 device,
-                &format!("{prefix}.ssm_norm.weight"),
-                head_v_dim,
             )?,
             eps: cfg.attention_layer_norm_rms_epsilon,
         };
-
         Ok(Self {
-            qkv_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_qkv.weight"))?,
-            gate_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_gate.weight"))?,
-            beta_proj: load_qmatmul(loader, device, &format!("{prefix}.ssm_beta.weight"))?,
-            alpha_proj: load_qmatmul(loader, device, &format!("{prefix}.ssm_alpha.weight"))?,
+            qkv_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_qkv.weight"),
+                [conv_dim, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            gate_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_z.weight"),
+                [cfg.ssm_inner_size, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            beta_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_b.weight"),
+                [num_v_heads, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            alpha_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_a.weight"),
+                [num_v_heads, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
             dt_bias,
             a,
             conv_kernel,
             conv_kernel_slices,
             norm,
-            out_proj: load_qmatmul(loader, device, &format!("{prefix}.ssm_out.weight"))?,
+            out_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.out_proj.weight"),
+                [cfg.embedding_length, cfg.ssm_inner_size],
+                block,
+                target,
+                device,
+            )?,
             num_k_heads,
             num_v_heads,
             head_k_dim,
             head_v_dim,
             conv_dim,
             kernel_size: cfg.ssm_conv_kernel,
-            tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
-            tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
+            tiled_recurrence_enabled: qwen38_tiled_recurrence_enabled(),
+            tiled_recurrence_tile_size_override: qwen38_tiled_recurrence_tile_size_override(),
         })
     }
 
     fn forward(
         &self,
         hidden_states: &Tensor,
-        state: &mut Qwen35LayerRuntimeState,
+        state: &mut Qwen38LayerRuntimeState,
     ) -> Result<Tensor> {
         let (conv_state, recurrent_state) = match state {
-            Qwen35LayerRuntimeState::Linear {
+            Qwen38LayerRuntimeState::Linear {
                 conv_state,
                 recurrent_state,
             } => (conv_state, recurrent_state),
             _ => {
                 return Err(Error::InferenceError(
-                    "Qwen3.5 layer runtime state does not match linear-attention layer".to_string(),
+                    "Qwen3.8 layer runtime state does not match linear-attention layer".to_string(),
                 ))
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let residual_dtype = hidden_states.dtype();
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let z = self
+            .gate_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(
+            &self
+                .beta_proj
+                .forward(hidden_states)?
+                .to_dtype(DType::F32)?,
+        )?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
@@ -1084,8 +1243,8 @@ impl Qwen35LinearAttention {
                 )));
             }
             let repeats = self.num_v_heads / self.num_k_heads;
-            query = repeat_head_states(&query, repeats)?;
-            key = repeat_head_states(&key, repeats)?;
+            query = repeat_interleave_head_states(&query, repeats)?;
+            key = repeat_interleave_head_states(&key, repeats)?;
         }
 
         let current_state = if let Some(state) = recurrent_state.take() {
@@ -1109,14 +1268,16 @@ impl Qwen35LinearAttention {
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
-        let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
+        let output = output
+            .reshape((1, 1, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output).map_err(Error::from)
     }
 
     fn forward_sequence(
         &self,
         hidden_states: &Tensor,
-        state: &mut Qwen35LayerRuntimeState,
+        state: &mut Qwen38LayerRuntimeState,
     ) -> Result<Tensor> {
         let seq_len = hidden_states.dim(1)?;
         if seq_len == 1 {
@@ -1124,21 +1285,33 @@ impl Qwen35LinearAttention {
         }
 
         let (conv_state, recurrent_state) = match state {
-            Qwen35LayerRuntimeState::Linear {
+            Qwen38LayerRuntimeState::Linear {
                 conv_state,
                 recurrent_state,
             } => (conv_state, recurrent_state),
             _ => {
                 return Err(Error::InferenceError(
-                    "Qwen3.5 layer runtime state does not match linear-attention layer".to_string(),
+                    "Qwen3.8 layer runtime state does not match linear-attention layer".to_string(),
                 ))
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let residual_dtype = hidden_states.dtype();
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let z = self
+            .gate_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(
+            &self
+                .beta_proj
+                .forward(hidden_states)?
+                .to_dtype(DType::F32)?,
+        )?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
@@ -1186,7 +1359,7 @@ impl Qwen35LinearAttention {
         let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
         let tile_size =
-            qwen35_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
+            qwen38_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
         let fused_sequence = if self.tiled_recurrence_enabled {
             try_tiled_deltanet_recurrence(
                 &query,
@@ -1203,16 +1376,16 @@ impl Qwen35LinearAttention {
         let (output, next_state) = if let Some(fused_sequence) = fused_sequence {
             fused_sequence
         } else {
-            // CUDA's equal-head kernel and the portable Candle reference consume
-            // tiled Q/K heads. The Metal sequence op above consumes the compact
-            // converted-GGUF 16K layout directly for both 16V and 32V models.
+            // The portable recurrence consumes one Q/K head per value head.
+            // Native Qwen3.8 stores 16 Q/K heads and 48 value heads, so expand
+            // with Transformers' repeat-interleave ordering before fallback.
             let (query, key) = if self.num_v_heads == self.num_k_heads {
                 (query, key)
             } else {
                 let repeats = self.num_v_heads / self.num_k_heads;
                 (
-                    repeat_head_states_seq(&query, repeats)?,
-                    repeat_head_states_seq(&key, repeats)?,
+                    repeat_interleave_head_states_seq(&query, repeats)?,
+                    repeat_interleave_head_states_seq(&key, repeats)?,
                 )
             };
             if self.tiled_recurrence_enabled {
@@ -1241,7 +1414,9 @@ impl Qwen35LinearAttention {
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
-        let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
+        let output = output
+            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output).map_err(Error::from)
     }
 
@@ -1262,7 +1437,7 @@ impl Qwen35LinearAttention {
             })?;
             if buffer.slots.len() != history_len || buffer.next_idx >= history_len {
                 return Err(Error::InferenceError(format!(
-                    "Invalid Qwen3.5 convolution history: slots={}, next_idx={}, expected_slots={history_len}",
+                    "Invalid Qwen3.8 convolution history: slots={}, next_idx={}, expected_slots={history_len}",
                     buffer.slots.len(),
                     buffer.next_idx
                 )));
@@ -1272,7 +1447,7 @@ impl Qwen35LinearAttention {
                 .collect();
             let history = Tensor::cat(&logical_slots, 1)?;
             if let Some((output, final_history)) =
-                try_qwen35_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
+                try_qwen38_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
             {
                 let final_history = deep_copy_tensor_storage(&final_history)?;
                 buffer.slots = (0..history_len)
@@ -1350,7 +1525,7 @@ impl Qwen35LinearAttention {
     }
 }
 
-impl Qwen35GatedRmsNorm {
+impl Qwen38GatedRmsNorm {
     fn forward(&self, hidden_states: &Tensor, gate: &Tensor) -> Result<Tensor> {
         if hidden_states.dtype() == DType::F32 {
             if let Some(result) =
@@ -1365,60 +1540,40 @@ impl Qwen35GatedRmsNorm {
     }
 }
 
-fn is_full_attention_layer(layer_idx: usize, full_attention_interval: usize) -> bool {
-    full_attention_interval > 0 && (layer_idx + 1).is_multiple_of(full_attention_interval)
-}
-
-fn load_qmatmul(loader: &GgufLoader, device: &Device, name: &str) -> Result<QMatMul> {
-    let weights = Arc::new(loader.load_qtensor(name, device)?);
-    QMatMul::from_weights(weights).map_err(Error::from)
-}
-
-fn load_rms_norm(
-    loader: &GgufLoader,
-    device: &Device,
-    name: &str,
-    cfg: &Qwen35TextConfig,
-) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(
-        loader.load_qtensor(name, device)?,
-        cfg.attention_layer_norm_rms_epsilon,
-    )
-    .map_err(Error::from)
-}
-
-fn load_dense(
-    loader: &GgufLoader,
-    device: &Device,
-    name: &str,
-    dtype: Option<DType>,
-) -> Result<Tensor> {
-    let mut tensor = loader
-        .load_qtensor(name, device)?
-        .dequantize(device)
-        .map_err(Error::from)?;
-    if let Some(dtype) = dtype {
-        if tensor.dtype() != dtype {
-            tensor = tensor.to_dtype(dtype)?;
-        }
+fn native_projection_target(device: &Device) -> ProjectionMaterialization {
+    if device.is_cpu() {
+        ProjectionMaterialization::F32
+    } else if device.is_metal() {
+        ProjectionMaterialization::F16
+    } else {
+        ProjectionMaterialization::BF16
     }
-    Ok(tensor)
 }
 
-fn load_vector(
-    loader: &GgufLoader,
-    device: &Device,
+fn load_native_projection(
+    tensors: &IndexedSafetensors,
     name: &str,
-    expected_len: usize,
-) -> Result<Tensor> {
-    let tensor = load_dense(loader, device, name, Some(DType::F32))?;
-    let actual_len = tensor.elem_count();
-    if actual_len != expected_len {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected tensor size for {name}: expected {expected_len} elements, found {actual_len}"
-        )));
-    }
-    tensor.reshape((expected_len,)).map_err(Error::from)
+    shape: [usize; 2],
+    block: [usize; 2],
+    target: ProjectionMaterialization,
+    device: &Device,
+) -> Result<Qwen38Projection> {
+    tensors
+        .materialize_projection(name, shape, block, target, device)
+        .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))
+}
+
+fn load_native_zero_centered_norm(
+    tensors: &IndexedSafetensors,
+    name: &str,
+    length: usize,
+    eps: f64,
+    target: ProjectionMaterialization,
+    device: &Device,
+) -> Result<Qwen38RmsNorm> {
+    let weight = tensors.materialize_dense_tensor(name, &[length], target, device)?;
+    let weight = (weight + 1.0)?;
+    Ok(Qwen38RmsNorm { weight, eps })
 }
 
 fn normalize_conv_kernel(
@@ -1435,7 +1590,7 @@ fn normalize_conv_kernel(
                 tensor.transpose(0, 1)?.contiguous().map_err(Error::from)
             } else {
                 Err(Error::ModelLoadError(format!(
-                    "Unexpected Qwen3.5 conv kernel shape: ({d0}, {d1}) for expected ({expected_channels}, {expected_kernel})"
+                    "Unexpected Qwen3.8 conv kernel shape: ({d0}, {d1}) for expected ({expected_channels}, {expected_kernel})"
                 )))
             }
         }
@@ -1451,13 +1606,13 @@ fn normalize_conv_kernel(
                     .map_err(Error::from)
             } else {
                 Err(Error::ModelLoadError(format!(
-                    "Unexpected rank-3 Qwen3.5 conv kernel shape: {:?}",
+                    "Unexpected rank-3 Qwen3.8 conv kernel shape: {:?}",
                     dims
                 )))
             }
         }
         rank => Err(Error::ModelLoadError(format!(
-            "Unexpected Qwen3.5 conv kernel rank {rank}"
+            "Unexpected Qwen3.8 conv kernel rank {rank}"
         ))),
     }
 }
@@ -1481,7 +1636,7 @@ fn build_mrope(
     let half_dim = rope_dim / 2;
     if inv_freqs.len() != half_dim {
         return Err(Error::InferenceError(format!(
-            "Invalid Qwen3.5 rotary dimension {rope_dim}"
+            "Invalid Qwen3.8 rotary dimension {rope_dim}"
         )));
     }
 
@@ -1498,7 +1653,7 @@ fn build_mrope(
     if position_ids[0] != position_ids[1] || position_ids[0] != position_ids[2] {
         if mrope_sections.iter().sum::<usize>() != half_dim || mrope_sections.len() < 3 {
             return Err(Error::InferenceError(format!(
-                "Invalid Qwen3.5 multimodal RoPE sections {:?} for rotary dim {}",
+                "Invalid Qwen3.8 multimodal RoPE sections {:?} for rotary dim {}",
                 mrope_sections, rope_dim
             )));
         }
@@ -1559,7 +1714,7 @@ fn build_rope_inv_freqs(rope_dim: usize, rope_theta: f64) -> Result<Vec<f32>> {
         .collect();
     if inv_freqs.len() != half_dim {
         return Err(Error::InferenceError(format!(
-            "Invalid Qwen3.5 rotary dimension {rope_dim}"
+            "Invalid Qwen3.8 rotary dimension {rope_dim}"
         )));
     }
     Ok(inv_freqs)
@@ -1613,7 +1768,7 @@ fn non_finite_counts(tensor: &Tensor) -> Result<NonFiniteCounts> {
     Ok(counts)
 }
 
-fn validate_qwen35_finite_tensor(
+fn validate_qwen38_finite_tensor(
     tensor: &Tensor,
     layer_idx: usize,
     path: &str,
@@ -1629,7 +1784,7 @@ fn validate_qwen35_finite_tensor(
     }
 
     Err(Error::InferenceError(format!(
-        "Qwen3.5 first non-finite tensor at {path}, layer {layer_idx}: \
+        "Qwen3.8 first non-finite tensor at {path}, layer {layer_idx}: \
          {} of {} values ({} NaN, {} +Inf, {} -Inf), shape {:?}, dtype {:?}",
         counts.total(),
         tensor.elem_count(),
@@ -1664,33 +1819,29 @@ fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
-fn repeat_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
+fn repeat_interleave_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
     if repeats <= 1 {
         return Ok(x.clone());
     }
     let (batch, heads, dim) = x.dims3()?;
-    // Match llama.cpp's tiled repeat layout for Qwen3.5 linear attention:
-    // [h0, h1, ...] -> [h0, h1, ..., h0, h1, ...].
-    let expanded = x.unsqueeze(1)?.broadcast_as((batch, repeats, heads, dim))?;
-    expanded
-        .reshape((batch, repeats * heads, dim))
+    x.unsqueeze(2)?
+        .broadcast_as((batch, heads, repeats, dim))?
+        .reshape((batch, heads * repeats, dim))
         .map_err(Error::from)
 }
 
-fn repeat_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
+fn repeat_interleave_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
     if repeats <= 1 {
         return Ok(x.clone());
     }
     let (batch, seq, heads, dim) = x.dims4()?;
-    let expanded = x
-        .unsqueeze(2)?
-        .broadcast_as((batch, seq, repeats, heads, dim))?;
-    expanded
-        .reshape((batch, seq, repeats * heads, dim))
+    x.unsqueeze(3)?
+        .broadcast_as((batch, seq, heads, repeats, dim))?
+        .reshape((batch, seq, heads * repeats, dim))
         .map_err(Error::from)
 }
 
-fn qwen35_env_bool(name: &str, default: bool) -> bool {
+fn qwen38_env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
         .map(|value| {
@@ -1702,22 +1853,22 @@ fn qwen35_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn qwen35_tiled_recurrence_enabled() -> bool {
-    qwen35_env_bool("IZWI_QWEN35_TILED_RECURRENCE", true)
+fn qwen38_tiled_recurrence_enabled() -> bool {
+    qwen38_env_bool("IZWI_QWEN38_TILED_RECURRENCE", true)
 }
 
-fn qwen35_rope_kernel_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN35_ROPE_KERNEL")
+fn qwen38_rope_kernel_enabled(device: &Device) -> bool {
+    let override_enabled = std::env::var("IZWI_QWEN38_ROPE_KERNEL")
         .ok()
         .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Some(true),
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         });
-    qwen35_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
+    qwen38_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
-fn qwen35_rope_kernel_policy(
+fn qwen38_rope_kernel_policy(
     is_metal: bool,
     is_cuda: bool,
     override_enabled: Option<bool>,
@@ -1731,8 +1882,8 @@ fn qwen35_rope_kernel_policy(
     false
 }
 
-fn qwen35_tiled_recurrence_tile_size_override() -> Option<usize> {
-    if let Ok(raw) = std::env::var("IZWI_QWEN35_TILED_RECURRENCE_TILE_SIZE") {
+fn qwen38_tiled_recurrence_tile_size_override() -> Option<usize> {
+    if let Ok(raw) = std::env::var("IZWI_QWEN38_TILED_RECURRENCE_TILE_SIZE") {
         if let Ok(parsed) = raw.trim().parse::<usize>() {
             return Some(parsed.max(1));
         }
@@ -1740,7 +1891,7 @@ fn qwen35_tiled_recurrence_tile_size_override() -> Option<usize> {
     None
 }
 
-fn qwen35_tiled_recurrence_tile_size(seq_len: usize, override_size: Option<usize>) -> usize {
+fn qwen38_tiled_recurrence_tile_size(seq_len: usize, override_size: Option<usize>) -> usize {
     if let Some(override_size) = override_size {
         return override_size.min(seq_len.max(1));
     }
@@ -1832,10 +1983,11 @@ fn recurrent_gated_delta(
 mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
-        qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
-        softplus, ConvRingState, Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        qwen38_rope_kernel_policy, recurrent_domain_v2, repeat_interleave_head_states,
+        repeat_interleave_head_states_seq, softplus, ConvRingState, Linear,
+        Qwen38LayerRuntimeState, Qwen38Projection, Qwen38TextRuntimeState,
     };
-    use crate::models::architectures::qwen35::cache::{
+    use crate::models::architectures::qwen38::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
     use candle_core::{DType, Device, IndexOp, Tensor};
@@ -1913,49 +2065,47 @@ mod tests {
     }
 
     #[test]
-    fn repeat_head_states_uses_tiled_order() {
+    fn native_head_repeat_uses_transformers_repeat_interleave_order() {
         let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 2), &Device::Cpu)
             .expect("tensor should build");
-        let repeated = repeat_head_states(&x, 2).expect("repeat should succeed");
-        let values = repeated.to_vec3::<f32>().expect("values");
-
+        let repeated = repeat_interleave_head_states(&x, 2).expect("repeat should succeed");
         assert_eq!(
-            values,
+            repeated.to_vec3::<f32>().expect("values"),
             vec![vec![
                 vec![1.0, 2.0],
-                vec![3.0, 4.0],
                 vec![1.0, 2.0],
+                vec![3.0, 4.0],
                 vec![3.0, 4.0]
             ]]
+        );
+
+        let sequence = x.unsqueeze(1).expect("sequence");
+        let repeated =
+            repeat_interleave_head_states_seq(&sequence, 2).expect("repeat should succeed");
+        assert_eq!(
+            repeated
+                .reshape((1, 1, 8))
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap(),
+            vec![vec![vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]]]
         );
     }
 
     #[test]
-    fn repeat_head_states_seq_uses_tiled_order() {
-        let x = Tensor::from_vec(
-            vec![
-                // seq 0
-                1f32, 2.0, 3.0, 4.0, // seq 1
-                5.0, 6.0, 7.0, 8.0,
-            ],
-            (1, 2, 2, 2),
-            &Device::Cpu,
-        )
-        .expect("tensor should build");
+    fn dense_projection_supports_batched_sequence_inputs() {
+        use candle_nn::Module;
 
-        let repeated = repeat_head_states_seq(&x, 2).expect("repeat should succeed");
-        let values = repeated
-            .reshape((1, 2, 8))
-            .expect("reshape")
-            .to_vec3::<f32>()
-            .expect("values");
-
+        let projection = Qwen38Projection::Dense(Linear::new(
+            Tensor::from_vec(vec![1f32, 0.0, 0.0, 1.0, 1.0, 1.0], (3, 2), &Device::Cpu).unwrap(),
+            None,
+        ));
+        let input = Tensor::from_vec(vec![2f32, 3.0, 4.0, 5.0], (1, 2, 2), &Device::Cpu).unwrap();
+        let output = projection.forward(&input).unwrap();
+        assert_eq!(output.dims3().unwrap(), (1, 2, 3));
         assert_eq!(
-            values,
-            vec![vec![
-                vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
-                vec![5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]
-            ]]
+            output.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0, 3.0, 5.0, 4.0, 5.0, 9.0]
         );
     }
 
@@ -1966,8 +2116,8 @@ mod tests {
         for token_idx in 37..40 {
             slots.push(backing.i((0, token_idx)).unwrap().reshape((32, 1)).unwrap());
         }
-        let mut state = Qwen35TextRuntimeState {
-            layers: vec![Qwen35LayerRuntimeState::Linear {
+        let mut state = Qwen38TextRuntimeState {
+            layers: vec![Qwen38LayerRuntimeState::Linear {
                 conv_state: Some(ConvRingState { slots, next_idx: 0 }),
                 recurrent_state: None,
             }],
@@ -1976,7 +2126,7 @@ mod tests {
         let retained_prefill_bytes = state.allocated_session_bytes().unwrap();
         assert!(retained_prefill_bytes >= 40 * 32 * 4);
 
-        let Qwen35LayerRuntimeState::Linear { conv_state, .. } = &mut state.layers[0] else {
+        let Qwen38LayerRuntimeState::Linear { conv_state, .. } = &mut state.layers[0] else {
             unreachable!("test state is linear")
         };
         conv_state
@@ -2004,8 +2154,8 @@ mod tests {
         drop(current);
         drop(projection);
 
-        let state = Qwen35TextRuntimeState {
-            layers: vec![Qwen35LayerRuntimeState::Linear {
+        let state = Qwen38TextRuntimeState {
+            layers: vec![Qwen38LayerRuntimeState::Linear {
                 conv_state: Some(ring),
                 recurrent_state: None,
             }],
@@ -2017,13 +2167,13 @@ mod tests {
     fn persistent_zero_states_have_independent_storage() {
         let first = owned_zero_tensor(&[1, 2, 3, 4], DType::F32, &Device::Cpu).unwrap();
         let second = owned_zero_tensor(&[1, 2, 3, 4], DType::F32, &Device::Cpu).unwrap();
-        let state = Qwen35TextRuntimeState {
+        let state = Qwen38TextRuntimeState {
             layers: vec![
-                Qwen35LayerRuntimeState::Linear {
+                Qwen38LayerRuntimeState::Linear {
                     conv_state: None,
                     recurrent_state: Some(first),
                 },
-                Qwen35LayerRuntimeState::Linear {
+                Qwen38LayerRuntimeState::Linear {
                     conv_state: None,
                     recurrent_state: Some(second),
                 },
@@ -2130,26 +2280,26 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_cuda_rope_kernel_defaults_on_with_explicit_rollback() {
-        assert!(qwen35_rope_kernel_policy(true, false, None));
-        assert!(qwen35_rope_kernel_policy(false, true, None));
-        assert!(qwen35_rope_kernel_policy(false, true, Some(true)));
-        assert!(!qwen35_rope_kernel_policy(true, false, Some(false)));
-        assert!(!qwen35_rope_kernel_policy(false, false, Some(true)));
+    fn qwen38_cuda_rope_kernel_defaults_on_with_explicit_rollback() {
+        assert!(qwen38_rope_kernel_policy(true, false, None));
+        assert!(qwen38_rope_kernel_policy(false, true, None));
+        assert!(qwen38_rope_kernel_policy(false, true, Some(true)));
+        assert!(!qwen38_rope_kernel_policy(true, false, Some(false)));
+        assert!(!qwen38_rope_kernel_policy(false, false, Some(true)));
     }
 
     fn synthetic_decode_state(
         device: &Device,
         layer_count: usize,
         num_v_heads: usize,
-    ) -> Qwen35TextRuntimeState {
+    ) -> Qwen38TextRuntimeState {
         let mut layers = Vec::with_capacity(layer_count);
         for layer_idx in 0..layer_count {
             if (layer_idx + 1).is_multiple_of(4) {
-                layers.push(Qwen35LayerRuntimeState::Full);
+                layers.push(Qwen38LayerRuntimeState::Full);
             } else {
                 let conv_width = num_v_heads * 2;
-                layers.push(Qwen35LayerRuntimeState::Linear {
+                layers.push(Qwen38LayerRuntimeState::Linear {
                     conv_state: Some(ConvRingState {
                         slots: (0..3)
                             .map(|_| Tensor::zeros((conv_width, 1), DType::F32, device).unwrap())
@@ -2162,17 +2312,17 @@ mod tests {
                 });
             }
         }
-        Qwen35TextRuntimeState { layers }
+        Qwen38TextRuntimeState { layers }
     }
 
     fn advance_synthetic_decode_state(
-        state: &mut Qwen35TextRuntimeState,
+        state: &mut Qwen38TextRuntimeState,
         device: &Device,
         num_v_heads: usize,
     ) {
         for layer in &mut state.layers {
             match layer {
-                Qwen35LayerRuntimeState::Linear {
+                Qwen38LayerRuntimeState::Linear {
                     conv_state: Some(conv_state),
                     recurrent_state,
                 } => {
@@ -2187,7 +2337,7 @@ mod tests {
                     *recurrent_state =
                         Some(Tensor::zeros((1, num_v_heads, 2, 2), DType::F32, device).unwrap());
                 }
-                Qwen35LayerRuntimeState::Full => {}
+                Qwen38LayerRuntimeState::Full => {}
                 _ => panic!("synthetic state must initialize every linear cache"),
             }
         }

@@ -24,9 +24,9 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::{
     Qwen3TtsModel, SpeakerReference, TtsGenerationParams, TtsSessionCacheRequest,
 };
-use crate::models::architectures::qwen35::chat::Qwen35PreparedPrompt;
 use crate::models::registry::{
-    AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease,
+    AsrModelLease, ChatModelLease, NativeAsrModel, NativeChatModel, NativeChatPreparedPrompt,
+    QwenTtsModelLease,
 };
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequestConfig};
 use crate::runtime::audio_io::{
@@ -199,7 +199,7 @@ pub(super) struct ChatExecutionReady {
     model_variant: ModelVariant,
     model: PreparedChatModel,
     fingerprint: u64,
-    prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+    prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
     context_limit: usize,
     core_validated: bool,
 }
@@ -1543,14 +1543,14 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
-        prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
         model: ChatModelLease,
         context_limit: usize,
     ) -> Result<()> {
         self.install_chat_execution_preparation_inner(
             model_variant,
             prompt_tokens,
-            prepared_qwen35_prompt,
+            prepared_chat_prompt,
             PreparedChatModel::Exact(model),
             context_limit,
         )
@@ -1561,13 +1561,13 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
-        prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
         context_limit: usize,
     ) -> Result<()> {
         self.install_chat_execution_preparation_inner(
             model_variant,
             prompt_tokens,
-            prepared_qwen35_prompt,
+            prepared_chat_prompt,
             PreparedChatModel::ValidationOnly,
             context_limit,
         )
@@ -1577,7 +1577,7 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         prompt_tokens: Vec<TokenId>,
-        prepared_qwen35_prompt: Option<Qwen35PreparedPrompt>,
+        prepared_chat_prompt: Option<NativeChatPreparedPrompt>,
         model: PreparedChatModel,
         context_limit: usize,
     ) -> Result<()> {
@@ -1616,30 +1616,32 @@ impl EngineCoreRequest {
             )));
         }
 
-        let is_qwen35 = model_variant.family() == ModelFamily::Qwen35Chat;
-        match prepared_qwen35_prompt.as_ref() {
-            Some(_) if !is_qwen35 => {
+        let family = model_variant.family();
+        let needs_prepared_prompt =
+            matches!(family, ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat);
+        match prepared_chat_prompt.as_ref() {
+            Some(prepared) if prepared.family() != family => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} routed a Qwen3.5 prompt artifact to {model_variant}",
+                    "Chat request {} routed a mismatched prepared prompt artifact to {model_variant}",
                     self.id
                 )));
             }
             Some(prepared) if prepared.prompt_ids() != prompt_tokens => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} Qwen3.5 prompt artifact does not match its exact prompt tokens",
+                    "Chat request {} prepared prompt artifact does not match its exact prompt tokens",
                     self.id
                 )));
             }
-            None if is_qwen35 => {
+            None if needs_prepared_prompt => {
                 return Err(Error::InvalidInput(format!(
-                    "Chat request {} is missing its prepared Qwen3.5 prompt artifact",
+                    "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
                     self.id
                 )));
             }
             _ => {}
         }
 
-        if prepared_qwen35_prompt.is_some() {
+        if prepared_chat_prompt.is_some() {
             // The opaque artifact owns all decoded/encoded vision state needed
             // by execution. Do not retain or repeatedly fingerprint multi-MB
             // data URLs (or signed remote URLs) on the scheduler hot path.
@@ -1664,7 +1666,7 @@ impl EngineCoreRequest {
             model_variant,
             model,
             fingerprint,
-            prepared_qwen35_prompt,
+            prepared_chat_prompt,
             context_limit,
             core_validated: false,
         });
@@ -1785,19 +1787,24 @@ impl EngineCoreRequest {
             )));
         }
 
-        match ready.prepared_qwen35_prompt.as_ref() {
+        match ready.prepared_chat_prompt.as_ref() {
             Some(prepared)
-                if model_variant.family() != ModelFamily::Qwen35Chat
+                if prepared.family() != model_variant.family()
                     || prepared.prompt_ids() != self.prompt_tokens =>
             {
                 Err(Error::InvalidInput(format!(
-                    "Chat request {} has a mismatched Qwen3.5 prompt artifact",
+                    "Chat request {} has a mismatched prepared prompt artifact",
                     self.id
                 )))
             }
-            None if model_variant.family() == ModelFamily::Qwen35Chat => {
+            None
+                if matches!(
+                    model_variant.family(),
+                    ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+                ) =>
+            {
                 Err(Error::InvalidInput(format!(
-                    "Chat request {} is missing its prepared Qwen3.5 prompt artifact",
+                    "Chat request {} is missing its prepared hybrid-Qwen prompt artifact",
                     self.id
                 )))
             }
@@ -1855,14 +1862,14 @@ impl EngineCoreRequest {
         self.validate_chat_execution_preparation()
     }
 
-    pub(crate) fn prepared_qwen35_prompt_for_executor(
+    pub(crate) fn prepared_chat_prompt_for_executor(
         &self,
-    ) -> Result<Option<&Qwen35PreparedPrompt>> {
+    ) -> Result<Option<&NativeChatPreparedPrompt>> {
         self.validate_chat_execution_for_executor()?;
         Ok(self
             .chat_execution_ready
             .as_ref()
-            .and_then(|ready| ready.prepared_qwen35_prompt.as_ref()))
+            .and_then(|ready| ready.prepared_chat_prompt.as_ref()))
     }
 
     pub(crate) fn prepared_chat_model_for_executor(&self) -> Result<Arc<NativeChatModel>> {

@@ -175,7 +175,7 @@ impl RuntimeService {
                 let original_messages = messages;
                 let initial =
                     model.prepare_prompt_for_execution(&original_messages, &prompt_config)?;
-                let (messages, prompt_tokens, prepared_qwen35_prompt, trimmed_messages) =
+                let (messages, prompt_tokens, prepared_chat_prompt, trimmed_messages) =
                     if initial.0.len() < context_limit {
                         (original_messages, initial.0, initial.1, 0usize)
                     } else {
@@ -277,7 +277,7 @@ impl RuntimeService {
                 request.install_chat_execution_preparation_with_model(
                     variant,
                     exact_prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
                     model,
                     context_limit,
                 )?;

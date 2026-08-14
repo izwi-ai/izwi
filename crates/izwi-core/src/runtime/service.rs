@@ -732,7 +732,10 @@ fn coordinator_lane_for_metadata(
 ) -> CoordinatorLane {
     let sequence = model_variant.is_some_and(|variant| match task_type {
         TaskType::Chat => {
-            matches!(variant.family(), ModelFamily::Qwen35Chat)
+            matches!(
+                variant.family(),
+                ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+            )
                 || matches!(
                     variant,
                     ModelVariant::Qwen306B

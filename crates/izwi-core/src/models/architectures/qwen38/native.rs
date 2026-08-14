@@ -1,4 +1,4 @@
-//! Native Hugging Face checkpoint foundations for Qwen3.5.
+//! Native Hugging Face checkpoint foundations for Qwen3.8.
 //!
 //! The published Qwen3.8 checkpoint is an indexed Safetensors bundle whose
 //! matrix weights use 128x128 block-scaled `F8_E4M3`. Candle can deserialize
@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
-use super::chat::Qwen35TextConfig;
+use super::chat::Qwen38TextConfig;
 
 const CONFIG_FILE: &str = "config.json";
 const INDEX_FILE: &str = "model.safetensors.index.json";
@@ -30,7 +30,7 @@ const WEIGHT_SUFFIX: &str = ".weight";
 pub const QWEN38_27B_FP8_REVISION: &str = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35LayerType {
+pub enum Qwen38LayerType {
     LinearAttention,
     FullAttention,
 }
@@ -42,9 +42,9 @@ pub struct BlockFp8Config {
 
 /// Validated native configuration plus the existing runtime geometry.
 #[derive(Debug, Clone)]
-pub struct Qwen35NativeConfig {
-    pub text: Qwen35TextConfig,
-    pub layer_types: Vec<Qwen35LayerType>,
+pub struct Qwen38NativeConfig {
+    pub text: Qwen38TextConfig,
+    pub layer_types: Vec<Qwen38LayerType>,
     pub vocab_size: usize,
     pub attn_output_gate: bool,
     pub partial_rotary_factor: f64,
@@ -53,12 +53,12 @@ pub struct Qwen35NativeConfig {
     pub block_fp8: BlockFp8Config,
 }
 
-impl Qwen35NativeConfig {
+impl Qwen38NativeConfig {
     pub fn load(model_dir: &Path) -> Result<Self> {
         let path = model_dir.join(CONFIG_FILE);
         let raw = fs::read(&path).map_err(|err| {
             Error::ModelLoadError(format!(
-                "Failed to read native Qwen3.5 config {}: {err}",
+                "Failed to read native Qwen3.8 config {}: {err}",
                 path.display()
             ))
         })?;
@@ -67,7 +67,7 @@ impl Qwen35NativeConfig {
 
     pub fn from_json(raw: &[u8]) -> Result<Self> {
         let config: HfConfig = serde_json::from_slice(raw).map_err(|err| {
-            Error::ModelLoadError(format!("Invalid native Qwen3.5 config.json: {err}"))
+            Error::ModelLoadError(format!("Invalid native Qwen3.8 config.json: {err}"))
         })?;
         validate_hf_config(config)
     }
@@ -136,7 +136,7 @@ struct HfQuantizationConfig {
     weight_block_size: Vec<usize>,
 }
 
-fn validate_hf_config(config: HfConfig) -> Result<Qwen35NativeConfig> {
+fn validate_hf_config(config: HfConfig) -> Result<Qwen38NativeConfig> {
     require_config_eq(
         "architectures",
         config.architectures,
@@ -268,8 +268,8 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen35NativeConfig> {
     let layer_types = actual_layers
         .into_iter()
         .map(|kind| match kind {
-            "linear_attention" => Qwen35LayerType::LinearAttention,
-            "full_attention" => Qwen35LayerType::FullAttention,
+            "linear_attention" => Qwen38LayerType::LinearAttention,
+            "full_attention" => Qwen38LayerType::FullAttention,
             _ => unreachable!("layer types were checked above"),
         })
         .collect::<Vec<_>>();
@@ -333,7 +333,7 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen35NativeConfig> {
         .linear_num_value_heads
         .checked_mul(text.linear_value_head_dim)
         .ok_or_else(|| config_error("text_config.linear_num_value_heads", "dimension overflow"))?;
-    let runtime = Qwen35TextConfig {
+    let runtime = Qwen38TextConfig {
         architecture: "qwen3_5".to_string(),
         block_count: text.num_hidden_layers,
         context_length: text.max_position_embeddings,
@@ -355,7 +355,7 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen35NativeConfig> {
         full_attention_interval: text.full_attention_interval,
     };
 
-    Ok(Qwen35NativeConfig {
+    Ok(Qwen38NativeConfig {
         text: runtime,
         layer_types,
         vocab_size: text.vocab_size,
@@ -394,7 +394,7 @@ fn require_config_float(field: &str, actual: f64, expected: f64) -> Result<()> {
 
 fn config_error(field: &str, detail: impl std::fmt::Display) -> Error {
     Error::ModelLoadError(format!(
-        "Unsupported native Qwen3.5 config field `{field}`: {detail}"
+        "Unsupported native Qwen3.8 config field `{field}`: {detail}"
     ))
 }
 
@@ -698,12 +698,12 @@ impl IndexedSafetensors {
         })
     }
 
-    pub fn validate_required_text_tensor_names(&self, config: &Qwen35NativeConfig) -> Result<()> {
+    pub fn validate_required_text_tensor_names(&self, config: &Qwen38NativeConfig) -> Result<()> {
         let required = required_text_tensor_names(config);
         for name in &required {
             if !self.contains_tensor(name) {
                 return Err(Error::ModelLoadError(format!(
-                    "Native Qwen3.5 text checkpoint is missing required tensor `{name}`"
+                    "Native Qwen3.8 text checkpoint is missing required tensor `{name}`"
                 )));
             }
         }
@@ -715,7 +715,7 @@ impl IndexedSafetensors {
                 && !required.contains(name)
             {
                 return Err(Error::ModelLoadError(format!(
-                    "Native Qwen3.5 text checkpoint has unexpected scale tensor `{name}`"
+                    "Native Qwen3.8 text checkpoint has unexpected scale tensor `{name}`"
                 )));
             }
         }
@@ -733,14 +733,14 @@ impl IndexedSafetensors {
 /// Validated config and index for the native checkpoint. Vision and MTP names
 /// remain indexed but are intentionally not required by the text-only slice.
 #[derive(Debug, Clone)]
-pub struct Qwen35NativeCheckpoint {
-    pub config: Qwen35NativeConfig,
+pub struct Qwen38NativeCheckpoint {
+    pub config: Qwen38NativeConfig,
     pub tensors: IndexedSafetensors,
 }
 
-impl Qwen35NativeCheckpoint {
+impl Qwen38NativeCheckpoint {
     pub fn open(model_dir: &Path) -> Result<Self> {
-        let config = Qwen35NativeConfig::load(model_dir)?;
+        let config = Qwen38NativeConfig::load(model_dir)?;
         let tensors = IndexedSafetensors::open(model_dir)?;
         tensors.validate_required_text_tensor_names(&config)?;
         Ok(Self { config, tensors })
@@ -793,7 +793,7 @@ fn validate_shard_file(model_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn required_text_tensor_names(config: &Qwen35NativeConfig) -> HashSet<String> {
+fn required_text_tensor_names(config: &Qwen38NativeConfig) -> HashSet<String> {
     let mut names = HashSet::new();
     names.insert("model.language_model.embed_tokens.weight".to_string());
     names.insert("model.language_model.norm.weight".to_string());
@@ -806,7 +806,7 @@ fn required_text_tensor_names(config: &Qwen35NativeConfig) -> HashSet<String> {
             insert_projection_pair(&mut names, format!("{prefix}.mlp.{projection}.weight"));
         }
         match layer_type {
-            Qwen35LayerType::LinearAttention => {
+            Qwen38LayerType::LinearAttention => {
                 for suffix in [
                     "linear_attn.A_log",
                     "linear_attn.dt_bias",
@@ -824,7 +824,7 @@ fn required_text_tensor_names(config: &Qwen35NativeConfig) -> HashSet<String> {
                     );
                 }
             }
-            Qwen35LayerType::FullAttention => {
+            Qwen38LayerType::FullAttention => {
                 names.insert(format!("{prefix}.self_attn.q_norm.weight"));
                 names.insert(format!("{prefix}.self_attn.k_norm.weight"));
                 for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
@@ -1075,7 +1075,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "izwi-qwen35-native-{label}-{}-{nonce}",
+                "izwi-qwen38-native-{label}-{}-{nonce}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn parses_and_maps_the_frozen_native_config() {
-        let config = Qwen35NativeConfig::from_json(&valid_config_json()).unwrap();
+        let config = Qwen38NativeConfig::from_json(&valid_config_json()).unwrap();
         assert_eq!(config.text.block_count, 64);
         assert_eq!(config.text.embedding_length, 5_120);
         assert_eq!(config.text.ssm_group_count, 16);
@@ -1200,7 +1200,7 @@ mod tests {
             config
                 .layer_types
                 .iter()
-                .filter(|kind| **kind == Qwen35LayerType::FullAttention)
+                .filter(|kind| **kind == Qwen38LayerType::FullAttention)
                 .count(),
             16
         );
@@ -1210,7 +1210,7 @@ mod tests {
     fn rejects_changed_layer_pattern_with_field_specific_error() {
         let mut value: serde_json::Value = serde_json::from_slice(&valid_config_json()).unwrap();
         value["text_config"]["layer_types"][0] = json!("full_attention");
-        let error = Qwen35NativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
+        let error = Qwen38NativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
             .to_string();
         assert!(error.contains("text_config.layer_types"), "{error}");
@@ -1220,7 +1220,7 @@ mod tests {
     fn rejects_changed_quantization_contract() {
         let mut value: serde_json::Value = serde_json::from_slice(&valid_config_json()).unwrap();
         value["quantization_config"]["activation_scheme"] = json!("static");
-        let error = Qwen35NativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
+        let error = Qwen38NativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
             .to_string();
         assert!(

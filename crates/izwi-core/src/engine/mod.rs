@@ -132,8 +132,7 @@ pub use types::{
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::chat::Qwen35PreparedPrompt;
-use crate::models::registry::{ChatModelLease, ModelRegistry};
+use crate::models::registry::{ChatModelLease, ModelRegistry, NativeChatPreparedPrompt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -681,7 +680,7 @@ impl Engine {
                 &EngineCoreRequest,
             ) -> Result<(
                 Vec<TokenId>,
-                Option<Qwen35PreparedPrompt>,
+                Option<NativeChatPreparedPrompt>,
                 Option<(ChatModelLease, usize)>,
             )> + Send
             + 'static,
@@ -731,12 +730,12 @@ impl Engine {
             // running on Tokio's blocking pool.
             let _permit = permit;
             let mut request = request;
-            let (prompt_tokens, prepared_qwen35_prompt, model) = prepare(&request)?;
+            let (prompt_tokens, prepared_chat_prompt, model) = prepare(&request)?;
             if let Some((model, context_limit)) = model {
                 request.install_chat_execution_preparation_with_model(
                     model_variant,
                     prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
                     model,
                     context_limit,
                 )?;
@@ -745,7 +744,7 @@ impl Engine {
                 request.install_chat_execution_preparation(
                     model_variant,
                     prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
                     4096,
                 )?;
                 #[cfg(not(test))]
@@ -901,11 +900,11 @@ impl Engine {
                             configured_context_limit,
                             model.max_context_tokens()?,
                         )?);
-                let (prompt_tokens, prepared_qwen35_prompt) = model
+                let (prompt_tokens, prepared_chat_prompt) = model
                     .prepare_prompt_for_execution(messages, &request.chat_generation_config())?;
                 Ok((
                     prompt_tokens,
-                    prepared_qwen35_prompt,
+                    prepared_chat_prompt,
                     Some((model, context_limit)),
                 ))
             },

@@ -5068,6 +5068,25 @@ pub fn try_qwen35_causal_conv_sequence(
     weight: &Tensor,
     history: &Tensor,
 ) -> Option<(Tensor, Tensor)> {
+    try_qwen_hybrid_causal_conv_sequence(input, weight, history)
+}
+
+/// Run Qwen3.8's independently routed causal depthwise-convolution sequence
+/// path. The entry point is intentionally separate so Qwen3.8 kernel policy
+/// and specialization can evolve without changing Qwen3.5 dispatch.
+pub fn try_qwen38_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    try_qwen_hybrid_causal_conv_sequence(input, weight, history)
+}
+
+fn try_qwen_hybrid_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
     #[cfg(not(feature = "metal"))]
     let _ = (input, weight, history);
 

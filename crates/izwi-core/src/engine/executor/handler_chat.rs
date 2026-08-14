@@ -143,7 +143,7 @@ impl NativeExecutor {
                 "managed chat tensor state requires its exact row reservation".into(),
             ));
         }
-        let prepared_qwen35_prompt = request.prepared_qwen35_prompt_for_executor()?;
+        let prepared_chat_prompt = request.prepared_chat_prompt_for_executor()?;
         let variant = Self::resolve_variant(request)?;
         let messages = Self::chat_messages(request)?;
         let max_new_tokens = request.params.max_tokens.max(1);
@@ -297,8 +297,8 @@ impl NativeExecutor {
             if let (Some(arena), Some(reservation)) = (tensor_arena.as_ref(), tensor_reservation) {
                 state
                     .state
-                    .bind_qwen35_tensor_sequence(reservation.sequence)?;
-                state.state.restore_qwen35_tensor_state(arena)?;
+                    .bind_hybrid_tensor_sequence(reservation.sequence)?;
+                state.state.restore_hybrid_tensor_state(arena)?;
             }
             state
         } else {
@@ -314,7 +314,18 @@ impl NativeExecutor {
                             messages,
                             max_new_tokens,
                             &generation_config,
-                            prepared_qwen35_prompt,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35()),
+                            cache,
+                        )
+                    })?
+                }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen38(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_qwen38_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
                             cache,
                         )
                     })?
@@ -334,7 +345,7 @@ impl NativeExecutor {
                 }
             };
             if let Some(reservation) = tensor_reservation {
-                decode_state.bind_qwen35_tensor_sequence(reservation.sequence)?;
+                decode_state.bind_hybrid_tensor_sequence(reservation.sequence)?;
             }
             ActiveChatDecode {
                 variant,
@@ -413,7 +424,7 @@ impl NativeExecutor {
         if let Some(arena) = tensor_arena.as_ref() {
             active_state
                 .state
-                .stage_qwen35_tensor_state(arena, scheduled.plan_id)?;
+                .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
         }
         let managed_cache_completions = active_state.state.take_managed_write_completions();
         if !finished {

@@ -314,6 +314,22 @@ pub fn try_qwen35_causal_conv_sequence(
     weight: &Tensor,
     history: &Tensor,
 ) -> Option<(Tensor, Tensor)> {
+    try_qwen_hybrid_causal_conv_sequence(input, weight, history)
+}
+
+pub fn try_qwen38_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    try_qwen_hybrid_causal_conv_sequence(input, weight, history)
+}
+
+fn try_qwen_hybrid_causal_conv_sequence(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
     if !cuda_tensor_pair_supported(input, weight)
         || !cuda_tensor_pair_supported(input, history)
         || input.dtype() != DType::F32
