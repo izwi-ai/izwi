@@ -782,14 +782,14 @@ mod tests {
     use izwi_core::LoadedModelDiagnostics;
 
     #[test]
-    fn admin_model_runtime_diagnostics_preserve_actual_and_policy_values() {
+    fn admin_model_runtime_diagnostics_preserve_qwen38_family_and_policy_values() {
         let diagnostics = LoadedModelDiagnostics {
-            variant_id: ModelVariant::Qwen306BGguf.dir_name().to_string(),
-            variant: ModelVariant::Qwen306BGguf.to_string(),
-            family: "qwen3_chat",
+            variant_id: ModelVariant::Qwen3827BFp8.dir_name().to_string(),
+            variant: ModelVariant::Qwen3827BFp8.to_string(),
+            family: "qwen38_chat",
             task: "chat",
             handle_kind: "native_chat",
-            loaded_model_kind: "qwen3_chat",
+            loaded_model_kind: "qwen38_chat",
             backend_kind: "cuda".to_string(),
             device_kind: "Cuda".to_string(),
             actual_device_kind: Some("cuda".to_string()),
@@ -802,11 +802,17 @@ mod tests {
             family_diagnostics: None,
         };
         let model = AdminModelInfo::from_model_info(
-            ModelInfo::new(ModelVariant::Qwen306BGguf),
+            ModelInfo::new(ModelVariant::Qwen3827BFp8),
             Some(serde_json::to_value(diagnostics).expect("serialize runtime diagnostics")),
         );
 
         let value = serde_json::to_value(model).expect("serialize admin model");
+        assert_eq!(value["variant"], "Qwen3.8-27B-FP8");
+        assert_eq!(value["runtime_diagnostics"]["family"], "qwen38_chat");
+        assert_eq!(
+            value["runtime_diagnostics"]["loaded_model_kind"],
+            "qwen38_chat"
+        );
         assert_eq!(value["runtime_diagnostics"]["actual_compute_dtype"], "f16");
         assert_eq!(
             value["runtime_diagnostics"]["default_compute_dtype"],

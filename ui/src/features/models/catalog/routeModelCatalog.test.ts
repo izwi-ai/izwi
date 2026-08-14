@@ -26,6 +26,9 @@ describe("route model catalog", () => {
     expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.capabilities).not.toContain(
       "Multimodal",
     );
+    expect(MODEL_DETAILS["Qwen3.8-27B-FP8"]?.description).not.toContain(
+      "Qwen3.5",
+    );
   });
 
   it("prioritizes Qwen3-8B as the default chat pick", () => {

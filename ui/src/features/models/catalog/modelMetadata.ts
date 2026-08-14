@@ -293,7 +293,8 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
   "Qwen3.8-27B-FP8": {
     shortName: "Qwen3.8 27B",
     fullName: "Qwen3.8 27B (Block FP8)",
-    description: "Large Qwen3.8 reasoning model with block-scaled FP8 weights",
+    description:
+      "Large dedicated Qwen3.8 text-chat architecture with block-scaled FP8 weights",
     category: "chat",
     capabilities: ["Text Chat", "Thinking", "Tool Calling", "FP8"],
     size: "28.74 GiB",

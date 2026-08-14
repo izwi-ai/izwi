@@ -881,6 +881,10 @@ Batch runtime metrics include `queued_stages`, `jobs_by_status`,
 
 Preview local admin routes. Use these routes as the OSS model lifecycle and discovery surface for voice apps: each model record includes local status, broad modalities, speech-generation capabilities when present, and route-level capability booleans.
 
+When a model is loaded, `runtime_diagnostics.family` preserves its runtime
+family identity. Qwen3.8 reports `qwen38_chat`; clients must not collapse that
+value into the distinct `qwen35_chat` family.
+
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/v1/admin/models` | List known enabled variants, local status, modalities, and route capabilities. |

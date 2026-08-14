@@ -66,6 +66,9 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | LFM2.5 text | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
 | Gemma | `Gemma-3-1b-it` |
 
+`Qwen3.8-27B-FP8` uses the separate `Qwen38Chat` architecture/model family.
+Qwen3.5 compatibility or backend evidence is not applied to it implicitly.
+
 ### Currently Disabled (Not Listed by `izwi list`)
 
 These variants exist in the catalog but are not currently enabled for standard listing/download:

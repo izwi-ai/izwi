@@ -117,6 +117,7 @@ The load path currently publishes ABI-v2 state as follows:
 |---|---|---|
 | **Qwen3 chat** | Retained paged KV | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3.5 chat** | Composite retained paged/ring state | Portable route validated; eligible CUDA paged cells remain unverified until NVIDIA evidence is retained |
+| **Qwen3.8 chat (`Qwen38Chat`)** | Composite retained paged/tensor state under an independent family contract | Separate conformance and backend evidence required; Qwen3.5 results do not certify this family |
 | **Gemma 3 chat** | Retained paged KV with model-declared attention semantics | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3 ASR** | Retained paged state plus bounded invocation workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
 | **Qwen3 TTS** | Retained paged predictor state plus bounded invocation state/workspace | Portable route validated; eligible CUDA cells remain unverified until NVIDIA evidence is retained |
@@ -142,6 +143,7 @@ current native CUDA ceilings are:
 |---|---:|---|
 | Qwen3 chat | 40,960 tokens | [Official Qwen3 config](https://huggingface.co/Qwen/Qwen3-4B/blob/main/config.json) |
 | Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
+| Qwen3.8 chat | 262,144 logical tokens; effective context is resource-fitted | [Pinned official Qwen3.8 config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json) |
 | LFM2.5 chat | 128,000 tokens | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
 | Gemma 3 1B / 4B | 32,768 / 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
 
@@ -208,7 +210,7 @@ Use the following expectations when validating a host:
 
 - **macOS Apple Silicon:** build or install a Metal-capable binary and run with `--backend metal` or `IZWI_BACKEND=metal`.
 - **Linux/Windows GitHub Release:** run `izwi serve --backend cpu`, then `izwi status --detailed`.
-- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches.
+- **Docker CUDA on NVIDIA Linux hosts:** run `docker compose --profile cuda up`, then confirm the container selects CUDA through `/v1/health` or `izwi status --detailed` from a matching client environment. Eligible Candle FlashAttention, Qwen3/Qwen3.5 RoPE, and Gemma RMSNorm CUDA routes activate automatically; their environment variables remain explicit rollback switches. Qwen3.8 is an independently gated family and must report its own execution path and evidence.
 - **Linux/Windows source build for CUDA:** build with `cargo build --release --features cuda`, then run with `--backend cuda` or `IZWI_BACKEND=cuda`. The `cuda` wrapper includes Candle FlashAttention, while `cudnn` additionally enables matching Candle/cuDNN convolution paths.
 
 ---

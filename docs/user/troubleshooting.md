@@ -341,7 +341,7 @@ Ensure required models are loaded:
 |---------|---------------------|
 | TTS | `*-tts-*` |
 | Transcription | `Parakeet-*`, `Whisper-*`, `Qwen3-ASR-*`, `Granite-Speech-*`, or `LFM2.5-Audio-*` |
-| Chat | `Qwen3-*`, `Qwen3.5-*`, `LFM2.5-1.2B-*`, or `Gemma-3-1b-it` |
+| Chat | `Qwen3-*`, `Qwen3.5-*`, `Qwen3.8-*`, `LFM2.5-1.2B-*`, or `Gemma-3-1b-it` |
 | Voice Cloning | `Qwen3-TTS-12Hz-*-Base*` |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign*` |
 
