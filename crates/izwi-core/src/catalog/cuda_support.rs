@@ -330,6 +330,11 @@ impl ModelVariant {
                 Provider::IzwiCudaEligible,
                 "Qwen3.5 recurrent blocks have an existing Izwi CUDA causal-convolution provider with a Candle fallback",
             ),
+            ModelFamily::Qwen38Chat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Qwen3.8 DeltaNet blocks require independently verified Izwi CUDA causal-convolution coverage with a Candle fallback; Qwen3.5 evidence is not inherited",
+            ),
             ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
                 CudaOperatorCapability::source_reviewed(
                     Operator::Convolution,
@@ -349,6 +354,7 @@ impl ModelVariant {
         let paged_provider = match family {
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Qwen3Tts
@@ -484,6 +490,7 @@ impl ModelVariant {
             | ModelFamily::VibeVoiceAsr
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm25Audio
             | ModelFamily::Gemma3Chat
@@ -723,6 +730,7 @@ mod tests {
         let quantization = variant.cuda_quantization();
 
         assert_eq!(support.level, CudaSupportLevel::CandleCudaGeneric);
+        assert_eq!(variant.family(), ModelFamily::Qwen38Chat);
         assert_eq!(
             support.execution_status,
             CudaExecutionStatus::EligibleUnverified
@@ -733,6 +741,15 @@ mod tests {
             CudaQuantizationSupportLevel::DenseDequantizedFallback
         );
         assert!(quantization.reason.contains("weight_scale_inv"));
+
+        let convolution = variant
+            .cuda_operator_capabilities()
+            .into_iter()
+            .find(|capability| capability.operator == CudaOperatorKind::Convolution)
+            .expect("Qwen3.8 convolution capability");
+        assert_eq!(convolution.provider, CudaProviderClass::IzwiCudaEligible);
+        assert!(convolution.reason.contains("Qwen3.8"));
+        assert!(convolution.reason.contains("not inherited"));
     }
 
     #[test]

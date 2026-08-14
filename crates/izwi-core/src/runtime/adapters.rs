@@ -166,7 +166,7 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        Qwen3Chat | Qwen35Chat | Gemma3Chat => FamilyInferenceStatePolicy {
+        Qwen3Chat | Qwen35Chat | Qwen38Chat | Gemma3Chat => FamilyInferenceStatePolicy {
             chat: Retained,
             ..FamilyInferenceStatePolicy::STATELESS
         },
@@ -409,7 +409,10 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
 fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
     if matches!(
         model_variant.family(),
-        ModelFamily::Qwen3Chat | ModelFamily::Qwen35Chat | ModelFamily::Gemma3Chat
+        ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
+            | ModelFamily::Gemma3Chat
     ) {
         SequenceExecutionMode::Always
     } else {

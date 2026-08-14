@@ -58,6 +58,9 @@ fn certified_topology(
         // Qwen3.5 commits full-attention pages, recurrent state, and
         // convolution state as one composite transaction.
         (Qwen35Chat, Chat) => RetainedPagedTensorTensor,
+        // Qwen3.8 owns an independent implementation of the same three-state
+        // topology so either family can optimize its representation separately.
+        (Qwen38Chat, Chat) => RetainedPagedTensorTensor,
         // Gemma alternates full and sliding-window pages; every layer carries
         // the loaded attention softcap in the paged semantic contract.
         (Gemma3Chat, Chat) => RetainedPaged,

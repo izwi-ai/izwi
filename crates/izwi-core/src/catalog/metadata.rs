@@ -655,6 +655,7 @@ impl ModelVariant {
             self.family(),
             crate::catalog::ModelFamily::Qwen3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
         )
@@ -1214,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_fp8_catalog_contract_is_enabled_native_qwen35_chat() {
+    fn qwen38_fp8_catalog_contract_has_distinct_chat_family() {
         let variant = ModelVariant::Qwen3827BFp8;
 
         assert!(variant.is_enabled());
@@ -1223,6 +1224,7 @@ mod tests {
         assert!(!variant.is_gguf());
         assert!(variant.is_qwen38_fp8());
         assert!(!variant.is_qwen35_chat_gguf());
+        assert_eq!(variant.family(), crate::catalog::ModelFamily::Qwen38Chat);
         assert_eq!(variant.repo_id(), "Qwen/Qwen3.8-27B-FP8");
         assert_eq!(variant.dir_name(), "Qwen3.8-27B-FP8");
         assert_eq!(variant.display_name(), "Qwen3.8 27B FP8");

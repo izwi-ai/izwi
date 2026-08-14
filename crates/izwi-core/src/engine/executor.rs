@@ -1306,7 +1306,11 @@ impl ModelExecutor for NativeExecutor {
         let implementation_incremental =
             loaded_incremental.unwrap_or_else(|| match request.task_type {
                 super::types::TaskType::Chat => {
-                    matches!(variant.family(), crate::catalog::ModelFamily::Qwen35Chat)
+                    matches!(
+                        variant.family(),
+                        crate::catalog::ModelFamily::Qwen35Chat
+                            | crate::catalog::ModelFamily::Qwen38Chat
+                    )
                         || matches!(
                             variant,
                             ModelVariant::Qwen306B

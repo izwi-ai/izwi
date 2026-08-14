@@ -824,6 +824,7 @@ impl ModelDownloader {
                 .exists(),
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen_chat_gguf() {
@@ -1435,6 +1436,7 @@ impl ModelDownloader {
             ],
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen38_fp8() {

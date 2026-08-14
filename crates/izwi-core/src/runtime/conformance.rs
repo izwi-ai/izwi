@@ -358,6 +358,7 @@ fn retained_state_expectation(
         },
         ModelFamily::Qwen3Chat
         | ModelFamily::Qwen35Chat
+        | ModelFamily::Qwen38Chat
         | ModelFamily::Lfm2Chat
         | ModelFamily::Gemma3Chat => match capability {
             Capability::Chat => Managed,

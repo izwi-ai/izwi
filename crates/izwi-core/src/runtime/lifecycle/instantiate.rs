@@ -49,6 +49,7 @@ impl ModelLifecycleController {
             }
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
                 self.model_registry.load_chat(variant, &model_path).await?;

@@ -3181,6 +3181,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
         ModelFamily::Qwen35Chat => "qwen35_chat",
+        ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",
         ModelFamily::Lfm25Audio => "lfm25_audio",
         ModelFamily::Gemma3Chat => "gemma3_chat",

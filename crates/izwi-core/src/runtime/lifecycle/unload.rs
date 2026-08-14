@@ -59,6 +59,7 @@ impl ModelLifecycleController {
             }
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
                 self.model_registry.unload_chat(variant).await;
@@ -103,9 +104,13 @@ impl ModelLifecycleController {
 
     async fn purge_executor_model_cache(&self, variant: ModelVariant) -> Result<()> {
         let release = self.core_engine.purge_model_cache(variant).await;
-        if variant.family() == ModelFamily::Qwen35Chat && !release.confirmed {
+        if matches!(
+            variant.family(),
+            ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+        ) && !release.confirmed
+        {
             return Err(Error::InferenceError(format!(
-                "Qwen3.5 cache purge was not confirmed before unloading {variant}"
+                "Qwen hybrid chat cache purge was not confirmed before unloading {variant}"
             )));
         }
         Ok(())

@@ -20,6 +20,7 @@ pub enum ModelFamily {
     SortformerDiarization,
     Qwen3Chat,
     Qwen35Chat,
+    Qwen38Chat,
     Lfm2Chat,
     Lfm25Audio,
     Gemma3Chat,
@@ -118,9 +119,8 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
-            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf | Qwen3827BFp8 => {
-                ModelFamily::Qwen35Chat
-            }
+            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
+            Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
@@ -145,6 +145,7 @@ impl ModelVariant {
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => ModelTask::Chat,
             ModelFamily::Qwen3ForcedAligner => ModelTask::ForcedAlign,
@@ -760,7 +761,7 @@ mod tests {
         ] {
             let parsed = parse_chat_model_variant(Some(alias)).expect("Qwen3.8 chat alias");
             assert_eq!(parsed, ModelVariant::Qwen3827BFp8, "alias {alias}");
-            assert_eq!(parsed.family(), ModelFamily::Qwen35Chat);
+            assert_eq!(parsed.family(), ModelFamily::Qwen38Chat);
             assert_eq!(parsed.primary_task(), ModelTask::Chat);
         }
     }
