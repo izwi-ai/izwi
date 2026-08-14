@@ -138,6 +138,15 @@ free -h
 
 Try a smaller model or close other applications.
 
+For `Qwen3.8-27B-FP8` on CUDA, inspect the loaded entry returned by
+`/v1/health`. A successful compressed load reports
+`family_diagnostics.resident_representation` as
+`q8_0_requantized_projections_with_dense_bf16` and
+`fp8_execution_mode` as `q8_0_compressed_fallback`. This is intended for
+40/48 GB-class devices with a resource-fitted context, but admission can still
+fail when free VRAM or allocator headroom is insufficient. It is not a native
+FP8 mode; see the [support matrix](/support-matrix#qwen38-cuda-weight-residency).
+
 **Corrupted model:**
 ```bash
 izwi rm <model-name>

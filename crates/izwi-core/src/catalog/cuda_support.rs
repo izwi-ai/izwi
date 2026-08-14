@@ -452,7 +452,7 @@ impl ModelVariant {
         if self.is_qwen38_fp8() {
             return CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
-                "Qwen3.8 FP8 is eligible for the dedicated block-scaled weight path and its explicit dense fallback on Candle CUDA; source review is not runtime validation",
+                "Qwen3.8 block-scaled FP8 is eligible on Candle CUDA through a scale-aware Q8_0 compressed projection fallback; this is not native FP8 execution, and source review is not runtime validation",
             );
         }
 
@@ -516,8 +516,8 @@ impl ModelVariant {
 
         if self.is_qwen38_fp8() {
             return CudaQuantizationInfo::new(
-                CudaQuantizationSupportLevel::DenseDequantizedFallback,
-                "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA must apply weight_scale_inv through the dedicated path or materialize the explicit BF16/F16 fallback",
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv before converting projections to resident Q8_0 Candle weights, a compressed fallback rather than native FP8 execution",
             );
         }
 
@@ -724,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_fp8_cuda_metadata_does_not_inherit_gguf_quantization_claims() {
+    fn qwen38_fp8_cuda_metadata_reports_q8_0_compressed_fallback() {
         let variant = ModelVariant::Qwen3827BFp8;
         let support = variant.cuda_support();
         let quantization = variant.cuda_quantization();
@@ -736,11 +736,22 @@ mod tests {
             CudaExecutionStatus::EligibleUnverified
         );
         assert!(support.reason.contains("block-scaled"));
+        assert!(support.reason.contains("scale-aware Q8_0"));
+        assert!(support.reason.contains("not native FP8"));
         assert_eq!(
             quantization.level,
-            CudaQuantizationSupportLevel::DenseDequantizedFallback
+            CudaQuantizationSupportLevel::CandleQuantizedGeneric
         );
         assert!(quantization.reason.contains("weight_scale_inv"));
+        assert!(quantization.reason.contains("Q8_0"));
+        assert!(quantization.reason.contains("rather than native FP8"));
+
+        let quantized_gemm = variant
+            .cuda_operator_capabilities()
+            .into_iter()
+            .find(|capability| capability.operator == CudaOperatorKind::QuantizedGemm)
+            .expect("Qwen3.8 quantized GEMM capability");
+        assert_eq!(quantized_gemm.provider, CudaProviderClass::CandleTensor);
 
         let convolution = variant
             .cuda_operator_capabilities()

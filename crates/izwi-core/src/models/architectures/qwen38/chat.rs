@@ -30,7 +30,7 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen38_composite_cache_contract;
 use super::native::{Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
-use super::text::{Qwen38TextModel, Qwen38TextRuntimeState};
+use super::text::{Qwen38ProjectionRepresentation, Qwen38TextModel, Qwen38TextRuntimeState};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
@@ -357,6 +357,32 @@ pub struct Qwen38ChatModel {
     text_model: Qwen38TextModel,
 }
 
+fn qwen38_fp8_execution_mode(
+    projection_representation: Qwen38ProjectionRepresentation,
+) -> &'static str {
+    match projection_representation {
+        Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => "q8_0_compressed_fallback",
+        Qwen38ProjectionRepresentation::ExpandedF32
+        | Qwen38ProjectionRepresentation::ExpandedF16
+        | Qwen38ProjectionRepresentation::ExpandedBf16 => "expanded_fallback",
+    }
+}
+
+fn qwen38_fp8_fallback_reason(
+    projection_representation: Qwen38ProjectionRepresentation,
+) -> &'static str {
+    match projection_representation {
+        Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => {
+            "CUDA applies weight_scale_inv during scale-aware FP8 dequantization and then requantizes projections to Q8_0 for Candle execution; native FP8 execution is not runtime-certified"
+        }
+        Qwen38ProjectionRepresentation::ExpandedF32
+        | Qwen38ProjectionRepresentation::ExpandedF16
+        | Qwen38ProjectionRepresentation::ExpandedBf16 => {
+            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
+        }
+    }
+}
+
 impl InferenceStateContractProvider for Qwen38ChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         let dtype = match self.device_kind {
@@ -381,15 +407,19 @@ impl Qwen38ChatModel {
         let text_config = checkpoint.config.text.clone();
         let text_model =
             Qwen38TextModel::load_native(&checkpoint.tensors, &checkpoint.config, &device.device)?;
+        let projection_representation = text_model.projection_representation();
+        let device_kind = BackendKind::from(device.kind);
         info!(
             variant = %variant,
             backend = ?device.kind,
             revision = QWEN38_27B_FP8_REVISION,
             tensors = checkpoint.tensors.tensor_count(),
-            "Loaded native Qwen3.8 text checkpoint with expanded block-FP8 projections"
+            resident_representation = projection_representation.as_str(),
+            fp8_execution_mode = qwen38_fp8_execution_mode(projection_representation),
+            "Loaded native Qwen3.8 text checkpoint"
         );
         Ok(Self {
-            device_kind: BackendKind::from(device.kind),
+            device_kind,
             variant,
             tokenizer,
             text_config,
@@ -449,16 +479,13 @@ impl Qwen38ChatModel {
     }
 
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        let projection_representation = self.text_model.projection_representation();
         serde_json::json!({
             "checkpoint_revision": QWEN38_27B_FP8_REVISION,
             "checkpoint_format": "safetensors_block_fp8",
-            "resident_representation": match self.device_kind {
-                BackendKind::Cpu => "expanded_f32",
-                BackendKind::Metal => "expanded_f16",
-                BackendKind::Cuda => "expanded_bf16",
-            },
-            "fp8_execution_mode": "expanded_fallback",
-            "fallback_reason": "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path",
+            "resident_representation": projection_representation.as_str(),
+            "fp8_execution_mode": qwen38_fp8_execution_mode(projection_representation),
+            "fallback_reason": qwen38_fp8_fallback_reason(projection_representation),
             "vision_enabled": false,
         })
     }
@@ -1247,6 +1274,53 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reused.prompt_ids(), prepared.prompt_ids());
+    }
+
+    #[test]
+    fn cuda_diagnostics_identify_q8_0_fallback_without_changing_portable_modes() {
+        let cuda_representation = Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16;
+        assert_eq!(
+            cuda_representation.as_str(),
+            "q8_0_requantized_projections_with_dense_bf16"
+        );
+        assert_eq!(
+            qwen38_fp8_execution_mode(cuda_representation),
+            "q8_0_compressed_fallback"
+        );
+        assert!(qwen38_fp8_fallback_reason(cuda_representation).contains("weight_scale_inv"));
+        assert!(qwen38_fp8_fallback_reason(cuda_representation)
+            .contains("native FP8 execution is not runtime-certified"));
+
+        assert_eq!(
+            Qwen38ProjectionRepresentation::ExpandedF32.as_str(),
+            "expanded_f32"
+        );
+        assert_eq!(
+            Qwen38ProjectionRepresentation::ExpandedF16.as_str(),
+            "expanded_f16"
+        );
+        assert_eq!(
+            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedF32),
+            "expanded_fallback"
+        );
+        assert_eq!(
+            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedF16),
+            "expanded_fallback"
+        );
+        assert_eq!(
+            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedBf16),
+            "expanded_fallback"
+        );
+        let expanded_reason =
+            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path";
+        assert_eq!(
+            qwen38_fp8_fallback_reason(Qwen38ProjectionRepresentation::ExpandedF32),
+            expanded_reason
+        );
+        assert_eq!(
+            qwen38_fp8_fallback_reason(Qwen38ProjectionRepresentation::ExpandedF16),
+            expanded_reason
+        );
     }
 
     #[test]

@@ -885,6 +885,14 @@ When a model is loaded, `runtime_diagnostics.family` preserves its runtime
 family identity. Qwen3.8 reports `qwen38_chat`; clients must not collapse that
 value into the distinct `qwen35_chat` family.
 
+For a CUDA-loaded Qwen3.8 model,
+`runtime_diagnostics.family_diagnostics.resident_representation` is
+`q8_0_requantized_projections_with_dense_bf16` and `fp8_execution_mode` is
+`q8_0_compressed_fallback`. The accompanying `fallback_reason` records that
+the runtime applied the block scales before Q8_0 requantization. These values
+describe a compressed Candle fallback, not native FP8 execution. CPU and Metal
+continue to report `expanded_f32` and `expanded_f16` respectively.
+
 | Method | Path | Notes |
 |--------|------|-------|
 | `GET` | `/v1/admin/models` | List known enabled variants, local status, modalities, and route capabilities. |

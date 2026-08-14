@@ -88,6 +88,23 @@ and realtime route families. Detailed preview behavior is documented in the
 - The Docker CUDA image/profile is the CUDA distribution path for NVIDIA Linux hosts and may require `CUDA_COMPUTE_CAP` when built on a machine without `nvidia-smi`.
 - On macOS, the recommended GPU path is Metal, not CUDA.
 
+### Qwen3.8 CUDA weight residency
+
+`Qwen3.8-27B-FP8` keeps its official block-scaled FP8 checkpoint as the source
+artifact, but the current CUDA path does not execute native FP8 matrix
+multiplication. It applies each projection's `weight_scale_inv`, requantizes
+the projection to resident Candle Q8_0 weights, and retains source-dense tensors
+as BF16. Runtime diagnostics identify this as
+`resident_representation: q8_0_requantized_projections_with_dense_bf16` and
+`fp8_execution_mode: q8_0_compressed_fallback`.
+
+This compressed fallback is designed to fit 40/48 GB-class CUDA devices with a
+resource-fitted context, subject to actual free VRAM and allocator headroom. It
+must not be described as native FP8 execution or as CUDA-certified until the
+corresponding NVIDIA evidence is retained. The earlier fully expanded BF16
+weight plan required an 80 GB-class device; CPU and Metal continue to use their
+expanded F32 and F16 representations respectively.
+
 ---
 
 ## Managed Inference-State Support
@@ -148,10 +165,11 @@ current native CUDA ceilings are:
 | Gemma 3 1B / 4B | 32,768 / 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
 
 Optional YaRN extensions are not included: the local adapters do not implement
-their scaling parameters. CUDA reserves enough paged KV capacity for the
-largest native context before publishing a model as ready. This can require
-substantial VRAM and may make model loading fail on a smaller GPU rather than
-silently reducing the context.
+their scaling parameters. Qwen3.8 fits its effective context to remaining
+resources without changing the 262,144-token logical maximum. Other CUDA chat
+routes reserve their selected paged KV capacity before publishing a model as
+ready. Explicit context requests still fail when the requested state cannot
+fit; the runtime does not overcommit VRAM.
 
 For audio generation, automatic output budgets remain bounded. Explicit CUDA
 requests can use the 32,768-token LFM2.5 Audio and Fish S2 contexts; Voxtral TTS

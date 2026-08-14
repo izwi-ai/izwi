@@ -143,7 +143,9 @@ streaming sequence.
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
-capabilities.
+capabilities. Its CUDA deployment uses a
+[scale-aware Q8_0 compressed fallback](/support-matrix#qwen38-cuda-weight-residency),
+not native FP8 execution.
 
 ---
 
@@ -158,7 +160,7 @@ capabilities.
 ## Tips
 
 1. Use `izwi list` to pick a currently enabled model ID.
-2. Use stronger models (`Qwen3-8B-GGUF`, `Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory.
+2. Use stronger models (`Qwen3-8B-GGUF`, `Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory; check the [Qwen3.8 CUDA residency requirements](/support-matrix#qwen38-cuda-weight-residency) before deploying the 27B checkpoint.
 3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`) for low-latency usage.
 
 ---

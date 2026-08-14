@@ -799,7 +799,12 @@ mod tests {
             effective_context_tokens: None,
             supports_incremental_decode: Some(true),
             supports_realtime_stream_decode: None,
-            family_diagnostics: None,
+            family_diagnostics: Some(serde_json::json!({
+                "checkpoint_format": "safetensors_block_fp8",
+                "resident_representation": "q8_0_requantized_projections_with_dense_bf16",
+                "fp8_execution_mode": "q8_0_compressed_fallback",
+                "fallback_reason": "native FP8 execution is not runtime-certified",
+            })),
         };
         let model = AdminModelInfo::from_model_info(
             ModelInfo::new(ModelVariant::Qwen3827BFp8),
@@ -817,6 +822,19 @@ mod tests {
         assert_eq!(
             value["runtime_diagnostics"]["default_compute_dtype"],
             "bf16"
+        );
+        assert_eq!(
+            value["runtime_diagnostics"]["family_diagnostics"]["resident_representation"],
+            "q8_0_requantized_projections_with_dense_bf16"
+        );
+        assert_eq!(
+            value["runtime_diagnostics"]["family_diagnostics"]["fp8_execution_mode"],
+            "q8_0_compressed_fallback"
+        );
+        assert!(
+            value["runtime_diagnostics"]["family_diagnostics"]["fallback_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not runtime-certified"))
         );
     }
 }
