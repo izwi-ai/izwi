@@ -111,21 +111,54 @@ struct ModelMemoryEstimate {
 
 const QWEN38_FP8_ELEMENTS: u64 = 24_699_207_680;
 const QWEN38_BF16_ELEMENTS: u64 = 3_082_220_272;
-const QWEN38_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
+const QWEN38_Q8_0_BLOCK_ELEMENTS: u64 = 32;
+const QWEN38_Q8_0_BLOCK_BYTES: u64 = 34;
 
-fn qwen38_expanded_memory_estimate(backend: BackendKind) -> ModelMemoryEstimate {
-    let bytes_per_resident_element = match backend {
-        BackendKind::Cpu => 4_u64,
-        BackendKind::Metal | BackendKind::Cuda => 2_u64,
+fn qwen38_representation_memory_estimate(backend: BackendKind) -> ModelMemoryEstimate {
+    let resident_bytes = match backend {
+        BackendKind::Cpu => QWEN38_FP8_ELEMENTS
+            .checked_add(QWEN38_BF16_ELEMENTS)
+            .and_then(|elements| elements.checked_mul(4))
+            .expect("Qwen3.8 F32 residency is a compile-time bounded value"),
+        BackendKind::Metal => QWEN38_FP8_ELEMENTS
+            .checked_add(QWEN38_BF16_ELEMENTS)
+            .and_then(|elements| elements.checked_mul(2))
+            .expect("Qwen3.8 F16 residency is a compile-time bounded value"),
+        BackendKind::Cuda => {
+            // Every source FP8 matrix uses 128x128 blocks, so its element count
+            // is independently divisible by Q8_0's 32-element block width.
+            // Keep ceil division here so a future inventory remains
+            // conservative if that checkpoint invariant changes.
+            let q8_blocks = QWEN38_FP8_ELEMENTS
+                .checked_add(QWEN38_Q8_0_BLOCK_ELEMENTS - 1)
+                .expect("Qwen3.8 Q8_0 block rounding is a compile-time bounded value")
+                / QWEN38_Q8_0_BLOCK_ELEMENTS;
+            let q8_bytes = q8_blocks
+                .checked_mul(QWEN38_Q8_0_BLOCK_BYTES)
+                .expect("Qwen3.8 Q8_0 residency is a compile-time bounded value");
+            let bf16_bytes = QWEN38_BF16_ELEMENTS
+                .checked_mul(2)
+                .expect("Qwen3.8 BF16 residency is a compile-time bounded value");
+            q8_bytes
+                .checked_add(bf16_bytes)
+                .expect("Qwen3.8 CUDA residency is a compile-time bounded value")
+        }
     };
-    let resident_bytes = QWEN38_FP8_ELEMENTS
-        .checked_add(QWEN38_BF16_ELEMENTS)
-        .and_then(|elements| elements.checked_mul(bytes_per_resident_element))
-        .expect("Qwen3.8 expanded residency is a compile-time bounded value");
-    ModelMemoryEstimate {
-        load_peak_bytes: resident_bytes
-            .checked_add(QWEN38_CONVERSION_SCRATCH_BYTES)
+    let load_peak_bytes = match backend {
+        BackendKind::Cpu | BackendKind::Metal => resident_bytes
+            .checked_add(QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES)
             .expect("Qwen3.8 expanded load peak is a compile-time bounded value"),
+        // Host-side F32 decode/conversion has a separate authorization. Device
+        // load admission adds only the bounded QTensor quantize/upload overlap.
+        BackendKind::Cuda => resident_bytes
+            .checked_add(QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES)
+            .expect("Qwen3.8 CUDA load peak is a compile-time bounded value"),
+    };
+    ModelMemoryEstimate {
+        load_peak_bytes,
         resident_bytes,
     }
 }
@@ -288,7 +321,7 @@ fn portable_model_memory_estimate(
     model_path: &Path,
 ) -> Result<ModelMemoryEstimate> {
     if variant == ModelVariant::Qwen3827BFp8 {
-        return Ok(qwen38_expanded_memory_estimate(backend));
+        return Ok(qwen38_representation_memory_estimate(backend));
     }
     let catalog = model_memory_estimate(variant);
     estimate_from_tensor_inventory(catalog, checkpoint_tensor_inventory(model_path)?)
@@ -334,13 +367,14 @@ fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> M
 }
 
 fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
-    let estimate = qwen38_expanded_memory_estimate(backend);
+    let estimate = qwen38_representation_memory_estimate(backend);
     let mut plan = model_resource_plan(backend, estimate);
     if backend == BackendKind::Cuda {
-        // Expanded CUDA weights remain device-resident. Host memory only holds
-        // the callback-scoped shard/dequantization staging window, not a second
-        // full expanded checkpoint.
-        plan.load_authorization.host_bytes = ResourceAmount::Known(QWEN38_CONVERSION_SCRATCH_BYTES);
+        // CUDA retains Q8_0 projections plus the checkpoint's BF16 tensors.
+        // Host memory only holds the callback-scoped shard/dequantization and
+        // requantization window, not a second full resident representation.
+        plan.load_authorization.host_bytes =
+            ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES);
     }
     plan
 }
@@ -1750,10 +1784,12 @@ mod tests {
     use super::{
         estimate_from_tensor_inventory, is_metal_command_buffer_oom,
         loaded_asr_state_publication_route, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, qwen38_expanded_memory_estimate, qwen38_resource_plan,
+        plan_invocation_allocations, qwen38_representation_memory_estimate, qwen38_resource_plan,
         residency_budget_has_capacity, select_lru_eviction_candidate,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, QWEN38_BF16_ELEMENTS,
-        QWEN38_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
+        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
+        QWEN38_FP8_ELEMENTS, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
+        QWEN38_Q8_0_BLOCK_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1840,32 +1876,105 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_resource_plan_prices_selected_expanded_representation() {
-        let cpu = qwen38_expanded_memory_estimate(BackendKind::Cpu);
-        let metal = qwen38_expanded_memory_estimate(BackendKind::Metal);
-        let cuda = qwen38_expanded_memory_estimate(BackendKind::Cuda);
+    fn qwen38_resource_plan_prices_backend_resident_representations() {
+        let cpu = qwen38_representation_memory_estimate(BackendKind::Cpu);
+        let metal = qwen38_representation_memory_estimate(BackendKind::Metal);
+        let cuda = qwen38_representation_memory_estimate(BackendKind::Cuda);
         let elements = QWEN38_FP8_ELEMENTS + QWEN38_BF16_ELEMENTS;
+        let q8_0_bytes =
+            QWEN38_FP8_ELEMENTS.div_ceil(QWEN38_Q8_0_BLOCK_ELEMENTS) * QWEN38_Q8_0_BLOCK_BYTES;
 
         assert_eq!(cpu.resident_bytes, elements * 4);
         assert_eq!(metal.resident_bytes, elements * 2);
-        assert_eq!(cuda, metal);
+        assert_eq!(cuda.resident_bytes, q8_0_bytes + QWEN38_BF16_ELEMENTS * 2);
+        assert_eq!(cuda.resident_bytes, 32_407_348_704);
+        assert_eq!(
+            cuda.load_peak_bytes,
+            cuda.resident_bytes + QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES
+        );
+        assert_eq!(cuda.load_peak_bytes, 32_675_784_160);
         assert_eq!(
             cpu.load_peak_bytes - cpu.resident_bytes,
-            QWEN38_CONVERSION_SCRATCH_BYTES
+            QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES
         );
         assert_eq!(
             metal.load_peak_bytes - metal.resident_bytes,
-            QWEN38_CONVERSION_SCRATCH_BYTES
+            QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES
         );
         let cuda_plan = qwen38_resource_plan(BackendKind::Cuda);
         assert_eq!(
             cuda_plan.load_authorization.host_bytes,
-            ResourceAmount::Known(QWEN38_CONVERSION_SCRATCH_BYTES)
+            ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES)
+        );
+        assert_eq!(
+            cuda_plan.load_authorization.device_bytes,
+            ResourceAmount::Known(cuda.load_peak_bytes)
         );
         assert_eq!(
             cuda_plan.resident_authorization.device_bytes,
             ResourceAmount::Known(cuda.resident_bytes)
         );
+    }
+
+    #[test]
+    fn qwen38_cuda_q8_0_plan_fits_reported_l40s_available_bytes() {
+        const REPORTED_L40S_AVAILABLE_BYTES: u64 = 47_196_667_904;
+
+        let plan = qwen38_resource_plan(BackendKind::Cuda);
+        let ResourceAmount::Known(device_load_peak_bytes) = plan.load_authorization.device_bytes
+        else {
+            panic!("Qwen3.8 CUDA device load peak must be known")
+        };
+        let old_expanded_load_peak_bytes = (QWEN38_FP8_ELEMENTS + QWEN38_BF16_ELEMENTS) * 2
+            + QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES;
+        assert_eq!(
+            plan.load_authorization.host_bytes,
+            ResourceAmount::Known(8_589_934_592)
+        );
+        assert_eq!(device_load_peak_bytes, 32_675_784_160);
+        assert_eq!(old_expanded_load_peak_bytes, 56_636_597_728);
+        assert!(device_load_peak_bytes < REPORTED_L40S_AVAILABLE_BYTES);
+        assert!(old_expanded_load_peak_bytes > REPORTED_L40S_AVAILABLE_BYTES);
+
+        let l40s_capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES),
+            device_bytes: ResourceAmount::Known(REPORTED_L40S_AVAILABLE_BYTES),
+            ..ResourceVector::zero()
+        };
+        let authority = vector_authority(l40s_capacity);
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "qwen38-cuda-q8_0"),
+                plan.load_authorization,
+            )
+            .expect("Q8_0 CUDA representation should fit reported L40S headroom");
+        drop(lease);
+
+        let old_expanded = ResourceVector {
+            host_bytes: ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES),
+            device_bytes: ResourceAmount::Known(old_expanded_load_peak_bytes),
+            ..ResourceVector::zero()
+        };
+        let error = vector_authority(l40s_capacity)
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "qwen38-cuda-expanded"),
+                old_expanded,
+            )
+            .expect_err("the old expanded CUDA peak must not fit reported L40S headroom");
+        assert!(matches!(error, Error::Overloaded(_)));
+
+        let insufficient_host = ResourceVector {
+            host_bytes: ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES - 1),
+            device_bytes: ResourceAmount::Known(REPORTED_L40S_AVAILABLE_BYTES),
+            ..ResourceVector::zero()
+        };
+        let error = vector_authority(insufficient_host)
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "qwen38-cuda-host-scratch"),
+                plan.load_authorization,
+            )
+            .expect_err("CUDA load must reserve the complete 8 GiB host conversion window");
+        assert!(matches!(error, Error::Overloaded(_)));
     }
 
     #[test]
