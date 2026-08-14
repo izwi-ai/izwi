@@ -202,6 +202,14 @@ pub enum ModelVariant {
         alias = "Qwen3.5-9B-Q4_K_M.gguf"
     )]
     Qwen359BGguf,
+    /// Qwen3.8 27B hybrid chat model with block-scaled FP8 Safetensors weights.
+    #[serde(
+        rename = "Qwen3.8-27B-FP8",
+        alias = "Qwen/Qwen3.8-27B-FP8",
+        alias = "qwen3.8-27b-fp8",
+        alias = "Qwen3.8-27B"
+    )]
+    Qwen3827BFp8,
     /// Gemma 3 1B instruction-tuned chat model
     #[serde(rename = "Gemma-3-1b-it")]
     Gemma31BIt,
@@ -245,6 +253,9 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
+    /// Revision used for the first supported Qwen3.8-27B-FP8 artifact contract.
+    pub const QWEN38_27B_FP8_ARTIFACT_REVISION: &'static str =
+        "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
@@ -277,6 +288,15 @@ impl ModelVariant {
                 native_context_tokens: 65_536,
                 evidence: "Qwen/Qwen3-ASR-1.7B@c85e7e3/config.json",
             }),
+            _ => None,
+        }
+    }
+
+    /// Pinned Hugging Face artifact revision, when mutable `main` is not an
+    /// acceptable source for this variant.
+    pub fn artifact_revision(self) -> Option<&'static str> {
+        match self {
+            Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
             _ => None,
         }
     }
@@ -339,6 +359,7 @@ impl ModelVariant {
             Self::Qwen352BGguf => "unsloth/Qwen3.5-2B-GGUF",
             Self::Qwen354BGguf => "unsloth/Qwen3.5-4B-GGUF",
             Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
+            Self::Qwen3827BFp8 => "Qwen/Qwen3.8-27B-FP8",
             Self::Gemma31BIt => "google/gemma-3-1b-it",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
@@ -395,6 +416,7 @@ impl ModelVariant {
             Self::Qwen352BGguf => "Qwen3.5 2B GGUF",
             Self::Qwen354BGguf => "Qwen3.5 4B GGUF",
             Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
+            Self::Qwen3827BFp8 => "Qwen3.8 27B FP8",
             Self::Gemma31BIt => "Gemma 3 1B Instruct",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
@@ -451,6 +473,7 @@ impl ModelVariant {
             Self::Qwen352BGguf => "Qwen3.5-2B",
             Self::Qwen354BGguf => "Qwen3.5-4B",
             Self::Qwen359BGguf => "Qwen3.5-9B",
+            Self::Qwen3827BFp8 => "Qwen3.8-27B-FP8",
             Self::Gemma31BIt => "Gemma-3-1b-it",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
@@ -507,8 +530,9 @@ impl ModelVariant {
             Self::Qwen352BGguf => 1_949_063_104, // local GGUF + mmproj + tokenizer assets
             Self::Qwen354BGguf => 3_413_361_504, // local GGUF + mmproj + tokenizer assets
             Self::Qwen359BGguf => 6_598_688_544, // local GGUF + mmproj + tokenizer assets
-            Self::Gemma31BIt => 2_200_000_000,  // ~2.05 GB (est)
-            Self::Gemma34BIt => 8_600_000_000,  // ~8.01 GB (est)
+            Self::Qwen3827BFp8 => 30_889_968_808, // pinned indexed FP8 bundle + chat/tokenizer metadata
+            Self::Gemma31BIt => 2_200_000_000,    // ~2.05 GB (est)
+            Self::Gemma34BIt => 8_600_000_000,    // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
@@ -562,6 +586,9 @@ impl ModelVariant {
             Self::Qwen352BGguf => 5.5,
             Self::Qwen354BGguf => 9.0,
             Self::Qwen359BGguf => 16.0,
+            // Backend-specific admission replaces this coarse catalog hint:
+            // packed FP8 CUDA needs less, while the CPU F32 fallback needs more.
+            Self::Qwen3827BFp8 => 80.0,
             Self::Gemma31BIt => 3.5,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
@@ -657,7 +684,7 @@ impl ModelVariant {
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B => Some("OpenMDW-1.1"),
-            Self::GraniteSpeech412BPlus => Some("Apache-2.0"),
+            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 => Some("Apache-2.0"),
             _ => None,
         }
     }
@@ -850,6 +877,7 @@ impl ModelVariant {
                 | Self::Qwen352BGguf
                 | Self::Qwen354BGguf
                 | Self::Qwen359BGguf
+                | Self::Qwen3827BFp8
                 | Self::Qwen3ForcedAligner06B4Bit
         )
     }
@@ -900,6 +928,11 @@ impl ModelVariant {
         )
     }
 
+    /// Whether this is the revision-pinned native Qwen3.8 FP8 checkpoint.
+    pub fn is_qwen38_fp8(&self) -> bool {
+        matches!(self, Self::Qwen3827BFp8)
+    }
+
     /// Whether this is an LFM2.5 chat GGUF variant.
     pub fn is_lfm2_chat_gguf(&self) -> bool {
         matches!(
@@ -931,6 +964,7 @@ impl ModelVariant {
             | Self::Qwen352BGguf
             | Self::Qwen354BGguf
             | Self::Qwen359BGguf
+            | Self::Qwen3827BFp8
             | Self::Gemma31BIt
             | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice4Bit
@@ -999,6 +1033,7 @@ impl ModelVariant {
             Self::Qwen352BGguf,
             Self::Qwen354BGguf,
             Self::Qwen359BGguf,
+            Self::Qwen3827BFp8,
             Self::Gemma31BIt,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
@@ -1176,6 +1211,46 @@ mod tests {
                 variant.dir_name()
             );
         }
+    }
+
+    #[test]
+    fn qwen38_fp8_catalog_contract_is_enabled_native_qwen35_chat() {
+        let variant = ModelVariant::Qwen3827BFp8;
+
+        assert!(variant.is_enabled());
+        assert!(variant.is_chat());
+        assert!(variant.is_quantized());
+        assert!(!variant.is_gguf());
+        assert!(variant.is_qwen38_fp8());
+        assert!(!variant.is_qwen35_chat_gguf());
+        assert_eq!(variant.repo_id(), "Qwen/Qwen3.8-27B-FP8");
+        assert_eq!(variant.dir_name(), "Qwen3.8-27B-FP8");
+        assert_eq!(variant.display_name(), "Qwen3.8 27B FP8");
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert_eq!(
+            variant.artifact_revision(),
+            Some(ModelVariant::QWEN38_27B_FP8_ARTIFACT_REVISION)
+        );
+    }
+
+    #[test]
+    fn qwen38_fp8_serde_accepts_canonical_and_repository_identifiers() {
+        for identifier in [
+            "Qwen3.8-27B-FP8",
+            "Qwen/Qwen3.8-27B-FP8",
+            "qwen3.8-27b-fp8",
+            "Qwen3.8-27B",
+        ] {
+            let encoded = serde_json::to_string(identifier).expect("serialize identifier");
+            let parsed: ModelVariant =
+                serde_json::from_str(&encoded).expect("deserialize Qwen3.8 alias");
+            assert_eq!(parsed, ModelVariant::Qwen3827BFp8, "alias {identifier}");
+        }
+
+        assert_eq!(
+            serde_json::to_string(&ModelVariant::Qwen3827BFp8).expect("serialize variant"),
+            "\"Qwen3.8-27B-FP8\""
+        );
     }
 
     #[test]

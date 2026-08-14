@@ -443,6 +443,13 @@ impl ModelVariant {
             );
         }
 
+        if self.is_qwen38_fp8() {
+            return CudaSupportInfo::new(
+                CudaSupportLevel::CandleCudaGeneric,
+                "Qwen3.8 FP8 is eligible for the dedicated block-scaled weight path and its explicit dense fallback on Candle CUDA; source review is not runtime validation",
+            );
+        }
+
         match self.family() {
             ModelFamily::Tokenizer => CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
@@ -497,6 +504,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::Disabled,
                 "variant is disabled in the application catalog",
+            );
+        }
+
+        if self.is_qwen38_fp8() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::DenseDequantizedFallback,
+                "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA must apply weight_scale_inv through the dedicated path or materialize the explicit BF16/F16 fallback",
             );
         }
 
@@ -700,6 +714,25 @@ mod tests {
         assert_eq!(info.execution_status, CudaExecutionStatus::Unsupported);
         assert_eq!(info.evidence, CudaEvidenceLevel::NotObserved);
         assert!(!info.evidence.proves_cuda_runtime());
+    }
+
+    #[test]
+    fn qwen38_fp8_cuda_metadata_does_not_inherit_gguf_quantization_claims() {
+        let variant = ModelVariant::Qwen3827BFp8;
+        let support = variant.cuda_support();
+        let quantization = variant.cuda_quantization();
+
+        assert_eq!(support.level, CudaSupportLevel::CandleCudaGeneric);
+        assert_eq!(
+            support.execution_status,
+            CudaExecutionStatus::EligibleUnverified
+        );
+        assert!(support.reason.contains("block-scaled"));
+        assert_eq!(
+            quantization.level,
+            CudaQuantizationSupportLevel::DenseDequantizedFallback
+        );
+        assert!(quantization.reason.contains("weight_scale_inv"));
     }
 
     #[test]

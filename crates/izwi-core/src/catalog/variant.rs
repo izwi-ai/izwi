@@ -118,7 +118,9 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
-            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
+            Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf | Qwen3827BFp8 => {
+                ModelFamily::Qwen35Chat
+            }
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
             Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
@@ -384,6 +386,14 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if let Some(qwen35_variant) = resolve_qwen35_chat_variant(normalized) {
         return Some(qwen35_variant);
+    }
+
+    if normalized.contains("qwen38")
+        && normalized.contains("27b")
+        && !normalized.contains("asr")
+        && !normalized.contains("tts")
+    {
+        return Some(Qwen3827BFp8);
     }
 
     if normalized.contains("qwen3") && !normalized.contains("asr") && !normalized.contains("tts") {
@@ -738,6 +748,21 @@ mod tests {
     fn parse_qwen35_chat_q4_file_alias() {
         let parsed = parse_chat_model_variant(Some("Qwen3.5-9B-Q4_K_M.gguf")).unwrap();
         assert_eq!(parsed, ModelVariant::Qwen359BGguf);
+    }
+
+    #[test]
+    fn parse_qwen38_fp8_chat_aliases() {
+        for alias in [
+            "Qwen3.8-27B-FP8",
+            "Qwen/Qwen3.8-27B-FP8",
+            "Qwen3.8 27B FP8",
+            "Qwen3.8-27B",
+        ] {
+            let parsed = parse_chat_model_variant(Some(alias)).expect("Qwen3.8 chat alias");
+            assert_eq!(parsed, ModelVariant::Qwen3827BFp8, "alias {alias}");
+            assert_eq!(parsed.family(), ModelFamily::Qwen35Chat);
+            assert_eq!(parsed.primary_task(), ModelTask::Chat);
+        }
     }
 
     #[test]
