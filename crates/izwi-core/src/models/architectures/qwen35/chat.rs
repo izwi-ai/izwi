@@ -21,7 +21,9 @@ use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::chat::{
+    ChatGenerationConfig, ChatMessage, ChatReasoningEffort, ChatRole,
+};
 use crate::models::shared::sampling::{
     bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
@@ -29,6 +31,7 @@ use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen35_composite_cache_contract;
+use super::native::{Qwen35NativeCheckpoint, QWEN38_27B_FP8_REVISION};
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
@@ -347,6 +350,64 @@ impl Qwen35Tokenizer {
         })
     }
 
+    fn load_hf(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
+        let config = load_tokenizer_config_file(model_dir)?.ok_or_else(|| {
+            Error::TokenizationError("Qwen3.8 tokenizer_config.json is missing".into())
+        })?;
+        let inner = Tokenizer::from_path_with_expected_vocab(model_dir, Some(248_320))?;
+        let mut token_to_id = HashMap::new();
+        for (id, entry) in &config.added_tokens_decoder {
+            if let Ok(id) = id.parse::<u32>() {
+                token_to_id.insert(entry.content.clone(), id);
+            }
+        }
+        let id_for = |token: &str| {
+            token_to_id
+                .get(token)
+                .copied()
+                .or_else(|| inner.token_to_id(token))
+        };
+        let required = |token: &str| {
+            id_for(token).ok_or_else(|| {
+                Error::TokenizationError(format!("Missing required Qwen3.8 token {token}"))
+            })
+        };
+        let im_start = required("<|im_start|>")?;
+        let im_end = required("<|im_end|>")?;
+        let image_pad = required(IMAGE_PAD_PLACEHOLDER)?;
+        let video_pad = required(VIDEO_PAD_PLACEHOLDER)?;
+        let eos_alt = id_for("<|endoftext|>");
+        let eos = config
+            .eos_token
+            .as_deref()
+            .and_then(id_for)
+            .or(eos_alt)
+            .unwrap_or(im_end);
+        let chat_template = config.chat_template.clone().ok_or_else(|| {
+            Error::TokenizationError("Qwen3.8 tokenizer config has no chat_template".into())
+        })?;
+        let mut literal_special_tokens = token_to_id.into_iter().collect::<Vec<_>>();
+        literal_special_tokens.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        Ok(Self {
+            vocab_size: inner.vocab_size(),
+            inner,
+            specials: SpecialTokenIds {
+                im_start,
+                im_end,
+                image_pad,
+                video_pad,
+                eos,
+                eos_alt,
+            },
+            literal_special_tokens,
+            default_enable_thinking: resolve_default_enable_thinking(&chat_template, variant),
+            chat_template,
+            bos_token: config.bos_token,
+        })
+    }
+
     fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
         if self.literal_special_tokens.is_empty() {
             return self.inner.encode(text);
@@ -409,17 +470,19 @@ pub struct Qwen35ChatModel {
     variant: ModelVariant,
     tokenizer: Qwen35Tokenizer,
     text_config: Qwen35TextConfig,
-    text_checkpoint: GgufModelInfo,
-    projector_checkpoint: GgufModelInfo,
+    text_checkpoint: Option<GgufModelInfo>,
+    projector_checkpoint: Option<GgufModelInfo>,
+    checkpoint_revision: Option<&'static str>,
+    checkpoint_format: &'static str,
     text_model: Qwen35TextModel,
-    vision_model: Qwen35VisionModel,
+    vision_model: Option<Qwen35VisionModel>,
 }
 
 impl InferenceStateContractProvider for Qwen35ChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
-        let dtype = match self.device_kind {
-            BackendKind::Cuda => DType::F16,
-            BackendKind::Cpu | BackendKind::Metal => DType::F32,
+        let dtype = match (self.device_kind, self.variant) {
+            (BackendKind::Cuda, _) | (BackendKind::Metal, ModelVariant::Qwen3827BFp8) => DType::F16,
+            (BackendKind::Cpu | BackendKind::Metal, _) => DType::F32,
         };
         Ok(InferenceStateCapability::Managed(
             self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
@@ -429,6 +492,9 @@ impl InferenceStateContractProvider for Qwen35ChatModel {
 
 impl Qwen35ChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        if variant == ModelVariant::Qwen3827BFp8 {
+            return Self::load_native_text(model_dir, variant, device);
+        }
         let gguf_path = model_dir.join(qwen35_gguf_filename(variant)?);
         let mmproj_path = model_dir.join("mmproj-F16.gguf");
 
@@ -483,10 +549,43 @@ impl Qwen35ChatModel {
             variant,
             tokenizer,
             text_config,
-            text_checkpoint,
-            projector_checkpoint,
+            text_checkpoint: Some(text_checkpoint),
+            projector_checkpoint: Some(projector_checkpoint),
+            checkpoint_revision: None,
+            checkpoint_format: "gguf",
             text_model,
-            vision_model,
+            vision_model: Some(vision_model),
+        })
+    }
+
+    fn load_native_text(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+    ) -> Result<Self> {
+        let checkpoint = Qwen35NativeCheckpoint::open(model_dir)?;
+        let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
+        let text_config = checkpoint.config.text.clone();
+        let text_model =
+            Qwen35TextModel::load_native(&checkpoint.tensors, &checkpoint.config, &device.device)?;
+        info!(
+            variant = %variant,
+            backend = ?device.kind,
+            revision = QWEN38_27B_FP8_REVISION,
+            tensors = checkpoint.tensors.tensor_count(),
+            "Loaded native Qwen3.8 text checkpoint with expanded block-FP8 projections"
+        );
+        Ok(Self {
+            device_kind: BackendKind::from(device.kind),
+            variant,
+            tokenizer,
+            text_config,
+            text_checkpoint: None,
+            projector_checkpoint: None,
+            checkpoint_revision: Some(QWEN38_27B_FP8_REVISION),
+            checkpoint_format: "safetensors_block_fp8",
+            text_model,
+            vision_model: None,
         })
     }
 
@@ -525,12 +624,55 @@ impl Qwen35ChatModel {
         self.tokenizer.default_enable_thinking
     }
 
-    pub fn text_checkpoint(&self) -> &GgufModelInfo {
-        &self.text_checkpoint
+    pub fn text_checkpoint(&self) -> Option<&GgufModelInfo> {
+        self.text_checkpoint.as_ref()
     }
 
-    pub fn projector_checkpoint(&self) -> &GgufModelInfo {
-        &self.projector_checkpoint
+    pub fn projector_checkpoint(&self) -> Option<&GgufModelInfo> {
+        self.projector_checkpoint.as_ref()
+    }
+
+    pub fn checkpoint_revision(&self) -> Option<&str> {
+        self.checkpoint_revision
+    }
+
+    pub fn checkpoint_format(&self) -> &'static str {
+        self.checkpoint_format
+    }
+
+    pub fn runtime_compute_dtype(&self) -> Option<&'static str> {
+        if self.variant != ModelVariant::Qwen3827BFp8 {
+            return None;
+        }
+        Some(match self.device_kind {
+            BackendKind::Cpu => "f32",
+            BackendKind::Metal => "f16",
+            BackendKind::Cuda => "bf16",
+        })
+    }
+
+    pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        let native_fp8 = self.variant == ModelVariant::Qwen3827BFp8;
+        serde_json::json!({
+            "checkpoint_revision": self.checkpoint_revision,
+            "checkpoint_format": self.checkpoint_format,
+            "resident_representation": if native_fp8 {
+                match self.device_kind {
+                    BackendKind::Cpu => "expanded_f32",
+                    BackendKind::Metal => "expanded_f16",
+                    BackendKind::Cuda => "expanded_bf16",
+                }
+            } else {
+                "gguf_quantized"
+            },
+            "fp8_execution_mode": if native_fp8 { "expanded_fallback" } else { "not_applicable" },
+            "fallback_reason": if native_fp8 {
+                Some("native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path")
+            } else {
+                None
+            },
+            "vision_enabled": self.vision_model.is_some(),
+        })
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -784,7 +926,12 @@ impl Qwen35ChatModel {
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
     ) -> Result<Qwen35PreparedPrompt> {
-        let prompt = render_prompt(messages, config, self.default_enable_thinking())?;
+        let prompt = render_prompt(
+            messages,
+            config,
+            self.default_enable_thinking(),
+            self.variant,
+        )?;
         let image_placeholders = prompt.matches(IMAGE_PAD_PLACEHOLDER).count();
         let video_placeholders = prompt.matches(VIDEO_PAD_PLACEHOLDER).count();
         if video_placeholders > 0 {
@@ -793,10 +940,22 @@ impl Qwen35ChatModel {
             ));
         }
 
-        let Some(vision_inputs) = self
-            .vision_model
-            .encode_media(&config.request.media_inputs)?
-        else {
+        let Some(vision_model) = self.vision_model.as_ref() else {
+            if !config.request.media_inputs.is_empty() || image_placeholders > 0 {
+                return Err(Error::InvalidInput(
+                    "Qwen3.8-27B-FP8 is text-only; image and video inputs are not enabled".into(),
+                ));
+            }
+            let prompt_ids = self.tokenizer.encode_text(&prompt)?;
+            let prompt_positions = build_text_positions(prompt_ids.len());
+            return Ok(Qwen35PreparedPrompt {
+                next_text_position: prompt_positions.len(),
+                prompt_ids,
+                prompt_positions,
+                vision_inputs: None,
+            });
+        };
+        let Some(vision_inputs) = vision_model.encode_media(&config.request.media_inputs)? else {
             if image_placeholders > 0 {
                 return Err(Error::InvalidInput(
                     "Qwen3.5 image placeholders require paired media inputs".to_string(),
@@ -832,7 +991,7 @@ impl Qwen35ChatModel {
             &vision_inputs,
             self.tokenizer.specials.image_pad,
             self.tokenizer.specials.video_pad,
-            self.vision_model.spatial_merge_size(),
+            vision_model.spatial_merge_size(),
         )?;
         Ok(Qwen35PreparedPrompt {
             prompt_ids,
@@ -1012,6 +1171,7 @@ fn render_prompt(
     messages: &[ChatMessage],
     config: &ChatGenerationConfig,
     default_enable_thinking: bool,
+    variant: ModelVariant,
 ) -> Result<String> {
     if messages.is_empty() {
         return Err(Error::InvalidInput(
@@ -1027,9 +1187,27 @@ fn render_prompt(
     } else {
         ""
     };
+    let is_qwen38 = variant == ModelVariant::Qwen3827BFp8;
+    let enable_thinking = config
+        .request
+        .enable_thinking
+        .unwrap_or(default_enable_thinking);
+    let reasoning_instructions = if is_qwen38 && enable_thinking {
+        match config.request.reasoning_effort.unwrap_or_default() {
+            ChatReasoningEffort::Xhigh => Some(QWEN38_XHIGH_REASONING_INSTRUCTIONS),
+            ChatReasoningEffort::Medium => None,
+            ChatReasoningEffort::Low => Some(QWEN38_LOW_REASONING_INSTRUCTIONS),
+        }
+    } else {
+        None
+    };
 
     if !config.request.tools.is_empty() {
         prompt.push_str("<|im_start|>system\n");
+        if let Some(instructions) = reasoning_instructions {
+            prompt.push_str(instructions);
+            prompt.push_str("\n\n");
+        }
         prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for tool in &config.request.tools {
             prompt.push('\n');
@@ -1042,9 +1220,21 @@ fn render_prompt(
             prompt.push_str(system_content);
         }
         prompt.push_str("<|im_end|>\n");
-    } else if leading_system {
+    } else if leading_system
+        && (!is_qwen38 || !system_content.is_empty() || reasoning_instructions.is_some())
+    {
         prompt.push_str("<|im_start|>system\n");
+        if let Some(instructions) = reasoning_instructions {
+            prompt.push_str(instructions);
+            if !system_content.is_empty() {
+                prompt.push_str("\n\n");
+            }
+        }
         prompt.push_str(system_content);
+        prompt.push_str("<|im_end|>\n");
+    } else if let Some(instructions) = reasoning_instructions {
+        prompt.push_str("<|im_start|>system\n");
+        prompt.push_str(instructions);
         prompt.push_str("<|im_end|>\n");
     }
 
@@ -1068,7 +1258,9 @@ fn render_prompt(
             ChatRole::Assistant => {
                 let (reasoning_content, content) = split_assistant_reasoning(&message.content);
                 prompt.push_str("<|im_start|>assistant\n");
-                if index > last_query_index {
+                let preserve_thinking =
+                    is_qwen38 && config.request.preserve_thinking.unwrap_or(true);
+                if preserve_thinking || index > last_query_index {
                     prompt.push_str("<think>\n");
                     prompt.push_str(reasoning_content.trim());
                     prompt.push_str("\n</think>\n\n");
@@ -1083,17 +1275,16 @@ fn render_prompt(
     }
 
     prompt.push_str("<|im_start|>assistant\n");
-    if config
-        .request
-        .enable_thinking
-        .unwrap_or(default_enable_thinking)
-    {
+    if enable_thinking {
         prompt.push_str("<think>\n");
     } else {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
     Ok(prompt)
 }
+
+const QWEN38_XHIGH_REASONING_INSTRUCTIONS: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const QWEN38_LOW_REASONING_INSTRUCTIONS: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
 
 fn last_query_index(messages: &[ChatMessage]) -> Result<usize> {
     messages
@@ -1143,7 +1334,7 @@ fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str> {
 fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) -> bool {
     matches!(
         variant,
-        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
+        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf | ModelVariant::Qwen3827BFp8
     )
 }
 
@@ -1849,6 +2040,10 @@ mod tests {
             small,
             ModelVariant::Qwen359BGguf
         ));
+        assert!(resolve_default_enable_thinking(
+            small,
+            ModelVariant::Qwen3827BFp8
+        ));
     }
 
     #[test]
@@ -1860,26 +2055,28 @@ mod tests {
         let enable = ChatGenerationConfig {
             request: ChatRequestConfig {
                 enable_thinking: Some(true),
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             ..ChatGenerationConfig::default()
         };
         let disable = ChatGenerationConfig {
             request: ChatRequestConfig {
                 enable_thinking: Some(false),
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             ..ChatGenerationConfig::default()
         };
 
-        assert!(render_prompt(&messages, &enable, false)
-            .expect("enable thinking")
-            .ends_with("<|im_start|>assistant\n<think>\n"));
-        assert!(render_prompt(&messages, &disable, true)
-            .expect("disable thinking")
-            .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(
+            render_prompt(&messages, &enable, false, ModelVariant::Qwen352BGguf)
+                .expect("enable thinking")
+                .ends_with("<|im_start|>assistant\n<think>\n")
+        );
+        assert!(
+            render_prompt(&messages, &disable, true, ModelVariant::Qwen354BGguf)
+                .expect("disable thinking")
+                .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        );
     }
 
     #[test]
@@ -1888,7 +2085,7 @@ mod tests {
             request: ChatRequestConfig {
                 enable_thinking: Some(true),
                 tools: vec![serde_json::json!({"type":"function","function":{"name":"lookup"}})],
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             ..ChatGenerationConfig::default()
         };
@@ -1905,6 +2102,7 @@ mod tests {
             ],
             &config,
             false,
+            ModelVariant::Qwen352BGguf,
         )
         .expect("prompt should render");
 
@@ -1919,8 +2117,7 @@ mod tests {
         let config = ChatGenerationConfig {
             request: ChatRequestConfig {
                 enable_thinking: Some(false),
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             ..ChatGenerationConfig::default()
         };
@@ -1931,6 +2128,7 @@ mod tests {
             }],
             &config,
             true,
+            ModelVariant::Qwen354BGguf,
         )
         .expect("prompt should render");
 
@@ -1950,8 +2148,7 @@ mod tests {
         let config = ChatGenerationConfig {
             request: ChatRequestConfig {
                 enable_thinking: Some(true),
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             ..ChatGenerationConfig::default()
         };
@@ -1972,11 +2169,135 @@ mod tests {
             ],
             &config,
             true,
+            ModelVariant::Qwen354BGguf,
         )
         .expect("prompt should render");
 
         assert!(prompt.contains("<|im_start|>assistant\nFinal answer<|im_end|>\n"));
         assert!(!prompt.contains("reasoning first"));
+    }
+
+    fn qwen38_history_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: "First question".to_string(),
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "reasoning first</think>\nFinal answer".to_string(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "Follow-up".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn qwen38_defaults_to_xhigh_thinking_and_preserved_history() {
+        let prompt = render_prompt(
+            &qwen38_history_messages(),
+            &ChatGenerationConfig::default(),
+            true,
+            ModelVariant::Qwen3827BFp8,
+        )
+        .expect("render qwen3.8 prompt");
+
+        assert!(prompt.starts_with(&format!(
+            "<|im_start|>system\n{QWEN38_XHIGH_REASONING_INSTRUCTIONS}<|im_end|>\n"
+        )));
+        assert!(prompt.contains(
+            "<|im_start|>assistant\n<think>\nreasoning first\n</think>\n\nFinal answer<|im_end|>\n"
+        ));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn qwen38_low_effort_uses_exact_instruction_with_tools() {
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                reasoning_effort: Some(ChatReasoningEffort::Low),
+                tools: vec![serde_json::json!({"type":"function","function":{"name":"lookup"}})],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let prompt = render_prompt(
+            &[ChatMessage {
+                role: ChatRole::User,
+                content: "Hi".to_string(),
+            }],
+            &config,
+            true,
+            ModelVariant::Qwen3827BFp8,
+        )
+        .expect("render qwen3.8 tool prompt");
+
+        assert!(prompt.starts_with(&format!(
+            "<|im_start|>system\n{QWEN38_LOW_REASONING_INSTRUCTIONS}\n\n# Tools"
+        )));
+        assert!(prompt.contains("<tool_call>\n<function=example_function_name>"));
+        assert!(prompt.contains("<tools>"));
+    }
+
+    #[test]
+    fn qwen38_disabled_thinking_closes_block_and_skips_reasoning_instruction() {
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                enable_thinking: Some(false),
+                reasoning_effort: Some(ChatReasoningEffort::Low),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let prompt = render_prompt(
+            &[ChatMessage {
+                role: ChatRole::User,
+                content: "Hi".to_string(),
+            }],
+            &config,
+            true,
+            ModelVariant::Qwen3827BFp8,
+        )
+        .expect("render non-thinking qwen3.8 prompt");
+
+        assert!(!prompt.contains(QWEN38_LOW_REASONING_INSTRUCTIONS));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn preserve_thinking_is_qwen38_only_and_can_be_disabled() {
+        let config = ChatGenerationConfig {
+            request: ChatRequestConfig {
+                preserve_thinking: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let qwen38_prompt = render_prompt(
+            &qwen38_history_messages(),
+            &config,
+            true,
+            ModelVariant::Qwen3827BFp8,
+        )
+        .expect("render qwen3.8 history");
+        let qwen35_prompt = render_prompt(
+            &qwen38_history_messages(),
+            &ChatGenerationConfig {
+                request: ChatRequestConfig {
+                    preserve_thinking: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            true,
+            ModelVariant::Qwen354BGguf,
+        )
+        .expect("render qwen3.5 history");
+
+        assert!(!qwen38_prompt.contains("reasoning first"));
+        assert!(!qwen35_prompt.contains("reasoning first"));
     }
 
     #[test]
@@ -1985,8 +2306,7 @@ mod tests {
         let config = ChatGenerationConfig {
             request: ChatRequestConfig {
                 enable_thinking: Some(false),
-                tools: Vec::new(),
-                media_inputs: Vec::new(),
+                ..Default::default()
             },
             ..ChatGenerationConfig::default()
         };
@@ -2007,6 +2327,7 @@ mod tests {
             ],
             &config,
             false,
+            ModelVariant::Qwen352BGguf,
         )
         .expect("render multi-turn prompt");
 
@@ -2159,11 +2480,12 @@ mod tests {
             resolve_default_enable_thinking(model.chat_template(), ModelVariant::Qwen354BGguf)
         );
         assert_eq!(
-            model.text_checkpoint().architecture.as_deref(),
+            model.text_checkpoint().unwrap().architecture.as_deref(),
             Some("qwen35")
         );
         assert!(model
             .projector_checkpoint()
+            .unwrap()
             .path
             .ends_with("mmproj-F16.gguf"));
     }

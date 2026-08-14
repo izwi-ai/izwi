@@ -3,7 +3,6 @@ use std::sync::Arc;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding};
 use candle_transformers::models::with_tracing::QMatMul;
-use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
@@ -25,13 +24,16 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
+use super::native::{
+    IndexedSafetensors, ProjectionMaterialization, Qwen35LayerType, Qwen35NativeConfig,
+};
 
 pub struct Qwen35TextModel {
     device: Device,
     token_embeddings: Embedding,
     layers: Vec<Qwen35Layer>,
-    output_norm: RmsNorm,
-    output: QMatMul,
+    output_norm: Qwen35RmsNorm,
+    output: Qwen35Projection,
     finite_diagnostics_enabled: bool,
 }
 
@@ -270,9 +272,9 @@ enum Qwen35LayerRuntimeState {
 }
 
 struct Qwen35Layer {
-    attn_norm: RmsNorm,
+    attn_norm: Qwen35RmsNorm,
     mixer: Qwen35Mixer,
-    post_attention_norm: RmsNorm,
+    post_attention_norm: Qwen35RmsNorm,
     mlp: Qwen35Mlp,
 }
 
@@ -282,18 +284,43 @@ enum Qwen35Mixer {
 }
 
 struct Qwen35Mlp {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    gate: Qwen35Projection,
+    up: Qwen35Projection,
+    down: Qwen35Projection,
+}
+
+enum Qwen35Projection {
+    Quantized(QMatMul),
+    Dense(Tensor),
+}
+
+struct Qwen35RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl Module for Qwen35RmsNorm {
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32)
+    }
+}
+
+impl Module for Qwen35Projection {
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Quantized(projection) => projection.forward(input),
+            Self::Dense(weight) => input.matmul(&weight.t()?),
+        }
+    }
 }
 
 struct Qwen35FullAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_proj: Qwen35Projection,
+    k_proj: Qwen35Projection,
+    v_proj: Qwen35Projection,
+    o_proj: Qwen35Projection,
+    q_norm: Qwen35RmsNorm,
+    k_norm: Qwen35RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -305,16 +332,16 @@ struct Qwen35FullAttention {
 }
 
 struct Qwen35LinearAttention {
-    qkv_proj: QMatMul,
-    gate_proj: QMatMul,
-    beta_proj: QMatMul,
-    alpha_proj: QMatMul,
+    qkv_proj: Qwen35Projection,
+    gate_proj: Qwen35Projection,
+    beta_proj: Qwen35Projection,
+    alpha_proj: Qwen35Projection,
     dt_bias: Tensor,
     a: Tensor,
     conv_kernel: Tensor,
     conv_kernel_slices: Vec<Tensor>,
     norm: Qwen35GatedRmsNorm,
-    out_proj: QMatMul,
+    out_proj: Qwen35Projection,
     num_k_heads: usize,
     num_v_heads: usize,
     head_k_dim: usize,
@@ -323,6 +350,13 @@ struct Qwen35LinearAttention {
     kernel_size: usize,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+    head_repeat: LinearHeadRepeat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinearHeadRepeat {
+    Tiled,
+    RepeatInterleave,
 }
 
 struct Qwen35GatedRmsNorm {
@@ -400,6 +434,85 @@ impl Qwen35TextModel {
             output_norm,
             output,
             finite_diagnostics_enabled,
+        })
+    }
+
+    pub fn load_native(
+        tensors: &IndexedSafetensors,
+        native: &Qwen35NativeConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        let cfg = &native.text;
+        let target = native_projection_target(device);
+        let block = native.block_fp8.block_shape;
+        let embedding_weights = tensors.materialize_dense_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[native.vocab_size, cfg.embedding_length],
+            target,
+            device,
+        )?;
+        let token_embeddings = Embedding::new(embedding_weights, cfg.embedding_length);
+        let output_norm = load_native_zero_centered_norm(
+            tensors,
+            "model.language_model.norm.weight",
+            cfg.embedding_length,
+            cfg.attention_layer_norm_rms_epsilon,
+            target,
+            device,
+        )?;
+        let output = load_native_projection(
+            tensors,
+            "lm_head.weight",
+            [native.vocab_size, cfg.embedding_length],
+            block,
+            target,
+            device,
+        )?;
+
+        let mut layers = Vec::with_capacity(cfg.block_count);
+        for (layer_idx, layer_type) in native.layer_types.iter().copied().enumerate() {
+            let prefix = format!("model.language_model.layers.{layer_idx}");
+            let attn_norm = load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.input_layernorm.weight"),
+                cfg.embedding_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?;
+            let post_attention_norm = load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                cfg.embedding_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?;
+            let mlp = Qwen35Mlp::load_native(tensors, device, &prefix, cfg, block, target)?;
+            let mixer = match layer_type {
+                Qwen35LayerType::FullAttention => Qwen35Mixer::Full(
+                    Qwen35FullAttention::load_native(tensors, device, &prefix, cfg, block, target)?,
+                ),
+                Qwen35LayerType::LinearAttention => {
+                    Qwen35Mixer::Linear(Qwen35LinearAttention::load_native(
+                        tensors, device, &prefix, cfg, block, target,
+                    )?)
+                }
+            };
+            layers.push(Qwen35Layer {
+                attn_norm,
+                mixer,
+                post_attention_norm,
+                mlp,
+            });
+        }
+        Ok(Self {
+            device: device.clone(),
+            token_embeddings,
+            layers,
+            output_norm,
+            output,
+            finite_diagnostics_enabled: qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false),
         })
     }
 
@@ -687,6 +800,42 @@ impl Qwen35Mlp {
         })
     }
 
+    fn load_native(
+        tensors: &IndexedSafetensors,
+        device: &Device,
+        prefix: &str,
+        cfg: &Qwen35TextConfig,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate: load_native_projection(
+                tensors,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                [cfg.feed_forward_length, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            up: load_native_projection(
+                tensors,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                [cfg.feed_forward_length, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            down: load_native_projection(
+                tensors,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                [cfg.embedding_length, cfg.feed_forward_length],
+                block,
+                target,
+                device,
+            )?,
+        })
+    }
+
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
         let gate_proj_out = self.gate.forward(hidden_states)?;
@@ -717,6 +866,95 @@ impl Qwen35FullAttention {
             o_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_output.weight"))?,
             q_norm: load_rms_norm(loader, device, &format!("{prefix}.attn_q_norm.weight"), cfg)?,
             k_norm: load_rms_norm(loader, device, &format!("{prefix}.attn_k_norm.weight"), cfg)?,
+            num_heads: cfg.attention_head_count,
+            num_kv_heads: cfg.attention_head_count_kv,
+            head_dim: cfg.attention_key_length,
+            rope_dim: cfg.rope_dimension_count.min(cfg.attention_key_length),
+            rope_theta: cfg.rope_freq_base,
+            mrope_sections: cfg
+                .rope_dimension_sections
+                .iter()
+                .copied()
+                .filter(|section| *section > 0)
+                .take(3)
+                .collect(),
+            rope_kernel_enabled: qwen35_rope_kernel_enabled(device),
+            rope_inv_freqs: build_rope_inv_freqs(
+                cfg.rope_dimension_count.min(cfg.attention_key_length),
+                cfg.rope_freq_base,
+            )?,
+        })
+    }
+
+    fn load_native(
+        tensors: &IndexedSafetensors,
+        device: &Device,
+        prefix: &str,
+        cfg: &Qwen35TextConfig,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
+    ) -> Result<Self> {
+        let q_width = cfg
+            .attention_head_count
+            .checked_mul(cfg.attention_key_length)
+            .and_then(|width| width.checked_mul(2))
+            .ok_or_else(|| Error::ModelLoadError("Qwen3.8 Q projection width overflow".into()))?;
+        let kv_width = cfg
+            .attention_head_count_kv
+            .checked_mul(cfg.attention_key_length)
+            .ok_or_else(|| Error::ModelLoadError("Qwen3.8 KV projection width overflow".into()))?;
+        Ok(Self {
+            q_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                [q_width, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            k_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                [kv_width, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            v_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                [kv_width, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            o_proj: load_native_projection(
+                tensors,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                [
+                    cfg.embedding_length,
+                    cfg.attention_head_count * cfg.attention_value_length,
+                ],
+                block,
+                target,
+                device,
+            )?,
+            q_norm: load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                cfg.attention_key_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?,
+            k_norm: load_native_zero_centered_norm(
+                tensors,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                cfg.attention_key_length,
+                cfg.attention_layer_norm_rms_epsilon,
+                target,
+                device,
+            )?,
             num_heads: cfg.attention_head_count,
             num_kv_heads: cfg.attention_head_count_kv,
             head_dim: cfg.attention_key_length,
@@ -1029,6 +1267,114 @@ impl Qwen35LinearAttention {
             kernel_size: cfg.ssm_conv_kernel,
             tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
+            head_repeat: LinearHeadRepeat::Tiled,
+        })
+    }
+
+    fn load_native(
+        tensors: &IndexedSafetensors,
+        device: &Device,
+        prefix: &str,
+        cfg: &Qwen35TextConfig,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
+    ) -> Result<Self> {
+        let num_k_heads = cfg.ssm_group_count;
+        let num_v_heads = cfg.ssm_time_step_rank;
+        let head_k_dim = cfg.ssm_state_size;
+        let head_v_dim = cfg.ssm_inner_size / cfg.ssm_time_step_rank;
+        let conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+        let linear = format!("{prefix}.linear_attn");
+        let dt_bias = tensors
+            .materialize_dense_tensor(
+                &format!("{linear}.dt_bias"),
+                &[num_v_heads],
+                ProjectionMaterialization::F32,
+                device,
+            )?
+            .reshape((1, 1, num_v_heads))?;
+        let a_log = tensors.materialize_dense_tensor(
+            &format!("{linear}.A_log"),
+            &[num_v_heads],
+            ProjectionMaterialization::F32,
+            device,
+        )?;
+        let a = a_log.exp()?.neg()?.reshape((1, 1, num_v_heads))?;
+        let conv_kernel = normalize_conv_kernel(
+            tensors.materialize_dense_tensor(
+                &format!("{linear}.conv1d.weight"),
+                &[conv_dim, 1, cfg.ssm_conv_kernel],
+                ProjectionMaterialization::F32,
+                device,
+            )?,
+            conv_dim,
+            cfg.ssm_conv_kernel,
+        )?;
+        let conv_kernel_slices = pre_slice_conv_kernel(&conv_kernel, cfg.ssm_conv_kernel)?;
+        let norm = Qwen35GatedRmsNorm {
+            weight: tensors.materialize_dense_tensor(
+                &format!("{linear}.norm.weight"),
+                &[head_v_dim],
+                ProjectionMaterialization::F32,
+                device,
+            )?,
+            eps: cfg.attention_layer_norm_rms_epsilon,
+        };
+        Ok(Self {
+            qkv_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_qkv.weight"),
+                [conv_dim, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            gate_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_z.weight"),
+                [cfg.ssm_inner_size, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            beta_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_b.weight"),
+                [num_v_heads, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            alpha_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.in_proj_a.weight"),
+                [num_v_heads, cfg.embedding_length],
+                block,
+                target,
+                device,
+            )?,
+            dt_bias,
+            a,
+            conv_kernel,
+            conv_kernel_slices,
+            norm,
+            out_proj: load_native_projection(
+                tensors,
+                &format!("{linear}.out_proj.weight"),
+                [cfg.embedding_length, cfg.ssm_inner_size],
+                block,
+                target,
+                device,
+            )?,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_dim,
+            kernel_size: cfg.ssm_conv_kernel,
+            tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
+            tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
+            head_repeat: LinearHeadRepeat::RepeatInterleave,
         })
     }
 
@@ -1049,10 +1395,22 @@ impl Qwen35LinearAttention {
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let residual_dtype = hidden_states.dtype();
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let z = self
+            .gate_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(
+            &self
+                .beta_proj
+                .forward(hidden_states)?
+                .to_dtype(DType::F32)?,
+        )?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
@@ -1084,8 +1442,8 @@ impl Qwen35LinearAttention {
                 )));
             }
             let repeats = self.num_v_heads / self.num_k_heads;
-            query = repeat_head_states(&query, repeats)?;
-            key = repeat_head_states(&key, repeats)?;
+            query = expand_linear_heads(&query, repeats, self.head_repeat)?;
+            key = expand_linear_heads(&key, repeats, self.head_repeat)?;
         }
 
         let current_state = if let Some(state) = recurrent_state.take() {
@@ -1109,7 +1467,9 @@ impl Qwen35LinearAttention {
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
-        let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
+        let output = output
+            .reshape((1, 1, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output).map_err(Error::from)
     }
 
@@ -1135,10 +1495,22 @@ impl Qwen35LinearAttention {
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let residual_dtype = hidden_states.dtype();
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let z = self
+            .gate_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(
+            &self
+                .beta_proj
+                .forward(hidden_states)?
+                .to_dtype(DType::F32)?,
+        )?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
@@ -1211,8 +1583,8 @@ impl Qwen35LinearAttention {
             } else {
                 let repeats = self.num_v_heads / self.num_k_heads;
                 (
-                    repeat_head_states_seq(&query, repeats)?,
-                    repeat_head_states_seq(&key, repeats)?,
+                    expand_linear_heads_seq(&query, repeats, self.head_repeat)?,
+                    expand_linear_heads_seq(&key, repeats, self.head_repeat)?,
                 )
             };
             if self.tiled_recurrence_enabled {
@@ -1241,7 +1613,9 @@ impl Qwen35LinearAttention {
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
-        let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
+        let output = output
+            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output).map_err(Error::from)
     }
 
@@ -1369,9 +1743,47 @@ fn is_full_attention_layer(layer_idx: usize, full_attention_interval: usize) -> 
     full_attention_interval > 0 && (layer_idx + 1).is_multiple_of(full_attention_interval)
 }
 
-fn load_qmatmul(loader: &GgufLoader, device: &Device, name: &str) -> Result<QMatMul> {
+fn load_qmatmul(loader: &GgufLoader, device: &Device, name: &str) -> Result<Qwen35Projection> {
     let weights = Arc::new(loader.load_qtensor(name, device)?);
-    QMatMul::from_weights(weights).map_err(Error::from)
+    QMatMul::from_weights(weights)
+        .map(Qwen35Projection::Quantized)
+        .map_err(Error::from)
+}
+
+fn native_projection_target(device: &Device) -> ProjectionMaterialization {
+    if device.is_cpu() {
+        ProjectionMaterialization::F32
+    } else if device.is_metal() {
+        ProjectionMaterialization::F16
+    } else {
+        ProjectionMaterialization::BF16
+    }
+}
+
+fn load_native_projection(
+    tensors: &IndexedSafetensors,
+    name: &str,
+    shape: [usize; 2],
+    block: [usize; 2],
+    target: ProjectionMaterialization,
+    device: &Device,
+) -> Result<Qwen35Projection> {
+    tensors
+        .materialize_projection(name, shape, block, target, device)
+        .map(Qwen35Projection::Dense)
+}
+
+fn load_native_zero_centered_norm(
+    tensors: &IndexedSafetensors,
+    name: &str,
+    length: usize,
+    eps: f64,
+    target: ProjectionMaterialization,
+    device: &Device,
+) -> Result<Qwen35RmsNorm> {
+    let weight = tensors.materialize_dense_tensor(name, &[length], target, device)?;
+    let weight = (weight + 1.0)?;
+    Ok(Qwen35RmsNorm { weight, eps })
 }
 
 fn load_rms_norm(
@@ -1379,12 +1791,11 @@ fn load_rms_norm(
     device: &Device,
     name: &str,
     cfg: &Qwen35TextConfig,
-) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(
-        loader.load_qtensor(name, device)?,
-        cfg.attention_layer_norm_rms_epsilon,
-    )
-    .map_err(Error::from)
+) -> Result<Qwen35RmsNorm> {
+    Ok(Qwen35RmsNorm {
+        weight: load_dense(loader, device, name, Some(DType::F32))?,
+        eps: cfg.attention_layer_norm_rms_epsilon,
+    })
 }
 
 fn load_dense(
@@ -1690,6 +2101,46 @@ fn repeat_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
+fn repeat_interleave_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats <= 1 {
+        return Ok(x.clone());
+    }
+    let (batch, heads, dim) = x.dims3()?;
+    x.unsqueeze(2)?
+        .broadcast_as((batch, heads, repeats, dim))?
+        .reshape((batch, heads * repeats, dim))
+        .map_err(Error::from)
+}
+
+fn repeat_interleave_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats <= 1 {
+        return Ok(x.clone());
+    }
+    let (batch, seq, heads, dim) = x.dims4()?;
+    x.unsqueeze(3)?
+        .broadcast_as((batch, seq, heads, repeats, dim))?
+        .reshape((batch, seq, heads * repeats, dim))
+        .map_err(Error::from)
+}
+
+fn expand_linear_heads(x: &Tensor, repeats: usize, ordering: LinearHeadRepeat) -> Result<Tensor> {
+    match ordering {
+        LinearHeadRepeat::Tiled => repeat_head_states(x, repeats),
+        LinearHeadRepeat::RepeatInterleave => repeat_interleave_head_states(x, repeats),
+    }
+}
+
+fn expand_linear_heads_seq(
+    x: &Tensor,
+    repeats: usize,
+    ordering: LinearHeadRepeat,
+) -> Result<Tensor> {
+    match ordering {
+        LinearHeadRepeat::Tiled => repeat_head_states_seq(x, repeats),
+        LinearHeadRepeat::RepeatInterleave => repeat_interleave_head_states_seq(x, repeats),
+    }
+}
+
 fn qwen35_env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
@@ -1833,7 +2284,8 @@ mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
-        softplus, ConvRingState, Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        repeat_interleave_head_states, repeat_interleave_head_states_seq, softplus, ConvRingState,
+        Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -1956,6 +2408,34 @@ mod tests {
                 vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
                 vec![5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]
             ]]
+        );
+    }
+
+    #[test]
+    fn native_head_repeat_uses_transformers_repeat_interleave_order() {
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 2), &Device::Cpu)
+            .expect("tensor should build");
+        let repeated = repeat_interleave_head_states(&x, 2).expect("repeat should succeed");
+        assert_eq!(
+            repeated.to_vec3::<f32>().expect("values"),
+            vec![vec![
+                vec![1.0, 2.0],
+                vec![1.0, 2.0],
+                vec![3.0, 4.0],
+                vec![3.0, 4.0]
+            ]]
+        );
+
+        let sequence = x.unsqueeze(1).expect("sequence");
+        let repeated =
+            repeat_interleave_head_states_seq(&sequence, 2).expect("repeat should succeed");
+        assert_eq!(
+            repeated
+                .reshape((1, 1, 8))
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap(),
+            vec![vec![vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]]]
         );
     }
 

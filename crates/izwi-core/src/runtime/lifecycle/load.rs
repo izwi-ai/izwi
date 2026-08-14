@@ -109,6 +109,27 @@ struct ModelMemoryEstimate {
     resident_bytes: u64,
 }
 
+const QWEN38_FP8_ELEMENTS: u64 = 24_699_207_680;
+const QWEN38_BF16_ELEMENTS: u64 = 3_082_220_272;
+const QWEN38_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn qwen38_expanded_memory_estimate(backend: BackendKind) -> ModelMemoryEstimate {
+    let bytes_per_resident_element = match backend {
+        BackendKind::Cpu => 4_u64,
+        BackendKind::Metal | BackendKind::Cuda => 2_u64,
+    };
+    let resident_bytes = QWEN38_FP8_ELEMENTS
+        .checked_add(QWEN38_BF16_ELEMENTS)
+        .and_then(|elements| elements.checked_mul(bytes_per_resident_element))
+        .expect("Qwen3.8 expanded residency is a compile-time bounded value");
+    ModelMemoryEstimate {
+        load_peak_bytes: resident_bytes
+            .checked_add(QWEN38_CONVERSION_SCRATCH_BYTES)
+            .expect("Qwen3.8 expanded load peak is a compile-time bounded value"),
+        resident_bytes,
+    }
+}
+
 fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -262,9 +283,13 @@ fn estimate_from_tensor_inventory(
 }
 
 fn portable_model_memory_estimate(
+    backend: BackendKind,
     variant: ModelVariant,
     model_path: &Path,
 ) -> Result<ModelMemoryEstimate> {
+    if variant == ModelVariant::Qwen3827BFp8 {
+        return Ok(qwen38_expanded_memory_estimate(backend));
+    }
     let catalog = model_memory_estimate(variant);
     estimate_from_tensor_inventory(catalog, checkpoint_tensor_inventory(model_path)?)
 }
@@ -306,6 +331,18 @@ fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> M
         load_authorization,
         resident_authorization,
     }
+}
+
+fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
+    let estimate = qwen38_expanded_memory_estimate(backend);
+    let mut plan = model_resource_plan(backend, estimate);
+    if backend == BackendKind::Cuda {
+        // Expanded CUDA weights remain device-resident. Host memory only holds
+        // the callback-scoped shard/dequantization staging window, not a second
+        // full expanded checkpoint.
+        plan.load_authorization.host_bytes = ResourceAmount::Known(QWEN38_CONVERSION_SCRATCH_BYTES);
+    }
+    plan
 }
 
 #[derive(Debug, Clone)]
@@ -773,10 +810,13 @@ impl ModelLifecycleController {
         model_path: &Path,
     ) -> Result<ModelResourcePlan> {
         let backend = self.backend_router.context().backend_kind;
+        if variant == ModelVariant::Qwen3827BFp8 {
+            return Ok(qwen38_resource_plan(backend));
+        }
         let estimate = if backend == BackendKind::Cuda {
             model_memory_estimate(variant)
         } else {
-            portable_model_memory_estimate(variant, model_path)?
+            portable_model_memory_estimate(backend, variant, model_path)?
         };
         Ok(model_resource_plan(backend, estimate))
     }
@@ -1710,8 +1750,10 @@ mod tests {
     use super::{
         estimate_from_tensor_inventory, is_metal_command_buffer_oom,
         loaded_asr_state_publication_route, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, residency_budget_has_capacity, select_lru_eviction_candidate,
-        LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
+        plan_invocation_allocations, qwen38_expanded_memory_estimate, qwen38_resource_plan,
+        residency_budget_has_capacity, select_lru_eviction_candidate,
+        LoadedAsrStatePublicationRoute, ModelMemoryEstimate, QWEN38_BF16_ELEMENTS,
+        QWEN38_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -1794,6 +1836,35 @@ mod tests {
         assert_eq!(
             estimate_from_tensor_inventory(catalog, None).unwrap(),
             catalog
+        );
+    }
+
+    #[test]
+    fn qwen38_resource_plan_prices_selected_expanded_representation() {
+        let cpu = qwen38_expanded_memory_estimate(BackendKind::Cpu);
+        let metal = qwen38_expanded_memory_estimate(BackendKind::Metal);
+        let cuda = qwen38_expanded_memory_estimate(BackendKind::Cuda);
+        let elements = QWEN38_FP8_ELEMENTS + QWEN38_BF16_ELEMENTS;
+
+        assert_eq!(cpu.resident_bytes, elements * 4);
+        assert_eq!(metal.resident_bytes, elements * 2);
+        assert_eq!(cuda, metal);
+        assert_eq!(
+            cpu.load_peak_bytes - cpu.resident_bytes,
+            QWEN38_CONVERSION_SCRATCH_BYTES
+        );
+        assert_eq!(
+            metal.load_peak_bytes - metal.resident_bytes,
+            QWEN38_CONVERSION_SCRATCH_BYTES
+        );
+        let cuda_plan = qwen38_resource_plan(BackendKind::Cuda);
+        assert_eq!(
+            cuda_plan.load_authorization.host_bytes,
+            ResourceAmount::Known(QWEN38_CONVERSION_SCRATCH_BYTES)
+        );
+        assert_eq!(
+            cuda_plan.resident_authorization.device_bytes,
+            ResourceAmount::Known(cuda.resident_bytes)
         );
     }
 

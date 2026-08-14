@@ -40,11 +40,37 @@ pub struct ChatMediaInput {
     pub source: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatReasoningEffort {
+    #[default]
+    Xhigh,
+    Medium,
+    Low,
+}
+
+/// Hugging Face-compatible keyword arguments accepted alongside the direct
+/// chat request fields. Server adapters resolve these into `ChatRequestConfig`
+/// before native model execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTemplateKwargs {
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+}
+
 /// Chat-specific request metadata consumed by native backends.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequestConfig {
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ChatReasoningEffort>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub tools: Vec<Value>,
     #[serde(default)]
@@ -83,7 +109,7 @@ impl Default for ChatGenerationConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatGenerationConfig, ChatRequestConfig};
+    use super::{ChatGenerationConfig, ChatReasoningEffort, ChatRequestConfig, ChatTemplateKwargs};
 
     #[test]
     fn chat_generation_config_default_is_greedy() {
@@ -96,5 +122,18 @@ mod tests {
         assert!(config.stop_token_ids.is_empty());
         assert_eq!(config.seed, 0);
         assert_eq!(config.request, ChatRequestConfig::default());
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_only_pinned_qwen_values() {
+        let kwargs: ChatTemplateKwargs =
+            serde_json::from_str(r#"{"reasoning_effort":"xhigh","preserve_thinking":true}"#)
+                .expect("supported effort");
+        assert_eq!(kwargs.reasoning_effort, Some(ChatReasoningEffort::Xhigh));
+        assert_eq!(kwargs.preserve_thinking, Some(true));
+
+        assert!(
+            serde_json::from_str::<ChatTemplateKwargs>(r#"{"reasoning_effort":"high"}"#).is_err()
+        );
     }
 }

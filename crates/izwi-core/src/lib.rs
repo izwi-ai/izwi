@@ -124,7 +124,8 @@ pub use catalog::{
     ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
-    ChatMediaInput, ChatMediaKind, ChatMessage, ChatRequestConfig, ChatRole,
+    ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
+    ChatTemplateKwargs,
 };
 
 // Canonical native registry/device exports.

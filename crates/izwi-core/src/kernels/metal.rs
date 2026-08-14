@@ -4071,6 +4071,20 @@ struct Qwen35GatedDeltaSequenceOp {
 }
 
 #[cfg(feature = "metal")]
+fn qwen35_gated_delta_tiled_layout_supported(
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) -> bool {
+    num_k_heads == 16
+        && matches!(num_v_heads, 16 | 32)
+        && num_v_heads.is_multiple_of(num_k_heads)
+        && head_k_dim > 0
+        && (1..=256).contains(&head_v_dim)
+}
+
+#[cfg(feature = "metal")]
 impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
     fn name(&self) -> &'static str {
         "izwi-qwen35-gated-delta-sequence-metal"
@@ -4111,12 +4125,12 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
         }
         if self.seq_len == 0
             || self.tile_size == 0
-            || self.num_k_heads != 16
-            || !matches!(self.num_v_heads, 16 | 32)
-            || !self.num_v_heads.is_multiple_of(self.num_k_heads)
-            || self.head_k_dim == 0
-            || self.head_v_dim == 0
-            || self.head_v_dim > 256
+            || !qwen35_gated_delta_tiled_layout_supported(
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
         {
             bail!(
                 "izwi-qwen35-gated-delta-sequence-metal requires Qwen3.5 16K/16V or 16K/32V non-empty heads with head_v_dim <= 256"
@@ -5191,19 +5205,19 @@ pub fn try_tiled_deltanet_recurrence(
             || v_seq_len != seq_len
             || g_seq_len != seq_len
             || b_seq_len != seq_len
-            || num_k_heads != 16
             || k_num_heads != num_k_heads
-            || !matches!(num_v_heads, 16 | 32)
-            || num_v_heads % num_k_heads != 0
+            || !qwen35_gated_delta_tiled_layout_supported(
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+            )
             || g_heads != num_v_heads
             || b_heads != num_v_heads
             || s_heads != num_v_heads
             || k_head_k_dim != head_k_dim
             || s_head_k_dim != head_k_dim
             || s_head_v_dim != head_v_dim
-            || head_k_dim == 0
-            || head_v_dim == 0
-            || head_v_dim > 256
             || !queries.device().is_metal()
             || !keys.device().is_metal()
             || !values.device().is_metal()
@@ -5471,6 +5485,17 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     #[cfg(all(feature = "metal", target_os = "macos"))]
     use candle_nn::Module;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qwen35_native_48_value_heads_remain_on_portable_recurrence() {
+        assert!(qwen35_gated_delta_tiled_layout_supported(16, 16, 128, 128));
+        assert!(qwen35_gated_delta_tiled_layout_supported(16, 32, 128, 128));
+        // The current shader indexes converted-GGUF tiled heads with
+        // `value_head % key_heads`. Native Qwen3.8 uses repeat-interleave head
+        // ordering, so its 16K/48V geometry must stay on the portable path.
+        assert!(!qwen35_gated_delta_tiled_layout_supported(16, 48, 128, 128));
+    }
 
     fn qwen35_causal_conv_reference(
         input: &[f32],

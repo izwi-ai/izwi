@@ -3404,13 +3404,16 @@ impl ModelRegistry {
                         ),
                         NativeChatModel::Qwen35(model) => LoadedModelActualRuntime::from_values(
                             Some(model.device_kind().as_str()),
-                            None,
+                            model.runtime_compute_dtype(),
                         ),
                         _ => LoadedModelActualRuntime::default(),
                     },
                     Some(model.supports_incremental_decode()),
                     None,
-                    None,
+                    match model.as_ref() {
+                        NativeChatModel::Qwen35(model) => Some(model.runtime_diagnostics()),
+                        _ => None,
+                    },
                 ));
             }
         }
