@@ -32,8 +32,10 @@ use crate::engine::{
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
-    ENGINE_KV_CACHE_ALLOCATED_BLOCKS, ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
+    ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
     ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
     ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_SCHEDULER_QUEUE_DEPTH,
@@ -711,14 +713,13 @@ fn coordinator_lane_for_metadata(
             matches!(
                 variant.family(),
                 ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
+            ) || matches!(
+                variant,
+                ModelVariant::Qwen306B
+                    | ModelVariant::Qwen306B4Bit
+                    | ModelVariant::Qwen317B
+                    | ModelVariant::Qwen317B4Bit
             )
-                || matches!(
-                    variant,
-                    ModelVariant::Qwen306B
-                        | ModelVariant::Qwen306B4Bit
-                        | ModelVariant::Qwen317B
-                        | ModelVariant::Qwen317B4Bit
-                )
         }
         TaskType::ASR => variant.family() == ModelFamily::Qwen3Asr && streaming,
         TaskType::TTS => variant.family() == ModelFamily::Qwen3Tts,
@@ -2631,6 +2632,8 @@ impl RuntimeService {
             tensor_batches_total: batch.tensor_batches_total,
             tensor_static_batches_total: batch.tensor_static_batches_total,
             tensor_continuous_batches_total: batch.tensor_continuous_batches_total,
+            tensor_continuous_multirow_batches_total: batch
+                .tensor_continuous_multirow_batches_total,
             request_parallel_batches_total: batch.request_parallel_batches_total,
             physical_batch_rejections_total: batch.physical_batch_rejections_total,
             tensor_batch_max_width: batch.tensor_batch_max_width,
@@ -2780,6 +2783,11 @@ impl RuntimeService {
             payload,
             ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
             snapshot.tensor_continuous_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
+            snapshot.tensor_continuous_multirow_batches_total,
         );
         push_engine_metric(
             payload,
@@ -4431,6 +4439,7 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_tensor_batch_max_width"));
         assert!(payload.contains("izwi_engine_executor_tensor_static_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_continuous_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_tensor_continuous_multirow_batches_total"));
         assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
         assert!(payload
             .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));

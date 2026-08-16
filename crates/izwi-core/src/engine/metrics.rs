@@ -52,6 +52,8 @@ pub const ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL: &str =
     "engine.executor.tensor_static_batches_total";
 pub const ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL: &str =
     "engine.executor.tensor_continuous_batches_total";
+pub const ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL: &str =
+    "engine.executor.tensor_continuous_multirow_batches_total";
 pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL: &str =
     "engine.executor.physical_batch_rejections_total";
 pub const ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL: &str = "engine.executor.tensor_batch_rows_total";
@@ -162,6 +164,10 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         description: "Observed continuous model-native tensor batch dispatches.",
     },
     EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
+        description: "Observed continuous tensor batches containing at least two rows.",
+    },
+    EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
         description: "Physical batches rejected before entering model code.",
     },
@@ -220,6 +226,7 @@ static ENGINE_REQUEST_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_MAX_WIDTH: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_STATIC_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_CONTINUOUS_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TENSOR_CONTINUOUS_MULTIROW_BATCHES: AtomicU64 = AtomicU64::new(0);
 static ENGINE_PHYSICAL_BATCH_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_CAPACITY_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -352,6 +359,7 @@ pub struct EngineBatchMetricsSnapshot {
     pub tensor_batches_total: u64,
     pub tensor_static_batches_total: u64,
     pub tensor_continuous_batches_total: u64,
+    pub tensor_continuous_multirow_batches_total: u64,
     pub request_parallel_batches_total: u64,
     pub physical_batch_rejections_total: u64,
     pub tensor_batch_max_width: u64,
@@ -485,6 +493,9 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
     }
 
     record_engine_batch_dispatch(dispatch);
+    if dispatch.kind == BatchDispatchKind::TensorContinuous && batch.rows.len() >= 2 {
+        ENGINE_TENSOR_CONTINUOUS_MULTIROW_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
     ENGINE_TENSOR_BATCH_ROWS.fetch_add(batch.rows.len() as u64, Ordering::Relaxed);
     ENGINE_TENSOR_BATCH_CAPACITY_ROWS.fetch_add(batch.budget.max_rows as u64, Ordering::Relaxed);
     let useful_elements = batch.rows.iter().fold(0u64, |total, row| {
@@ -516,6 +527,8 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         tensor_batches_total: engine_tensor_batches_total(),
         tensor_static_batches_total: ENGINE_TENSOR_STATIC_BATCHES.load(Ordering::Relaxed),
         tensor_continuous_batches_total: ENGINE_TENSOR_CONTINUOUS_BATCHES.load(Ordering::Relaxed),
+        tensor_continuous_multirow_batches_total: ENGINE_TENSOR_CONTINUOUS_MULTIROW_BATCHES
+            .load(Ordering::Relaxed),
         request_parallel_batches_total: engine_request_parallel_batches_total(),
         physical_batch_rejections_total: ENGINE_PHYSICAL_BATCH_REJECTIONS.load(Ordering::Relaxed),
         tensor_batch_max_width: engine_tensor_batch_max_width(),
@@ -1120,11 +1133,21 @@ mod tests {
         assert!(dispatched.workspace_domains.unified >= before.workspace_domains.unified + 3);
         assert!(dispatched.workspace_domains.temporary >= before.workspace_domains.temporary + 2);
 
+        record_engine_physical_batch(
+            &batch,
+            BatchDispatch::new(BatchDispatchKind::TensorContinuous, 2),
+        );
+        let continuous = engine_batch_metrics_snapshot();
+        assert!(
+            continuous.tensor_continuous_multirow_batches_total
+                > dispatched.tensor_continuous_multirow_batches_total
+        );
+
         record_engine_physical_batch(&batch, BatchDispatch::not_dispatched(2));
         let rejected = engine_batch_metrics_snapshot();
         assert!(
-            rejected.physical_batch_rejections_total > dispatched.physical_batch_rejections_total
+            rejected.physical_batch_rejections_total > continuous.physical_batch_rejections_total
         );
-        assert!(rejected.batch_workspace_bytes_total >= dispatched.batch_workspace_bytes_total);
+        assert!(rejected.batch_workspace_bytes_total >= continuous.batch_workspace_bytes_total);
     }
 }

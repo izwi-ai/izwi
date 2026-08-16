@@ -86,6 +86,34 @@ struct EngineRuntimeTelemetrySnapshot {
     #[serde(default)]
     stream_backpressure_total: u64,
     #[serde(default)]
+    tensor_batches_total: u64,
+    #[serde(default)]
+    tensor_static_batches_total: u64,
+    #[serde(default)]
+    tensor_continuous_batches_total: u64,
+    #[serde(default)]
+    tensor_continuous_multirow_batches_total: u64,
+    #[serde(default)]
+    request_parallel_batches_total: u64,
+    #[serde(default)]
+    physical_batch_rejections_total: u64,
+    #[serde(default)]
+    tensor_batch_max_width: u64,
+    #[serde(default)]
+    tensor_batch_rows_total: u64,
+    #[serde(default)]
+    tensor_batch_capacity_rows_total: u64,
+    #[serde(default)]
+    tensor_batch_useful_elements_total: u64,
+    #[serde(default)]
+    tensor_batch_materialized_elements_total: u64,
+    #[serde(default)]
+    batch_workspace_bytes_total: u64,
+    #[serde(default)]
+    tensor_batch_fill_ratio: f64,
+    #[serde(default)]
+    tensor_batch_padding_ratio: f64,
+    #[serde(default)]
     kv_cache: ManagedKvRuntimeSnapshot,
 }
 
@@ -4760,6 +4788,74 @@ fn print_runtime_delta(
     println!("  Active (current):     {}", after.requests_active);
     println!("  Worker restarts{}:    {}", counter_suffix, restart_delta);
     println!("  Worker panics{}:      {}", counter_suffix, panic_delta);
+    let batch_before = &before.engine;
+    let batch_after = &after.engine;
+    let tensor_batches_delta = batch_after
+        .tensor_batches_total
+        .saturating_sub(batch_before.tensor_batches_total);
+    let static_batches_delta = batch_after
+        .tensor_static_batches_total
+        .saturating_sub(batch_before.tensor_static_batches_total);
+    let continuous_batches_delta = batch_after
+        .tensor_continuous_batches_total
+        .saturating_sub(batch_before.tensor_continuous_batches_total);
+    let continuous_multirow_batches_delta = batch_after
+        .tensor_continuous_multirow_batches_total
+        .saturating_sub(batch_before.tensor_continuous_multirow_batches_total);
+    let request_parallel_batches_delta = batch_after
+        .request_parallel_batches_total
+        .saturating_sub(batch_before.request_parallel_batches_total);
+    let rejected_batches_delta = batch_after
+        .physical_batch_rejections_total
+        .saturating_sub(batch_before.physical_batch_rejections_total);
+    let batch_rows_delta = batch_after
+        .tensor_batch_rows_total
+        .saturating_sub(batch_before.tensor_batch_rows_total);
+    let batch_capacity_rows_delta = batch_after
+        .tensor_batch_capacity_rows_total
+        .saturating_sub(batch_before.tensor_batch_capacity_rows_total);
+    let useful_elements_delta = batch_after
+        .tensor_batch_useful_elements_total
+        .saturating_sub(batch_before.tensor_batch_useful_elements_total);
+    let materialized_elements_delta = batch_after
+        .tensor_batch_materialized_elements_total
+        .saturating_sub(batch_before.tensor_batch_materialized_elements_total);
+    let workspace_bytes_delta = batch_after
+        .batch_workspace_bytes_total
+        .saturating_sub(batch_before.batch_workspace_bytes_total);
+    let run_fill_ratio = if batch_capacity_rows_delta == 0 {
+        0.0
+    } else {
+        batch_rows_delta as f64 / batch_capacity_rows_delta as f64
+    };
+    let run_padding_ratio = if materialized_elements_delta == 0 {
+        0.0
+    } else {
+        1.0 - useful_elements_delta as f64 / materialized_elements_delta as f64
+    };
+    println!(
+        "  Batch dispatch{} (tensor/static/continuous/continuous-multirow/request-parallel/rejected): {} / {} / {} / {} / {} / {}",
+        counter_suffix,
+        tensor_batches_delta,
+        static_batches_delta,
+        continuous_batches_delta,
+        continuous_multirow_batches_delta,
+        request_parallel_batches_delta,
+        rejected_batches_delta
+    );
+    println!(
+        "  Tensor batch{} (rows/capacity/max-width/fill/padding): {} / {} / {} / {:.1}% / {:.1}%",
+        counter_suffix,
+        batch_rows_delta,
+        batch_capacity_rows_delta,
+        batch_after.tensor_batch_max_width,
+        run_fill_ratio * 100.0,
+        run_padding_ratio.max(0.0) * 100.0
+    );
+    println!(
+        "  Tensor elements{} (useful/materialized), workspace bytes: {} / {}, {}",
+        counter_suffix, useful_elements_delta, materialized_elements_delta, workspace_bytes_delta
+    );
     println!(
         "  Queue wait rolling(avg/p50/p95): {:.2} / {:.2} / {:.2} ms",
         after.queue_wait_ms_avg, after.queue_wait_ms_p50, after.queue_wait_ms_p95
@@ -5749,6 +5845,20 @@ mod tests {
         let engine: EngineRuntimeTelemetrySnapshot = serde_json::from_value(serde_json::json!({
             "scheduler_queue_depth": 1,
             "scheduler_running_requests": 2,
+            "tensor_batches_total": 7,
+            "tensor_static_batches_total": 2,
+            "tensor_continuous_batches_total": 5,
+            "tensor_continuous_multirow_batches_total": 4,
+            "request_parallel_batches_total": 3,
+            "physical_batch_rejections_total": 1,
+            "tensor_batch_max_width": 8,
+            "tensor_batch_rows_total": 29,
+            "tensor_batch_capacity_rows_total": 40,
+            "tensor_batch_useful_elements_total": 2048,
+            "tensor_batch_materialized_elements_total": 2304,
+            "batch_workspace_bytes_total": 4096,
+            "tensor_batch_fill_ratio": 0.725,
+            "tensor_batch_padding_ratio": 0.1111111111,
             "kv_cache": {
                 "memory_accounting": "physical_arena_backing",
                 "totals": {
@@ -5775,6 +5885,16 @@ mod tests {
         .expect("engine telemetry should deserialize");
 
         assert_eq!(engine.scheduler_queue_depth, 1);
+        assert_eq!(engine.tensor_batches_total, 7);
+        assert_eq!(engine.tensor_continuous_batches_total, 5);
+        assert_eq!(engine.tensor_continuous_multirow_batches_total, 4);
+        assert_eq!(engine.tensor_batch_max_width, 8);
+        assert_eq!(engine.tensor_batch_rows_total, 29);
+        assert_eq!(engine.tensor_batch_capacity_rows_total, 40);
+        assert_eq!(engine.tensor_batch_useful_elements_total, 2048);
+        assert_eq!(engine.tensor_batch_materialized_elements_total, 2304);
+        assert_eq!(engine.batch_workspace_bytes_total, 4096);
+        assert!((engine.tensor_batch_fill_ratio - 0.725).abs() < f64::EPSILON);
         assert_eq!(engine.kv_cache.memory_accounting, "physical_arena_backing");
         assert_eq!(engine.kv_cache.totals.coordinator.capacity_pages, 128);
         assert_eq!(engine.kv_cache.totals.coordinator.allocated_pages, 48);

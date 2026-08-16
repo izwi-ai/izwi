@@ -1125,7 +1125,7 @@ fn benchmark_operation(
     }
     let after = runtime.arena.operation_stats();
     let dispatches = dispatch_delta(operation, before, after);
-    if dispatches == 0 && operation != "paged_prefill" {
+    if dispatches == 0 {
         return Err(format!(
             "{operation} completed without advancing its arena dispatch counter"
         ));
@@ -1173,9 +1173,8 @@ fn dispatch_delta(
 ) -> u64 {
     match operation {
         "slot_write" => after.slot_write_dispatches - before.slot_write_dispatches,
-        "paged_prefill" | "paged_decode" => {
-            after.paged_decode_dispatches - before.paged_decode_dispatches
-        }
+        "paged_prefill" => after.paged_prefill_dispatches - before.paged_prefill_dispatches,
+        "paged_decode" => after.paged_decode_dispatches - before.paged_decode_dispatches,
         "page_zero" => after.page_zero_dispatches - before.page_zero_dispatches,
         "page_copy" => after.page_copy_dispatches - before.page_copy_dispatches,
         _ => 0,
@@ -1207,9 +1206,9 @@ fn emit_measurement(
     let workspace_bytes = optional_u64(after.workspace_bytes);
     let workspace_allocations = optional_u64(after.workspace_allocations);
     println!(
-        "{{\"schema\":\"{SCHEMA}\",\"status\":\"measured\",\"backend\":\"{}\",\"dtype\":\"{}\",\"page_tokens\":{},\"profile\":\"{}\",\"contexts\":\"{}\",\"requested_provider\":\"{}\",\"observed_provider\":{},\"first_page_offset\":{},\"window_tokens\":{},\"softcap\":{},\"query_heads\":{},\"kv_heads\":{},\"head_dim\":{},\"batch_size\":{},\"operation\":\"{operation}\",\"iterations\":{},\"warmup\":{},\"dispatches\":{dispatches},\"dispatches_per_iteration\":{:.3},\"plan_cache_hits\":{},\"plan_cache_misses\":{},\"plan_cache_evictions\":{},\"device_uploads\":{},\"plan_resident_bytes\":{},\"backing_allocations\":{},\"host_synchronizations\":{},\"workspace_bytes\":{},\"workspace_allocations\":{},\"rss_bytes\":null,\"vram_bytes\":null,\"max_abs_error\":{:.8},\"max_rel_error\":{:.8},\"tolerance\":{:.8},\"mean_us\":{mean:.3},\"p50_us\":{:.3},\"p95_us\":{:.3}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"status\":\"measured\",\"backend\":\"{}\",\"dtype\":\"{}\",\"page_tokens\":{},\"profile\":\"{}\",\"contexts\":\"{}\",\"requested_context_len\":{},\"requested_provider\":\"{}\",\"observed_provider\":{},\"first_page_offset\":{},\"window_tokens\":{},\"softcap\":{},\"query_heads\":{},\"kv_heads\":{},\"head_dim\":{},\"batch_size\":{},\"operation\":\"{operation}\",\"iterations\":{},\"warmup\":{},\"dispatches\":{dispatches},\"dispatches_per_iteration\":{:.3},\"plan_cache_hits\":{},\"plan_cache_misses\":{},\"plan_cache_evictions\":{},\"device_uploads\":{},\"plan_resident_bytes\":{},\"backing_allocations\":{},\"host_synchronizations\":{},\"workspace_bytes\":{},\"workspace_allocations\":{},\"rss_bytes\":null,\"vram_bytes\":null,\"max_abs_error\":{:.8},\"max_rel_error\":{:.8},\"tolerance\":{:.8},\"mean_us\":{mean:.3},\"p50_us\":{:.3},\"p95_us\":{:.3}}}",
         options.backend.name(), dtype_name(options.dtype), options.page_tokens, options.profile,
-        workload.context_summary, options.provider, provider,
+        workload.context_summary, optional_u32(options.context_len), options.provider, provider,
         optional_u32(options.first_page_offset), optional_u32(options.window_tokens), optional_f32(options.softcap),
         options.query_heads, options.kv_heads, options.head_dim, workload.decode.sequences.len(),
         options.iterations, options.warmup, dispatches as f64 / options.iterations as f64,

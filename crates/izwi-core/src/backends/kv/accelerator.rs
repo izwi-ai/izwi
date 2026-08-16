@@ -3231,192 +3231,226 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[ignore = "required CUDA evidence: run explicitly on a CUDA device; absence must fail"]
     fn cuda_paged_decode_matches_cpu_for_offsets_and_gqa() -> Result<()> {
-        let Ok(device) = Device::new_cuda(0) else {
-            return Ok(());
-        };
-        for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for (num_kv_heads, num_query_heads) in [(1_usize, 2_usize), (2, 2), (2, 4)] {
-                let binding = KvLayerBinding {
-                    model_layer: 0,
-                    physical_layer: 0,
-                };
-                let cuda_arena_id = KvArenaId {
-                    model_instance: ModelInstanceId::new(1),
-                    backend: BackendKind::Cuda,
-                    device_ordinal: Some(0),
-                    generation: 1,
-                };
-                let cpu_arena_id = KvArenaId {
-                    backend: BackendKind::Cpu,
-                    device_ordinal: None,
-                    ..cuda_arena_id
-                };
-                let group = KvGroupId::new(0);
-                let layer_config = super::super::KvLayerConfig {
+        let device = Device::new_cuda(0)?;
+        // Cover every supported page size and accelerator dtype with realistic
+        // MQA/GQA geometry. Non-zero first-page offsets deliberately make the
+        // FlashAttention path ineligible so this test certifies CUDA-native
+        // grouped-head addressing rather than silently accepting a provider
+        // fallback.
+        let cases = [
+            (16_u32, DType::F32, 1_usize, 8_usize, 64_usize),
+            (32, DType::F16, 8, 32, 128),
+            (64, DType::BF16, 4, 16, 64),
+        ];
+        for (case_index, (page_tokens, dtype, num_kv_heads, num_query_heads, head_dim)) in
+            cases.into_iter().enumerate()
+        {
+            let binding = KvLayerBinding {
+                model_layer: 0,
+                physical_layer: 0,
+            };
+            let cuda_arena_id = KvArenaId {
+                model_instance: ModelInstanceId::new(case_index as u64 + 1),
+                backend: BackendKind::Cuda,
+                device_ordinal: Some(0),
+                generation: 1,
+            };
+            let cpu_arena_id = KvArenaId {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                ..cuda_arena_id
+            };
+            let group = KvGroupId::new(0);
+            let layer_config = super::super::KvLayerConfig {
+                binding,
+                num_kv_heads: num_kv_heads as u32,
+                key_head_dim: head_dim as u32,
+                value_head_dim: head_dim as u32,
+            };
+            let cuda_config = KvArenaConfig {
+                id: cuda_arena_id,
+                group,
+                page_tokens,
+                capacity_pages: 4,
+                growth: None,
+                dtype,
+                layers: vec![layer_config],
+            };
+            let cpu_config = KvArenaConfig {
+                id: cpu_arena_id,
+                ..cuda_config.clone()
+            };
+            let cuda_arena =
+                CandleAcceleratorKvArena::new_mutation_only(cuda_config, device.clone())?;
+            let cpu_arena = super::super::CpuKvArena::new(cpu_config)?;
+            let cuda_block = |index| CacheBlockRef {
+                arena: cuda_arena_id,
+                group,
+                index,
+                slot_generation: 1,
+            };
+            let cpu_block = |index| CacheBlockRef {
+                arena: cpu_arena_id,
+                group,
+                index,
+                slot_generation: 1,
+            };
+            let cuda_slots = (0..4)
+                .flat_map(|page| {
+                    (0..page_tokens).map(move |offset| KvSlotRef {
+                        block: cuda_block(page),
+                        offset,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let cpu_slots = (0..4)
+                .flat_map(|page| {
+                    (0..page_tokens).map(move |offset| KvSlotRef {
+                        block: cpu_block(page),
+                        offset,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let cuda_slots = cuda_arena.lower_slots(&cuda_slots)?;
+            let cpu_slots = cpu_arena.lower_slots(&cpu_slots)?;
+            let token_capacity = 4 * page_tokens as usize;
+            let key_data = (0..(token_capacity * num_kv_heads * head_dim))
+                .map(|index| ((index % 251) as f32 - 125.0) / 64.0)
+                .collect::<Vec<_>>();
+            let value_data = (0..(token_capacity * num_kv_heads * head_dim))
+                .map(|index| ((index % 239) as f32 - 119.0) / 71.0)
+                .collect::<Vec<_>>();
+            let cuda_keys = Tensor::from_vec(
+                key_data.clone(),
+                (token_capacity, num_kv_heads, head_dim),
+                &device,
+            )?
+            .to_dtype(dtype)?;
+            let cuda_values = Tensor::from_vec(
+                value_data.clone(),
+                (token_capacity, num_kv_heads, head_dim),
+                &device,
+            )?
+            .to_dtype(dtype)?;
+            let cpu_keys = Tensor::from_vec(
+                key_data,
+                (token_capacity, num_kv_heads, head_dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(dtype)?;
+            let cpu_values = Tensor::from_vec(
+                value_data,
+                (token_capacity, num_kv_heads, head_dim),
+                &Device::Cpu,
+            )?
+            .to_dtype(dtype)?;
+            cuda_arena
+                .write_slots(
                     binding,
-                    num_kv_heads: num_kv_heads as u32,
-                    key_head_dim: 4,
-                    value_head_dim: 4,
-                };
-                let cuda_config = KvArenaConfig {
-                    id: cuda_arena_id,
-                    group,
-                    page_tokens: 2,
-                    capacity_pages: 4,
-                    growth: None,
-                    dtype,
-                    layers: vec![layer_config],
-                };
-                let cpu_config = KvArenaConfig {
-                    id: cpu_arena_id,
-                    ..cuda_config.clone()
-                };
-                let cuda_arena =
-                    CandleAcceleratorKvArena::new_mutation_only(cuda_config, device.clone())?;
-                let cpu_arena = super::super::CpuKvArena::new(cpu_config)?;
-                let cuda_block = |index| CacheBlockRef {
-                    arena: cuda_arena_id,
-                    group,
-                    index,
-                    slot_generation: 1,
-                };
-                let cpu_block = |index| CacheBlockRef {
-                    arena: cpu_arena_id,
-                    group,
-                    index,
-                    slot_generation: 1,
-                };
-                let cuda_slots = (0..4)
-                    .flat_map(|page| {
-                        (0..2).map(move |offset| KvSlotRef {
-                            block: cuda_block(page),
-                            offset,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let cpu_slots = (0..4)
-                    .flat_map(|page| {
-                        (0..2).map(move |offset| KvSlotRef {
-                            block: cpu_block(page),
-                            offset,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let cuda_slots = cuda_arena.lower_slots(&cuda_slots)?;
-                let cpu_slots = cpu_arena.lower_slots(&cpu_slots)?;
-                let key_data = (0..(8 * num_kv_heads * 4))
-                    .map(|index| (index as f32 - 9.0) / 11.0)
-                    .collect::<Vec<_>>();
-                let value_data = (0..(8 * num_kv_heads * 4))
-                    .map(|index| (index as f32 + 2.0) / 13.0)
-                    .collect::<Vec<_>>();
-                let cuda_keys = Tensor::from_vec(key_data.clone(), (8, num_kv_heads, 4), &device)?
-                    .to_dtype(dtype)?;
-                let cuda_values =
-                    Tensor::from_vec(value_data.clone(), (8, num_kv_heads, 4), &device)?
-                        .to_dtype(dtype)?;
-                let cpu_keys = Tensor::from_vec(key_data, (8, num_kv_heads, 4), &Device::Cpu)?
-                    .to_dtype(dtype)?;
-                let cpu_values = Tensor::from_vec(value_data, (8, num_kv_heads, 4), &Device::Cpu)?
-                    .to_dtype(dtype)?;
-                cuda_arena
-                    .write_slots(
-                        binding,
-                        KvWriteArgs {
-                            keys: &cuda_keys,
-                            values: &cuda_values,
-                            slots: cuda_slots.as_ref(),
-                        },
-                    )?
-                    .wait()?;
-                cpu_arena
-                    .write_slots(
-                        binding,
-                        KvWriteArgs {
-                            keys: &cpu_keys,
-                            values: &cpu_values,
-                            slots: cpu_slots.as_ref(),
-                        },
-                    )?
-                    .wait()?;
+                    KvWriteArgs {
+                        keys: &cuda_keys,
+                        values: &cuda_values,
+                        slots: cuda_slots.as_ref(),
+                    },
+                )?
+                .wait()?;
+            cpu_arena
+                .write_slots(
+                    binding,
+                    KvWriteArgs {
+                        keys: &cpu_keys,
+                        values: &cpu_values,
+                        slots: cpu_slots.as_ref(),
+                    },
+                )?
+                .wait()?;
 
-                let cuda_batch = KvDecodeBatchMetadata {
-                    sequences: vec![
-                        crate::kv::KvSequenceBlockTable {
-                            blocks: vec![cuda_block(2), cuda_block(0)],
-                            first_page_offset: 1,
-                            context_len: 3,
-                        },
-                        crate::kv::KvSequenceBlockTable {
-                            blocks: vec![cuda_block(3)],
-                            first_page_offset: 0,
-                            context_len: 2,
-                        },
-                    ],
-                };
-                let cpu_batch = KvDecodeBatchMetadata {
-                    sequences: vec![
-                        crate::kv::KvSequenceBlockTable {
-                            blocks: vec![cpu_block(2), cpu_block(0)],
-                            first_page_offset: 1,
-                            context_len: 3,
-                        },
-                        crate::kv::KvSequenceBlockTable {
-                            blocks: vec![cpu_block(3)],
-                            first_page_offset: 0,
-                            context_len: 2,
-                        },
-                    ],
-                };
-                let query_data = (0..(2 * num_query_heads * 4))
-                    .map(|index| (index as f32 - 5.0) / 7.0)
-                    .collect::<Vec<_>>();
-                let cuda_query =
-                    Tensor::from_vec(query_data.clone(), (2, num_query_heads, 4), &device)?
-                        .to_dtype(dtype)?;
-                let cpu_query =
-                    Tensor::from_vec(query_data, (2, num_query_heads, 4), &Device::Cpu)?
-                        .to_dtype(dtype)?;
-                let cuda_output = cuda_arena.paged_decode(
-                    binding,
-                    PagedKvDecodeArgs {
-                        queries: &cuda_query,
-                        batch: &cuda_batch,
-                        softmax_scale: 0.5,
-                        softcap: None,
+            let cuda_batch = KvDecodeBatchMetadata {
+                sequences: vec![
+                    crate::kv::KvSequenceBlockTable {
+                        blocks: vec![cuda_block(2), cuda_block(0)],
+                        first_page_offset: 1,
+                        context_len: page_tokens + 5,
                     },
-                )?;
-                let cpu_output = cpu_arena.paged_decode(
-                    binding,
-                    PagedKvDecodeArgs {
-                        queries: &cpu_query,
-                        batch: &cpu_batch,
-                        softmax_scale: 0.5,
-                        softcap: None,
+                    crate::kv::KvSequenceBlockTable {
+                        blocks: vec![cuda_block(3)],
+                        first_page_offset: 0,
+                        context_len: page_tokens - 1,
                     },
-                )?;
-                let actual = cuda_output
-                    .to_device(&Device::Cpu)?
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                let expected = cpu_output
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                let tolerance = match dtype {
-                    DType::F32 => 1e-5,
-                    DType::F16 => 3e-3,
-                    DType::BF16 => 2e-2,
-                    _ => unreachable!(),
-                };
-                for (actual, expected) in actual.iter().zip(expected.iter()) {
-                    assert!(
+                ],
+            };
+            let cpu_batch = KvDecodeBatchMetadata {
+                sequences: vec![
+                    crate::kv::KvSequenceBlockTable {
+                        blocks: vec![cpu_block(2), cpu_block(0)],
+                        first_page_offset: 1,
+                        context_len: page_tokens + 5,
+                    },
+                    crate::kv::KvSequenceBlockTable {
+                        blocks: vec![cpu_block(3)],
+                        first_page_offset: 0,
+                        context_len: page_tokens - 1,
+                    },
+                ],
+            };
+            let query_data = (0..(2 * num_query_heads * head_dim))
+                .map(|index| ((index % 127) as f32 - 63.0) / 53.0)
+                .collect::<Vec<_>>();
+            let cuda_query =
+                Tensor::from_vec(query_data.clone(), (2, num_query_heads, head_dim), &device)?
+                    .to_dtype(dtype)?;
+            let cpu_query =
+                Tensor::from_vec(query_data, (2, num_query_heads, head_dim), &Device::Cpu)?
+                    .to_dtype(dtype)?;
+            let softmax_scale = 1.0 / (head_dim as f32).sqrt();
+            let cuda_output = cuda_arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &cuda_query,
+                    batch: &cuda_batch,
+                    softmax_scale,
+                    softcap: None,
+                },
+            )?;
+            assert_eq!(
+                cuda_arena
+                    .operation_stats()
+                    .last_attention_provider
+                    .map(|provider| provider.name()),
+                Some("cuda_native"),
+                "required CUDA-native evidence used a different provider"
+            );
+            let cpu_output = cpu_arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &cpu_query,
+                    batch: &cpu_batch,
+                    softmax_scale,
+                    softcap: None,
+                },
+            )?;
+            let actual = cuda_output
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected = cpu_output
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let tolerance = match dtype {
+                DType::F32 => 1e-5,
+                DType::F16 => 3e-3,
+                DType::BF16 => 2e-2,
+                _ => unreachable!(),
+            };
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                assert!(
                         (actual - expected).abs() < tolerance,
-                        "{dtype:?} {num_query_heads}Q/{num_kv_heads}KV: {actual} != {expected}"
+                        "page={page_tokens} dtype={dtype:?} dim={head_dim} {num_query_heads}Q/{num_kv_heads}KV: {actual} != {expected}"
                     );
-                }
             }
         }
         Ok(())

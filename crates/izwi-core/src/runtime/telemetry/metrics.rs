@@ -62,6 +62,7 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub tensor_batches_total: u64,
     pub tensor_static_batches_total: u64,
     pub tensor_continuous_batches_total: u64,
+    pub tensor_continuous_multirow_batches_total: u64,
     pub request_parallel_batches_total: u64,
     pub physical_batch_rejections_total: u64,
     pub tensor_batch_max_width: u64,

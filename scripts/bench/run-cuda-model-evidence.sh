@@ -12,6 +12,7 @@ allow_remote=0
 allow_unsupported=0
 dry_run=0
 require_optimized_kernel_evidence=0
+require_continuous_batch_evidence=0
 certificate_written=0
 started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -27,6 +28,8 @@ Options:
   --allow-unsupported   Missing NVIDIA hardware emits unsupported instead of failing
   --require-optimized-kernel-evidence
                         Require every case to observe a fused/paged/RoPE CUDA path
+  --require-continuous-batch-evidence
+                        Require every case to prove run-local multi-row continuous batching
   --dry-run             Print the benchmark command without probing hardware/server
   -h, --help            Show this help
 
@@ -65,6 +68,10 @@ while [[ $# -gt 0 ]]; do
             require_optimized_kernel_evidence=1
             shift
             ;;
+        --require-continuous-batch-evidence)
+            require_continuous_batch_evidence=1
+            shift
+            ;;
         --dry-run)
             dry_run=1
             shift
@@ -97,6 +104,11 @@ health_path="${output_dir}/health.json"
 benchmark_dir="${output_dir}/benchmark"
 : >"${runner_log}"
 git_sha=$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || printf 'unknown')
+if [[ -z "$(git -C "${repo_root}" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+    worktree_clean=true
+else
+    worktree_clean=false
+fi
 if command -v sha256sum >/dev/null 2>&1; then
     manifest_hash=$(sha256sum "${manifest}" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
@@ -126,6 +138,9 @@ write_status_certificate() {
         --arg manifest_sha256 "${manifest_hash}" \
         --arg started_at "${started_at}" \
         --arg ended_at "${ended_at}" \
+        --argjson worktree_clean "${worktree_clean}" \
+        --argjson require_optimized "${require_optimized_kernel_evidence}" \
+        --argjson require_continuous "${require_continuous_batch_evidence}" \
         '{
             schema: "izwi.cuda-model-evidence.v1",
             status: $status,
@@ -134,8 +149,13 @@ write_status_certificate() {
                 git_sha: $git_sha,
                 manifest: $manifest,
                 manifest_sha256: $manifest_sha256,
+                worktree_clean: $worktree_clean,
                 started_at: $started_at,
                 ended_at: $ended_at
+            },
+            requirements: {
+                optimized_kernel: ($require_optimized == 1),
+                continuous_batch: ($require_continuous == 1)
             },
             device: null,
             cases: [],
@@ -184,6 +204,9 @@ if ! command -v "${nvidia_smi}" >/dev/null 2>&1 || ! "${nvidia_smi}" -L >/dev/nu
     fi
     fail "CUDA model certification requires a device visible to nvidia-smi"
 fi
+if [[ "${worktree_clean}" != true ]]; then
+    fail "CUDA model certification requires a clean exact-SHA worktree"
+fi
 
 require_command curl
 if [[ ! -x "${izwi_bin}" ]]; then
@@ -228,7 +251,9 @@ report_path="${benchmark_dir}/report.json"
 metadata_path="${benchmark_dir}/metadata.json"
 observability_path="${benchmark_dir}/observability.json"
 
-if ! jq -e --argjson require_optimized "${require_optimized_kernel_evidence}" '
+if ! jq -e \
+    --argjson require_optimized "${require_optimized_kernel_evidence}" \
+    --argjson require_continuous "${require_continuous_batch_evidence}" '
     .schema_version == 1 and
     (.reports | length) > 0 and
     ([.reports[].name] | all(type == "string") and length == (unique | length)) and
@@ -253,6 +278,36 @@ if ! jq -e --argjson require_optimized "${require_optimized_kernel_evidence}" '
         $telemetry.after.worker_panics == $telemetry.before.worker_panics and
         $telemetry.after.worker_restarts == $telemetry.before.worker_restarts
     ] | all(. == true)) and
+    (($require_continuous == 0) or ([.reports[] |
+        .report as $report |
+        $report.telemetry as $telemetry |
+        (($telemetry.after.engine.tensor_continuous_batches_total -
+          $telemetry.before.engine.tensor_continuous_batches_total) as $continuous |
+         ($telemetry.after.engine.tensor_batches_total -
+          $telemetry.before.engine.tensor_batches_total) as $tensor_batches |
+         ($telemetry.after.engine.tensor_continuous_multirow_batches_total -
+          $telemetry.before.engine.tensor_continuous_multirow_batches_total) as $continuous_multirow |
+         ($telemetry.after.engine.tensor_batch_rows_total -
+          $telemetry.before.engine.tensor_batch_rows_total) as $rows |
+         ($telemetry.after.engine.tensor_batch_capacity_rows_total -
+          $telemetry.before.engine.tensor_batch_capacity_rows_total) as $capacity_rows |
+         ($telemetry.after.engine.tensor_batch_useful_elements_total -
+          $telemetry.before.engine.tensor_batch_useful_elements_total) as $useful_elements |
+         ($telemetry.after.engine.tensor_batch_materialized_elements_total -
+          $telemetry.before.engine.tensor_batch_materialized_elements_total) as $materialized_elements |
+         $report.command == "chat" and
+         $report.config.concurrent >= 2 and
+         $continuous > 0 and
+         $continuous_multirow > 0 and
+         $tensor_batches >= $continuous and
+         $rows > $continuous and
+         $capacity_rows >= $rows and
+         $useful_elements > 0 and
+         $materialized_elements >= $useful_elements and
+         $telemetry.after.engine.tensor_batch_max_width >= 2 and
+         $telemetry.after.engine.physical_batch_rejections_total ==
+           $telemetry.before.engine.physical_batch_rejections_total)
+    ] | all(. == true))) and
     (($require_optimized == 0) or ([.reports[] |
         .report.telemetry as $telemetry |
         (((($telemetry.after.kernel_path.fused_attention_success_total // 0) -
@@ -263,7 +318,7 @@ if ! jq -e --argjson require_optimized "${require_optimized_kernel_evidence}" '
            ($telemetry.before.kernel_path.rope_kernel_total // 0)) > 0))
     ] | all(. == true)))
 ' "${report_path}" >/dev/null; then
-    fail "CUDA benchmark report failed case, sample, quality, runtime, or optimized-kernel validation"
+    fail "CUDA benchmark report failed case, sample, quality, runtime, continuous-batch, or optimized-kernel validation"
 fi
 if ! jq -e --arg git_sha "${git_sha}" '.schema_version == 1 and .git_sha == $git_sha' \
     "${metadata_path}" >/dev/null; then
@@ -284,6 +339,8 @@ jq -n \
     --arg manifest_sha256 "${manifest_hash}" \
     --arg started_at "${started_at}" \
     --arg ended_at "${ended_at}" \
+    --argjson require_optimized "${require_optimized_kernel_evidence}" \
+    --argjson require_continuous "${require_continuous_batch_evidence}" \
     --slurpfile health "${health_path}" \
     --slurpfile report "${report_path}" \
     '{
@@ -294,8 +351,13 @@ jq -n \
             git_sha: $git_sha,
             manifest: $manifest,
             manifest_sha256: $manifest_sha256,
+            worktree_clean: true,
             started_at: $started_at,
             ended_at: $ended_at
+        },
+        requirements: {
+            optimized_kernel: ($require_optimized == 1),
+            continuous_batch: ($require_continuous == 1)
         },
         device: {
             build_git_sha: $health[0].runtime.build_git_sha,
@@ -320,6 +382,29 @@ jq -n \
                     .backend_kind == "cuda" and
                     .actual_device_kind == "cuda"
                 )] | first) as $runtime |
+            $case.report.telemetry as $telemetry |
+            (($telemetry.after.engine.tensor_batches_total // 0) -
+             ($telemetry.before.engine.tensor_batches_total // 0)) as $tensor_batches |
+            (($telemetry.after.engine.tensor_static_batches_total // 0) -
+             ($telemetry.before.engine.tensor_static_batches_total // 0)) as $static_batches |
+            (($telemetry.after.engine.tensor_continuous_batches_total // 0) -
+             ($telemetry.before.engine.tensor_continuous_batches_total // 0)) as $continuous_batches |
+            (($telemetry.after.engine.tensor_continuous_multirow_batches_total // 0) -
+             ($telemetry.before.engine.tensor_continuous_multirow_batches_total // 0)) as $continuous_multirow_batches |
+            (($telemetry.after.engine.request_parallel_batches_total // 0) -
+             ($telemetry.before.engine.request_parallel_batches_total // 0)) as $request_parallel_batches |
+            (($telemetry.after.engine.physical_batch_rejections_total // 0) -
+             ($telemetry.before.engine.physical_batch_rejections_total // 0)) as $batch_rejections |
+            (($telemetry.after.engine.tensor_batch_rows_total // 0) -
+             ($telemetry.before.engine.tensor_batch_rows_total // 0)) as $rows |
+            (($telemetry.after.engine.tensor_batch_capacity_rows_total // 0) -
+             ($telemetry.before.engine.tensor_batch_capacity_rows_total // 0)) as $capacity_rows |
+            (($telemetry.after.engine.tensor_batch_useful_elements_total // 0) -
+             ($telemetry.before.engine.tensor_batch_useful_elements_total // 0)) as $useful_elements |
+            (($telemetry.after.engine.tensor_batch_materialized_elements_total // 0) -
+             ($telemetry.before.engine.tensor_batch_materialized_elements_total // 0)) as $materialized_elements |
+            (($telemetry.after.engine.batch_workspace_bytes_total // 0) -
+             ($telemetry.before.engine.batch_workspace_bytes_total // 0)) as $workspace_bytes |
             {
                 name: .name,
                 command: .report.command,
@@ -330,6 +415,24 @@ jq -n \
                 backend_kind: $runtime.backend_kind,
                 actual_device_kind: $runtime.actual_device_kind,
                 actual_compute_dtype: $runtime.actual_compute_dtype,
+                batch_delta: {
+                    tensor_batches: $tensor_batches,
+                    static_batches: $static_batches,
+                    continuous_batches: $continuous_batches,
+                    continuous_multirow_batches: $continuous_multirow_batches,
+                    request_parallel_batches: $request_parallel_batches,
+                    physical_batch_rejections: $batch_rejections,
+                    max_width_after: ($telemetry.after.engine.tensor_batch_max_width // 0),
+                    rows: $rows,
+                    capacity_rows: $capacity_rows,
+                    fill_ratio: (if $capacity_rows > 0 then $rows / $capacity_rows else null end),
+                    useful_elements: $useful_elements,
+                    materialized_elements: $materialized_elements,
+                    padding_ratio: (if $materialized_elements > 0 then
+                        1 - ($useful_elements / $materialized_elements)
+                      else null end),
+                    workspace_bytes: $workspace_bytes
+                },
                 kernel_delta: {
                     host_read_ops: ((.report.telemetry.after.kernel_path.host_read_ops_total // 0) - (.report.telemetry.before.kernel_path.host_read_ops_total // 0)),
                     host_read_bytes: ((.report.telemetry.after.kernel_path.host_read_bytes_total // 0) - (.report.telemetry.before.kernel_path.host_read_bytes_total // 0)),

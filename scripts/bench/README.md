@@ -47,6 +47,27 @@ scripts/bench/run_kv_cache_matrix.sh --lane cuda --require-device \
   --iterations 30 --warmup 5 --output target/kv-cache-cuda-certification.jsonl
 ```
 
+Retained Metal/CUDA evidence must bind a clean worktree to an explicit SHA:
+
+```bash
+git_sha=$(git rev-parse HEAD)
+scripts/bench/run_kv_cache_matrix.sh --lane metal --require-device \
+  --expected-git-sha "$git_sha" --iterations 30 --warmup 5 \
+  --output target/metal-kv-evidence/matrix.jsonl \
+  --certificate target/metal-kv-evidence/certificate.json
+scripts/bench/validate-gpu-evidence-certificate.sh \
+  --certificate target/metal-kv-evidence/certificate.json \
+  --backend metal --expected-git-sha "$git_sha"
+
+scripts/bench/run_kv_cache_matrix.sh --lane cuda --require-device \
+  --expected-git-sha "$git_sha" --iterations 30 --warmup 5 \
+  --output target/cuda-kv-evidence/matrix.jsonl \
+  --certificate target/cuda-kv-evidence/certificate.json
+scripts/bench/validate-gpu-evidence-certificate.sh \
+  --certificate target/cuda-kv-evidence/certificate.json \
+  --backend cuda --expected-git-sha "$git_sha"
+```
+
 The CUDA lane builds with `--features flash-attn` (which implies `cuda`) and
 exercises both the portable kill switch and enabled optimized rollout with F16
 and BF16. Provider attribution comes from the arena after execution, so native
@@ -91,6 +112,31 @@ expected to exercise fused attention, paged attention, or a fused RoPE path.
 The protected workflow runs this stricter check separately from broad family
 coverage so generic Candle CUDA execution is not mislabeled as an optimized
 custom kernel.
+
+Continuous batching uses a dedicated concurrent Qwen3/Gemma manifest. The
+certificate rejects missing run-local multi-row continuous batches, zero work,
+width below two, or physical-batch rejections:
+
+```bash
+git_sha=$(git rev-parse HEAD)
+scripts/bench/run-cuda-model-evidence.sh \
+  --manifest benchmarks/manifests/cuda-continuous-batching.toml \
+  --require-continuous-batch-evidence \
+  --output target/cuda-continuous-batching-evidence
+scripts/bench/validate-gpu-evidence-certificate.sh \
+  --certificate target/cuda-continuous-batching-evidence/certificate.json \
+  --backend cuda --expected-git-sha "$git_sha" \
+  --require-continuous-batch-evidence
+```
+
+The ignored native CUDA GQA oracle fails if explicitly run without CUDA or if
+the observed provider is not `cuda_native`:
+
+```bash
+cargo test -p izwi-core --features cuda \
+  backends::kv::accelerator::tests::cuda_paged_decode_matches_cpu_for_offsets_and_gqa \
+  -- --ignored --exact
+```
 
 The same workflow first runs `run-cuda-model-load-evidence.sh` against one
 representative from every registered implementation family. This closes the

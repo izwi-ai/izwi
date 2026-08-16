@@ -1,0 +1,23 @@
+# Exact-SHA CUDA continuous-batching certification workload.
+# Both selected adapters declare tensor-continuous chat support. Run only with
+# scripts/bench/run-cuda-model-evidence.sh --require-continuous-batch-evidence.
+
+[[benchmarks]]
+name = "qwen3-chat-continuous-c8"
+command = "chat"
+model = "Qwen3-0.6B-GGUF"
+iterations = 8
+concurrent = 8
+warmup = true
+prompt = "In one sentence, explain why grouped-query attention reduces KV-cache memory."
+max_tokens = 128
+
+[[benchmarks]]
+name = "gemma3-chat-continuous-c8"
+command = "chat"
+model = "Gemma-3-1b-it"
+iterations = 8
+concurrent = 8
+warmup = true
+prompt = "In one sentence, explain why continuous batching improves GPU utilization."
+max_tokens = 128
