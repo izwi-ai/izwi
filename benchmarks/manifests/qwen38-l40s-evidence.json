@@ -1,0 +1,24 @@
+{
+  "schema": "izwi.qwen38-l40s-workload.v1",
+  "model": "Qwen3.8-27B-FP8",
+  "checkpoint": {
+    "repository": "Qwen/Qwen3.8-27B-FP8",
+    "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+  },
+  "notes": [
+    "prompt_words is an input-size target, not a claimed tokenizer token count",
+    "the evidence report records the prompt token count observed by the server",
+    "all performance cases use a warmed model and deterministic greedy sampling"
+  ],
+  "cases": [
+    { "name": "decode-short-c1", "prompt_words": 32, "max_tokens": 512, "iterations": 5, "concurrent": 1 },
+    { "name": "decode-sustained-c1", "prompt_words": 32, "max_tokens": 2048, "iterations": 3, "concurrent": 1 },
+    { "name": "context-512-c1", "prompt_words": 512, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
+    { "name": "context-2048-c1", "prompt_words": 2048, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
+    { "name": "context-8192-c1", "prompt_words": 8192, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
+    { "name": "context-32768-c1", "prompt_words": 32768, "max_tokens": 128, "iterations": 3, "concurrent": 1 },
+    { "name": "decode-short-c2", "prompt_words": 32, "max_tokens": 256, "iterations": 3, "concurrent": 2 },
+    { "name": "decode-short-c4", "prompt_words": 32, "max_tokens": 256, "iterations": 3, "concurrent": 4 },
+    { "name": "decode-short-c8", "prompt_words": 32, "max_tokens": 256, "iterations": 3, "concurrent": 8 }
+  ]
+}

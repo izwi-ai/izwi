@@ -122,3 +122,41 @@ Every model case must report `actual_device_kind=cuda`, strict quality success,
 no worker panic/restart/request-failure delta, and the expected observed
 provider. Compile-only CI and an `unsupported` record cannot promote a runtime
 cell.
+
+## Qwen3.8 L40S performance evidence
+
+`run-qwen38-l40s-evidence.sh` imports the versioned
+`benchmarks/manifests/qwen38-l40s-evidence.json` workload into the strict CUDA
+model evidence runner. It covers warmed single-user decode, longer prompts, a
+sustained 2,048-token completion, and concurrency 1/2/4/8. `prompt_words`
+controls deterministic input construction; it is not reported as a tokenizer
+token count. The certificate retains the actual prompt-token count returned by
+the server.
+
+Run it manually on the exact L40S deployment and retain the output directory:
+
+```bash
+scripts/bench/run-qwen38-l40s-evidence.sh \
+  --server http://127.0.0.1:8080 \
+  --izwi-bin target/release/izwi \
+  --output target/qwen38-l40s-evidence
+```
+
+A pass requires the exact model ID, an observed NVIDIA L40S, a server built
+from the checked-out Git SHA, strict quality success, and measured TTFT and
+completion throughput for every case. It records detailed `nvidia-smi`, OS,
+imported-manifest, standard CUDA certificate, and raw benchmark artifacts. The
+Qwen3.8 certificate keeps both end-to-end completion throughput and per-sample
+decode throughput calculated from the server-reported generation interval; the
+two metrics must not be conflated. The workload pins the expected Hugging Face
+checkpoint revision; provisioning that
+revision remains an operator responsibility because the runner never downloads
+or mutates models.
+
+On a host without an NVIDIA device, the default is a non-zero failure. Local
+workflow validation can explicitly record unsupported without inventing data:
+
+```bash
+scripts/bench/run-qwen38-l40s-evidence.sh --allow-unsupported
+scripts/bench/test-run-qwen38-l40s-evidence.sh
+```
