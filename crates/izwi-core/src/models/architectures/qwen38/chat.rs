@@ -30,6 +30,10 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen38_composite_cache_contract;
 use super::native::{Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
+use super::telemetry::{
+    record_sampling_bounded_cuda, record_sampling_device_argmax, record_sampling_host,
+    snapshot as qwen38_optimization_telemetry_snapshot,
+};
 use super::text::{Qwen38ProjectionRepresentation, Qwen38TextModel, Qwen38TextRuntimeState};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
@@ -486,6 +490,19 @@ impl Qwen38ChatModel {
             "resident_representation": projection_representation.as_str(),
             "fp8_execution_mode": qwen38_fp8_execution_mode(projection_representation),
             "fallback_reason": qwen38_fp8_fallback_reason(projection_representation),
+            "optimization_evidence": {
+                "scope": "qwen38_process_lifetime",
+                "cuda_runtime_validated": false,
+                "counters": qwen38_optimization_telemetry_snapshot(),
+                "managed_kv_counters_source": "runtime_metrics.kv_cache.models[].arenas[].operations",
+                "managed_kv_counter_coverage": [
+                    "allocation",
+                    "workspace",
+                    "host_synchronization",
+                    "attention_provider",
+                    "cuda_graph"
+                ],
+            },
             "vision_enabled": false,
         })
     }
@@ -906,9 +923,15 @@ fn sample_next_token(
         && config.top_k == 0
         && config.top_p >= 1.0;
     if deterministic_greedy {
+        if logits.device().is_cuda() {
+            record_sampling_device_argmax();
+        } else {
+            record_sampling_host();
+        }
         return argmax_clamped(logits, vocab_size);
     }
 
+    let cuda_sampling_attempted = logits.device().is_cuda();
     if let Some(candidates) = bounded_cuda_sampling_candidates(
         logits,
         vocab_size,
@@ -923,10 +946,15 @@ fn sample_next_token(
             if let Some(sampled) =
                 sample_device_candidates(&candidates, config.top_p, rng.next_f32())
             {
+                record_sampling_bounded_cuda(true);
                 return Ok(sampled);
             }
         }
     }
+    if cuda_sampling_attempted {
+        record_sampling_bounded_cuda(false);
+    }
+    record_sampling_host();
 
     let mut values = logits_to_vec(logits)?;
     truncate_logits_to_vocab(&mut values, vocab_size);
@@ -1196,6 +1224,9 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     // finite candidate when one exists and otherwise returns useful counts for
     // the exact in-vocabulary row in every sampling mode.
     let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    if clamped.device().is_cuda() {
+        record_sampling_host();
+    }
     argmax_values(&values)
 }
 

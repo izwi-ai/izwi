@@ -1,0 +1,274 @@
+//! Qwen3.8-only optimization evidence.
+//!
+//! These process-lifetime counters intentionally describe execution-path
+//! selection, not timings. CUDA runtime correctness and performance still
+//! require the separately captured, SHA-bound device evidence bundle.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
+    pub cuda_projection_calls_total: u64,
+    pub cuda_q8_projection_calls_total: u64,
+    pub cuda_dense_projection_calls_total: u64,
+    pub cuda_attention_dtype_casts_total: u64,
+    pub cuda_state_initial_allocations_total: u64,
+    pub cuda_head_expansion_materializations_total: u64,
+    pub cuda_silu_mul_attempts_total: u64,
+    pub cuda_silu_mul_success_total: u64,
+    pub cuda_silu_mul_fallback_total: u64,
+    pub cuda_gated_rms_norm_attempts_total: u64,
+    pub cuda_gated_rms_norm_success_total: u64,
+    pub cuda_gated_rms_norm_fallback_total: u64,
+    pub cuda_l2_norm_attempts_total: u64,
+    pub cuda_l2_norm_success_total: u64,
+    pub cuda_l2_norm_fallback_total: u64,
+    pub cuda_deltanet_decode_attempts_total: u64,
+    pub cuda_deltanet_decode_success_total: u64,
+    pub cuda_deltanet_decode_fallback_total: u64,
+    pub cuda_deltanet_prefill_attempts_total: u64,
+    pub cuda_deltanet_prefill_success_total: u64,
+    pub cuda_deltanet_prefill_fallback_total: u64,
+    pub cuda_causal_conv_prefill_attempts_total: u64,
+    pub cuda_causal_conv_prefill_success_total: u64,
+    pub cuda_causal_conv_prefill_fallback_total: u64,
+    pub cuda_rope_kernel_success_total: u64,
+    pub cuda_rope_manual_fallback_total: u64,
+    pub sampling_device_argmax_total: u64,
+    pub sampling_bounded_cuda_attempts_total: u64,
+    pub sampling_bounded_cuda_success_total: u64,
+    pub sampling_bounded_cuda_fallback_to_host_total: u64,
+    pub sampling_host_total: u64,
+}
+
+macro_rules! counters {
+    ($($name:ident),+ $(,)?) => {
+        $(static $name: AtomicU64 = AtomicU64::new(0);)+
+    };
+}
+
+counters!(
+    CUDA_PROJECTION_CALLS,
+    CUDA_Q8_PROJECTION_CALLS,
+    CUDA_DENSE_PROJECTION_CALLS,
+    CUDA_ATTENTION_DTYPE_CASTS,
+    CUDA_STATE_INITIAL_ALLOCATIONS,
+    CUDA_HEAD_EXPANSION_MATERIALIZATIONS,
+    CUDA_SILU_MUL_ATTEMPTS,
+    CUDA_SILU_MUL_SUCCESS,
+    CUDA_SILU_MUL_FALLBACK,
+    CUDA_GATED_RMS_NORM_ATTEMPTS,
+    CUDA_GATED_RMS_NORM_SUCCESS,
+    CUDA_GATED_RMS_NORM_FALLBACK,
+    CUDA_L2_NORM_ATTEMPTS,
+    CUDA_L2_NORM_SUCCESS,
+    CUDA_L2_NORM_FALLBACK,
+    CUDA_DELTANET_DECODE_ATTEMPTS,
+    CUDA_DELTANET_DECODE_SUCCESS,
+    CUDA_DELTANET_DECODE_FALLBACK,
+    CUDA_DELTANET_PREFILL_ATTEMPTS,
+    CUDA_DELTANET_PREFILL_SUCCESS,
+    CUDA_DELTANET_PREFILL_FALLBACK,
+    CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
+    CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
+    CUDA_CAUSAL_CONV_PREFILL_FALLBACK,
+    CUDA_ROPE_KERNEL_SUCCESS,
+    CUDA_ROPE_MANUAL_FALLBACK,
+    SAMPLING_DEVICE_ARGMAX,
+    SAMPLING_BOUNDED_CUDA_ATTEMPTS,
+    SAMPLING_BOUNDED_CUDA_SUCCESS,
+    SAMPLING_BOUNDED_CUDA_FALLBACK_TO_HOST,
+    SAMPLING_HOST,
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaProjectionPath {
+    Q8,
+    Dense,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaKernelPath {
+    SiluMul,
+    GatedRmsNorm,
+    L2Norm,
+    DeltaNetDecode,
+    DeltaNetPrefill,
+    CausalConvPrefill,
+}
+
+pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
+    CUDA_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
+    match path {
+        CudaProjectionPath::Q8 => CUDA_Q8_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
+        CudaProjectionPath::Dense => CUDA_DENSE_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
+pub(crate) fn record_cuda_attention_dtype_casts(count: usize) {
+    CUDA_ATTENTION_DTYPE_CASTS.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_cuda_state_initial_allocation() {
+    CUDA_STATE_INITIAL_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_cuda_head_expansion_materialization() {
+    CUDA_HEAD_EXPANSION_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
+    let (attempts, success, fallback) = match path {
+        CudaKernelPath::SiluMul => (
+            &CUDA_SILU_MUL_ATTEMPTS,
+            &CUDA_SILU_MUL_SUCCESS,
+            &CUDA_SILU_MUL_FALLBACK,
+        ),
+        CudaKernelPath::GatedRmsNorm => (
+            &CUDA_GATED_RMS_NORM_ATTEMPTS,
+            &CUDA_GATED_RMS_NORM_SUCCESS,
+            &CUDA_GATED_RMS_NORM_FALLBACK,
+        ),
+        CudaKernelPath::L2Norm => (
+            &CUDA_L2_NORM_ATTEMPTS,
+            &CUDA_L2_NORM_SUCCESS,
+            &CUDA_L2_NORM_FALLBACK,
+        ),
+        CudaKernelPath::DeltaNetDecode => (
+            &CUDA_DELTANET_DECODE_ATTEMPTS,
+            &CUDA_DELTANET_DECODE_SUCCESS,
+            &CUDA_DELTANET_DECODE_FALLBACK,
+        ),
+        CudaKernelPath::DeltaNetPrefill => (
+            &CUDA_DELTANET_PREFILL_ATTEMPTS,
+            &CUDA_DELTANET_PREFILL_SUCCESS,
+            &CUDA_DELTANET_PREFILL_FALLBACK,
+        ),
+        CudaKernelPath::CausalConvPrefill => (
+            &CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
+            &CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
+            &CUDA_CAUSAL_CONV_PREFILL_FALLBACK,
+        ),
+    };
+    attempts.fetch_add(1, Ordering::Relaxed);
+    if selected {
+        success.fetch_add(1, Ordering::Relaxed);
+    } else {
+        fallback.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_cuda_rope(selected: bool) {
+    if selected {
+        CUDA_ROPE_KERNEL_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_ROPE_MANUAL_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_sampling_device_argmax() {
+    SAMPLING_DEVICE_ARGMAX.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_sampling_bounded_cuda(selected: bool) {
+    SAMPLING_BOUNDED_CUDA_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if selected {
+        SAMPLING_BOUNDED_CUDA_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SAMPLING_BOUNDED_CUDA_FALLBACK_TO_HOST.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_sampling_host() {
+    SAMPLING_HOST.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
+    macro_rules! load {
+        ($name:ident) => {
+            $name.load(Ordering::Relaxed)
+        };
+    }
+    Qwen38OptimizationTelemetrySnapshot {
+        cuda_projection_calls_total: load!(CUDA_PROJECTION_CALLS),
+        cuda_q8_projection_calls_total: load!(CUDA_Q8_PROJECTION_CALLS),
+        cuda_dense_projection_calls_total: load!(CUDA_DENSE_PROJECTION_CALLS),
+        cuda_attention_dtype_casts_total: load!(CUDA_ATTENTION_DTYPE_CASTS),
+        cuda_state_initial_allocations_total: load!(CUDA_STATE_INITIAL_ALLOCATIONS),
+        cuda_head_expansion_materializations_total: load!(CUDA_HEAD_EXPANSION_MATERIALIZATIONS),
+        cuda_silu_mul_attempts_total: load!(CUDA_SILU_MUL_ATTEMPTS),
+        cuda_silu_mul_success_total: load!(CUDA_SILU_MUL_SUCCESS),
+        cuda_silu_mul_fallback_total: load!(CUDA_SILU_MUL_FALLBACK),
+        cuda_gated_rms_norm_attempts_total: load!(CUDA_GATED_RMS_NORM_ATTEMPTS),
+        cuda_gated_rms_norm_success_total: load!(CUDA_GATED_RMS_NORM_SUCCESS),
+        cuda_gated_rms_norm_fallback_total: load!(CUDA_GATED_RMS_NORM_FALLBACK),
+        cuda_l2_norm_attempts_total: load!(CUDA_L2_NORM_ATTEMPTS),
+        cuda_l2_norm_success_total: load!(CUDA_L2_NORM_SUCCESS),
+        cuda_l2_norm_fallback_total: load!(CUDA_L2_NORM_FALLBACK),
+        cuda_deltanet_decode_attempts_total: load!(CUDA_DELTANET_DECODE_ATTEMPTS),
+        cuda_deltanet_decode_success_total: load!(CUDA_DELTANET_DECODE_SUCCESS),
+        cuda_deltanet_decode_fallback_total: load!(CUDA_DELTANET_DECODE_FALLBACK),
+        cuda_deltanet_prefill_attempts_total: load!(CUDA_DELTANET_PREFILL_ATTEMPTS),
+        cuda_deltanet_prefill_success_total: load!(CUDA_DELTANET_PREFILL_SUCCESS),
+        cuda_deltanet_prefill_fallback_total: load!(CUDA_DELTANET_PREFILL_FALLBACK),
+        cuda_causal_conv_prefill_attempts_total: load!(CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS),
+        cuda_causal_conv_prefill_success_total: load!(CUDA_CAUSAL_CONV_PREFILL_SUCCESS),
+        cuda_causal_conv_prefill_fallback_total: load!(CUDA_CAUSAL_CONV_PREFILL_FALLBACK),
+        cuda_rope_kernel_success_total: load!(CUDA_ROPE_KERNEL_SUCCESS),
+        cuda_rope_manual_fallback_total: load!(CUDA_ROPE_MANUAL_FALLBACK),
+        sampling_device_argmax_total: load!(SAMPLING_DEVICE_ARGMAX),
+        sampling_bounded_cuda_attempts_total: load!(SAMPLING_BOUNDED_CUDA_ATTEMPTS),
+        sampling_bounded_cuda_success_total: load!(SAMPLING_BOUNDED_CUDA_SUCCESS),
+        sampling_bounded_cuda_fallback_to_host_total: load!(SAMPLING_BOUNDED_CUDA_FALLBACK_TO_HOST),
+        sampling_host_total: load!(SAMPLING_HOST),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_serializes_stable_evidence_names() {
+        let value = serde_json::to_value(Qwen38OptimizationTelemetrySnapshot::default()).unwrap();
+        assert_eq!(value["cuda_projection_calls_total"], 0);
+        assert_eq!(value["cuda_deltanet_decode_fallback_total"], 0);
+        assert_eq!(value["sampling_bounded_cuda_fallback_to_host_total"], 0);
+    }
+
+    #[test]
+    fn projection_and_kernel_outcomes_remain_reconcilable() {
+        let before = snapshot();
+        record_cuda_projection(CudaProjectionPath::Q8);
+        record_cuda_projection(CudaProjectionPath::Dense);
+        record_cuda_kernel(CudaKernelPath::DeltaNetDecode, true);
+        record_cuda_kernel(CudaKernelPath::DeltaNetDecode, false);
+        let after = snapshot();
+        assert_eq!(
+            after.cuda_projection_calls_total - before.cuda_projection_calls_total,
+            2
+        );
+        assert_eq!(
+            after.cuda_q8_projection_calls_total - before.cuda_q8_projection_calls_total,
+            1
+        );
+        assert_eq!(
+            after.cuda_dense_projection_calls_total - before.cuda_dense_projection_calls_total,
+            1
+        );
+        assert_eq!(
+            after.cuda_deltanet_decode_attempts_total - before.cuda_deltanet_decode_attempts_total,
+            2
+        );
+        assert_eq!(
+            after.cuda_deltanet_decode_success_total - before.cuda_deltanet_decode_success_total,
+            1
+        );
+        assert_eq!(
+            after.cuda_deltanet_decode_fallback_total - before.cuda_deltanet_decode_fallback_total,
+            1
+        );
+    }
+}

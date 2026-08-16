@@ -8,6 +8,11 @@ use super::chat::Qwen38TextConfig;
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
 };
+use super::telemetry::{
+    record_cuda_attention_dtype_casts, record_cuda_head_expansion_materialization,
+    record_cuda_kernel, record_cuda_projection, record_cuda_rope,
+    record_cuda_state_initial_allocation, CudaKernelPath, CudaProjectionPath,
+};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
@@ -331,6 +336,12 @@ impl Module for Qwen38RmsNorm {
 
 impl Module for Qwen38Projection {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        if input.device().is_cuda() {
+            record_cuda_projection(match self {
+                Self::Quantized(_) => CudaProjectionPath::Q8,
+                Self::Dense(_) => CudaProjectionPath::Dense,
+            });
+        }
         match self {
             Self::Quantized(projection) => projection.forward(input),
             Self::Dense(projection) => projection.forward(input),
@@ -796,7 +807,11 @@ impl Qwen38Mlp {
             Error::InferenceError("Qwen3.8 gate/up projection omitted up output".into())
         })?;
 
-        let hidden = if let Some(fused) = try_fused_silu_mul(&gate_proj_out, &up_proj_out) {
+        let fused = try_fused_silu_mul(&gate_proj_out, &up_proj_out);
+        if gate_proj_out.device().is_cuda() {
+            record_cuda_kernel(CudaKernelPath::SiluMul, fused.is_some());
+        }
+        let hidden = if let Some(fused) = fused {
             fused
         } else {
             let gate = ops::silu(&gate_proj_out)?;
@@ -940,6 +955,11 @@ impl Qwen38FullAttention {
             .contiguous()?;
         let storage_dtype = cache.arena().config().dtype;
         let output_dtype = queries.dtype();
+        if queries.device().is_cuda() && storage_dtype != output_dtype {
+            // Q, K, V enter storage dtype and the attention result returns to
+            // the activation dtype.
+            record_cuda_attention_dtype_casts(4);
+        }
         let queries = queries.to_dtype(storage_dtype)?;
         let keys = keys.to_dtype(storage_dtype)?;
         let values = values.to_dtype(storage_dtype)?;
@@ -976,10 +996,16 @@ impl Qwen38FullAttention {
             match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
                 Some((query_rot, key_rot)) => {
                     record_rope_kernel();
+                    if query_states.device().is_cuda() {
+                        record_cuda_rope(true);
+                    }
                     (query_rot, key_rot)
                 }
                 None => {
                     record_rope_manual();
+                    if query_states.device().is_cuda() {
+                        record_cuda_rope(false);
+                    }
                     (
                         apply_rotary_emb(&query_rot, &cos, &sin)?,
                         apply_rotary_emb(&key_rot, &cos, &sin)?,
@@ -988,6 +1014,9 @@ impl Qwen38FullAttention {
             }
         } else {
             record_rope_manual();
+            if query_states.device().is_cuda() {
+                record_cuda_rope(false);
+            }
             (
                 apply_rotary_emb(&query_rot, &cos, &sin)?,
                 apply_rotary_emb(&key_rot, &cos, &sin)?,
@@ -1044,12 +1073,18 @@ impl Qwen38FullAttention {
                 Some((query_rot, key_rot)) => {
                     for _ in 0..seq_len {
                         record_rope_kernel();
+                        if query_states.device().is_cuda() {
+                            record_cuda_rope(true);
+                        }
                     }
                     (query_rot, key_rot)
                 }
                 None => {
                     for _ in 0..seq_len {
                         record_rope_manual();
+                        if query_states.device().is_cuda() {
+                            record_cuda_rope(false);
+                        }
                     }
                     (
                         apply_rotary_emb(&query_rot, &cos, &sin)?,
@@ -1060,6 +1095,9 @@ impl Qwen38FullAttention {
         } else {
             for _ in 0..seq_len {
                 record_rope_manual();
+                if query_states.device().is_cuda() {
+                    record_cuda_rope(false);
+                }
             }
             (
                 apply_rotary_emb(&query_rot, &cos, &sin)?,
@@ -1263,6 +1301,11 @@ impl Qwen38LinearAttention {
                 )));
             }
             let repeats = self.num_v_heads / self.num_k_heads;
+            if query.device().is_cuda() {
+                // Repeat-interleave materializes one expanded Q and K tensor.
+                record_cuda_head_expansion_materialization();
+                record_cuda_head_expansion_materialization();
+            }
             query = repeat_interleave_head_states(&query, repeats)?;
             key = repeat_interleave_head_states(&key, repeats)?;
         }
@@ -1270,6 +1313,9 @@ impl Qwen38LinearAttention {
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
+            if value.device().is_cuda() {
+                record_cuda_state_initial_allocation();
+            }
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
                 value.dtype(),
@@ -1363,6 +1409,9 @@ impl Qwen38LinearAttention {
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
+            if value.device().is_cuda() {
+                record_cuda_state_initial_allocation();
+            }
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
                 value.dtype(),
@@ -1375,7 +1424,7 @@ impl Qwen38LinearAttention {
         let tile_size =
             qwen38_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
         let fused_sequence = if self.tiled_recurrence_enabled {
-            try_tiled_deltanet_recurrence(
+            let fused = try_tiled_deltanet_recurrence(
                 &query,
                 &key,
                 &value,
@@ -1383,7 +1432,11 @@ impl Qwen38LinearAttention {
                 &beta,
                 &current_state,
                 tile_size,
-            )
+            );
+            if query.device().is_cuda() {
+                record_cuda_kernel(CudaKernelPath::DeltaNetPrefill, fused.is_some());
+            }
+            fused
         } else {
             None
         };
@@ -1397,13 +1450,17 @@ impl Qwen38LinearAttention {
                 (query, key)
             } else {
                 let repeats = self.num_v_heads / self.num_k_heads;
+                if query.device().is_cuda() {
+                    record_cuda_head_expansion_materialization();
+                    record_cuda_head_expansion_materialization();
+                }
                 (
                     repeat_interleave_head_states_seq(&query, repeats)?,
                     repeat_interleave_head_states_seq(&key, repeats)?,
                 )
             };
             if self.tiled_recurrence_enabled {
-                if let Some(fused_sequence) = try_tiled_deltanet_recurrence(
+                let fused_sequence = try_tiled_deltanet_recurrence(
                     &query,
                     &key,
                     &value,
@@ -1411,7 +1468,11 @@ impl Qwen38LinearAttention {
                     &beta,
                     &current_state,
                     tile_size,
-                ) {
+                );
+                if query.device().is_cuda() {
+                    record_cuda_kernel(CudaKernelPath::DeltaNetPrefill, fused_sequence.is_some());
+                }
+                if let Some(fused_sequence) = fused_sequence {
                     fused_sequence
                 } else {
                     recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
@@ -1460,9 +1521,11 @@ impl Qwen38LinearAttention {
                 .map(|idx| &buffer.slots[(buffer.next_idx + idx) % history_len])
                 .collect();
             let history = Tensor::cat(&logical_slots, 1)?;
-            if let Some((output, final_history)) =
-                try_qwen38_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
-            {
+            let fused = try_qwen38_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history);
+            if mixed_qkv.device().is_cuda() {
+                record_cuda_kernel(CudaKernelPath::CausalConvPrefill, fused.is_some());
+            }
+            if let Some((output, final_history)) = fused {
                 let final_history = deep_copy_tensor_storage(&final_history)?;
                 buffer.slots = (0..history_len)
                     .map(|idx| final_history.narrow(1, idx, 1))
@@ -1542,9 +1605,11 @@ impl Qwen38LinearAttention {
 impl Qwen38GatedRmsNorm {
     fn forward(&self, hidden_states: &Tensor, gate: &Tensor) -> Result<Tensor> {
         if hidden_states.dtype() == DType::F32 {
-            if let Some(result) =
-                try_fused_gated_rms_norm(hidden_states, gate, &self.weight, self.eps)
-            {
+            let fused = try_fused_gated_rms_norm(hidden_states, gate, &self.weight, self.eps);
+            if hidden_states.device().is_cuda() {
+                record_cuda_kernel(CudaKernelPath::GatedRmsNorm, fused.is_some());
+            }
+            if let Some(result) = fused {
                 return Ok(result);
             }
         }
@@ -1937,7 +2002,11 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
     // Try fused Metal kernel first for F32 tensors
     if x.dtype() == DType::F32 {
-        if let Some(result) = try_fused_l2_norm(x, eps) {
+        let fused = try_fused_l2_norm(x, eps);
+        if x.device().is_cuda() {
+            record_cuda_kernel(CudaKernelPath::L2Norm, fused.is_some());
+        }
+        if let Some(result) = fused {
             return Ok(result);
         }
     }
@@ -2085,7 +2154,11 @@ fn recurrent_gated_delta(
 ) -> Result<(Tensor, Tensor)> {
     // Try fused Metal kernel first (for F32 on Metal devices)
     if query.dtype() == DType::F32 {
-        if let Some(result) = try_fused_gated_delta_recurrent(query, key, value, g, beta, &state) {
+        let fused = try_fused_gated_delta_recurrent(query, key, value, g, beta, &state);
+        if query.device().is_cuda() {
+            record_cuda_kernel(CudaKernelPath::DeltaNetDecode, fused.is_some());
+        }
+        if let Some(result) = fused {
             return Ok(result);
         }
     }

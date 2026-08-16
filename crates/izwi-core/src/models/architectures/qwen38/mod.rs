@@ -7,4 +7,5 @@
 mod cache;
 pub mod chat;
 pub mod native;
+mod telemetry;
 mod text;

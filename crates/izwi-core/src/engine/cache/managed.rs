@@ -53,6 +53,14 @@ pub struct ManagedKvOperationSnapshot {
     pub paged_decode_dispatches: u64,
     pub page_zero_dispatches: u64,
     pub page_copy_dispatches: u64,
+    /// Long-lived K/V backing allocations reported by metered arenas.
+    pub backing_allocations: u64,
+    pub backing_allocations_observed_arenas: u64,
+    /// Retained provider workspace reported by metered arenas.
+    pub workspace_bytes: u64,
+    pub workspace_bytes_observed_arenas: u64,
+    pub workspace_allocations: u64,
+    pub workspace_allocations_observed_arenas: u64,
     pub host_synchronizations: u64,
     pub cpu_reference_attention_dispatches: u64,
     pub portable_attention_dispatches: u64,
@@ -84,6 +92,22 @@ impl ManagedKvOperationSnapshot {
         self.page_copy_dispatches = self
             .page_copy_dispatches
             .saturating_add(other.page_copy_dispatches);
+        self.backing_allocations = self
+            .backing_allocations
+            .saturating_add(other.backing_allocations);
+        self.backing_allocations_observed_arenas = self
+            .backing_allocations_observed_arenas
+            .saturating_add(other.backing_allocations_observed_arenas);
+        self.workspace_bytes = self.workspace_bytes.saturating_add(other.workspace_bytes);
+        self.workspace_bytes_observed_arenas = self
+            .workspace_bytes_observed_arenas
+            .saturating_add(other.workspace_bytes_observed_arenas);
+        self.workspace_allocations = self
+            .workspace_allocations
+            .saturating_add(other.workspace_allocations);
+        self.workspace_allocations_observed_arenas = self
+            .workspace_allocations_observed_arenas
+            .saturating_add(other.workspace_allocations_observed_arenas);
         self.host_synchronizations = self
             .host_synchronizations
             .saturating_add(other.host_synchronizations);
@@ -555,6 +579,20 @@ impl ManagedKvCacheManager {
                             paged_decode_dispatches: operation_stats.paged_decode_dispatches,
                             page_zero_dispatches: operation_stats.page_zero_dispatches,
                             page_copy_dispatches: operation_stats.page_copy_dispatches,
+                            backing_allocations: operation_stats.backing_allocations.unwrap_or(0),
+                            backing_allocations_observed_arenas: u64::from(
+                                operation_stats.backing_allocations.is_some(),
+                            ),
+                            workspace_bytes: operation_stats.workspace_bytes.unwrap_or(0),
+                            workspace_bytes_observed_arenas: u64::from(
+                                operation_stats.workspace_bytes.is_some(),
+                            ),
+                            workspace_allocations: operation_stats
+                                .workspace_allocations
+                                .unwrap_or(0),
+                            workspace_allocations_observed_arenas: u64::from(
+                                operation_stats.workspace_allocations.is_some(),
+                            ),
                             host_synchronizations: operation_stats.host_synchronizations,
                             cpu_reference_attention_dispatches: operation_stats
                                 .cpu_reference_attention_dispatches,
@@ -3201,6 +3239,19 @@ mod tests {
         assert_eq!(prepared.totals.coordinator.allocated_pages, 1);
         assert_eq!(prepared.totals.coordinator.active_transactions, 1);
         assert_eq!(prepared.totals.operations.page_zero_dispatches, 1);
+        assert_eq!(prepared.totals.operations.backing_allocations, 2);
+        assert_eq!(
+            prepared
+                .totals
+                .operations
+                .backing_allocations_observed_arenas,
+            1
+        );
+        assert_eq!(prepared.totals.operations.workspace_bytes, 0);
+        assert_eq!(
+            prepared.totals.operations.workspace_bytes_observed_arenas,
+            1
+        );
         assert_eq!(prepared.counters.pages_zeroed, 1);
         assert_eq!(prepared.counters.backing_allocations, 1);
         assert_eq!(prepared.models[0].model_instance, model);
@@ -3215,6 +3266,11 @@ mod tests {
             "resident_paged_plus_authorized_tensor"
         );
         assert_eq!(encoded["totals"]["coordinator"]["allocated_pages"], 1);
+        assert_eq!(encoded["totals"]["operations"]["backing_allocations"], 2);
+        assert_eq!(
+            encoded["totals"]["operations"]["workspace_allocations_observed_arenas"],
+            1
+        );
         assert_eq!(encoded["models"][0]["backend"], "cpu");
 
         manager.finalize(&reservation, None, false).expect("abort");
