@@ -5462,7 +5462,9 @@ mod tests {
         core.add_request(bad).unwrap();
         core.add_request(good).unwrap();
 
-        let outputs = core.step().await.unwrap();
+        let mut outputs = core.step().await.unwrap();
+        assert_eq!(outputs.len(), 1);
+        outputs.extend(core.step().await.unwrap());
 
         assert_eq!(outputs.len(), 2);
         assert!(outputs
@@ -5907,9 +5909,10 @@ mod tests {
         );
         core.add_request(owner).expect("add capacity owner");
         core.add_request(decoder).expect("add decoder");
-        core.step().await.expect("commit both prefills");
+        core.step().await.expect("commit first prefill quantum");
         core.scheduler
             .finish_request(&"decode-isolation-owner".to_string());
+        core.step().await.expect("commit second prefill quantum");
 
         let blocked = managed_test_request(
             &mut core,
@@ -5939,16 +5942,20 @@ mod tests {
         let blocked_session = core
             .get_session_key(&"decode-isolation-blocked".to_string())
             .expect("blocked session");
-        assert_eq!(
+        assert!(
             core.managed_kv_cache
                 .snapshot(
                     saturated_model,
                     &blocked_session,
                     crate::kv::CacheDomainId::new(1),
                 )
-                .expect("blocked logical table")
-                .committed_tokens,
-            0
+                .is_none(),
+            "phase isolation must defer the blocked prefill before staging KV state"
+        );
+        assert_eq!(
+            core.scheduler
+                .get_status(&"decode-isolation-blocked".to_string()),
+            Some(RequestStatus::Waiting)
         );
     }
 
