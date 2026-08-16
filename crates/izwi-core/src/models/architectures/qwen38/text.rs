@@ -380,6 +380,19 @@ struct Qwen38FullAttention {
     rope_inv_freqs: Vec<f32>,
 }
 
+/// Forward-scoped rotary tensors shared by every Qwen3.8 full-attention layer.
+///
+/// Qwen3.8 uses the same rotary configuration in each full-attention layer, so
+/// rebuilding these position-dependent tensors in every layer only repeats
+/// device work. The plan deliberately contains no kernel-policy decision: each
+/// layer still selects the rotary kernel or the exact manual fallback itself.
+struct Qwen38MropePlan {
+    cos: Option<Tensor>,
+    sin: Option<Tensor>,
+    sequence_len: usize,
+    rope_dim: usize,
+}
+
 struct Qwen38LinearAttention {
     qkv_z_proj: Qwen38ProjectionGroup,
     alpha_beta_proj: Qwen38ProjectionGroup,
@@ -594,6 +607,8 @@ impl Qwen38TextModel {
         )?;
         let start_pos = cache.context_len();
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let mrope_plan =
+            first_full.prepare_mrope_plan(position_ids, input.device(), input.dtype())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.ensure_state_initialized(layer_state, &self.device)?;
         }
@@ -605,7 +620,7 @@ impl Qwen38TextModel {
             hidden = layer.forward_physical(
                 &hidden,
                 layer_state,
-                position_ids,
+                &mrope_plan,
                 cache,
                 &mut prepared,
                 &mut physical_layer,
@@ -728,7 +743,7 @@ impl Qwen38Layer {
         &self,
         hidden_states: &Tensor,
         state: &mut Qwen38LayerRuntimeState,
-        position_ids: &[[usize; 3]],
+        mrope_plan: &Qwen38MropePlan,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
@@ -746,7 +761,7 @@ impl Qwen38Layer {
             Qwen38Mixer::Full(mixer) => {
                 let output = mixer.forward_physical(
                     &normalized,
-                    position_ids,
+                    mrope_plan,
                     cache,
                     prepared,
                     *physical_layer,
@@ -906,17 +921,16 @@ impl Qwen38FullAttention {
     fn forward_physical(
         &self,
         hidden_states: &Tensor,
-        position_ids: &[[usize; 3]],
+        mrope_plan: &Qwen38MropePlan,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: usize,
     ) -> Result<Tensor> {
         let seq_len = hidden_states.dim(1)?;
-        if seq_len == 0 || seq_len != position_ids.len() {
+        if seq_len == 0 || seq_len != mrope_plan.sequence_len {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.8 physical attention received {} tokens and {} positions",
-                seq_len,
-                position_ids.len()
+                "Qwen3.8 physical attention received {} tokens and a {}-token rotary plan",
+                seq_len, mrope_plan.sequence_len
             )));
         }
         let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
@@ -940,11 +954,8 @@ impl Qwen38FullAttention {
             .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
-        let (query_states, key_states) = if seq_len == 1 {
-            self.apply_rope(&query_states, &key_states, position_ids[0])?
-        } else {
-            self.apply_rope_sequence(&query_states, &key_states, position_ids)?
-        };
+        let (query_states, key_states) =
+            self.apply_rope_plan(&query_states, &key_states, mrope_plan)?;
         let queries = query_states
             .reshape((seq_len, self.num_heads, self.head_dim))?
             .contiguous()?;
@@ -980,99 +991,51 @@ impl Qwen38FullAttention {
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
-    fn apply_rope(
+    fn prepare_mrope_plan(
         &self,
-        query_states: &Tensor,
-        key_states: &Tensor,
-        position_ids: [usize; 3],
-    ) -> Result<(Tensor, Tensor)> {
-        if self.rope_dim == 0 {
-            return Ok((query_states.clone(), key_states.clone()));
-        }
-        let (cos, sin) = self.mrope(position_ids, query_states.device(), query_states.dtype())?;
-
-        let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
-        let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
-        let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
-            match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
-                Some((query_rot, key_rot)) => {
-                    record_rope_kernel();
-                    if query_states.device().is_cuda() {
-                        record_cuda_rope(true);
-                    }
-                    (query_rot, key_rot)
-                }
-                None => {
-                    record_rope_manual();
-                    if query_states.device().is_cuda() {
-                        record_cuda_rope(false);
-                    }
-                    (
-                        apply_rotary_emb(&query_rot, &cos, &sin)?,
-                        apply_rotary_emb(&key_rot, &cos, &sin)?,
-                    )
-                }
-            }
-        } else {
-            record_rope_manual();
-            if query_states.device().is_cuda() {
-                record_cuda_rope(false);
-            }
-            (
-                apply_rotary_emb(&query_rot, &cos, &sin)?,
-                apply_rotary_emb(&key_rot, &cos, &sin)?,
-            )
-        };
-
-        if self.rope_dim == self.head_dim {
-            return Ok((query_rot, key_rot));
-        }
-
-        let query_pass = query_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
-        let key_pass = key_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
-        Ok((
-            Tensor::cat(&[&query_rot, &query_pass], 3)?,
-            Tensor::cat(&[&key_rot, &key_pass], 3)?,
-        ))
+        position_ids: &[[usize; 3]],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Qwen38MropePlan> {
+        build_mrope_plan(
+            self.rope_dim,
+            position_ids,
+            &self.mrope_sections,
+            &self.rope_inv_freqs,
+            device,
+            dtype,
+        )
     }
 
-    fn apply_rope_sequence(
+    fn apply_rope_plan(
         &self,
         query_states: &Tensor,
         key_states: &Tensor,
-        position_ids: &[[usize; 3]],
+        plan: &Qwen38MropePlan,
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = query_states.dim(1)?;
-        if seq_len != position_ids.len() {
+        if seq_len != plan.sequence_len || self.rope_dim != plan.rope_dim {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.8 rotary sequence mismatch: seq_len={}, position_ids={}",
-                seq_len,
-                position_ids.len()
+                "Qwen3.8 rotary plan mismatch: attention has seq_len={} and rope_dim={}, plan has seq_len={} and rope_dim={}",
+                seq_len, self.rope_dim, plan.sequence_len, plan.rope_dim
             )));
         }
         if self.rope_dim == 0 {
             return Ok((query_states.clone(), key_states.clone()));
         }
-
-        let mut cos_tokens = Vec::with_capacity(seq_len);
-        let mut sin_tokens = Vec::with_capacity(seq_len);
-        for &position_id in position_ids {
-            let (cos, sin) =
-                self.mrope(position_id, query_states.device(), query_states.dtype())?;
-            cos_tokens.push(cos);
-            sin_tokens.push(sin);
-        }
-        let cos_refs: Vec<&Tensor> = cos_tokens.iter().collect();
-        let sin_refs: Vec<&Tensor> = sin_tokens.iter().collect();
-        let cos = Tensor::cat(&cos_refs, 1)?.contiguous()?;
-        let sin = Tensor::cat(&sin_refs, 1)?.contiguous()?;
+        let cos = plan.cos.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 rotary plan omitted cosine values".into())
+        })?;
+        let sin = plan.sin.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 rotary plan omitted sine values".into())
+        })?;
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
             match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
                 Some((query_rot, key_rot)) => {
-                    for _ in 0..seq_len {
+                    for _ in 0..plan.sequence_len {
                         record_rope_kernel();
                         if query_states.device().is_cuda() {
                             record_cuda_rope(true);
@@ -1081,7 +1044,7 @@ impl Qwen38FullAttention {
                     (query_rot, key_rot)
                 }
                 None => {
-                    for _ in 0..seq_len {
+                    for _ in 0..plan.sequence_len {
                         record_rope_manual();
                         if query_states.device().is_cuda() {
                             record_cuda_rope(false);
@@ -1094,7 +1057,7 @@ impl Qwen38FullAttention {
                 }
             }
         } else {
-            for _ in 0..seq_len {
+            for _ in 0..plan.sequence_len {
                 record_rope_manual();
                 if query_states.device().is_cuda() {
                     record_cuda_rope(false);
@@ -1116,22 +1079,6 @@ impl Qwen38FullAttention {
             Tensor::cat(&[&query_rot, &query_pass], 3)?,
             Tensor::cat(&[&key_rot, &key_pass], 3)?,
         ))
-    }
-
-    fn mrope(
-        &self,
-        position_ids: [usize; 3],
-        device: &Device,
-        dtype: DType,
-    ) -> Result<(Tensor, Tensor)> {
-        build_mrope(
-            self.rope_dim,
-            position_ids,
-            &self.mrope_sections,
-            &self.rope_inv_freqs,
-            device,
-            dtype,
-        )
     }
 
     fn should_try_rope_kernel(&self, dtype: DType) -> bool {
@@ -1899,6 +1846,58 @@ fn build_mrope(
     Ok((emb.cos()?, emb.sin()?))
 }
 
+fn build_mrope_plan(
+    rope_dim: usize,
+    position_ids: &[[usize; 3]],
+    mrope_sections: &[usize],
+    inv_freqs: &[f32],
+    device: &Device,
+    dtype: DType,
+) -> Result<Qwen38MropePlan> {
+    let sequence_len = position_ids.len();
+    if rope_dim == 0 {
+        return Ok(Qwen38MropePlan {
+            cos: None,
+            sin: None,
+            sequence_len,
+            rope_dim: 0,
+        });
+    }
+    if sequence_len == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.8 cannot prepare an empty rotary plan".into(),
+        ));
+    }
+
+    // Retain the established token-wise construction and concatenate only
+    // after each token has produced its original [1, 1, half_dim] tensors.
+    // This keeps multimodal section selection and device trigonometry exactly
+    // aligned with the pre-plan implementation.
+    let mut cos_tokens = Vec::with_capacity(sequence_len);
+    let mut sin_tokens = Vec::with_capacity(sequence_len);
+    for &position_id in position_ids {
+        let (cos, sin) = build_mrope(
+            rope_dim,
+            position_id,
+            mrope_sections,
+            inv_freqs,
+            device,
+            dtype,
+        )?;
+        cos_tokens.push(cos);
+        sin_tokens.push(sin);
+    }
+    let cos_refs: Vec<&Tensor> = cos_tokens.iter().collect();
+    let sin_refs: Vec<&Tensor> = sin_tokens.iter().collect();
+
+    Ok(Qwen38MropePlan {
+        cos: Some(Tensor::cat(&cos_refs, 1)?.contiguous()?),
+        sin: Some(Tensor::cat(&sin_refs, 1)?.contiguous()?),
+        sequence_len,
+        rope_dim,
+    })
+}
+
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let half_dim = x.dim(3)? / 2;
     let x1 = x.narrow(3, 0, half_dim)?;
@@ -2227,7 +2226,8 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
+        apply_rotary_emb, build_mrope, build_mrope_plan, build_rope_inv_freqs,
+        convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         projection_group_geometry_compatible, qwen38_projection_packing_policy,
         qwen38_rope_kernel_policy, recurrent_domain_v2, repeat_interleave_head_states,
         repeat_interleave_head_states_seq, softplus, ConvRingState, Linear,
@@ -2560,6 +2560,104 @@ mod tests {
         for (idx, expected_theta) in expected.iter().enumerate() {
             assert!((cos_vals[0][0][idx] - expected_theta.cos()).abs() < 1e-5);
             assert!((sin_vals[0][0][idx] - expected_theta.sin()).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn shared_mrope_plan_matches_tokenwise_construction_at_long_positions() {
+        let positions = [
+            [262_140, 262_140, 262_140],
+            [262_141, 131_071, 65_535],
+            [262_143, 262_142, 262_141],
+        ];
+        let sections = [2, 2, 2];
+        let inv_freqs = build_rope_inv_freqs(12, 10_000_000.0).expect("inverse frequencies");
+        let plan = build_mrope_plan(
+            12,
+            &positions,
+            &sections,
+            &inv_freqs,
+            &Device::Cpu,
+            DType::F32,
+        )
+        .expect("shared mrope plan");
+
+        let mut legacy_cos = Vec::new();
+        let mut legacy_sin = Vec::new();
+        for position in positions {
+            let (cos, sin) = build_mrope(
+                12,
+                position,
+                &sections,
+                &inv_freqs,
+                &Device::Cpu,
+                DType::F32,
+            )
+            .expect("tokenwise mrope");
+            legacy_cos.push(cos);
+            legacy_sin.push(sin);
+        }
+        let legacy_cos_refs = legacy_cos.iter().collect::<Vec<_>>();
+        let legacy_sin_refs = legacy_sin.iter().collect::<Vec<_>>();
+        let legacy_cos = Tensor::cat(&legacy_cos_refs, 1).expect("legacy cosine span");
+        let legacy_sin = Tensor::cat(&legacy_sin_refs, 1).expect("legacy sine span");
+
+        assert_eq!(plan.sequence_len, positions.len());
+        assert_eq!(plan.rope_dim, 12);
+        assert_eq!(
+            plan.cos
+                .expect("plan cosine")
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            legacy_cos.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            plan.sin
+                .expect("plan sine")
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            legacy_sin.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_mrope_plan_manual_matches_rope_kernel_at_long_positions() {
+        let positions = [
+            [262_141, 262_141, 262_141],
+            [262_142, 131_071, 65_535],
+            [262_143, 262_142, 262_141],
+        ];
+        let inv_freqs = build_rope_inv_freqs(8, 10_000_000.0).expect("inverse frequencies");
+        let plan = build_mrope_plan(
+            8,
+            &positions,
+            &[2, 1, 1],
+            &inv_freqs,
+            &Device::Cpu,
+            DType::F32,
+        )
+        .expect("shared mrope plan");
+        let x = Tensor::from_vec(
+            (0..(positions.len() * 2 * 8))
+                .map(|value| value as f32 / 31.0 - 0.5)
+                .collect::<Vec<_>>(),
+            (1, positions.len(), 2, 8),
+            &Device::Cpu,
+        )
+        .expect("rotary input");
+        let cos = plan.cos.as_ref().expect("plan cosine");
+        let sin = plan.sin.as_ref().expect("plan sine");
+        let manual = apply_rotary_emb(&x, cos, sin).expect("manual rotary");
+        let kernel = rotary_emb::rope_thd(&x, cos, sin).expect("rotary kernel");
+        let manual = manual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let kernel = kernel.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        for (manual, kernel) in manual.iter().zip(kernel.iter()) {
+            assert!((manual - kernel).abs() < 1e-5);
         }
     }
 
