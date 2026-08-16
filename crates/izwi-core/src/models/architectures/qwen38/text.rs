@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
-    try_tiled_deltanet_recurrence,
+    try_qwen38_deltanet_decode, try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -1222,59 +1222,76 @@ impl Qwen38LinearAttention {
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
 
+        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
+            return Err(Error::InferenceError(format!(
+                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
         let key_width = self.num_k_heads * self.head_k_dim;
         let value_width = self.num_v_heads * self.head_v_dim;
-        let query =
-            mixed_qkv
-                .narrow(2, 0, key_width)?
-                .reshape((1, self.num_k_heads, self.head_k_dim))?;
-        let key = mixed_qkv.narrow(2, key_width, key_width)?.reshape((
-            1,
-            self.num_k_heads,
-            self.head_k_dim,
-        ))?;
-        let value = mixed_qkv.narrow(2, key_width * 2, value_width)?.reshape((
-            1,
-            self.num_v_heads,
-            self.head_v_dim,
-        ))?;
-
-        let mut query = l2norm(&query, 1e-6)?;
-        let mut key = l2norm(&key, 1e-6)?;
-        if self.num_v_heads != self.num_k_heads {
-            if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
-                return Err(Error::InferenceError(format!(
-                    "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
-                    self.num_v_heads, self.num_k_heads
-                )));
-            }
-            let repeats = self.num_v_heads / self.num_k_heads;
-            if query.device().is_cuda() {
-                // Repeat-interleave materializes one expanded Q and K tensor.
-                record_cuda_head_expansion_materialization();
-                record_cuda_head_expansion_materialization();
-            }
-            query = repeat_interleave_head_states(&query, repeats)?;
-            key = repeat_interleave_head_states(&key, repeats)?;
-        }
-
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
-            if value.device().is_cuda() {
+            if mixed_qkv.device().is_cuda() {
                 record_cuda_state_initial_allocation();
             }
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
-                value.device(),
+                mixed_qkv.dtype(),
+                mixed_qkv.device(),
             )?
         };
 
         let beta = beta.reshape((1, self.num_v_heads))?;
         let g = g.reshape((1, self.num_v_heads))?;
-        let (output, next_state) =
-            recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?;
+        let specialized = if qwen38_deltanet_decode_enabled(mixed_qkv.device()) {
+            let result = try_qwen38_deltanet_decode(
+                &mixed_qkv,
+                &g,
+                &beta,
+                &current_state,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            );
+            record_cuda_kernel(CudaKernelPath::DeltaNetSpecializedDecode, result.is_some());
+            result
+        } else {
+            None
+        };
+        let (output, next_state) = if let Some(result) = specialized {
+            result
+        } else {
+            let query = mixed_qkv.narrow(2, 0, key_width)?.reshape((
+                1,
+                self.num_k_heads,
+                self.head_k_dim,
+            ))?;
+            let key = mixed_qkv.narrow(2, key_width, key_width)?.reshape((
+                1,
+                self.num_k_heads,
+                self.head_k_dim,
+            ))?;
+            let value = mixed_qkv.narrow(2, key_width * 2, value_width)?.reshape((
+                1,
+                self.num_v_heads,
+                self.head_v_dim,
+            ))?;
+            let mut query = l2norm(&query, 1e-6)?;
+            let mut key = l2norm(&key, 1e-6)?;
+            if self.num_v_heads != self.num_k_heads {
+                let repeats = self.num_v_heads / self.num_k_heads;
+                if query.device().is_cuda() {
+                    record_cuda_head_expansion_materialization();
+                    record_cuda_head_expansion_materialization();
+                }
+                query = repeat_interleave_head_states(&query, repeats)?;
+                key = repeat_interleave_head_states(&key, repeats)?;
+            }
+            recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?
+        };
         // The recurrent decode output owns a fresh Candle-managed allocation;
         // retaining it avoids a full state-sized copy on every layer/token.
         *recurrent_state = Some(next_state);
@@ -2093,6 +2110,17 @@ fn qwen38_projection_packing_policy(is_cuda: bool, requested: bool) -> bool {
     is_cuda && requested
 }
 
+fn qwen38_deltanet_decode_enabled(device: &Device) -> bool {
+    qwen38_deltanet_decode_policy(
+        device.is_cuda(),
+        qwen38_env_bool("IZWI_QWEN38_DELTANET_DECODE", false),
+    )
+}
+
+fn qwen38_deltanet_decode_policy(is_cuda: bool, requested: bool) -> bool {
+    is_cuda && requested
+}
+
 fn qwen38_tiled_recurrence_enabled() -> bool {
     qwen38_env_bool("IZWI_QWEN38_TILED_RECURRENCE", true)
 }
@@ -2228,10 +2256,11 @@ mod tests {
     use super::{
         apply_rotary_emb, build_mrope, build_mrope_plan, build_rope_inv_freqs,
         convolution_domain_v2, non_finite_counts, owned_zero_tensor,
-        projection_group_geometry_compatible, qwen38_projection_packing_policy,
-        qwen38_rope_kernel_policy, recurrent_domain_v2, repeat_interleave_head_states,
-        repeat_interleave_head_states_seq, softplus, ConvRingState, Linear,
-        Qwen38LayerRuntimeState, Qwen38Projection, Qwen38ProjectionGroup, Qwen38TextRuntimeState,
+        projection_group_geometry_compatible, qwen38_deltanet_decode_policy,
+        qwen38_projection_packing_policy, qwen38_rope_kernel_policy, recurrent_domain_v2,
+        repeat_interleave_head_states, repeat_interleave_head_states_seq, softplus, ConvRingState,
+        Linear, Qwen38LayerRuntimeState, Qwen38Projection, Qwen38ProjectionGroup,
+        Qwen38TextRuntimeState,
     };
     use crate::models::architectures::qwen38::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2390,6 +2419,14 @@ mod tests {
         assert!(!qwen38_projection_packing_policy(false, true));
         assert!(!qwen38_projection_packing_policy(true, false));
         assert!(qwen38_projection_packing_policy(true, true));
+    }
+
+    #[test]
+    fn deltanet_decode_specialization_is_cuda_only_and_disabled_without_opt_in() {
+        assert!(!qwen38_deltanet_decode_policy(false, false));
+        assert!(!qwen38_deltanet_decode_policy(false, true));
+        assert!(!qwen38_deltanet_decode_policy(true, false));
+        assert!(qwen38_deltanet_decode_policy(true, true));
     }
 
     #[test]

@@ -483,6 +483,36 @@ pub fn try_tiled_deltanet_recurrence(
     None
 }
 
+/// Qwen3.8-only CUDA single-token DeltaNet recurrence candidate.
+///
+/// Unsupported devices and geometries return `None`, keeping the model's
+/// portable recurrence as the authoritative fallback.
+pub fn try_qwen38_deltanet_decode(
+    mixed_qkv: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(mixed_qkv.device()) || !mixed_qkv.device().is_cuda() {
+        return None;
+    }
+
+    cuda::try_qwen38_deltanet_decode(
+        mixed_qkv,
+        g,
+        beta,
+        initial_state,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+    )
+}
+
 /// Result type for fused kernel operations.
 pub type FusedResult<T> = std::result::Result<T, FusedKernelError>;
 

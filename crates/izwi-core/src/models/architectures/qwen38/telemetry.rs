@@ -30,6 +30,9 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_deltanet_decode_attempts_total: u64,
     pub cuda_deltanet_decode_success_total: u64,
     pub cuda_deltanet_decode_fallback_total: u64,
+    pub cuda_deltanet_specialized_decode_attempts_total: u64,
+    pub cuda_deltanet_specialized_decode_success_total: u64,
+    pub cuda_deltanet_specialized_decode_fallback_total: u64,
     pub cuda_deltanet_prefill_attempts_total: u64,
     pub cuda_deltanet_prefill_success_total: u64,
     pub cuda_deltanet_prefill_fallback_total: u64,
@@ -75,6 +78,9 @@ counters!(
     CUDA_DELTANET_DECODE_ATTEMPTS,
     CUDA_DELTANET_DECODE_SUCCESS,
     CUDA_DELTANET_DECODE_FALLBACK,
+    CUDA_DELTANET_SPECIALIZED_DECODE_ATTEMPTS,
+    CUDA_DELTANET_SPECIALIZED_DECODE_SUCCESS,
+    CUDA_DELTANET_SPECIALIZED_DECODE_FALLBACK,
     CUDA_DELTANET_PREFILL_ATTEMPTS,
     CUDA_DELTANET_PREFILL_SUCCESS,
     CUDA_DELTANET_PREFILL_FALLBACK,
@@ -105,6 +111,7 @@ pub(crate) enum CudaKernelPath {
     GatedRmsNorm,
     L2Norm,
     DeltaNetDecode,
+    DeltaNetSpecializedDecode,
     DeltaNetPrefill,
     CausalConvPrefill,
     CausalConvDecode,
@@ -159,6 +166,11 @@ pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
             &CUDA_DELTANET_DECODE_ATTEMPTS,
             &CUDA_DELTANET_DECODE_SUCCESS,
             &CUDA_DELTANET_DECODE_FALLBACK,
+        ),
+        CudaKernelPath::DeltaNetSpecializedDecode => (
+            &CUDA_DELTANET_SPECIALIZED_DECODE_ATTEMPTS,
+            &CUDA_DELTANET_SPECIALIZED_DECODE_SUCCESS,
+            &CUDA_DELTANET_SPECIALIZED_DECODE_FALLBACK,
         ),
         CudaKernelPath::DeltaNetPrefill => (
             &CUDA_DELTANET_PREFILL_ATTEMPTS,
@@ -236,6 +248,15 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_deltanet_decode_attempts_total: load!(CUDA_DELTANET_DECODE_ATTEMPTS),
         cuda_deltanet_decode_success_total: load!(CUDA_DELTANET_DECODE_SUCCESS),
         cuda_deltanet_decode_fallback_total: load!(CUDA_DELTANET_DECODE_FALLBACK),
+        cuda_deltanet_specialized_decode_attempts_total: load!(
+            CUDA_DELTANET_SPECIALIZED_DECODE_ATTEMPTS
+        ),
+        cuda_deltanet_specialized_decode_success_total: load!(
+            CUDA_DELTANET_SPECIALIZED_DECODE_SUCCESS
+        ),
+        cuda_deltanet_specialized_decode_fallback_total: load!(
+            CUDA_DELTANET_SPECIALIZED_DECODE_FALLBACK
+        ),
         cuda_deltanet_prefill_attempts_total: load!(CUDA_DELTANET_PREFILL_ATTEMPTS),
         cuda_deltanet_prefill_success_total: load!(CUDA_DELTANET_PREFILL_SUCCESS),
         cuda_deltanet_prefill_fallback_total: load!(CUDA_DELTANET_PREFILL_FALLBACK),
@@ -266,6 +287,7 @@ mod tests {
         assert_eq!(value["cuda_bf16_kv_provider_selected_total"], 0);
         assert_eq!(value["cuda_f16_kv_fallback_selected_total"], 0);
         assert_eq!(value["cuda_deltanet_decode_fallback_total"], 0);
+        assert_eq!(value["cuda_deltanet_specialized_decode_fallback_total"], 0);
         assert_eq!(value["sampling_bounded_cuda_fallback_to_host_total"], 0);
     }
 
@@ -299,6 +321,46 @@ mod tests {
         );
         assert_eq!(
             after.cuda_deltanet_decode_fallback_total - before.cuda_deltanet_decode_fallback_total,
+            1
+        );
+    }
+
+    #[test]
+    fn specialized_deltanet_decode_outcomes_remain_reconcilable() {
+        let before = snapshot();
+        record_cuda_kernel(CudaKernelPath::DeltaNetSpecializedDecode, true);
+        record_cuda_kernel(CudaKernelPath::DeltaNetSpecializedDecode, false);
+        let after = snapshot();
+        assert_eq!(
+            after.cuda_deltanet_specialized_decode_attempts_total
+                - before.cuda_deltanet_specialized_decode_attempts_total,
+            2
+        );
+        assert_eq!(
+            after.cuda_deltanet_specialized_decode_success_total
+                - before.cuda_deltanet_specialized_decode_success_total,
+            1
+        );
+        assert_eq!(
+            after.cuda_deltanet_specialized_decode_fallback_total
+                - before.cuda_deltanet_specialized_decode_fallback_total,
+            1
+        );
+    }
+
+    #[test]
+    fn kv_provider_outcomes_remain_reconcilable() {
+        let before = snapshot();
+        record_cuda_kv_provider(true);
+        record_cuda_kv_provider(false);
+        let after = snapshot();
+        assert_eq!(
+            after.cuda_bf16_kv_provider_selected_total
+                - before.cuda_bf16_kv_provider_selected_total,
+            1
+        );
+        assert_eq!(
+            after.cuda_f16_kv_fallback_selected_total - before.cuda_f16_kv_fallback_selected_total,
             1
         );
     }
