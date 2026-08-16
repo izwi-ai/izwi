@@ -301,14 +301,21 @@ enum Qwen38Mixer {
 }
 
 struct Qwen38Mlp {
-    gate: Qwen38Projection,
-    up: Qwen38Projection,
+    gate_up: Qwen38ProjectionGroup,
     down: Qwen38Projection,
 }
 
 enum Qwen38Projection {
     Quantized(QMatMul),
     Dense(Linear),
+}
+
+enum Qwen38ProjectionGroup {
+    Separate(Vec<Qwen38Projection>),
+    Packed {
+        projection: Qwen38Projection,
+        widths: Vec<usize>,
+    },
 }
 
 struct Qwen38RmsNorm {
@@ -331,10 +338,23 @@ impl Module for Qwen38Projection {
     }
 }
 
+impl Qwen38ProjectionGroup {
+    fn forward(&self, input: &Tensor) -> Result<Vec<Tensor>> {
+        match self {
+            Self::Separate(projections) => projections
+                .iter()
+                .map(|projection| projection.forward(input).map_err(Error::from))
+                .collect(),
+            Self::Packed { projection, widths } => {
+                let output = projection.forward(input)?;
+                split_projection_output(&output, widths)
+            }
+        }
+    }
+}
+
 struct Qwen38FullAttention {
-    q_proj: Qwen38Projection,
-    k_proj: Qwen38Projection,
-    v_proj: Qwen38Projection,
+    qkv_proj: Qwen38ProjectionGroup,
     o_proj: Qwen38Projection,
     q_norm: Qwen38RmsNorm,
     k_norm: Qwen38RmsNorm,
@@ -349,10 +369,8 @@ struct Qwen38FullAttention {
 }
 
 struct Qwen38LinearAttention {
-    qkv_proj: Qwen38Projection,
-    gate_proj: Qwen38Projection,
-    beta_proj: Qwen38Projection,
-    alpha_proj: Qwen38Projection,
+    qkv_z_proj: Qwen38ProjectionGroup,
+    alpha_beta_proj: Qwen38ProjectionGroup,
     dt_bias: Tensor,
     a: Tensor,
     conv_kernel: Tensor,
@@ -744,19 +762,15 @@ impl Qwen38Mlp {
         block: [usize; 2],
         target: ProjectionMaterialization,
     ) -> Result<Self> {
+        let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+        let up_name = format!("{prefix}.mlp.up_proj.weight");
         Ok(Self {
-            gate: load_native_projection(
+            gate_up: load_native_projection_group(
                 tensors,
-                &format!("{prefix}.mlp.gate_proj.weight"),
-                [cfg.feed_forward_length, cfg.embedding_length],
-                block,
-                target,
-                device,
-            )?,
-            up: load_native_projection(
-                tensors,
-                &format!("{prefix}.mlp.up_proj.weight"),
-                [cfg.feed_forward_length, cfg.embedding_length],
+                &[
+                    (&gate_name, [cfg.feed_forward_length, cfg.embedding_length]),
+                    (&up_name, [cfg.feed_forward_length, cfg.embedding_length]),
+                ],
                 block,
                 target,
                 device,
@@ -774,8 +788,13 @@ impl Qwen38Mlp {
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
-        let gate_proj_out = self.gate.forward(hidden_states)?;
-        let up_proj_out = self.up.forward(hidden_states)?;
+        let mut gate_up = self.gate_up.forward(hidden_states)?.into_iter();
+        let gate_proj_out = gate_up.next().ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 gate/up projection omitted gate output".into())
+        })?;
+        let up_proj_out = gate_up.next().ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 gate/up projection omitted up output".into())
+        })?;
 
         let hidden = if let Some(fused) = try_fused_silu_mul(&gate_proj_out, &up_proj_out) {
             fused
@@ -806,27 +825,17 @@ impl Qwen38FullAttention {
             .attention_head_count_kv
             .checked_mul(cfg.attention_key_length)
             .ok_or_else(|| Error::ModelLoadError("Qwen3.8 KV projection width overflow".into()))?;
+        let q_name = format!("{prefix}.self_attn.q_proj.weight");
+        let k_name = format!("{prefix}.self_attn.k_proj.weight");
+        let v_name = format!("{prefix}.self_attn.v_proj.weight");
         Ok(Self {
-            q_proj: load_native_projection(
+            qkv_proj: load_native_projection_group(
                 tensors,
-                &format!("{prefix}.self_attn.q_proj.weight"),
-                [q_width, cfg.embedding_length],
-                block,
-                target,
-                device,
-            )?,
-            k_proj: load_native_projection(
-                tensors,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-                [kv_width, cfg.embedding_length],
-                block,
-                target,
-                device,
-            )?,
-            v_proj: load_native_projection(
-                tensors,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-                [kv_width, cfg.embedding_length],
+                &[
+                    (&q_name, [q_width, cfg.embedding_length]),
+                    (&k_name, [kv_width, cfg.embedding_length]),
+                    (&v_name, [kv_width, cfg.embedding_length]),
+                ],
                 block,
                 target,
                 device,
@@ -894,30 +903,25 @@ impl Qwen38FullAttention {
                 position_ids.len()
             )));
         }
-        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_heads,
-            self.head_dim * 2,
-        ))?;
+        let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
+        let q_proj = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
+            .reshape((1, seq_len, self.num_heads, self.head_dim * 2))?;
         let query_states = q_proj.narrow(3, 0, self.head_dim)?;
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             1,
             seq_len,
             self.num_heads * self.head_dim,
         ))?;
-        let key_states = self.k_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let value_states = self.v_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let key_states = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
+            .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
+        let value_states = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
+            .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let (query_states, key_states) = if seq_len == 1 {
@@ -1152,35 +1156,27 @@ impl Qwen38LinearAttention {
             )?,
             eps: cfg.attention_layer_norm_rms_epsilon,
         };
+        let qkv_name = format!("{linear}.in_proj_qkv.weight");
+        let z_name = format!("{linear}.in_proj_z.weight");
+        let alpha_name = format!("{linear}.in_proj_a.weight");
+        let beta_name = format!("{linear}.in_proj_b.weight");
         Ok(Self {
-            qkv_proj: load_native_projection(
+            qkv_z_proj: load_native_projection_group(
                 tensors,
-                &format!("{linear}.in_proj_qkv.weight"),
-                [conv_dim, cfg.embedding_length],
+                &[
+                    (&qkv_name, [conv_dim, cfg.embedding_length]),
+                    (&z_name, [cfg.ssm_inner_size, cfg.embedding_length]),
+                ],
                 block,
                 target,
                 device,
             )?,
-            gate_proj: load_native_projection(
+            alpha_beta_proj: load_native_projection_group(
                 tensors,
-                &format!("{linear}.in_proj_z.weight"),
-                [cfg.ssm_inner_size, cfg.embedding_length],
-                block,
-                target,
-                device,
-            )?,
-            beta_proj: load_native_projection(
-                tensors,
-                &format!("{linear}.in_proj_b.weight"),
-                [num_v_heads, cfg.embedding_length],
-                block,
-                target,
-                device,
-            )?,
-            alpha_proj: load_native_projection(
-                tensors,
-                &format!("{linear}.in_proj_a.weight"),
-                [num_v_heads, cfg.embedding_length],
+                &[
+                    (&alpha_name, [num_v_heads, cfg.embedding_length]),
+                    (&beta_name, [num_v_heads, cfg.embedding_length]),
+                ],
                 block,
                 target,
                 device,
@@ -1227,21 +1223,15 @@ impl Qwen38LinearAttention {
         };
 
         let residual_dtype = hidden_states.dtype();
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
-        let z = self
-            .gate_proj
-            .forward(hidden_states)?
-            .to_dtype(DType::F32)?;
+        let mut qkv_z = self.qkv_z_proj.forward(hidden_states)?.into_iter();
+        let mixed_qkv = required_group_output(&mut qkv_z, "DeltaNet QKV")?.to_dtype(DType::F32)?;
+        let z = required_group_output(&mut qkv_z, "DeltaNet Z")?.to_dtype(DType::F32)?;
+        let mut alpha_beta = self.alpha_beta_proj.forward(hidden_states)?.into_iter();
+        let alpha =
+            required_group_output(&mut alpha_beta, "DeltaNet alpha")?.to_dtype(DType::F32)?;
         let beta = ops::sigmoid(
-            &self
-                .beta_proj
-                .forward(hidden_states)?
-                .to_dtype(DType::F32)?,
+            &required_group_output(&mut alpha_beta, "DeltaNet beta")?.to_dtype(DType::F32)?,
         )?;
-        let alpha = self
-            .alpha_proj
-            .forward(hidden_states)?
-            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
@@ -1327,21 +1317,15 @@ impl Qwen38LinearAttention {
         };
 
         let residual_dtype = hidden_states.dtype();
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
-        let z = self
-            .gate_proj
-            .forward(hidden_states)?
-            .to_dtype(DType::F32)?;
+        let mut qkv_z = self.qkv_z_proj.forward(hidden_states)?.into_iter();
+        let mixed_qkv = required_group_output(&mut qkv_z, "DeltaNet QKV")?.to_dtype(DType::F32)?;
+        let z = required_group_output(&mut qkv_z, "DeltaNet Z")?.to_dtype(DType::F32)?;
+        let mut alpha_beta = self.alpha_beta_proj.forward(hidden_states)?.into_iter();
+        let alpha =
+            required_group_output(&mut alpha_beta, "DeltaNet alpha")?.to_dtype(DType::F32)?;
         let beta = ops::sigmoid(
-            &self
-                .beta_proj
-                .forward(hidden_states)?
-                .to_dtype(DType::F32)?,
+            &required_group_output(&mut alpha_beta, "DeltaNet beta")?.to_dtype(DType::F32)?,
         )?;
-        let alpha = self
-            .alpha_proj
-            .forward(hidden_states)?
-            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
@@ -1610,6 +1594,101 @@ fn load_native_projection(
     tensors
         .materialize_projection(name, shape, block, target, device)
         .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))
+}
+
+fn load_native_projection_group(
+    tensors: &IndexedSafetensors,
+    projections: &[(&str, [usize; 2])],
+    block: [usize; 2],
+    target: ProjectionMaterialization,
+    device: &Device,
+) -> Result<Qwen38ProjectionGroup> {
+    let load_separate = || {
+        projections
+            .iter()
+            .map(|(name, shape)| {
+                load_native_projection(tensors, name, *shape, block, target, device)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Qwen38ProjectionGroup::Separate)
+    };
+    if !qwen38_projection_packing_enabled(device)
+        || !projection_group_geometry_compatible(projections)
+    {
+        return load_separate();
+    }
+
+    let all_fp8 = projections.iter().all(|(name, _)| {
+        tensors
+            .tensor_info(name)
+            .is_ok_and(|info| info.dtype == SafeDType::F8_E4M3)
+    });
+    let any_fp8 = projections.iter().any(|(name, _)| {
+        tensors
+            .tensor_info(name)
+            .is_ok_and(|info| info.dtype == SafeDType::F8_E4M3)
+    });
+    // Do not merge different persistent representations. The separate path
+    // remains the safe fallback for unusual checkpoint variants.
+    if any_fp8 && !all_fp8 {
+        return load_separate();
+    }
+
+    let projection = if device.is_cuda() && all_fp8 {
+        tensors
+            .materialize_q8_projection_group(projections, block, device)
+            .map(Qwen38Projection::Quantized)?
+    } else {
+        tensors
+            .materialize_projection_group(projections, block, target, device)
+            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))?
+    };
+    Ok(Qwen38ProjectionGroup::Packed {
+        projection,
+        widths: projections.iter().map(|(_, shape)| shape[0]).collect(),
+    })
+}
+
+fn projection_group_geometry_compatible(projections: &[(&str, [usize; 2])]) -> bool {
+    let Some((_, first)) = projections.first() else {
+        return false;
+    };
+    projections
+        .iter()
+        .all(|(_, shape)| shape[0] > 0 && shape[1] == first[1])
+}
+
+fn split_projection_output(output: &Tensor, widths: &[usize]) -> Result<Vec<Tensor>> {
+    let output_axis = output.rank().checked_sub(1).ok_or_else(|| {
+        Error::InferenceError("Qwen3.8 projection output cannot be scalar".into())
+    })?;
+    let output_width = output.dim(output_axis)?;
+    let expected_width = widths.iter().try_fold(0usize, |sum, width| {
+        sum.checked_add(*width)
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 projection split width overflow".into()))
+    })?;
+    if output_width != expected_width {
+        return Err(Error::InferenceError(format!(
+            "Qwen3.8 packed projection produced width {output_width}, expected {expected_width}"
+        )));
+    }
+    let mut offset = 0usize;
+    widths
+        .iter()
+        .map(|width| {
+            let split = output
+                .narrow(output_axis, offset, *width)
+                .map_err(Error::from)?;
+            offset += *width;
+            Ok(split)
+        })
+        .collect()
+}
+
+fn required_group_output(outputs: &mut std::vec::IntoIter<Tensor>, label: &str) -> Result<Tensor> {
+    outputs.next().ok_or_else(|| {
+        Error::InferenceError(format!("Qwen3.8 packed projection omitted {label} output"))
+    })
 }
 
 fn load_native_zero_centered_norm(
@@ -1902,6 +1981,17 @@ fn qwen38_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn qwen38_projection_packing_enabled(device: &Device) -> bool {
+    qwen38_projection_packing_policy(
+        device.is_cuda(),
+        qwen38_env_bool("IZWI_QWEN38_PACKED_PROJECTIONS", false),
+    )
+}
+
+fn qwen38_projection_packing_policy(is_cuda: bool, requested: bool) -> bool {
+    is_cuda && requested
+}
+
 fn qwen38_tiled_recurrence_enabled() -> bool {
     qwen38_env_bool("IZWI_QWEN38_TILED_RECURRENCE", true)
 }
@@ -2032,9 +2122,10 @@ fn recurrent_gated_delta(
 mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
+        projection_group_geometry_compatible, qwen38_projection_packing_policy,
         qwen38_rope_kernel_policy, recurrent_domain_v2, repeat_interleave_head_states,
         repeat_interleave_head_states_seq, softplus, ConvRingState, Linear,
-        Qwen38LayerRuntimeState, Qwen38Projection, Qwen38TextRuntimeState,
+        Qwen38LayerRuntimeState, Qwen38Projection, Qwen38ProjectionGroup, Qwen38TextRuntimeState,
     };
     use crate::models::architectures::qwen38::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2157,6 +2248,56 @@ mod tests {
             output.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![2.0, 3.0, 5.0, 4.0, 5.0, 9.0]
         );
+    }
+
+    #[test]
+    fn packed_projection_group_matches_separate_outputs_exactly() {
+        let first =
+            Tensor::from_vec(vec![1f32, 0.0, 0.0, 1.0, 1.0, 1.0], (3, 2), &Device::Cpu).unwrap();
+        let second = Tensor::from_vec(vec![2f32, -1.0, -2.0, 1.0], (2, 2), &Device::Cpu).unwrap();
+        let packed = Tensor::cat(&[&first, &second], 0).unwrap();
+        let separate = Qwen38ProjectionGroup::Separate(vec![
+            Qwen38Projection::Dense(Linear::new(first, None)),
+            Qwen38Projection::Dense(Linear::new(second, None)),
+        ]);
+        let packed = Qwen38ProjectionGroup::Packed {
+            projection: Qwen38Projection::Dense(Linear::new(packed, None)),
+            widths: vec![3, 2],
+        };
+        let input = Tensor::from_vec(vec![2f32, 3.0, 4.0, 5.0], (1, 2, 2), &Device::Cpu).unwrap();
+
+        let separate = separate.forward(&input).unwrap();
+        let packed = packed.forward(&input).unwrap();
+        assert_eq!(packed.len(), separate.len());
+        for (packed, separate) in packed.iter().zip(&separate) {
+            assert_eq!(packed.dims(), separate.dims());
+            assert_eq!(
+                packed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                separate.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn projection_packing_is_cuda_only_and_disabled_without_opt_in() {
+        assert!(!qwen38_projection_packing_policy(false, false));
+        assert!(!qwen38_projection_packing_policy(false, true));
+        assert!(!qwen38_projection_packing_policy(true, false));
+        assert!(qwen38_projection_packing_policy(true, true));
+    }
+
+    #[test]
+    fn projection_group_rejects_incompatible_inner_dimensions() {
+        assert!(projection_group_geometry_compatible(&[
+            ("q", [3, 8]),
+            ("k", [2, 8]),
+            ("v", [2, 8]),
+        ]));
+        assert!(!projection_group_geometry_compatible(&[
+            ("q", [3, 8]),
+            ("k", [2, 4]),
+        ]));
+        assert!(!projection_group_geometry_compatible(&[]));
     }
 
     #[test]

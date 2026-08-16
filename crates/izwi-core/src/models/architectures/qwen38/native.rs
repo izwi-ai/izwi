@@ -661,6 +661,27 @@ impl IndexedSafetensors {
         })
     }
 
+    /// Materialize several row-compatible projections as one projection.
+    ///
+    /// Concatenation follows the supplied order. This lets the execution path
+    /// issue one matrix multiplication and recover the original outputs with
+    /// row-range views. Each source tensor is still decoded with its own FP8
+    /// scale tensor, so packing does not alter checkpoint quantization.
+    pub fn materialize_projection_group(
+        &self,
+        projections: &[(&str, [usize; 2])],
+        block_shape: [usize; 2],
+        target: ProjectionMaterialization,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let (values, shape) = self.load_projection_group_f32(projections, block_shape, false)?;
+        materialize_f32(values, &shape, target, device).map_err(|err| {
+            Error::ModelLoadError(format!(
+                "Failed to materialize native projection group as {target:?}: {err}"
+            ))
+        })
+    }
+
     /// Materialize a block-scaled FP8 projection as packed Q8_0 weights.
     ///
     /// The upstream inverse scale is applied while decoding to CPU F32 before
@@ -703,6 +724,90 @@ impl IndexedSafetensors {
                 ))
             })?;
         Ok(QMatMul::QTensor(Arc::new(quantized)))
+    }
+
+    /// Materialize several FP8 projections as one persistent Q8_0 matrix.
+    pub fn materialize_q8_projection_group(
+        &self,
+        projections: &[(&str, [usize; 2])],
+        block_shape: [usize; 2],
+        device: &Device,
+    ) -> Result<QMatMul> {
+        let (values, shape) = self.load_projection_group_f32(projections, block_shape, true)?;
+        let q8_block = GgmlDType::Q8_0.block_size();
+        if !shape[1].is_multiple_of(q8_block) {
+            return Err(Error::ModelLoadError(format!(
+                "Native Q8_0 projection group inner dimension {} is not divisible by {q8_block}",
+                shape[1]
+            )));
+        }
+        let source = Tensor::from_vec(values, &shape, &Device::Cpu).map_err(|err| {
+            Error::ModelLoadError(format!(
+                "Failed to stage native projection group for Q8_0 quantization: {err}"
+            ))
+        })?;
+        let quantized =
+            QTensor::quantize_onto(&source, GgmlDType::Q8_0, device).map_err(|err| {
+                Error::ModelLoadError(format!(
+                    "Failed to quantize native projection group as Q8_0: {err}"
+                ))
+            })?;
+        Ok(QMatMul::QTensor(Arc::new(quantized)))
+    }
+
+    fn load_projection_group_f32(
+        &self,
+        projections: &[(&str, [usize; 2])],
+        block_shape: [usize; 2],
+        require_fp8: bool,
+    ) -> Result<(Vec<f32>, [usize; 2])> {
+        let Some((_, first_shape)) = projections.first() else {
+            return Err(Error::ModelLoadError(
+                "Native projection group cannot be empty".into(),
+            ));
+        };
+        let inner = first_shape[1];
+        let mut rows = 0usize;
+        let mut values = Vec::new();
+        for (name, shape) in projections {
+            if shape[1] != inner {
+                return Err(Error::ModelLoadError(format!(
+                    "Native projection group has incompatible inner dimensions: `{name}` uses {}, expected {inner}",
+                    shape[1]
+                )));
+            }
+            rows = rows.checked_add(shape[0]).ok_or_else(|| {
+                Error::ModelLoadError("Native projection group row count overflow".into())
+            })?;
+            let info = self.tensor_info(name)?;
+            if require_fp8 && info.dtype != SafeDType::F8_E4M3 {
+                return Err(Error::ModelLoadError(format!(
+                    "Native Q8_0 projection group tensor `{name}` must use F8_E4M3 storage, found {:?}",
+                    info.dtype
+                )));
+            }
+            let mut projection = match info.dtype {
+                SafeDType::F8_E4M3 => self.load_block_fp8_f32(name, *shape, block_shape)?,
+                SafeDType::BF16 | SafeDType::F16 | SafeDType::F32 => {
+                    let scale_name = scale_name_for_weight(name)?;
+                    if self.contains_tensor(&scale_name) {
+                        return Err(Error::ModelLoadError(format!(
+                            "Native dense tensor `{name}` has an unexpected scale tensor `{scale_name}`"
+                        )));
+                    }
+                    self.with_tensor_view(name, Some(info.dtype), Some(shape), |view| {
+                        decode_dense_f32(view, name)
+                    })?
+                }
+                dtype => {
+                    return Err(Error::ModelLoadError(format!(
+                        "Native projection `{name}` uses unsupported dtype {dtype:?}"
+                    )));
+                }
+            };
+            values.append(&mut projection);
+        }
+        Ok((values, [rows, inner]))
     }
 
     /// Materialize an ordinary BF16/F16/F32 tensor of any rank.
@@ -1382,6 +1487,51 @@ mod tests {
     }
 
     #[test]
+    fn indexed_projection_group_preserves_source_order_and_scales() {
+        let dir = TestDir::new("projection-group");
+        let first = "model.language_model.layers.0.mlp.gate_proj.weight";
+        let first_scale = "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv";
+        let second = "model.language_model.layers.0.mlp.up_proj.weight";
+        let second_scale = "model.language_model.layers.0.mlp.up_proj.weight_scale_inv";
+        let first_weights = [0x38, 0x40]; // 1, 2
+        let second_weights = [0xb8, 0xc0]; // -1, -2
+        let first_scales = bf16_bytes(&[0.5]);
+        let second_scales = bf16_bytes(&[3.0]);
+        write_safetensors(
+            &dir.path().join("layers-0.safetensors"),
+            &[
+                (first, SafeDType::F8_E4M3, vec![1, 2], &first_weights),
+                (first_scale, SafeDType::BF16, vec![1, 1], &first_scales),
+                (second, SafeDType::F8_E4M3, vec![1, 2], &second_weights),
+                (second_scale, SafeDType::BF16, vec![1, 1], &second_scales),
+            ],
+        );
+        write_index(
+            dir.path(),
+            json!({
+                (first): "layers-0.safetensors",
+                (first_scale): "layers-0.safetensors",
+                (second): "layers-0.safetensors",
+                (second_scale): "layers-0.safetensors"
+            }),
+        );
+
+        let source = IndexedSafetensors::open(dir.path()).unwrap();
+        let packed = source
+            .materialize_projection_group(
+                &[(first, [1, 2]), (second, [1, 2])],
+                [128, 128],
+                ProjectionMaterialization::F32,
+                &Device::Cpu,
+            )
+            .unwrap();
+        assert_eq!(
+            packed.to_vec2::<f32>().unwrap(),
+            vec![vec![0.5, 1.0], vec![-3.0, -6.0]]
+        );
+    }
+
+    #[test]
     fn indexed_q8_materialization_applies_fp8_scales_before_quantizing() {
         let dir = TestDir::new("q8-projection");
         let weight_name = "model.language_model.layers.0.mlp.gate_proj.weight";
@@ -1438,6 +1588,57 @@ mod tests {
             assert!((row[0] - 96.0).abs() < 0.5, "{} != 96", row[0]);
             assert!((row[1] - 192.0).abs() < 0.5, "{} != 192", row[1]);
         }
+    }
+
+    #[test]
+    fn indexed_q8_projection_group_retains_packed_shape_and_row_order() {
+        let dir = TestDir::new("q8-projection-group");
+        let first = "model.language_model.layers.0.mlp.gate_proj.weight";
+        let first_scale = "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv";
+        let second = "model.language_model.layers.0.mlp.up_proj.weight";
+        let second_scale = "model.language_model.layers.0.mlp.up_proj.weight_scale_inv";
+        let first_weights = vec![0x38; 32]; // +1.0
+        let second_weights = vec![0xc0; 32]; // -2.0
+        let first_scales = bf16_bytes(&[3.0]);
+        let second_scales = bf16_bytes(&[2.0]);
+        write_safetensors(
+            &dir.path().join("layers-0.safetensors"),
+            &[
+                (first, SafeDType::F8_E4M3, vec![1, 32], &first_weights),
+                (first_scale, SafeDType::BF16, vec![1, 1], &first_scales),
+                (second, SafeDType::F8_E4M3, vec![1, 32], &second_weights),
+                (second_scale, SafeDType::BF16, vec![1, 1], &second_scales),
+            ],
+        );
+        write_index(
+            dir.path(),
+            json!({
+                (first): "layers-0.safetensors",
+                (first_scale): "layers-0.safetensors",
+                (second): "layers-0.safetensors",
+                (second_scale): "layers-0.safetensors"
+            }),
+        );
+
+        let source = IndexedSafetensors::open(dir.path()).unwrap();
+        let projection = source
+            .materialize_q8_projection_group(
+                &[(first, [1, 32]), (second, [1, 32])],
+                [128, 128],
+                &Device::Cpu,
+            )
+            .unwrap();
+        let QMatMul::QTensor(weight) = projection else {
+            panic!("Q8 projection group must retain packed QTensor storage")
+        };
+        assert_eq!(weight.shape().dims(), [2, 32]);
+        let rows = weight
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(rows[0].iter().all(|value| (*value - 3.0).abs() < 0.05));
+        assert!(rows[1].iter().all(|value| (*value + 4.0).abs() < 0.05));
     }
 
     #[test]
