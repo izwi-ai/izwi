@@ -13,7 +13,11 @@ grep -q 'never estimates or synthesizes performance' <<<"${help}"
 grep -q -- '--allow-unsupported' <<<"${help}"
 
 ${runner} --workload "${workload}" --output "${tmp_dir}/dry" --dry-run >/dev/null
-jq -e '.schema == "izwi.qwen38-l40s-evidence.v1" and .status == "unsupported" and .reason == "dry_run"' \
+jq -e '.schema == "izwi.qwen38-cuda-evidence.v1" and
+       .hardware_profile.id == "nvidia-l40s-48gb" and
+       .hardware_profile.promotion_scope == "profile_only" and
+       .promotion_eligible == false and
+       .status == "unsupported" and .reason == "dry_run"' \
     "${tmp_dir}/dry/certificate.json" >/dev/null
 [[ $(grep -c '^\[\[benchmarks\]\]$' "${tmp_dir}/dry/imported-manifest.toml") -eq 9 ]]
 [[ $(grep -c '^model = "Qwen3.8-27B-FP8"$' "${tmp_dir}/dry/imported-manifest.toml") -eq 9 ]]

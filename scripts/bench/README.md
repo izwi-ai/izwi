@@ -123,11 +123,12 @@ no worker panic/restart/request-failure delta, and the expected observed
 provider. Compile-only CI and an `unsupported` record cannot promote a runtime
 cell.
 
-## Qwen3.8 L40S performance evidence
+## Qwen3.8 CUDA hardware-profile evidence
 
-`run-qwen38-l40s-evidence.sh` imports the versioned
-`benchmarks/manifests/qwen38-l40s-evidence.json` workload into the strict CUDA
-model evidence runner. It covers warmed single-user decode, longer prompts, a
+`run-qwen38-cuda-evidence.sh` imports a versioned Qwen3.8 workload and hardware
+profile into the strict CUDA model evidence runner. The included
+`benchmarks/manifests/qwen38-l40s-evidence.json` profile covers warmed
+single-user decode, longer prompts, a
 sustained 2,048-token completion, and concurrency 1/2/4/8. `prompt_words`
 controls deterministic input construction; it is not reported as a tokenizer
 token count. The certificate retains the actual prompt-token count returned by
@@ -135,7 +136,8 @@ the server. The complete operator protocol, candidate matrix, required
 artifacts, promotion gates, and deferred phases are in
 [`docs/dev/QWEN38_L40S_VALIDATION.md`](../../docs/dev/QWEN38_L40S_VALIDATION.md).
 
-Run it manually on the exact L40S deployment and retain the output directory:
+Run the strict L40S convenience profile manually on the exact deployment and
+retain the output directory:
 
 ```bash
 scripts/bench/run-qwen38-l40s-evidence.sh \
@@ -144,7 +146,8 @@ scripts/bench/run-qwen38-l40s-evidence.sh \
   --output target/qwen38-l40s-evidence
 ```
 
-A pass requires the exact model ID, an observed NVIDIA L40S, a server built
+A pass requires the exact model ID, a selected device matching the manifest's
+name, compute capability, minimum VRAM, and driver constraints, a server built
 from the checked-out Git SHA, strict quality success, and measured TTFT and
 completion throughput for every case. It records detailed `nvidia-smi`, OS,
 imported-manifest, standard CUDA certificate, and raw benchmark artifacts. The
@@ -154,6 +157,22 @@ two metrics must not be conflated. The workload pins the expected Hugging Face
 checkpoint revision; provisioning that
 revision remains an operator responsibility because the runner never downloads
 or mutates models.
+
+The L40S script is a small strict wrapper around the reusable CUDA runner. For
+another NVIDIA GPU, create a separate versioned workload with a distinct
+`hardware_profile.id` and run:
+
+```bash
+scripts/bench/run-qwen38-cuda-evidence.sh \
+  --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
+  --output target/qwen38-<profile>-evidence
+```
+
+Each profile owns its performance thresholds. An L40S result is useful for the
+`nvidia-l40s-48gb` deployment profile only; it cannot promote a global CUDA
+default or set an expected throughput for another GPU. Global promotion needs
+representative retained evidence across supported CUDA compute capabilities
+and a runtime capability gate that fails closed on unvalidated devices.
 
 The runner measures an existing warmed server; it does not enable optimization
 candidates. Set candidate variables on the server process and restart between
@@ -168,5 +187,6 @@ workflow validation can explicitly record unsupported without inventing data:
 
 ```bash
 scripts/bench/run-qwen38-l40s-evidence.sh --allow-unsupported
+scripts/bench/test-run-qwen38-cuda-evidence.sh
 scripts/bench/test-run-qwen38-l40s-evidence.sh
 ```

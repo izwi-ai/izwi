@@ -1,9 +1,16 @@
-# Qwen3.8 27B L40S validation handoff
+# Qwen3.8 27B CUDA validation profiles
 
 This is the manual CUDA validation protocol for `Qwen3.8-27B-FP8`. The
-optimization candidates described here are scoped to the separate Qwen3.8
-model family. They are all disabled by default and have not been validated on
-an NVIDIA GPU in this repository.
+optimization candidates are scoped to the separate Qwen3.8 model family, but
+they are not tied to the L40S: production dispatch selects the CUDA backend,
+not a GPU product name. The L40S is the first strict evidence profile because
+it is the deployment that motivated this work. All candidates remain disabled
+by default and have not been validated on an NVIDIA GPU in this repository.
+
+CUDA correctness and performance evidence is hardware-profile-specific. A
+passing L40S bundle certifies only the versioned `nvidia-l40s-48gb` profile. It
+does not certify, establish a throughput expectation for, or authorize a
+global default on other NVIDIA architectures.
 
 The development host used for the implementation had no usable NVIDIA device.
 It could verify builds, CPU reference behavior, policy tests, runner routing,
@@ -11,7 +18,7 @@ and fail-closed behavior, but it could not establish CUDA correctness,
 throughput, latency, VRAM use, kernel selection, or numerical parity. Do not
 interpret compilation or an `unsupported` certificate as device evidence.
 
-## Required deployment
+## Initial strict deployment profile
 
 Use an NVIDIA L40S host with the pinned
 `Qwen/Qwen3.8-27B-FP8` checkpoint revision
@@ -20,6 +27,14 @@ release CLI, and the running server must all use the same Git SHA. Build the
 CLI and server with the intended CUDA feature set, start the server with
 `--backend cuda`, preload or load `Qwen3.8-27B-FP8`, and warm it before
 collecting a bundle.
+
+The L40S manifest records and enforces the selected device name, compute
+capability 8.9, minimum VRAM, and a well-formed driver version. To test another
+NVIDIA GPU, copy the versioned workload, assign a new `hardware_profile.id`,
+and set that device's name regex, compute-capability regex, minimum VRAM, and
+driver-version regex. Run the generic
+`scripts/bench/run-qwen38-cuda-evidence.sh` command against the new manifest.
+Do not weaken the L40S profile to make a different device pass.
 
 The server process owns the candidate switches. Restart the server between
 cells so each bundle has exactly the intended environment:
@@ -52,7 +67,7 @@ target/release/izwi serve --backend cuda
 For a candidate cell, add exactly one variable from the table to that server
 environment. Keep the terminal and server log with the evidence bundle.
 
-## Exact evidence command
+## Exact L40S evidence command
 
 From the root of the same checkout, with the warmed server listening on port
 8080, run exactly:
@@ -92,14 +107,32 @@ decode throughput derived from the server-reported generation interval. Keep
 those metrics separate. The workload also records observed prompt tokens; its
 `prompt_words` value is only a deterministic input-size target.
 
-## Candidate review and promotion
+For another versioned NVIDIA hardware profile, use:
+
+```bash
+scripts/bench/run-qwen38-cuda-evidence.sh \
+  --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
+  --server http://127.0.0.1:8080 \
+  --izwi-bin target/release/izwi \
+  --output target/qwen38-<profile>-evidence
+```
+
+The certificate records the exact device name, compute capability, total and
+free VRAM, driver version, Git SHA, and checkpoint revision. The selected
+server device must match every constraint in the manifest's hardware profile.
+
+## Candidate review and profile-scoped promotion
 
 Review the baseline first, then each isolated candidate, then only combinations
-whose isolated cells passed. A candidate can be considered for default-on
-promotion only when all of the following are true on the exact L40S deployment:
+whose isolated cells passed. Declare acceptance thresholds in that hardware
+profile before promotion runs; do not reuse absolute throughput thresholds
+from a different GPU class. A candidate can be considered for an explicitly
+profile-gated provider only when all of the following are true on the matching
+deployment:
 
 1. The runner exits successfully and both certificates say `passed`; the
-   device is an observed L40S, the server selects CUDA, and every Git SHA and
+   selected device matches the manifest's name, compute capability, VRAM, and
+   driver constraints; the server selects CUDA; and every Git SHA and
    checkpoint revision matches.
 2. Every workload case passes strict quality gates with no panic, worker
    restart, request-failure increase, non-finite output, or context/admission
@@ -123,7 +156,15 @@ promotion only when all of the following are true on the exact L40S deployment:
 
 Keep candidates default-off when evidence is incomplete, contradictory, or
 shows only compilation/dispatch eligibility. Promotion should be a separate,
-reviewable change bound to the retained bundles.
+reviewable change bound to the retained bundles and an explicit runtime
+hardware capability/profile gate.
+
+An L40S pass alone must never promote a candidate to the global CUDA default.
+A global default requires retained correctness and performance evidence across
+the repository's representative supported CUDA architecture matrix, including
+each materially different compute capability, plus a fail-closed capability
+policy for unobserved devices. Until that exists, promotion remains limited to
+the tested profile or the candidate remains default-off.
 
 ## Deferred evidence-gated phases
 
@@ -138,10 +179,10 @@ default-off candidate set:
 
 These phases change numerical behavior, memory ownership, scheduling, or the
 execution graph broadly enough that they cannot be enabled safely before the
-current baseline and isolated candidates have real L40S evidence. Each phase
-needs its own design, kill switch, telemetry, correctness comparison, resource
-accounting, and versioned hardware workload. No result for these phases has
-been measured or synthesized here.
+current baseline and isolated candidates have real CUDA device evidence. Each
+phase needs its own design, kill switch, telemetry, correctness comparison,
+resource accounting, and versioned hardware workload. No result for these
+phases has been measured or synthesized here.
 
 On a host without an NVIDIA GPU, use `--dry-run` to validate manifest import or
 `--allow-unsupported` only to exercise unsupported reporting. Neither path is

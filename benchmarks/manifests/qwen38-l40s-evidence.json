@@ -1,9 +1,24 @@
 {
-  "schema": "izwi.qwen38-l40s-workload.v1",
+  "schema": "izwi.qwen38-cuda-workload.v1",
   "model": "Qwen3.8-27B-FP8",
   "checkpoint": {
     "repository": "Qwen/Qwen3.8-27B-FP8",
     "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+  },
+  "hardware_profile": {
+    "id": "nvidia-l40s-48gb",
+    "device_name_regex": "(^|[[:space:]])L40S([[:space:]]|$)",
+    "compute_capability_regex": "^8\\.9$",
+    "minimum_total_memory_bytes": 47000000000,
+    "driver_version_regex": "^[0-9]{3,}\\.[0-9]+([.][0-9]+)?$",
+    "promotion_scope": "profile_only"
+  },
+  "acceptance": {
+    "performance_thresholds": {
+      "scope": "nvidia-l40s-48gb",
+      "policy": "declare-before-promotion-runs",
+      "values": null
+    }
   },
   "notes": [
     "prompt_words is an input-size target, not a claimed tokenizer token count",
