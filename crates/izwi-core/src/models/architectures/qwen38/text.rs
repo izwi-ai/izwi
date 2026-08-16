@@ -47,6 +47,7 @@ pub enum Qwen38ProjectionRepresentation {
     ExpandedF32,
     ExpandedF16,
     ExpandedBf16,
+    PackedQ8WithDenseF16,
     PackedQ8WithDenseBf16,
 }
 
@@ -56,7 +57,16 @@ impl Qwen38ProjectionRepresentation {
             Self::ExpandedF32 => "expanded_f32",
             Self::ExpandedF16 => "expanded_f16",
             Self::ExpandedBf16 => "expanded_bf16",
+            Self::PackedQ8WithDenseF16 => "q8_0_requantized_projections_with_dense_f16",
             Self::PackedQ8WithDenseBf16 => "q8_0_requantized_projections_with_dense_bf16",
+        }
+    }
+
+    pub const fn compute_dtype(self) -> &'static str {
+        match self {
+            Self::ExpandedF32 => "f32",
+            Self::ExpandedF16 | Self::PackedQ8WithDenseF16 => "f16",
+            Self::ExpandedBf16 | Self::PackedQ8WithDenseBf16 => "bf16",
         }
     }
 }
@@ -541,9 +551,9 @@ impl Qwen38TextModel {
         tensors: &IndexedSafetensors,
         native: &Qwen38NativeConfig,
         device: &Device,
+        target: ProjectionMaterialization,
     ) -> Result<Self> {
         let cfg = &native.text;
-        let target = native_projection_target(device);
         let projection_representation = native_projection_representation(device, target);
         let block = native.block_fp8.block_shape;
         let embedding_weights = tensors.materialize_dense_tensor(
@@ -1740,22 +1750,18 @@ impl Qwen38GatedRmsNorm {
     }
 }
 
-fn native_projection_target(device: &Device) -> ProjectionMaterialization {
-    if device.is_cpu() {
-        ProjectionMaterialization::F32
-    } else if device.is_metal() {
-        ProjectionMaterialization::F16
-    } else {
-        ProjectionMaterialization::BF16
-    }
-}
-
 fn native_projection_representation(
     device: &Device,
     target: ProjectionMaterialization,
 ) -> Qwen38ProjectionRepresentation {
     if device.is_cuda() {
-        return Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16;
+        return match target {
+            ProjectionMaterialization::F16 => Qwen38ProjectionRepresentation::PackedQ8WithDenseF16,
+            ProjectionMaterialization::BF16 => {
+                Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16
+            }
+            ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,
+        };
     }
     match target {
         ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,

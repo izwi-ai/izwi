@@ -10,6 +10,7 @@ use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
 use tracing::info;
 
+use crate::backends::device::cuda_compute_capability_supports_bf16;
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateArena,
 };
@@ -29,7 +30,7 @@ use crate::models::shared::sampling::{
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen38_composite_cache_contract;
-use super::native::{Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
+use super::native::{ProjectionMaterialization, Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
 use super::telemetry::{
     record_cuda_kv_provider, record_sampling_bounded_cuda, record_sampling_device_argmax,
     record_sampling_host, snapshot as qwen38_optimization_telemetry_snapshot,
@@ -47,16 +48,27 @@ enum Qwen38KvStorageProvider {
     CpuF32,
     MetalF16,
     CudaF16Fallback,
+    CudaF16CapabilityFallback,
     CudaBf16Candidate,
 }
 
 impl Qwen38KvStorageProvider {
-    fn select(backend: BackendKind, cuda_bf16_override: Option<&str>) -> Self {
+    fn select(
+        backend: BackendKind,
+        cuda_compute_capability: Option<(u32, u32)>,
+        cuda_bf16_override: Option<&str>,
+    ) -> Self {
         match backend {
             BackendKind::Cpu => Self::CpuF32,
             BackendKind::Metal => Self::MetalF16,
-            BackendKind::Cuda if qwen38_candidate_enabled(cuda_bf16_override) => {
+            BackendKind::Cuda
+                if qwen38_candidate_enabled(cuda_bf16_override)
+                    && qwen38_cuda_supports_bf16(cuda_compute_capability) =>
+            {
                 Self::CudaBf16Candidate
+            }
+            BackendKind::Cuda if qwen38_candidate_enabled(cuda_bf16_override) => {
+                Self::CudaF16CapabilityFallback
             }
             BackendKind::Cuda => Self::CudaF16Fallback,
         }
@@ -65,7 +77,7 @@ impl Qwen38KvStorageProvider {
     const fn dtype(self) -> DType {
         match self {
             Self::CpuF32 => DType::F32,
-            Self::MetalF16 | Self::CudaF16Fallback => DType::F16,
+            Self::MetalF16 | Self::CudaF16Fallback | Self::CudaF16CapabilityFallback => DType::F16,
             Self::CudaBf16Candidate => DType::BF16,
         }
     }
@@ -75,6 +87,7 @@ impl Qwen38KvStorageProvider {
             Self::CpuF32 => "portable_f32",
             Self::MetalF16 => "metal_f16",
             Self::CudaF16Fallback => "cuda_f16_fallback",
+            Self::CudaF16CapabilityFallback => "cuda_f16_capability_fallback",
             Self::CudaBf16Candidate => "cuda_bf16_candidate",
         }
     }
@@ -84,9 +97,16 @@ impl Qwen38KvStorageProvider {
             Self::CudaF16Fallback => Some(
                 "CUDA BF16 KV is an unvalidated candidate; set IZWI_QWEN38_CUDA_BF16_KV=1 to test it",
             ),
+            Self::CudaF16CapabilityFallback => Some(
+                "CUDA BF16 KV requires an observed compute capability 8.0 or newer; using F16",
+            ),
             _ => None,
         }
     }
+}
+
+fn qwen38_cuda_supports_bf16(compute_capability: Option<(u32, u32)>) -> bool {
+    compute_capability.is_some_and(cuda_compute_capability_supports_bf16)
 }
 
 fn qwen38_candidate_enabled(raw: Option<&str>) -> bool {
@@ -96,9 +116,38 @@ fn qwen38_candidate_enabled(raw: Option<&str>) -> bool {
     )
 }
 
-fn qwen38_kv_storage_provider(backend: BackendKind) -> Qwen38KvStorageProvider {
+fn qwen38_kv_storage_provider(
+    backend: BackendKind,
+    cuda_compute_capability: Option<(u32, u32)>,
+) -> Qwen38KvStorageProvider {
     let requested = std::env::var(CUDA_BF16_KV_ENV).ok();
-    Qwen38KvStorageProvider::select(backend, requested.as_deref())
+    Qwen38KvStorageProvider::select(backend, cuda_compute_capability, requested.as_deref())
+}
+
+fn qwen38_projection_materialization(device: &DeviceProfile) -> Result<ProjectionMaterialization> {
+    qwen38_projection_materialization_policy(
+        BackendKind::from(device.kind),
+        device.capabilities.cuda_compute_capability,
+        device.capabilities.supports_f16,
+    )
+}
+
+fn qwen38_projection_materialization_policy(
+    backend: BackendKind,
+    cuda_compute_capability: Option<(u32, u32)>,
+    supports_f16: bool,
+) -> Result<ProjectionMaterialization> {
+    match backend {
+        BackendKind::Cpu => Ok(ProjectionMaterialization::F32),
+        BackendKind::Metal => Ok(ProjectionMaterialization::F16),
+        BackendKind::Cuda if qwen38_cuda_supports_bf16(cuda_compute_capability) => {
+            Ok(ProjectionMaterialization::BF16)
+        }
+        BackendKind::Cuda if supports_f16 => Ok(ProjectionMaterialization::F16),
+        BackendKind::Cuda => Err(Error::ModelLoadError(
+            "Qwen3.8 CUDA requires F16 support when BF16 capability is unavailable".into(),
+        )),
+    }
 }
 
 fn qwen38_prefill_chunk_size() -> usize {
@@ -415,6 +464,7 @@ impl Qwen38Tokenizer {
 
 pub struct Qwen38ChatModel {
     device_kind: BackendKind,
+    cuda_compute_capability: Option<(u32, u32)>,
     kv_storage_provider: Qwen38KvStorageProvider,
     variant: ModelVariant,
     tokenizer: Qwen38Tokenizer,
@@ -426,7 +476,8 @@ fn qwen38_fp8_execution_mode(
     projection_representation: Qwen38ProjectionRepresentation,
 ) -> &'static str {
     match projection_representation {
-        Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => "q8_0_compressed_fallback",
+        Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
+        | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => "q8_0_compressed_fallback",
         Qwen38ProjectionRepresentation::ExpandedF32
         | Qwen38ProjectionRepresentation::ExpandedF16
         | Qwen38ProjectionRepresentation::ExpandedBf16 => "expanded_fallback",
@@ -437,7 +488,8 @@ fn qwen38_fp8_fallback_reason(
     projection_representation: Qwen38ProjectionRepresentation,
 ) -> &'static str {
     match projection_representation {
-        Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => {
+        Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
+        | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => {
             "CUDA applies weight_scale_inv during scale-aware FP8 dequantization and then requantizes projections to Q8_0 for Candle execution; native FP8 execution is not runtime-certified"
         }
         Qwen38ProjectionRepresentation::ExpandedF32
@@ -445,6 +497,25 @@ fn qwen38_fp8_fallback_reason(
         | Qwen38ProjectionRepresentation::ExpandedBf16 => {
             "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen38RepresentationDiagnostics {
+    resident_representation: &'static str,
+    fp8_execution_mode: &'static str,
+    fallback_reason: &'static str,
+    runtime_compute_dtype: &'static str,
+}
+
+fn qwen38_representation_diagnostics(
+    projection_representation: Qwen38ProjectionRepresentation,
+) -> Qwen38RepresentationDiagnostics {
+    Qwen38RepresentationDiagnostics {
+        resident_representation: projection_representation.as_str(),
+        fp8_execution_mode: qwen38_fp8_execution_mode(projection_representation),
+        fallback_reason: qwen38_fp8_fallback_reason(projection_representation),
+        runtime_compute_dtype: projection_representation.compute_dtype(),
     }
 }
 
@@ -469,11 +540,17 @@ impl Qwen38ChatModel {
         let checkpoint = Qwen38NativeCheckpoint::open(model_dir)?;
         let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
         let text_config = checkpoint.config.text.clone();
-        let text_model =
-            Qwen38TextModel::load_native(&checkpoint.tensors, &checkpoint.config, &device.device)?;
+        let projection_materialization = qwen38_projection_materialization(&device)?;
+        let text_model = Qwen38TextModel::load_native(
+            &checkpoint.tensors,
+            &checkpoint.config,
+            &device.device,
+            projection_materialization,
+        )?;
         let projection_representation = text_model.projection_representation();
         let device_kind = BackendKind::from(device.kind);
-        let kv_storage_provider = qwen38_kv_storage_provider(device_kind);
+        let cuda_compute_capability = device.capabilities.cuda_compute_capability;
+        let kv_storage_provider = qwen38_kv_storage_provider(device_kind, cuda_compute_capability);
         if device_kind == BackendKind::Cuda {
             record_cuda_kv_provider(
                 kv_storage_provider == Qwen38KvStorageProvider::CudaBf16Candidate,
@@ -491,6 +568,7 @@ impl Qwen38ChatModel {
         );
         Ok(Self {
             device_kind,
+            cuda_compute_capability,
             kv_storage_provider,
             variant,
             tokenizer,
@@ -543,24 +621,26 @@ impl Qwen38ChatModel {
     }
 
     pub fn runtime_compute_dtype(&self) -> Option<&'static str> {
-        Some(match self.device_kind {
-            BackendKind::Cpu => "f32",
-            BackendKind::Metal => "f16",
-            BackendKind::Cuda => "bf16",
-        })
+        Some(
+            qwen38_representation_diagnostics(self.text_model.projection_representation())
+                .runtime_compute_dtype,
+        )
     }
 
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
         let projection_representation = self.text_model.projection_representation();
+        let representation = qwen38_representation_diagnostics(projection_representation);
         serde_json::json!({
             "checkpoint_revision": QWEN38_27B_FP8_REVISION,
             "checkpoint_format": "safetensors_block_fp8",
-            "resident_representation": projection_representation.as_str(),
-            "fp8_execution_mode": qwen38_fp8_execution_mode(projection_representation),
-            "fallback_reason": qwen38_fp8_fallback_reason(projection_representation),
+            "resident_representation": representation.resident_representation,
+            "runtime_compute_dtype": representation.runtime_compute_dtype,
+            "fp8_execution_mode": representation.fp8_execution_mode,
+            "fallback_reason": representation.fallback_reason,
             "optimization_evidence": {
                 "scope": "qwen38_process_lifetime",
                 "cuda_runtime_validated": false,
+                "cuda_compute_capability": self.cuda_compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
                 "counters": qwen38_optimization_telemetry_snapshot(),
                 "managed_kv_counters_source": "runtime_metrics.kv_cache.models[].arenas[].operations",
                 "managed_kv_counter_coverage": [
@@ -1392,33 +1472,80 @@ mod tests {
             Some("no"),
             Some("off"),
         ] {
-            let provider = Qwen38KvStorageProvider::select(BackendKind::Cuda, disabled);
+            let provider =
+                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), disabled);
             assert_eq!(provider, Qwen38KvStorageProvider::CudaF16Fallback);
             assert_eq!(provider.dtype(), DType::F16);
             assert!(provider.fallback_reason().is_some());
         }
         for enabled in [Some("1"), Some("true"), Some(" YES "), Some("on")] {
-            let provider = Qwen38KvStorageProvider::select(BackendKind::Cuda, enabled);
+            let provider =
+                Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), enabled);
             assert_eq!(provider, Qwen38KvStorageProvider::CudaBf16Candidate);
             assert_eq!(provider.dtype(), DType::BF16);
             assert!(provider.fallback_reason().is_none());
         }
         assert_eq!(
-            Qwen38KvStorageProvider::select(BackendKind::Cuda, Some("invalid")),
+            Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((8, 0)), Some("invalid")),
             Qwen38KvStorageProvider::CudaF16Fallback
+        );
+    }
+
+    #[test]
+    fn cuda_bf16_kv_candidate_requires_observed_ampere_or_newer_capability() {
+        for compute_capability in [None, Some((7, 5))] {
+            let provider =
+                Qwen38KvStorageProvider::select(BackendKind::Cuda, compute_capability, Some("1"));
+            assert_eq!(provider, Qwen38KvStorageProvider::CudaF16CapabilityFallback);
+            assert_eq!(provider.dtype(), DType::F16);
+            assert!(provider
+                .fallback_reason()
+                .expect("capability fallback reason")
+                .contains("8.0 or newer"));
+        }
+        assert_eq!(
+            Qwen38KvStorageProvider::select(BackendKind::Cuda, Some((9, 0)), Some("1")),
+            Qwen38KvStorageProvider::CudaBf16Candidate
         );
     }
 
     #[test]
     fn cuda_bf16_kv_switch_does_not_change_portable_storage_policy() {
         for candidate in [None, Some("0"), Some("1")] {
-            let cpu = Qwen38KvStorageProvider::select(BackendKind::Cpu, candidate);
-            let metal = Qwen38KvStorageProvider::select(BackendKind::Metal, candidate);
+            let cpu = Qwen38KvStorageProvider::select(BackendKind::Cpu, None, candidate);
+            let metal = Qwen38KvStorageProvider::select(BackendKind::Metal, None, candidate);
             assert_eq!(cpu, Qwen38KvStorageProvider::CpuF32);
             assert_eq!(cpu.dtype(), DType::F32);
             assert_eq!(metal, Qwen38KvStorageProvider::MetalF16);
             assert_eq!(metal.dtype(), DType::F16);
         }
+    }
+
+    #[test]
+    fn qwen38_compute_materialization_is_capability_derived_and_portable() {
+        assert_eq!(
+            qwen38_projection_materialization_policy(BackendKind::Cpu, None, false).unwrap(),
+            ProjectionMaterialization::F32
+        );
+        assert_eq!(
+            qwen38_projection_materialization_policy(BackendKind::Metal, None, false).unwrap(),
+            ProjectionMaterialization::F16
+        );
+        assert_eq!(
+            qwen38_projection_materialization_policy(BackendKind::Cuda, Some((8, 0)), true)
+                .unwrap(),
+            ProjectionMaterialization::BF16
+        );
+        assert_eq!(
+            qwen38_projection_materialization_policy(BackendKind::Cuda, Some((7, 5)), true)
+                .unwrap(),
+            ProjectionMaterialization::F16
+        );
+        assert_eq!(
+            qwen38_projection_materialization_policy(BackendKind::Cuda, None, true).unwrap(),
+            ProjectionMaterialization::F16
+        );
+        assert!(qwen38_projection_materialization_policy(BackendKind::Cuda, None, false).is_err());
     }
 
     #[test]
@@ -1435,6 +1562,28 @@ mod tests {
         assert!(qwen38_fp8_fallback_reason(cuda_representation).contains("weight_scale_inv"));
         assert!(qwen38_fp8_fallback_reason(cuda_representation)
             .contains("native FP8 execution is not runtime-certified"));
+        let f16_cuda_representation = Qwen38ProjectionRepresentation::PackedQ8WithDenseF16;
+        assert_eq!(
+            f16_cuda_representation.as_str(),
+            "q8_0_requantized_projections_with_dense_f16"
+        );
+        assert_eq!(f16_cuda_representation.compute_dtype(), "f16");
+        assert_eq!(
+            qwen38_fp8_execution_mode(f16_cuda_representation),
+            "q8_0_compressed_fallback"
+        );
+        let f16_diagnostics = qwen38_representation_diagnostics(f16_cuda_representation);
+        assert_eq!(
+            f16_diagnostics.resident_representation,
+            "q8_0_requantized_projections_with_dense_f16"
+        );
+        assert_eq!(f16_diagnostics.runtime_compute_dtype, "f16");
+        let bf16_diagnostics = qwen38_representation_diagnostics(cuda_representation);
+        assert_eq!(
+            bf16_diagnostics.resident_representation,
+            "q8_0_requantized_projections_with_dense_bf16"
+        );
+        assert_eq!(bf16_diagnostics.runtime_compute_dtype, "bf16");
 
         assert_eq!(
             Qwen38ProjectionRepresentation::ExpandedF32.as_str(),
