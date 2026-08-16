@@ -186,18 +186,3 @@ export function getChatRouteModelLabel(variant: string): string {
   }
   return variant;
 }
-
-export function isThinkingChatModel(variant: string): boolean {
-  const normalized = variant.trim().toLowerCase();
-  const isQwenThinkingFamily =
-    (normalized.startsWith("qwen3-") ||
-      normalized.startsWith("qwen3.5-") ||
-      normalized.startsWith("qwen3.8-")) &&
-    !normalized.includes("-asr-") &&
-    !normalized.includes("-tts-") &&
-    !normalized.includes("forcedaligner");
-
-  const isLfmThinkingVariant = normalized === "lfm2.5-1.2b-thinking-gguf";
-
-  return isQwenThinkingFamily || isLfmThinkingVariant;
-}

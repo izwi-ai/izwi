@@ -3,6 +3,7 @@ import {
   consumeDataStream,
   isAbortError,
 } from "@/shared/api/http";
+import type { ChatReasoningEffort } from "@/shared/api/models";
 
 const DEFAULT_CHAT_MODEL = "Qwen3-8B-GGUF";
 const CHAT_STREAM_TRUNCATED_ERROR =
@@ -118,11 +119,11 @@ export interface ChatThreadSendMessageRequest {
   max_tokens?: number;
   system_prompt?: string;
   enable_thinking?: boolean;
-  reasoning_effort?: "xhigh" | "medium" | "low";
+  reasoning_effort?: ChatReasoningEffort;
   preserve_thinking?: boolean;
   chat_template_kwargs?: {
     enable_thinking?: boolean;
-    reasoning_effort?: "xhigh" | "medium" | "low";
+    reasoning_effort?: ChatReasoningEffort;
     preserve_thinking?: boolean;
   };
   top_k?: number;

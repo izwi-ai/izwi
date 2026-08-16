@@ -7,6 +7,8 @@ export type {
 } from "@/shared/api/pagination";
 
 export type {
+  ChatModelCapabilities,
+  ChatReasoningEffort,
   ModelInfo,
   ModelsResponse,
   SpeechModelCapabilities,

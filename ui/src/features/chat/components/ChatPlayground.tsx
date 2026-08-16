@@ -28,6 +28,13 @@ import {
 import { useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { RouteHistoryDrawer } from "@/components/RouteHistoryDrawer";
 import {
   Dialog,
@@ -49,6 +56,7 @@ import {
   formatThreadTimestamp,
   getErrorMessage,
   isQwen35ThinkingModel,
+  isQwen38ThinkingModel,
   normalizeGeneratedThreadTitle,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
@@ -59,7 +67,12 @@ import {
   supportsImplicitOpenThinkTagParsing,
   threadPreviewFromContent,
 } from "@/features/chat/playground/support";
-import { api, type ChatThread, type ChatThreadMessageRecord } from "@/api";
+import {
+  api,
+  type ChatReasoningEffort,
+  type ChatThread,
+  type ChatThreadMessageRecord,
+} from "@/api";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import { RouteModelSelect } from "@/components/RouteModelSelect";
 
@@ -67,6 +80,7 @@ export function ChatPlayground({
   selectedModel,
   selectedModelReady,
   supportsThinking,
+  chatCapabilities,
   modelLabel,
   modelOptions,
   onSelectModel,
@@ -83,8 +97,15 @@ export function ChatPlayground({
   >({});
   const [input, setInput] = useState("");
   const [isThinkingEnabled, setIsThinkingEnabled] = useState(() =>
-    defaultThinkingEnabledForModel(selectedModel),
+    chatCapabilities?.default_thinking_enabled ??
+      defaultThinkingEnabledForModel(selectedModel),
   );
+  const [reasoningEffort, setReasoningEffort] =
+    useState<ChatReasoningEffort>(
+      chatCapabilities?.default_reasoning_effort ??
+        chatCapabilities?.reasoning_efforts[0] ??
+        "xhigh",
+    );
   const [isStreaming, setIsStreaming] = useState(false);
   const [isPreparingThread, setIsPreparingThread] = useState(false);
   const [streamingThreadId, setStreamingThreadId] = useState<string | null>(
@@ -154,6 +175,10 @@ export function ChatPlayground({
     (visibleMessages.length > 0 || isStreaming || messagesLoading);
   const isEmptyChatWorkspace = !hasConversation;
   const thinkingEnabledForModel = supportsThinking && isThinkingEnabled;
+  const supportedReasoningEfforts =
+    chatCapabilities?.reasoning_efforts ?? [];
+  const reasoningEffortOptionsKey = supportedReasoningEfforts.join(",");
+  const firstSupportedReasoningEffort = supportedReasoningEfforts[0];
   const supportsImageAttachments =
     supportsImageAttachmentsForModel(selectedModel);
   const renderModelId = activeThread?.model_id ?? selectedModel;
@@ -186,8 +211,23 @@ export function ChatPlayground({
       setIsThinkingEnabled(false);
       return;
     }
-    setIsThinkingEnabled(defaultThinkingEnabledForModel(selectedModel));
-  }, [selectedModel, supportsThinking]);
+    setIsThinkingEnabled(
+      chatCapabilities?.default_thinking_enabled ??
+        defaultThinkingEnabledForModel(selectedModel),
+    );
+    setReasoningEffort(
+      chatCapabilities?.default_reasoning_effort ??
+        firstSupportedReasoningEffort ??
+        "xhigh",
+    );
+  }, [
+    chatCapabilities?.default_reasoning_effort,
+    chatCapabilities?.default_thinking_enabled,
+    firstSupportedReasoningEffort,
+    reasoningEffortOptionsKey,
+    selectedModel,
+    supportsThinking,
+  ]);
 
   useEffect(() => {
     if (supportsImageAttachments) {
@@ -721,8 +761,15 @@ export function ChatPlayground({
       thinkingEnabledForModel,
     );
     const enableThinking =
-      isQwen35ThinkingModel(selectedModel) && supportsThinking
+      (isQwen35ThinkingModel(selectedModel) ||
+        isQwen38ThinkingModel(selectedModel)) &&
+      supportsThinking
         ? thinkingEnabledForModel
+        : undefined;
+    const selectedReasoningEffort =
+      thinkingEnabledForModel &&
+      supportedReasoningEfforts.includes(reasoningEffort)
+        ? reasoningEffort
         : undefined;
 
     setMessages((previous) => [
@@ -745,6 +792,7 @@ export function ChatPlayground({
         content_parts: requestPayload.contentParts,
         system_prompt: systemPrompt,
         enable_thinking: enableThinking,
+        reasoning_effort: selectedReasoningEffort,
       },
       {
         onStart: ({ userMessage }) => {
@@ -1027,6 +1075,32 @@ export function ChatPlayground({
               <Brain className="w-3.5 h-3.5" />
               Thinking {thinkingEnabledForModel ? "On" : "Off"}
             </Button>
+          )}
+          {thinkingEnabledForModel && supportedReasoningEfforts.length > 0 && (
+            <Select
+              value={reasoningEffort}
+              onValueChange={(value) =>
+                setReasoningEffort(value as ChatReasoningEffort)
+              }
+              disabled={isStreaming || isPreparingThread}
+            >
+              <SelectTrigger
+                aria-label="Reasoning effort"
+                title="Reasoning effort"
+                className="h-8 w-[7.25rem] border bg-[var(--bg-surface-2)] px-2.5 text-xs shadow-none"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {supportedReasoningEfforts.map((effort) => (
+                  <SelectItem key={effort} value={effort}>
+                    {effort === "xhigh"
+                      ? "XHigh"
+                      : `${effort[0].toUpperCase()}${effort.slice(1)}`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )}
         </div>
 

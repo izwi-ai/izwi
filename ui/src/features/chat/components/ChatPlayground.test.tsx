@@ -635,6 +635,9 @@ describe("ChatPlayground", () => {
     expect(
       screen.getByRole("button", { name: "Enable thinking mode" }),
     ).toHaveTextContent("Thinking Off");
+    expect(
+      screen.queryByRole("combobox", { name: "Reasoning effort" }),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Enable thinking mode" }),
@@ -662,6 +665,152 @@ describe("ChatPlayground", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("sends the selected reasoning effort for Qwen3.8", async () => {
+    const thread = {
+      id: "thread-qwen38-effort",
+      title: "Reasoning effort",
+      model_id: "Qwen3.8-27B-FP8",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-qwen38-effort"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.8-27B-FP8"
+          selectedModelReady={true}
+          supportsThinking={true}
+          chatCapabilities={{
+            supports_thinking: true,
+            default_thinking_enabled: true,
+            reasoning_efforts: ["xhigh", "medium", "low"],
+            default_reasoning_effort: "xhigh",
+            supports_preserve_thinking: true,
+          }}
+          modelLabel="Qwen3.8 27B (FP8)"
+          modelOptions={[
+            {
+              value: "Qwen3.8-27B-FP8",
+              label: "Qwen3.8 27B (FP8)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith(
+        "thread-qwen38-effort",
+      ),
+    );
+
+    const effortSelect = screen.getByRole("combobox", {
+      name: "Reasoning effort",
+    });
+    expect(effortSelect).toHaveTextContent("XHigh");
+    fireEvent.click(effortSelect);
+    fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Answer efficiently." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled(),
+    );
+    expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledWith(
+      "thread-qwen38-effort",
+      expect.objectContaining({
+        enable_thinking: true,
+        reasoning_effort: "low",
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("disables Qwen3.8 thinking without sending a reasoning effort", async () => {
+    const thread = {
+      id: "thread-qwen38-direct",
+      title: "Direct answer",
+      model_id: "Qwen3.8-27B-FP8",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: null,
+      message_count: 0,
+    };
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-qwen38-direct"]}>
+        <ChatPlayground
+          selectedModel="Qwen3.8-27B-FP8"
+          selectedModelReady={true}
+          supportsThinking={true}
+          chatCapabilities={{
+            supports_thinking: true,
+            default_thinking_enabled: true,
+            reasoning_efforts: ["xhigh", "medium", "low"],
+            default_reasoning_effort: "xhigh",
+            supports_preserve_thinking: true,
+          }}
+          modelLabel="Qwen3.8 27B (FP8)"
+          modelOptions={[
+            {
+              value: "Qwen3.8-27B-FP8",
+              label: "Qwen3.8 27B (FP8)",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(apiMocks.getChatThread).toHaveBeenCalledWith(
+        "thread-qwen38-direct",
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Disable thinking mode" }),
+    );
+    expect(
+      screen.queryByRole("combobox", { name: "Reasoning effort" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "Give me the direct answer." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalled(),
+    );
+    const request = apiMocks.sendChatThreadMessageStream.mock.calls[0]?.[1];
+    expect(request).toEqual(
+      expect.objectContaining({ enable_thinking: false }),
+    );
+    expect(request).not.toHaveProperty("reasoning_effort", expect.anything());
   });
 
   it("renders Qwen3.5 close-only think output as reasoning plus final answer", async () => {

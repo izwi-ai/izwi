@@ -5,6 +5,15 @@ use std::path::PathBuf;
 
 use super::{CudaQuantizationInfo, CudaSupportInfo};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatReasoningEffort {
+    #[default]
+    Xhigh,
+    Medium,
+    Low,
+}
+
 /// Revision-pinned model limits used when converted artifacts omit otherwise
 /// authoritative configuration metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -792,6 +801,34 @@ impl ModelVariant {
         Some(capabilities)
     }
 
+    /// Machine-readable chat controls that the selected runtime actually
+    /// consumes. Keep reasoning effort narrower than generic thinking support:
+    /// today only Qwen3.8 implements the three-level effort contract.
+    pub fn chat_capabilities(&self) -> Option<ChatModelCapabilities> {
+        let (default_thinking_enabled, reasoning_efforts, supports_preserve_thinking) = match self {
+            Self::Qwen3827BFp8 => (
+                true,
+                vec![
+                    ChatReasoningEffort::Xhigh,
+                    ChatReasoningEffort::Medium,
+                    ChatReasoningEffort::Low,
+                ],
+                true,
+            ),
+            Self::Qwen3508BGguf | Self::Qwen352BGguf => (false, Vec::new(), false),
+            Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
+            _ => return None,
+        };
+
+        Some(ChatModelCapabilities {
+            supports_thinking: true,
+            default_thinking_enabled,
+            default_reasoning_effort: reasoning_efforts.first().copied(),
+            reasoning_efforts,
+            supports_preserve_thinking,
+        })
+    }
+
     /// Max output codec frames for this TTS variant, if known.
     pub fn tts_max_output_frames_hint(&self) -> Option<usize> {
         match self.family() {
@@ -1083,6 +1120,16 @@ pub struct SpeechModelCapabilities {
     pub supports_auto_long_form: bool,
 }
 
+/// Machine-readable controls exposed by chat-capable model runtimes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatModelCapabilities {
+    pub supports_thinking: bool,
+    pub default_thinking_enabled: bool,
+    pub reasoning_efforts: Vec<ChatReasoningEffort>,
+    pub default_reasoning_effort: Option<ChatReasoningEffort>,
+    pub supports_preserve_thinking: bool,
+}
+
 /// Complete model information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -1093,6 +1140,8 @@ pub struct ModelInfo {
     pub size_bytes: Option<u64>,
     pub download_progress: Option<f32>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub chat_capabilities: Option<ChatModelCapabilities>,
     pub speech_capabilities: Option<SpeechModelCapabilities>,
     #[serde(skip_deserializing)]
     pub cuda_support: CudaSupportInfo,
@@ -1110,6 +1159,7 @@ impl ModelInfo {
             size_bytes: None,
             download_progress: None,
             error_message: None,
+            chat_capabilities: variant.chat_capabilities(),
             speech_capabilities: variant.speech_capabilities(),
             cuda_support: variant.cuda_support(),
             cuda_quantization: variant.cuda_quantization(),
@@ -1127,7 +1177,42 @@ impl ModelInfo {
 mod tests {
     use crate::catalog::ModelTask;
 
-    use super::{ModelVariant, SpeechModelCapabilities};
+    use super::{ChatReasoningEffort, ModelVariant, SpeechModelCapabilities};
+
+    #[test]
+    fn chat_capabilities_expose_reasoning_effort_only_for_qwen38() {
+        let qwen38 = ModelVariant::Qwen3827BFp8
+            .chat_capabilities()
+            .expect("Qwen3.8 chat capabilities");
+        assert!(qwen38.supports_thinking);
+        assert!(qwen38.default_thinking_enabled);
+        assert_eq!(
+            qwen38.reasoning_efforts,
+            vec![
+                ChatReasoningEffort::Xhigh,
+                ChatReasoningEffort::Medium,
+                ChatReasoningEffort::Low,
+            ]
+        );
+        assert_eq!(
+            qwen38.default_reasoning_effort,
+            Some(ChatReasoningEffort::Xhigh)
+        );
+        assert!(qwen38.supports_preserve_thinking);
+
+        let qwen35 = ModelVariant::Qwen354BGguf
+            .chat_capabilities()
+            .expect("Qwen3.5 chat capabilities");
+        assert!(qwen35.supports_thinking);
+        assert!(qwen35.default_thinking_enabled);
+        assert!(qwen35.reasoning_efforts.is_empty());
+        assert_eq!(qwen35.default_reasoning_effort, None);
+
+        assert_eq!(ModelVariant::Gemma31BIt.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Lfm2512BThinkingGguf.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Qwen34BGguf.chat_capabilities(), None);
+    }
 
     #[test]
     fn qwen3_tts_variants_expose_output_hints() {

@@ -1,4 +1,5 @@
 import type {
+  ChatModelCapabilities,
   ChatMessage,
   ChatThreadContentPart,
   ChatThreadMessageRecord,
@@ -16,6 +17,7 @@ export interface ChatPlaygroundProps {
   selectedModel: string | null;
   selectedModelReady: boolean;
   supportsThinking: boolean;
+  chatCapabilities?: ChatModelCapabilities | null;
   modelLabel?: string | null;
   modelOptions: ModelOption[];
   onSelectModel: (variant: string) => void;

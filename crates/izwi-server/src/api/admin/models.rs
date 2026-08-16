@@ -18,7 +18,8 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::model::download::DownloadState;
 use izwi_core::{
-    parse_model_variant, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
+    parse_model_variant, ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus,
+    ModelVariant, SpeechModelCapabilities,
 };
 
 /// Response for model list
@@ -41,6 +42,7 @@ pub struct AdminModelInfo {
     pub modalities: Vec<String>,
     pub route_capabilities: AdminModelRouteCapabilities,
     pub batch_capabilities: AdminModelBatchCapabilities,
+    pub chat_capabilities: Option<AdminChatModelCapabilities>,
     pub speech_capabilities: Option<AdminSpeechModelCapabilities>,
     pub cuda_support: serde_json::Value,
     pub cuda_quantization: serde_json::Value,
@@ -58,6 +60,15 @@ pub struct AdminSpeechModelCapabilities {
     pub supports_streaming: bool,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminChatModelCapabilities {
+    pub supports_thinking: bool,
+    pub default_thinking_enabled: bool,
+    pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub supports_preserve_thinking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -137,6 +148,7 @@ impl AdminModelInfo {
             modalities: model_modalities(variant),
             route_capabilities: AdminModelRouteCapabilities::from_variant(variant),
             batch_capabilities: AdminModelBatchCapabilities::from_variant(variant),
+            chat_capabilities: info.chat_capabilities.map(AdminChatModelCapabilities::from),
             speech_capabilities: info
                 .speech_capabilities
                 .map(AdminSpeechModelCapabilities::from),
@@ -148,6 +160,34 @@ impl AdminModelInfo {
                 .unwrap_or(serde_json::Value::Null),
             runtime_diagnostics,
         }
+    }
+}
+
+impl From<ChatModelCapabilities> for AdminChatModelCapabilities {
+    fn from(capabilities: ChatModelCapabilities) -> Self {
+        Self {
+            supports_thinking: capabilities.supports_thinking,
+            default_thinking_enabled: capabilities.default_thinking_enabled,
+            reasoning_efforts: capabilities
+                .reasoning_efforts
+                .into_iter()
+                .map(reasoning_effort_as_str)
+                .map(str::to_string)
+                .collect(),
+            default_reasoning_effort: capabilities
+                .default_reasoning_effort
+                .map(reasoning_effort_as_str)
+                .map(str::to_string),
+            supports_preserve_thinking: capabilities.supports_preserve_thinking,
+        }
+    }
+}
+
+const fn reasoning_effort_as_str(effort: ChatReasoningEffort) -> &'static str {
+    match effort {
+        ChatReasoningEffort::Xhigh => "xhigh",
+        ChatReasoningEffort::Medium => "medium",
+        ChatReasoningEffort::Low => "low",
     }
 }
 
@@ -813,6 +853,19 @@ mod tests {
 
         let value = serde_json::to_value(model).expect("serialize admin model");
         assert_eq!(value["variant"], "Qwen3.8-27B-FP8");
+        assert_eq!(value["chat_capabilities"]["supports_thinking"], true);
+        assert_eq!(
+            value["chat_capabilities"]["default_reasoning_effort"],
+            "xhigh"
+        );
+        assert_eq!(
+            value["chat_capabilities"]["reasoning_efforts"],
+            serde_json::json!(["xhigh", "medium", "low"])
+        );
+        assert_eq!(
+            value["chat_capabilities"]["supports_preserve_thinking"],
+            true
+        );
         assert_eq!(value["runtime_diagnostics"]["family"], "qwen38_chat");
         assert_eq!(
             value["runtime_diagnostics"]["loaded_model_kind"],

@@ -296,7 +296,13 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     description:
       "Large dedicated Qwen3.8 text-chat architecture with block-scaled FP8 weights",
     category: "chat",
-    capabilities: ["Text Chat", "Thinking", "Tool Calling", "FP8"],
+    capabilities: [
+      "Text Chat",
+      "Thinking",
+      "Reasoning Effort",
+      "Tool Calling",
+      "FP8",
+    ],
     size: "28.74 GiB",
   },
   "LFM2.5-1.2B-Instruct-GGUF": {

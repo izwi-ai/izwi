@@ -14,7 +14,10 @@ pub use cuda_support::{
     CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,
     CudaSupportLevel,
 };
-pub use metadata::{ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities};
+pub use metadata::{
+    ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus, ModelVariant,
+    SpeechModelCapabilities,
+};
 pub use variant::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,

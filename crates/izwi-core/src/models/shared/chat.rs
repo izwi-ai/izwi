@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::catalog::ChatReasoningEffort;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
@@ -38,15 +40,6 @@ pub enum ChatMediaKind {
 pub struct ChatMediaInput {
     pub kind: ChatMediaKind,
     pub source: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChatReasoningEffort {
-    #[default]
-    Xhigh,
-    Medium,
-    Low,
 }
 
 /// Hugging Face-compatible keyword arguments accepted alongside the direct
