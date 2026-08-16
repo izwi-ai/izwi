@@ -5,7 +5,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+#[cfg(test)]
+use candle_core::D;
+use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -22,8 +24,9 @@ use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3Model};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::sampling::ChatSampler;
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::Tokenizer;
 
@@ -45,8 +48,20 @@ pub struct ChatDecodeState {
     /// progress aligned with the scheduler's input range.
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
+    sampler: ChatSampler,
     assembled: String,
     max_new_tokens: usize,
+    finished: bool,
+}
+
+pub(crate) struct ChatDecodeCheckpoint {
+    cache: PhysicalPagedKvCache,
+    unconsumed_output: Option<Tensor>,
+    pos: usize,
+    pending_token: Option<u32>,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    assembled: String,
     finished: bool,
 }
 
@@ -63,6 +78,15 @@ impl ChatDecodeState {
         &mut self,
         cache: PhysicalPagedKvCache,
     ) -> Result<()> {
+        let checkpoint = self.begin_managed_quantum(cache)?;
+        drop(checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeCheckpoint> {
         let current = &self.cache;
         if current.arena().id() != cache.arena().id()
             || current.arena().config().group != cache.arena().config().group
@@ -78,8 +102,28 @@ impl ChatDecodeState {
                 self.pos
             )));
         }
-        self.cache = cache;
-        Ok(())
+        let checkpoint = ChatDecodeCheckpoint {
+            cache: std::mem::replace(&mut self.cache, cache),
+            unconsumed_output: self.unconsumed_output.clone(),
+            pos: self.pos,
+            pending_token: self.pending_token,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            assembled: self.assembled.clone(),
+            finished: self.finished,
+        };
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: ChatDecodeCheckpoint) {
+        self.cache = checkpoint.cache;
+        self.unconsumed_output = checkpoint.unconsumed_output;
+        self.pos = checkpoint.pos;
+        self.pending_token = checkpoint.pending_token;
+        self.generated_ids = checkpoint.generated_ids;
+        self.sampler = checkpoint.sampler;
+        self.assembled = checkpoint.assembled;
+        self.finished = checkpoint.finished;
     }
 }
 
@@ -349,6 +393,7 @@ impl Qwen3ChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        config: &ChatGenerationConfig,
         mut cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let text_model = &self.text_model;
@@ -374,6 +419,7 @@ impl Qwen3ChatModel {
             pos,
             pending_token: None,
             generated_ids: Vec::new(),
+            sampler: ChatSampler::new(config.clone(), &prompt_ids),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
@@ -400,11 +446,15 @@ impl Qwen3ChatModel {
             state.pos += 1;
         }
 
-        let next = take_quantum_argmax(&mut state.unconsumed_output)?;
+        let output = state.unconsumed_output.take().ok_or_else(|| {
+            Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".into())
+        })?;
+        let next = state.sampler.sample(&output, self.tokenizer.vocab_size)?;
 
         if next == self.tokenizer.specials.im_end
             || next == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(next)
+            || state.sampler.is_configured_stop(next)
         {
             state.finished = true;
             return Ok(ChatDecodeStep {
@@ -482,10 +532,13 @@ impl Qwen3ChatModel {
             }
 
             let row_output = next_logits.i(row)?.unsqueeze(0)?;
-            let next = argmax_last_sequence_output(&row_output)?;
+            let next = state
+                .sampler
+                .sample(&row_output, self.tokenizer.vocab_size)?;
             if next == self.tokenizer.specials.im_end
                 || next == self.tokenizer.specials.eos
                 || self.tokenizer.specials.eos_alt == Some(next)
+                || state.sampler.is_configured_stop(next)
             {
                 state.finished = true;
                 steps.push(ChatDecodeStep {
@@ -704,6 +757,7 @@ fn continuous_decode_collation_workspace_bytes(
         })
 }
 
+#[cfg(test)]
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -733,6 +787,7 @@ fn argmax(logits: &Tensor) -> Result<u32> {
         .map_err(Error::from)
 }
 
+#[cfg(test)]
 fn argmax_last_sequence_output(output: &Tensor) -> Result<u32> {
     let (batch, sequence, _width) = output.dims3()?;
     if batch != 1 || sequence == 0 {
@@ -744,6 +799,7 @@ fn argmax_last_sequence_output(output: &Tensor) -> Result<u32> {
     argmax(&output.i((0, sequence - 1))?)
 }
 
+#[cfg(test)]
 fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
     let output = output.take().ok_or_else(|| {
         Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".to_string())

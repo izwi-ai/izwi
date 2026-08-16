@@ -5,16 +5,338 @@
 //! large vocabulary never becomes one oversized CUDA sort or a full host copy.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 use crate::{Error, Result};
+
+use super::chat::ChatGenerationConfig;
 
 const CUDA_SORT_CHUNK: usize = 1024;
 const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
 const CUDA_SAMPLING_TENSOR_CACHE_ENTRIES: usize = 8;
 pub const CUDA_SAMPLING_CANDIDATE_LIMIT: usize = 256;
+
+/// Request-owned chat sampler used after a shared tensor forward. Continuous
+/// batching shares logits computation, never sampling policy or RNG state.
+#[derive(Clone)]
+pub struct ChatSampler {
+    config: ChatGenerationConfig,
+    history: Vec<u32>,
+    track_history: bool,
+    rng: SimpleRng,
+}
+
+impl ChatSampler {
+    pub fn new(config: ChatGenerationConfig, prompt_history: &[u32]) -> Self {
+        let track_history =
+            config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        Self {
+            rng: SimpleRng::new(config.seed),
+            history: if track_history {
+                prompt_history.to_vec()
+            } else {
+                Vec::new()
+            },
+            config,
+            track_history,
+        }
+    }
+
+    pub fn sample(&mut self, logits: &Tensor, vocab_size: usize) -> Result<u32> {
+        let token = sample_chat_token(
+            logits,
+            vocab_size,
+            &self.config,
+            &self.history,
+            &mut self.rng,
+        )?;
+        if self.track_history {
+            self.history.push(token);
+        }
+        Ok(token)
+    }
+
+    pub fn is_configured_stop(&self, token: u32) -> bool {
+        self.config.stop_token_ids.contains(&token)
+    }
+
+    #[cfg(test)]
+    fn history(&self) -> &[u32] {
+        &self.history
+    }
+}
+
+#[derive(Clone)]
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        let seed = if seed == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        } else {
+            seed
+        };
+        Self {
+            state: seed ^ 0xA076_1D64_78BD_642F,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+}
+
+fn sample_chat_token(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<u32> {
+    if vocab_size == 0 {
+        return Err(Error::InvalidInput(
+            "chat sampler received vocab_size=0".to_string(),
+        ));
+    }
+    let row = chat_logits_row(logits)?;
+    let deterministic_greedy = config.temperature <= 1e-5
+        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
+        && config.presence_penalty.abs() <= f32::EPSILON
+        && config.top_k == 0
+        && config.top_p >= 1.0;
+    if deterministic_greedy {
+        return chat_argmax_clamped(&row, vocab_size);
+    }
+
+    if let Some(candidates) = bounded_cuda_sampling_candidates(
+        &row,
+        vocab_size,
+        config.top_k,
+        config.temperature,
+        history,
+        config.repetition_penalty,
+        config.presence_penalty,
+        None,
+    )? {
+        if device_candidates_cover_top_p(&candidates, config.top_p) {
+            if let Some(sampled) =
+                sample_device_candidates(&candidates, config.top_p, rng.next_f32())
+            {
+                return Ok(sampled);
+            }
+        }
+    }
+
+    let mut values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    values.truncate(vocab_size.min(values.len()));
+    if values.is_empty() {
+        return Err(Error::InvalidInput(
+            "chat sampler received no in-vocabulary logits".to_string(),
+        ));
+    }
+    apply_chat_history_penalties(
+        &mut values,
+        history,
+        config.repetition_penalty,
+        config.presence_penalty,
+    );
+    if config.temperature <= 1e-5 {
+        return finite_argmax(&values);
+    }
+
+    let temperature = config.temperature.max(1e-5);
+    for value in &mut values {
+        if value.is_finite() {
+            *value /= temperature;
+        }
+    }
+    let mut candidates = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.is_finite().then_some(index))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return finite_argmax(&values);
+    }
+    candidates.sort_by(|left, right| {
+        values[*right]
+            .partial_cmp(&values[*left])
+            .unwrap_or(Ordering::Equal)
+    });
+    if config.top_k > 0 {
+        candidates.truncate(config.top_k.min(candidates.len()));
+    }
+    let max_logit = candidates
+        .iter()
+        .map(|index| values[*index])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probabilities = candidates
+        .iter()
+        .map(|index| (*index, (values[*index] - max_logit).exp()))
+        .collect::<Vec<_>>();
+    let mut sum = probabilities.iter().map(|(_, value)| *value).sum::<f32>();
+    if !sum.is_finite() || sum <= 0.0 {
+        return finite_argmax(&values);
+    }
+    for (_, probability) in &mut probabilities {
+        *probability /= sum;
+    }
+    if config.top_p < 1.0 {
+        let cutoff = config.top_p.clamp(1e-6, 1.0);
+        let mut cumulative = 0.0f32;
+        let mut keep = 0usize;
+        for (_, probability) in &probabilities {
+            cumulative += *probability;
+            keep += 1;
+            if cumulative >= cutoff {
+                break;
+            }
+        }
+        probabilities.truncate(keep.max(1));
+        sum = probabilities.iter().map(|(_, value)| *value).sum();
+        if sum.is_finite() && sum > 0.0 {
+            for (_, probability) in &mut probabilities {
+                *probability /= sum;
+            }
+        }
+    }
+    let draw = rng.next_f32();
+    let mut cumulative = 0.0f32;
+    for (index, probability) in &probabilities {
+        cumulative += *probability;
+        if draw <= cumulative {
+            return u32::try_from(*index)
+                .map_err(|_| Error::InferenceError("sampled token exceeds u32".into()));
+        }
+    }
+    probabilities
+        .last()
+        .map(|(index, _)| *index)
+        .ok_or_else(|| Error::InferenceError("chat sampler produced no candidate".into()))
+        .and_then(|index| {
+            u32::try_from(index)
+                .map_err(|_| Error::InferenceError("sampled token exceeds u32".into()))
+        })
+}
+
+fn chat_logits_row(logits: &Tensor) -> Result<Tensor> {
+    match logits.rank() {
+        1 => Ok(logits.clone()),
+        2 => {
+            let rows = logits.dim(0)?;
+            if rows == 0 {
+                return Err(Error::InvalidInput(
+                    "chat sampler received an empty sequence".into(),
+                ));
+            }
+            logits.i(rows - 1).map_err(Error::from)
+        }
+        3 => {
+            let (batch, sequence, _) = logits.dims3()?;
+            if batch != 1 || sequence == 0 {
+                return Err(Error::InvalidInput(format!(
+                    "chat sampler expected one non-empty row, got {:?}",
+                    logits.dims()
+                )));
+            }
+            logits.i((0, sequence - 1)).map_err(Error::from)
+        }
+        rank => Err(Error::InvalidInput(format!(
+            "chat sampler expected rank 1, 2, or 3 logits, got rank {rank}"
+        ))),
+    }
+}
+
+fn chat_argmax_clamped(row: &Tensor, vocab_size: usize) -> Result<u32> {
+    let width = row.dim(0)?;
+    let row = if vocab_size < width {
+        row.narrow(0, 0, vocab_size)?
+    } else {
+        row.clone()
+    };
+    if row.dim(0)? == 0 {
+        return Err(Error::InvalidInput(
+            "chat sampler received no in-vocabulary logits".into(),
+        ));
+    }
+    let selected = row
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .to_scalar::<u32>()?;
+    let selected_value = row
+        .i(selected as usize)?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()?;
+    if selected_value.is_finite() {
+        return Ok(selected);
+    }
+    finite_argmax(&row.to_dtype(DType::F32)?.to_vec1::<f32>()?)
+}
+
+fn apply_chat_history_penalties(
+    values: &mut [f32],
+    history: &[u32],
+    repetition_penalty: f32,
+    presence_penalty: f32,
+) {
+    if history.is_empty()
+        || ((repetition_penalty - 1.0).abs() <= f32::EPSILON
+            && presence_penalty.abs() <= f32::EPSILON)
+    {
+        return;
+    }
+    let mut seen = vec![false; values.len()];
+    for token in history {
+        if let Some(seen) = seen.get_mut(*token as usize) {
+            *seen = true;
+        }
+    }
+    for (index, was_seen) in seen.into_iter().enumerate() {
+        if !was_seen || !values[index].is_finite() {
+            continue;
+        }
+        if repetition_penalty > 1.0 {
+            if values[index] > 0.0 {
+                values[index] /= repetition_penalty;
+            } else {
+                values[index] *= repetition_penalty;
+            }
+        }
+        values[index] -= presence_penalty;
+    }
+}
+
+fn finite_argmax(values: &[f32]) -> Result<u32> {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|left, right| left.1.partial_cmp(right.1).unwrap_or(Ordering::Equal))
+        .map(|(index, _)| index)
+        .ok_or_else(|| Error::InferenceError("chat sampler found no finite logits".into()))
+        .and_then(|index| {
+            u32::try_from(index)
+                .map_err(|_| Error::InferenceError("sampled token exceeds u32".into()))
+        })
+}
 
 #[derive(Clone)]
 enum SamplingTensorCacheInput {
@@ -377,6 +699,52 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_sampler_keeps_per_request_seed_and_policy_independent() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 0.0], 4, &device).unwrap();
+        let config = ChatGenerationConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed: 17,
+            ..ChatGenerationConfig::default()
+        };
+        let mut first = ChatSampler::new(config.clone(), &[]);
+        let mut second = ChatSampler::new(config, &[]);
+        let first_tokens = (0..8)
+            .map(|_| first.sample(&logits, 4).unwrap())
+            .collect::<Vec<_>>();
+        let second_tokens = (0..8)
+            .map(|_| second.sample(&logits, 4).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first_tokens, second_tokens);
+    }
+
+    #[test]
+    fn chat_sampler_applies_history_and_custom_stop_contract() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![4.0f32, 3.0], 2, &device).unwrap();
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            stop_token_ids: vec![1],
+            ..ChatGenerationConfig::default()
+        };
+        let mut sampler = ChatSampler::new(config, &[0]);
+        let token = sampler.sample(&logits, 2).unwrap();
+        assert_eq!(token, 1);
+        assert!(sampler.is_configured_stop(token));
+        assert_eq!(sampler.history(), &[0, 1]);
+    }
+
+    #[test]
+    fn chat_sampler_selects_last_sequence_row() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![9.0f32, 0.0, 0.0, 1.0], (1, 2, 2), &device).unwrap();
+        let mut sampler = ChatSampler::new(ChatGenerationConfig::default(), &[]);
+        assert_eq!(sampler.sample(&logits, 2).unwrap(), 1);
+    }
 
     #[test]
     fn chunked_topk_is_exact_across_chunk_boundaries() {

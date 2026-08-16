@@ -6,7 +6,9 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+#[cfg(test)]
+use candle_core::D;
+use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::gemma3::Config as Gemma3Config;
 use serde_json::Value;
@@ -22,8 +24,9 @@ use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::core::Gemma3PhysicalModel;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::sampling::ChatSampler;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -38,9 +41,22 @@ pub struct ChatDecodeState {
     position: usize,
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
+    sampler: ChatSampler,
     assembled: String,
     stagnant_steps: usize,
     max_new_tokens: usize,
+    finished: bool,
+}
+
+pub(crate) struct ChatDecodeCheckpoint {
+    cache: PhysicalPagedKvCache,
+    unconsumed_logits: Option<Tensor>,
+    position: usize,
+    pending_token: Option<u32>,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    assembled: String,
+    stagnant_steps: usize,
     finished: bool,
 }
 
@@ -49,6 +65,15 @@ impl ChatDecodeState {
         &mut self,
         cache: PhysicalPagedKvCache,
     ) -> Result<()> {
+        let checkpoint = self.begin_managed_quantum(cache)?;
+        drop(checkpoint);
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeCheckpoint> {
         if self.cache.arena().id() != cache.arena().id()
             || self.cache.arena().config().group != cache.arena().config().group
         {
@@ -63,8 +88,30 @@ impl ChatDecodeState {
                 self.position
             )));
         }
-        self.cache = cache;
-        Ok(())
+        let checkpoint = ChatDecodeCheckpoint {
+            cache: std::mem::replace(&mut self.cache, cache),
+            unconsumed_logits: self.unconsumed_logits.clone(),
+            position: self.position,
+            pending_token: self.pending_token,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            assembled: self.assembled.clone(),
+            stagnant_steps: self.stagnant_steps,
+            finished: self.finished,
+        };
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn rollback_managed_quantum(&mut self, checkpoint: ChatDecodeCheckpoint) {
+        self.cache = checkpoint.cache;
+        self.unconsumed_logits = checkpoint.unconsumed_logits;
+        self.position = checkpoint.position;
+        self.pending_token = checkpoint.pending_token;
+        self.generated_ids = checkpoint.generated_ids;
+        self.sampler = checkpoint.sampler;
+        self.assembled = checkpoint.assembled;
+        self.stagnant_steps = checkpoint.stagnant_steps;
+        self.finished = checkpoint.finished;
     }
 
     pub(crate) fn take_physical_write_completions(&mut self) -> Vec<Arc<KvWriteBatchCompletion>> {
@@ -567,6 +614,7 @@ impl Gemma3ChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        config: &ChatGenerationConfig,
         mut cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let prompt_ids = self.build_prompt(messages)?;
@@ -596,6 +644,7 @@ impl Gemma3ChatModel {
             position: prompt_ids.len(),
             pending_token: None,
             generated_ids: Vec::new(),
+            sampler: ChatSampler::new(config.clone(), &prompt_ids),
             assembled: String::new(),
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),
@@ -620,7 +669,7 @@ impl Gemma3ChatModel {
         let logits = state.unconsumed_logits.take().ok_or_else(|| {
             Error::InferenceError("Gemma decode quantum has no unconsumed logits".into())
         })?;
-        let next = select_next_token(&logits, self.tokenizer.vocab_size)?;
+        let next = state.sampler.sample(&logits, self.tokenizer.vocab_size)?;
         self.apply_sample(state, next)
     }
 
@@ -667,7 +716,9 @@ impl Gemma3ChatModel {
         }
         let mut steps = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let next = select_next_token(&logits.i(row)?, self.tokenizer.vocab_size)?;
+            let next = state
+                .sampler
+                .sample(&logits.i(row)?, self.tokenizer.vocab_size)?;
             steps.push(self.apply_sample(state, next)?);
         }
         Ok(steps)
@@ -678,6 +729,7 @@ impl Gemma3ChatModel {
             || next == self.tokenizer.specials.eos
             || next == self.tokenizer.specials.start_of_turn
             || self.tokenizer.specials.bos.is_some_and(|bos| next == bos)
+            || state.sampler.is_configured_stop(next)
         {
             state.finished = true;
             return Ok(state.step(String::new()));
@@ -873,6 +925,7 @@ fn strip_unused_placeholders(input: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
     let capped = vocab_limit.min(logits.dim(0)?);
     if capped == 0 {
@@ -898,6 +951,7 @@ fn argmax(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
         .map_err(Error::from)
 }
 
+#[cfg(test)]
 fn select_next_token(logits: &Tensor, vocab_limit: usize) -> Result<u32> {
     match logits.rank() {
         // [vocab]

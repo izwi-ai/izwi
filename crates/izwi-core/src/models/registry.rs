@@ -24,7 +24,8 @@ use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2TtsModel;
 use crate::models::architectures::gemma3::chat::{
-    ChatDecodeState as Gemma3ChatDecodeState, Gemma3ChatModel,
+    ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
+    Gemma3ChatModel,
 };
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
@@ -54,7 +55,8 @@ use crate::models::architectures::qwen3::asr::{
     Qwen3AsrPhysicalStateSpec,
 };
 use crate::models::architectures::qwen3::chat::{
-    ChatDecodeState as Qwen3ChatDecodeState, ChatGenerationOutput, Qwen3ChatModel,
+    ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
+    ChatGenerationOutput, Qwen3ChatModel,
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
@@ -2621,6 +2623,11 @@ pub enum NativeChatDecodeState {
     Gemma3(Gemma3ChatDecodeState),
 }
 
+pub(crate) enum NativeChatDecodeCheckpoint {
+    Qwen3(Qwen3ChatDecodeCheckpoint),
+    Gemma3(Gemma3ChatDecodeCheckpoint),
+}
+
 #[derive(Debug, Clone)]
 pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
@@ -2658,6 +2665,42 @@ impl NativeChatPreparedPrompt {
 }
 
 impl NativeChatDecodeState {
+    pub(crate) fn begin_continuous_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeCheckpoint> {
+        match self {
+            Self::Qwen3(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeChatDecodeCheckpoint::Qwen3),
+            Self::Gemma3(state) => state
+                .begin_managed_quantum(cache)
+                .map(NativeChatDecodeCheckpoint::Gemma3),
+            Self::Qwen35(_) | Self::Qwen38(_) => Err(Error::InvalidInput(
+                "scalar chat state entered a continuous tensor quantum".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn rollback_continuous_quantum(
+        &mut self,
+        checkpoint: NativeChatDecodeCheckpoint,
+    ) -> Result<()> {
+        match (self, checkpoint) {
+            (Self::Qwen3(state), NativeChatDecodeCheckpoint::Qwen3(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Gemma3(state), NativeChatDecodeCheckpoint::Gemma3(checkpoint)) => {
+                state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            _ => Err(Error::InferenceError(
+                "continuous chat rollback checkpoint changed model family".into(),
+            )),
+        }
+    }
+
     pub(crate) fn install_managed_reservation(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -2946,12 +2989,14 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(model.start_decode_managed(
                 messages,
                 max_new_tokens,
+                config,
                 cache,
             )?)),
             _ => Err(Error::InvalidInput(
@@ -3012,12 +3057,14 @@ impl NativeChatModel {
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
+        config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Gemma3(model) => Ok(NativeChatDecodeState::Gemma3(model.start_decode_managed(
                 messages,
                 max_new_tokens,
+                config,
                 cache,
             )?)),
             _ => Err(Error::InvalidInput(

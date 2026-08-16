@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::models::registry::NativeChatModel;
+use crate::models::registry::{NativeChatDecodeCheckpoint, NativeChatModel};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
@@ -10,6 +11,7 @@ use crate::models::shared::chat::ChatMessage;
 use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
+use super::super::SessionKey;
 use super::state::ActiveChatDecode;
 use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
 
@@ -21,6 +23,79 @@ struct StreamDeltaBatch {
     emitted_first: bool,
     pending: String,
     pending_pieces: usize,
+}
+
+struct ContinuousChatStateBatch<'a> {
+    store: &'a Mutex<HashMap<SessionKey, ActiveChatDecode>>,
+    rows: Vec<(
+        usize,
+        SessionKey,
+        ActiveChatDecode,
+        Option<NativeChatDecodeCheckpoint>,
+    )>,
+    armed: bool,
+}
+
+impl<'a> ContinuousChatStateBatch<'a> {
+    fn new(
+        store: &'a Mutex<HashMap<SessionKey, ActiveChatDecode>>,
+        rows: Vec<(usize, SessionKey, ActiveChatDecode)>,
+    ) -> Self {
+        Self {
+            store,
+            rows: rows
+                .into_iter()
+                .map(|(index, session, state)| (index, session, state, None))
+                .collect(),
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) -> Vec<(usize, SessionKey, ActiveChatDecode)> {
+        self.armed = false;
+        std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(|(index, session, state, _)| (index, session, state))
+            .collect()
+    }
+}
+
+impl Drop for ContinuousChatStateBatch<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (_, session, state, checkpoint) in &mut self.rows {
+            if let Some(checkpoint) = checkpoint.take() {
+                if let Err(error) = state.state.rollback_continuous_quantum(checkpoint) {
+                    tracing::error!(
+                        request_id = %session.request_id,
+                        epoch = session.epoch,
+                        %error,
+                        "continuous chat rollback failed"
+                    );
+                }
+            }
+        }
+        for (_, session, state, _) in std::mem::take(&mut self.rows) {
+            match store.entry(session.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(state);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    tracing::error!(
+                        request_id = %session.request_id,
+                        epoch = session.epoch,
+                        "continuous chat rollback collided with an active state"
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl StreamDeltaBatch {
@@ -332,11 +407,21 @@ impl NativeExecutor {
                 }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
                     Self::run_blocking(|| {
-                        model.start_gemma3_decode_state_managed(messages, max_new_tokens, cache)
+                        model.start_gemma3_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            cache,
+                        )
                     })?
                 }
                 Some(cache) => Self::run_blocking(|| {
-                    model.start_qwen3_decode_state_managed(messages, max_new_tokens, cache)
+                    model.start_qwen3_decode_state_managed(
+                        messages,
+                        max_new_tokens,
+                        &generation_config,
+                        cache,
+                    )
                 })?,
                 None => {
                     return Err(Error::InferenceError(
@@ -496,13 +581,40 @@ impl NativeExecutor {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let model = ordered_requests[0].prepared_chat_model_for_executor()?;
+        let live_indices = ordered_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| (!request.is_cancelled()).then_some(index))
+            .collect::<Vec<_>>();
+        let mut outputs = (0..scheduled.len())
+            .map(|_| None)
+            .collect::<Vec<Option<ModelSessionResult>>>();
+        for (index, request) in ordered_requests.iter().enumerate() {
+            if request.is_cancelled() {
+                outputs[index] = Some(ModelSessionResult::cancelled_before_dispatch(
+                    ExecutorOutput::cancelled(request.id.clone()),
+                ));
+            }
+        }
+        if live_indices.is_empty() {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("cancelled chat row produced no result".into())
+                    })
+                })
+                .collect();
+        }
+
+        let model = ordered_requests[live_indices[0]].prepared_chat_model_for_executor()?;
         if !model.supports_continuous_decode_batch() {
             return Err(Error::InvalidInput(
                 "loaded chat model has no continuous tensor decode adapter".to_string(),
             ));
         }
-        for request in ordered_requests.iter().skip(1) {
+        for index in live_indices.iter().copied().skip(1) {
+            let request = ordered_requests[index];
             let row_model = request.prepared_chat_model_for_executor()?;
             if !Arc::ptr_eq(&model, &row_model) {
                 return Err(Error::InferenceError(
@@ -511,12 +623,13 @@ impl NativeExecutor {
             }
         }
 
-        let mut active_states = {
+        let active_states = {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {
                 Error::InferenceError("Chat decode state mutex poisoned".to_string())
             })?;
-            for (request, scheduled) in ordered_requests.iter().zip(scheduled) {
-                let session = scheduled.session_key();
+            for index in live_indices.iter().copied() {
+                let request = ordered_requests[index];
+                let session = scheduled[index].session_key();
                 let expected_variant = Self::resolve_variant(request)?;
                 let state = guard.get(&session).ok_or_else(|| {
                     Error::InferenceError(format!(
@@ -530,28 +643,34 @@ impl NativeExecutor {
                     ));
                 }
             }
-            scheduled
+            live_indices
                 .iter()
-                .map(|scheduled| {
-                    guard
-                        .remove(&scheduled.session_key())
-                        .expect("continuous chat state was validated under the same lock")
+                .copied()
+                .map(|index| {
+                    let session = scheduled[index].session_key();
+                    let state = guard
+                        .remove(&session)
+                        .expect("continuous chat state was validated under the same lock");
+                    (index, session, state)
                 })
                 .collect::<Vec<_>>()
         };
+        let mut active_states =
+            ContinuousChatStateBatch::new(&self.chat_decode_states, active_states);
+        let mut managed_caches = managed_caches;
 
-        for ((request, active_state), managed_cache) in ordered_requests
-            .iter()
-            .zip(active_states.iter_mut())
-            .zip(managed_caches)
-        {
+        for (index, _, active_state, checkpoint) in &mut active_states.rows {
+            let request = ordered_requests[*index];
+            let managed_cache = managed_caches[*index].take();
             if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
                 return Err(Error::InferenceError(
                     "continuous managed Qwen3 row lost its reservation".to_string(),
                 ));
             }
             match managed_cache {
-                Some(cache) => active_state.state.install_managed_reservation(cache)?,
+                Some(cache) => {
+                    *checkpoint = Some(active_state.state.begin_continuous_quantum(cache)?);
+                }
                 None if active_state.state.uses_managed_kv() => {
                     return Err(Error::InferenceError(
                         "continuous managed Qwen3 session changed cache authority".to_string(),
@@ -562,40 +681,32 @@ impl NativeExecutor {
         }
 
         let mut state_refs = active_states
+            .rows
             .iter_mut()
-            .map(|state| &mut state.state)
+            .map(|(_, _, state, _)| &mut state.state)
             .collect::<Vec<_>>();
         let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
         drop(state_refs);
-        if steps.len() != active_states.len() {
+        if steps.len() != active_states.rows.len() {
             return Err(Error::InferenceError(
                 "continuous chat model returned the wrong number of rows".to_string(),
             ));
         }
 
-        let mut outputs = Vec::with_capacity(steps.len());
-        let mut continuing = Vec::new();
-        for (((request, scheduled), mut active_state), step) in ordered_requests
-            .into_iter()
-            .zip(scheduled)
-            .zip(active_states)
-            .zip(steps)
-        {
-            if request.is_cancelled() {
-                outputs.push(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                    request.id.clone(),
-                )));
-                continue;
-            }
-
+        let mut continuing = vec![false; scheduled.len()];
+        for ((index, _, active_state, _), step) in active_states.rows.iter_mut().zip(steps) {
+            let request = ordered_requests[*index];
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
             active_state.last_tokens_generated = step.tokens_generated;
-            if let Some(tx) = Self::stream_sender(request).as_ref() {
+            let stream_result = (|| -> Result<()> {
+                let Some(tx) = Self::stream_sender(request) else {
+                    return Ok(());
+                };
                 if !step.delta.is_empty() {
                     Self::stream_text_with_policy(
-                        tx,
+                        &tx,
                         request.stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
@@ -605,16 +716,24 @@ impl NativeExecutor {
                 }
                 if step.finished {
                     Self::stream_final_marker_with_policy(
-                        tx,
+                        &tx,
                         request.stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                     )?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = stream_result {
+                outputs[*index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    request.id.clone(),
+                    format!("continuous chat stream staging failed: {error}"),
+                )));
+                continue;
             }
 
             let managed_cache_completions = active_state.state.take_managed_write_completions();
-            outputs.push(
+            outputs[*index] = Some(
                 ModelSessionResult::sequence(ExecutorOutput {
                     request_id: request.id.clone(),
                     audio: Some(AudioOutput::empty(24_000)),
@@ -634,23 +753,41 @@ impl NativeExecutor {
                 .with_managed_cache_completions(managed_cache_completions),
             );
             if !step.finished {
-                continuing.push((scheduled.session_key(), active_state));
+                continuing[*index] = true;
             }
         }
 
-        if !continuing.is_empty() {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
-            })?;
-            for (session, state) in continuing {
-                if guard.insert(session, state).is_some() {
-                    return Err(Error::InferenceError(
-                        "continuous chat state collided during commit".to_string(),
-                    ));
+        let committed_states = active_states.commit();
+        if continuing.iter().any(|continuing| *continuing) {
+            let mut guard = self
+                .chat_decode_states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (index, session, state) in committed_states {
+                if !continuing[index] {
+                    continue;
+                }
+                match guard.entry(session) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(state);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                            ordered_requests[index].id.clone(),
+                            "continuous chat state collided during commit",
+                        )));
+                    }
                 }
             }
         }
-        Ok(outputs)
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("continuous chat row produced no result".into())
+                })
+            })
+            .collect()
     }
 }
 
