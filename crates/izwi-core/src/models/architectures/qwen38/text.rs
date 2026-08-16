@@ -1033,7 +1033,7 @@ impl Qwen38FullAttention {
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
-            match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
+            match try_apply_rope_thd(&query_rot, &key_rot, cos, sin)? {
                 Some((query_rot, key_rot)) => {
                     for _ in 0..plan.sequence_len {
                         record_rope_kernel();
@@ -1051,8 +1051,8 @@ impl Qwen38FullAttention {
                         }
                     }
                     (
-                        apply_rotary_emb(&query_rot, &cos, &sin)?,
-                        apply_rotary_emb(&key_rot, &cos, &sin)?,
+                        apply_rotary_emb(&query_rot, cos, sin)?,
+                        apply_rotary_emb(&key_rot, cos, sin)?,
                     )
                 }
             }
@@ -1064,8 +1064,8 @@ impl Qwen38FullAttention {
                 }
             }
             (
-                apply_rotary_emb(&query_rot, &cos, &sin)?,
-                apply_rotary_emb(&key_rot, &cos, &sin)?,
+                apply_rotary_emb(&query_rot, cos, sin)?,
+                apply_rotary_emb(&key_rot, cos, sin)?,
             )
         };
 
