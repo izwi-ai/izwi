@@ -34,6 +34,9 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_causal_conv_prefill_attempts_total: u64,
     pub cuda_causal_conv_prefill_success_total: u64,
     pub cuda_causal_conv_prefill_fallback_total: u64,
+    pub cuda_causal_conv_decode_attempts_total: u64,
+    pub cuda_causal_conv_decode_success_total: u64,
+    pub cuda_causal_conv_decode_fallback_total: u64,
     pub cuda_rope_kernel_success_total: u64,
     pub cuda_rope_manual_fallback_total: u64,
     pub sampling_device_argmax_total: u64,
@@ -74,6 +77,9 @@ counters!(
     CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
     CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
     CUDA_CAUSAL_CONV_PREFILL_FALLBACK,
+    CUDA_CAUSAL_CONV_DECODE_ATTEMPTS,
+    CUDA_CAUSAL_CONV_DECODE_SUCCESS,
+    CUDA_CAUSAL_CONV_DECODE_FALLBACK,
     CUDA_ROPE_KERNEL_SUCCESS,
     CUDA_ROPE_MANUAL_FALLBACK,
     SAMPLING_DEVICE_ARGMAX,
@@ -97,6 +103,7 @@ pub(crate) enum CudaKernelPath {
     DeltaNetDecode,
     DeltaNetPrefill,
     CausalConvPrefill,
+    CausalConvDecode,
 }
 
 pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
@@ -150,6 +157,11 @@ pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
             &CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
             &CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
             &CUDA_CAUSAL_CONV_PREFILL_FALLBACK,
+        ),
+        CudaKernelPath::CausalConvDecode => (
+            &CUDA_CAUSAL_CONV_DECODE_ATTEMPTS,
+            &CUDA_CAUSAL_CONV_DECODE_SUCCESS,
+            &CUDA_CAUSAL_CONV_DECODE_FALLBACK,
         ),
     };
     attempts.fetch_add(1, Ordering::Relaxed);
@@ -216,6 +228,9 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_causal_conv_prefill_attempts_total: load!(CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS),
         cuda_causal_conv_prefill_success_total: load!(CUDA_CAUSAL_CONV_PREFILL_SUCCESS),
         cuda_causal_conv_prefill_fallback_total: load!(CUDA_CAUSAL_CONV_PREFILL_FALLBACK),
+        cuda_causal_conv_decode_attempts_total: load!(CUDA_CAUSAL_CONV_DECODE_ATTEMPTS),
+        cuda_causal_conv_decode_success_total: load!(CUDA_CAUSAL_CONV_DECODE_SUCCESS),
+        cuda_causal_conv_decode_fallback_total: load!(CUDA_CAUSAL_CONV_DECODE_FALLBACK),
         cuda_rope_kernel_success_total: load!(CUDA_ROPE_KERNEL_SUCCESS),
         cuda_rope_manual_fallback_total: load!(CUDA_ROPE_MANUAL_FALLBACK),
         sampling_device_argmax_total: load!(SAMPLING_DEVICE_ARGMAX),

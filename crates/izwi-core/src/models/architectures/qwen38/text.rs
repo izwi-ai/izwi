@@ -19,7 +19,8 @@ use crate::backends::state::{
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
-    try_fused_silu_mul, try_qwen38_causal_conv_sequence, try_tiled_deltanet_recurrence,
+    try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
+    try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -1552,6 +1553,38 @@ impl Qwen38LinearAttention {
         mixed_qkv: &Tensor,
         conv_state: &mut Option<ConvRingState>,
     ) -> Result<Tensor> {
+        if self.kernel_size == 4
+            && mixed_qkv.device().is_cuda()
+            && qwen38_env_bool("IZWI_QWEN38_CAUSAL_CONV_DECODE", false)
+        {
+            let buffer = conv_state.as_mut().ok_or_else(|| {
+                Error::InferenceError(
+                    "conv_state not initialized but Qwen3.8 decode convolution needs history"
+                        .to_string(),
+                )
+            })?;
+            if buffer.slots.len() != 3 || buffer.next_idx >= 3 {
+                return Err(Error::InferenceError(format!(
+                    "Invalid Qwen3.8 decode convolution history: slots={}, next_idx={}",
+                    buffer.slots.len(),
+                    buffer.next_idx
+                )));
+            }
+            let logical_slots: Vec<&Tensor> = (0..3)
+                .map(|idx| &buffer.slots[(buffer.next_idx + idx) % 3])
+                .collect();
+            let history = Tensor::cat(&logical_slots, 1)?;
+            let fused = try_qwen38_causal_conv_decode(mixed_qkv, &self.conv_kernel, &history);
+            record_cuda_kernel(CudaKernelPath::CausalConvDecode, fused.is_some());
+            if let Some((output, next_history)) = fused {
+                buffer.slots = (0..3)
+                    .map(|idx| next_history.narrow(1, idx, 1))
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+                buffer.next_idx = 0;
+                return Ok(output);
+            }
+        }
+
         let current = mixed_qkv.i((0, 0))?;
         let current = if current.dtype() != self.conv_kernel.dtype() {
             current.to_dtype(self.conv_kernel.dtype())?

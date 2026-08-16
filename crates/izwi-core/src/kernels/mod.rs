@@ -387,6 +387,18 @@ pub fn try_qwen38_causal_conv_sequence(
     None
 }
 
+pub fn try_qwen38_causal_conv_decode(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !use_fused_kernels_for_device(input.device()) || !input.device().is_cuda() {
+        return None;
+    }
+
+    cuda::try_qwen38_causal_conv_decode(input, weight, history)
+}
+
 pub fn try_fused_gated_rms_norm(
     hidden: &Tensor,
     gate: &Tensor,

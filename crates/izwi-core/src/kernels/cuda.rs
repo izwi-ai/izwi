@@ -325,6 +325,55 @@ pub fn try_qwen38_causal_conv_sequence(
     try_qwen_hybrid_causal_conv_sequence(input, weight, history)
 }
 
+pub fn try_qwen38_causal_conv_decode(
+    input: &Tensor,
+    weight: &Tensor,
+    history: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    if !cuda_tensor_pair_supported(input, weight)
+        || !cuda_tensor_pair_supported(input, history)
+        || input.dtype() != DType::F32
+    {
+        return None;
+    }
+    let (batch, sequence, conv_dim) = input.dims3().ok()?;
+    let (weight_channels, kernel_size) = weight.dims2().ok()?;
+    let (history_channels, history_len) = history.dims2().ok()?;
+    if batch != 1
+        || sequence != 1
+        || conv_dim == 0
+        || kernel_size != 4
+        || weight_channels != conv_dim
+        || history_channels != conv_dim
+        || history_len != 3
+    {
+        return None;
+    }
+
+    let input = input.contiguous().ok()?;
+    let weight = weight.contiguous().ok()?;
+    let history = history.contiguous().ok()?;
+    let state_elements = conv_dim.checked_mul(history_len)?;
+    let packed = input
+        .apply_op3_no_bwd(
+            &weight,
+            &history,
+            &CudaQwen38CausalConvDecodeOp { conv_dim },
+        )
+        .ok()?;
+    let output = packed
+        .narrow(0, 0, conv_dim)
+        .ok()?
+        .reshape((1, 1, conv_dim))
+        .ok()?;
+    let next_history = packed
+        .narrow(0, conv_dim, state_elements)
+        .ok()?
+        .reshape((conv_dim, history_len))
+        .ok()?;
+    Some((output, next_history))
+}
+
 fn try_qwen_hybrid_causal_conv_sequence(
     input: &Tensor,
     weight: &Tensor,
@@ -1577,6 +1626,93 @@ struct CudaCausalConvSequenceOp {
     kernel_size: usize,
 }
 
+struct CudaQwen38CausalConvDecodeOp {
+    conv_dim: usize,
+}
+
+impl CustomOp3 for CudaQwen38CausalConvDecodeOp {
+    fn name(&self) -> &'static str {
+        "qwen38-causal-conv-decode"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _input: &CpuStorage,
+        _input_layout: &Layout,
+        _weight: &CpuStorage,
+        _weight_layout: &Layout,
+        _history: &CpuStorage,
+        _history_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("Qwen3.8 CUDA decode convolution has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        input: &candle_core::CudaStorage,
+        input_layout: &Layout,
+        weight: &candle_core::CudaStorage,
+        weight_layout: &Layout,
+        history: &candle_core::CudaStorage,
+        history_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        fn contiguous_slice<'a>(
+            storage: &'a CudaStorageSlice,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
+        {
+            let CudaStorageSlice::F32(slice) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(slice.slice(start..end))
+        }
+
+        let input_slice = contiguous_slice(&input.slice, input_layout, "input")?;
+        let weight_slice = contiguous_slice(&weight.slice, weight_layout, "weight")?;
+        let history_slice = contiguous_slice(&history.slice, history_layout, "history")?;
+        let total_elements = self.conv_dim.checked_mul(4).ok_or_else(|| {
+            candle_core::Error::Msg("Qwen3.8 CUDA decode convolution overflow".to_string())
+        })?;
+        if total_elements > i32::MAX as usize {
+            candle_core::bail!("Qwen3.8 CUDA decode convolution tensor is too large")
+        }
+        let device = input.device();
+        // SAFETY: the custom kernel writes every element before the storage is observed.
+        let output = unsafe { device.alloc::<f32>(total_elements)? };
+        let function = device.get_or_load_custom_func(
+            "qwen38_causal_conv_decode_f32",
+            "izwi_qwen38_causal_conv_decode",
+            cuda_ptx::QWEN38,
+        )?;
+        let config = LaunchConfig::for_num_elems(total_elements as u32);
+        let mut builder = function.builder();
+        builder.arg(&input_slice);
+        builder.arg(&weight_slice);
+        builder.arg(&history_slice);
+        builder.arg(&output);
+        candle_core::builder_arg!(builder, self.conv_dim as i32);
+        // SAFETY: argument types and element bounds match the CUDA kernel signature.
+        unsafe { builder.launch(config) }.w()?;
+
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            Shape::from_dims(&[total_elements]),
+        ))
+    }
+}
+
 impl CustomOp3 for CudaCausalConvSequenceOp {
     fn name(&self) -> &'static str {
         "qwen35-causal-conv-sequence"
@@ -2360,6 +2496,11 @@ mod tests {
         assert!(try_fused_silu_mul(&lhs, &rhs).is_none());
         assert!(try_fused_l2_norm(&lhs, 1e-6).is_none());
 
+        let conv_input = Tensor::zeros((1, 1, 8), DType::F32, &device).unwrap();
+        let conv_weight = Tensor::zeros((8, 4), DType::F32, &device).unwrap();
+        let conv_history = Tensor::zeros((8, 3), DType::F32, &device).unwrap();
+        assert!(try_qwen38_causal_conv_decode(&conv_input, &conv_weight, &conv_history).is_none());
+
         let queries = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
         let keys = Tensor::zeros((1, 16, 1, 2), DType::F32, &device).unwrap();
         let values = Tensor::zeros((1, 16, 1, 2), DType::F32, &device).unwrap();
@@ -2370,6 +2511,13 @@ mod tests {
         .is_err());
         assert!(try_fused_rms_norm(&lhs, &rhs, 1e-6).is_none());
         assert!(try_fused_gated_rms_norm(&lhs, &rhs, &rhs, 1e-6).is_none());
+    }
+
+    #[test]
+    fn qwen38_cuda_source_uses_independent_decode_symbol() {
+        let source = include_str!("cuda/qwen38.cu");
+        assert!(source.contains("qwen38_causal_conv_decode_f32"));
+        assert!(!source.contains("qwen35"));
     }
 
     #[test]
