@@ -131,7 +131,9 @@ model evidence runner. It covers warmed single-user decode, longer prompts, a
 sustained 2,048-token completion, and concurrency 1/2/4/8. `prompt_words`
 controls deterministic input construction; it is not reported as a tokenizer
 token count. The certificate retains the actual prompt-token count returned by
-the server.
+the server. The complete operator protocol, candidate matrix, required
+artifacts, promotion gates, and deferred phases are in
+[`docs/dev/QWEN38_L40S_VALIDATION.md`](../../docs/dev/QWEN38_L40S_VALIDATION.md).
 
 Run it manually on the exact L40S deployment and retain the output directory:
 
@@ -152,6 +154,14 @@ two metrics must not be conflated. The workload pins the expected Hugging Face
 checkpoint revision; provisioning that
 revision remains an operator responsibility because the runner never downloads
 or mutates models.
+
+The runner measures an existing warmed server; it does not enable optimization
+candidates. Set candidate variables on the server process and restart between
+cells. `IZWI_QWEN38_PACKED_PROJECTIONS`, `IZWI_QWEN38_CUDA_BF16_KV`,
+`IZWI_QWEN38_CAUSAL_CONV_DECODE`, `IZWI_QWEN38_DELTANET_DECODE`, and
+`IZWI_QWEN38_DECODE_EPILOGUES` are all default-off and CUDA-unvalidated. Run a
+default-off baseline and then one candidate per retained output directory
+before testing combinations.
 
 On a host without an NVIDIA device, the default is a non-zero failure. Local
 workflow validation can explicitly record unsupported without inventing data:
