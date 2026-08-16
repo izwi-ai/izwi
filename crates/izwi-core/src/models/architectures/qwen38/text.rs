@@ -86,9 +86,7 @@ impl Qwen38TextRuntimeState {
                     recurrent_state,
                 } => {
                     if let Some(conv_state) = conv_state {
-                        for slot in &conv_state.slots {
-                            accounting.add_tensor(slot)?;
-                        }
+                        conv_state.account_storage(accounting)?;
                     }
                     if let Some(recurrent_state) = recurrent_state {
                         accounting.add_tensor(recurrent_state)?;
@@ -139,11 +137,7 @@ impl Qwen38TextRuntimeState {
                 Error::InferenceError("Qwen3.8 convolution component is absent".into())
             })?;
             *recurrent_state = Some(recurrent_tensor.clone());
-            let history_len = convolution_tensor.dim(0)?;
-            let slots = (0..history_len)
-                .map(|index| convolution_tensor.i(index).map_err(Error::from))
-                .collect::<Result<Vec<_>>>()?;
-            *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+            *conv_state = Some(ConvRingState::from_staged(convolution_tensor.clone())?);
         }
         if recurrent_components.next().is_some() || convolution_components.next().is_some() {
             return Err(Error::InferenceError(
@@ -183,15 +177,7 @@ impl Qwen38TextRuntimeState {
             let ring = conv_state.as_ref().ok_or_else(|| {
                 Error::InferenceError("Qwen3.8 convolution state was not initialized".into())
             })?;
-            if ring.slots.is_empty() || ring.next_idx >= ring.slots.len() {
-                return Err(Error::InferenceError(
-                    "Qwen3.8 convolution ring is invalid at the physical boundary".into(),
-                ));
-            }
-            let ordered = (0..ring.slots.len())
-                .map(|offset| &ring.slots[(ring.next_idx + offset) % ring.slots.len()])
-                .collect::<Vec<_>>();
-            let ring_tensor = Tensor::stack(&ordered, 0)?;
+            let ring_tensor = ring.staged_tensor()?;
             let component = u32::try_from(recurrent.len() + 1)
                 .map_err(|_| Error::InvalidInput("Qwen3.8 state component overflow".into()))?;
             recurrent.push(StateComponentValue {
@@ -244,26 +230,157 @@ fn convolution_domain_v2() -> StateDomainId {
 
 #[derive(Clone)]
 struct ConvRingState {
-    slots: Vec<Tensor>,
-    next_idx: usize,
+    storage: ConvHistoryStorage,
+}
+
+#[derive(Clone)]
+enum ConvHistoryStorage {
+    /// Portable circular storage used by the generic convolution fallback.
+    Ring { slots: Vec<Tensor>, next_idx: usize },
+    /// Oldest-to-newest `[channels, history]` storage returned by the dedicated
+    /// Qwen3.8 CUDA decode convolution. Keeping this tensor intact avoids
+    /// rebuilding the same history with `Tensor::cat` on every decode token.
+    Contiguous(Tensor),
 }
 
 impl ConvRingState {
+    fn from_slots(slots: Vec<Tensor>) -> Self {
+        Self {
+            storage: ConvHistoryStorage::Ring { slots, next_idx: 0 },
+        }
+    }
+
+    fn from_staged(history: Tensor) -> Result<Self> {
+        match history.rank() {
+            // Canonical Qwen3.8 physical representation. The dedicated CUDA
+            // decode kernel can consume this handle on the next quantum.
+            2 => {
+                let (channels, history_len) = history.dims2()?;
+                if channels == 0 || history_len == 0 {
+                    return Err(Error::InferenceError(
+                        "Qwen3.8 staged convolution history is empty".into(),
+                    ));
+                }
+                Ok(Self {
+                    storage: ConvHistoryStorage::Contiguous(history),
+                })
+            }
+            // Read the legacy `[history, channels, 1]` representation so
+            // sessions staged before this optimization remain portable.
+            3 => {
+                let (history_len, channels, singleton) = history.dims3()?;
+                if history_len == 0 || channels == 0 || singleton != 1 {
+                    return Err(Error::InferenceError(format!(
+                        "Invalid legacy Qwen3.8 convolution history shape {:?}",
+                        history.dims()
+                    )));
+                }
+                Ok(Self {
+                    storage: ConvHistoryStorage::Contiguous(history.squeeze(2)?.transpose(0, 1)?),
+                })
+            }
+            rank => Err(Error::InferenceError(format!(
+                "Invalid Qwen3.8 convolution history rank {rank}"
+            ))),
+        }
+    }
+
+    fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
+        match &self.storage {
+            ConvHistoryStorage::Ring { slots, .. } => {
+                for slot in slots {
+                    accounting.add_tensor(slot)?;
+                }
+            }
+            ConvHistoryStorage::Contiguous(history) => accounting.add_tensor(history)?,
+        }
+        Some(())
+    }
+
+    fn history_len(&self) -> Result<usize> {
+        match &self.storage {
+            ConvHistoryStorage::Ring { slots, next_idx } => {
+                if slots.is_empty() || *next_idx >= slots.len() {
+                    return Err(Error::InferenceError(format!(
+                        "Invalid Qwen3.8 convolution ring: slots={}, next_idx={next_idx}",
+                        slots.len()
+                    )));
+                }
+                Ok(slots.len())
+            }
+            ConvHistoryStorage::Contiguous(history) => history.dim(1).map_err(Error::from),
+        }
+    }
+
+    /// Return oldest-to-newest CUDA kernel history without copying when the
+    /// previous specialized decode already produced that representation.
+    fn contiguous_history(&self) -> Result<Tensor> {
+        match &self.storage {
+            ConvHistoryStorage::Contiguous(history) => Ok(history.clone()),
+            ConvHistoryStorage::Ring { slots, next_idx } => {
+                if slots.is_empty() || *next_idx >= slots.len() {
+                    return Err(Error::InferenceError(format!(
+                        "Invalid Qwen3.8 convolution ring: slots={}, next_idx={next_idx}",
+                        slots.len()
+                    )));
+                }
+                let logical = (0..slots.len())
+                    .map(|offset| &slots[(*next_idx + offset) % slots.len()])
+                    .collect::<Vec<_>>();
+                Tensor::cat(&logical, 1).map_err(Error::from)
+            }
+        }
+    }
+
+    fn replace_contiguous(&mut self, history: Tensor, expected_len: usize) -> Result<()> {
+        let (channels, history_len) = history.dims2()?;
+        if channels == 0 || history_len != expected_len {
+            return Err(Error::InferenceError(format!(
+                "Invalid Qwen3.8 contiguous convolution history: channels={channels}, history={history_len}, expected_history={expected_len}"
+            )));
+        }
+        self.storage = ConvHistoryStorage::Contiguous(history);
+        Ok(())
+    }
+
+    fn ensure_ring(&mut self) -> Result<(&mut Vec<Tensor>, &mut usize)> {
+        if let ConvHistoryStorage::Contiguous(history) = &self.storage {
+            let history_len = history.dim(1)?;
+            let slots = (0..history_len)
+                .map(|index| history.narrow(1, index, 1).map_err(Error::from))
+                .collect::<Result<Vec<_>>>()?;
+            self.storage = ConvHistoryStorage::Ring { slots, next_idx: 0 };
+        }
+        match &mut self.storage {
+            ConvHistoryStorage::Ring { slots, next_idx } => Ok((slots, next_idx)),
+            ConvHistoryStorage::Contiguous(_) => unreachable!("history was converted to a ring"),
+        }
+    }
+
+    fn staged_tensor(&self) -> Result<Tensor> {
+        self.contiguous_history()
+    }
+
     /// Move every logical history slot into independent fixed-history storage.
     ///
     /// Sequence-prefill slots are views into the entire projected token span.
     /// Keeping those views in runtime state would retain the full projection
     /// instead of the fixed `kernel_size - 1` history required by the conv.
     fn compact_owned(&mut self) -> Result<()> {
-        if self.slots.is_empty() {
-            return Ok(());
+        match &mut self.storage {
+            ConvHistoryStorage::Ring { slots, .. } => {
+                if slots.is_empty() {
+                    return Ok(());
+                }
+                *slots = slots
+                    .iter()
+                    .map(deep_copy_tensor_storage)
+                    .collect::<candle_core::Result<Vec<_>>>()?;
+            }
+            ConvHistoryStorage::Contiguous(history) => {
+                *history = deep_copy_tensor_storage(history)?;
+            }
         }
-
-        self.slots = self
-            .slots
-            .iter()
-            .map(deep_copy_tensor_storage)
-            .collect::<candle_core::Result<Vec<_>>>()?;
         Ok(())
     }
 
@@ -273,15 +390,16 @@ impl ConvRingState {
     /// sequence-sized backing tensor. Sequence prefill detaches its final fixed
     /// history once at the sequence boundary instead.
     fn push_decode(&mut self, current: &Tensor) -> Result<()> {
-        if self.slots.is_empty() || self.next_idx >= self.slots.len() {
+        let (slots, next_idx) = self.ensure_ring()?;
+        if slots.is_empty() || *next_idx >= slots.len() {
             return Err(Error::InferenceError(format!(
                 "Invalid Qwen3.8 convolution ring: slots={}, next_idx={}",
-                self.slots.len(),
-                self.next_idx
+                slots.len(),
+                *next_idx
             )));
         }
-        self.slots[self.next_idx] = current.clone();
-        self.next_idx = (self.next_idx + 1) % self.slots.len();
+        slots[*next_idx] = current.clone();
+        *next_idx = (*next_idx + 1) % slots.len();
         Ok(())
     }
 }
@@ -726,7 +844,7 @@ impl Qwen38Layer {
                 for _ in 0..history_len {
                     slots.push(owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device)?);
                 }
-                *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+                *conv_state = Some(ConvRingState::from_slots(slots));
             }
             if recurrent_state.is_none() {
                 *recurrent_state = Some(owned_zero_tensor(
@@ -1484,27 +1602,22 @@ impl Qwen38LinearAttention {
             let buffer = conv_state.as_mut().ok_or_else(|| {
                 Error::InferenceError("conv_state not initialized but kernel_size > 1".to_string())
             })?;
-            if buffer.slots.len() != history_len || buffer.next_idx >= history_len {
+            if buffer.history_len()? != history_len {
                 return Err(Error::InferenceError(format!(
-                    "Invalid Qwen3.8 convolution history: slots={}, next_idx={}, expected_slots={history_len}",
-                    buffer.slots.len(),
-                    buffer.next_idx
+                    "Invalid Qwen3.8 convolution history: actual_history={}, expected_history={history_len}",
+                    buffer.history_len()?
                 )));
             }
-            let logical_slots: Vec<&Tensor> = (0..history_len)
-                .map(|idx| &buffer.slots[(buffer.next_idx + idx) % history_len])
-                .collect();
-            let history = Tensor::cat(&logical_slots, 1)?;
+            let history = buffer.contiguous_history()?;
             let fused = try_qwen38_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history);
             if mixed_qkv.device().is_cuda() {
                 record_cuda_kernel(CudaKernelPath::CausalConvPrefill, fused.is_some());
             }
             if let Some((output, final_history)) = fused {
-                let final_history = deep_copy_tensor_storage(&final_history)?;
-                buffer.slots = (0..history_len)
-                    .map(|idx| final_history.narrow(1, idx, 1))
-                    .collect::<candle_core::Result<Vec<_>>>()?;
-                buffer.next_idx = 0;
+                // Prefill output packing may retain the entire sequence, so
+                // detach its fixed history at the sequence boundary.
+                buffer
+                    .replace_contiguous(deep_copy_tensor_storage(&final_history)?, history_len)?;
                 return Ok(output);
             }
         }
@@ -1536,24 +1649,20 @@ impl Qwen38LinearAttention {
                         .to_string(),
                 )
             })?;
-            if buffer.slots.len() != 3 || buffer.next_idx >= 3 {
+            if buffer.history_len()? != 3 {
                 return Err(Error::InferenceError(format!(
-                    "Invalid Qwen3.8 decode convolution history: slots={}, next_idx={}",
-                    buffer.slots.len(),
-                    buffer.next_idx
+                    "Invalid Qwen3.8 decode convolution history: actual_history={}, expected_history=3",
+                    buffer.history_len()?
                 )));
             }
-            let logical_slots: Vec<&Tensor> = (0..3)
-                .map(|idx| &buffer.slots[(buffer.next_idx + idx) % 3])
-                .collect();
-            let history = Tensor::cat(&logical_slots, 1)?;
+            let history = buffer.contiguous_history()?;
             let fused = try_qwen38_causal_conv_decode(mixed_qkv, &self.conv_kernel, &history);
             record_cuda_kernel(CudaKernelPath::CausalConvDecode, fused.is_some());
             if let Some((output, next_history)) = fused {
-                buffer.slots = (0..3)
-                    .map(|idx| next_history.narrow(1, idx, 1))
-                    .collect::<candle_core::Result<Vec<_>>>()?;
-                buffer.next_idx = 0;
+                // The dedicated kernel returns oldest-to-newest contiguous
+                // history. Retain it directly so subsequent decode tokens and
+                // transaction staging do not stack/copy three slot views.
+                buffer.replace_contiguous(next_history, 3)?;
                 return Ok(output);
             }
         }
@@ -1588,9 +1697,10 @@ impl Qwen38LinearAttention {
             // Add previous tokens * their respective kernel weights.
             // Read history in oldest -> newest order from the circular ring.
             let history_len = self.kernel_size - 1;
+            let (slots, next_idx) = buffer.ensure_ring()?;
             for i in 0..(self.kernel_size - 1) {
-                let ring_idx = (buffer.next_idx + i) % history_len;
-                let prev_token = &buffer.slots[ring_idx];
+                let ring_idx = (*next_idx + i) % history_len;
+                let prev_token = &slots[ring_idx];
                 let k_slice = &self.conv_kernel_slices[i];
                 convolved = (&convolved + &(prev_token * k_slice)?)?;
             }
@@ -2284,11 +2394,11 @@ mod tests {
     use super::{
         apply_rotary_emb, build_mrope, build_mrope_plan, build_rope_inv_freqs,
         convolution_domain_v2, non_finite_counts, owned_zero_tensor,
-        projection_group_geometry_compatible, qwen38_deltanet_decode_policy,
-        qwen38_projection_packing_policy, qwen38_rope_kernel_policy, recurrent_domain_v2,
-        repeat_interleave_head_states, repeat_interleave_head_states_seq, softplus, ConvRingState,
-        Linear, Qwen38LayerRuntimeState, Qwen38Projection, Qwen38ProjectionGroup,
-        Qwen38TextRuntimeState,
+        projection_group_geometry_compatible, qwen38_decode_epilogues_policy,
+        qwen38_deltanet_decode_policy, qwen38_projection_packing_policy, qwen38_rope_kernel_policy,
+        recurrent_domain_v2, repeat_interleave_head_states, repeat_interleave_head_states_seq,
+        softplus, ConvHistoryStorage, ConvRingState, Linear, Qwen38LayerRuntimeState,
+        Qwen38Projection, Qwen38ProjectionGroup, Qwen38TextRuntimeState,
     };
     use crate::models::architectures::qwen38::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2450,6 +2560,14 @@ mod tests {
     }
 
     #[test]
+    fn decode_epilogues_are_cuda_only_and_disabled_without_opt_in() {
+        assert!(!qwen38_decode_epilogues_policy(false, false));
+        assert!(!qwen38_decode_epilogues_policy(false, true));
+        assert!(!qwen38_decode_epilogues_policy(true, false));
+        assert!(qwen38_decode_epilogues_policy(true, true));
+    }
+
+    #[test]
     fn deltanet_decode_specialization_is_cuda_only_and_disabled_without_opt_in() {
         assert!(!qwen38_deltanet_decode_policy(false, false));
         assert!(!qwen38_deltanet_decode_policy(false, true));
@@ -2512,7 +2630,7 @@ mod tests {
         }
         let mut state = Qwen38TextRuntimeState {
             layers: vec![Qwen38LayerRuntimeState::Linear {
-                conv_state: Some(ConvRingState { slots, next_idx: 0 }),
+                conv_state: Some(ConvRingState::from_slots(slots)),
                 recurrent_state: None,
             }],
         };
@@ -2537,14 +2655,17 @@ mod tests {
         let slots = (0..3)
             .map(|_| Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap())
             .collect();
-        let mut ring = ConvRingState { slots, next_idx: 0 };
+        let mut ring = ConvRingState::from_slots(slots);
         let projection = Tensor::zeros((1, 1, 32), DType::F32, &Device::Cpu).unwrap();
         let current = projection.i((0, 0)).unwrap().reshape((32, 1)).unwrap();
         let projection_storage = tensor_storage_address(&current);
 
         ring.push_decode(&current)
             .expect("ring push should succeed");
-        assert_eq!(tensor_storage_address(&ring.slots[0]), projection_storage);
+        let ConvHistoryStorage::Ring { slots, .. } = &ring.storage else {
+            panic!("generic push should retain ring representation")
+        };
+        assert_eq!(tensor_storage_address(&slots[0]), projection_storage);
         drop(current);
         drop(projection);
 
@@ -2555,6 +2676,73 @@ mod tests {
             }],
         };
         assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
+    }
+
+    #[test]
+    fn contiguous_conv_history_stages_without_new_storage() {
+        let history =
+            Tensor::from_vec(vec![1f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), &Device::Cpu).unwrap();
+        let history_storage = tensor_storage_address(&history);
+        let mut state = ConvRingState::from_slots(vec![
+            Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+            Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+            Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap(),
+        ]);
+
+        state
+            .replace_contiguous(history, 3)
+            .expect("specialized history should be accepted");
+        let staged = state
+            .staged_tensor()
+            .expect("contiguous state should stage");
+        let next_decode = state
+            .contiguous_history()
+            .expect("contiguous state should feed decode");
+
+        assert_eq!(staged.dims(), &[2, 3]);
+        assert_eq!(tensor_storage_address(&staged), history_storage);
+        assert_eq!(tensor_storage_address(&next_decode), history_storage);
+        assert_eq!(
+            staged.to_vec2::<f32>().unwrap(),
+            vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0]]
+        );
+    }
+
+    #[test]
+    fn contiguous_conv_history_accounts_for_its_complete_kernel_backing() {
+        // The CUDA custom op packs the current output before its next-history
+        // slice. Retaining the slice deliberately avoids a device copy, and
+        // accounting must still charge the complete backing allocation.
+        let packed = Tensor::zeros(8, DType::F32, &Device::Cpu).unwrap();
+        let history = packed.narrow(0, 2, 6).unwrap().reshape((2, 3)).unwrap();
+        let state = Qwen38TextRuntimeState {
+            layers: vec![Qwen38LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState {
+                    storage: ConvHistoryStorage::Contiguous(history),
+                }),
+                recurrent_state: None,
+            }],
+        };
+
+        assert_eq!(state.allocated_session_bytes(), Some(8 * 4));
+    }
+
+    #[test]
+    fn conv_history_restore_accepts_canonical_and_legacy_representations() {
+        let canonical =
+            Tensor::from_vec(vec![1f32, 2.0, 3.0, 10.0, 20.0, 30.0], (2, 3), &Device::Cpu).unwrap();
+        let restored = ConvRingState::from_staged(canonical.clone()).unwrap();
+        assert_eq!(
+            restored.staged_tensor().unwrap().to_vec2::<f32>().unwrap(),
+            canonical.to_vec2::<f32>().unwrap()
+        );
+
+        let legacy = canonical.transpose(0, 1).unwrap().unsqueeze(2).unwrap();
+        let restored = ConvRingState::from_staged(legacy).unwrap();
+        assert_eq!(
+            restored.staged_tensor().unwrap().to_vec2::<f32>().unwrap(),
+            canonical.to_vec2::<f32>().unwrap()
+        );
     }
 
     #[test]
@@ -2792,12 +2980,11 @@ mod tests {
             } else {
                 let conv_width = num_v_heads * 2;
                 layers.push(Qwen38LayerRuntimeState::Linear {
-                    conv_state: Some(ConvRingState {
-                        slots: (0..3)
+                    conv_state: Some(ConvRingState::from_slots(
+                        (0..3)
                             .map(|_| Tensor::zeros((conv_width, 1), DType::F32, device).unwrap())
                             .collect(),
-                        next_idx: 0,
-                    }),
+                    )),
                     recurrent_state: Some(
                         Tensor::zeros((1, num_v_heads, 2, 2), DType::F32, device).unwrap(),
                     ),
