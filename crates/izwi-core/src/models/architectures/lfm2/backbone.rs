@@ -4,8 +4,6 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Embedding, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 
-use candle_transformers::utils::repeat_kv as candle_repeat_kv;
-
 use crate::backends::state::InvocationRingDepthwiseConvTransaction;
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
@@ -16,6 +14,7 @@ use crate::kernels::{
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
 };
+use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -320,28 +319,16 @@ impl AttentionLayer {
             }
         }
 
-        let (key_states, value_states) = if self.n_head != self.n_kv_head {
-            let repeats = self.n_head / self.n_kv_head;
-            (
-                candle_repeat_kv(key_states, repeats)?,
-                candle_repeat_kv(value_states, repeats)?,
-            )
-        } else {
-            (key_states, value_states)
-        };
-
-        let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?.contiguous()?)?
-            / (self.head_dim as f64).sqrt())?;
-        let attn_weights = if let Some(mask) = mask {
-            let mask = mask.broadcast_as(attn_weights.shape())?;
-            masked_fill(&attn_weights, &mask, &self.neg_inf)?
-        } else {
-            attn_weights
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights
-            .contiguous()?
-            .matmul(&value_states.contiguous()?)?;
+        let attn_output = compact_gqa_sdpa_bhsd(
+            &query_states,
+            &key_states,
+            &value_states,
+            mask.map(|mask| CompactGqaMask::Boolean {
+                mask,
+                masked_value: &self.neg_inf,
+            }),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?;
         let attn_output =
             attn_output
                 .transpose(1, 2)?
@@ -934,12 +921,6 @@ impl QuantizedLfm2Backbone {
             .collect();
         Tensor::from_slice(&mask, (seq_len, seq_len), device).map_err(Error::from)
     }
-}
-
-fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Tensor> {
-    let shape = mask.shape();
-    mask.where_cond(&on_true.broadcast_as(shape.dims())?, on_false)
-        .map_err(Error::from)
 }
 
 fn lfm25_cuda_flash_attention_options(

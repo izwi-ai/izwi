@@ -4,12 +4,11 @@
 //! Implementation mirrors the official 12Hz decoder architecture:
 //! RVQ projection -> pre-conv -> pre-transformer -> upsample stack -> decoder blocks -> waveform.
 
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, LayerNormConfig,
     Linear, Module, RmsNorm, VarBuilder,
 };
-use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::Deserialize;
 use tracing::{debug, info};
 
@@ -17,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
 };
+use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
 
 /// Speech Tokenizer Configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -604,9 +604,6 @@ impl EncoderAttention {
         q = self.apply_rope(q)?;
         k = self.apply_rope(k)?;
 
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
@@ -624,19 +621,14 @@ impl EncoderAttention {
                 return self.o_proj.forward(&out).map_err(Error::from);
             }
         }
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-        let mask = causal_mask(seq_len, total_len, 0, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
+        let mask = causal_mask(seq_len, total_len, 0, q.device(), q.dtype())?;
+        let out = compact_gqa_sdpa_bhsd(
+            &q,
+            &k,
+            &v,
+            Some(CompactGqaMask::Additive(&mask)),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?;
         let out = out
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
@@ -1005,9 +997,6 @@ impl Attention {
         q = self.apply_rope(q)?;
         k = self.apply_rope(k)?;
 
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
@@ -1026,22 +1015,14 @@ impl Attention {
             }
         }
 
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale)?;
-
-        let mask = causal_mask(seq_len, total_len, 0, att.device(), att.dtype())?;
-        att = att.broadcast_add(&mask)?;
-
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
+        let mask = causal_mask(seq_len, total_len, 0, q.device(), q.dtype())?;
+        let out = compact_gqa_sdpa_bhsd(
+            &q,
+            &k,
+            &v,
+            Some(CompactGqaMask::Additive(&mask)),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?;
         let out = out
             .transpose(1, 2)?
             .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
@@ -1837,22 +1818,6 @@ impl SpeechTokenizerDecoder {
             .to_vec1::<f32>()
             .map_err(Error::from)
     }
-}
-
-/// Repeat KV heads for GQA.
-fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
-    if num_heads == num_kv_heads {
-        return Ok(x.clone());
-    }
-    if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
-        return Err(Error::InvalidInput(format!(
-            "Invalid GQA head config: num_heads={num_heads}, num_kv_heads={num_kv_heads}"
-        )));
-    }
-    let repeats = num_heads / num_kv_heads;
-    let x = x.transpose(1, 2)?;
-    let out = candle_repeat_kv(x, repeats)?;
-    out.transpose(1, 2).map_err(Error::from)
 }
 
 /// Build standard RoPE cos/sin cache.

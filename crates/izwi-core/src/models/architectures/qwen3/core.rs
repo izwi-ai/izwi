@@ -4,7 +4,9 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+#[cfg(test)]
+use candle_core::D;
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
 #[cfg(test)]
 use candle_nn::kv_cache::Cache;
 use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
@@ -31,10 +33,13 @@ use crate::kv::v2::{
 use crate::kv::KvDecodeBatchMetadata;
 #[cfg(test)]
 use crate::kv::{CacheBlockRef, KvLayerBinding};
+#[cfg(test)]
 use crate::models::shared::attention::batched::{
     batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
 };
 use crate::models::shared::attention::flash::try_fused_self_attention;
+use crate::models::shared::attention::geometry::AttentionGeometry;
+use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
 #[cfg(test)]
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
@@ -94,13 +99,49 @@ pub struct Qwen3Config {
 }
 
 impl Qwen3Config {
+    pub(crate) fn attention_geometry(&self) -> Result<AttentionGeometry> {
+        if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3 attention geometry is invalid: rope_theta must be finite and positive, got {}",
+                self.rope_theta
+            )));
+        }
+        let geometry = AttentionGeometry::from_hidden_size(
+            "Qwen3",
+            self.hidden_size,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        )?;
+        geometry.validate_rotary_dim("Qwen3", geometry.key_head_dim())?;
+        Ok(geometry)
+    }
+
+    /// Compatibility accessor for callers that only inspect a parsed config.
+    /// Model construction uses [`Self::attention_geometry`] and returns a typed
+    /// error for invalid geometry rather than relying on this sentinel value.
     pub fn head_dim(&self) -> usize {
-        self.head_dim
-            .unwrap_or(self.hidden_size / self.num_attention_heads)
+        match self.head_dim {
+            Some(head_dim) => head_dim,
+            None if self.num_attention_heads != 0
+                && self.hidden_size.is_multiple_of(self.num_attention_heads) =>
+            {
+                self.hidden_size / self.num_attention_heads
+            }
+            None => 0,
+        }
     }
 
     pub fn kv_groups(&self) -> usize {
-        self.num_attention_heads / self.num_key_value_heads
+        if self.num_key_value_heads != 0
+            && self
+                .num_attention_heads
+                .is_multiple_of(self.num_key_value_heads)
+        {
+            self.num_attention_heads / self.num_key_value_heads
+        } else {
+            0
+        }
     }
 
     pub fn context_length(&self) -> Option<usize> {
@@ -1183,10 +1224,10 @@ impl Qwen3FusedQuantizedQkvProjection {
         device: &Device,
         prefix: &str,
     ) -> Result<Self> {
-        let head_dim = cfg.head_dim();
-        let q_out = cfg.num_attention_heads * head_dim;
-        let k_out = cfg.num_key_value_heads * head_dim;
-        let v_out = cfg.num_key_value_heads * head_dim;
+        let geometry = cfg.attention_geometry()?;
+        let q_out = geometry.query_width();
+        let k_out = geometry.key_width();
+        let v_out = geometry.value_width();
         let names = [
             format!("{prefix}.q_proj.weight"),
             format!("{prefix}.k_proj.weight"),
@@ -1540,27 +1581,16 @@ struct Qwen3Attention {
 
 impl Qwen3Attention {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let head_dim = cfg.head_dim();
-        let q_proj = Qwen3Projection::dense(
-            cfg.hidden_size,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("q_proj"),
-        )?;
-        let k_proj = Qwen3Projection::dense(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = Qwen3Projection::dense(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = Qwen3Projection::dense(
-            cfg.num_attention_heads * head_dim,
-            cfg.hidden_size,
-            vb.pp("o_proj"),
-        )?;
+        let geometry = cfg.attention_geometry()?;
+        let head_dim = geometry.key_head_dim();
+        let q_proj =
+            Qwen3Projection::dense(cfg.hidden_size, geometry.query_width(), vb.pp("q_proj"))?;
+        let k_proj =
+            Qwen3Projection::dense(cfg.hidden_size, geometry.key_width(), vb.pp("k_proj"))?;
+        let v_proj =
+            Qwen3Projection::dense(cfg.hidden_size, geometry.value_width(), vb.pp("v_proj"))?;
+        let o_proj =
+            Qwen3Projection::dense(geometry.query_width(), cfg.hidden_size, vb.pp("o_proj"))?;
         let qkv_proj = Qwen3QkvProjection::new_dense(q_proj, k_proj, v_proj, vb.device())?;
 
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
@@ -1599,7 +1629,7 @@ impl Qwen3Attention {
         dtype: DType,
         prefix: &str,
     ) -> Result<Self> {
-        let head_dim = cfg.head_dim();
+        let head_dim = cfg.attention_geometry()?.key_head_dim();
         let qkv_proj = if qwen3_quantized_projection_grouping_enabled(device, cfg) {
             Qwen3QkvProjection::new_quantized_grouped(loader, cfg, device, prefix)?
         } else {
@@ -1803,27 +1833,6 @@ impl Qwen3Attention {
         let (query, key) = self.apply_qk_norm_pair(query, key, sequence)?;
         let (query, key) = self.apply_rope_pair(query, key, start_pos, position_ids)?;
 
-        if batch > 1 {
-            let key = repeat_kv(&key, self.num_heads, self.num_kv_heads)?;
-            let value = repeat_kv(&value, self.num_heads, self.num_kv_heads)?;
-            let input = BatchedAttentionInput {
-                queries: query.reshape((batch, sequence, self.num_heads * self.head_dim))?,
-                keys: key.reshape((batch, sequence, self.num_heads * self.head_dim))?,
-                values: value.reshape((batch, sequence, self.num_heads * self.head_dim))?,
-                attention_mask: (sequence > 1)
-                    .then(|| causal_mask(sequence, sequence, start_pos, x.device(), x.dtype()))
-                    .transpose()?,
-                seq_lengths: vec![sequence; batch],
-            };
-            return self
-                .o_proj
-                .forward(&batched_scaled_dot_product_attention(
-                    &input,
-                    &BatchedAttentionConfig::new(self.num_heads, self.head_dim),
-                )?)
-                .map_err(Error::from);
-        }
-
         let query = query.transpose(1, 2)?;
         let key_heads = key.transpose(1, 2)?;
         let value_heads = value.transpose(1, 2)?;
@@ -1847,27 +1856,18 @@ impl Qwen3Attention {
             }
         }
 
-        let key = repeat_kv(&key, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
-        let value = repeat_kv(&value, self.num_heads, self.num_kv_heads)?.transpose(1, 2)?;
-        let query = query.reshape((batch * self.num_heads, sequence, self.head_dim))?;
-        let key = key.reshape((batch * self.num_heads, sequence, self.head_dim))?;
-        let value = value.reshape((batch * self.num_heads, sequence, self.head_dim))?;
-        let mut scores = query.matmul(&key.transpose(1, 2)?)?;
-        scores = (scores / (self.head_dim as f64).sqrt())?;
-        if sequence > 1 {
-            scores = scores.broadcast_add(&causal_mask(
-                sequence,
-                sequence,
-                start_pos,
-                scores.device(),
-                scores.dtype(),
-            )?)?;
-        }
-        let output = ops::softmax(&scores, D::Minus1)?
-            .matmul(&value)?
-            .reshape((batch, self.num_heads, sequence, self.head_dim))?
-            .transpose(1, 2)?
-            .reshape((batch, sequence, self.num_heads * self.head_dim))?;
+        let mask = (sequence > 1)
+            .then(|| causal_mask(sequence, sequence, start_pos, query.device(), query.dtype()))
+            .transpose()?;
+        let output = compact_gqa_sdpa_bhsd(
+            &query,
+            &key_heads,
+            &value_heads,
+            mask.as_ref().map(CompactGqaMask::Additive),
+            1.0 / (self.head_dim as f64).sqrt(),
+        )?
+        .transpose(1, 2)?
+        .reshape((batch, sequence, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
@@ -2519,14 +2519,15 @@ impl Qwen3Model {
         storage_dtype: DType,
         preferred_page_tokens: usize,
     ) -> Result<InferenceStateContract> {
+        let attention = self.cfg.attention_geometry()?;
         let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
             domain,
             clock: StateClock::DecoderTokens,
             num_layers: self.cfg.num_hidden_layers,
             num_query_heads: self.cfg.num_attention_heads,
             num_kv_heads: self.cfg.num_key_value_heads,
-            key_head_dim: self.cfg.head_dim(),
-            value_head_dim: self.cfg.head_dim(),
+            key_head_dim: attention.key_head_dim(),
+            value_head_dim: attention.value_head_dim(),
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
@@ -2556,6 +2557,7 @@ impl Qwen3Model {
         vb: VarBuilder,
         layout: Qwen3WeightLayout,
     ) -> Result<Self> {
+        cfg.attention_geometry()?;
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
         let embed_tokens = mlx::load_embedding(
             cfg.vocab_size,
@@ -2626,6 +2628,7 @@ impl Qwen3Model {
         dtype: DType,
         prefix: &str,
     ) -> Result<Self> {
+        cfg.attention_geometry()?;
         let lm_head_size = cfg.lm_head_size.unwrap_or(cfg.vocab_size);
         let model_prefix = qwen3_join_prefix(prefix, "model");
         let embed_name = qwen3_join_prefix(&model_prefix, "embed_tokens.weight");
@@ -2828,7 +2831,7 @@ impl Qwen3Model {
         cache.validate_model(
             self.cfg.num_hidden_layers,
             self.cfg.num_key_value_heads,
-            self.cfg.head_dim(),
+            self.cfg.attention_geometry()?.key_head_dim(),
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
@@ -2877,7 +2880,7 @@ impl Qwen3Model {
             cache.validate_model(
                 self.cfg.num_hidden_layers,
                 self.cfg.num_key_value_heads,
-                self.cfg.head_dim(),
+                self.cfg.attention_geometry()?.key_head_dim(),
             )?;
             cache.slots_for_append(start_positions[row], 1)?;
         }
@@ -3069,20 +3072,27 @@ pub(crate) fn dense_decode_attention(
         return out.transpose(1, 2).map_err(Error::from);
     }
 
-    let k = k_heads.transpose(1, 2)?.contiguous()?;
-    let v = v_heads.transpose(1, 2)?.contiguous()?;
-    let k = repeat_kv(&k, num_heads, num_kv_heads)?;
-    let v = repeat_kv(&v, num_heads, num_kv_heads)?;
-    let k_heads = k.transpose(1, 2)?.contiguous()?;
-    let v_heads = v.transpose(1, 2)?.contiguous()?;
-    let k_heads_t = k_heads.transpose(2, 3)?.contiguous()?;
-    let mut att = q_heads.matmul(&k_heads_t)?;
-    att = (att / (head_dim as f64).sqrt())?;
-    let att = ops::softmax(&att, D::Minus1)?;
-    let out = att.matmul(&v_heads)?;
-    out.transpose(1, 2)?
-        .reshape((bsz, seq_len, num_heads, head_dim))
-        .map_err(Error::from)
+    if q_heads.dim(1)? != num_heads
+        || k_heads.dim(1)? != num_kv_heads
+        || v_heads.dim(1)? != num_kv_heads
+    {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3 dense decode head geometry does not match config: q={:?}, k={:?}, v={:?}, expected query_heads={num_heads}, kv_heads={num_kv_heads}",
+            q_heads.dims(),
+            k_heads.dims(),
+            v_heads.dims()
+        )));
+    }
+    compact_gqa_sdpa_bhsd(
+        &q_heads,
+        k_heads,
+        v_heads,
+        None,
+        1.0 / (head_dim as f64).sqrt(),
+    )?
+    .transpose(1, 2)?
+    .reshape((bsz, seq_len, num_heads, head_dim))
+    .map_err(Error::from)
 }
 
 pub fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
@@ -3330,6 +3340,76 @@ mod tests {
     use crate::kv::{KvArenaId, KvGroupId};
     use candle_nn::rotary_emb;
     use std::collections::HashMap;
+
+    fn attention_config(
+        hidden_size: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: Option<usize>,
+    ) -> Qwen3Config {
+        Qwen3Config {
+            hidden_size,
+            intermediate_size: hidden_size.saturating_mul(2),
+            num_attention_heads: query_heads,
+            num_hidden_layers: 1,
+            num_key_value_heads: kv_heads,
+            max_position_embeddings: Some(128),
+            head_dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            vocab_size: 32,
+            lm_head_size: None,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            ada_rms_norm_t_cond: false,
+            ada_rms_norm_t_cond_dim: 0,
+        }
+    }
+
+    #[test]
+    fn qwen3_attention_geometry_accepts_explicit_gqa_width() {
+        let config = attention_config(3072, 32, 8, Some(128));
+        let geometry = config.attention_geometry().unwrap();
+        assert_eq!(geometry.query_width(), 4096);
+        assert_eq!(geometry.key_width(), 1024);
+        assert_eq!(geometry.kv_groups(), 4);
+    }
+
+    #[test]
+    fn qwen3_malformed_heads_return_errors_without_division_panics() {
+        let zero_query = attention_config(4096, 0, 8, Some(128));
+        assert_eq!(zero_query.head_dim(), 128);
+        assert!(zero_query
+            .attention_geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("head counts must be non-zero"));
+
+        let inferred_zero_query = attention_config(4096, 0, 8, None);
+        assert_eq!(inferred_zero_query.head_dim(), 0);
+        assert!(inferred_zero_query.attention_geometry().is_err());
+
+        let zero_kv = attention_config(4096, 32, 0, Some(128));
+        assert_eq!(zero_kv.kv_groups(), 0);
+        assert!(zero_kv.attention_geometry().is_err());
+
+        let non_divisible = attention_config(1536, 12, 5, Some(128));
+        assert!(non_divisible
+            .attention_geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("query heads must be divisible"));
+
+        let mut invalid_theta = attention_config(4096, 32, 8, Some(128));
+        invalid_theta.rope_theta = f64::NAN;
+        assert!(invalid_theta
+            .attention_geometry()
+            .unwrap_err()
+            .to_string()
+            .contains("rope_theta must be finite and positive"));
+    }
 
     #[test]
     fn canonical_qwen3_gguf_names_cover_the_native_decoder_graph() {

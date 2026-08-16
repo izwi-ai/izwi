@@ -19,7 +19,35 @@ use crate::kv::v2::{
     StateScope, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::kv::KvDecodeBatchMetadata;
+use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+
+fn gemma_attention_geometry(config: &Config) -> Result<AttentionGeometry> {
+    for (name, value) in [
+        ("rope_theta", config.rope_theta),
+        ("rope_local_base_freq", config.rope_local_base_freq),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::ModelLoadError(format!(
+                "Gemma3 attention geometry is invalid: {name} must be finite and positive, got {value}"
+            )));
+        }
+    }
+    let geometry = AttentionGeometry::new(
+        "Gemma3",
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.head_dim,
+        config.head_dim,
+    )?;
+    geometry.validate_rotary_dim("Gemma3", geometry.key_head_dim())?;
+    if config.query_pre_attn_scalar == 0 {
+        return Err(Error::ModelLoadError(
+            "Gemma3 attention geometry is invalid: query_pre_attn_scalar must be non-zero".into(),
+        ));
+    }
+    Ok(geometry)
+}
 
 #[derive(Debug, Clone)]
 struct GemmaRmsNorm {
@@ -181,28 +209,29 @@ struct GemmaAttention {
 
 impl GemmaAttention {
     fn load(config: &Config, vb: VarBuilder, sliding_window: Option<usize>) -> Result<Self> {
+        let geometry = gemma_attention_geometry(config)?;
         let bias = config.attention_bias;
         Ok(Self {
             query: linear(
                 config.hidden_size,
-                config.num_attention_heads * config.head_dim,
+                geometry.query_width(),
                 bias,
                 vb.pp("q_proj"),
             )?,
             key: linear(
                 config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
+                geometry.key_width(),
                 bias,
                 vb.pp("k_proj"),
             )?,
             value: linear(
                 config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
+                geometry.value_width(),
                 bias,
                 vb.pp("v_proj"),
             )?,
             output: linear(
-                config.num_attention_heads * config.head_dim,
+                geometry.query_width(),
                 config.hidden_size,
                 bias,
                 vb.pp("o_proj"),
@@ -483,6 +512,7 @@ impl Gemma3PhysicalModel {
     }
 
     pub(crate) fn load(config: Config, vb: VarBuilder) -> Result<Self> {
+        gemma_attention_geometry(&config)?;
         if let Some(softcap) = config.attn_logit_softcapping {
             AttentionLogitSoftcap::new(softcap as f32).map_err(|_| {
                 Error::ModelLoadError(
@@ -740,6 +770,46 @@ mod tests {
             sliding_window_pattern: 2,
             max_position_embeddings: 16,
         }
+    }
+
+    #[test]
+    fn gemma_attention_geometry_accepts_grouped_query_heads() {
+        let geometry = gemma_attention_geometry(&tiny_config()).unwrap();
+        assert_eq!(geometry.query_width(), 4);
+        assert_eq!(geometry.key_width(), 2);
+        assert_eq!(geometry.kv_groups(), 2);
+    }
+
+    #[test]
+    fn gemma_attention_geometry_rejects_invalid_heads_rope_and_scale() {
+        let mut config = tiny_config();
+        config.num_attention_heads = 0;
+        assert!(gemma_attention_geometry(&config).is_err());
+
+        let mut config = tiny_config();
+        config.num_key_value_heads = 0;
+        assert!(gemma_attention_geometry(&config).is_err());
+
+        let mut config = tiny_config();
+        config.head_dim = 3;
+        assert!(gemma_attention_geometry(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("rotary dimension"));
+
+        let mut config = tiny_config();
+        config.query_pre_attn_scalar = 0;
+        assert!(gemma_attention_geometry(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("query_pre_attn_scalar"));
+
+        let mut config = tiny_config();
+        config.rope_local_base_freq = f64::INFINITY;
+        assert!(gemma_attention_geometry(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("rope_local_base_freq must be finite and positive"));
     }
 
     fn values(count: usize, scale: f32) -> Vec<f32> {

@@ -86,6 +86,7 @@ struct VoxtralAdaRmsNorm {
 
 impl VoxtralLM {
     pub fn load(cfg: Qwen3Config, vb: VarBuilder) -> Result<Self> {
+        cfg.attention_geometry()?;
         let embed_tokens = load_embedding_from_candidates(&vb, &cfg)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -143,14 +144,15 @@ impl VoxtralLM {
         storage_dtype: DType,
         preferred_page_tokens: usize,
     ) -> Result<InferenceStateContract> {
+        let attention = self.cfg.attention_geometry()?;
         let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
             domain,
             clock: StateClock::DecoderTokens,
             num_layers: self.cfg.num_hidden_layers,
             num_query_heads: self.cfg.num_attention_heads,
             num_kv_heads: self.cfg.num_key_value_heads,
-            key_head_dim: self.cfg.head_dim(),
-            value_head_dim: self.cfg.head_dim(),
+            key_head_dim: attention.key_head_dim(),
+            value_head_dim: attention.value_head_dim(),
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
@@ -233,7 +235,11 @@ impl VoxtralLM {
         let end_pos = start_pos
             .checked_add(sequence_len)
             .ok_or_else(|| Error::InvalidInput("Voxtral managed context length overflow".into()))?;
-        if self.cfg.context_length().is_some_and(|limit| end_pos > limit) {
+        if self
+            .cfg
+            .context_length()
+            .is_some_and(|limit| end_pos > limit)
+        {
             return Err(Error::InvalidInput(format!(
                 "Voxtral sequence ends at {end_pos}, beyond the loaded model context"
             )));
@@ -244,7 +250,7 @@ impl VoxtralLM {
         cache.validate_model(
             self.cfg.num_hidden_layers,
             self.cfg.num_key_value_heads,
-            self.cfg.head_dim(),
+            self.cfg.attention_geometry()?.key_head_dim(),
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
@@ -373,27 +379,15 @@ impl VoxtralLayer {
 
 impl VoxtralAttention {
     fn load(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let head_dim = cfg.head_dim();
-        let q_proj = candle_nn::linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("wq"),
-        )?;
-        let k_proj = candle_nn::linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("wk"),
-        )?;
-        let v_proj = candle_nn::linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("wv"),
-        )?;
-        let o_proj = candle_nn::linear_no_bias(
-            cfg.num_attention_heads * head_dim,
-            cfg.hidden_size,
-            vb.pp("wo"),
-        )?;
+        let geometry = cfg.attention_geometry()?;
+        let head_dim = geometry.key_head_dim();
+        let q_proj =
+            candle_nn::linear_no_bias(cfg.hidden_size, geometry.query_width(), vb.pp("wq"))?;
+        let k_proj = candle_nn::linear_no_bias(cfg.hidden_size, geometry.key_width(), vb.pp("wk"))?;
+        let v_proj =
+            candle_nn::linear_no_bias(cfg.hidden_size, geometry.value_width(), vb.pp("wv"))?;
+        let o_proj =
+            candle_nn::linear_no_bias(geometry.query_width(), cfg.hidden_size, vb.pp("wo"))?;
 
         let q_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm")).ok();
         let k_norm = candle_nn::rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm")).ok();
@@ -471,9 +465,8 @@ impl VoxtralAttention {
         let v = v.squeeze(0)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let out = match self.sliding_window {
-            Some(window) => cache.write_and_attend_with_window(
-                layer_idx, prepared, &q, &k, &v, scale, window,
-            )?,
+            Some(window) => cache
+                .write_and_attend_with_window(layer_idx, prepared, &q, &k, &v, scale, window)?,
             None => cache.write_and_attend(layer_idx, prepared, &q, &k, &v, scale)?,
         };
         let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;

@@ -20,6 +20,7 @@ use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv};
 use crate::models::shared::attention::flash::{
     try_fused_self_attention, try_fused_self_attention_scaled,
 };
+use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
@@ -602,6 +603,31 @@ impl GraniteTextExecutionPlan {
     }
 }
 
+fn granite_text_attention_geometry(config: &GraniteTextConfig) -> Result<AttentionGeometry> {
+    for (name, value) in [
+        ("rope_theta", config.rope_theta),
+        (
+            "attention_multiplier",
+            f64::from(config.attention_multiplier),
+        ),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::ModelLoadError(format!(
+                "Granite Speech text attention geometry is invalid: {name} must be finite and positive, got {value}"
+            )));
+        }
+    }
+    let geometry = AttentionGeometry::from_hidden_size(
+        "Granite Speech text",
+        config.hidden_size,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        None,
+    )?;
+    geometry.validate_rotary_dim("Granite Speech text", geometry.key_head_dim())?;
+    Ok(geometry)
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -625,6 +651,9 @@ impl GraniteSpeechRuntime {
         device: &DeviceProfile,
         dtype: DType,
     ) -> Result<Self> {
+        // Reject malformed text geometry before mapping a potentially large
+        // checkpoint and before any head-dimension division occurs.
+        granite_text_attention_geometry(&config.text_config)?;
         let load_started = Instant::now();
         let mmap_started = Instant::now();
         let vb = unsafe {
@@ -2452,12 +2481,9 @@ impl GraniteTextAttention {
         prescale_residual: bool,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
-        let head_dim = config.hidden_size / config.num_attention_heads;
-        let o_proj = linear_no_bias(
-            config.num_attention_heads * head_dim,
-            config.hidden_size,
-            vb.pp("o_proj"),
-        )?;
+        let geometry = granite_text_attention_geometry(config)?;
+        let head_dim = geometry.key_head_dim();
+        let o_proj = linear_no_bias(geometry.query_width(), config.hidden_size, vb.pp("o_proj"))?;
         let o_proj =
             maybe_prescale_residual_linear(o_proj, config.residual_multiplier, prescale_residual)?;
         let o_proj = if execution_plan.selective_f16_attention_output {
@@ -3199,6 +3225,44 @@ mod tests {
             use_cache: true,
             vocab_size: 16,
         }
+    }
+
+    #[test]
+    fn granite_text_attention_geometry_is_checked_before_division() {
+        let geometry = granite_text_attention_geometry(&tiny_granite_text_config()).unwrap();
+        assert_eq!(geometry.query_width(), 4);
+        assert_eq!(geometry.key_width(), 2);
+        assert_eq!(geometry.kv_groups(), 2);
+
+        let mut zero_query = tiny_granite_text_config();
+        zero_query.num_attention_heads = 0;
+        assert!(granite_text_attention_geometry(&zero_query)
+            .unwrap_err()
+            .to_string()
+            .contains("head counts must be non-zero"));
+
+        let mut non_divisible_hidden = tiny_granite_text_config();
+        non_divisible_hidden.hidden_size = 5;
+        assert!(granite_text_attention_geometry(&non_divisible_hidden)
+            .unwrap_err()
+            .to_string()
+            .contains("hidden size 5 is not divisible"));
+
+        let mut non_divisible_heads = tiny_granite_text_config();
+        non_divisible_heads.num_attention_heads = 3;
+        non_divisible_heads.num_key_value_heads = 2;
+        non_divisible_heads.hidden_size = 6;
+        assert!(granite_text_attention_geometry(&non_divisible_heads)
+            .unwrap_err()
+            .to_string()
+            .contains("query heads must be divisible"));
+
+        let mut invalid_scale = tiny_granite_text_config();
+        invalid_scale.attention_multiplier = 0.0;
+        assert!(granite_text_attention_geometry(&invalid_scale)
+            .unwrap_err()
+            .to_string()
+            .contains("attention_multiplier must be finite and positive"));
     }
 
     fn tiny_granite_text_tensors(device: &Device) -> HashMap<String, Tensor> {
