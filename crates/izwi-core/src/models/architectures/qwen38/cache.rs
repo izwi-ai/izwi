@@ -290,4 +290,22 @@ mod tests {
         assert_eq!(runtime.state_plan_v2().non_paged.len(), 2);
         assert!(runtime.tensor_state().is_some());
     }
+
+    #[test]
+    fn bf16_attention_storage_does_not_change_transactional_state_dtypes() {
+        let contract = qwen38_composite_cache_contract(&config(), DType::BF16, 64).unwrap();
+        let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
+            panic!("expected attention domain");
+        };
+        assert_eq!(attention.accepted_dtypes, vec![StateDType::Bf16]);
+        for domain in &contract.domains[1..] {
+            let StateDomainSpec::Tensor(tensor) = domain else {
+                panic!("expected transactional tensor domain");
+            };
+            assert!(tensor
+                .components
+                .iter()
+                .all(|component| component.accepted_dtypes == vec![StateDType::F32]));
+        }
+    }
 }

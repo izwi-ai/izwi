@@ -14,6 +14,8 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_q8_projection_calls_total: u64,
     pub cuda_dense_projection_calls_total: u64,
     pub cuda_attention_dtype_casts_total: u64,
+    pub cuda_bf16_kv_provider_selected_total: u64,
+    pub cuda_f16_kv_fallback_selected_total: u64,
     pub cuda_state_initial_allocations_total: u64,
     pub cuda_head_expansion_materializations_total: u64,
     pub cuda_silu_mul_attempts_total: u64,
@@ -57,6 +59,8 @@ counters!(
     CUDA_Q8_PROJECTION_CALLS,
     CUDA_DENSE_PROJECTION_CALLS,
     CUDA_ATTENTION_DTYPE_CASTS,
+    CUDA_BF16_KV_PROVIDER_SELECTED,
+    CUDA_F16_KV_FALLBACK_SELECTED,
     CUDA_STATE_INITIAL_ALLOCATIONS,
     CUDA_HEAD_EXPANSION_MATERIALIZATIONS,
     CUDA_SILU_MUL_ATTEMPTS,
@@ -116,6 +120,14 @@ pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
 
 pub(crate) fn record_cuda_attention_dtype_casts(count: usize) {
     CUDA_ATTENTION_DTYPE_CASTS.fetch_add(count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_cuda_kv_provider(bf16_selected: bool) {
+    if bf16_selected {
+        CUDA_BF16_KV_PROVIDER_SELECTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_F16_KV_FALLBACK_SELECTED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn record_cuda_state_initial_allocation() {
@@ -208,6 +220,8 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_q8_projection_calls_total: load!(CUDA_Q8_PROJECTION_CALLS),
         cuda_dense_projection_calls_total: load!(CUDA_DENSE_PROJECTION_CALLS),
         cuda_attention_dtype_casts_total: load!(CUDA_ATTENTION_DTYPE_CASTS),
+        cuda_bf16_kv_provider_selected_total: load!(CUDA_BF16_KV_PROVIDER_SELECTED),
+        cuda_f16_kv_fallback_selected_total: load!(CUDA_F16_KV_FALLBACK_SELECTED),
         cuda_state_initial_allocations_total: load!(CUDA_STATE_INITIAL_ALLOCATIONS),
         cuda_head_expansion_materializations_total: load!(CUDA_HEAD_EXPANSION_MATERIALIZATIONS),
         cuda_silu_mul_attempts_total: load!(CUDA_SILU_MUL_ATTEMPTS),
@@ -249,6 +263,8 @@ mod tests {
     fn snapshot_serializes_stable_evidence_names() {
         let value = serde_json::to_value(Qwen38OptimizationTelemetrySnapshot::default()).unwrap();
         assert_eq!(value["cuda_projection_calls_total"], 0);
+        assert_eq!(value["cuda_bf16_kv_provider_selected_total"], 0);
+        assert_eq!(value["cuda_f16_kv_fallback_selected_total"], 0);
         assert_eq!(value["cuda_deltanet_decode_fallback_total"], 0);
         assert_eq!(value["sampling_bounded_cuda_fallback_to_host_total"], 0);
     }
