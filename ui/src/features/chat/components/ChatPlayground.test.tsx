@@ -1,4 +1,11 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { ChatPlayground } from "@/features/chat/components/ChatPlayground";
@@ -164,6 +171,105 @@ describe("ChatPlayground", () => {
     const tokensStat = screen.getByText("12 tokens");
     const position = sendButton.compareDocumentPosition(tokensStat);
     expect(position & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("stops following streamed output while the user reads earlier messages", async () => {
+    const thread = {
+      id: "thread-scroll",
+      title: "Scrollable thread",
+      model_id: "Gemma-3-1b-it",
+      created_at: 1,
+      updated_at: 2,
+      last_message_preview: "Earlier answer",
+      message_count: 2,
+    };
+    let streamCallbacks: { onDelta: (delta: string) => void } | null = null;
+
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({
+      thread,
+      messages: [
+        {
+          id: "message-user",
+          thread_id: thread.id,
+          role: "user",
+          content: "Earlier question",
+          created_at: 1,
+          tokens_generated: null,
+          generation_time_ms: null,
+        },
+        {
+          id: "message-assistant",
+          thread_id: thread.id,
+          role: "assistant",
+          content: "Earlier answer",
+          created_at: 2,
+          tokens_generated: 2,
+          generation_time_ms: 10,
+        },
+      ],
+    });
+    apiMocks.sendChatThreadMessageStream.mockImplementation(
+      (_threadId, _request, callbacks) => {
+        streamCallbacks = callbacks;
+        return new AbortController();
+      },
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat?threadId=thread-scroll"]}>
+        <ChatPlayground
+          selectedModel="Gemma-3-1b-it"
+          selectedModelReady={true}
+          supportsThinking={false}
+          modelLabel="Gemma 3 1B"
+          modelOptions={[
+            {
+              value: "Gemma-3-1b-it",
+              label: "Gemma 3 1B",
+              statusLabel: "Ready",
+              isReady: true,
+            },
+          ]}
+          onSelectModel={vi.fn()}
+          onOpenModelManager={vi.fn()}
+          onModelRequired={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Earlier answer");
+    const viewport = screen.getByTestId("chat-message-viewport");
+    let scrollHeight = 1_200;
+    Object.defineProperties(viewport, {
+      clientHeight: { configurable: true, get: () => 400 },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: { configurable: true, writable: true, value: 800 },
+    });
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "A new question" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(streamCallbacks).not.toBeNull());
+    expect(viewport.scrollTop).toBe(scrollHeight);
+
+    viewport.scrollTop = 300;
+    fireEvent.scroll(viewport);
+    scrollHeight = 1_300;
+    act(() => streamCallbacks?.onDelta("First token"));
+    expect(viewport.scrollTop).toBe(300);
+
+    scrollHeight = 1_400;
+    act(() => streamCallbacks?.onDelta(" second token"));
+    expect(viewport.scrollTop).toBe(300);
+
+    viewport.scrollTop = 1_000;
+    fireEvent.scroll(viewport);
+    scrollHeight = 1_500;
+    act(() => streamCallbacks?.onDelta(" third token"));
+    expect(viewport.scrollTop).toBe(scrollHeight);
   });
 
   it("lets the delete confirmation buttons work while the history drawer stays open", async () => {

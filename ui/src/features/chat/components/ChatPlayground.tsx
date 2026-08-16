@@ -2,6 +2,7 @@ import {
   type ChangeEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -116,8 +117,11 @@ export function ChatPlayground({
   const threadsRef = useRef<ChatThread[]>([]);
   const titleGenerationInFlightRef = useRef<Set<string>>(new Set());
   const streamAbortRef = useRef<AbortController | null>(null);
-  const listEndRef = useRef<HTMLDivElement | null>(null);
+  const messageViewportRef = useRef<HTMLDivElement | null>(null);
+  const followingOutputRef = useRef(true);
+  const followingOutputThreadRef = useRef<string | null>(null);
   const streamingThinkingRef = useRef<HTMLDivElement | null>(null);
+  const followingStreamingThinkingRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImageSeqRef = useRef(0);
@@ -313,17 +317,47 @@ export function ChatPlayground({
     };
   }, []);
 
-  useEffect(() => {
-    listEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  useLayoutEffect(() => {
+    if (followingOutputThreadRef.current !== activeThreadId) {
+      followingOutputThreadRef.current = activeThreadId;
+      followingOutputRef.current = true;
+    }
+    if (!followingOutputRef.current || !messageViewportRef.current) {
+      return;
+    }
+    messageViewportRef.current.scrollTop =
+      messageViewportRef.current.scrollHeight;
   }, [visibleMessages, isStreaming, activeThreadId]);
 
-  useEffect(() => {
-    if (!isStreaming || !streamingThinkingRef.current) {
+  useLayoutEffect(() => {
+    if (
+      !isStreaming ||
+      !followingStreamingThinkingRef.current ||
+      !streamingThinkingRef.current
+    ) {
       return;
     }
     streamingThinkingRef.current.scrollTop =
       streamingThinkingRef.current.scrollHeight;
   }, [isStreaming, messages]);
+
+  const handleMessageViewportScroll = useCallback(() => {
+    const viewport = messageViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    followingOutputRef.current =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
+  }, []);
+
+  const handleStreamingThinkingScroll = useCallback(() => {
+    const viewport = streamingThinkingRef.current;
+    if (!viewport) {
+      return;
+    }
+    followingStreamingThinkingRef.current =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 48;
+  }, []);
 
   useEffect(() => {
     if (!textareaRef.current) {
@@ -696,6 +730,8 @@ export function ChatPlayground({
       optimisticUserMessage,
       optimisticAssistantMessage,
     ]);
+    followingOutputRef.current = true;
+    followingStreamingThinkingRef.current = true;
     setInput("");
     setPendingImages([]);
     setIsStreaming(true);
@@ -1240,7 +1276,12 @@ export function ChatPlayground({
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
             <div className="relative flex-1 min-h-0">
-              <div className="h-full overflow-y-auto px-4 sm:px-6 pb-48 pt-3 scrollbar-thin">
+              <div
+                ref={messageViewportRef}
+                data-testid="chat-message-viewport"
+                onScroll={handleMessageViewportScroll}
+                className="h-full overflow-y-auto px-4 sm:px-6 pb-48 pt-3 scrollbar-thin"
+              >
                 {messagesLoading ? (
                   <div className="max-w-4xl mx-auto p-4 text-center text-xs text-muted-foreground flex items-center justify-center gap-2">
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -1408,6 +1449,7 @@ export function ChatPlayground({
                                       </div>
                                       <div
                                         ref={streamingThinkingRef}
+                                        onScroll={handleStreamingThinkingScroll}
                                         className="h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-[var(--border-muted)]/70 bg-background/60 px-2.5 py-2 font-mono text-[11px] leading-relaxed scrollbar-thin sm:h-48"
                                       >
                                         {parsed.thinking}
@@ -1478,7 +1520,6 @@ export function ChatPlayground({
                         </motion.div>
                       );
                     })}
-                    <div ref={listEndRef} />
                   </div>
                 )}
               </div>
