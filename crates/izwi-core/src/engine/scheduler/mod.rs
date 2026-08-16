@@ -20,15 +20,17 @@ use super::types::{Priority, RequestId, SequenceId, TaskType};
 use super::{InputRange, PlanId, SequencePhase, SessionKey, WorkUnit};
 use crate::model::ModelVariant;
 
+pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
+
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchedulingPolicy {
-    /// First-come, first-served (default)
-    #[default]
+    /// First-come, first-served.
     FCFS,
     /// Priority-based scheduling (higher priority first)
     Priority,
     /// Weighted workload-class service with priority ordering inside each class.
+    #[default]
     WeightedFair,
 }
 
@@ -97,7 +99,7 @@ impl Default for SchedulerConfig {
         Self {
             max_batch_size: 8,
             max_tokens_per_step: 384,
-            policy: SchedulingPolicy::FCFS,
+            policy: SchedulingPolicy::WeightedFair,
             enable_chunked_prefill: false,
             chunked_prefill_threshold: 192,
             enable_preemption: false,
@@ -366,6 +368,10 @@ pub struct Scheduler {
     telemetry: SchedulerTelemetry,
     /// Completed scheduling quanta by workload class for weighted service.
     class_service: HashMap<WorkloadClass, u64>,
+    /// Decode-only transactions observed while an indivisible full prefill was
+    /// waiting. This bounds starvation without pretending that a Full adapter
+    /// can safely resume a scheduler-authored chunk.
+    decode_only_steps_with_waiting_full_prefill: usize,
 }
 
 /// Metadata for a request in the scheduler.
@@ -399,7 +405,9 @@ impl Default for RequestCachePolicy {
     fn default() -> Self {
         Self {
             mode: None,
-            prefill: PrefillMode::Incremental,
+            // Fail closed until the loaded adapter explicitly proves resumable
+            // incremental-prefill safe points.
+            prefill: PrefillMode::Full,
             decode_batch: NativeBatchMode::None,
             recompute_safe: false,
             cache_release_safe: false,
@@ -449,6 +457,7 @@ impl Scheduler {
             next_plan_id: 1,
             telemetry,
             class_service: HashMap::new(),
+            decode_only_steps_with_waiting_full_prefill: 0,
         }
     }
 
@@ -539,6 +548,10 @@ impl Scheduler {
         self.update_dynamic_budget();
 
         let total_budget = self.current_token_budget();
+        let waiting_full_prefill = self.has_waiting_full_prefill();
+        let force_full_prefill_service = waiting_full_prefill
+            && self.decode_only_steps_with_waiting_full_prefill
+                >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL.saturating_sub(1);
         let latency_sensitive_waiting = self.has_latency_sensitive_waiting();
         let throughput_waiting_only =
             !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
@@ -571,6 +584,14 @@ impl Scheduler {
         {
             reserved_prefill_budget = total_budget.clamp(1, 32);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
+        }
+        if force_full_prefill_service {
+            // Full-prefill adapters expose no resumable scheduler safe point.
+            // Give one such prompt an isolated transaction after a bounded
+            // number of decode-only commits instead of mixing it behind live
+            // decode output or pretending it can honor a token chunk.
+            decode_budget = 0;
+            reserved_prefill_budget = total_budget;
         }
         let mut remaining_decode_budget = decode_budget;
 
@@ -742,7 +763,9 @@ impl Scheduler {
         }
 
         // Phase 2: schedule prefill requests.
-        let mut remaining_prefill_budget = if self.config.enable_adaptive_batching
+        let mut remaining_prefill_budget = if force_full_prefill_service {
+            reserved_prefill_budget
+        } else if self.config.enable_adaptive_batching
             || self.config.policy == SchedulingPolicy::WeightedFair
         {
             reserved_prefill_budget.saturating_add(remaining_decode_budget)
@@ -751,6 +774,7 @@ impl Scheduler {
         };
         let prefill_admission_cap = usize::MAX;
         let mut prefill_admissions = 0usize;
+        let mut scheduling_full_prefill_batch = false;
 
         // Phase 2a: continue incomplete prefills before admitting new waiting requests.
         // An in-flight quantum is excluded until update_after_step commits its
@@ -798,6 +822,12 @@ impl Scheduler {
             }
 
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
+            if force_full_prefill_service && !full_prefill {
+                continue;
+            }
+            if !full_prefill && scheduling_full_prefill_batch {
+                continue;
+            }
             let mut target_tokens = remaining_prompt;
             if !full_prefill
                 && self.config.enable_chunked_prefill
@@ -806,9 +836,12 @@ impl Scheduler {
                 target_tokens = effective_prefill_chunk_threshold;
             }
             if full_prefill {
-                if target_tokens > remaining_prefill_budget && result.has_execution_work() {
+                if !result.decode_requests.is_empty()
+                    || (!result.prefill_requests.is_empty() && !scheduling_full_prefill_batch)
+                {
                     continue;
                 }
+                scheduling_full_prefill_batch = true;
             } else {
                 target_tokens = target_tokens.min(remaining_prefill_budget);
             }
@@ -844,8 +877,12 @@ impl Scheduler {
                 },
             });
 
-            remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
-            remaining_batch -= 1;
+            if full_prefill {
+                remaining_batch -= 1;
+            } else {
+                remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
+                remaining_batch -= 1;
+            }
             result.total_tokens += num_tokens;
             self.record_class_service(metadata.workload_class, num_tokens);
         }
@@ -877,6 +914,14 @@ impl Scheduler {
 
             // Calculate tokens for this prefill.
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
+            if force_full_prefill_service && !full_prefill {
+                deferred_waiting.push(request_id);
+                continue;
+            }
+            if !full_prefill && scheduling_full_prefill_batch {
+                deferred_waiting.push(request_id);
+                continue;
+            }
             let mut target_tokens = metadata.total_prompt_tokens;
 
             // Apply chunked prefill if enabled and prompt is long
@@ -888,12 +933,15 @@ impl Scheduler {
             }
 
             // Full-prefill executors cannot honor a scheduler chunk. Permit one
-            // indivisible over-budget prompt only in an otherwise empty step.
+            // indivisible prompt only in an otherwise empty transaction.
             if full_prefill {
-                if target_tokens > remaining_prefill_budget && result.has_execution_work() {
+                if !result.decode_requests.is_empty()
+                    || (!result.prefill_requests.is_empty() && !scheduling_full_prefill_batch)
+                {
                     deferred_waiting.push(request_id);
                     continue;
                 }
+                scheduling_full_prefill_batch = true;
             } else {
                 target_tokens = target_tokens.min(remaining_prefill_budget);
             }
@@ -943,8 +991,12 @@ impl Scheduler {
 
             self.running.insert(request_id.clone(), running);
 
-            remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
-            remaining_batch -= 1;
+            if full_prefill {
+                remaining_batch -= 1;
+            } else {
+                remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
+                remaining_batch -= 1;
+            }
             prefill_admissions = prefill_admissions.saturating_add(1);
             result.total_tokens += num_tokens;
             self.record_class_service(metadata.workload_class, num_tokens);
@@ -952,6 +1004,19 @@ impl Scheduler {
 
         for request_id in deferred_waiting {
             self.enqueue_waiting_request(request_id);
+        }
+
+        let served_full_prefill = result.prefill_requests.iter().any(|scheduled| {
+            self.requests
+                .get(&scheduled.request_id)
+                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+        });
+        if served_full_prefill || !waiting_full_prefill {
+            self.decode_only_steps_with_waiting_full_prefill = 0;
+        } else if !result.decode_requests.is_empty() {
+            self.decode_only_steps_with_waiting_full_prefill = self
+                .decode_only_steps_with_waiting_full_prefill
+                .saturating_add(1);
         }
 
         result
@@ -1695,6 +1760,23 @@ impl Scheduler {
         })
     }
 
+    fn has_waiting_full_prefill(&self) -> bool {
+        let running_full = self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && !running.prefill_in_flight
+                && self
+                    .requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+        });
+        running_full
+            || self.waiting_members.iter().any(|request_id| {
+                self.requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+            })
+    }
+
     fn refresh_queue_age_sample(&mut self) {
         let (sum_ms, count) = self
             .requests
@@ -1901,6 +1983,17 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile));
+    }
+
+    fn allow_incremental_prefill(scheduler: &mut Scheduler, request_id: &str) {
+        let epoch = scheduler
+            .get_sequence_id(&request_id.to_string())
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
     }
 
     #[test]
@@ -2414,6 +2507,7 @@ mod tests {
         request.id = request_id.clone();
         request.prompt_tokens = vec![7; 8];
         scheduler.add_request(&request);
+        allow_incremental_prefill(&mut scheduler, &request_id);
 
         let scheduled = scheduler.schedule();
         assert_eq!(scheduled.prefill_requests.len(), 1);
@@ -2443,6 +2537,7 @@ mod tests {
         request.id = request_id.clone();
         request.prompt_tokens = vec![7; 8];
         scheduler.add_request(&request);
+        allow_incremental_prefill(&mut scheduler, &request_id);
 
         let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
@@ -2473,7 +2568,7 @@ mod tests {
     }
 
     #[test]
-    fn full_prefill_profile_schedules_the_entire_prompt_without_block_projection() {
+    fn unproven_prefill_profile_fails_closed_to_an_isolated_full_prompt() {
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 4,
@@ -2497,11 +2592,6 @@ mod tests {
             .get_sequence_id(&request_id)
             .expect("request epoch");
         let session = SessionKey::new(request_id.clone(), epoch);
-        let mut profile =
-            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
-        profile.prefill = PrefillMode::Full;
-        assert!(scheduler.update_execution_profile(&session, &profile));
-
         let scheduled = scheduler.schedule();
 
         assert_eq!(scheduled.prefill_requests.len(), 1);
@@ -2516,6 +2606,98 @@ mod tests {
                 max_output_steps: 8,
             }
         );
+    }
+
+    #[test]
+    fn full_prefill_is_isolated_from_live_decode() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 16,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+
+        let decode_id = "live-decode".to_string();
+        let decode = build_request(TaskType::Chat, &decode_id, Priority::Normal);
+        assert!(scheduler.add_request(&decode));
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&decode_id, decode.num_prompt_tokens(), 1, 1.0);
+
+        let full_id = "waiting-full-prefill".to_string();
+        let mut full = build_request(TaskType::Chat, &full_id, Priority::Normal);
+        full.prompt_tokens = vec![7; 4];
+        assert!(scheduler.add_request(&full));
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        assert!(scheduled.prefill_requests.is_empty());
+    }
+
+    #[test]
+    fn compatible_full_prefills_remain_logically_batchable() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 4,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        for request_id in ["full-a", "full-b"] {
+            let mut request = build_request(TaskType::Chat, request_id, Priority::Normal);
+            request.prompt_tokens = vec![1; 8];
+            assert!(scheduler.add_request(&request));
+        }
+
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.prefill_requests.len(), 2);
+        assert!(scheduled.decode_requests.is_empty());
+        assert_eq!(scheduled.total_tokens, 16);
+    }
+
+    #[test]
+    fn waiting_full_prefill_gets_bounded_service_among_decode_steps() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 16,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+
+        let decode_id = "persistent-decode".to_string();
+        let mut decode = build_request(TaskType::Chat, &decode_id, Priority::Normal);
+        decode.params.max_tokens = 64;
+        assert!(scheduler.add_request(&decode));
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&decode_id, decode.num_prompt_tokens(), 1, 1.0);
+
+        let full_id = "bounded-full-prefill".to_string();
+        let full = build_request(TaskType::Chat, &full_id, Priority::Normal);
+        assert!(scheduler.add_request(&full));
+
+        for step in 0..MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            let scheduled = scheduler.schedule();
+            if !scheduled.prefill_requests.is_empty() {
+                assert_eq!(scheduled.prefill_requests.len(), 1);
+                assert_eq!(scheduled.prefill_requests[0].request_id, full_id);
+                assert!(scheduled.decode_requests.is_empty());
+                assert!(step < MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL);
+                return;
+            }
+            assert_eq!(
+                scheduled.decode_requests.len(),
+                1,
+                "decode unexpectedly absent at bounded-service step {step}: {scheduled:?}"
+            );
+            scheduler.update_after_step(&decode_id, 1, 1, 1.0);
+        }
+        panic!("full prefill was starved beyond the bounded decode-only window");
     }
 
     #[test]
@@ -2749,6 +2931,7 @@ mod tests {
             request.id = request_id.to_string();
             request.prompt_tokens = vec![1];
             scheduler.add_request(&request);
+            allow_incremental_prefill(&mut scheduler, request_id);
         }
 
         let first = scheduler.schedule();
@@ -2943,7 +3126,7 @@ mod tests {
     #[test]
     fn production_defaults_only_enable_physically_enforced_features() {
         let config = SchedulerConfig::default();
-        assert_eq!(config.policy, SchedulingPolicy::FCFS);
+        assert_eq!(config.policy, SchedulingPolicy::WeightedFair);
         assert!(!config.enable_chunked_prefill);
         assert!(!config.enable_preemption);
         assert!(!config.enable_adaptive_batching);

@@ -1180,6 +1180,7 @@ impl EngineCore {
         requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
         capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
+        transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
     ) -> Result<Vec<PreparedExecutionBatch>> {
         let available = requests
             .iter()
@@ -1324,8 +1325,16 @@ impl EngineCore {
             }
         }
 
-        let mut prepared = Vec::with_capacity(assemblies.len());
-        for assembly in assemblies {
+        // The execution group commits only after every physical batch in an
+        // engine step completes. Bound the transaction to one physical launch
+        // so an incompatible/slow lane cannot amplify head-of-line latency for
+        // cancellation, new admissions, or already-finished rows.
+        let mut prepared = Vec::with_capacity(assemblies.len().min(1));
+        for (index, assembly) in assemblies.into_iter().enumerate() {
+            if index > 0 {
+                transaction_deferred.extend(assembly.scheduled);
+                continue;
+            }
             if assembly.output_visibility == OutputVisibility::IncrementalCommitted {
                 let rows = assembly
                     .physical_batch
@@ -2162,10 +2171,12 @@ impl EngineCore {
         }
 
         let mut capacity_blocked = Vec::new();
+        let mut transaction_deferred = Vec::new();
         let decode_batches = match self.form_physical_batches(
             &decode_requests,
             &decode_scheduled,
             &mut capacity_blocked,
+            &mut transaction_deferred,
         ) {
             Ok(batches) => batches,
             Err(Error::Backpressure(reason)) => {
@@ -2178,22 +2189,32 @@ impl EngineCore {
                 return Err(error);
             }
         };
-        let prefill_batches = match self.form_physical_batches(
-            &prefill_requests,
-            &prefill_scheduled,
-            &mut capacity_blocked,
-        ) {
-            Ok(batches) => batches,
-            Err(Error::Backpressure(reason)) => {
-                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
-                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
-                return Ok(None);
+        let prefill_batches = if decode_batches.is_empty() {
+            match self.form_physical_batches(
+                &prefill_requests,
+                &prefill_scheduled,
+                &mut capacity_blocked,
+                &mut transaction_deferred,
+            ) {
+                Ok(batches) => batches,
+                Err(Error::Backpressure(reason)) => {
+                    self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                    debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                self.rollback_unexecuted_schedule(&all_scheduled);
-                return Err(error);
-            }
+        } else {
+            // Decode and prefill have distinct shapes and safe points. Preserve
+            // one physical transaction per engine step; the scheduler will
+            // reconsider these prefills immediately after decode commits.
+            transaction_deferred.extend(prefill_scheduled.iter().cloned());
+            Vec::new()
         };
+        self.rollback_unexecuted_schedule(&transaction_deferred);
         self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
@@ -4529,7 +4550,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let joined = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut Vec::new())
             .unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].physical_batch().rows.len(), 2);
@@ -4553,13 +4574,14 @@ mod tests {
             .as_mut()
             .unwrap()
             .model_instance_id = super::super::ModelInstanceId::new(9);
+        let mut deferred = Vec::new();
         let split = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut deferred)
             .unwrap();
-        assert_eq!(split.len(), 2);
-        assert!(split
-            .iter()
-            .all(|batch| batch.physical_batch().rows.len() == 1));
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].physical_batch().rows.len(), 1);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].plan_id, scheduled[1].plan_id);
     }
 
     #[test]
@@ -4690,14 +4712,16 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
+        let mut deferred = Vec::new();
         let batches = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut deferred)
             .unwrap();
         let widths = batches
             .iter()
             .map(|batch| batch.physical_batch().rows.len())
             .collect::<Vec<_>>();
-        assert_eq!(widths, vec![2, 2, 1]);
+        assert_eq!(widths, vec![2]);
+        assert_eq!(deferred.len(), 3);
         assert!(batches
             .iter()
             .all(|batch| batch.physical_batch().mode == NativeBatchMode::None));
@@ -4790,10 +4814,12 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
+        let mut deferred = Vec::new();
         let batches = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut deferred)
             .unwrap();
-        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(deferred.len(), 1);
         assert!(batches
             .iter()
             .all(|batch| batch.physical_batch().rows.len() == 1));
@@ -4805,14 +4831,7 @@ mod tests {
                 .unwrap(),
             8
         );
-        assert_eq!(
-            batches[1]
-                .physical_batch()
-                .workspace
-                .workspace_bytes()
-                .unwrap(),
-            9
-        );
+        assert_eq!(deferred[0].plan_id, scheduled[1].plan_id);
     }
 
     #[test]
@@ -4882,7 +4901,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let batches = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new())
+            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut Vec::new())
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(
@@ -6060,7 +6079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serialized_physical_batches_only_charge_each_request_its_own_elapsed_time() {
+    async fn incompatible_physical_batches_commit_in_separate_engine_steps() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
         ))));
@@ -6082,14 +6101,16 @@ mod tests {
             core.add_request(request).unwrap();
         }
 
-        let prepared = core
-            .prepare_step()
-            .await
-            .unwrap()
-            .expect("prepared physical batches");
-        let mut executed = core.execute_prepared_with_progress(prepared).await.unwrap();
-        assert_eq!(executed.batches.len(), 2);
-        for batch in &mut executed.batches {
+        let mut prefill_ms = HashMap::new();
+        for _ in 0..=super::super::scheduler::MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            let prepared = core
+                .prepare_step()
+                .await
+                .unwrap()
+                .expect("prepared physical batch");
+            let mut executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+            assert_eq!(executed.batches.len(), 1);
+            let batch = &mut executed.batches[0];
             let request_id = batch.results[0].session.request_id.as_str();
             let elapsed = match request_id {
                 "fast-batch" => Duration::from_millis(7),
@@ -6100,23 +6121,21 @@ mod tests {
             for row in &mut batch.report.rows {
                 row.execution.elapsed = elapsed;
             }
-        }
-
-        let committed = core.commit_step(executed).await.unwrap();
-        let prefill_ms = committed
-            .outputs
-            .iter()
-            .map(|output| {
-                (
-                    output.request_id.as_str(),
+            let committed = core.commit_step(executed).await.unwrap();
+            for output in &committed.outputs {
+                prefill_ms.insert(
+                    output.request_id.clone(),
                     output
                         .latency_breakdown
                         .as_ref()
                         .expect("latency breakdown")
                         .prefill_ms,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+                );
+            }
+            if prefill_ms.contains_key("slow-batch") {
+                break;
+            }
+        }
 
         assert!((prefill_ms["fast-batch"] - 7.0).abs() < 0.001);
         assert!((prefill_ms["slow-batch"] - 31.0).abs() < 0.001);
