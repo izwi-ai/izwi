@@ -1466,12 +1466,35 @@ impl Engine {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
-        let _step = self.step_gate.lock().await;
-        self.core.write().await.load_managed_model_cache(
+        self.load_managed_model_cache_with_capacity_policy(
             model_instance,
             capability,
             logical_context_tokens,
+            None,
+            false,
         )
+        .await
+    }
+
+    pub(crate) async fn load_managed_model_cache_with_capacity_policy(
+        &self,
+        model_instance: ModelInstanceId,
+        capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
+        staged_transaction_rows: Option<u32>,
+        fit_cuda_contiguous_context: bool,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .load_managed_model_cache_with_capacity_policy(
+                model_instance,
+                capability,
+                logical_context_tokens,
+                staged_transaction_rows,
+                fit_cuda_contiguous_context,
+            )
     }
 
     pub(crate) async fn load_managed_model_state(

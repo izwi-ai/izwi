@@ -70,11 +70,14 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
 
-    /// Resolve portable context from the load-time memory plan. CUDA ignores
-    /// this flag and preserves its native-context behavior.
+    /// Resolve CPU/Metal context from the load-time memory plan. CUDA ignores
+    /// this flag; CUDA families may independently seal a resource-fitted
+    /// context when their physical growth contract requires it.
     #[serde(default)]
     pub(crate) portable_context_auto: bool,
 
+    /// Memory kept outside fitted state plans for allocator and backend
+    /// command-buffer overhead.
     #[serde(default = "default_portable_context_reserve_bytes")]
     pub(crate) portable_context_reserve_bytes: u64,
 

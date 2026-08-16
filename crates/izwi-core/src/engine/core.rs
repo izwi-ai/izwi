@@ -2763,17 +2763,64 @@ impl EngineCore {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
+        self.load_managed_model_cache_with_capacity_policy(
+            model_instance,
+            capability,
+            logical_context_tokens,
+            None,
+            false,
+        )
+    }
+
+    /// Load managed state while allowing a model lifecycle to distinguish the
+    /// scheduler's retained-session capacity from its simultaneously staged
+    /// transaction width. `None` preserves the engine-wide legacy behavior.
+    pub(crate) fn load_managed_model_cache_with_capacity_policy(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        capability: &crate::kv::InferenceStateCapability,
+        logical_context_tokens: Option<usize>,
+        staged_transaction_rows: Option<u32>,
+        fit_cuda_contiguous_context: bool,
+    ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
         };
         let backend = self.managed_kv_cache.worker_backend();
-        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
-            backend,
-            model_instance,
-            contract,
-            logical_context_tokens,
-            1,
-        )?;
+        let retained_sequence_rows = u32::try_from(self.config.max_batch_size)
+            .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
+        let fit_cuda_contiguous_context =
+            backend == BackendKind::Cuda && fit_cuda_contiguous_context;
+        let staged_transaction_rows = staged_transaction_rows.unwrap_or(retained_sequence_rows);
+        let logical_token_reach = if fit_cuda_contiguous_context {
+            let maximum_tokens = logical_context_tokens.ok_or_else(|| {
+                Error::ModelLoadError(
+                    "CUDA managed state requires a positive loaded-model context limit".into(),
+                )
+            })?;
+            Some(
+                self.managed_kv_cache
+                    .fit_cuda_contiguous_logical_token_reach(
+                        model_instance,
+                        contract,
+                        u64::try_from(maximum_tokens).map_err(|_| {
+                            Error::ModelLoadError("model context exceeds u64".into())
+                        })?,
+                        self.config.portable_context_reserve_bytes,
+                        self.config.block_size,
+                        retained_sequence_rows,
+                        staged_transaction_rows,
+                    )?,
+            )
+        } else {
+            self.resolve_managed_token_reach_for_contract(
+                backend,
+                model_instance,
+                contract,
+                logical_context_tokens,
+                1,
+            )?
+        };
         let runtime = self
             .managed_kv_cache
             .bind_request_with_capacity(
@@ -2784,16 +2831,8 @@ impl EngineCore {
                         Error::InvalidInput("managed KV page budget exceeds u32".into())
                     })?,
                     logical_token_reach,
-                    retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
-                        |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
-                    )?,
-                    staged_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
-                        |_| {
-                            Error::InvalidInput(
-                                "managed state transaction limit exceeds u32".into(),
-                            )
-                        },
-                    )?,
+                    retained_sequence_rows,
+                    staged_transaction_rows,
                 },
                 self.config.block_size,
                 capability,

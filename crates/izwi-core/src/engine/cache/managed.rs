@@ -489,6 +489,101 @@ impl ManagedKvCacheManager {
         Ok(low)
     }
 
+    /// Fit a CUDA logical reach against the peak required by the current
+    /// contiguous growth implementation. Candle must keep the old backing
+    /// alive while allocating and copying the replacement, so steady-state
+    /// bytes alone are not an honest reach contract.
+    pub(crate) fn fit_cuda_contiguous_logical_token_reach(
+        &self,
+        model_instance: ModelInstanceId,
+        contract: &InferenceStateContract,
+        maximum_tokens: u64,
+        safety_reserve_bytes: u64,
+        page_tokens_hint: usize,
+        retained_sequence_rows: u32,
+        staged_transaction_rows: u32,
+    ) -> Result<u64> {
+        if self.worker_backend != BackendKind::Cuda || maximum_tokens == 0 {
+            return Ok(maximum_tokens);
+        }
+        let Some(authority) = self.resource_authority.as_ref() else {
+            return Err(Error::ModelLoadError(
+                "CUDA managed context fitting requires a resource authority".into(),
+            ));
+        };
+        let ResourceAmount::Known(headroom_bytes) =
+            authority.planning_headroom_bytes(BackendKind::Cuda)?
+        else {
+            return Err(Error::ModelLoadError(
+                "CUDA managed context fitting requires known device capacity".into(),
+            ));
+        };
+        let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let page_tokens_hint = u32::try_from(page_tokens_hint)
+            .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
+        let state_plan = negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cuda,
+                device_ordinal: self.worker_device_ordinal,
+                page_tokens_hint: Some(page_tokens_hint),
+                storage_dtype_hint: None,
+            },
+        )?;
+        if state_plan.paged_attention.len() != 1 {
+            return Err(Error::ModelLoadError(
+                "contiguous CUDA context fitting currently requires one paged-attention group"
+                    .into(),
+            ));
+        }
+        let (maximum_allocation, _) = plan_managed_state_capacity(
+            &state_plan,
+            model_instance,
+            ManagedStateCapacityRequest {
+                total_paged_pages: u32::MAX,
+                logical_token_reach: Some(maximum_tokens),
+                retained_sequence_rows,
+                staged_transaction_rows,
+            },
+        )?;
+        let steady_resources = managed_state_resources(
+            BackendKind::Cuda,
+            maximum_allocation.maximum_resources(&state_plan)?,
+        )?;
+        let steady_bytes = known_resource_bytes(steady_resources.device_bytes, "device")?;
+        let paged = &state_plan.paged_attention[0];
+        let maximum_blocks = maximum_allocation
+            .group_capacity(paged.group, paged.domain)?
+            .strategy
+            .maximum_blocks();
+        let maximum_paged_bytes = paged
+            .bytes_per_page
+            .checked_mul(u64::from(maximum_blocks))
+            .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))?;
+        let fixed_state_bytes = steady_bytes
+            .checked_sub(maximum_paged_bytes)
+            .ok_or_else(|| Error::ModelLoadError("CUDA fixed state byte plan underflow".into()))?;
+        let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
+        let minimum_bytes = cuda_contiguous_replacement_required_bytes(
+            minimum_tokens,
+            page_tokens_hint,
+            paged.bytes_per_page,
+            fixed_state_bytes,
+        )?;
+        if minimum_bytes > budget_bytes {
+            return Err(Error::ModelLoadError(format!(
+                "CUDA managed context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, contiguous_growth_peak_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+            )));
+        }
+        fit_cuda_contiguous_token_reach(
+            maximum_tokens,
+            page_tokens_hint,
+            paged.bytes_per_page,
+            fixed_state_bytes,
+            budget_bytes,
+        )
+    }
+
     pub(crate) fn with_prefix_cache_salt(
         resource_authority: Option<Arc<ResourceAuthority>>,
         salt: Option<[u8; 32]>,
@@ -1925,6 +2020,89 @@ fn managed_paged_capacity_strategy(backend: BackendKind, blocks: u32) -> Capacit
     }
 }
 
+/// Maximum simultaneously live page rows for the CUDA arena's current
+/// doubling/quantized contiguous replacement schedule.
+fn cuda_contiguous_replacement_peak_pages(maximum_pages: u32) -> Result<u64> {
+    if maximum_pages == 0 {
+        return Err(Error::InvalidInput(
+            "CUDA KV replacement peak requires non-zero pages".into(),
+        ));
+    }
+    let geometry = cuda_paged_growth_geometry(maximum_pages);
+    let mut current = geometry.initial_pages;
+    let mut peak = u64::from(current);
+    while current < maximum_pages {
+        let quantum = geometry.growth_quantum_pages;
+        let rounded_target = current.saturating_add(quantum).min(maximum_pages);
+        let amortized_addition = current
+            .max(quantum)
+            .div_ceil(quantum)
+            .saturating_mul(quantum);
+        let doubled = current
+            .saturating_add(amortized_addition)
+            .min(maximum_pages);
+        let target = rounded_target.max(doubled).min(maximum_pages);
+        peak = peak.max(u64::from(current) + u64::from(target));
+        if target <= current {
+            return Err(Error::InferenceError(
+                "CUDA KV replacement growth made no progress".into(),
+            ));
+        }
+        current = target;
+    }
+    Ok(peak)
+}
+
+fn cuda_contiguous_replacement_required_bytes(
+    tokens: u64,
+    page_tokens: u32,
+    bytes_per_page: u64,
+    fixed_state_bytes: u64,
+) -> Result<u64> {
+    let pages = u32::try_from(tokens.div_ceil(u64::from(page_tokens)))
+        .map_err(|_| Error::ModelLoadError("CUDA KV page demand exceeds u32".into()))?;
+    let peak_pages = cuda_contiguous_replacement_peak_pages(pages)?;
+    bytes_per_page
+        .checked_mul(peak_pages)
+        .and_then(|bytes| bytes.checked_add(fixed_state_bytes))
+        .ok_or_else(|| Error::ModelLoadError("CUDA state peak byte plan overflow".into()))
+}
+
+fn fit_cuda_contiguous_token_reach(
+    maximum_tokens: u64,
+    page_tokens: u32,
+    bytes_per_page: u64,
+    fixed_state_bytes: u64,
+    budget_bytes: u64,
+) -> Result<u64> {
+    let minimum_tokens = u64::from(page_tokens).min(maximum_tokens);
+    if cuda_contiguous_replacement_required_bytes(
+        maximum_tokens,
+        page_tokens,
+        bytes_per_page,
+        fixed_state_bytes,
+    )? <= budget_bytes
+    {
+        return Ok(maximum_tokens);
+    }
+    let (mut low, mut high) = (minimum_tokens, maximum_tokens);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if cuda_contiguous_replacement_required_bytes(
+            middle,
+            page_tokens,
+            bytes_per_page,
+            fixed_state_bytes,
+        )? <= budget_bytes
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(low)
+}
+
 fn known_resource_bytes(amount: ResourceAmount, domain: &str) -> Result<u64> {
     match amount {
         ResourceAmount::Known(bytes) => Ok(bytes),
@@ -2624,6 +2802,74 @@ mod tests {
         contract
     }
 
+    fn qwen38_27b_tensor_contract() -> InferenceStateContract {
+        let mut contract = test_contract();
+        let StateDomainSpec::PagedAttention(attention) = &mut contract.domains[0] else {
+            unreachable!("test contract is paged")
+        };
+        let layer = attention.layers[0].clone();
+        attention.layers = (0..16)
+            .map(|attention_layer| crate::kv::v2::PagedAttentionLayerSpec {
+                model_layer: attention_layer * 4 + 3,
+                query_heads: 24,
+                kv_heads: 4,
+                key_head_dim: 256,
+                value_head_dim: 256,
+                ..layer.clone()
+            })
+            .collect();
+        attention.header.prefix = PrefixPolicy::Disabled;
+        attention.header.checkpoint = crate::kv::v2::CheckpointPolicy::Transactional;
+        attention.accepted_dtypes = vec![StateDType::F16];
+
+        let recurrent_domain = CacheDomainId::new(2);
+        let convolution_domain = CacheDomainId::new(3);
+        let tensor_domain = |domain: CacheDomainId, role: TensorRole, elements: u64| {
+            StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: domain,
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: crate::kv::v2::PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: crate::kv::v2::CheckpointPolicy::Transactional,
+                },
+                components: (1..=48)
+                    .map(|id| TensorComponentSpec {
+                        id: StateComponentId::new(id),
+                        role: role.clone(),
+                        shape: BoundedShape {
+                            dimensions: vec![ShapeDimension {
+                                axis: ShapeAxis::Hidden,
+                                extent: ShapeExtent::Fixed { value: elements },
+                            }],
+                        },
+                        accepted_dtypes: vec![StateDType::F32],
+                    })
+                    .collect(),
+            })
+        };
+        // Each of the 48 DeltaNet layers owns a 128 x 128 x 48 F32
+        // recurrence and 10,240 x 3 F32 convolution history.
+        contract.domains.push(tensor_domain(
+            recurrent_domain,
+            TensorRole::RecurrentHidden,
+            786_432,
+        ));
+        contract.domains.push(tensor_domain(
+            convolution_domain,
+            TensorRole::ConvolutionState,
+            30_720,
+        ));
+        contract.groups = vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: vec![CacheDomainId::new(1), recurrent_domain, convolution_domain],
+            prefix_shareable: false,
+        }];
+        contract.validate().unwrap();
+        contract
+    }
+
     fn heterogeneous_paged_contract() -> InferenceStateContract {
         let mut contract = test_contract();
         let StateDomainSpec::PagedAttention(first) = &contract.domains[0] else {
@@ -3085,6 +3331,74 @@ mod tests {
                 .strategy
                 .maximum_blocks(),
             4_096
+        );
+    }
+
+    #[test]
+    fn qwen38_scalar_cuda_staging_preserves_sessions_and_reclaims_exact_bytes() {
+        let state_plan = negotiate_state_plan(
+            &qwen38_27b_tensor_contract(),
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: Some(StateDType::F16),
+            },
+        )
+        .unwrap();
+        let capacity = |staged_transaction_rows| {
+            plan_managed_state_capacity(
+                &state_plan,
+                ModelInstanceId::new(838),
+                ManagedStateCapacityRequest {
+                    total_paged_pages: 4_096,
+                    logical_token_reach: Some(262_144),
+                    retained_sequence_rows: 16,
+                    staged_transaction_rows,
+                },
+            )
+            .unwrap()
+            .1
+            .expect("Qwen3.8 has retained tensor state")
+        };
+
+        let scalar = capacity(1);
+        let legacy = capacity(16);
+        assert_eq!(scalar.sequence_capacity(), 16);
+        assert_eq!(scalar.transaction_capacity(), 1);
+        assert_eq!(scalar.per_sequence_bytes(), 156_893_184);
+        assert_eq!(scalar.authorized_bytes(), 2_667_184_128);
+        assert_eq!(legacy.authorized_bytes(), 5_020_581_888);
+        assert_eq!(
+            legacy.authorized_bytes() - scalar.authorized_bytes(),
+            2_353_397_760
+        );
+    }
+
+    #[test]
+    fn cuda_contiguous_growth_peak_prices_old_and_new_backing() {
+        assert_eq!(cuda_contiguous_replacement_peak_pages(64).unwrap(), 64);
+        assert_eq!(cuda_contiguous_replacement_peak_pages(128).unwrap(), 192);
+        assert_eq!(
+            cuda_contiguous_replacement_peak_pages(1_024).unwrap(),
+            1_536
+        );
+        assert_eq!(
+            cuda_contiguous_replacement_peak_pages(4_096).unwrap(),
+            6_144
+        );
+    }
+
+    #[test]
+    fn qwen38_contiguous_context_fitter_selects_the_largest_admissible_page() {
+        const TENSOR_BYTES: u64 = 2_667_184_128;
+        const BYTES_PER_PAGE: u64 = 4 * 1024 * 1024;
+        const PEAK_PAGES_AT_64K: u64 = 1_536;
+        let exact_peak = TENSOR_BYTES + BYTES_PER_PAGE * PEAK_PAGES_AT_64K;
+        assert_eq!(
+            fit_cuda_contiguous_token_reach(262_144, 64, BYTES_PER_PAGE, TENSOR_BYTES, exact_peak,)
+                .unwrap(),
+            65_536
         );
     }
 
