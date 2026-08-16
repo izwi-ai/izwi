@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
-use crate::config::{resolve_kv_cache_policy, ResolvedKvCachePolicy};
+use crate::config::{resolve_kv_cache_policy, BatchSizePreference, ResolvedKvCachePolicy};
 use crate::model::ModelVariant;
 use crate::Result;
 
@@ -62,9 +62,25 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
 
-    /// Maximum batch size for inference
+    /// Maximum logical rows selected by one scheduler step.
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
+
+    /// Automatic or explicitly fixed physical tensor invocation width.
+    #[serde(default)]
+    pub max_tensor_batch_size: BatchSizePreference,
+
+    /// Maximum retained sequence/session rows in managed model state.
+    #[serde(default = "default_max_retained_sequences")]
+    pub max_retained_sequences: usize,
+
+    /// Maximum simultaneously staged managed-state transactions.
+    #[serde(default = "default_max_staged_transactions")]
+    pub max_staged_transactions: usize,
+
+    /// Maximum admitted jobs in the runtime inference queue.
+    #[serde(default = "default_max_queued_requests")]
+    pub max_queued_requests: usize,
 
     /// Maximum sequence length (tokens)
     #[serde(default = "default_max_seq_len")]
@@ -208,6 +224,15 @@ fn default_models_dir() -> PathBuf {
 fn default_max_batch_size() -> usize {
     8
 }
+fn default_max_retained_sequences() -> usize {
+    8
+}
+fn default_max_staged_transactions() -> usize {
+    8
+}
+fn default_max_queued_requests() -> usize {
+    128
+}
 fn default_max_seq_len() -> usize {
     4096
 }
@@ -329,6 +354,10 @@ impl Default for EngineCoreConfig {
         Self {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
+            max_tensor_batch_size: BatchSizePreference::Auto,
+            max_retained_sequences: default_max_retained_sequences(),
+            max_staged_transactions: default_max_staged_transactions(),
+            max_queued_requests: default_max_queued_requests(),
             max_seq_len: default_max_seq_len(),
             portable_context_auto: false,
             portable_context_reserve_bytes: default_portable_context_reserve_bytes(),

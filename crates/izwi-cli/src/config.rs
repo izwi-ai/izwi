@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use izwi_core::backends::BackendPreference;
-use izwi_core::{ContextLengthPreference, ServeRuntimeConfig, ServeRuntimeConfigOverrides};
+use izwi_core::{
+    BatchSizePreference, ContextLengthPreference, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -56,7 +58,15 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<BackendPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_size: Option<usize>,
+    pub max_batch_size: Option<BatchSizePreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scheduler_batch_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retained_sequences: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_staged_transactions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queued_requests: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sequence_length: Option<ContextLengthPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +81,10 @@ impl RuntimeConfig {
     fn is_empty(&self) -> bool {
         self.backend.is_none()
             && self.max_batch_size.is_none()
+            && self.max_scheduler_batch_size.is_none()
+            && self.max_retained_sequences.is_none()
+            && self.max_staged_transactions.is_none()
+            && self.max_queued_requests.is_none()
             && self.max_sequence_length.is_none()
             && self.threads.is_none()
             && self.max_concurrent.is_none()
@@ -148,6 +162,10 @@ impl Config {
             runtime: RuntimeConfig {
                 backend: Some(defaults.backend),
                 max_batch_size: Some(defaults.max_batch_size),
+                max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
+                max_retained_sequences: Some(defaults.max_retained_sequences),
+                max_staged_transactions: Some(defaults.max_staged_transactions),
+                max_queued_requests: Some(defaults.max_queued_requests),
                 max_sequence_length: Some(defaults.max_sequence_length),
                 threads: Some(defaults.num_threads),
                 max_concurrent: Some(defaults.max_concurrent_requests),
@@ -175,6 +193,10 @@ impl Config {
             models_dir: self.models.dir.clone(),
             backend: self.runtime.backend,
             max_batch_size: self.runtime.max_batch_size,
+            max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
+            max_retained_sequences: self.runtime.max_retained_sequences,
+            max_staged_transactions: self.runtime.max_staged_transactions,
+            max_queued_requests: self.runtime.max_queued_requests,
             max_sequence_length: self.runtime.max_sequence_length,
             num_threads: self.runtime.threads,
             max_concurrent_requests: self.runtime.max_concurrent,
@@ -194,7 +216,25 @@ impl Config {
             "server.cors_origins" => self.server.cors_origins = Some(parse_string_list(value)?),
             "models.dir" => self.models.dir = Some(parse_path(value)?),
             "runtime.backend" => self.runtime.backend = Some(parse_backend(value)?),
-            "runtime.max_batch_size" => self.runtime.max_batch_size = Some(parse_usize(value)?),
+            "runtime.max_batch_size" => {
+                self.runtime.max_batch_size = Some(
+                    value
+                        .parse::<BatchSizePreference>()
+                        .map_err(|error| anyhow!(error.to_string()))?,
+                )
+            }
+            "runtime.max_scheduler_batch_size" => {
+                self.runtime.max_scheduler_batch_size = Some(parse_usize(value)?)
+            }
+            "runtime.max_retained_sequences" => {
+                self.runtime.max_retained_sequences = Some(parse_usize(value)?)
+            }
+            "runtime.max_staged_transactions" => {
+                self.runtime.max_staged_transactions = Some(parse_usize(value)?)
+            }
+            "runtime.max_queued_requests" => {
+                self.runtime.max_queued_requests = Some(parse_usize(value)?)
+            }
             "runtime.max_sequence_length" => {
                 self.runtime.max_sequence_length = Some(
                     value
@@ -238,9 +278,27 @@ impl Config {
                 .runtime
                 .backend
                 .map(|value| toml::Value::String(value.as_str().to_string())),
-            "runtime.max_batch_size" => self
+            "runtime.max_batch_size" => self.runtime.max_batch_size.map(|value| {
+                value.fixed_rows().map_or_else(
+                    || toml::Value::String("auto".to_string()),
+                    |rows| toml::Value::Integer(rows as i64),
+                )
+            }),
+            "runtime.max_scheduler_batch_size" => self
                 .runtime
-                .max_batch_size
+                .max_scheduler_batch_size
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_retained_sequences" => self
+                .runtime
+                .max_retained_sequences
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_staged_transactions" => self
+                .runtime
+                .max_staged_transactions
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.max_queued_requests" => self
+                .runtime
+                .max_queued_requests
                 .map(|value| toml::Value::Integer(value as i64)),
             "runtime.max_sequence_length" => self.runtime.max_sequence_length.map(|value| {
                 value.explicit_tokens().map_or_else(
@@ -390,7 +448,11 @@ mod tests {
             },
             runtime: RuntimeConfig {
                 backend: Some(BackendPreference::Cpu),
-                max_batch_size: Some(12),
+                max_batch_size: Some(BatchSizePreference::fixed(12).unwrap()),
+                max_scheduler_batch_size: Some(9),
+                max_retained_sequences: Some(11),
+                max_staged_transactions: Some(3),
+                max_queued_requests: Some(91),
                 max_sequence_length: Some(ContextLengthPreference::Auto),
                 threads: Some(6),
                 max_concurrent: Some(48),
@@ -409,7 +471,16 @@ mod tests {
         assert_eq!(overrides.port, Some(9090));
         assert_eq!(overrides.models_dir, Some(PathBuf::from("/tmp/models")));
         assert_eq!(overrides.backend, Some(BackendPreference::Cpu));
-        assert_eq!(overrides.max_batch_size, Some(12));
+        assert_eq!(
+            overrides
+                .max_batch_size
+                .and_then(BatchSizePreference::fixed_rows),
+            Some(12)
+        );
+        assert_eq!(overrides.max_scheduler_batch_size, Some(9));
+        assert_eq!(overrides.max_retained_sequences, Some(11));
+        assert_eq!(overrides.max_staged_transactions, Some(3));
+        assert_eq!(overrides.max_queued_requests, Some(91));
         assert_eq!(overrides.num_threads, Some(6));
         assert_eq!(overrides.max_concurrent_requests, Some(48));
         assert_eq!(overrides.request_timeout_secs, Some(720));
@@ -433,6 +504,12 @@ mod tests {
             .set_value("runtime.backend", "cuda")
             .expect("backend should parse");
         config
+            .set_value("runtime.max_batch_size", "auto")
+            .expect("automatic physical batch size should parse");
+        config
+            .set_value("runtime.max_scheduler_batch_size", "13")
+            .expect("scheduler capacity should parse");
+        config
             .set_value(
                 "server.cors_origins",
                 "http://localhost:3000,https://example.com",
@@ -444,6 +521,11 @@ mod tests {
 
         assert_eq!(config.server.port, Some(9000));
         assert_eq!(config.runtime.backend, Some(BackendPreference::Cuda));
+        assert_eq!(
+            config.runtime.max_batch_size,
+            Some(BatchSizePreference::Auto)
+        );
+        assert_eq!(config.runtime.max_scheduler_batch_size, Some(13));
         assert_eq!(
             config.server.cors_origins,
             Some(vec![

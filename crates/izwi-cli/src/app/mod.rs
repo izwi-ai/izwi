@@ -25,6 +25,10 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
             port,
             models_dir,
             max_batch_size,
+            max_scheduler_batch_size,
+            max_retained_sequences,
+            max_staged_transactions,
+            max_queued_requests,
             max_sequence_length,
             backend,
             threads,
@@ -43,6 +47,10 @@ pub async fn run(cli: Cli, theme: Theme) -> Result<()> {
                 port,
                 models_dir,
                 max_batch_size,
+                max_scheduler_batch_size,
+                max_retained_sequences,
+                max_staged_transactions,
+                max_queued_requests,
                 max_sequence_length,
                 backend,
                 threads,
@@ -217,7 +225,11 @@ fn build_serve_args(
     host: Option<String>,
     port: Option<u16>,
     models_dir: Option<std::path::PathBuf>,
-    max_batch_size: Option<usize>,
+    max_batch_size: Option<izwi_core::BatchSizePreference>,
+    max_scheduler_batch_size: Option<usize>,
+    max_retained_sequences: Option<usize>,
+    max_staged_transactions: Option<usize>,
+    max_queued_requests: Option<usize>,
     max_sequence_length: Option<izwi_core::ContextLengthPreference>,
     backend: Option<Backend>,
     threads: Option<usize>,
@@ -235,6 +247,10 @@ fn build_serve_args(
         models_dir,
         backend: backend.as_ref().map(Backend::as_preference),
         max_batch_size,
+        max_scheduler_batch_size,
+        max_retained_sequences,
+        max_staged_transactions,
+        max_queued_requests,
         max_sequence_length,
         num_threads: threads,
         max_concurrent_requests: max_concurrent,
@@ -281,6 +297,10 @@ mod tests {
         std::env::remove_var(izwi_core::serve_runtime::ENV_MODELS_DIR);
         std::env::remove_var(izwi_core::serve_runtime::ENV_BACKEND);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_BATCH_SIZE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_SCHEDULER_BATCH_SIZE);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_RETAINED_SEQUENCES);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_STAGED_TRANSACTIONS);
+        std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_QUEUED_REQUESTS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_NUM_THREADS);
         std::env::remove_var(izwi_core::serve_runtime::ENV_MAX_CONCURRENT);
         std::env::remove_var(izwi_core::serve_runtime::ENV_TIMEOUT);
@@ -325,6 +345,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
             Some(Backend::Cuda),
             None,
             None,
@@ -338,7 +362,7 @@ mod tests {
         .expect("serve args should resolve");
 
         assert_eq!(args.runtime.host, "cli-host");
-        assert_eq!(args.runtime.max_batch_size, 5);
+        assert_eq!(args.runtime.max_batch_size.fixed_rows(), Some(5));
         assert_eq!(args.runtime.request_timeout_secs, 600);
         assert_eq!(args.runtime.backend, BackendPreference::Cuda);
         assert!(args.runtime.cors_enabled);
@@ -358,6 +382,10 @@ mod tests {
         let args = build_serve_args(
             None,
             ServeMode::Server,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,

@@ -79,30 +79,6 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
-const DEFAULT_CONFIGURED_BATCH_SIZE: usize = 8;
-
-fn cuda_continuous_batch_default(
-    backend: BackendKind,
-    configured: usize,
-    cuda_device_observed: bool,
-    compute_capability: Option<(u32, u32)>,
-    total_memory_bytes: Option<usize>,
-) -> usize {
-    if backend != BackendKind::Cuda
-        || configured != DEFAULT_CONFIGURED_BATCH_SIZE
-        || !cuda_device_observed
-        || !matches!(compute_capability, Some((major, _)) if major >= 8)
-    {
-        return configured.max(1);
-    }
-    const GIB: usize = 1024 * 1024 * 1024;
-    match total_memory_bytes {
-        Some(bytes) if bytes >= 48 * GIB => 32,
-        Some(bytes) if bytes >= 20 * GIB => 16,
-        _ => DEFAULT_CONFIGURED_BATCH_SIZE,
-    }
-}
-
 fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
     if output.finish_reason == Some(OutputFinishReason::Aborted) {
         return Err(Error::Cancelled(output.request_id));
@@ -1177,13 +1153,11 @@ impl RuntimeService {
         core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
         core_config.portable_context_reserve_bytes = config.portable_context_reserve_bytes;
         core_config.models_dir = config.models_dir.clone();
-        core_config.max_batch_size = cuda_continuous_batch_default(
-            selected_backend_kind,
-            config.max_batch_size,
-            device.device.is_cuda(),
-            device.capabilities.cuda_compute_capability,
-            device.capabilities.cuda_total_memory_bytes,
-        );
+        core_config.max_batch_size = config.max_scheduler_batch_size.max(1);
+        core_config.max_tensor_batch_size = config.max_batch_size;
+        core_config.max_retained_sequences = config.max_retained_sequences.max(1);
+        core_config.max_staged_transactions = config.max_staged_transactions.max(1);
+        core_config.max_queued_requests = config.max_queued_requests.max(1);
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
@@ -1214,7 +1188,7 @@ impl RuntimeService {
             selected_backend_kind,
             device.clone(),
             execution_parallelism,
-            config.max_batch_size.max(1).saturating_mul(16).max(64),
+            core_config.max_queued_requests,
         )?);
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
@@ -3061,36 +3035,6 @@ mod tests {
         OutputProcessor,
     };
     use crate::runtime::broker::{InferenceBroker, InferenceBrokerMode};
-
-    #[test]
-    fn cuda_continuous_batch_default_is_observation_and_vram_tiered() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        assert_eq!(
-            cuda_continuous_batch_default(BackendKind::Cuda, 8, true, Some((8, 0)), Some(24 * GIB),),
-            16
-        );
-        assert_eq!(
-            cuda_continuous_batch_default(BackendKind::Cuda, 8, true, Some((9, 0)), Some(80 * GIB),),
-            32
-        );
-        for (backend, observed, capability) in [
-            (BackendKind::Cpu, true, Some((8, 0))),
-            (BackendKind::Metal, true, Some((8, 0))),
-            (BackendKind::Cuda, false, Some((8, 0))),
-            (BackendKind::Cuda, true, Some((7, 5))),
-            (BackendKind::Cuda, true, None),
-        ] {
-            assert_eq!(
-                cuda_continuous_batch_default(backend, 8, observed, capability, Some(80 * GIB),),
-                8
-            );
-        }
-        assert_eq!(
-            cuda_continuous_batch_default(BackendKind::Cuda, 4, true, Some((9, 0)), Some(80 * GIB),),
-            4,
-            "an explicit non-default batch size must win"
-        );
-    }
 
     fn terminal_output(reason: ExecutionFinishReason) -> EngineOutput {
         OutputProcessor::new(24_000).process_execution(

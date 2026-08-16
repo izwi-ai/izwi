@@ -516,7 +516,7 @@ impl Default for WorkerConfig {
             dtype: "float32".to_string(),
             kv_cache_dtype: "float16".to_string(),
             num_threads,
-            request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
+            request_parallelism: Self::request_parallelism_for(backend_kind),
             kv_page_size: 64,
             model_registry: None,
             resource_authority: None,
@@ -533,13 +533,12 @@ impl From<&EngineCoreConfig> for WorkerConfig {
         let backend_kind = backend_context.backend_kind;
         let num_threads = config.num_threads.max(1);
         let max_tensor_batch_size = config
-            .max_batch_size
+            .max_tensor_batch_size
+            .resolve(backend_kind)
             .min(Self::tensor_batch_cap(backend_kind))
             .max(1);
         let request_parallelism = Self::resolve_batch_request_parallelism(
             backend_kind,
-            num_threads,
-            max_tensor_batch_size,
             Self::request_parallelism_override(),
         );
         Self {
@@ -576,11 +575,7 @@ impl WorkerConfig {
             .filter(|value| *value > 0)
     }
 
-    fn resolve_request_parallelism(
-        backend: BackendKind,
-        num_threads: usize,
-        override_value: Option<usize>,
-    ) -> usize {
+    fn resolve_request_parallelism(backend: BackendKind, override_value: Option<usize>) -> usize {
         // Candle's Metal path is intentionally serialized in dispatch. Do not
         // let an environment override inflate coordinator capacity beyond what
         // the executor can actually run concurrently.
@@ -592,31 +587,21 @@ impl WorkerConfig {
             // keep inter-request fan-out conservative unless explicitly overridden.
             BackendKind::Cpu => 1,
             BackendKind::Metal => unreachable!("Metal is clamped above"),
-            BackendKind::Cuda => num_threads.max(1),
+            BackendKind::Cuda => 1,
         };
 
         override_value.unwrap_or(default_parallelism).max(1)
     }
 
-    fn request_parallelism_for(backend: BackendKind, num_threads: usize) -> usize {
-        Self::resolve_request_parallelism(
-            backend,
-            num_threads,
-            Self::request_parallelism_override(),
-        )
+    fn request_parallelism_for(backend: BackendKind) -> usize {
+        Self::resolve_request_parallelism(backend, Self::request_parallelism_override())
     }
 
     fn resolve_batch_request_parallelism(
         backend: BackendKind,
-        num_threads: usize,
-        max_tensor_batch_size: usize,
         override_value: Option<usize>,
     ) -> usize {
-        match override_value {
-            Some(value) => Self::resolve_request_parallelism(backend, num_threads, Some(value)),
-            None if backend == BackendKind::Cuda => max_tensor_batch_size.max(1),
-            None => Self::resolve_request_parallelism(backend, num_threads, None),
-        }
+        Self::resolve_request_parallelism(backend, override_value)
     }
 }
 
@@ -1785,37 +1770,55 @@ mod tests {
     #[test]
     fn test_request_parallelism_defaults_are_backend_aware() {
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 8, None),
-            8
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, None),
+            1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, Some(3)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, Some(3)),
             3
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 8, Some(3)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, Some(3)),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, 8, 32, None),
-            32
+            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, None),
+            1
         );
         assert_eq!(
-            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, 8, 32, Some(4)),
+            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, Some(4)),
             4
         );
         assert_eq!(
-            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Metal, 8, 32, None),
+            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Metal, None),
             1
         );
+    }
+
+    #[test]
+    fn automatic_tensor_width_follows_resolved_backend_and_not_scheduler_rows() {
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let engine = EngineCoreConfig {
+                backend,
+                max_batch_size: 19,
+                ..EngineCoreConfig::default()
+            };
+            let worker = WorkerConfig::from(&engine);
+            assert_eq!(
+                worker.max_tensor_batch_size,
+                engine.max_tensor_batch_size.resolve(worker.backend)
+            );
+            assert_eq!(worker.request_parallelism, 1);
+            assert_eq!(engine.max_batch_size, 19);
+        }
     }
 
     #[test]

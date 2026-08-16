@@ -2,13 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::BackendPreference;
-use crate::config::{ContextLengthPreference, EngineConfig};
+use crate::config::{BatchSizePreference, ContextLengthPreference, EngineConfig};
 
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
 pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
+pub const ENV_MAX_SCHEDULER_BATCH_SIZE: &str = "IZWI_MAX_SCHEDULER_BATCH_SIZE";
+pub const ENV_MAX_RETAINED_SEQUENCES: &str = "IZWI_MAX_RETAINED_SEQUENCES";
+pub const ENV_MAX_STAGED_TRANSACTIONS: &str = "IZWI_MAX_STAGED_TRANSACTIONS";
+pub const ENV_MAX_QUEUED_REQUESTS: &str = "IZWI_MAX_QUEUED_REQUESTS";
 pub const ENV_MAX_SEQUENCE_LENGTH: &str = "IZWI_MAX_SEQUENCE_LENGTH";
 pub const ENV_NUM_THREADS: &str = "IZWI_NUM_THREADS";
 pub const ENV_MAX_CONCURRENT: &str = "IZWI_MAX_CONCURRENT";
@@ -27,7 +31,11 @@ pub struct ServeRuntimeConfig {
     pub port: u16,
     pub models_dir: PathBuf,
     pub backend: BackendPreference,
-    pub max_batch_size: usize,
+    pub max_batch_size: BatchSizePreference,
+    pub max_scheduler_batch_size: usize,
+    pub max_retained_sequences: usize,
+    pub max_staged_transactions: usize,
+    pub max_queued_requests: usize,
     pub max_sequence_length: ContextLengthPreference,
     pub num_threads: usize,
     pub max_concurrent_requests: usize,
@@ -46,6 +54,10 @@ impl Default for ServeRuntimeConfig {
             models_dir: default_models_dir(),
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
+            max_scheduler_batch_size: default_max_scheduler_batch_size(),
+            max_retained_sequences: default_max_retained_sequences(),
+            max_staged_transactions: default_max_staged_transactions(),
+            max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
             num_threads: default_num_threads(),
             max_concurrent_requests: default_max_concurrent_requests(),
@@ -86,6 +98,18 @@ impl ServeRuntimeConfig {
         if let Some(max_batch_size) = overrides.max_batch_size {
             self.max_batch_size = max_batch_size;
         }
+        if let Some(max_scheduler_batch_size) = overrides.max_scheduler_batch_size {
+            self.max_scheduler_batch_size = max_scheduler_batch_size;
+        }
+        if let Some(max_retained_sequences) = overrides.max_retained_sequences {
+            self.max_retained_sequences = max_retained_sequences;
+        }
+        if let Some(max_staged_transactions) = overrides.max_staged_transactions {
+            self.max_staged_transactions = max_staged_transactions;
+        }
+        if let Some(max_queued_requests) = overrides.max_queued_requests {
+            self.max_queued_requests = max_queued_requests;
+        }
         if let Some(max_sequence_length) = overrides.max_sequence_length {
             self.max_sequence_length = max_sequence_length;
         }
@@ -117,7 +141,11 @@ impl ServeRuntimeConfig {
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig {
             models_dir: self.models_dir.clone(),
-            max_batch_size: self.max_batch_size.max(1),
+            max_batch_size: self.max_batch_size,
+            max_scheduler_batch_size: self.max_scheduler_batch_size.max(1),
+            max_retained_sequences: self.max_retained_sequences.max(1),
+            max_staged_transactions: self.max_staged_transactions.max(1),
+            max_queued_requests: self.max_queued_requests.max(1),
             max_sequence_length: self.max_sequence_length,
             backend: self.backend,
             num_threads: self.num_threads.max(1),
@@ -132,7 +160,11 @@ pub struct ServeRuntimeConfigOverrides {
     pub port: Option<u16>,
     pub models_dir: Option<PathBuf>,
     pub backend: Option<BackendPreference>,
-    pub max_batch_size: Option<usize>,
+    pub max_batch_size: Option<BatchSizePreference>,
+    pub max_scheduler_batch_size: Option<usize>,
+    pub max_retained_sequences: Option<usize>,
+    pub max_staged_transactions: Option<usize>,
+    pub max_queued_requests: Option<usize>,
     pub max_sequence_length: Option<ContextLengthPreference>,
     pub num_threads: Option<usize>,
     pub max_concurrent_requests: Option<usize>,
@@ -150,7 +182,11 @@ impl ServeRuntimeConfigOverrides {
             port: read_env_u16(ENV_PORT, &[]),
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),
             backend: read_env_backend(ENV_BACKEND, &[]),
-            max_batch_size: read_env_usize(ENV_MAX_BATCH_SIZE, &[]),
+            max_batch_size: read_env_batch_size(ENV_MAX_BATCH_SIZE, &[]),
+            max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
+            max_retained_sequences: read_env_usize(ENV_MAX_RETAINED_SEQUENCES, &[]),
+            max_staged_transactions: read_env_usize(ENV_MAX_STAGED_TRANSACTIONS, &[]),
+            max_queued_requests: read_env_usize(ENV_MAX_QUEUED_REQUESTS, &[]),
             max_sequence_length: read_env_context(ENV_MAX_SEQUENCE_LENGTH, &[]),
             num_threads: read_env_usize(ENV_NUM_THREADS, &[]),
             max_concurrent_requests: read_env_usize(ENV_MAX_CONCURRENT, LEGACY_ENV_MAX_CONCURRENT),
@@ -182,8 +218,24 @@ fn default_backend() -> BackendPreference {
     BackendPreference::Auto
 }
 
-fn default_max_batch_size() -> usize {
+fn default_max_batch_size() -> BatchSizePreference {
+    BatchSizePreference::Auto
+}
+
+fn default_max_scheduler_batch_size() -> usize {
     8
+}
+
+fn default_max_retained_sequences() -> usize {
+    8
+}
+
+fn default_max_staged_transactions() -> usize {
+    8
+}
+
+fn default_max_queued_requests() -> usize {
+    128
 }
 
 fn default_num_threads() -> usize {
@@ -254,10 +306,11 @@ fn read_env_usize(primary: &str, aliases: &[&str]) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
-fn read_env_context(
-    primary: &str,
-    aliases: &[&str],
-) -> Option<ContextLengthPreference> {
+fn read_env_batch_size(primary: &str, aliases: &[&str]) -> Option<BatchSizePreference> {
+    first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
+}
+
+fn read_env_context(primary: &str, aliases: &[&str]) -> Option<ContextLengthPreference> {
     first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
 }
 
@@ -292,6 +345,10 @@ mod tests {
         ENV_MODELS_DIR,
         ENV_BACKEND,
         ENV_MAX_BATCH_SIZE,
+        ENV_MAX_SCHEDULER_BATCH_SIZE,
+        ENV_MAX_RETAINED_SEQUENCES,
+        ENV_MAX_STAGED_TRANSACTIONS,
+        ENV_MAX_QUEUED_REQUESTS,
         ENV_MAX_SEQUENCE_LENGTH,
         ENV_NUM_THREADS,
         ENV_MAX_CONCURRENT,
@@ -371,7 +428,7 @@ mod tests {
         let config_file = ServeRuntimeConfigOverrides {
             host: Some("config-host".to_string()),
             port: Some(9001),
-            max_batch_size: Some(6),
+            max_batch_size: Some(BatchSizePreference::fixed(6).unwrap()),
             num_threads: Some(3),
             max_concurrent_requests: Some(50),
             request_timeout_secs: Some(111),
@@ -381,7 +438,7 @@ mod tests {
         };
         let env = ServeRuntimeConfigOverrides {
             host: Some("env-host".to_string()),
-            max_batch_size: Some(7),
+            max_batch_size: Some(BatchSizePreference::fixed(7).unwrap()),
             request_timeout_secs: Some(222),
             cors_enabled: Some(true),
             ..ServeRuntimeConfigOverrides::default()
@@ -398,7 +455,7 @@ mod tests {
 
         assert_eq!(resolved.host, "cli-host");
         assert_eq!(resolved.port, 9003);
-        assert_eq!(resolved.max_batch_size, 7);
+        assert_eq!(resolved.max_batch_size.fixed_rows(), Some(7));
         assert_eq!(resolved.num_threads, 5);
         assert_eq!(resolved.max_concurrent_requests, 50);
         assert_eq!(resolved.request_timeout_secs, 222);
@@ -436,7 +493,11 @@ mod tests {
         let resolved = ServeRuntimeConfig {
             models_dir: PathBuf::from("/tmp/izwi-models"),
             backend: BackendPreference::Cpu,
-            max_batch_size: 12,
+            max_batch_size: BatchSizePreference::fixed(12).unwrap(),
+            max_scheduler_batch_size: 9,
+            max_retained_sequences: 10,
+            max_staged_transactions: 3,
+            max_queued_requests: 77,
             num_threads: 6,
             ..ServeRuntimeConfig::default()
         };
@@ -444,7 +505,11 @@ mod tests {
         let engine = resolved.engine_config();
 
         assert_eq!(engine.models_dir, PathBuf::from("/tmp/izwi-models"));
-        assert_eq!(engine.max_batch_size, 12);
+        assert_eq!(engine.max_batch_size.fixed_rows(), Some(12));
+        assert_eq!(engine.max_scheduler_batch_size, 9);
+        assert_eq!(engine.max_retained_sequences, 10);
+        assert_eq!(engine.max_staged_transactions, 3);
+        assert_eq!(engine.max_queued_requests, 77);
         assert_eq!(engine.backend, BackendPreference::Cpu);
         assert_eq!(engine.num_threads, 6);
     }

@@ -829,6 +829,10 @@ mod tests {
         std::env::remove_var("IZWI_BACKEND");
         std::env::remove_var("IZWI_LOG_FORMAT");
         std::env::remove_var("IZWI_MAX_BATCH_SIZE");
+        std::env::remove_var("IZWI_MAX_SCHEDULER_BATCH_SIZE");
+        std::env::remove_var("IZWI_MAX_RETAINED_SEQUENCES");
+        std::env::remove_var("IZWI_MAX_STAGED_TRANSACTIONS");
+        std::env::remove_var("IZWI_MAX_QUEUED_REQUESTS");
         std::env::remove_var("IZWI_NUM_THREADS");
         std::env::remove_var("IZWI_MAX_CONCURRENT");
         std::env::remove_var("IZWI_TIMEOUT");
@@ -1028,7 +1032,10 @@ mod tests {
 
         assert_eq!(resolved.host, "0.0.0.0");
         assert_eq!(resolved.port, 8080);
-        assert_eq!(resolved.max_batch_size, 8);
+        assert_eq!(
+            resolved.max_batch_size,
+            izwi_core::BatchSizePreference::Auto
+        );
         assert!(resolved.num_threads >= 1);
         clear_bind_env();
     }
@@ -1056,7 +1063,7 @@ mod tests {
 
         let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"]));
 
-        assert_eq!(resolved.max_batch_size, 16);
+        assert_eq!(resolved.max_batch_size.fixed_rows(), Some(16));
         assert_eq!(resolved.num_threads, 6);
         assert_eq!(resolved.max_concurrent_requests, 44);
         assert_eq!(resolved.request_timeout_secs, 720);

@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::backends::{BackendPreference, BackendRouter};
+use crate::backends::{BackendKind, BackendPreference, BackendRouter};
 use crate::{Error, Result};
 
 /// Operator intent for selecting a model's maximum context length.
@@ -121,6 +121,133 @@ impl<'de> Deserialize<'de> for ContextLengthPreference {
         }
 
         deserializer.deserialize_any(ContextLengthVisitor)
+    }
+}
+
+/// Operator intent for the maximum width of one physical tensor invocation.
+///
+/// This is deliberately independent from scheduler, retained-session, staged
+/// transaction, and request-queue capacities. Automatic width is resolved only
+/// after the execution backend is known; positive numeric values retain the
+/// historical meaning of an explicit fixed width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatchSizePreference {
+    #[default]
+    Auto,
+    Fixed(NonZeroUsize),
+}
+
+impl BatchSizePreference {
+    pub fn fixed(rows: usize) -> Result<Self> {
+        NonZeroUsize::new(rows)
+            .map(Self::Fixed)
+            .ok_or_else(|| Error::ConfigError("batch size must be greater than zero".into()))
+    }
+
+    pub const fn fixed_rows(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(rows) => Some(rows.get()),
+        }
+    }
+
+    /// Resolve the effective native tensor width for a concrete backend.
+    pub const fn resolve(self, backend: BackendKind) -> usize {
+        match self {
+            Self::Fixed(rows) => rows.get(),
+            Self::Auto => match backend {
+                BackendKind::Cpu | BackendKind::Metal => 1,
+                BackendKind::Cuda => 8,
+            },
+        }
+    }
+}
+
+impl fmt::Display for BatchSizePreference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("auto"),
+            Self::Fixed(rows) => rows.fmt(formatter),
+        }
+    }
+}
+
+impl FromStr for BatchSizePreference {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let rows = value.parse::<usize>().map_err(|_| {
+            Error::ConfigError(format!(
+                "invalid batch size {value:?}; expected 'auto' or a positive integer"
+            ))
+        })?;
+        Self::fixed(rows)
+    }
+}
+
+impl Serialize for BatchSizePreference {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Fixed(rows) => serializer.serialize_u64(rows.get() as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BatchSizePreference {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BatchSizeVisitor;
+
+        impl serde::de::Visitor<'_> for BatchSizeVisitor {
+            type Value = BatchSizePreference;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("\"auto\" or a positive integer physical batch width")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.trim().eq_ignore_ascii_case("auto") {
+                    Ok(BatchSizePreference::Auto)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = usize::try_from(value)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))?;
+                NonZeroUsize::new(value)
+                    .map(BatchSizePreference::Fixed)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Unsigned(0), &self))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = u64::try_from(value)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))?;
+                self.visit_u64(value)
+            }
+        }
+
+        deserializer.deserialize_any(BatchSizeVisitor)
     }
 }
 
@@ -316,9 +443,25 @@ pub struct EngineConfig {
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
 
-    /// Maximum batch size for inference
-    #[serde(default = "default_max_batch_size")]
-    pub max_batch_size: usize,
+    /// Automatic or explicitly fixed physical tensor batch width.
+    #[serde(default)]
+    pub max_batch_size: BatchSizePreference,
+
+    /// Maximum logical rows selected by one scheduler step.
+    #[serde(default = "default_max_scheduler_batch_size")]
+    pub max_scheduler_batch_size: usize,
+
+    /// Maximum retained sequence/session rows in managed model state.
+    #[serde(default = "default_max_retained_sequences")]
+    pub max_retained_sequences: usize,
+
+    /// Maximum simultaneously staged managed-state transactions.
+    #[serde(default = "default_max_staged_transactions")]
+    pub max_staged_transactions: usize,
+
+    /// Maximum admitted jobs in the runtime inference queue.
+    #[serde(default = "default_max_queued_requests")]
+    pub max_queued_requests: usize,
 
     /// Automatic or explicitly fixed maximum sequence length.
     #[serde(default)]
@@ -368,7 +511,11 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             models_dir: default_models_dir(),
-            max_batch_size: default_max_batch_size(),
+            max_batch_size: BatchSizePreference::Auto,
+            max_scheduler_batch_size: default_max_scheduler_batch_size(),
+            max_retained_sequences: default_max_retained_sequences(),
+            max_staged_transactions: default_max_staged_transactions(),
+            max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
             portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
             chunk_size: default_chunk_size(),
@@ -409,8 +556,20 @@ fn default_models_dir() -> PathBuf {
         .join("models")
 }
 
-fn default_max_batch_size() -> usize {
+fn default_max_scheduler_batch_size() -> usize {
     8
+}
+
+fn default_max_retained_sequences() -> usize {
+    8
+}
+
+fn default_max_staged_transactions() -> usize {
+    8
+}
+
+fn default_max_queued_requests() -> usize {
+    128
 }
 
 fn default_portable_context_reserve_bytes() -> u64 {
@@ -631,7 +790,44 @@ fn get_num_cpus() -> usize {
 
 #[cfg(test)]
 mod managed_kv_default_tests {
-    use super::{ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy};
+    use super::{
+        BatchSizePreference, ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy,
+    };
+    use crate::backends::BackendKind;
+
+    #[test]
+    fn physical_batch_defaults_are_backend_aware() {
+        let preference = EngineConfig::default().max_batch_size;
+        assert_eq!(preference, BatchSizePreference::Auto);
+        assert_eq!(preference.resolve(BackendKind::Cpu), 1);
+        assert_eq!(preference.resolve(BackendKind::Metal), 1);
+        assert_eq!(preference.resolve(BackendKind::Cuda), 8);
+    }
+
+    #[test]
+    fn fixed_physical_batch_provenance_survives_configuration_parsing() {
+        let automatic: EngineConfig = serde_json::from_str(r#"{"max_batch_size":"auto"}"#).unwrap();
+        assert_eq!(automatic.max_batch_size, BatchSizePreference::Auto);
+
+        let fixed: EngineConfig = serde_json::from_str(r#"{"max_batch_size":4}"#).unwrap();
+        assert_eq!(fixed.max_batch_size.fixed_rows(), Some(4));
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(fixed.max_batch_size.resolve(backend), 4);
+        }
+
+        let serialized = serde_json::to_value(fixed).unwrap();
+        assert_eq!(serialized["max_batch_size"], 4);
+    }
+
+    #[test]
+    fn physical_and_logical_capacity_defaults_are_independent() {
+        let config = EngineConfig::default();
+        assert_eq!(config.max_scheduler_batch_size, 8);
+        assert_eq!(config.max_retained_sequences, 8);
+        assert_eq!(config.max_staged_transactions, 8);
+        assert_eq!(config.max_queued_requests, 128);
+        assert_eq!(config.max_batch_size.resolve(BackendKind::Cpu), 1);
+    }
 
     #[test]
     fn managed_prefix_reuse_is_fail_closed_for_normal_runtime_config() {

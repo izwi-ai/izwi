@@ -99,9 +99,25 @@ pub enum Commands {
         #[arg(short, long)]
         models_dir: Option<PathBuf>,
 
-        /// Maximum batch size
+        /// Physical tensor batch width (`auto` or a positive row count)
+        #[arg(long, value_name = "AUTO_OR_ROWS")]
+        max_batch_size: Option<izwi_core::BatchSizePreference>,
+
+        /// Maximum logical rows selected by one scheduler step
         #[arg(long)]
-        max_batch_size: Option<usize>,
+        max_scheduler_batch_size: Option<usize>,
+
+        /// Maximum retained sequence/session rows
+        #[arg(long)]
+        max_retained_sequences: Option<usize>,
+
+        /// Maximum simultaneously staged managed-state transactions
+        #[arg(long)]
+        max_staged_transactions: Option<usize>,
+
+        /// Maximum admitted jobs in the runtime inference queue
+        #[arg(long)]
+        max_queued_requests: Option<usize>,
 
         /// Portable context length (`auto` or a positive token count)
         #[arg(long, value_name = "AUTO_OR_TOKENS")]

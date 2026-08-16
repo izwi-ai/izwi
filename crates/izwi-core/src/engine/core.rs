@@ -2787,11 +2787,15 @@ impl EngineCore {
             return Ok(None);
         };
         let backend = self.managed_kv_cache.worker_backend();
-        let retained_sequence_rows = u32::try_from(self.config.max_batch_size)
+        let retained_sequence_rows = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
         let fit_cuda_contiguous_context =
             backend == BackendKind::Cuda && fit_cuda_contiguous_context;
-        let staged_transaction_rows = staged_transaction_rows.unwrap_or(retained_sequence_rows);
+        let staged_transaction_rows = staged_transaction_rows.unwrap_or(
+            u32::try_from(self.config.max_staged_transactions).map_err(|_| {
+                Error::InvalidInput("managed state transaction limit exceeds u32".into())
+            })?,
+        );
         let logical_token_reach = if fit_cuda_contiguous_context {
             let maximum_tokens = logical_context_tokens.ok_or_else(|| {
                 Error::ModelLoadError(
@@ -2883,12 +2887,13 @@ impl EngineCore {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
                 logical_token_reach,
-                retained_sequence_rows: u32::try_from(self.config.max_batch_size).map_err(
+                retained_sequence_rows: u32::try_from(self.config.max_retained_sequences).map_err(
                     |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
                 )?,
-                staged_transaction_rows: u32::try_from(self.config.max_batch_size).map_err(
-                    |_| Error::InvalidInput("managed state transaction limit exceeds u32".into()),
-                )?,
+                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
+                    .map_err(|_| {
+                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                    })?,
             },
             self.config.block_size,
             retained_state,
@@ -2927,10 +2932,10 @@ impl EngineCore {
                     maximum_tokens,
                     self.config.portable_context_reserve_bytes,
                     self.config.block_size,
-                    u32::try_from(self.config.max_batch_size).map_err(|_| {
+                    u32::try_from(self.config.max_retained_sequences).map_err(|_| {
                         Error::InvalidInput("managed state sequence limit exceeds u32".into())
                     })?,
-                    u32::try_from(self.config.max_batch_size).map_err(|_| {
+                    u32::try_from(self.config.max_staged_transactions).map_err(|_| {
                         Error::InvalidInput("managed state transaction limit exceeds u32".into())
                     })?,
                     portable_state_copies,
