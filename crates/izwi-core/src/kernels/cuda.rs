@@ -5,7 +5,7 @@
 //! by `Device::is_cuda()` and fall back to the caller's existing implementation
 //! when a shape, dtype, or build does not support the operation.
 
-use candle_core::{CpuStorage, CustomOp3, DType, Layout, Shape, Tensor, D};
+use candle_core::{CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Layout, Shape, Tensor, D};
 
 #[cfg(feature = "cuda")]
 use std::cell::RefCell;
@@ -77,6 +77,87 @@ pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
                 .ok()?
                 .sqrt()
                 .ok()?,
+        )
+        .ok()
+}
+
+/// Qwen3.8-only single-launch SiLU-times-up candidate for F32 decode rows.
+pub fn try_qwen38_silu_mul_decode(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(gate, up)
+        || gate.dtype() != DType::F32
+        || gate.dims() != up.dims()
+        || gate.dims().len() != 3
+        || gate.dim(0).ok()? != 1
+        || gate.dim(1).ok()? != 1
+        || gate.elem_count() == 0
+    {
+        return None;
+    }
+    gate.contiguous()
+        .ok()?
+        .apply_op2_no_bwd(&up.contiguous().ok()?, &CudaQwen38SiluMulDecodeOp)
+        .ok()
+}
+
+/// Qwen3.8-only single-launch last-axis L2 normalization candidate for decode.
+pub fn try_qwen38_l2_norm_decode(input: &Tensor, eps: f64) -> Option<Tensor> {
+    if !cuda_tensor_supported(input)
+        || input.dtype() != DType::F32
+        || input.dims().len() != 3
+        || input.dim(0).ok()? != 1
+        || input.elem_count() == 0
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return None;
+    }
+    let hidden_dim = input.dim(D::Minus1).ok()?;
+    let rows = input.elem_count().checked_div(hidden_dim)?;
+    input
+        .contiguous()
+        .ok()?
+        .apply_op1_no_bwd(&CudaQwen38L2NormDecodeOp {
+            rows,
+            hidden_dim,
+            eps: eps as f32,
+        })
+        .ok()
+}
+
+/// Qwen3.8-only single-launch gated RMSNorm candidate for DeltaNet decode.
+pub fn try_qwen38_gated_rms_norm_decode(
+    hidden: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Option<Tensor> {
+    if !cuda_tensor_pair_supported(hidden, gate)
+        || !cuda_tensor_pair_supported(hidden, weight)
+        || hidden.dtype() != DType::F32
+        || hidden.dims() != gate.dims()
+        || hidden.dims().len() != 2
+        || hidden.elem_count() == 0
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return None;
+    }
+    let hidden_dim = hidden.dim(D::Minus1).ok()?;
+    let rows = hidden.elem_count().checked_div(hidden_dim)?;
+    if weight.dims() != [hidden_dim] {
+        return None;
+    }
+    hidden
+        .contiguous()
+        .ok()?
+        .apply_op3_no_bwd(
+            &gate.contiguous().ok()?,
+            &weight.contiguous().ok()?,
+            &CudaQwen38GatedRmsNormDecodeOp {
+                rows,
+                hidden_dim,
+                eps: eps as f32,
+            },
         )
         .ok()
 }
@@ -1712,6 +1793,259 @@ struct CudaQwen38CausalConvDecodeOp {
     conv_dim: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CudaQwen38SiluMulDecodeOp;
+
+#[derive(Debug, Clone, Copy)]
+struct CudaQwen38L2NormDecodeOp {
+    rows: usize,
+    hidden_dim: usize,
+    eps: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CudaQwen38GatedRmsNormDecodeOp {
+    rows: usize,
+    hidden_dim: usize,
+    eps: f32,
+}
+
+impl CustomOp2 for CudaQwen38SiluMulDecodeOp {
+    fn name(&self) -> &'static str {
+        "qwen38-silu-mul-decode"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _gate: &CpuStorage,
+        _gate_layout: &Layout,
+        _up: &CpuStorage,
+        _up_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("Qwen3.8 CUDA SiLU-mul decode has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        gate: &candle_core::CudaStorage,
+        gate_layout: &Layout,
+        up: &candle_core::CudaStorage,
+        up_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        let CudaStorageSlice::F32(gate_slice) = &gate.slice else {
+            candle_core::bail!("Qwen3.8 CUDA SiLU-mul gate must use F32 storage")
+        };
+        let CudaStorageSlice::F32(up_slice) = &up.slice else {
+            candle_core::bail!("Qwen3.8 CUDA SiLU-mul up must use F32 storage")
+        };
+        let Some((gate_start, gate_end)) = gate_layout.contiguous_offsets() else {
+            candle_core::bail!("Qwen3.8 CUDA SiLU-mul gate must be contiguous")
+        };
+        let Some((up_start, up_end)) = up_layout.contiguous_offsets() else {
+            candle_core::bail!("Qwen3.8 CUDA SiLU-mul up must be contiguous")
+        };
+        let elements = gate_layout.shape().elem_count();
+        if elements == 0
+            || elements != up_layout.shape().elem_count()
+            || elements > i32::MAX as usize
+        {
+            candle_core::bail!("Qwen3.8 CUDA SiLU-mul shape is unsupported")
+        }
+        let gate_view = gate_slice.slice(gate_start..gate_end);
+        let up_view = up_slice.slice(up_start..up_end);
+        let device = gate.device();
+        // SAFETY: the kernel writes every element before the storage is observed.
+        let output = unsafe { device.alloc::<f32>(elements)? };
+        let function = device.get_or_load_custom_func(
+            "qwen38_silu_mul_decode_f32",
+            "izwi_qwen38_decode_epilogues",
+            cuda_ptx::QWEN38,
+        )?;
+        let mut builder = function.builder();
+        builder.arg(&gate_view);
+        builder.arg(&up_view);
+        builder.arg(&output);
+        candle_core::builder_arg!(builder, elements as i32);
+        // SAFETY: the validated F32 views and element count match the CUDA ABI.
+        unsafe { builder.launch(LaunchConfig::for_num_elems(elements as u32)) }.w()?;
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            gate_layout.shape().clone(),
+        ))
+    }
+}
+
+impl CustomOp1 for CudaQwen38L2NormDecodeOp {
+    fn name(&self) -> &'static str {
+        "qwen38-l2-norm-decode"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _input: &CpuStorage,
+        _input_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("Qwen3.8 CUDA L2 norm decode has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        input: &candle_core::CudaStorage,
+        input_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        let CudaStorageSlice::F32(input_slice) = &input.slice else {
+            candle_core::bail!("Qwen3.8 CUDA L2 norm input must use F32 storage")
+        };
+        let Some((start, end)) = input_layout.contiguous_offsets() else {
+            candle_core::bail!("Qwen3.8 CUDA L2 norm input must be contiguous")
+        };
+        let elements = self.rows.checked_mul(self.hidden_dim).ok_or_else(|| {
+            candle_core::Error::Msg("Qwen3.8 CUDA L2 norm shape overflow".to_string())
+        })?;
+        if elements != input_layout.shape().elem_count()
+            || self.rows == 0
+            || self.hidden_dim == 0
+            || self.rows > u32::MAX as usize
+            || self.hidden_dim > i32::MAX as usize
+        {
+            candle_core::bail!("Qwen3.8 CUDA L2 norm shape is unsupported")
+        }
+        let input_view = input_slice.slice(start..end);
+        let device = input.device();
+        // SAFETY: each block writes its complete output row.
+        let output = unsafe { device.alloc::<f32>(elements)? };
+        let function = device.get_or_load_custom_func(
+            "qwen38_l2_norm_decode_f32",
+            "izwi_qwen38_decode_epilogues",
+            cuda_ptx::QWEN38,
+        )?;
+        let config = LaunchConfig {
+            grid_dim: (self.rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+        };
+        let mut builder = function.builder();
+        builder.arg(&input_view);
+        builder.arg(&output);
+        candle_core::builder_arg!(builder, self.hidden_dim as i32, self.eps);
+        // SAFETY: one block owns each validated row and reduction scratch is sized for the block.
+        unsafe { builder.launch(config) }.w()?;
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            input_layout.shape().clone(),
+        ))
+    }
+}
+
+impl CustomOp3 for CudaQwen38GatedRmsNormDecodeOp {
+    fn name(&self) -> &'static str {
+        "qwen38-gated-rms-norm-decode"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _hidden: &CpuStorage,
+        _hidden_layout: &Layout,
+        _gate: &CpuStorage,
+        _gate_layout: &Layout,
+        _weight: &CpuStorage,
+        _weight_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        candle_core::bail!("Qwen3.8 CUDA gated RMSNorm decode has no CPU implementation")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        hidden: &candle_core::CudaStorage,
+        hidden_layout: &Layout,
+        gate: &candle_core::CudaStorage,
+        gate_layout: &Layout,
+        weight: &candle_core::CudaStorage,
+        weight_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        fn contiguous_f32<'a>(
+            storage: &'a CudaStorageSlice,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
+        {
+            let CudaStorageSlice::F32(slice) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(slice.slice(start..end))
+        }
+
+        let elements = self.rows.checked_mul(self.hidden_dim).ok_or_else(|| {
+            candle_core::Error::Msg("Qwen3.8 CUDA gated RMSNorm shape overflow".to_string())
+        })?;
+        if elements != hidden_layout.shape().elem_count()
+            || elements != gate_layout.shape().elem_count()
+            || self.hidden_dim != weight_layout.shape().elem_count()
+            || self.rows == 0
+            || self.hidden_dim == 0
+            || self.rows > u32::MAX as usize
+            || self.hidden_dim > i32::MAX as usize
+        {
+            candle_core::bail!("Qwen3.8 CUDA gated RMSNorm shape is unsupported")
+        }
+        let hidden_view = contiguous_f32(&hidden.slice, hidden_layout, "hidden")?;
+        let gate_view = contiguous_f32(&gate.slice, gate_layout, "gate")?;
+        let weight_view = contiguous_f32(&weight.slice, weight_layout, "weight")?;
+        let device = hidden.device();
+        // SAFETY: each block writes its complete output row.
+        let output = unsafe { device.alloc::<f32>(elements)? };
+        let function = device.get_or_load_custom_func(
+            "qwen38_gated_rms_norm_decode_f32",
+            "izwi_qwen38_decode_epilogues",
+            cuda_ptx::QWEN38,
+        )?;
+        let config = LaunchConfig {
+            grid_dim: (self.rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+        };
+        let mut builder = function.builder();
+        builder.arg(&hidden_view);
+        builder.arg(&gate_view);
+        builder.arg(&weight_view);
+        builder.arg(&output);
+        candle_core::builder_arg!(builder, self.hidden_dim as i32, self.eps);
+        // SAFETY: one block owns each validated row and reduction scratch is sized for the block.
+        unsafe { builder.launch(config) }.w()?;
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            hidden_layout.shape().clone(),
+        ))
+    }
+}
+
 impl CustomOp3 for CudaQwen38CausalConvDecodeOp {
     fn name(&self) -> &'static str {
         "qwen38-causal-conv-decode"
@@ -2674,6 +3008,14 @@ mod tests {
 
         assert!(try_fused_silu_mul(&lhs, &rhs).is_none());
         assert!(try_fused_l2_norm(&lhs, 1e-6).is_none());
+        assert!(
+            try_qwen38_silu_mul_decode(&lhs.unsqueeze(1).unwrap(), &rhs.unsqueeze(1).unwrap())
+                .is_none()
+        );
+        assert!(try_qwen38_l2_norm_decode(&lhs.unsqueeze(1).unwrap(), 1e-6).is_none());
+        assert!(
+            try_qwen38_gated_rms_norm_decode(&lhs, &rhs, &rhs.squeeze(0).unwrap(), 1e-6).is_none()
+        );
 
         let conv_input = Tensor::zeros((1, 1, 8), DType::F32, &device).unwrap();
         let conv_weight = Tensor::zeros((8, 4), DType::F32, &device).unwrap();
@@ -2712,10 +3054,108 @@ mod tests {
         let source = include_str!("cuda/qwen38.cu");
         assert!(source.contains("qwen38_causal_conv_decode_f32"));
         assert!(source.contains("qwen38_deltanet_decode_f32"));
+        assert!(source.contains("qwen38_silu_mul_decode_f32"));
+        assert!(source.contains("qwen38_l2_norm_decode_f32"));
+        assert!(source.contains("qwen38_gated_rms_norm_decode_f32"));
         assert!(source.contains("const int key_head = value_head / repeats"));
         assert!(source.contains("next_state[state_idx] = updated"));
         assert!(source.contains("initial_state[state_idx]"));
         assert!(!source.contains("qwen35"));
+    }
+
+    fn qwen38_silu_mul_oracle(gate: &[f32], up: &[f32]) -> Vec<f32> {
+        gate.iter()
+            .zip(up)
+            .map(|(&gate, &up)| gate / (1.0 + (-gate).exp()) * up)
+            .collect()
+    }
+
+    fn qwen38_l2_norm_oracle(input: &[f32], eps: f32) -> Vec<f32> {
+        let inverse = 1.0 / (input.iter().map(|value| value * value).sum::<f32>() + eps).sqrt();
+        input.iter().map(|value| value * inverse).collect()
+    }
+
+    fn qwen38_gated_rms_norm_oracle(
+        hidden: &[f32],
+        gate: &[f32],
+        weight: &[f32],
+        eps: f32,
+    ) -> Vec<f32> {
+        let mean_square =
+            hidden.iter().map(|value| value * value).sum::<f32>() / hidden.len() as f32;
+        let inverse_rms = 1.0 / (mean_square + eps).sqrt();
+        hidden
+            .iter()
+            .zip(gate)
+            .zip(weight)
+            .map(|((&hidden, &gate), &weight)| {
+                hidden * inverse_rms * weight * gate / (1.0 + (-gate).exp())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn qwen38_decode_epilogue_oracles_match_portable_candle_math() {
+        let device = candle_core::Device::Cpu;
+        let hidden_values = vec![3.0f32, 4.0, -2.0, 1.0];
+        let gate_values = vec![-1.0f32, 0.0, 1.0, 2.0];
+        let up_values = vec![0.5f32, -2.0, 3.0, 0.25];
+        let weight_values = vec![1.0f32, 0.75, -0.5, 2.0];
+        let hidden = Tensor::from_vec(hidden_values.clone(), (1, 4), &device).unwrap();
+        let gate = Tensor::from_vec(gate_values.clone(), (1, 4), &device).unwrap();
+        let up = Tensor::from_vec(up_values.clone(), (1, 4), &device).unwrap();
+        let weight = Tensor::from_vec(weight_values.clone(), 4, &device).unwrap();
+        let eps = 1e-6f64;
+
+        let candle_silu_mul = candle_nn::ops::silu(&gate)
+            .unwrap()
+            .broadcast_mul(&up)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let candle_l2 = hidden
+            .broadcast_div(
+                &(hidden.sqr().unwrap().sum_keepdim(D::Minus1).unwrap() + eps)
+                    .unwrap()
+                    .sqrt()
+                    .unwrap(),
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let candle_gated = candle_nn::ops::rms_norm(&hidden, &weight, eps as f32)
+            .unwrap()
+            .broadcast_mul(&candle_nn::ops::silu(&gate).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        for (actual, expected) in candle_silu_mul
+            .iter()
+            .zip(qwen38_silu_mul_oracle(&gate_values, &up_values))
+        {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+        for (actual, expected) in candle_l2
+            .iter()
+            .zip(qwen38_l2_norm_oracle(&hidden_values, eps as f32))
+        {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
+        for (actual, expected) in candle_gated.iter().zip(qwen38_gated_rms_norm_oracle(
+            &hidden_values,
+            &gate_values,
+            &weight_values,
+            eps as f32,
+        )) {
+            assert!((actual - expected).abs() <= 1e-6);
+        }
     }
 
     fn deltanet_step_reference(

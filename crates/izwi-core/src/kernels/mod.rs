@@ -146,6 +146,35 @@ pub fn try_fused_l2_norm(input: &Tensor, eps: f64) -> Option<Tensor> {
     None
 }
 
+/// Try the Qwen3.8-specific CUDA SiLU-mul decode epilogue.
+pub fn try_qwen38_silu_mul_decode(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(gate.device()) || !gate.device().is_cuda() {
+        return None;
+    }
+    cuda::try_qwen38_silu_mul_decode(gate, up)
+}
+
+/// Try the Qwen3.8-specific CUDA L2-normalization decode epilogue.
+pub fn try_qwen38_l2_norm_decode(input: &Tensor, eps: f64) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(input.device()) || !input.device().is_cuda() {
+        return None;
+    }
+    cuda::try_qwen38_l2_norm_decode(input, eps)
+}
+
+/// Try the Qwen3.8-specific CUDA gated-RMSNorm decode epilogue.
+pub fn try_qwen38_gated_rms_norm_decode(
+    hidden: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Option<Tensor> {
+    if !use_fused_kernels_for_device(hidden.device()) || !hidden.device().is_cuda() {
+        return None;
+    }
+    cuda::try_qwen38_gated_rms_norm_decode(hidden, gate, weight, eps)
+}
+
 pub fn try_fused_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<Tensor> {
     if !use_fused_kernels_for_device(input.device()) {
         return None;

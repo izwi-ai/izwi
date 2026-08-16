@@ -1,5 +1,77 @@
 #include <math.h>
 
+// Qwen3.8 decode-only elementwise epilogues. These symbols intentionally live
+// in the model-family source so they can evolve independently of Qwen3.5.
+extern "C" __global__ void qwen38_silu_mul_decode_f32(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ output,
+    int elements) {
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= elements) return;
+  const float value = gate[gid];
+  output[gid] = (value / (1.0f + expf(-value))) * up[gid];
+}
+
+extern "C" __global__ void qwen38_l2_norm_decode_f32(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int hidden_dim,
+    float eps) {
+  const int row = blockIdx.x;
+  const int base = row * hidden_dim;
+  extern __shared__ float reduction[];
+  float squares = 0.0f;
+  for (int column = threadIdx.x; column < hidden_dim; column += blockDim.x) {
+    const float value = input[base + column];
+    squares += value * value;
+  }
+  reduction[threadIdx.x] = squares;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse_norm = rsqrtf(reduction[0] + eps);
+  for (int column = threadIdx.x; column < hidden_dim; column += blockDim.x) {
+    output[base + column] = input[base + column] * inverse_norm;
+  }
+}
+
+extern "C" __global__ void qwen38_gated_rms_norm_decode_f32(
+    const float* __restrict__ hidden,
+    const float* __restrict__ gate,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int hidden_dim,
+    float eps) {
+  const int row = blockIdx.x;
+  const int base = row * hidden_dim;
+  extern __shared__ float reduction[];
+  float squares = 0.0f;
+  for (int column = threadIdx.x; column < hidden_dim; column += blockDim.x) {
+    const float value = hidden[base + column];
+    squares += value * value;
+  }
+  reduction[threadIdx.x] = squares;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse_rms = rsqrtf(reduction[0] / (float)hidden_dim + eps);
+  for (int column = threadIdx.x; column < hidden_dim; column += blockDim.x) {
+    const int index = base + column;
+    const float gate_value = gate[index];
+    const float silu_gate = gate_value / (1.0f + expf(-gate_value));
+    output[index] = hidden[index] * inverse_rms * weight[column] * silu_gate;
+  }
+}
+
 // Qwen3.8 single-token depthwise convolution. The packed result contains the
 // activated output followed by the next three-slot history. Keeping both in one
 // allocation lets the model stage the new transactional state without stacking

@@ -20,7 +20,8 @@ use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
-    try_qwen38_deltanet_decode, try_tiled_deltanet_recurrence,
+    try_qwen38_deltanet_decode, try_qwen38_gated_rms_norm_decode, try_qwen38_l2_norm_decode,
+    try_qwen38_silu_mul_decode, try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -823,10 +824,18 @@ impl Qwen38Mlp {
             Error::InferenceError("Qwen3.8 gate/up projection omitted up output".into())
         })?;
 
-        let fused = try_fused_silu_mul(&gate_proj_out, &up_proj_out);
-        if gate_proj_out.device().is_cuda() {
-            record_cuda_kernel(CudaKernelPath::SiluMul, fused.is_some());
-        }
+        let candidate = if qwen38_decode_epilogues_enabled(gate_proj_out.device())
+            && gate_proj_out
+                .dims3()
+                .is_ok_and(|dims| dims.0 == 1 && dims.1 == 1)
+        {
+            let result = try_qwen38_silu_mul_decode(&gate_proj_out, &up_proj_out);
+            record_cuda_kernel(CudaKernelPath::SiluMul, result.is_some());
+            result
+        } else {
+            None
+        };
+        let fused = candidate.or_else(|| try_fused_silu_mul(&gate_proj_out, &up_proj_out));
         let hidden = if let Some(fused) = fused {
             fused
         } else {
@@ -1298,7 +1307,7 @@ impl Qwen38LinearAttention {
 
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
-        let output = self.norm.forward(&output, &z)?;
+        let output = self.norm.forward(&output, &z, true)?;
         let output = output
             .reshape((1, 1, self.num_v_heads * self.head_v_dim))?
             .to_dtype(residual_dtype)?;
@@ -1453,7 +1462,7 @@ impl Qwen38LinearAttention {
 
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
-        let output = self.norm.forward(&output, &z)?;
+        let output = self.norm.forward(&output, &z, false)?;
         let output = output
             .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
             .to_dtype(residual_dtype)?;
@@ -1600,12 +1609,17 @@ impl Qwen38LinearAttention {
 }
 
 impl Qwen38GatedRmsNorm {
-    fn forward(&self, hidden_states: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, gate: &Tensor, decode: bool) -> Result<Tensor> {
         if hidden_states.dtype() == DType::F32 {
-            let fused = try_fused_gated_rms_norm(hidden_states, gate, &self.weight, self.eps);
-            if hidden_states.device().is_cuda() {
-                record_cuda_kernel(CudaKernelPath::GatedRmsNorm, fused.is_some());
+            if decode && qwen38_decode_epilogues_enabled(hidden_states.device()) {
+                let candidate =
+                    try_qwen38_gated_rms_norm_decode(hidden_states, gate, &self.weight, self.eps);
+                record_cuda_kernel(CudaKernelPath::GatedRmsNorm, candidate.is_some());
+                if let Some(result) = candidate {
+                    return Ok(result);
+                }
             }
+            let fused = try_fused_gated_rms_norm(hidden_states, gate, &self.weight, self.eps);
             if let Some(result) = fused {
                 return Ok(result);
             }
@@ -2049,12 +2063,15 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 }
 
 fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
-    // Try fused Metal kernel first for F32 tensors
     if x.dtype() == DType::F32 {
-        let fused = try_fused_l2_norm(x, eps);
-        if x.device().is_cuda() {
-            record_cuda_kernel(CudaKernelPath::L2Norm, fused.is_some());
+        if qwen38_decode_epilogues_enabled(x.device()) && x.dims().len() == 3 {
+            let candidate = try_qwen38_l2_norm_decode(x, eps);
+            record_cuda_kernel(CudaKernelPath::L2Norm, candidate.is_some());
+            if let Some(result) = candidate {
+                return Ok(result);
+            }
         }
+        let fused = try_fused_l2_norm(x, eps);
         if let Some(result) = fused {
             return Ok(result);
         }
@@ -2104,6 +2121,17 @@ fn qwen38_projection_packing_enabled(device: &Device) -> bool {
         device.is_cuda(),
         qwen38_env_bool("IZWI_QWEN38_PACKED_PROJECTIONS", false),
     )
+}
+
+fn qwen38_decode_epilogues_enabled(device: &Device) -> bool {
+    qwen38_decode_epilogues_policy(
+        device.is_cuda(),
+        qwen38_env_bool("IZWI_QWEN38_DECODE_EPILOGUES", false),
+    )
+}
+
+fn qwen38_decode_epilogues_policy(is_cuda: bool, requested: bool) -> bool {
+    is_cuda && requested
 }
 
 fn qwen38_projection_packing_policy(is_cuda: bool, requested: bool) -> bool {
