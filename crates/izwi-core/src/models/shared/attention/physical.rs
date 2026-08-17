@@ -40,6 +40,18 @@ pub struct PhysicalPagedKvCache {
     completed_writes: Vec<Arc<KvWriteBatchCompletion>>,
 }
 
+/// Logical rollback point for a cache whose submitted writes are already
+/// backend-fenced. The physical pages remain owned by the cache; restoring a
+/// checkpoint only rewinds its block-table view and completion receipts.
+#[derive(Debug, Clone)]
+pub(crate) struct PhysicalPagedKvCheckpoint {
+    arena: KvArenaId,
+    blocks: Vec<CacheBlockRef>,
+    window_start: usize,
+    context_len: usize,
+    completed_write_count: usize,
+}
+
 impl PhysicalPagedKvCache {
     pub fn new(
         arena: Arc<dyn KvArena>,
@@ -142,6 +154,43 @@ impl PhysicalPagedKvCache {
 
     pub fn window_start(&self) -> usize {
         self.window_start
+    }
+
+    pub(crate) fn logical_checkpoint(&self) -> PhysicalPagedKvCheckpoint {
+        PhysicalPagedKvCheckpoint {
+            arena: self.arena.id(),
+            blocks: self.blocks.clone(),
+            window_start: self.window_start,
+            context_len: self.context_len,
+            completed_write_count: self.completed_writes.len(),
+        }
+    }
+
+    /// Restore one earlier logical view after all writes since that checkpoint
+    /// have been sealed. Discarded suffix pages may be overwritten by the next
+    /// append; incrementing the generation invalidates any older preparation.
+    pub(crate) fn restore_logical_checkpoint(
+        &mut self,
+        checkpoint: PhysicalPagedKvCheckpoint,
+    ) -> Result<()> {
+        if checkpoint.arena != self.arena.id()
+            || checkpoint.completed_write_count > self.completed_writes.len()
+            || checkpoint.context_len > self.context_len
+        {
+            return Err(Error::InvalidInput(
+                "physical paged rollback checkpoint is stale or foreign".into(),
+            ));
+        }
+        self.logical_generation = self
+            .logical_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("physical rollback generation overflow".into()))?;
+        self.blocks = checkpoint.blocks;
+        self.window_start = checkpoint.window_start;
+        self.context_len = checkpoint.context_len;
+        self.completed_writes
+            .truncate(checkpoint.completed_write_count);
+        Ok(())
     }
 
     /// Recycle fully invisible leading pages before a sliding-window append.
@@ -1082,6 +1131,40 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].slots(), &original_slots[..1]);
         assert_eq!(writes[1].slots(), &original_slots[1..]);
+    }
+
+    #[test]
+    fn logical_checkpoint_restores_accepted_sequential_writes() {
+        let mut cache = prefix_test_cache(21);
+        let base = cache.logical_checkpoint();
+        let first = fully_written_append(&cache, 1);
+        cache.commit_prepared(first).unwrap();
+        let accepted = cache.logical_checkpoint();
+        let rejected = fully_written_append(&cache, 1);
+        let rejected_slot = rejected.slots.logical_slots()[0];
+        cache.commit_prepared(rejected).unwrap();
+
+        cache.restore_logical_checkpoint(accepted).unwrap();
+        assert_eq!(cache.context_len(), 1);
+        assert_eq!(cache.completed_writes.len(), 1);
+        assert_eq!(cache.slots_for_append(1, 1).unwrap()[0], rejected_slot);
+
+        cache.restore_logical_checkpoint(base).unwrap();
+        assert_eq!(cache.context_len(), 0);
+        assert!(cache.completed_writes.is_empty());
+    }
+
+    #[test]
+    fn logical_restore_invalidates_prepared_suffix_and_foreign_checkpoints() {
+        let mut cache = prefix_test_cache(22);
+        let base = cache.logical_checkpoint();
+        let mut stale = cache.prepare_append(0, 1).unwrap();
+        submit_prepared_writes(&cache, &mut stale, cache.layer_bindings.len());
+        cache.restore_logical_checkpoint(base).unwrap();
+        assert!(cache.commit_prepared(stale).is_err());
+
+        let foreign = prefix_test_cache(23).logical_checkpoint();
+        assert!(cache.restore_logical_checkpoint(foreign).is_err());
     }
 
     #[test]
