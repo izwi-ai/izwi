@@ -376,6 +376,25 @@ impl KvWriteBatchCompletion {
             .checked_mul(self.layers.len())
             .expect("validated KV write batch slot count overflowed")
     }
+
+    /// Narrow one already sealed batch proof to an exact leading slot range.
+    ///
+    /// Sealing has already waited every layer fence for the original slot set,
+    /// so this cannot expose unfinished writes. The returned proof deliberately
+    /// omits the discarded suffix, allowing exact-slot consumers to authenticate
+    /// only the logical prefix that was accepted by the model.
+    pub(crate) fn into_slot_prefix(mut self, slots_per_layer: usize) -> Result<Self> {
+        if slots_per_layer == 0 || slots_per_layer > self.slots.len() {
+            return Err(Error::InvalidInput(format!(
+                "KV write completion prefix {slots_per_layer} is outside 1..={}",
+                self.slots.len()
+            )));
+        }
+        if slots_per_layer < self.slots.len() {
+            self.slots = self.slots[..slots_per_layer].to_vec().into();
+        }
+        Ok(self)
+    }
 }
 
 /// Collects authenticated backend write tokens for one exact physical batch.
@@ -1142,6 +1161,39 @@ mod tests {
         assert_eq!(sealed.page_tokens(), 4);
         assert_eq!(sealed.total_slots(), 6);
         assert_eq!(waits.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn sealed_completion_prefix_fences_full_batch_and_exposes_exact_slots() {
+        let arena = test_arena(1);
+        let layers = [layer(4, 0), layer(9, 1)];
+        let config = config(arena, &layers);
+        let slots = slots(arena, 3);
+        let waits = Arc::new(AtomicUsize::new(0));
+        let mut collector =
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
+        for binding in layers {
+            collector
+                .collect(completion(
+                    arena,
+                    binding,
+                    slots.clone(),
+                    TestFence::new(waits.clone()),
+                ))
+                .expect("layer completion");
+        }
+
+        let prefix = collector
+            .seal()
+            .expect("sealed completion")
+            .into_slot_prefix(2)
+            .expect("authenticated prefix");
+
+        assert_eq!(waits.load(Ordering::Relaxed), 2);
+        assert_eq!(prefix.layers(), &layers);
+        assert_eq!(prefix.slots(), &slots[..2]);
+        assert_eq!(prefix.slots_per_layer(), 2);
+        assert_eq!(prefix.total_slots(), 4);
     }
 
     #[test]

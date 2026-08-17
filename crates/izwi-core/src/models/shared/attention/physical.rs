@@ -182,9 +182,10 @@ impl PhysicalPagedKvCache {
             }
             self.blocks.rotate_left(1);
             self.window_start = next_window_start;
-            self.logical_generation = self.logical_generation.checked_add(1).ok_or_else(|| {
-                Error::InvalidInput("physical window generation overflow".into())
-            })?;
+            self.logical_generation = self
+                .logical_generation
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidInput("physical window generation overflow".into()))?;
         }
         Ok(())
     }
@@ -563,9 +564,8 @@ impl PhysicalPagedKvCache {
         }
         let window_tokens_u32 = window_tokens
             .map(|window| {
-                u32::try_from(window).map_err(|_| {
-                    Error::InvalidInput("physical paged window exceeds u32".into())
-                })
+                u32::try_from(window)
+                    .map_err(|_| Error::InvalidInput("physical paged window exceeds u32".into()))
             })
             .transpose()?;
         let window_views = window_tokens
@@ -649,16 +649,66 @@ impl PhysicalPagedKvCache {
     }
 
     pub(crate) fn commit_prepared(&mut self, prepared: PreparedPhysicalPagedStep) -> Result<()> {
-        if prepared.arena != self.arena.id()
-            || prepared.logical_generation != self.logical_generation
-            || prepared.start_pos != self.context_len
-        {
-            return Err(Error::InvalidInput(
-                "physical paged commit received a stale prepared step".into(),
-            ));
+        let token_count = prepared.token_count;
+        self.commit_prepared_prefix(prepared, token_count)
+    }
+
+    /// Commit an exact logical prefix of one fully executed physical append.
+    ///
+    /// Every backend completion for the original append is sealed and fenced
+    /// before this method returns, including writes for a rejected suffix. Only
+    /// the accepted prefix advances the logical cursor or enters the completion
+    /// receipts exposed to the executor. Passing zero therefore aborts the
+    /// prepared append without exposing any of its physical writes.
+    pub(crate) fn commit_prepared_prefix(
+        &mut self,
+        prepared: PreparedPhysicalPagedStep,
+        accepted_token_count: usize,
+    ) -> Result<()> {
+        let is_compatible = prepared.arena == self.arena.id()
+            && prepared.logical_generation == self.logical_generation
+            && prepared.start_pos == self.context_len;
+        let accepted_count_is_valid = accepted_token_count <= prepared.token_count;
+        let start_pos = prepared.start_pos;
+        let completion = prepared.completions.seal();
+
+        // The collector is consumed and every submitted fence is drained above,
+        // even when the logical commit request itself is invalid. This prevents
+        // a rejected or stale prepared step from orphaning writes before its
+        // provisional slots are reused.
+        if !is_compatible {
+            let message = "physical paged commit received a stale prepared step";
+            return match completion {
+                Ok(_) => Err(Error::InvalidInput(message.into())),
+                Err(drain_error) => Err(Error::InferenceError(format!(
+                    "{message}; prepared write drain also failed: {drain_error}"
+                ))),
+            };
         }
-        let completion = Arc::new(prepared.completions.seal()?);
-        self.commit_shared_completion(prepared.start_pos, prepared.token_count, completion)
+        if !accepted_count_is_valid {
+            let message = format!(
+                "physical paged accepted prefix {accepted_token_count} exceeds prepared token count {}",
+                prepared.token_count
+            );
+            return match completion {
+                Ok(_) => Err(Error::InvalidInput(message)),
+                Err(drain_error) => Err(Error::InferenceError(format!(
+                    "{message}; prepared write drain also failed: {drain_error}"
+                ))),
+            };
+        }
+
+        let completion = completion?;
+        if accepted_token_count == 0 {
+            return Ok(());
+        }
+        let completion = Arc::new(completion.into_slot_prefix(accepted_token_count)?);
+        self.commit_shared_completion(start_pos, accepted_token_count, completion)
+    }
+
+    /// Fence and discard every write in one prepared append.
+    pub(crate) fn abort_prepared(&mut self, prepared: PreparedPhysicalPagedStep) -> Result<()> {
+        self.commit_prepared_prefix(prepared, 0)
     }
 
     pub(crate) fn commit_shared_completion(
@@ -716,12 +766,97 @@ impl PhysicalPagedKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
+    use candle_core::{DType, Device};
 
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::BackendKind;
     use crate::engine::ModelInstanceId;
     use crate::kv::{KvGroupId, KvLayerBinding};
+
+    fn prefix_test_cache(generation: u32) -> PhysicalPagedKvCache {
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(20),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation,
+        };
+        let group = KvGroupId::new(1);
+        let bindings = vec![
+            KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            },
+            KvLayerBinding {
+                model_layer: 7,
+                physical_layer: 1,
+            },
+        ];
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: 2,
+                growth: None,
+                dtype: DType::F32,
+                layers: bindings
+                    .iter()
+                    .copied()
+                    .map(|binding| KvLayerConfig {
+                        binding,
+                        num_kv_heads: 1,
+                        key_head_dim: 2,
+                        value_head_dim: 2,
+                    })
+                    .collect(),
+            })
+            .unwrap(),
+        );
+        let blocks = (0..2)
+            .map(|index| CacheBlockRef {
+                arena: arena_id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+    }
+
+    fn submit_prepared_writes(
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        layer_count: usize,
+    ) {
+        let keys = Tensor::zeros((prepared.token_count, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        let values = keys.clone();
+        let slots = prepared.slots.clone();
+        for binding in cache.layer_bindings.iter().copied().take(layer_count) {
+            let completion = cache
+                .arena
+                .write_slots(
+                    binding,
+                    KvWriteArgs {
+                        keys: &keys,
+                        values: &values,
+                        slots: slots.as_ref(),
+                    },
+                )
+                .unwrap();
+            prepared.completions.collect(completion).unwrap();
+        }
+    }
+
+    fn fully_written_append(
+        cache: &PhysicalPagedKvCache,
+        token_count: usize,
+    ) -> PreparedPhysicalPagedStep {
+        let mut prepared = cache
+            .prepare_append(cache.context_len(), token_count)
+            .unwrap();
+        submit_prepared_writes(cache, &mut prepared, cache.layer_bindings.len());
+        prepared
+    }
 
     #[test]
     fn sparse_model_layers_bind_to_dense_physical_ordinals() {
@@ -882,12 +1017,133 @@ mod tests {
         let mut cache =
             PhysicalPagedKvCache::new(arena, vec![binding], blocks.clone(), 12).unwrap();
 
-        cache
-            .advance_sliding_window_for_append(12, 1, 8)
-            .unwrap();
+        cache.advance_sliding_window_for_append(12, 1, 8).unwrap();
 
         assert_eq!(cache.window_start(), 4);
         assert_eq!(cache.capacity_tokens(), 16);
         assert_eq!(cache.slots_for_append(12, 1).unwrap()[0].block, blocks[0]);
+    }
+
+    #[test]
+    fn prepared_append_commits_every_exact_prefix_without_exposing_suffix() {
+        for accepted in 0..=3 {
+            let mut cache = prefix_test_cache(accepted as u32 + 1);
+            let prepared = fully_written_append(&cache, 3);
+            let prepared_slots = prepared.slots.logical_slots().to_vec();
+
+            cache
+                .commit_prepared_prefix(prepared, accepted)
+                .expect("accepted prefix commit");
+
+            assert_eq!(cache.context_len(), accepted);
+            let writes = cache.take_completed_writes();
+            if accepted == 0 {
+                assert!(writes.is_empty());
+            } else {
+                assert_eq!(writes.len(), 1);
+                assert_eq!(writes[0].slots_per_layer(), accepted);
+                assert_eq!(writes[0].slots(), &prepared_slots[..accepted]);
+            }
+            if accepted < prepared_slots.len() {
+                assert_eq!(
+                    cache.slots_for_append(accepted, 1).unwrap()[0],
+                    prepared_slots[accepted]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn abort_prepared_fences_and_discards_the_complete_append() {
+        let mut cache = prefix_test_cache(10);
+        let prepared = fully_written_append(&cache, 3);
+        let first_slot = prepared.slots.logical_slots()[0];
+
+        cache.abort_prepared(prepared).unwrap();
+
+        assert_eq!(cache.context_len(), 0);
+        assert!(cache.take_completed_writes().is_empty());
+        assert_eq!(cache.slots_for_append(0, 1).unwrap()[0], first_slot);
+    }
+
+    #[test]
+    fn partial_commit_receipt_composes_with_rewritten_suffix() {
+        let mut cache = prefix_test_cache(11);
+        let first = fully_written_append(&cache, 3);
+        let original_slots = first.slots.logical_slots().to_vec();
+        cache.commit_prepared_prefix(first, 1).unwrap();
+
+        let second = fully_written_append(&cache, 2);
+        assert_eq!(second.slots.logical_slots().as_ref(), &original_slots[1..]);
+        cache.commit_prepared(second).unwrap();
+
+        assert_eq!(cache.context_len(), 3);
+        let writes = cache.take_completed_writes();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].slots(), &original_slots[..1]);
+        assert_eq!(writes[1].slots(), &original_slots[1..]);
+    }
+
+    #[test]
+    fn full_prefix_preserves_commit_prepared_behavior() {
+        let mut legacy = prefix_test_cache(12);
+        let mut prefix = prefix_test_cache(13);
+        let legacy_prepared = fully_written_append(&legacy, 3);
+        let prefix_prepared = fully_written_append(&prefix, 3);
+
+        legacy.commit_prepared(legacy_prepared).unwrap();
+        prefix.commit_prepared_prefix(prefix_prepared, 3).unwrap();
+
+        assert_eq!(legacy.context_len(), 3);
+        assert_eq!(prefix.context_len(), 3);
+        let legacy_writes = legacy.take_completed_writes();
+        let prefix_writes = prefix.take_completed_writes();
+        assert_eq!(legacy_writes.len(), 1);
+        assert_eq!(prefix_writes.len(), 1);
+        assert_eq!(legacy_writes[0].slots_per_layer(), 3);
+        assert_eq!(prefix_writes[0].slots_per_layer(), 3);
+    }
+
+    #[test]
+    fn prefix_commit_rejects_out_of_range_without_mutating_cursor_or_receipts() {
+        let mut cache = prefix_test_cache(14);
+        let prepared = fully_written_append(&cache, 3);
+
+        let error = cache.commit_prepared_prefix(prepared, 4).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds prepared token count"));
+        assert_eq!(cache.context_len(), 0);
+        assert!(cache.take_completed_writes().is_empty());
+        assert!(cache.prepare_append(0, 3).is_ok());
+    }
+
+    #[test]
+    fn every_prefix_requires_a_complete_authenticated_layer_batch() {
+        for accepted in 0..=3 {
+            let mut cache = prefix_test_cache(20 + accepted as u32);
+            let mut prepared = cache.prepare_append(0, 3).unwrap();
+            submit_prepared_writes(&cache, &mut prepared, 1);
+
+            let error = cache
+                .commit_prepared_prefix(prepared, accepted)
+                .unwrap_err();
+
+            assert!(error.to_string().contains("missing layer bindings"));
+            assert_eq!(cache.context_len(), 0);
+            assert!(cache.take_completed_writes().is_empty());
+        }
+    }
+
+    #[test]
+    fn stale_prefix_commit_drains_but_never_advances_the_reset_cache() {
+        let mut cache = prefix_test_cache(30);
+        let prepared = fully_written_append(&cache, 3);
+        cache.reset_invocation().unwrap();
+
+        let error = cache.commit_prepared_prefix(prepared, 2).unwrap_err();
+
+        assert!(error.to_string().contains("stale prepared step"));
+        assert_eq!(cache.context_len(), 0);
+        assert!(cache.take_completed_writes().is_empty());
     }
 }
