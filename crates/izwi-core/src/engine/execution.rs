@@ -996,6 +996,28 @@ impl ManagedCacheReservation {
         &self,
         completions: &[Arc<KvWriteBatchCompletion>],
     ) -> Result<ManagedCacheReceipt> {
+        self.completed_write_receipt_inner(completions, None)
+    }
+
+    /// Reconcile sealed backend writes with one common accepted prefix of the
+    /// scheduler's maximum reservation.
+    ///
+    /// The receipt retains this exact reservation as its transaction fence.
+    /// `committed_tokens` is an absolute logical cursor and must advance every
+    /// domain beyond its execution start without exceeding any reserved target.
+    pub(crate) fn completed_write_receipt_for_prefix(
+        &self,
+        completions: &[Arc<KvWriteBatchCompletion>],
+        committed_tokens: u32,
+    ) -> Result<ManagedCacheReceipt> {
+        self.completed_write_receipt_inner(completions, Some(committed_tokens))
+    }
+
+    fn completed_write_receipt_inner(
+        &self,
+        completions: &[Arc<KvWriteBatchCompletion>],
+        accepted_prefix: Option<u32>,
+    ) -> Result<ManagedCacheReceipt> {
         if completions.is_empty() {
             return Err(Error::InferenceError(
                 "managed-cache row returned no backend write completion".into(),
@@ -1003,6 +1025,14 @@ impl ManagedCacheReservation {
         }
         let mut receipts = Vec::with_capacity(self.domains.len());
         for domain in &self.domains {
+            let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+            if committed_tokens <= domain.execution_start_tokens
+                || committed_tokens > domain.target_committed_tokens
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache accepted prefix is outside the reserved append range".into(),
+                ));
+            }
             let writable = domain
                 .writable_blocks
                 .iter()
@@ -1053,7 +1083,7 @@ impl ManagedCacheReservation {
                     "managed-cache completions disagree on page geometry".into(),
                 ));
             }
-            let expected = expected_domain_slots(domain, group, page_tokens)?;
+            let expected = expected_domain_slots(domain, group, page_tokens, committed_tokens)?;
             let mut observed = HashSet::with_capacity(expected.len());
             for completion in matching {
                 for slot in completion.slots() {
@@ -1069,15 +1099,28 @@ impl ManagedCacheReservation {
                     "managed-cache completion does not match the row's exact physical slots".into(),
                 ));
             }
+            let written_blocks = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .filter(|block| expected.iter().any(|slot| slot.block == *block))
+                .collect::<Vec<_>>();
+            if written_blocks.is_empty() {
+                return Err(Error::InferenceError(
+                    "managed-cache accepted prefix has no writable physical page".into(),
+                ));
+            }
             receipts.push(ManagedCacheDomainReceipt {
                 arena: domain.arena,
                 domain: domain.domain,
-                written_blocks: domain.writable_blocks.clone(),
+                written_blocks,
+                page_tokens,
             });
         }
         Ok(ManagedCacheReceipt {
             reservation: self.clone(),
             domains: receipts,
+            accepted_prefix,
         })
     }
 
@@ -1092,9 +1135,59 @@ impl ManagedCacheReservation {
                     arena: domain.arena,
                     domain: domain.domain,
                     written_blocks: domain.writable_blocks.clone(),
+                    page_tokens: inferred_page_tokens_for_test(domain),
                 })
                 .collect(),
+            accepted_prefix: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_write_receipt_for_prefix_for_test(
+        &self,
+        committed_tokens: u32,
+        page_tokens: u32,
+    ) -> Result<ManagedCacheReceipt> {
+        let mut domains = Vec::with_capacity(self.domains.len());
+        for domain in &self.domains {
+            if committed_tokens <= domain.execution_start_tokens
+                || committed_tokens > domain.target_committed_tokens
+            {
+                return Err(Error::InvalidInput(
+                    "test managed-cache prefix is outside the reservation".into(),
+                ));
+            }
+            let writable = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let group = domain
+                .provisional_groups
+                .iter()
+                .find(|group| writable.iter().any(|block| block.group == group.group))
+                .ok_or_else(|| {
+                    Error::InvalidInput("test reservation has no writable group".into())
+                })?;
+            let expected = expected_domain_slots(domain, group, page_tokens, committed_tokens)?;
+            let written_blocks = domain
+                .writable_blocks
+                .iter()
+                .copied()
+                .filter(|block| expected.iter().any(|slot| slot.block == *block))
+                .collect::<Vec<_>>();
+            domains.push(ManagedCacheDomainReceipt {
+                arena: domain.arena,
+                domain: domain.domain,
+                written_blocks,
+                page_tokens,
+            });
+        }
+        Ok(ManagedCacheReceipt {
+            reservation: self.clone(),
+            domains,
+            accepted_prefix: Some(committed_tokens),
+        })
     }
 }
 
@@ -1102,17 +1195,19 @@ fn expected_domain_slots(
     domain: &ManagedCacheDomainReservation,
     table: &GroupBlockTable,
     page_tokens: u32,
+    committed_tokens: u32,
 ) -> Result<HashSet<KvSlotRef>> {
-    if domain.target_committed_tokens <= domain.execution_start_tokens {
+    if committed_tokens <= domain.execution_start_tokens
+        || committed_tokens > domain.target_committed_tokens
+    {
         return Err(Error::InferenceError(
             "managed-cache reservation has no physical append range".into(),
         ));
     }
     let first_logical_page = domain.target_window_start / page_tokens;
-    let mut slots = HashSet::with_capacity(
-        (domain.target_committed_tokens - domain.execution_start_tokens) as usize,
-    );
-    for position in domain.execution_start_tokens..domain.target_committed_tokens {
+    let mut slots =
+        HashSet::with_capacity((committed_tokens - domain.execution_start_tokens) as usize);
+    for position in domain.execution_start_tokens..committed_tokens {
         let logical_page = position / page_tokens;
         let table_index = logical_page
             .checked_sub(first_logical_page)
@@ -1139,6 +1234,9 @@ fn expected_domain_slots(
 pub struct ManagedCacheReceipt {
     pub reservation: ManagedCacheReservation,
     pub domains: Vec<ManagedCacheDomainReceipt>,
+    // `None` preserves the legacy exact-full-reservation receipt. `Some` is a
+    // common accepted cursor authenticated from sealed backend completions.
+    accepted_prefix: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1146,10 +1244,15 @@ pub struct ManagedCacheDomainReceipt {
     pub arena: KvArenaId,
     pub domain: CacheDomainId,
     pub written_blocks: Vec<CacheBlockRef>,
+    page_tokens: u32,
 }
 
 impl ManagedCacheReceipt {
-    fn validate(&self) -> Result<()> {
+    pub(crate) const fn accepted_prefix(&self) -> Option<u32> {
+        self.accepted_prefix
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.domains.len() != self.reservation.domains.len() {
             return Err(Error::InferenceError(
                 "managed-cache receipt does not cover every reserved domain".to_string(),
@@ -1179,13 +1282,39 @@ impl ManagedCacheReceipt {
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
+            let committed_tokens = self
+                .accepted_prefix
+                .unwrap_or(reservation.target_committed_tokens);
+            if committed_tokens <= reservation.execution_start_tokens
+                || committed_tokens > reservation.target_committed_tokens
+                || receipt.page_tokens == 0
+            {
+                return Err(Error::InferenceError(
+                    "managed-cache receipt has an invalid committed prefix".into(),
+                ));
+            }
+            let writable = reservation
+                .writable_blocks
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let group = reservation
+                .provisional_groups
+                .iter()
+                .find(|group| writable.iter().any(|block| block.group == group.group))
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed-cache receipt has no reserved writable group".into(),
+                    )
+                })?;
+            let expected_blocks =
+                expected_domain_slots(reservation, group, receipt.page_tokens, committed_tokens)?
+                    .into_iter()
+                    .map(|slot| slot.block)
+                    .filter(|block| writable.contains(block))
+                    .collect::<HashSet<_>>();
             if blocks.len() != receipt.written_blocks.len()
-                || blocks
-                    != reservation
-                        .writable_blocks
-                        .iter()
-                        .copied()
-                        .collect::<HashSet<_>>()
+                || blocks != expected_blocks
                 || receipt
                     .written_blocks
                     .iter()
@@ -1198,6 +1327,34 @@ impl ManagedCacheReceipt {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn inferred_page_tokens_for_test(domain: &ManagedCacheDomainReservation) -> u32 {
+    let upper = domain.target_committed_tokens.max(1);
+    (1..=upper)
+        .find(|page_tokens| {
+            domain.target_window_start % page_tokens == domain.first_page_offset
+                && domain.provisional_groups.iter().any(|group| {
+                    expected_domain_slots(
+                        domain,
+                        group,
+                        *page_tokens,
+                        domain.target_committed_tokens,
+                    )
+                    .is_ok_and(|slots| {
+                        let blocks = slots
+                            .into_iter()
+                            .map(|slot| slot.block)
+                            .collect::<HashSet<_>>();
+                        domain
+                            .writable_blocks
+                            .iter()
+                            .all(|block| blocks.contains(block))
+                    })
+                })
+        })
+        .unwrap_or(upper)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2428,7 +2585,7 @@ mod tests {
             session.clone(),
             WorkUnit::SequenceStep {
                 phase: SequencePhase::Decode,
-                input: InputRange { start: 4, end: 5 },
+                input: InputRange { start: 4, end: 7 },
                 max_output_steps: 1,
             },
         );
@@ -2438,12 +2595,14 @@ mod tests {
             device_ordinal: lane.device_ordinal,
             generation: 3,
         };
-        let written_block = CacheBlockRef {
-            arena,
-            group: KvGroupId::new(0),
-            index: 1,
-            slot_generation: 8,
-        };
+        let written_blocks = (1..=3)
+            .map(|index| CacheBlockRef {
+                arena,
+                group: KvGroupId::new(0),
+                index,
+                slot_generation: 8,
+            })
+            .collect::<Vec<_>>();
         let reservation = ManagedCacheReservation {
             txn_id: plan.plan_id,
             session: session.clone(),
@@ -2453,14 +2612,14 @@ mod tests {
                 expected_version: 11,
                 expected_committed_tokens: 4,
                 execution_start_tokens: 4,
-                target_committed_tokens: 5,
-                target_window_start: 0,
+                target_committed_tokens: 7,
+                target_window_start: 4,
                 first_page_offset: 0,
                 provisional_groups: vec![GroupBlockTable {
                     group: KvGroupId::new(0),
-                    blocks: vec![written_block],
+                    blocks: written_blocks.clone(),
                 }],
-                writable_blocks: vec![written_block],
+                writable_blocks: written_blocks.clone(),
             }],
             tensor_state: None,
         };
@@ -2497,14 +2656,32 @@ mod tests {
                     domains: vec![ManagedCacheDomainReceipt {
                         arena,
                         domain: CacheDomainId::new(2),
-                        written_blocks: vec![written_block],
+                        written_blocks: written_blocks.clone(),
+                        page_tokens: 1,
                     }],
+                    accepted_prefix: None,
                 }),
             }],
         };
         let active = HashMap::from([(plan.plan_id, plan)]);
 
         assert!(report.validate_against(&batch, &active).is_ok());
+        report.rows[0].managed_cache = Some(
+            reservation
+                .completed_write_receipt_for_prefix_for_test(5, 1)
+                .unwrap(),
+        );
+        assert!(report.validate_against(&batch, &active).is_ok());
+        let mut forged_prefix = report.rows[0].managed_cache.clone().unwrap();
+        forged_prefix.accepted_prefix = Some(4);
+        report.rows[0].managed_cache = Some(forged_prefix);
+        assert!(report.validate_against(&batch, &active).is_err());
+        let mut forged_blocks = reservation
+            .completed_write_receipt_for_prefix_for_test(6, 1)
+            .unwrap();
+        forged_blocks.domains[0].written_blocks = vec![written_blocks[2]];
+        report.rows[0].managed_cache = Some(forged_blocks);
+        assert!(report.validate_against(&batch, &active).is_err());
         report.rows[0].managed_cache = None;
         assert!(report.validate_against(&batch, &active).is_err());
         let mut foreign = reservation;
@@ -2512,6 +2689,7 @@ mod tests {
         report.rows[0].managed_cache = Some(ManagedCacheReceipt {
             reservation: foreign,
             domains: Vec::new(),
+            accepted_prefix: None,
         });
         assert!(report.validate_against(&batch, &active).is_err());
     }

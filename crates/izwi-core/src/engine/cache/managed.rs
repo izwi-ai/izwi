@@ -1501,9 +1501,13 @@ impl ManagedKvCacheManager {
                 "managed KV receipt crossed a row transaction fence".to_string(),
             ));
         }
+        if let Err(error) = receipt.validate() {
+            abort_reservation(state, reservation);
+            return Err(error);
+        }
 
-        // Mark every live transaction written. This changes no table/index
-        // ownership and is rolled back by abort if any later validation fails.
+        let accepted_prefix = receipt.accepted_prefix();
+        let mut resolved_domains = Vec::with_capacity(reservation.domains.len());
         for domain in &reservation.domains {
             let Some(written) = receipt
                 .domains
@@ -1515,15 +1519,75 @@ impl ManagedKvCacheManager {
                     "managed KV receipt omitted a cache domain".into(),
                 ));
             };
-            let completed = state
+            let group = state
+                .runtime
+                .plan
+                .groups
+                .iter()
+                .find(|group| group.arena == domain.arena && group.domain == domain.domain)
+                .ok_or_else(|| {
+                    Error::InferenceError(
+                        "managed KV reservation lost its authoritative page geometry".into(),
+                    )
+                });
+            let group = match group {
+                Ok(group) => group,
+                Err(error) => {
+                    abort_reservation(state, reservation);
+                    return Err(error);
+                }
+            };
+            let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+            if committed_tokens <= domain.execution_start_tokens
+                || committed_tokens > domain.target_committed_tokens
+            {
+                abort_reservation(state, reservation);
+                return Err(Error::InferenceError(
+                    "managed KV accepted prefix is outside one domain reservation".into(),
+                ));
+            }
+            let target_window_start = if accepted_prefix.is_some() {
+                match sliding_window_for_domain(&state.contract, domain.domain) {
+                    Ok(Some(window)) => committed_tokens
+                        .saturating_sub(window)
+                        .min(domain.expected_committed_tokens),
+                    Ok(None) => 0,
+                    Err(error) => {
+                        abort_reservation(state, reservation);
+                        return Err(error);
+                    }
+                }
+            } else {
+                domain.target_window_start
+            };
+            resolved_domains.push((
+                domain,
+                written.written_blocks.clone(),
+                committed_tokens,
+                target_window_start,
+                group.page_tokens,
+            ));
+        }
+
+        // Mark every live transaction written. This changes no table/index
+        // ownership and is rolled back by abort if any later validation fails.
+        for (domain, written_blocks, committed_tokens, target_window_start, page_tokens) in
+            &resolved_domains
+        {
+            let receipt = KvWriteReceipt {
+                txn_id: reservation.txn_id,
+                committed_tokens: *committed_tokens,
+                written_blocks: written_blocks.clone(),
+            };
+            let coordinator = state
                 .coordinators
                 .get_mut(&domain.arena)
-                .expect("reservation arena has a coordinator")
-                .complete_write(KvWriteReceipt {
-                    txn_id: reservation.txn_id,
-                    committed_tokens: domain.target_committed_tokens,
-                    written_blocks: written.written_blocks.clone(),
-                });
+                .expect("reservation arena has a coordinator");
+            let completed = if accepted_prefix.is_some() {
+                coordinator.complete_write_prefix(receipt, *target_window_start, *page_tokens)
+            } else {
+                coordinator.complete_write(receipt)
+            };
             if let Err(error) = completed {
                 abort_reservation(state, reservation);
                 return Err(coordinator_error(error));
@@ -1544,19 +1608,31 @@ impl ManagedKvCacheManager {
                 .iter()
                 .position(|publication| publication.arena == domain.arena)
             {
-                let publication = pending.swap_remove(index);
-                let staged_prefix = state
-                    .prefix_indexes
-                    .get(&domain.arena)
-                    .expect("reservation arena has a prefix index")
-                    .stage_transaction(publication.page_tokens, &publication.publications);
-                Some(match staged_prefix {
-                    Ok(staged) => staged,
-                    Err(error) => {
-                        abort_reservation(state, reservation);
-                        return Err(prefix_error(error));
-                    }
-                })
+                let mut publication = pending.swap_remove(index);
+                let committed_tokens = accepted_prefix.unwrap_or(domain.target_committed_tokens);
+                publication.publications.retain(|candidate| {
+                    candidate
+                        .key
+                        .start_position
+                        .checked_add(candidate.key.tokens.len() as u64)
+                        .is_some_and(|end| end <= u64::from(committed_tokens))
+                });
+                if publication.publications.is_empty() {
+                    None
+                } else {
+                    let staged_prefix = state
+                        .prefix_indexes
+                        .get(&domain.arena)
+                        .expect("reservation arena has a prefix index")
+                        .stage_transaction(publication.page_tokens, &publication.publications);
+                    Some(match staged_prefix {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            abort_reservation(state, reservation);
+                            return Err(prefix_error(error));
+                        }
+                    })
+                }
             } else {
                 None
             };
@@ -1596,13 +1672,12 @@ impl ManagedKvCacheManager {
             let target_cursor = reservation
                 .domains
                 .first()
-                .map(|domain| u64::from(domain.target_committed_tokens))
+                .map(|domain| u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens)))
                 .ok_or_else(|| Error::InferenceError("managed KV reservation is empty".into()))?;
-            if reservation
-                .domains
-                .iter()
-                .any(|domain| u64::from(domain.target_committed_tokens) != target_cursor)
-            {
+            if reservation.domains.iter().any(|domain| {
+                u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
+                    != target_cursor
+            }) {
                 abort_reservation(state, reservation);
                 return Err(Error::InferenceError(
                     "one managed state transaction resolved divergent domain cursors".into(),
@@ -2747,6 +2822,22 @@ mod tests {
             domains: vec![CacheDomainId::new(1), domain],
             prefix_shareable: false,
         }];
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn two_paged_tensor_contract() -> InferenceStateContract {
+        let mut contract = composite_tensor_contract();
+        let mut second_paged = contract.domains[0].clone();
+        if let StateDomainSpec::PagedAttention(domain) = &mut second_paged {
+            domain.header.id = CacheDomainId::new(3);
+        }
+        contract.domains.push(second_paged);
+        contract.groups.push(StateGroupSpec {
+            id: crate::kv::v2::StateGroupId::new(2),
+            domains: vec![CacheDomainId::new(3)],
+            prefix_shareable: false,
+        });
         contract.validate().unwrap();
         contract
     }
@@ -4029,6 +4120,159 @@ mod tests {
                 .committed_tokens,
             1
         );
+    }
+
+    #[test]
+    fn accepted_prefix_reconciles_two_paged_domains_and_tensor_cursor() {
+        const MAX_RESERVED: u32 = 9;
+
+        for accepted in 1..=MAX_RESERVED {
+            let model = ModelInstanceId::new(520 + u64::from(accepted));
+            let session = SessionKey::new(format!("managed-prefix-{accepted}"), 1);
+            let mut manager = ManagedKvCacheManager::default();
+            let runtime = manager
+                .bind_request(
+                    model,
+                    BackendKind::Cpu,
+                    8,
+                    8,
+                    &CacheCapability::Managed(two_paged_tensor_contract()),
+                )
+                .unwrap()
+                .unwrap();
+            let page_tokens = runtime.plan().groups[0].page_tokens;
+            assert!(runtime
+                .plan()
+                .groups
+                .iter()
+                .all(|group| group.page_tokens == page_tokens));
+            let tensor_arena = runtime.tensor_state().unwrap().clone();
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    500 + u64::from(accepted),
+                    &session,
+                    &sequence_work(0, MAX_RESERVED as usize),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(reservation.domains.len(), 2);
+            let sequence = PhysicalStateSequenceId::new(
+                reservation
+                    .tensor_state
+                    .expect("tensor reservation")
+                    .sequence,
+            )
+            .unwrap();
+            tensor_arena
+                .stage_replace(
+                    PhysicalStateTransactionId::new(reservation.txn_id).unwrap(),
+                    StateDomainId::new(2),
+                    0,
+                    u64::from(accepted),
+                    vec![StateComponentValue {
+                        component: StateComponentId::new(1),
+                        tensor: Some(
+                            Tensor::from_slice(&[accepted as f32; 4], 4, &Device::Cpu).unwrap(),
+                        ),
+                    }],
+                )
+                .unwrap();
+            let receipt = reservation
+                .completed_write_receipt_for_prefix_for_test(accepted, page_tokens)
+                .unwrap();
+            assert_eq!(receipt.accepted_prefix(), Some(accepted));
+            manager
+                .finalize(&reservation, Some(&receipt), true)
+                .unwrap();
+
+            for domain in [CacheDomainId::new(1), CacheDomainId::new(3)] {
+                let snapshot = manager.snapshot(model, &session, domain).unwrap();
+                assert_eq!(snapshot.committed_tokens, accepted);
+                assert_eq!(snapshot.version, 1);
+                assert_eq!(
+                    snapshot.groups[0].blocks.len(),
+                    accepted.div_ceil(page_tokens) as usize
+                );
+            }
+            let tensor = tensor_arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(tensor.cursor, u64::from(accepted));
+            assert_eq!(
+                tensor.components[0]
+                    .tensor
+                    .as_ref()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                vec![accepted as f32; 4]
+            );
+            let state = manager.models.get(&model).unwrap();
+            for coordinator in state.coordinators.values() {
+                assert_eq!(coordinator.stats().active_transactions, 0);
+                assert_eq!(
+                    coordinator.stats().allocated_pages,
+                    accepted.div_ceil(page_tokens) as usize
+                );
+                coordinator.check_invariants().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn zero_accepted_prefix_aborts_every_paged_domain_and_tensor_state() {
+        let model = ModelInstanceId::new(540);
+        let session = SessionKey::new("managed-prefix-zero".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                8,
+                &CacheCapability::Managed(two_paged_tensor_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let tensor_arena = runtime.tensor_state().unwrap().clone();
+        let reservation = manager
+            .prepare(&runtime, 550, &session, &sequence_work(0, 9), None)
+            .unwrap()
+            .unwrap();
+        let sequence =
+            PhysicalStateSequenceId::new(reservation.tensor_state.unwrap().sequence).unwrap();
+        tensor_arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(reservation.txn_id).unwrap(),
+                StateDomainId::new(2),
+                0,
+                9,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(Tensor::from_slice(&[9.0_f32; 4], 4, &Device::Cpu).unwrap()),
+                }],
+            )
+            .unwrap();
+
+        manager.finalize(&reservation, None, false).unwrap();
+        for domain in [CacheDomainId::new(1), CacheDomainId::new(3)] {
+            let snapshot = manager.snapshot(model, &session, domain).unwrap();
+            assert_eq!(snapshot.committed_tokens, 0);
+            assert_eq!(snapshot.version, 0);
+        }
+        assert!(tensor_arena
+            .read(sequence, StateDomainId::new(2))
+            .unwrap()
+            .is_none());
+        let state = manager.models.get(&model).unwrap();
+        for coordinator in state.coordinators.values() {
+            assert_eq!(coordinator.stats().active_transactions, 0);
+            assert_eq!(coordinator.stats().allocated_pages, 0);
+            coordinator.check_invariants().unwrap();
+        }
     }
 
     #[test]

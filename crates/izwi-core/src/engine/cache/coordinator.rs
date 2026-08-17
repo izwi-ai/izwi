@@ -290,6 +290,11 @@ struct Transaction {
     writable_blocks: Vec<CacheBlockRef>,
     page_copies: Vec<KvPageCopy>,
     holds: Vec<TransactionHold>,
+    /// Exact pages pinned when the reservation entered `Prepared`. Prefix
+    /// reconciliation may restore older committed leading pages that were not
+    /// part of the maximum-range execution view, so pins cannot be inferred
+    /// from the final provisional table.
+    execution_blocks: Vec<CacheBlockRef>,
     target_committed_tokens: u32,
     target_window_start: u32,
     state: KvTransactionState,
@@ -651,6 +656,7 @@ impl KvCacheCoordinator {
                 writable_blocks,
                 page_copies,
                 holds,
+                execution_blocks: Vec::new(),
                 target_committed_tokens: request.target_committed_tokens,
                 target_window_start: request.target_window_start,
                 state: KvTransactionState::Reserved,
@@ -683,13 +689,14 @@ impl KvCacheCoordinator {
                 return Err(KvCoordinatorError::WriteConflict);
             }
         }
-        for block in pages {
+        for block in &pages {
             self.slots[block.index as usize].execution_pins += 1;
         }
         let txn = self
             .transactions
             .get_mut(&txn_id)
             .expect("transaction exists");
+        txn.execution_blocks = pages;
         txn.state = KvTransactionState::Prepared;
         Ok(KvPreparedReservation {
             txn_id,
@@ -724,6 +731,149 @@ impl KvCacheCoordinator {
             return Err(KvCoordinatorError::InvalidWriteReceipt);
         }
         txn.state = KvTransactionState::Written;
+        Ok(())
+    }
+
+    /// Authenticate and commit only a leading logical prefix of a prepared
+    /// maximum-range reservation.
+    ///
+    /// The original transaction ID, expected snapshot, writer ownership, and
+    /// table version remain authoritative. Only the provisional target is
+    /// narrowed. Pages and copy sources that belong exclusively to the unused
+    /// suffix have their execution pins and reservation holds released before
+    /// the transaction becomes `Written`.
+    pub fn complete_write_prefix(
+        &mut self,
+        receipt: KvWriteReceipt,
+        target_window_start: u32,
+        page_tokens: u32,
+    ) -> KvCoordinatorResult<()> {
+        let original = self
+            .transactions
+            .get(&receipt.txn_id)
+            .cloned()
+            .ok_or(KvCoordinatorError::MissingTransaction(receipt.txn_id))?;
+        if original.state != KvTransactionState::Prepared {
+            return Err(KvCoordinatorError::InvalidTransactionState {
+                txn_id: receipt.txn_id,
+                expected: KvTransactionState::Prepared,
+                actual: original.state,
+            });
+        }
+        if page_tokens == 0
+            || receipt.committed_tokens <= original.expected.committed_tokens
+            || receipt.committed_tokens > original.target_committed_tokens
+            || target_window_start < original.expected.window_start
+            || target_window_start > receipt.committed_tokens
+            || target_window_start > original.target_window_start
+        {
+            return Err(KvCoordinatorError::InvalidTokenRange);
+        }
+
+        let mut reconciled = original.clone();
+        reconciled.provisional_groups = reconciled_prefix_groups(
+            &original,
+            receipt.committed_tokens,
+            target_window_start,
+            page_tokens,
+        )?;
+        let retained_blocks = unique_table_blocks(&reconciled.provisional_groups)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        reconciled
+            .writable_blocks
+            .retain(|block| retained_blocks.contains(block));
+        reconciled
+            .page_copies
+            .retain(|copy| retained_blocks.contains(&copy.destination));
+        reconciled
+            .holds
+            .retain(|hold| retained_blocks.contains(&hold.block));
+
+        let retained_copy_sources = reconciled
+            .page_copies
+            .iter()
+            .map(|copy| copy.source)
+            .collect::<HashSet<_>>();
+        reconciled.execution_blocks.retain(|block| {
+            retained_blocks.contains(block) || retained_copy_sources.contains(block)
+        });
+        reconciled.target_committed_tokens = receipt.committed_tokens;
+        reconciled.target_window_start = target_window_start;
+
+        let expected = reconciled
+            .writable_blocks
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let written = receipt
+            .written_blocks
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if expected.is_empty()
+            || written.len() != receipt.written_blocks.len()
+            || written != expected
+        {
+            return Err(KvCoordinatorError::InvalidWriteReceipt);
+        }
+
+        let retained_pins = reconciled
+            .execution_blocks
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let retained_holds = reconciled
+            .holds
+            .iter()
+            .map(|hold| hold.block)
+            .collect::<HashSet<_>>();
+        for block in original
+            .execution_blocks
+            .iter()
+            .copied()
+            .filter(|block| !retained_pins.contains(block))
+        {
+            let slot = &self.slots[block.index as usize];
+            if slot.execution_pins == 0 {
+                return Err(KvCoordinatorError::ReferenceUnderflow);
+            }
+        }
+        for hold in original
+            .holds
+            .iter()
+            .filter(|hold| !retained_holds.contains(&hold.block))
+        {
+            let slot = &self.slots[hold.block.index as usize];
+            if slot.reservations == 0 || (hold.writer && slot.writer != Some(original.id)) {
+                return Err(KvCoordinatorError::ReferenceUnderflow);
+            }
+        }
+
+        // All validation is complete. From here the mutation is infallible.
+        for block in original
+            .execution_blocks
+            .iter()
+            .copied()
+            .filter(|block| !retained_pins.contains(block))
+        {
+            self.slots[block.index as usize].execution_pins -= 1;
+            self.recycle_if_unowned(block.index);
+        }
+        for hold in original
+            .holds
+            .iter()
+            .filter(|hold| !retained_holds.contains(&hold.block))
+        {
+            let slot = &mut self.slots[hold.block.index as usize];
+            slot.reservations -= 1;
+            if hold.writer {
+                slot.writer = None;
+            }
+            self.recycle_if_unowned(hold.block.index);
+        }
+        reconciled.state = KvTransactionState::Written;
+        self.transactions.insert(receipt.txn_id, reconciled);
         Ok(())
     }
 
@@ -1071,7 +1221,7 @@ impl KvCacheCoordinator {
                 txn.state,
                 KvTransactionState::Prepared | KvTransactionState::Written
             ) {
-                for block in transaction_execution_blocks(txn) {
+                for block in &txn.execution_blocks {
                     execution_pins[block.index as usize] += 1;
                 }
             }
@@ -1177,7 +1327,7 @@ impl KvCacheCoordinator {
         ) {
             return;
         }
-        for block in transaction_execution_blocks(txn) {
+        for block in &txn.execution_blocks {
             let slot = &mut self.slots[block.index as usize];
             slot.execution_pins = slot
                 .execution_pins
@@ -1214,6 +1364,50 @@ impl KvCacheCoordinator {
             }
         }
     }
+}
+
+fn reconciled_prefix_groups(
+    txn: &Transaction,
+    committed_tokens: u32,
+    target_window_start: u32,
+    page_tokens: u32,
+) -> KvCoordinatorResult<Vec<GroupBlockTable>> {
+    let first_page = target_window_start / page_tokens;
+    let end_page = committed_tokens.div_ceil(page_tokens);
+    if end_page <= first_page {
+        return Err(KvCoordinatorError::InvalidTokenRange);
+    }
+    let provisional_first_page = txn.target_window_start / page_tokens;
+    let expected_first_page = txn.expected.window_start / page_tokens;
+    let mut reconciled = Vec::with_capacity(txn.provisional_groups.len());
+
+    for provisional in &txn.provisional_groups {
+        let expected = txn
+            .expected
+            .groups
+            .iter()
+            .find(|group| group.group == provisional.group);
+        let mut blocks = Vec::with_capacity((end_page - first_page) as usize);
+        for logical_page in first_page..end_page {
+            let block = logical_page
+                .checked_sub(provisional_first_page)
+                .and_then(|index| provisional.blocks.get(index as usize))
+                .copied()
+                .or_else(|| {
+                    logical_page
+                        .checked_sub(expected_first_page)
+                        .and_then(|index| expected?.blocks.get(index as usize))
+                        .copied()
+                })
+                .ok_or(KvCoordinatorError::InvalidTokenRange)?;
+            blocks.push(block);
+        }
+        reconciled.push(GroupBlockTable {
+            group: provisional.group,
+            blocks,
+        });
+    }
+    Ok(reconciled)
 }
 
 fn unique_table_blocks(groups: &[GroupBlockTable]) -> Vec<CacheBlockRef> {
@@ -1383,6 +1577,183 @@ mod tests {
             assert_eq!(coordinator.stats().allocated_pages, 0);
             coordinator.check_invariants().unwrap();
         }
+    }
+
+    #[test]
+    fn prepared_prefix_commit_reconciles_every_accepted_length() {
+        const PAGE_TOKENS: u32 = 2;
+        const MAX_TOKENS: u32 = 7;
+
+        for accepted in 1..=MAX_TOKENS {
+            let mut coordinator = KvCacheCoordinator::new(arena(1), 4);
+            let key = session("accepted-prefix", u64::from(accepted));
+            let initial = coordinator
+                .register_table(key.clone(), CacheDomainId::new(0))
+                .unwrap();
+            reserve_fresh(
+                &mut coordinator,
+                100 + u64::from(accepted),
+                initial,
+                4,
+                MAX_TOKENS,
+            );
+            let txn_id = 100 + u64::from(accepted);
+            let prepared = coordinator.prepare(txn_id).unwrap();
+            let retained_pages = accepted.div_ceil(PAGE_TOKENS) as usize;
+            let written_blocks = prepared.provisional_groups[0].blocks[..retained_pages]
+                .iter()
+                .copied()
+                .filter(|block| prepared.writable_blocks.contains(block))
+                .collect();
+
+            coordinator
+                .complete_write_prefix(
+                    KvWriteReceipt {
+                        txn_id,
+                        committed_tokens: accepted,
+                        written_blocks,
+                    },
+                    0,
+                    PAGE_TOKENS,
+                )
+                .unwrap();
+            assert_eq!(
+                coordinator.stats().allocated_pages,
+                retained_pages,
+                "accepted={accepted} must release every reserved suffix page"
+            );
+            coordinator.check_invariants().unwrap();
+
+            let committed = coordinator.commit(txn_id, &[]).unwrap();
+            assert_eq!(committed.committed_tokens, accepted);
+            assert_eq!(committed.window_start, 0);
+            assert_eq!(committed.groups[0].blocks.len(), retained_pages);
+            assert_eq!(committed.version, 1);
+            assert_eq!(coordinator.stats().active_transactions, 0);
+            coordinator.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn prefix_reconciliation_restores_required_committed_window_pages() {
+        const PAGE_TOKENS: u32 = 2;
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 6);
+        let key = session("accepted-window", 1);
+        let initial = coordinator
+            .register_table(key, CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 200, initial, 3, 6);
+        prepare_and_complete(&mut coordinator, 200);
+        let expected = coordinator.commit(200, &[]).unwrap();
+        let old_blocks = expected.groups[0].blocks.clone();
+
+        coordinator
+            .reserve(KvReserveRequest {
+                txn_id: 201,
+                expected,
+                target_committed_tokens: 10,
+                target_window_start: 6,
+                groups: vec![KvGroupReservation {
+                    group: KvGroupId::new(0),
+                    blocks: vec![KvBlockIntent::Fresh; 2],
+                }],
+            })
+            .unwrap();
+        let prepared = coordinator.prepare(201).unwrap();
+        let accepted_page = prepared.provisional_groups[0].blocks[0];
+        coordinator
+            .complete_write_prefix(
+                KvWriteReceipt {
+                    txn_id: 201,
+                    committed_tokens: 7,
+                    written_blocks: vec![accepted_page],
+                },
+                3,
+                PAGE_TOKENS,
+            )
+            .unwrap();
+        let committed = coordinator.commit(201, &[]).unwrap();
+
+        assert_eq!(committed.committed_tokens, 7);
+        assert_eq!(committed.window_start, 3);
+        assert_eq!(
+            committed.groups[0].blocks,
+            vec![old_blocks[1], old_blocks[2], accepted_page]
+        );
+        assert_eq!(coordinator.stats().allocated_pages, 3);
+        coordinator.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn zero_abort_and_stale_or_forged_prefix_receipts_preserve_authority() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 3);
+        let initial = coordinator
+            .register_table(session("prefix-authority", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 300, initial, 3, 5);
+        let prepared = coordinator.prepare(300).unwrap();
+
+        assert_eq!(
+            coordinator.complete_write_prefix(
+                KvWriteReceipt {
+                    txn_id: 999,
+                    committed_tokens: 1,
+                    written_blocks: vec![prepared.writable_blocks[0]],
+                },
+                0,
+                2,
+            ),
+            Err(KvCoordinatorError::MissingTransaction(999))
+        );
+        assert_eq!(
+            coordinator.complete_write_prefix(
+                KvWriteReceipt {
+                    txn_id: 300,
+                    committed_tokens: 6,
+                    written_blocks: prepared.writable_blocks.clone(),
+                },
+                0,
+                2,
+            ),
+            Err(KvCoordinatorError::InvalidTokenRange)
+        );
+        assert_eq!(
+            coordinator.complete_write_prefix(
+                KvWriteReceipt {
+                    txn_id: 300,
+                    committed_tokens: 1,
+                    written_blocks: vec![prepared.writable_blocks[1]],
+                },
+                0,
+                2,
+            ),
+            Err(KvCoordinatorError::InvalidWriteReceipt)
+        );
+        assert_eq!(
+            coordinator.transaction_state(300),
+            Some(KvTransactionState::Prepared)
+        );
+        coordinator.check_invariants().unwrap();
+
+        assert!(coordinator.abort(300).unwrap());
+        assert_eq!(coordinator.stats().allocated_pages, 0);
+        assert_eq!(
+            coordinator.complete_write_prefix(
+                KvWriteReceipt {
+                    txn_id: 300,
+                    committed_tokens: 1,
+                    written_blocks: vec![prepared.writable_blocks[0]],
+                },
+                0,
+                2,
+            ),
+            Err(KvCoordinatorError::MissingTransaction(300))
+        );
+        assert_eq!(
+            coordinator.terminal_state(300),
+            Some(KvTerminalState::Aborted)
+        );
+        coordinator.check_invariants().unwrap();
     }
 
     #[test]
