@@ -785,6 +785,10 @@ pub struct ExecutionProfile {
     pub cache_release_safe: bool,
     pub prefix_reuse_safe: bool,
     pub max_batch_size: usize,
+    /// Model-preferred number of decode inputs in one isolated scheduler
+    /// transaction. The scheduler may reduce this for fairness or latency.
+    #[serde(default = "default_preferred_decode_tokens")]
+    pub preferred_decode_tokens: usize,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -819,6 +823,7 @@ impl ExecutionProfile {
             cache_release_safe: false,
             prefix_reuse_safe: false,
             max_batch_size: 1,
+            preferred_decode_tokens: 1,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
@@ -848,6 +853,10 @@ impl ExecutionProfile {
             },
         }
     }
+}
+
+const fn default_preferred_decode_tokens() -> usize {
+    1
 }
 
 impl Default for ExecutionCapabilities {

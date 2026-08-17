@@ -455,70 +455,59 @@ impl NativeExecutor {
             }
         };
 
-        let decode_iterations = if scheduled.is_prefill {
+        let input_budget = if scheduled.is_prefill {
             1
         } else {
             scheduled.num_tokens.max(1)
         };
         let mut total_tokens_generated = 0usize;
-        let mut decode_steps_ran = 0usize;
-        let mut final_text = String::new();
-        let mut finished = false;
+        if request.is_cancelled() {
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
+        let step =
+            Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?;
+        if request.is_cancelled() {
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        }
 
-        for _ in 0..decode_iterations {
-            if request.is_cancelled() {
-                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                    request.id.clone(),
-                )));
+        let step_tokens_generated = step
+            .tokens_generated
+            .saturating_sub(active_state.last_tokens_generated);
+        active_state.last_tokens_generated = step.tokens_generated;
+        total_tokens_generated = total_tokens_generated.saturating_add(step_tokens_generated);
+        let mut final_text = step.text.clone();
+        let finished = step.finished;
+
+        if let Some(tx) = stream_tx.as_ref() {
+            if !step.delta.is_empty() {
+                Self::stream_text_with_policy(
+                    tx,
+                    stream_policy,
+                    &request.id,
+                    &mut active_state.stream_sequence,
+                    step.delta.clone(),
+                )?;
+                active_state.streamed_text.push_str(&step.delta);
             }
-            let step = Self::run_blocking(|| model.decode_step(&mut active_state.state))?;
-            if request.is_cancelled() {
-                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                    request.id.clone(),
-                )));
-            }
-            decode_steps_ran = decode_steps_ran.saturating_add(1);
-
-            let step_tokens_generated = step
-                .tokens_generated
-                .saturating_sub(active_state.last_tokens_generated);
-            active_state.last_tokens_generated = step.tokens_generated;
-            total_tokens_generated = total_tokens_generated.saturating_add(step_tokens_generated);
-            final_text = step.text.clone();
-
-            if let Some(tx) = stream_tx.as_ref() {
-                if !step.delta.is_empty() {
-                    Self::stream_text_with_policy(
-                        tx,
-                        stream_policy,
-                        &request.id,
-                        &mut active_state.stream_sequence,
-                        step.delta.clone(),
-                    )?;
-                    active_state.streamed_text.push_str(&step.delta);
-                }
-                if step.finished {
-                    Self::stream_final_marker_with_policy(
-                        tx,
-                        stream_policy,
-                        &request.id,
-                        &mut active_state.stream_sequence,
-                    )?;
-                    final_text =
-                        canonical_chat_terminal_text(&active_state.streamed_text, final_text);
-                }
-            }
-
             if step.finished {
-                finished = true;
-                break;
+                Self::stream_final_marker_with_policy(
+                    tx,
+                    stream_policy,
+                    &request.id,
+                    &mut active_state.stream_sequence,
+                )?;
+                final_text = canonical_chat_terminal_text(&active_state.streamed_text, final_text);
             }
         }
 
         let tokens_processed = if scheduled.is_prefill {
             request.num_prompt_tokens()
         } else {
-            decode_steps_ran.max(1)
+            step.input_tokens_committed
         };
         if let Some(arena) = tensor_arena.as_ref() {
             active_state

@@ -1451,6 +1451,16 @@ impl ModelExecutor for NativeExecutor {
         if request.managed_cache_runtime().is_some() {
             profile.cache_mode = CacheMode::ExternalPaged;
         }
+        if matches!(request.task_type, super::types::TaskType::Chat) {
+            profile.preferred_decode_tokens = request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .and_then(|model| match model.as_ref() {
+                    NativeChatModel::Qwen38(model) => Some(model.preferred_decode_tokens()),
+                    _ => None,
+                })
+                .unwrap_or(1);
+        }
         Some(profile)
     }
 

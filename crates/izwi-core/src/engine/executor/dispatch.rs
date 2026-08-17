@@ -432,9 +432,39 @@ impl NativeExecutor {
                         .and_then(|rows| rows.iter().find(|row| row.plan_id == scheduled.plan_id))
                         .and_then(|row| row.managed_cache.as_ref())
                     {
-                        match reservation
-                            .completed_write_receipt(&result.managed_cache_completions)
-                        {
+                        let receipt = if result.output.tokens_processed == scheduled.num_tokens {
+                            reservation.completed_write_receipt(&result.managed_cache_completions)
+                        } else {
+                            reservation
+                                .domains
+                                .first()
+                                .ok_or_else(|| {
+                                    Error::InferenceError(
+                                        "managed-cache reservation has no domains".into(),
+                                    )
+                                })
+                                .and_then(|domain| {
+                                    let accepted = u32::try_from(result.output.tokens_processed)
+                                        .map_err(|_| {
+                                            Error::InferenceError(
+                                                "accepted cache prefix exceeds u32".into(),
+                                            )
+                                        })?;
+                                    let committed = domain
+                                        .execution_start_tokens
+                                        .checked_add(accepted)
+                                        .ok_or_else(|| {
+                                            Error::InferenceError(
+                                                "accepted cache cursor overflowed".into(),
+                                            )
+                                        })?;
+                                    reservation.completed_write_receipt_for_prefix(
+                                        &result.managed_cache_completions,
+                                        committed,
+                                    )
+                                })
+                        };
+                        match receipt {
                             Ok(receipt) => result.managed_cache = Some(receipt),
                             Err(error) => {
                                 result = ExecutorStepResult::from_session(
