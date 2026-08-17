@@ -2708,6 +2708,12 @@ impl NativeChatDecodeState {
     ) -> Result<()> {
         match self {
             Self::Qwen38(state) => {
+                if state.uses_mtp_physical_kv() != mtp_cache.is_some() {
+                    return Err(Error::InferenceError(
+                        "Qwen3.8 managed MTP reservation does not match the decode state policy"
+                            .into(),
+                    ));
+                }
                 state.install_physical_reservation(cache)?;
                 if let Some(mtp_cache) = mtp_cache {
                     state.install_mtp_physical_reservation(mtp_cache)?;

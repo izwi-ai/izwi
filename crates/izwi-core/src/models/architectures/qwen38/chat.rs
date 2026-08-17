@@ -297,6 +297,10 @@ impl ChatDecodeState {
         true
     }
 
+    pub(crate) fn uses_mtp_physical_kv(&self) -> bool {
+        self.mtp_physical_kv.is_some()
+    }
+
     pub(crate) fn install_physical_reservation(
         &mut self,
         cache: PhysicalPagedKvCache,
