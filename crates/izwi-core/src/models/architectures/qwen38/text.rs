@@ -42,6 +42,16 @@ pub struct Qwen38TextModel {
     finite_diagnostics_enabled: bool,
 }
 
+/// One target-model prefill pass retained for MTP prompt alignment.
+///
+/// `hidden_states` is the complete decoder residual before the target output
+/// norm. `logits`, when requested, is sampled from the final row of that same
+/// pass; no target computation is repeated.
+pub(super) struct Qwen38TextPrefillOutput {
+    pub hidden_states: Tensor,
+    pub logits: Option<Tensor>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen38ProjectionRepresentation {
     ExpandedF32,
@@ -435,12 +445,12 @@ enum Qwen38Mixer {
     Full(Qwen38FullAttention),
 }
 
-struct Qwen38Mlp {
+pub(super) struct Qwen38Mlp {
     gate_up: Qwen38ProjectionGroup,
     down: Qwen38Projection,
 }
 
-enum Qwen38Projection {
+pub(super) enum Qwen38Projection {
     Quantized(QMatMul),
     Dense(Linear),
 }
@@ -453,7 +463,7 @@ enum Qwen38ProjectionGroup {
     },
 }
 
-struct Qwen38RmsNorm {
+pub(super) struct Qwen38RmsNorm {
     weight: Tensor,
     eps: f64,
 }
@@ -494,7 +504,7 @@ impl Qwen38ProjectionGroup {
     }
 }
 
-struct Qwen38FullAttention {
+pub(super) struct Qwen38FullAttention {
     qkv_proj: Qwen38ProjectionGroup,
     o_proj: Qwen38Projection,
     q_norm: Qwen38RmsNorm,
@@ -515,7 +525,7 @@ struct Qwen38FullAttention {
 /// rebuilding these position-dependent tensors in every layer only repeats
 /// device work. The plan deliberately contains no kernel-policy decision: each
 /// layer still selects the rotary kernel or the exact manual fallback itself.
-struct Qwen38MropePlan {
+pub(super) struct Qwen38MropePlan {
     cos: Option<Tensor>,
     sin: Option<Tensor>,
     sequence_len: usize,
@@ -649,10 +659,20 @@ impl Qwen38TextModel {
         state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
-        let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
-        let hidden = self.token_embeddings.forward(&input)?;
-        let hidden = self.forward_hidden_physical(&hidden, &[position_ids], state, cache)?;
+        let hidden =
+            self.forward_token_id_hidden_at_physical(token_id, position_ids, state, cache)?;
         self.forward_hidden_to_logits(&hidden)
+    }
+
+    pub(super) fn forward_token_id_hidden_at_physical(
+        &self,
+        token_id: u32,
+        position_ids: [usize; 3],
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let hidden = self.embed_token_ids(&[token_id])?;
+        self.forward_hidden_physical(&hidden, &[position_ids], state, cache)
     }
 
     pub(crate) fn prefill_token_ids_physical(
@@ -663,6 +683,25 @@ impl Qwen38TextModel {
         cache: &mut PhysicalPagedKvCache,
         compute_logits: bool,
     ) -> Result<Option<Tensor>> {
+        Ok(self
+            .prefill_token_ids_with_hidden_physical(
+                token_ids,
+                position_ids,
+                state,
+                cache,
+                compute_logits,
+            )?
+            .and_then(|output| output.logits))
+    }
+
+    pub(super) fn prefill_token_ids_with_hidden_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        compute_logits: bool,
+    ) -> Result<Option<Qwen38TextPrefillOutput>> {
         if token_ids.is_empty() {
             return Ok(None);
         }
@@ -674,14 +713,34 @@ impl Qwen38TextModel {
             )));
         }
         record_prefill_sequence_span(token_ids.len());
-        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
-        let hidden = self.token_embeddings.forward(&input)?;
-        let hidden = self.forward_hidden_physical(&hidden, position_ids, state, cache)?;
-        if !compute_logits {
-            return Ok(None);
+        let input = self.embed_token_ids(token_ids)?;
+        let hidden = self.forward_hidden_physical(&input, position_ids, state, cache)?;
+        let logits = if compute_logits {
+            let last = hidden.narrow(1, token_ids.len() - 1, 1)?;
+            Some(self.forward_hidden_to_logits(&last)?)
+        } else {
+            None
+        };
+        Ok(Some(Qwen38TextPrefillOutput {
+            hidden_states: hidden,
+            logits,
+        }))
+    }
+
+    pub(super) fn embed_token_ids(&self, token_ids: &[u32]) -> Result<Tensor> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 shared embedding received no token ids".into(),
+            ));
         }
-        let last = hidden.narrow(1, token_ids.len() - 1, 1)?;
-        self.forward_hidden_to_logits(&last).map(Some)
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        self.token_embeddings.forward(&input).map_err(Error::from)
+    }
+
+    /// Project an already normalized MTP hidden span through the target LM
+    /// head without applying the target model's output norm.
+    pub(super) fn project_with_shared_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.output.forward(hidden).map_err(Error::from)
     }
 
     pub(crate) fn forward_input_embedding_at_physical(
@@ -696,7 +755,7 @@ impl Qwen38TextModel {
         self.forward_hidden_to_logits(&hidden)
     }
 
-    fn forward_hidden_physical(
+    pub(super) fn forward_hidden_physical(
         &self,
         input: &Tensor,
         position_ids: &[[usize; 3]],
@@ -910,7 +969,7 @@ impl Qwen38Layer {
 }
 
 impl Qwen38Mlp {
-    fn load_native(
+    pub(super) fn load_native(
         tensors: &IndexedSafetensors,
         device: &Device,
         prefix: &str,
@@ -942,7 +1001,7 @@ impl Qwen38Mlp {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
         let mut gate_up = self.gate_up.forward(hidden_states)?.into_iter();
         let gate_proj_out = gate_up.next().ok_or_else(|| {
@@ -976,7 +1035,7 @@ impl Qwen38Mlp {
 }
 
 impl Qwen38FullAttention {
-    fn load_native(
+    pub(super) fn load_native(
         tensors: &IndexedSafetensors,
         device: &Device,
         prefix: &str,
@@ -1055,7 +1114,7 @@ impl Qwen38FullAttention {
         })
     }
 
-    fn forward_physical(
+    pub(super) fn forward_physical(
         &self,
         hidden_states: &Tensor,
         mrope_plan: &Qwen38MropePlan,
@@ -1128,7 +1187,7 @@ impl Qwen38FullAttention {
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
-    fn prepare_mrope_plan(
+    pub(super) fn prepare_mrope_plan(
         &self,
         position_ids: &[[usize; 3]],
         device: &Device,
@@ -1142,6 +1201,10 @@ impl Qwen38FullAttention {
             device,
             dtype,
         )
+    }
+
+    pub(super) fn cache_geometry(&self) -> (usize, usize, usize) {
+        (self.num_kv_heads, self.head_dim, self.head_dim)
     }
 
     fn apply_rope_plan(
@@ -1750,7 +1813,7 @@ impl Qwen38GatedRmsNorm {
     }
 }
 
-fn native_projection_representation(
+pub(super) fn native_projection_representation(
     device: &Device,
     target: ProjectionMaterialization,
 ) -> Qwen38ProjectionRepresentation {
@@ -1770,7 +1833,7 @@ fn native_projection_representation(
     }
 }
 
-fn load_native_projection(
+pub(super) fn load_native_projection(
     tensors: &IndexedSafetensors,
     name: &str,
     shape: [usize; 2],
@@ -1883,7 +1946,7 @@ fn required_group_output(outputs: &mut std::vec::IntoIter<Tensor>, label: &str) 
     })
 }
 
-fn load_native_zero_centered_norm(
+pub(super) fn load_native_zero_centered_norm(
     tensors: &IndexedSafetensors,
     name: &str,
     length: usize,

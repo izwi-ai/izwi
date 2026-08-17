@@ -6,6 +6,7 @@
 
 mod cache;
 pub mod chat;
+pub(crate) mod mtp;
 pub mod native;
 mod telemetry;
 mod text;
