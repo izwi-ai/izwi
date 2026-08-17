@@ -23,26 +23,28 @@ jq '
 ' "${base_workload}" >"${tmp_dir}/portable-profile.json"
 
 ${runner} --workload "${tmp_dir}/portable-profile.json" \
-    --output "${tmp_dir}/dry" --dry-run >/dev/null
+    --mtp-depth 3 --output "${tmp_dir}/dry" --dry-run >/dev/null
 jq -e '.schema == "izwi.qwen38-cuda-evidence.v1" and
        .hardware_profile.id == "portable-sm80-sm86" and
        .hardware_profile.compute_capability_regex == "^8[.][06]$" and
        .hardware_profile.minimum_total_memory_bytes == 32000000000 and
        .acceptance.performance_thresholds.scope == "portable-sm80-sm86" and
+       .configuration.mtp == {"enabled":true,"draft_tokens":3} and
+       .evidence_level == "implemented_unvalidated" and
        .promotion_eligible == false and .status == "unsupported"' \
     "${tmp_dir}/dry/certificate.json" >/dev/null
 
 jq 'del(.hardware_profile.compute_capability_regex)' \
     "${tmp_dir}/portable-profile.json" >"${tmp_dir}/invalid-profile.json"
 if ${runner} --workload "${tmp_dir}/invalid-profile.json" \
-    --output "${tmp_dir}/invalid" --dry-run >/dev/null 2>&1; then
+    --mtp-depth 3 --output "${tmp_dir}/invalid" --dry-run >/dev/null 2>&1; then
     echo "Qwen3.8 CUDA evidence must reject incomplete hardware profiles" >&2
     exit 1
 fi
 
 if IZWI_QWEN38_EVIDENCE_NVIDIA_SMI=/usr/bin/false \
     ${runner} --workload "${tmp_dir}/portable-profile.json" \
-    --output "${tmp_dir}/required" >/dev/null 2>&1; then
+    --mtp-depth 3 --output "${tmp_dir}/required" >/dev/null 2>&1; then
     echo "required Qwen3.8 CUDA evidence must fail without an NVIDIA device" >&2
     exit 1
 fi

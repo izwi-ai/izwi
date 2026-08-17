@@ -187,6 +187,7 @@ retain the output directory:
 
 ```bash
 scripts/bench/run-qwen38-l40s-evidence.sh \
+  --mtp-depth 3 \
   --server http://127.0.0.1:8080 \
   --izwi-bin target/release/izwi \
   --output target/qwen38-l40s-evidence
@@ -194,9 +195,10 @@ scripts/bench/run-qwen38-l40s-evidence.sh \
 
 A pass requires the exact model ID, a selected device matching the manifest's
 name, compute capability, minimum VRAM, and driver constraints, a server built
-from the checked-out Git SHA, strict quality success, and measured TTFT and
-completion throughput for every case. It records detailed `nvidia-smi`, OS,
-imported-manifest, standard CUDA certificate, and raw benchmark artifacts. The
+from the checked-out Git SHA, strict quality success, and measured TTFT,
+completion throughput, and sampled device-memory use for every case. It records
+detailed `nvidia-smi`, OS, imported-manifest, standard CUDA certificate, and raw
+benchmark artifacts. The
 Qwen3.8 certificate keeps both end-to-end completion throughput and per-sample
 decode throughput calculated from the server-reported generation interval; the
 two metrics must not be conflated. The workload pins the expected Hugging Face
@@ -211,6 +213,7 @@ another NVIDIA GPU, create a separate versioned workload with a distinct
 ```bash
 scripts/bench/run-qwen38-cuda-evidence.sh \
   --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
+  --mtp-depth 3 \
   --output target/qwen38-<profile>-evidence
 ```
 
@@ -228,11 +231,62 @@ cells. `IZWI_QWEN38_PACKED_PROJECTIONS`, `IZWI_QWEN38_CUDA_BF16_KV`,
 default-off baseline and then one candidate per retained output directory
 before testing combinations.
 
+### Qwen3.8 paired MTP evidence
+
+`--mtp-depth` is required for every Qwen3.8 evidence cell. `0` means an
+explicitly disabled baseline; `1`, `2`, and `3` mean enabled MTP with that
+draft depth. The option does not configure the server. Restart the server for
+each cell with matching explicit settings so the runner can compare the
+requested policy with loaded-model diagnostics:
+
+| Cell | Server settings | Runner setting |
+|---|---|---|
+| Baseline | `IZWI_QWEN38_MTP=0` | `--mtp-depth 0` |
+| Depth 1 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=1` | `--mtp-depth 1` |
+| Depth 2 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=2` | `--mtp-depth 2` |
+| Depth 3 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=3` | `--mtp-depth 3` |
+
+Retain the four directories, then validate the exact pair:
+
+```bash
+scripts/bench/certify-qwen38-mtp-evidence.sh \
+  --baseline target/qwen38-mtp-disabled \
+  --depth-1 target/qwen38-mtp-depth-1 \
+  --depth-2 target/qwen38-mtp-depth-2 \
+  --depth-3 target/qwen38-mtp-depth-3 \
+  --output target/qwen38-mtp-paired
+```
+
+The certifier rejects a missing cell or any checkpoint revision, Git SHA,
+workload hash, hardware profile, physical device identity, CUDA/compute/KV
+provider, sampled-memory, or performance-case mismatch. Its evidence levels
+are intentionally monotonic:
+
+- `implemented_unvalidated`: manifests were validated with `--dry-run`; there
+  is no device/runtime claim and promotion remains false.
+- `runtime_validated`: all four measured cells passed the runtime and pairing
+  contract, but profile thresholds are absent or no depth met them.
+- `performance_certified`: at least one depth meets every declared per-case
+  completion-TPS and TTFT threshold plus the peak-memory threshold. Only those
+  depths appear in `certified_depths`. Eligibility remains bound to the exact
+  hardware profile/device, checkpoint, and Git SHA in the certificate; it is
+  not a global CUDA claim.
+
+To permit the last state, declare these values under
+`acceptance.performance_thresholds.values.mtp` before collecting all four
+runs: `minimum_completion_tps_p50_speedup_ratio` (strictly greater than `1`),
+`maximum_ttft_p95_regression_ratio`, and
+`maximum_peak_device_memory_ratio`. These compare candidate completion-TPS p50,
+TTFT p95, and sampled peak memory to the disabled baseline. Null thresholds,
+including the checked-in L40S manifest today, can establish runtime validation
+but cannot synthesize a performance claim.
+
 On a host without an NVIDIA device, the default is a non-zero failure. Local
 workflow validation can explicitly record unsupported without inventing data:
 
 ```bash
-scripts/bench/run-qwen38-l40s-evidence.sh --allow-unsupported
+scripts/bench/run-qwen38-l40s-evidence.sh --mtp-depth 3 --allow-unsupported
 scripts/bench/test-run-qwen38-cuda-evidence.sh
 scripts/bench/test-run-qwen38-l40s-evidence.sh
+scripts/bench/test-certify-qwen38-mtp-evidence.sh
 ```

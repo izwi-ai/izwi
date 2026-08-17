@@ -12,10 +12,13 @@ help=$(${runner} --help)
 grep -q 'never estimates or synthesizes performance' <<<"${help}"
 grep -q -- '--allow-unsupported' <<<"${help}"
 
-${runner} --workload "${workload}" --output "${tmp_dir}/dry" --dry-run >/dev/null
+${runner} --workload "${workload}" --mtp-depth 3 \
+    --output "${tmp_dir}/dry" --dry-run >/dev/null
 jq -e '.schema == "izwi.qwen38-cuda-evidence.v1" and
        .hardware_profile.id == "nvidia-l40s-48gb" and
        .hardware_profile.promotion_scope == "profile_only" and
+       .configuration.mtp == {"enabled":true,"draft_tokens":3} and
+       .evidence_level == "implemented_unvalidated" and
        .promotion_eligible == false and
        .status == "unsupported" and .reason == "dry_run"' \
     "${tmp_dir}/dry/certificate.json" >/dev/null
@@ -25,13 +28,15 @@ grep -q '^warmup = true$' "${tmp_dir}/dry/imported-manifest.toml"
 grep -q '^max_tokens = 2048$' "${tmp_dir}/dry/imported-manifest.toml"
 
 jq '.cases[0].iterations = 2' "${workload}" >"${tmp_dir}/invalid.json"
-if ${runner} --workload "${tmp_dir}/invalid.json" --output "${tmp_dir}/invalid" --dry-run >/dev/null 2>&1; then
+if ${runner} --workload "${tmp_dir}/invalid.json" --mtp-depth 3 \
+    --output "${tmp_dir}/invalid" --dry-run >/dev/null 2>&1; then
     echo "invalid Qwen3.8 workload must be rejected" >&2
     exit 1
 fi
 
 if IZWI_QWEN38_EVIDENCE_NVIDIA_SMI=/usr/bin/false \
-    ${runner} --workload "${workload}" --output "${tmp_dir}/required" >/dev/null 2>&1; then
+    ${runner} --workload "${workload}" --mtp-depth 3 \
+    --output "${tmp_dir}/required" >/dev/null 2>&1; then
     echo "required Qwen3.8 L40S evidence must fail without an NVIDIA device" >&2
     exit 1
 fi
@@ -40,7 +45,7 @@ jq -e '.status == "failed" and .reason == "nvidia_device_not_observed" and .meas
 
 IZWI_QWEN38_EVIDENCE_NVIDIA_SMI=/usr/bin/false \
     ${runner} --workload "${workload}" --output "${tmp_dir}/unsupported" \
-    --allow-unsupported >/dev/null
+    --mtp-depth 3 --allow-unsupported >/dev/null
 jq -e '.status == "unsupported" and .reason == "nvidia_device_not_observed" and .measurements == null' \
     "${tmp_dir}/unsupported/certificate.json" >/dev/null
 

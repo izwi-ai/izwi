@@ -4,8 +4,10 @@ This is the manual CUDA validation protocol for `Qwen3.8-27B-FP8`. The
 optimization candidates are scoped to the separate Qwen3.8 model family, but
 they are not tied to the L40S: production dispatch selects the CUDA backend,
 not a GPU product name. The L40S is the first strict evidence profile because
-it is the deployment that motivated this work. All candidates remain disabled
-by default and have not been validated on an NVIDIA GPU in this repository.
+it is the deployment that motivated this work. The legacy CUDA candidates in
+the table below remain disabled by default. Qwen3.8 MTP has a separate
+default-on policy and four-cell evidence protocol; it has not yet been
+validated on an NVIDIA GPU in this repository.
 
 CUDA correctness and performance evidence is hardware-profile-specific. A
 passing L40S bundle certifies only the versioned `nvidia-l40s-48gb` profile. It
@@ -74,6 +76,7 @@ From the root of the same checkout, with the warmed server listening on port
 
 ```bash
 scripts/bench/run-qwen38-l40s-evidence.sh \
+  --mtp-depth 3 \
   --server http://127.0.0.1:8080 \
   --izwi-bin target/release/izwi \
   --output target/qwen38-l40s-evidence
@@ -94,8 +97,8 @@ Retain the entire output directory, including:
 - `certificate.json`, with the workload hash, checkpoint revision, device,
   Git SHA, and measured per-case results;
 - `imported-manifest.toml`;
-- `nvidia-smi.csv`, `nvidia-smi-q.txt`, `uname.txt`, and `nvcc-version.txt`
-  when `nvcc` is available;
+- `nvidia-smi.csv`, `nvidia-memory-samples.csv`, `nvidia-smi-q.txt`,
+  `uname.txt`, and `nvcc-version.txt` when `nvcc` is available;
 - `cuda-evidence/certificate.json`, `cuda-evidence/health.json`, and
   `cuda-evidence/runner.log`;
 - `cuda-evidence/benchmark/report.json`, `metadata.json`,
@@ -112,14 +115,68 @@ For another versioned NVIDIA hardware profile, use:
 ```bash
 scripts/bench/run-qwen38-cuda-evidence.sh \
   --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
+  --mtp-depth 3 \
   --server http://127.0.0.1:8080 \
   --izwi-bin target/release/izwi \
   --output target/qwen38-<profile>-evidence
 ```
 
-The certificate records the exact device name, compute capability, total and
-free VRAM, driver version, Git SHA, and checkpoint revision. The selected
-server device must match every constraint in the manifest's hardware profile.
+The certificate records the exact device UUID/name, compute capability, total
+and sampled peak-used/free VRAM, driver version, Git SHA, checkpoint revision,
+observed provider, and resolved MTP policy. The selected server device must
+match every constraint in the manifest's hardware profile.
+
+## Paired MTP validation
+
+Collect four otherwise identical runs from fresh server processes. Do not rely
+on the default when recording evidence; set the process variables explicitly:
+
+| Cell | Required process environment | Evidence argument |
+|---|---|---|
+| Disabled baseline | `IZWI_QWEN38_MTP=0` | `--mtp-depth 0` |
+| Depth 1 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=1` | `--mtp-depth 1` |
+| Depth 2 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=2` | `--mtp-depth 2` |
+| Depth 3 | `IZWI_QWEN38_MTP=1 IZWI_QWEN38_MTP_DRAFT_TOKENS=3` | `--mtp-depth 3` |
+
+The runner option labels expected state; it does not mutate the server. A real
+cell passes only when loaded-model diagnostics prove the matching enabled flag
+and draft depth and run-local counters prove disabled or active MTP execution.
+After collecting the four retained bundles, run:
+
+```bash
+scripts/bench/certify-qwen38-mtp-evidence.sh \
+  --baseline target/qwen38-mtp-disabled \
+  --depth-1 target/qwen38-mtp-depth-1 \
+  --depth-2 target/qwen38-mtp-depth-2 \
+  --depth-3 target/qwen38-mtp-depth-3 \
+  --output target/qwen38-mtp-paired
+```
+
+The certifier fails closed unless every cell has the same 40-character Git SHA
+and checkpoint revision, workload hash, hardware profile, device identity,
+hardware/compute/KV provider, and complete case names/configuration. Each cell
+must have measured positive TTFT and completion throughput plus sampled peak
+device memory. A dry-run pairing emits only `implemented_unvalidated`; four
+measured cells emit `runtime_validated`. `performance_certified` additionally
+requires a profile-scoped predeclared threshold object with:
+
+```json
+{
+  "mtp": {
+    "minimum_completion_tps_p50_speedup_ratio": 1.05,
+    "maximum_ttft_p95_regression_ratio": 1.05,
+    "maximum_peak_device_memory_ratio": 1.15
+  }
+}
+```
+
+These numbers are an example of the schema, not recommended L40S thresholds.
+Set profile-specific values before measurement. With the checked-in null
+thresholds the strongest possible result is `runtime_validated`; tooling never
+turns missing thresholds into a performance claim.
+Even a performance certificate is eligible only for its bound hardware
+profile/device, checkpoint revision, and Git SHA; it cannot promote a global
+CUDA default.
 
 ## Candidate review and profile-scoped promotion
 
@@ -174,7 +231,6 @@ default-off candidate set:
 - Q8 projection-kernel tuning;
 - whole-token CUDA graph capture and replay;
 - native block-scaled FP8 execution;
-- multi-token prediction (MTP);
 - continuous batching.
 
 These phases change numerical behavior, memory ownership, scheduling, or the
