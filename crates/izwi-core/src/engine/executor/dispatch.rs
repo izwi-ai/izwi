@@ -127,14 +127,35 @@ impl NativeExecutor {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match managed_cache {
                 Some(reservation) if request.task_type == TaskType::Chat => {
-                    let cache =
-                        super::qwen3_managed_cache_for_row(request, scheduled_req, reservation)?;
-                    self.chat_request_with_managed_cache(
-                        request,
-                        scheduled_req,
-                        Some(cache),
-                        reservation.tensor_state,
-                    )
+                    if request.model_variant.is_some_and(|variant| {
+                        variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+                    }) {
+                        let caches = super::qwen38_managed_caches_for_row(
+                            request,
+                            scheduled_req,
+                            reservation,
+                        )?;
+                        self.chat_request_with_managed_cache(
+                            request,
+                            scheduled_req,
+                            Some(caches.target),
+                            caches.mtp,
+                            reservation.tensor_state,
+                        )
+                    } else {
+                        let cache = super::qwen3_managed_cache_for_row(
+                            request,
+                            scheduled_req,
+                            reservation,
+                        )?;
+                        self.chat_request_with_managed_cache(
+                            request,
+                            scheduled_req,
+                            Some(cache),
+                            None,
+                            reservation.tensor_state,
+                        )
+                    }
                 }
                 Some(reservation) if request.task_type == TaskType::ASR => {
                     let cache =

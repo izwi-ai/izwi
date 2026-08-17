@@ -186,7 +186,7 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
     ) -> Result<ModelSessionResult> {
-        self.chat_request_with_managed_cache(request, scheduled, None, None)
+        self.chat_request_with_managed_cache(request, scheduled, None, None, None)
     }
 
     pub(super) fn chat_request_with_managed_cache(
@@ -194,8 +194,14 @@ impl NativeExecutor {
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
         mut managed_cache: Option<PhysicalPagedKvCache>,
+        mut mtp_cache: Option<PhysicalPagedKvCache>,
         tensor_reservation: Option<crate::engine::ManagedTensorStateReservation>,
     ) -> Result<ModelSessionResult> {
+        if managed_cache.is_none() && mtp_cache.is_some() {
+            return Err(Error::InferenceError(
+                "managed Qwen3.8 MTP cache has no target-cache authority".into(),
+            ));
+        }
         if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
             return Err(Error::InferenceError(
                 "managed Qwen3 execution requires its exact row reservation".to_string(),
@@ -227,6 +233,11 @@ impl NativeExecutor {
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
         let model = request.prepared_chat_model_for_executor()?;
+        if mtp_cache.is_some() && !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
+            return Err(Error::InferenceError(
+                "managed Qwen3.8 MTP cache was routed to another model family".into(),
+            ));
+        }
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
             let mut phase_timing_override: Option<ExecutorPhaseTiming> = None;
@@ -361,7 +372,9 @@ impl NativeExecutor {
 
         let mut active_state = if let Some(mut state) = active_state {
             match managed_cache.take() {
-                Some(cache) => state.state.install_managed_reservation(cache)?,
+                Some(cache) => state
+                    .state
+                    .install_managed_reservations(cache, mtp_cache.take())?,
                 None if state.state.uses_managed_kv() => {
                     return Err(Error::InferenceError(
                         "managed chat session lost its physical cache authority".to_string(),
@@ -402,6 +415,7 @@ impl NativeExecutor {
                             &generation_config,
                             prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
                             cache,
+                            mtp_cache.take(),
                         )
                     })?
                 }

@@ -2701,15 +2701,43 @@ impl NativeChatDecodeState {
         }
     }
 
-    pub(crate) fn install_managed_reservation(
+    pub(crate) fn install_managed_reservations(
         &mut self,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<()> {
         match self {
-            Self::Qwen3(state) => state.install_managed_reservation(cache),
-            Self::Qwen35(state) => state.install_physical_reservation(cache),
-            Self::Qwen38(state) => state.install_physical_reservation(cache),
-            Self::Gemma3(state) => state.install_physical_reservation(cache),
+            Self::Qwen38(state) => {
+                state.install_physical_reservation(cache)?;
+                if let Some(mtp_cache) = mtp_cache {
+                    state.install_mtp_physical_reservation(mtp_cache)?;
+                }
+                Ok(())
+            }
+            Self::Qwen3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3 state".into(),
+                    ));
+                }
+                state.install_managed_reservation(cache)
+            }
+            Self::Qwen35(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3.5 state".into(),
+                    ));
+                }
+                state.install_physical_reservation(cache)
+            }
+            Self::Gemma3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Gemma3 state".into(),
+                    ));
+                }
+                state.install_physical_reservation(cache)
+            }
         }
     }
 
@@ -3035,7 +3063,8 @@ impl NativeChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen38PreparedPrompt>,
-        cache: PhysicalPagedKvCache,
+        target_cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen38(model) => Ok(NativeChatDecodeState::Qwen38(
@@ -3044,7 +3073,8 @@ impl NativeChatModel {
                     max_new_tokens,
                     config,
                     prepared,
-                    cache,
+                    target_cache,
+                    mtp_cache,
                 )?,
             )),
             _ => Err(Error::InvalidInput(

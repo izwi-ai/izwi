@@ -52,13 +52,112 @@ use crate::backends::{
     BackendSelectionSource,
 };
 use crate::error::{Error, Result};
-use crate::kv::{CacheDomainId, KvGroupId, KvStorageDType, KvStorageFormat};
+use crate::kv::{CacheDomainId, KvArenaId, KvGroupId, KvStorageDType, KvStorageFormat};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
+
+const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
+const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+
+struct Qwen38ManagedCaches {
+    target: PhysicalPagedKvCache,
+    mtp: Option<PhysicalPagedKvCache>,
+}
+
+fn exact_managed_group_for_domain(
+    groups: &[(CacheDomainId, KvGroupId, KvArenaId)],
+    reservation: &super::ManagedCacheReservation,
+    domain_id: CacheDomainId,
+    required: bool,
+) -> Result<Option<KvGroupId>> {
+    let planned = groups
+        .iter()
+        .filter(|(domain, _, _)| *domain == domain_id)
+        .collect::<Vec<_>>();
+    let reserved = reservation
+        .domains
+        .iter()
+        .filter(|domain| domain.domain == domain_id)
+        .collect::<Vec<_>>();
+
+    if planned.is_empty() && reserved.is_empty() {
+        if required {
+            return Err(Error::InferenceError(format!(
+                "managed Qwen3.8 reservation omitted required domain {}",
+                domain_id.get()
+            )));
+        }
+        return Ok(None);
+    }
+    if planned.len() != 1 || reserved.len() != 1 {
+        return Err(Error::InferenceError(format!(
+            "managed Qwen3.8 domain {} must resolve exactly once in both the plan and reservation",
+            domain_id.get()
+        )));
+    }
+    let (_, group_id, arena) = *planned[0];
+    if reserved[0].arena != arena {
+        return Err(Error::InferenceError(format!(
+            "managed Qwen3.8 domain {} crossed its planned arena",
+            domain_id.get()
+        )));
+    }
+    Ok(Some(group_id))
+}
+
+fn qwen38_managed_group_ids(
+    groups: &[(CacheDomainId, KvGroupId, KvArenaId)],
+    reservation: &super::ManagedCacheReservation,
+) -> Result<(KvGroupId, Option<KvGroupId>)> {
+    let target =
+        exact_managed_group_for_domain(groups, reservation, QWEN38_TARGET_ATTENTION_DOMAIN, true)?
+            .ok_or_else(|| {
+                Error::InferenceError("managed Qwen3.8 target domain did not resolve".into())
+            })?;
+    let mtp =
+        exact_managed_group_for_domain(groups, reservation, QWEN38_MTP_ATTENTION_DOMAIN, false)?;
+    Ok((target, mtp))
+}
+
+fn qwen38_managed_caches_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<Qwen38ManagedCaches> {
+    let runtime = request.managed_cache_runtime().ok_or_else(|| {
+        Error::InferenceError("managed Qwen3.8 row has no model runtime".to_string())
+    })?;
+    let groups = runtime
+        .plan()
+        .groups
+        .iter()
+        .map(|group| (group.domain, group.id, group.arena))
+        .collect::<Vec<_>>();
+    let (target_group, mtp_group) = qwen38_managed_group_ids(&groups, reservation)?;
+    let target = physical_paged_cache_for_row(
+        request,
+        scheduled,
+        reservation,
+        QWEN38_TARGET_ATTENTION_DOMAIN,
+        target_group,
+    )?;
+    let mtp = mtp_group
+        .map(|group| {
+            physical_paged_cache_for_row(
+                request,
+                scheduled,
+                reservation,
+                QWEN38_MTP_ATTENTION_DOMAIN,
+                group,
+            )
+        })
+        .transpose()?;
+    Ok(Qwen38ManagedCaches { target, mtp })
+}
 
 fn qwen3_managed_cache_for_row(
     request: &EngineCoreRequest,
@@ -1695,7 +1794,8 @@ mod tests {
     use super::*;
     use crate::engine::request::StreamStagingBuffer;
     use crate::engine::{
-        CapacitySource, PhysicalCapacityProvider, PhysicalCapacitySnapshot, ResourceAmount,
+        CapacitySource, ManagedCacheDomainReservation, ManagedCacheReservation,
+        PhysicalCapacityProvider, PhysicalCapacitySnapshot, ResourceAmount,
     };
     use crate::model::ModelVariant;
     use base64::Engine;
@@ -1713,6 +1813,123 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
+    }
+
+    fn qwen38_test_arena(generation: u32) -> KvArenaId {
+        KvArenaId {
+            model_instance: super::super::ModelInstanceId::new(38),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation,
+        }
+    }
+
+    fn qwen38_test_reservation(domains: &[(CacheDomainId, KvArenaId)]) -> ManagedCacheReservation {
+        ManagedCacheReservation {
+            txn_id: 1,
+            session: SessionKey::new("qwen38-domain-selection".into(), 1),
+            domains: domains
+                .iter()
+                .map(|(domain, arena)| ManagedCacheDomainReservation {
+                    arena: *arena,
+                    domain: *domain,
+                    expected_version: 0,
+                    expected_committed_tokens: 0,
+                    execution_start_tokens: 0,
+                    target_committed_tokens: 1,
+                    target_window_start: 0,
+                    first_page_offset: 0,
+                    provisional_groups: Vec::new(),
+                    writable_blocks: Vec::new(),
+                })
+                .collect(),
+            tensor_state: None,
+        }
+    }
+
+    #[test]
+    fn qwen38_managed_group_selection_resolves_exact_target_and_optional_mtp() {
+        let target_arena = qwen38_test_arena(1);
+        let mtp_arena = qwen38_test_arena(2);
+        let target_group = KvGroupId::new(1);
+        let mtp_group = KvGroupId::new(1);
+        let dual_groups = [
+            (QWEN38_MTP_ATTENTION_DOMAIN, mtp_group, mtp_arena),
+            (QWEN38_TARGET_ATTENTION_DOMAIN, target_group, target_arena),
+        ];
+        let dual_reservation = qwen38_test_reservation(&[
+            (QWEN38_TARGET_ATTENTION_DOMAIN, target_arena),
+            (QWEN38_MTP_ATTENTION_DOMAIN, mtp_arena),
+        ]);
+        assert_eq!(
+            qwen38_managed_group_ids(&dual_groups, &dual_reservation).unwrap(),
+            (target_group, Some(mtp_group))
+        );
+
+        let target_groups = [(QWEN38_TARGET_ATTENTION_DOMAIN, target_group, target_arena)];
+        let target_reservation =
+            qwen38_test_reservation(&[(QWEN38_TARGET_ATTENTION_DOMAIN, target_arena)]);
+        assert_eq!(
+            qwen38_managed_group_ids(&target_groups, &target_reservation).unwrap(),
+            (target_group, None)
+        );
+    }
+
+    #[test]
+    fn qwen38_managed_group_selection_rejects_half_resolved_mtp_domain() {
+        let target_arena = qwen38_test_arena(1);
+        let mtp_arena = qwen38_test_arena(2);
+        let groups = [
+            (
+                QWEN38_TARGET_ATTENTION_DOMAIN,
+                KvGroupId::new(1),
+                target_arena,
+            ),
+            (QWEN38_MTP_ATTENTION_DOMAIN, KvGroupId::new(1), mtp_arena),
+        ];
+        let target_only =
+            qwen38_test_reservation(&[(QWEN38_TARGET_ATTENTION_DOMAIN, target_arena)]);
+        assert!(qwen38_managed_group_ids(&groups, &target_only).is_err());
+
+        let target_group_only = &groups[..1];
+        let reservation_with_mtp = qwen38_test_reservation(&[
+            (QWEN38_TARGET_ATTENTION_DOMAIN, target_arena),
+            (QWEN38_MTP_ATTENTION_DOMAIN, mtp_arena),
+        ]);
+        assert!(qwen38_managed_group_ids(target_group_only, &reservation_with_mtp).is_err());
+    }
+
+    #[test]
+    fn qwen38_managed_group_selection_rejects_missing_duplicate_or_foreign_target() {
+        let target_arena = qwen38_test_arena(1);
+        let foreign_arena = qwen38_test_arena(2);
+        let empty_reservation = qwen38_test_reservation(&[]);
+        assert!(qwen38_managed_group_ids(&[], &empty_reservation).is_err());
+
+        let target_reservation =
+            qwen38_test_reservation(&[(QWEN38_TARGET_ATTENTION_DOMAIN, target_arena)]);
+        assert!(qwen38_managed_group_ids(&[], &target_reservation).is_err());
+
+        let duplicate_groups = [
+            (
+                QWEN38_TARGET_ATTENTION_DOMAIN,
+                KvGroupId::new(1),
+                target_arena,
+            ),
+            (
+                QWEN38_TARGET_ATTENTION_DOMAIN,
+                KvGroupId::new(2),
+                target_arena,
+            ),
+        ];
+        assert!(qwen38_managed_group_ids(&duplicate_groups, &target_reservation).is_err());
+
+        let foreign_groups = [(
+            QWEN38_TARGET_ATTENTION_DOMAIN,
+            KvGroupId::new(1),
+            foreign_arena,
+        )];
+        assert!(qwen38_managed_group_ids(&foreign_groups, &target_reservation).is_err());
     }
 
     #[test]
