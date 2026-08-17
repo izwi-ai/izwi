@@ -30,6 +30,7 @@ const WEIGHT_SUFFIX: &str = ".weight";
 /// The exact model revision against which the first native implementation is
 /// designed and validated.
 pub const QWEN38_27B_FP8_REVISION: &str = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
+pub const QWEN38_MTP_TENSOR_COUNT: usize = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen38LayerType {
@@ -40,6 +41,18 @@ pub enum Qwen38LayerType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockFp8Config {
     pub block_shape: [usize; 2],
+}
+
+/// Serialized MTP topology retained from the Qwen3.8 text configuration.
+///
+/// The published 27B checkpoint has one physical MTP decoder layer and shares
+/// the language model's token embeddings. Execution is intentionally outside
+/// this module; this type records the checkpoint contract without interpreting
+/// the physical layer as a particular speculative decoding policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen38MtpConfig {
+    pub num_hidden_layers: usize,
+    pub use_dedicated_embeddings: bool,
 }
 
 /// Validated native configuration plus the existing runtime geometry.
@@ -53,6 +66,7 @@ pub struct Qwen38NativeConfig {
     pub mrope_interleaved: bool,
     pub tie_word_embeddings: bool,
     pub block_fp8: BlockFp8Config,
+    pub mtp: Qwen38MtpConfig,
 }
 
 impl Qwen38NativeConfig {
@@ -368,6 +382,10 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen38NativeConfig> {
         block_fp8: BlockFp8Config {
             block_shape: [quant.weight_block_size[0], quant.weight_block_size[1]],
         },
+        mtp: Qwen38MtpConfig {
+            num_hidden_layers: text.mtp_num_hidden_layers,
+            use_dedicated_embeddings: text.mtp_use_dedicated_embeddings,
+        },
     })
 }
 
@@ -434,6 +452,60 @@ pub struct NativeTensorInfo {
     pub shape: Vec<usize>,
     pub storage_bytes: usize,
     pub shard: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen38MtpTensorKind {
+    Dense,
+    BlockFp8Weight,
+    BlockFp8Scale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen38MtpTensorInfo {
+    pub kind: Qwen38MtpTensorKind,
+    pub tensor: NativeTensorInfo,
+}
+
+/// Exact checkpoint payload accounting for the MTP tensor scope.
+///
+/// These values count tensor payload bytes, excluding Safetensors metadata and
+/// any execution-time materialization or cache storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen38MtpByteAccounting {
+    pub dense_bytes: u64,
+    pub fp8_weight_bytes: u64,
+    pub fp8_scale_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Validated tensor inventory for the published Qwen3.8 MTP head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen38MtpInventory {
+    tensors: BTreeMap<String, Qwen38MtpTensorInfo>,
+    pub bytes: Qwen38MtpByteAccounting,
+}
+
+impl Qwen38MtpInventory {
+    pub fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn tensors(&self) -> &BTreeMap<String, Qwen38MtpTensorInfo> {
+        &self.tensors
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&Qwen38MtpTensorInfo> {
+        self.tensors.get(name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MtpTensorSpec {
+    name: String,
+    kind: Qwen38MtpTensorKind,
+    dtype: SafeDType,
+    shape: Vec<usize>,
 }
 
 /// Tensor-to-shard index for an HF checkpoint.
@@ -873,6 +945,31 @@ impl IndexedSafetensors {
         Ok(())
     }
 
+    /// Validate and inventory the complete Qwen3.8 MTP tensor scope.
+    ///
+    /// Unlike the text-name validation above, the MTP contract is deliberately
+    /// exact: missing tensors, additional `mtp.*` tensors, wrong shapes or
+    /// dtypes, malformed FP8 scale companions, and payload byte mismatches all
+    /// fail checkpoint loading.
+    pub fn validate_mtp_tensor_manifest(
+        &self,
+        config: &Qwen38NativeConfig,
+    ) -> Result<Qwen38MtpInventory> {
+        let specs = mtp_tensor_specs(config)?;
+        let actual_names = self
+            .tensor_names()
+            .filter(|name| native_tensor_scope(name) == NativeTensorScope::Mtp)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        validate_mtp_tensor_names(&specs, &actual_names)?;
+
+        let tensors = specs
+            .iter()
+            .map(|spec| Ok((spec.name.clone(), self.tensor_info(&spec.name)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        validate_mtp_tensor_infos(config, tensors)
+    }
+
     fn shard_path_for_tensor(&self, name: &str) -> Result<PathBuf> {
         let shard = self.weight_map.get(name).ok_or_else(|| {
             Error::ModelLoadError(format!("Tensor `{name}` is absent from {INDEX_FILE}"))
@@ -881,12 +978,15 @@ impl IndexedSafetensors {
     }
 }
 
-/// Validated config and index for the native checkpoint. Vision and MTP names
-/// remain indexed but are intentionally not required by the text-only slice.
+/// Validated config and index for the native checkpoint.
+///
+/// MTP remains outside the execution graph, but its complete checkpoint
+/// contract is validated and retained for the speculative runtime to consume.
 #[derive(Debug, Clone)]
 pub struct Qwen38NativeCheckpoint {
     pub config: Qwen38NativeConfig,
     pub tensors: IndexedSafetensors,
+    pub mtp: Qwen38MtpInventory,
 }
 
 impl Qwen38NativeCheckpoint {
@@ -894,7 +994,12 @@ impl Qwen38NativeCheckpoint {
         let config = Qwen38NativeConfig::load(model_dir)?;
         let tensors = IndexedSafetensors::open(model_dir)?;
         tensors.validate_required_text_tensor_names(&config)?;
-        Ok(Self { config, tensors })
+        let mtp = tensors.validate_mtp_tensor_manifest(&config)?;
+        Ok(Self {
+            config,
+            tensors,
+            mtp,
+        })
     }
 }
 
@@ -942,6 +1047,258 @@ fn validate_shard_file(model_dir: &Path, name: &str) -> Result<PathBuf> {
         )));
     }
     Ok(canonical)
+}
+
+fn mtp_tensor_specs(config: &Qwen38NativeConfig) -> Result<Vec<MtpTensorSpec>> {
+    let hidden = config.text.embedding_length;
+    let intermediate = config.text.feed_forward_length;
+    let head_dim = config.text.attention_key_length;
+    let query_width = checked_mtp_dimension(
+        "query projection width",
+        config.text.attention_head_count,
+        head_dim,
+    )?;
+    let gated_query_width = checked_mtp_dimension("gated query projection width", query_width, 2)?;
+    let kv_width = checked_mtp_dimension(
+        "key/value projection width",
+        config.text.attention_head_count_kv,
+        head_dim,
+    )?;
+    let fused_input = checked_mtp_dimension("fused input width", hidden, 2)?;
+
+    let mut specs = Vec::with_capacity(QWEN38_MTP_TENSOR_COUNT);
+    push_mtp_dense(&mut specs, "mtp.fc.weight", vec![hidden, fused_input]);
+    for layer in 0..config.mtp.num_hidden_layers {
+        let prefix = format!("mtp.layers.{layer}");
+        push_mtp_dense(
+            &mut specs,
+            format!("{prefix}.input_layernorm.weight"),
+            vec![hidden],
+        );
+        push_mtp_dense(
+            &mut specs,
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        push_mtp_projection(
+            &mut specs,
+            format!("{prefix}.mlp.gate_proj.weight"),
+            [intermediate, hidden],
+            config.block_fp8.block_shape,
+        )?;
+        push_mtp_projection(
+            &mut specs,
+            format!("{prefix}.mlp.up_proj.weight"),
+            [intermediate, hidden],
+            config.block_fp8.block_shape,
+        )?;
+        push_mtp_projection(
+            &mut specs,
+            format!("{prefix}.mlp.down_proj.weight"),
+            [hidden, intermediate],
+            config.block_fp8.block_shape,
+        )?;
+        push_mtp_dense(
+            &mut specs,
+            format!("{prefix}.self_attn.q_norm.weight"),
+            vec![head_dim],
+        );
+        push_mtp_dense(
+            &mut specs,
+            format!("{prefix}.self_attn.k_norm.weight"),
+            vec![head_dim],
+        );
+        for (projection, shape) in [
+            ("q_proj", [gated_query_width, hidden]),
+            ("k_proj", [kv_width, hidden]),
+            ("v_proj", [kv_width, hidden]),
+            ("o_proj", [hidden, query_width]),
+        ] {
+            push_mtp_projection(
+                &mut specs,
+                format!("{prefix}.self_attn.{projection}.weight"),
+                shape,
+                config.block_fp8.block_shape,
+            )?;
+        }
+    }
+    push_mtp_dense(&mut specs, "mtp.norm.weight", vec![hidden]);
+    push_mtp_dense(&mut specs, "mtp.pre_fc_norm_embedding.weight", vec![hidden]);
+    push_mtp_dense(&mut specs, "mtp.pre_fc_norm_hidden.weight", vec![hidden]);
+
+    if specs.len() != QWEN38_MTP_TENSOR_COUNT {
+        return Err(Error::ModelLoadError(format!(
+            "Native Qwen3.8 MTP manifest resolved to {} tensors, expected {QWEN38_MTP_TENSOR_COUNT}",
+            specs.len()
+        )));
+    }
+    Ok(specs)
+}
+
+fn checked_mtp_dimension(label: &str, left: usize, right: usize) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(|| {
+        Error::ModelLoadError(format!(
+            "Native Qwen3.8 MTP {label} overflow: {left} * {right}"
+        ))
+    })
+}
+
+fn push_mtp_dense(specs: &mut Vec<MtpTensorSpec>, name: impl Into<String>, shape: Vec<usize>) {
+    specs.push(MtpTensorSpec {
+        name: name.into(),
+        kind: Qwen38MtpTensorKind::Dense,
+        dtype: SafeDType::BF16,
+        shape,
+    });
+}
+
+fn push_mtp_projection(
+    specs: &mut Vec<MtpTensorSpec>,
+    name: String,
+    shape: [usize; 2],
+    block_shape: [usize; 2],
+) -> Result<()> {
+    let scale_name = scale_name_for_weight(&name)?;
+    let scale_shape = block_scale_shape(shape, block_shape)?;
+    specs.push(MtpTensorSpec {
+        name,
+        kind: Qwen38MtpTensorKind::BlockFp8Weight,
+        dtype: SafeDType::F8_E4M3,
+        shape: shape.to_vec(),
+    });
+    specs.push(MtpTensorSpec {
+        name: scale_name,
+        kind: Qwen38MtpTensorKind::BlockFp8Scale,
+        dtype: SafeDType::BF16,
+        shape: scale_shape.to_vec(),
+    });
+    Ok(())
+}
+
+fn validate_mtp_tensor_names(
+    specs: &[MtpTensorSpec],
+    actual_names: &BTreeSet<String>,
+) -> Result<()> {
+    let expected_names = specs
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect::<BTreeSet<_>>();
+    let missing = expected_names
+        .difference(actual_names)
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected = actual_names
+        .difference(&expected_names)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
+        return Ok(());
+    }
+    Err(Error::ModelLoadError(format!(
+        "Native Qwen3.8 MTP tensor manifest mismatch: missing {missing:?}, unexpected {unexpected:?}"
+    )))
+}
+
+fn validate_mtp_tensor_infos(
+    config: &Qwen38NativeConfig,
+    tensors: BTreeMap<String, NativeTensorInfo>,
+) -> Result<Qwen38MtpInventory> {
+    let specs = mtp_tensor_specs(config)?;
+    let actual_names = tensors.keys().cloned().collect::<BTreeSet<_>>();
+    validate_mtp_tensor_names(&specs, &actual_names)?;
+
+    let mut inventory = BTreeMap::new();
+    let mut dense_bytes = 0u64;
+    let mut fp8_weight_bytes = 0u64;
+    let mut fp8_scale_bytes = 0u64;
+    for spec in specs {
+        let tensor = tensors.get(&spec.name).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{}` disappeared during validation",
+                spec.name
+            ))
+        })?;
+        if tensor.dtype != spec.dtype {
+            return Err(Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{}` dtype mismatch: found {:?}, expected {:?}",
+                spec.name, tensor.dtype, spec.dtype
+            )));
+        }
+        if tensor.shape != spec.shape {
+            return Err(Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{}` shape mismatch: found {:?}, expected {:?}",
+                spec.name, tensor.shape, spec.shape
+            )));
+        }
+        let expected_bytes = tensor_payload_bytes(&spec.name, &spec.shape, spec.dtype)?;
+        let actual_bytes = u64::try_from(tensor.storage_bytes).map_err(|_| {
+            Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{}` storage byte count does not fit u64",
+                spec.name
+            ))
+        })?;
+        if actual_bytes != expected_bytes {
+            return Err(Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{}` payload byte mismatch: found {actual_bytes}, expected {expected_bytes}",
+                spec.name
+            )));
+        }
+        let category = match spec.kind {
+            Qwen38MtpTensorKind::Dense => &mut dense_bytes,
+            Qwen38MtpTensorKind::BlockFp8Weight => &mut fp8_weight_bytes,
+            Qwen38MtpTensorKind::BlockFp8Scale => &mut fp8_scale_bytes,
+        };
+        *category = category.checked_add(actual_bytes).ok_or_else(|| {
+            Error::ModelLoadError("Native Qwen3.8 MTP byte accounting overflow".into())
+        })?;
+        inventory.insert(
+            spec.name,
+            Qwen38MtpTensorInfo {
+                kind: spec.kind,
+                tensor: tensor.clone(),
+            },
+        );
+    }
+    let total_bytes = dense_bytes
+        .checked_add(fp8_weight_bytes)
+        .and_then(|bytes| bytes.checked_add(fp8_scale_bytes))
+        .ok_or_else(|| {
+            Error::ModelLoadError("Native Qwen3.8 MTP total byte accounting overflow".into())
+        })?;
+    Ok(Qwen38MtpInventory {
+        tensors: inventory,
+        bytes: Qwen38MtpByteAccounting {
+            dense_bytes,
+            fp8_weight_bytes,
+            fp8_scale_bytes,
+            total_bytes,
+        },
+    })
+}
+
+fn tensor_payload_bytes(name: &str, shape: &[usize], dtype: SafeDType) -> Result<u64> {
+    let elements = shape.iter().try_fold(1u64, |elements, dimension| {
+        let dimension = u64::try_from(*dimension).map_err(|_| {
+            Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{name}` dimension does not fit u64"
+            ))
+        })?;
+        elements.checked_mul(dimension).ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Native Qwen3.8 MTP tensor `{name}` element count overflow"
+            ))
+        })
+    })?;
+    let element_bytes = u64::try_from(dtype.size()).map_err(|_| {
+        Error::ModelLoadError(format!(
+            "Native Qwen3.8 MTP tensor `{name}` dtype size does not fit u64"
+        ))
+    })?;
+    elements.checked_mul(element_bytes).ok_or_else(|| {
+        Error::ModelLoadError(format!(
+            "Native Qwen3.8 MTP tensor `{name}` payload byte count overflow"
+        ))
+    })
 }
 
 fn required_text_tensor_names(config: &Qwen38NativeConfig) -> HashSet<String> {
@@ -1338,6 +1695,28 @@ mod tests {
             .collect()
     }
 
+    fn valid_mtp_tensor_infos(config: &Qwen38NativeConfig) -> BTreeMap<String, NativeTensorInfo> {
+        mtp_tensor_specs(config)
+            .unwrap()
+            .into_iter()
+            .map(|spec| {
+                let storage_bytes = usize::try_from(
+                    tensor_payload_bytes(&spec.name, &spec.shape, spec.dtype).unwrap(),
+                )
+                .unwrap();
+                (
+                    spec.name,
+                    NativeTensorInfo {
+                        dtype: spec.dtype,
+                        shape: spec.shape,
+                        storage_bytes,
+                        shard: PathBuf::from("mtp.safetensors"),
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn parses_and_maps_the_frozen_native_config() {
         let config = Qwen38NativeConfig::from_json(&valid_config_json()).unwrap();
@@ -1349,6 +1728,13 @@ mod tests {
         assert_eq!(config.text.rope_dimension_count, 64);
         assert_eq!(config.block_fp8.block_shape, [128, 128]);
         assert_eq!(
+            config.mtp,
+            Qwen38MtpConfig {
+                num_hidden_layers: 1,
+                use_dedicated_embeddings: false,
+            }
+        );
+        assert_eq!(
             config
                 .layer_types
                 .iter()
@@ -1356,6 +1742,114 @@ mod tests {
                 .count(),
             16
         );
+    }
+
+    #[test]
+    fn validates_exact_mtp_manifest_and_accounts_checkpoint_payload_bytes() {
+        let config = Qwen38NativeConfig::from_json(&valid_config_json()).unwrap();
+        let inventory =
+            validate_mtp_tensor_infos(&config, valid_mtp_tensor_infos(&config)).unwrap();
+
+        assert_eq!(inventory.tensor_count(), QWEN38_MTP_TENSOR_COUNT);
+        assert_eq!(
+            inventory.bytes,
+            Qwen38MtpByteAccounting {
+                dense_bytes: 104_909_824,
+                fp8_weight_bytes: 372_244_480,
+                fp8_scale_bytes: 45_440,
+                total_bytes: 477_199_744,
+            }
+        );
+        assert_eq!(
+            inventory
+                .tensors()
+                .values()
+                .filter(|tensor| tensor.kind == Qwen38MtpTensorKind::Dense)
+                .count(),
+            8
+        );
+        let fc = inventory.tensor("mtp.fc.weight").unwrap();
+        assert_eq!(fc.tensor.dtype, SafeDType::BF16);
+        assert_eq!(fc.tensor.shape, [5_120, 10_240]);
+        let gated_query = inventory
+            .tensor("mtp.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(gated_query.kind, Qwen38MtpTensorKind::BlockFp8Weight);
+        assert_eq!(gated_query.tensor.dtype, SafeDType::F8_E4M3);
+        assert_eq!(gated_query.tensor.shape, [12_288, 5_120]);
+        let query_scale = inventory
+            .tensor("mtp.layers.0.self_attn.q_proj.weight_scale_inv")
+            .unwrap();
+        assert_eq!(query_scale.kind, Qwen38MtpTensorKind::BlockFp8Scale);
+        assert_eq!(query_scale.tensor.dtype, SafeDType::BF16);
+        assert_eq!(query_scale.tensor.shape, [96, 40]);
+    }
+
+    #[test]
+    fn rejects_missing_and_unexpected_mtp_tensor_names() {
+        let config = Qwen38NativeConfig::from_json(&valid_config_json()).unwrap();
+        let mut missing = valid_mtp_tensor_infos(&config);
+        missing.remove("mtp.norm.weight");
+        let error = validate_mtp_tensor_infos(&config, missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing"), "{error}");
+        assert!(error.contains("mtp.norm.weight"), "{error}");
+
+        let mut unexpected = valid_mtp_tensor_infos(&config);
+        unexpected.insert(
+            "mtp.layers.0.self_attn.bias".into(),
+            NativeTensorInfo {
+                dtype: SafeDType::BF16,
+                shape: vec![1],
+                storage_bytes: 2,
+                shard: PathBuf::from("mtp.safetensors"),
+            },
+        );
+        let error = validate_mtp_tensor_infos(&config, unexpected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unexpected"), "{error}");
+        assert!(error.contains("mtp.layers.0.self_attn.bias"), "{error}");
+    }
+
+    #[test]
+    fn rejects_mtp_projection_and_scale_contract_drift() {
+        let config = Qwen38NativeConfig::from_json(&valid_config_json()).unwrap();
+        let q_weight = "mtp.layers.0.self_attn.q_proj.weight";
+        let q_scale = "mtp.layers.0.self_attn.q_proj.weight_scale_inv";
+
+        let mut wrong_weight_dtype = valid_mtp_tensor_infos(&config);
+        wrong_weight_dtype.get_mut(q_weight).unwrap().dtype = SafeDType::BF16;
+        let error = validate_mtp_tensor_infos(&config, wrong_weight_dtype)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(q_weight), "{error}");
+        assert!(error.contains("dtype mismatch"), "{error}");
+
+        let mut wrong_scale_shape = valid_mtp_tensor_infos(&config);
+        wrong_scale_shape.get_mut(q_scale).unwrap().shape = vec![40, 96];
+        let error = validate_mtp_tensor_infos(&config, wrong_scale_shape)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(q_scale), "{error}");
+        assert!(error.contains("shape mismatch"), "{error}");
+
+        let mut wrong_scale_dtype = valid_mtp_tensor_infos(&config);
+        wrong_scale_dtype.get_mut(q_scale).unwrap().dtype = SafeDType::F32;
+        let error = validate_mtp_tensor_infos(&config, wrong_scale_dtype)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(q_scale), "{error}");
+        assert!(error.contains("dtype mismatch"), "{error}");
+
+        let mut wrong_payload_bytes = valid_mtp_tensor_infos(&config);
+        wrong_payload_bytes.get_mut(q_scale).unwrap().storage_bytes -= 2;
+        let error = validate_mtp_tensor_infos(&config, wrong_payload_bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(q_scale), "{error}");
+        assert!(error.contains("payload byte mismatch"), "{error}");
     }
 
     #[test]
