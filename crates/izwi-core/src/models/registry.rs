@@ -2813,6 +2813,7 @@ pub struct NativeChatDecodeStep {
     pub delta: String,
     pub text: String,
     pub tokens_generated: usize,
+    pub input_tokens_committed: usize,
     pub finished: bool,
 }
 
@@ -3153,6 +3154,7 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
                     finished: step.finished,
                 })
             }
@@ -3162,6 +3164,7 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
                     finished: step.finished,
                 })
             }
@@ -3171,6 +3174,7 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
                 })
             }
@@ -3180,6 +3184,7 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
                     finished: step.finished,
                 })
             }
@@ -3187,6 +3192,47 @@ impl NativeChatModel {
                 "Chat decode state does not match loaded chat model".to_string(),
             )),
         }
+    }
+
+    pub(crate) fn decode_quantum(
+        &self,
+        state: &mut NativeChatDecodeState,
+        input_budget: usize,
+    ) -> Result<NativeChatDecodeStep> {
+        if let (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) = (self, &mut *state) {
+            let step = model.decode_quantum(state, input_budget.max(1))?;
+            return Ok(NativeChatDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                input_tokens_committed: step.input_tokens_committed,
+                finished: step.finished,
+            });
+        }
+        let mut delta = String::new();
+        let mut text = String::new();
+        let mut tokens_generated = 0usize;
+        let mut input_tokens_committed = 0usize;
+        let mut finished = false;
+        for _ in 0..input_budget.max(1) {
+            let step = self.decode_step(state)?;
+            delta.push_str(&step.delta);
+            text = step.text;
+            tokens_generated = step.tokens_generated;
+            input_tokens_committed =
+                input_tokens_committed.saturating_add(step.input_tokens_committed);
+            finished = step.finished;
+            if finished {
+                break;
+            }
+        }
+        Ok(NativeChatDecodeStep {
+            delta,
+            text,
+            tokens_generated,
+            input_tokens_committed,
+            finished,
+        })
     }
 
     pub fn decode_step_batch(
@@ -3200,6 +3246,7 @@ impl NativeChatModel {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
+                    input_tokens_committed: 1,
                     finished: step.finished,
                 })
                 .collect()
@@ -3238,6 +3285,7 @@ impl NativeChatModel {
                             delta: step.delta,
                             text: step.text,
                             tokens_generated: step.tokens_generated,
+                            input_tokens_committed: 1,
                             finished: step.finished,
                         })
                         .collect()

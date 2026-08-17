@@ -834,6 +834,12 @@ impl Qwen38TextModel {
     }
 
     pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.project_target_hidden_span(hidden)?
+            .i((0, 0))
+            .map_err(Error::from)
+    }
+
+    pub(super) fn project_target_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.output_norm.forward(hidden)?;
         validate_qwen38_finite_tensor(
             &hidden,
@@ -842,7 +848,6 @@ impl Qwen38TextModel {
             self.finite_diagnostics_enabled,
         )?;
         let logits = self.output.forward(&hidden)?;
-        let logits = logits.i((0, 0))?;
         validate_qwen38_finite_tensor(
             &logits,
             self.layers.len(),

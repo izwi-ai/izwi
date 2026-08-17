@@ -27,13 +27,16 @@ use crate::models::shared::chat::{
 use crate::models::shared::sampling::{
     bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
+use crate::models::shared::speculative_sampling::verify_speculative_prefix;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
-use super::cache::qwen38_composite_cache_contract;
+use super::cache::qwen38_composite_cache_contract_with_mtp;
+use super::mtp::{Qwen38MtpDepth, Qwen38MtpHead, Qwen38MtpPairBatch};
 use super::native::{ProjectionMaterialization, Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
 use super::telemetry::{
-    record_cuda_kv_provider, record_sampling_bounded_cuda, record_sampling_device_argmax,
-    record_sampling_host, snapshot as qwen38_optimization_telemetry_snapshot,
+    record_cuda_kv_provider, record_mtp_policy, record_mtp_round, record_sampling_bounded_cuda,
+    record_sampling_device_argmax, record_sampling_host,
+    snapshot as qwen38_optimization_telemetry_snapshot,
 };
 use super::text::{Qwen38ProjectionRepresentation, Qwen38TextModel, Qwen38TextRuntimeState};
 
@@ -42,6 +45,66 @@ const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
 const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
 const CUDA_BF16_KV_ENV: &str = "IZWI_QWEN38_CUDA_BF16_KV";
+const MTP_ENABLED_ENV: &str = "IZWI_QWEN38_MTP";
+const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
+const DEFAULT_MTP_DRAFT_TOKENS: usize = 3;
+const MAX_MTP_DRAFT_TOKENS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen38MtpPolicy {
+    Disabled,
+    Enabled { draft_tokens: usize },
+}
+
+impl Qwen38MtpPolicy {
+    fn from_process_environment() -> Result<Self> {
+        Self::resolve(
+            std::env::var(MTP_ENABLED_ENV).ok().as_deref(),
+            std::env::var(MTP_DRAFT_TOKENS_ENV).ok().as_deref(),
+        )
+    }
+
+    fn resolve(enabled: Option<&str>, draft_tokens: Option<&str>) -> Result<Self> {
+        let enabled = match enabled.map(str::trim).map(str::to_ascii_lowercase) {
+            None => true,
+            Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => true,
+            Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => false,
+            Some(value) => {
+                return Err(Error::ConfigError(format!(
+                    "{MTP_ENABLED_ENV} must be a boolean, got `{value}`"
+                )))
+            }
+        };
+        if !enabled {
+            return Ok(Self::Disabled);
+        }
+        let draft_tokens = match draft_tokens.map(str::trim) {
+            None | Some("") => DEFAULT_MTP_DRAFT_TOKENS,
+            Some(value) => value.parse::<usize>().map_err(|_| {
+                Error::ConfigError(format!(
+                    "{MTP_DRAFT_TOKENS_ENV} must be an integer in 1..={MAX_MTP_DRAFT_TOKENS}"
+                ))
+            })?,
+        };
+        if !(1..=MAX_MTP_DRAFT_TOKENS).contains(&draft_tokens) {
+            return Err(Error::ConfigError(format!(
+                "{MTP_DRAFT_TOKENS_ENV} must be in 1..={MAX_MTP_DRAFT_TOKENS}, got {draft_tokens}"
+            )));
+        }
+        Ok(Self::Enabled { draft_tokens })
+    }
+
+    const fn draft_tokens(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { draft_tokens } => Some(draft_tokens),
+        }
+    }
+
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Qwen38KvStorageProvider {
@@ -209,6 +272,9 @@ fn initial_penalty_history(
 pub struct ChatDecodeState {
     text_state: Qwen38TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
+    mtp_physical_kv: Option<PhysicalPagedKvCache>,
+    mtp_anchor_hidden: Option<Tensor>,
+    bootstrap_token: Option<u32>,
     physical_tensor_sequence: Option<PhysicalStateSequenceId>,
     /// Model output awaiting sampling inside the current executor quantum.
     /// This slot is drained before the state is returned to the executor.
@@ -247,10 +313,32 @@ impl ChatDecodeState {
         Ok(())
     }
 
+    pub(crate) fn install_mtp_physical_reservation(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let current = self.mtp_physical_kv.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 scalar state received an MTP cache reservation".into())
+        })?;
+        if current.arena().id() != cache.arena().id()
+            || current.context_len() != cache.context_len()
+        {
+            return Err(Error::InferenceError(
+                "Qwen3.8 MTP KV reservation does not continue the session".into(),
+            ));
+        }
+        self.mtp_physical_kv = Some(cache);
+        Ok(())
+    }
+
     pub(crate) fn take_physical_write_completions(
         &mut self,
     ) -> Vec<std::sync::Arc<crate::backends::kv::KvWriteBatchCompletion>> {
-        self.physical_kv.take_completed_writes()
+        let mut completions = self.physical_kv.take_completed_writes();
+        if let Some(mtp) = self.mtp_physical_kv.as_mut() {
+            completions.extend(mtp.take_completed_writes());
+        }
+        completions
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -293,6 +381,7 @@ pub struct ChatDecodeStep {
     pub delta: String,
     pub text: String,
     pub tokens_generated: usize,
+    pub input_tokens_committed: usize,
     pub finished: bool,
 }
 
@@ -470,6 +559,8 @@ pub struct Qwen38ChatModel {
     tokenizer: Qwen38Tokenizer,
     text_config: Qwen38TextConfig,
     text_model: Qwen38TextModel,
+    mtp_policy: Qwen38MtpPolicy,
+    mtp_head: Option<Qwen38MtpHead>,
 }
 
 fn qwen38_fp8_execution_mode(
@@ -538,6 +629,7 @@ impl Qwen38ChatModel {
             )));
         }
         let checkpoint = Qwen38NativeCheckpoint::open(model_dir)?;
+        let mtp_policy = Qwen38MtpPolicy::from_process_environment()?;
         let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
         let text_config = checkpoint.config.text.clone();
         let projection_materialization = qwen38_projection_materialization(&device)?;
@@ -547,6 +639,17 @@ impl Qwen38ChatModel {
             &device.device,
             projection_materialization,
         )?;
+        let mtp_head = match mtp_policy {
+            Qwen38MtpPolicy::Disabled => None,
+            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native(
+                &checkpoint.tensors,
+                &checkpoint.config,
+                &checkpoint.mtp,
+                &device.device,
+                projection_materialization,
+            )?),
+        };
+        record_mtp_policy(mtp_policy.enabled());
         let projection_representation = text_model.projection_representation();
         let device_kind = BackendKind::from(device.kind);
         let cuda_compute_capability = device.capabilities.cuda_compute_capability;
@@ -564,6 +667,8 @@ impl Qwen38ChatModel {
             tensors = checkpoint.tensors.tensor_count(),
             resident_representation = projection_representation.as_str(),
             fp8_execution_mode = qwen38_fp8_execution_mode(projection_representation),
+            mtp_enabled = mtp_policy.enabled(),
+            mtp_draft_tokens = mtp_policy.draft_tokens(),
             "Loaded native Qwen3.8 text checkpoint"
         );
         Ok(Self {
@@ -574,6 +679,8 @@ impl Qwen38ChatModel {
             tokenizer,
             text_config,
             text_model,
+            mtp_policy,
+            mtp_head,
         })
     }
 
@@ -601,7 +708,12 @@ impl Qwen38ChatModel {
         attention_dtype: DType,
         preferred_page_tokens: usize,
     ) -> Result<InferenceStateContract> {
-        qwen38_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
+        qwen38_composite_cache_contract_with_mtp(
+            &self.text_config,
+            attention_dtype,
+            preferred_page_tokens,
+            self.mtp_policy.enabled(),
+        )
     }
 
     pub fn chat_template(&self) -> &str {
@@ -657,6 +769,16 @@ impl Qwen38ChatModel {
                     "fallback_reason": self.kv_storage_provider.fallback_reason(),
                     "runtime_validated": false,
                 },
+                "mtp": {
+                    "enabled": self.mtp_policy.enabled(),
+                    "draft_tokens": self.mtp_policy.draft_tokens(),
+                    "default_enabled": true,
+                    "enabled_switch": MTP_ENABLED_ENV,
+                    "depth_switch": MTP_DRAFT_TOKENS_ENV,
+                    "implementation_status": "implemented_unvalidated",
+                    "runtime_validated": false,
+                    "performance_certified": false,
+                },
             },
             "vision_enabled": false,
         })
@@ -688,6 +810,12 @@ impl Qwen38ChatModel {
         true
     }
 
+    pub(crate) fn preferred_decode_tokens(&self) -> usize {
+        self.mtp_policy
+            .draft_tokens()
+            .map_or(1, |draft_tokens| draft_tokens.saturating_add(1))
+    }
+
     pub fn device_kind(&self) -> BackendKind {
         self.device_kind
     }
@@ -699,16 +827,20 @@ impl Qwen38ChatModel {
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen38PreparedPrompt>,
         mut cache: PhysicalPagedKvCache,
+        mut mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
         let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
-        if prepared.prompt_ids.is_empty() || cache.context_len() != 0 {
+        if prepared.prompt_ids.is_empty()
+            || cache.context_len() != 0
+            || mtp_cache.as_ref().is_some_and(|mtp| mtp.context_len() != 0)
+        {
             return Err(Error::InvalidInput(
                 "Qwen3.8 physical prefill requires a non-empty prompt and an empty reservation"
                     .into(),
             ));
         }
         let mut text_state = self.text_model.new_state();
-        let logits = self
+        let (logits, target_hidden_states) = self
             .prefill_text_range_physical(
                 &prepared,
                 &mut text_state,
@@ -722,17 +854,58 @@ impl Qwen38ChatModel {
             })?;
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let mut history_ids =
+            initial_penalty_history(&prepared.prompt_ids, max_new_tokens, track_history);
+        let mut rng = SimpleRng::new(config.seed);
+        let (unconsumed_output, pending_token, bootstrap_token, mtp_anchor_hidden) =
+            match (&self.mtp_head, mtp_cache.as_mut()) {
+                (Some(head), Some(mtp_cache)) => {
+                    let history: &[u32] = if track_history { &history_ids } else { &[] };
+                    let anchor = sample_next_token(
+                        &logits,
+                        self.tokenizer.vocab_size,
+                        config,
+                        history,
+                        &mut rng,
+                    )?;
+                    if track_history {
+                        history_ids.push(anchor);
+                    }
+                    let prompt_embeddings =
+                        self.text_model.embed_token_ids(&prepared.prompt_ids)?;
+                    let anchor_embedding = self.text_model.embed_token_ids(&[anchor])?;
+                    let pairs = Qwen38MtpPairBatch::shifted_prompt(
+                        &prompt_embeddings,
+                        &target_hidden_states,
+                        &anchor_embedding,
+                        &prepared.prompt_positions,
+                    )?;
+                    let hidden = head.forward_pairs(&pairs, mtp_cache)?;
+                    let final_hidden = hidden.narrow(1, hidden.dim(1)? - 1, 1)?;
+                    (None, Some(anchor), Some(anchor), Some(final_hidden))
+                }
+                (None, None) => (Some(logits), None, None, None),
+                (Some(_), None) => {
+                    return Err(Error::InferenceError(
+                        "default-enabled Qwen3.8 MTP state has no managed MTP cache".into(),
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(Error::InferenceError(
+                        "disabled Qwen3.8 MTP received an unexpected managed MTP cache".into(),
+                    ))
+                }
+            };
         Ok(ChatDecodeState {
             text_state,
             physical_kv: cache,
+            mtp_physical_kv: mtp_cache,
+            mtp_anchor_hidden,
+            bootstrap_token,
             physical_tensor_sequence: None,
-            unconsumed_output: Some(logits),
-            pending_token: None,
-            history_ids: initial_penalty_history(
-                &prepared.prompt_ids,
-                max_new_tokens,
-                track_history,
-            ),
+            unconsumed_output,
+            pending_token,
+            history_ids,
             decoder: IncrementalDecoder::new(true),
             tokens_generated: 0,
             track_history,
@@ -741,11 +914,19 @@ impl Qwen38ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             config: config.clone(),
-            rng: SimpleRng::new(config.seed),
+            rng,
         })
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        self.decode_quantum(state, 1)
+    }
+
+    pub(crate) fn decode_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -754,10 +935,21 @@ impl Qwen38ChatModel {
                 delta,
                 text: state.assembled.clone(),
                 tokens_generated: state.tokens_generated,
+                input_tokens_committed: 0,
                 finished: true,
             });
         }
 
+        if let Some(anchor) = state.bootstrap_token.take() {
+            let delta = self.publish_token(state, anchor)?;
+            return Ok(self.decode_step_result(state, delta, 0));
+        }
+
+        if self.mtp_head.is_some() {
+            return self.decode_mtp_quantum(state, input_budget.max(1));
+        }
+
+        let mut input_tokens_committed = 0;
         if let Some(pending) = state.pending_token.take() {
             state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
                 pending,
@@ -766,6 +958,7 @@ impl Qwen38ChatModel {
                 &mut state.physical_kv,
             )?);
             state.next_text_position += 1;
+            input_tokens_committed = 1;
         }
 
         let history: &[u32] = if state.track_history {
@@ -780,45 +973,248 @@ impl Qwen38ChatModel {
             history,
             &mut state.rng,
         )?;
-        if self.is_stop_token(next, &state.config) {
-            state.finished = true;
-            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
-            state.assembled.push_str(&delta);
-            return Ok(ChatDecodeStep {
-                delta,
-                text: state.assembled.clone(),
-                tokens_generated: state.tokens_generated,
-                finished: true,
-            });
-        }
-
-        let mut delta = self
-            .tokenizer
-            .decode_token_delta(&mut state.decoder, next)?;
         if state.track_history {
             state.history_ids.push(next);
         }
+        state.pending_token = Some(next);
+        let delta = self.publish_token(state, next)?;
+        Ok(self.decode_step_result(state, delta, input_tokens_committed))
+    }
+
+    fn decode_step_result(
+        &self,
+        state: &ChatDecodeState,
+        delta: String,
+        input_tokens_committed: usize,
+    ) -> ChatDecodeStep {
+        ChatDecodeStep {
+            delta,
+            text: if state.finished {
+                state.assembled.clone()
+            } else {
+                String::new()
+            },
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed,
+            finished: state.finished,
+        }
+    }
+
+    fn publish_token(&self, state: &mut ChatDecodeState, token: u32) -> Result<String> {
+        if self.is_stop_token(token, &state.config) {
+            state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
+            return Ok(delta);
+        }
+        let mut delta = self
+            .tokenizer
+            .decode_token_delta(&mut state.decoder, token)?;
         state.tokens_generated = state.tokens_generated.saturating_add(1);
         state.assembled.push_str(&delta);
-        state.pending_token = Some(next);
         if state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             let suffix = self.tokenizer.finish_decode(&mut state.decoder)?;
             state.assembled.push_str(&suffix);
             delta.push_str(&suffix);
         }
-        let final_text = if state.finished {
-            state.assembled.clone()
-        } else {
-            String::new()
-        };
+        Ok(delta)
+    }
 
-        Ok(ChatDecodeStep {
-            delta,
-            text: final_text,
-            tokens_generated: state.tokens_generated,
-            finished: state.finished,
-        })
+    fn decode_mtp_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        let head = self
+            .mtp_head
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 MTP decode has no loaded head".into()))?;
+        let configured_depth = self.mtp_policy.draft_tokens().ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 MTP decode has a disabled policy".into())
+        })?;
+        let mut delta = String::new();
+        let mut committed = 0usize;
+
+        while committed < input_budget && !state.finished {
+            let remaining = input_budget - committed;
+            if remaining == 1 {
+                let pending = state.pending_token.ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 MTP scalar tail has no pending token".into())
+                })?;
+                let hidden = self.text_model.forward_token_id_hidden_at_physical(
+                    pending,
+                    [state.next_text_position; 3],
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                )?;
+                let logits = self
+                    .text_model
+                    .project_target_hidden_span(&hidden)?
+                    .i((0, 0))?;
+                let history = if state.track_history {
+                    state.history_ids.as_slice()
+                } else {
+                    &[]
+                };
+                let next = sample_next_token(
+                    &logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?;
+                if state.track_history {
+                    state.history_ids.push(next);
+                }
+                let mtp = state.mtp_physical_kv.as_mut().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 MTP scalar tail lost its cache".into())
+                })?;
+                let next_hidden = head.forward_step(
+                    self.text_model.embed_token_ids(&[next])?,
+                    hidden,
+                    [state.next_text_position; 3],
+                    mtp,
+                )?;
+                state.mtp_anchor_hidden = Some(next_hidden);
+                state.pending_token = Some(next);
+                state.next_text_position += 1;
+                committed += 1;
+                delta.push_str(&self.publish_token(state, next)?);
+                continue;
+            }
+
+            let depth = configured_depth.min(remaining - 1);
+            let depth = Qwen38MtpDepth::new(depth)?;
+            let mtp = state
+                .mtp_physical_kv
+                .as_mut()
+                .ok_or_else(|| Error::InferenceError("Qwen3.8 MTP decode lost its cache".into()))?;
+            let mtp_checkpoint = mtp.logical_checkpoint();
+            let anchor_hidden = state.mtp_anchor_hidden.as_ref().ok_or_else(|| {
+                Error::InferenceError("Qwen3.8 MTP decode has no recurrent anchor".into())
+            })?;
+            let continuation_positions = (0..depth.get().saturating_sub(1))
+                .map(|offset| [state.next_text_position + offset; 3])
+                .collect::<Vec<_>>();
+            let drafted = head.draft_recurrently_with_text(
+                &self.text_model,
+                anchor_hidden,
+                depth,
+                &continuation_positions,
+                mtp,
+                |_, logits| argmax_clamped(&logits.i((0, 0))?, self.tokenizer.vocab_size),
+            );
+            mtp.restore_logical_checkpoint(mtp_checkpoint)?;
+            let drafted = drafted?;
+
+            let pending = state.pending_token.ok_or_else(|| {
+                Error::InferenceError("Qwen3.8 MTP verification has no pending token".into())
+            })?;
+            let mut target_inputs = Vec::with_capacity(drafted.token_ids.len() + 1);
+            target_inputs.push(pending);
+            target_inputs.extend_from_slice(&drafted.token_ids);
+            let positions = (0..target_inputs.len())
+                .map(|offset| [state.next_text_position + offset; 3])
+                .collect::<Vec<_>>();
+            let target_checkpoint = state.physical_kv.logical_checkpoint();
+            let text_checkpoint = state.text_state.clone();
+            let target_output = self
+                .text_model
+                .prefill_token_ids_with_hidden_physical(
+                    &target_inputs,
+                    &positions,
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                    false,
+                )?
+                .ok_or_else(|| Error::InferenceError("empty MTP verification span".into()))?;
+            let target_logits = self
+                .text_model
+                .project_target_hidden_span(&target_output.hidden_states)?;
+            let mut host_rows = Vec::with_capacity(target_inputs.len());
+            for row in 0..target_inputs.len() {
+                let mut values = logits_to_vec(&target_logits.i((0, row))?)?;
+                truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                host_rows.push(values);
+            }
+            let mut verification_history = if state.track_history {
+                state.history_ids.clone()
+            } else {
+                Vec::new()
+            };
+            let verification = verify_speculative_prefix(
+                &drafted.token_ids,
+                &host_rows,
+                &state.config,
+                &mut verification_history,
+                &mut state.rng,
+            )?;
+
+            let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
+            let mut kept = Vec::new();
+            let mut non_stop = 0usize;
+            for token in verification.emitted_tokens.iter().copied() {
+                kept.push(token);
+                if self.is_stop_token(token, &state.config) {
+                    break;
+                }
+                non_stop += 1;
+                if non_stop >= remaining_outputs {
+                    break;
+                }
+            }
+            let canonical_count = kept.len();
+            let replay =
+                canonical_count != target_inputs.len() || !verification.all_drafts_accepted();
+            let canonical_hidden = if replay {
+                state
+                    .physical_kv
+                    .restore_logical_checkpoint(target_checkpoint)?;
+                state.text_state = text_checkpoint;
+                self.text_model
+                    .prefill_token_ids_with_hidden_physical(
+                        &target_inputs[..canonical_count],
+                        &positions[..canonical_count],
+                        &mut state.text_state,
+                        &mut state.physical_kv,
+                        false,
+                    )?
+                    .ok_or_else(|| Error::InferenceError("empty MTP replay span".into()))?
+                    .hidden_states
+            } else {
+                target_output.hidden_states
+            };
+            if state.track_history {
+                state.history_ids = verification_history;
+            }
+            let canonical_pairs = Qwen38MtpPairBatch::new(
+                self.text_model.embed_token_ids(&kept)?,
+                canonical_hidden,
+                positions[..canonical_count].to_vec(),
+            )?;
+            let canonical_mtp_hidden = head.forward_pairs(&canonical_pairs, mtp)?;
+            state.mtp_anchor_hidden =
+                Some(canonical_mtp_hidden.narrow(1, canonical_count - 1, 1)?);
+            state.pending_token = kept.last().copied();
+            state.next_text_position += canonical_count;
+            committed += canonical_count;
+            record_mtp_round(
+                drafted.token_ids.len(),
+                verification.accepted_draft_tokens,
+                verification.emitted_bonus_token(),
+                target_inputs.len(),
+                if replay { canonical_count } else { 0 },
+            );
+            for token in kept {
+                delta.push_str(&self.publish_token(state, token)?);
+                if state.finished {
+                    break;
+                }
+            }
+        }
+
+        Ok(self.decode_step_result(state, delta, committed))
     }
 
     fn is_stop_token(&self, token_id: u32, config: &ChatGenerationConfig) -> bool {
@@ -836,25 +1232,32 @@ impl Qwen38ChatModel {
         start: usize,
         end: usize,
         compute_final_logits: bool,
-    ) -> Result<Option<Tensor>> {
+    ) -> Result<Option<(Tensor, Tensor)>> {
         let mut logits = None;
+        let mut hidden_chunks = Vec::new();
         let mut chunk_start = start;
         let chunk_size = qwen38_prefill_chunk_size();
         while chunk_start < end {
             let chunk_end = (chunk_start + chunk_size).min(end);
             let compute_logits = compute_final_logits && chunk_end == end;
-            if let Some(chunk_logits) = self.text_model.prefill_token_ids_physical(
+            if let Some(output) = self.text_model.prefill_token_ids_with_hidden_physical(
                 &prepared.prompt_ids[chunk_start..chunk_end],
                 &prepared.prompt_positions[chunk_start..chunk_end],
                 text_state,
                 cache,
                 compute_logits,
             )? {
-                logits = Some(chunk_logits);
+                hidden_chunks.push(output.hidden_states);
+                if let Some(chunk_logits) = output.logits {
+                    logits = Some(chunk_logits);
+                }
             }
             chunk_start = chunk_end;
         }
-        Ok(logits)
+        match logits {
+            Some(logits) => Ok(Some((logits, Tensor::cat(&hidden_chunks, 1)?))),
+            None => Ok(None),
+        }
     }
 
     fn prepare_prompt(
@@ -1385,8 +1788,31 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     argmax_values(&values)
 }
 
+#[derive(Clone)]
 struct SimpleRng {
     state: u64,
+}
+
+impl rand::RngCore for SimpleRng {
+    fn next_u32(&mut self) -> u32 {
+        SimpleRng::next_u32(self)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        (u64::from(SimpleRng::next_u32(self)) << 32) | u64::from(SimpleRng::next_u32(self))
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(std::mem::size_of::<u32>()) {
+            let bytes = SimpleRng::next_u32(self).to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
 }
 
 impl SimpleRng {
@@ -1460,6 +1886,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reused.prompt_ids(), prepared.prompt_ids());
+    }
+
+    #[test]
+    fn mtp_policy_is_enabled_at_depth_three_by_default() {
+        let policy = Qwen38MtpPolicy::resolve(None, None).unwrap();
+        assert_eq!(policy, Qwen38MtpPolicy::Enabled { draft_tokens: 3 });
+        assert!(policy.enabled());
+        assert_eq!(policy.draft_tokens(), Some(3));
+    }
+
+    #[test]
+    fn mtp_policy_has_an_explicit_disable_and_bounded_depth_override() {
+        for disabled in ["0", "false", "NO", " off "] {
+            assert_eq!(
+                Qwen38MtpPolicy::resolve(Some(disabled), Some("invalid")).unwrap(),
+                Qwen38MtpPolicy::Disabled
+            );
+        }
+        for depth in 1..=3 {
+            assert_eq!(
+                Qwen38MtpPolicy::resolve(Some("on"), Some(&depth.to_string())).unwrap(),
+                Qwen38MtpPolicy::Enabled {
+                    draft_tokens: depth
+                }
+            );
+        }
+        assert!(Qwen38MtpPolicy::resolve(Some("maybe"), None).is_err());
+        assert!(Qwen38MtpPolicy::resolve(None, Some("0")).is_err());
+        assert!(Qwen38MtpPolicy::resolve(None, Some("4")).is_err());
+        assert!(Qwen38MtpPolicy::resolve(None, Some("many")).is_err());
     }
 
     #[test]

@@ -49,6 +49,15 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub sampling_bounded_cuda_success_total: u64,
     pub sampling_bounded_cuda_fallback_to_host_total: u64,
     pub sampling_host_total: u64,
+    pub mtp_enabled_loads_total: u64,
+    pub mtp_disabled_loads_total: u64,
+    pub mtp_rounds_total: u64,
+    pub mtp_draft_tokens_total: u64,
+    pub mtp_accepted_draft_tokens_total: u64,
+    pub mtp_rejected_rounds_total: u64,
+    pub mtp_bonus_tokens_total: u64,
+    pub mtp_target_verified_tokens_total: u64,
+    pub mtp_target_replay_tokens_total: u64,
 }
 
 macro_rules! counters {
@@ -97,6 +106,15 @@ counters!(
     SAMPLING_BOUNDED_CUDA_SUCCESS,
     SAMPLING_BOUNDED_CUDA_FALLBACK_TO_HOST,
     SAMPLING_HOST,
+    MTP_ENABLED_LOADS,
+    MTP_DISABLED_LOADS,
+    MTP_ROUNDS,
+    MTP_DRAFT_TOKENS,
+    MTP_ACCEPTED_DRAFT_TOKENS,
+    MTP_REJECTED_ROUNDS,
+    MTP_BONUS_TOKENS,
+    MTP_TARGET_VERIFIED_TOKENS,
+    MTP_TARGET_REPLAY_TOKENS,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +239,34 @@ pub(crate) fn record_sampling_host() {
     SAMPLING_HOST.fetch_add(1, Ordering::Relaxed);
 }
 
+pub(crate) fn record_mtp_policy(enabled: bool) {
+    if enabled {
+        MTP_ENABLED_LOADS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        MTP_DISABLED_LOADS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_mtp_round(
+    drafted: usize,
+    accepted: usize,
+    emitted_bonus: bool,
+    target_verified: usize,
+    target_replayed: usize,
+) {
+    MTP_ROUNDS.fetch_add(1, Ordering::Relaxed);
+    MTP_DRAFT_TOKENS.fetch_add(drafted as u64, Ordering::Relaxed);
+    MTP_ACCEPTED_DRAFT_TOKENS.fetch_add(accepted as u64, Ordering::Relaxed);
+    if accepted < drafted {
+        MTP_REJECTED_ROUNDS.fetch_add(1, Ordering::Relaxed);
+    }
+    if emitted_bonus {
+        MTP_BONUS_TOKENS.fetch_add(1, Ordering::Relaxed);
+    }
+    MTP_TARGET_VERIFIED_TOKENS.fetch_add(target_verified as u64, Ordering::Relaxed);
+    MTP_TARGET_REPLAY_TOKENS.fetch_add(target_replayed as u64, Ordering::Relaxed);
+}
+
 pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
     macro_rules! load {
         ($name:ident) => {
@@ -273,6 +319,15 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         sampling_bounded_cuda_success_total: load!(SAMPLING_BOUNDED_CUDA_SUCCESS),
         sampling_bounded_cuda_fallback_to_host_total: load!(SAMPLING_BOUNDED_CUDA_FALLBACK_TO_HOST),
         sampling_host_total: load!(SAMPLING_HOST),
+        mtp_enabled_loads_total: load!(MTP_ENABLED_LOADS),
+        mtp_disabled_loads_total: load!(MTP_DISABLED_LOADS),
+        mtp_rounds_total: load!(MTP_ROUNDS),
+        mtp_draft_tokens_total: load!(MTP_DRAFT_TOKENS),
+        mtp_accepted_draft_tokens_total: load!(MTP_ACCEPTED_DRAFT_TOKENS),
+        mtp_rejected_rounds_total: load!(MTP_REJECTED_ROUNDS),
+        mtp_bonus_tokens_total: load!(MTP_BONUS_TOKENS),
+        mtp_target_verified_tokens_total: load!(MTP_TARGET_VERIFIED_TOKENS),
+        mtp_target_replay_tokens_total: load!(MTP_TARGET_REPLAY_TOKENS),
     }
 }
 
@@ -289,6 +344,8 @@ mod tests {
         assert_eq!(value["cuda_deltanet_decode_fallback_total"], 0);
         assert_eq!(value["cuda_deltanet_specialized_decode_fallback_total"], 0);
         assert_eq!(value["sampling_bounded_cuda_fallback_to_host_total"], 0);
+        assert_eq!(value["mtp_rounds_total"], 0);
+        assert_eq!(value["mtp_target_replay_tokens_total"], 0);
     }
 
     #[test]
@@ -322,6 +379,49 @@ mod tests {
         assert_eq!(
             after.cuda_deltanet_decode_fallback_total - before.cuda_deltanet_decode_fallback_total,
             1
+        );
+    }
+
+    #[test]
+    fn mtp_acceptance_and_replay_outcomes_remain_reconcilable() {
+        let before = snapshot();
+        record_mtp_policy(true);
+        record_mtp_policy(false);
+        record_mtp_round(3, 3, true, 4, 0);
+        record_mtp_round(3, 1, false, 4, 2);
+        let after = snapshot();
+        assert_eq!(
+            after.mtp_enabled_loads_total - before.mtp_enabled_loads_total,
+            1
+        );
+        assert_eq!(
+            after.mtp_disabled_loads_total - before.mtp_disabled_loads_total,
+            1
+        );
+        assert_eq!(after.mtp_rounds_total - before.mtp_rounds_total, 2);
+        assert_eq!(
+            after.mtp_draft_tokens_total - before.mtp_draft_tokens_total,
+            6
+        );
+        assert_eq!(
+            after.mtp_accepted_draft_tokens_total - before.mtp_accepted_draft_tokens_total,
+            4
+        );
+        assert_eq!(
+            after.mtp_rejected_rounds_total - before.mtp_rejected_rounds_total,
+            1
+        );
+        assert_eq!(
+            after.mtp_bonus_tokens_total - before.mtp_bonus_tokens_total,
+            1
+        );
+        assert_eq!(
+            after.mtp_target_verified_tokens_total - before.mtp_target_verified_tokens_total,
+            8
+        );
+        assert_eq!(
+            after.mtp_target_replay_tokens_total - before.mtp_target_replay_tokens_total,
+            2
         );
     }
 
