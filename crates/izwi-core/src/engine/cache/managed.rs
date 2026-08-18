@@ -915,28 +915,12 @@ impl ManagedKvCacheManager {
             backend,
             allocation_plan.initial_state_resources(&state_plan_v2)?,
         )?;
-        let initial_authorization = if backend == BackendKind::Cuda {
-            let deferred_paged_bytes = plan.groups.iter().try_fold(0_u64, |total, group| {
-                let initial_pages = group.capacity_strategy.initial_blocks();
-                let deferred_pages = group.capacity_pages.saturating_sub(initial_pages);
-                total
-                    .checked_add(
-                        group
-                            .bytes_per_page
-                            .checked_mul(u64::from(deferred_pages))
-                            .ok_or_else(|| {
-                                Error::Overloaded(
-                                    "managed CUDA deferred KV byte total overflow".into(),
-                                )
-                            })?,
-                    )
-                    .ok_or_else(|| {
-                        Error::Overloaded("managed CUDA deferred KV byte total overflow".into())
-                    })
-            })?;
-            let mut deferred = ResourceVector::zero();
-            deferred.device_bytes = ResourceAmount::Known(deferred_paged_bytes);
-            resources.checked_sub(deferred)?
+        // A fitted CUDA context is a durable allocation promise, not a
+        // one-time observation. Reserve the worst contiguous-replacement peak
+        // before Ready publication so later request/workspace allocations
+        // cannot consume memory required by lazy KV growth.
+        let authorization = if backend == BackendKind::Cuda {
+            cuda_managed_state_peak_authorization(resources, &plan.groups)?
         } else {
             resources
         };
@@ -944,7 +928,7 @@ impl ManagedKvCacheManager {
             .resource_authority
             .as_ref()
             .map(|authority| {
-                reserve_managed_arena(authority, model_instance, backend, initial_authorization)
+                reserve_managed_arena(authority, model_instance, backend, authorization)
             })
             .transpose()?;
         let mut arenas = HashMap::with_capacity(plan.groups.len());
@@ -1270,15 +1254,6 @@ impl ManagedKvCacheManager {
                         .ok_or_else(|| {
                             Error::Overloaded("managed KV growth byte total overflow".into())
                         })?;
-                    let previous_authorization =
-                        state.resource_lease.as_ref().map(ResourceLease::resources);
-                    let final_authorization = previous_authorization
-                        .map(|current| {
-                            let mut delta = ResourceVector::zero();
-                            delta.device_bytes = ResourceAmount::Known(added_bytes);
-                            current.checked_add(delta)
-                        })
-                        .transpose()?;
                     let final_materialized =
                         state.materialized_resources.checked_add(ResourceVector {
                             device_bytes: ResourceAmount::Known(added_bytes),
@@ -1294,31 +1269,20 @@ impl ManagedKvCacheManager {
                         .ok_or_else(|| {
                             Error::Overloaded("managed KV growth peak byte total overflow".into())
                         })?;
-                    let peak_authorization = previous_authorization
-                        .map(|current| {
-                            let mut delta = ResourceVector::zero();
-                            delta.device_bytes = ResourceAmount::Known(target_bytes);
-                            current.checked_add(delta)
-                        })
-                        .transpose()?;
-                    if let (Some(lease), Some(peak)) =
-                        (state.resource_lease.as_mut(), peak_authorization)
-                    {
-                        lease.resize(peak)?;
-                    }
-                    if let Err(error) = arena.grow_resident_pages(growth) {
-                        if let (Some(lease), Some(previous)) =
-                            (state.resource_lease.as_mut(), previous_authorization)
-                        {
-                            let _ = lease.resize(previous);
+                    let allocation_peak =
+                        state.materialized_resources.checked_add(ResourceVector {
+                            device_bytes: ResourceAmount::Known(target_bytes),
+                            ..ResourceVector::zero()
+                        })?;
+                    if let Some(lease) = state.resource_lease.as_ref() {
+                        if !allocation_peak.fits_within(lease.resources()) {
+                            return Err(Error::InferenceError(
+                                "managed CUDA growth exceeds its load-time replacement reservation"
+                                    .into(),
+                            ));
                         }
-                        return Err(error);
                     }
-                    if let (Some(lease), Some(final_resources)) =
-                        (state.resource_lease.as_mut(), final_authorization)
-                    {
-                        lease.resize(final_resources)?;
-                    }
+                    arena.grow_resident_pages(growth)?;
                     state.allocation_ledger.reconcile_group_receipt(
                         runtime.allocation_plan(),
                         crate::kv::v2::StateGroupId::new(group.id.get()),
@@ -2135,6 +2099,55 @@ fn cuda_contiguous_replacement_peak_pages(maximum_pages: u32) -> Result<u64> {
         current = target;
     }
     Ok(peak)
+}
+
+fn cuda_largest_contiguous_replacement_extra(
+    paged: impl IntoIterator<Item = (u32, u64)>,
+) -> Result<u64> {
+    paged
+        .into_iter()
+        .try_fold(0_u64, |largest_extra, (maximum_pages, bytes_per_page)| {
+            let peak_pages = cuda_contiguous_replacement_peak_pages(maximum_pages)?;
+            let extra_pages = peak_pages
+                .checked_sub(u64::from(maximum_pages))
+                .ok_or_else(|| {
+                    Error::InferenceError("CUDA KV replacement peak underflow".into())
+                })?;
+            let extra_bytes = bytes_per_page.checked_mul(extra_pages).ok_or_else(|| {
+                Error::ModelLoadError("CUDA KV replacement byte plan overflow".into())
+            })?;
+            Ok(largest_extra.max(extra_bytes))
+        })
+}
+
+fn cuda_managed_state_peak_authorization(
+    steady_resources: ResourceVector,
+    groups: &[crate::kv::ResolvedKvGroup],
+) -> Result<ResourceVector> {
+    let ResourceAmount::Known(steady_device_bytes) = steady_resources.device_bytes else {
+        return Err(Error::ModelLoadError(
+            "CUDA managed state requires known steady device bytes".into(),
+        ));
+    };
+    let replacement_extra =
+        cuda_largest_contiguous_replacement_extra(groups.iter().filter_map(|group| {
+            match group.capacity_strategy {
+                CapacityStrategy::AdmissionGrowable { .. } => {
+                    Some((group.capacity_pages, group.bytes_per_page))
+                }
+                CapacityStrategy::Fixed { .. }
+                | CapacityStrategy::BoundedLazy { .. }
+                | CapacityStrategy::Reserved { .. } => None,
+            }
+        }))?;
+    Ok(ResourceVector {
+        device_bytes: ResourceAmount::Known(
+            steady_device_bytes
+                .checked_add(replacement_extra)
+                .ok_or_else(|| Error::ModelLoadError("CUDA state peak overflow".into()))?,
+        ),
+        ..steady_resources
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3519,6 +3532,22 @@ mod tests {
         assert_eq!(
             cuda_contiguous_replacement_peak_pages(4_096).unwrap(),
             6_144
+        );
+    }
+
+    #[test]
+    fn cuda_durable_reservation_prices_the_largest_replacement_extra() {
+        assert_eq!(
+            cuda_largest_contiguous_replacement_extra([
+                (1_024, 4 * 1024 * 1024),
+                (1_024, 256 * 1024),
+            ])
+            .unwrap(),
+            512 * 4 * 1024 * 1024
+        );
+        assert_eq!(
+            cuda_largest_contiguous_replacement_extra(std::iter::empty()).unwrap(),
+            0
         );
     }
 
