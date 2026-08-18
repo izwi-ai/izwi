@@ -3570,6 +3570,54 @@ mod tests {
     }
 
     #[test]
+    fn qwen38_cuda_context_budget_uses_live_device_headroom() {
+        const TENSOR_BYTES: u64 = 2_667_184_128;
+        const TARGET_BYTES_PER_PAGE: u64 = 4 * 1024 * 1024;
+        const MTP_BYTES_PER_PAGE: u64 = 256 * 1024;
+        const STEADY_PAGES_AT_64K: u64 = 1_024;
+        const PEAK_PAGES_AT_64K: u64 = 1_536;
+        let live_peak = TENSOR_BYTES
+            + TARGET_BYTES_PER_PAGE * PEAK_PAGES_AT_64K
+            + MTP_BYTES_PER_PAGE * STEADY_PAGES_AT_64K;
+        let capacity = ResourceVector {
+            device_bytes: ResourceAmount::Known(live_peak * 4),
+            ..ResourceVector::zero()
+        };
+        let available = ResourceVector {
+            device_bytes: ResourceAmount::Known(live_peak),
+            ..ResourceVector::zero()
+        };
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity,
+                available,
+                source: CapacitySource::Test,
+            },
+        })));
+        let ResourceAmount::Known(budget) = authority
+            .planning_headroom_bytes(BackendKind::Cuda)
+            .unwrap()
+        else {
+            panic!("CUDA test budget must be known");
+        };
+        let paged = [
+            CudaContiguousPagedGeometry {
+                page_tokens: 64,
+                bytes_per_page: TARGET_BYTES_PER_PAGE,
+            },
+            CudaContiguousPagedGeometry {
+                page_tokens: 64,
+                bytes_per_page: MTP_BYTES_PER_PAGE,
+            },
+        ];
+
+        assert_eq!(
+            fit_cuda_contiguous_token_reach(262_144, 64, &paged, TENSOR_BYTES, budget,).unwrap(),
+            65_536
+        );
+    }
+
+    #[test]
     fn multi_domain_cuda_context_fitter_handles_heterogeneous_page_geometry() {
         let paged = [
             CudaContiguousPagedGeometry {
