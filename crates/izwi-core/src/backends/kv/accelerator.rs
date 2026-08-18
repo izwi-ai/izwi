@@ -177,6 +177,29 @@ fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
 
 const ACCELERATOR_WORKSPACE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+fn zero_workspace_pages_per_chunk(
+    page_count: usize,
+    trailing_shape: &[usize],
+    dtype: DType,
+    per_shape_budget: usize,
+) -> Result<usize> {
+    let bytes_per_page =
+        trailing_shape
+            .iter()
+            .try_fold(dtype.size_in_bytes(), |bytes, dimension| {
+                bytes.checked_mul(*dimension).ok_or_else(|| {
+                    Error::Overloaded("accelerator zero workspace byte count overflow".into())
+                })
+            })?;
+    let pages_per_chunk = page_count.min(per_shape_budget.checked_div(bytes_per_page).unwrap_or(0));
+    if pages_per_chunk == 0 {
+        return Err(Error::Overloaded(format!(
+            "one accelerator KV page requires {bytes_per_page} zero-workspace bytes, exceeding per-shape budget {per_shape_budget}"
+        )));
+    }
+    Ok(pages_per_chunk)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AcceleratorWorkspaceKey {
     shape: Vec<usize>,
@@ -254,6 +277,21 @@ impl AcceleratorWorkspacePool {
         let bytes = elements
             .checked_mul(dtype.size_in_bytes())
             .ok_or_else(|| Error::Overloaded("accelerator workspace byte count overflow".into()))?;
+        while self
+            .reserved_bytes
+            .checked_add(bytes)
+            .is_some_and(|total| total > self.budget_bytes)
+        {
+            let Some(index) = self
+                .retired
+                .iter()
+                .position(|entry| entry.retirement.is_complete())
+            else {
+                break;
+            };
+            let retired = self.retired.swap_remove(index);
+            self.reserved_bytes = self.reserved_bytes.saturating_sub(retired.lease.bytes);
+        }
         let requested_total = self.reserved_bytes.checked_add(bytes).ok_or_else(|| {
             Error::Overloaded("accelerator workspace reservation overflow".into())
         })?;
@@ -1619,68 +1657,92 @@ impl KvArena for CandleAcceleratorKvArena {
             .layers
             .read()
             .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
-        let mut workspaces = Vec::new();
-        let mut dispatch_result = Ok(());
-        if !page_indices.is_empty() {
-            let page_indices = accelerator_indices(&page_indices, &self.device)?;
-            for layer in layers.values() {
-                let key_shape = [
-                    page_indices.elem_count(),
-                    self.config.page_tokens as usize,
-                    layer.num_kv_heads,
-                    layer.key_head_dim,
-                ];
-                let value_shape = [
-                    page_indices.elem_count(),
-                    self.config.page_tokens as usize,
-                    layer.num_kv_heads,
-                    layer.value_head_dim,
-                ];
-                let acquired = (|| {
-                    let mut pool = self.workspace_pool.lock().map_err(|_| {
-                        Error::InferenceError("accelerator workspace pool was poisoned".into())
-                    })?;
-                    let keys = pool.acquire(&key_shape, self.storage_dtype, &self.device)?;
-                    match pool.acquire(&value_shape, self.storage_dtype, &self.device) {
-                        Ok(values) => Ok((keys, values)),
-                        Err(error) => {
-                            pool.discard(keys);
-                            Err(error)
-                        }
-                    }
-                })();
-                let (zero_keys, zero_values) = match acquired {
-                    Ok(workspace) => workspace,
+        let mut trailing_shapes = layers
+            .values()
+            .flat_map(|layer| {
+                [
+                    vec![
+                        self.config.page_tokens as usize,
+                        layer.num_kv_heads,
+                        layer.key_head_dim,
+                    ],
+                    vec![
+                        self.config.page_tokens as usize,
+                        layer.num_kv_heads,
+                        layer.value_head_dim,
+                    ],
+                ]
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        trailing_shapes.sort_unstable();
+        let per_shape_budget = ACCELERATOR_WORKSPACE_BUDGET_BYTES
+            .checked_div(trailing_shapes.len())
+            .ok_or_else(|| Error::InferenceError("accelerator arena has no KV layers".into()))?;
+        let mut workspaces = Vec::with_capacity(trailing_shapes.len());
+        let acquisition_result = (|| -> Result<()> {
+            let mut pool = self.workspace_pool.lock().map_err(|_| {
+                Error::InferenceError("accelerator workspace pool was poisoned".into())
+            })?;
+            for trailing_shape in trailing_shapes {
+                let pages_per_chunk = zero_workspace_pages_per_chunk(
+                    page_indices.len(),
+                    &trailing_shape,
+                    self.storage_dtype,
+                    per_shape_budget,
+                )?;
+                let mut shape = Vec::with_capacity(trailing_shape.len() + 1);
+                shape.push(pages_per_chunk);
+                shape.extend_from_slice(&trailing_shape);
+                match pool.acquire(&shape, self.storage_dtype, &self.device) {
+                    Ok(workspace) => workspaces.push((trailing_shape, pages_per_chunk, workspace)),
                     Err(error) => {
-                        dispatch_result = Err(error);
-                        break;
+                        for (_, _, workspace) in workspaces.drain(..) {
+                            pool.discard(workspace);
+                        }
+                        return Err(error);
                     }
-                };
-                let keys_index = workspaces.len();
-                workspaces.push(zero_keys);
-                let values_index = workspaces.len();
-                workspaces.push(zero_values);
-                if let Err(error) =
-                    scatter_rows(&layer.keys, &page_indices, &workspaces[keys_index].tensor)
-                        .and_then(|_| {
-                            scatter_rows(
-                                &layer.values,
-                                &page_indices,
-                                &workspaces[values_index].tensor,
-                            )
-                        })
-                {
-                    dispatch_result = Err(error);
-                    break;
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = acquisition_result {
+            if let Ok(mut pool) = self.workspace_pool.lock() {
+                for (_, _, workspace) in workspaces.drain(..) {
+                    pool.discard(workspace);
+                }
+            }
+            return Err(error);
         }
+
+        let dispatch_result = (|| -> Result<()> {
+            for (trailing_shape, pages_per_chunk, workspace) in &workspaces {
+                let destinations = layers
+                    .values()
+                    .flat_map(|layer| [&layer.keys, &layer.values])
+                    .filter(|tensor| tensor.dims()[1..] == trailing_shape[..])
+                    .collect::<Vec<_>>();
+                for chunk in page_indices.chunks(*pages_per_chunk) {
+                    let indices = accelerator_indices(chunk, &self.device)?;
+                    let source = if chunk.len() == *pages_per_chunk {
+                        workspace.tensor.clone()
+                    } else {
+                        workspace.tensor.narrow(0, 0, chunk.len())?
+                    };
+                    for destination in &destinations {
+                        scatter_rows(destination, &indices, &source)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
         self.page_zero_dispatches.fetch_add(1, Ordering::Relaxed);
         let retirement = match self.mutation_fence() {
             Ok(retirement) => retirement,
             Err(error) => {
                 if let Ok(mut pool) = self.workspace_pool.lock() {
-                    for workspace in workspaces {
+                    for (_, _, workspace) in workspaces {
                         pool.discard(workspace);
                     }
                 }
@@ -1691,7 +1753,7 @@ impl KvArena for CandleAcceleratorKvArena {
             .workspace_pool
             .lock()
             .map_err(|_| Error::InferenceError("accelerator workspace pool was poisoned".into()))?;
-        for workspace in workspaces {
+        for (_, _, workspace) in workspaces {
             pool.retire(workspace, retirement.clone());
         }
         dispatch_result?;
@@ -2567,6 +2629,43 @@ mod tests {
         let reused = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
         assert_eq!(reused.tensor.id(), first_id);
         assert_eq!(pool.allocations, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn accelerator_workspace_pool_evicts_completed_mismatched_shapes() -> Result<()> {
+        let mut pool = AcceleratorWorkspacePool::new(64);
+        let (completed, _) = test_completion(true);
+        let workspace = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        pool.retire(workspace, completed);
+
+        let replacement = pool.acquire(&[32], DType::F16, &Device::Cpu)?;
+        assert_eq!(replacement.bytes, 64);
+        assert_eq!(pool.reserved_bytes, 64);
+        assert!(pool.retired.is_empty());
+        assert_eq!(pool.allocations, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn accelerator_zero_workspace_chunks_distinct_kv_shapes_within_one_budget() -> Result<()> {
+        let per_shape_budget = ACCELERATOR_WORKSPACE_BUDGET_BYTES / 2;
+        let key_shape = [64, 8, 256];
+        let value_shape = [64, 8, 128];
+        let key_pages =
+            zero_workspace_pages_per_chunk(1_024, &key_shape, DType::BF16, per_shape_budget)?;
+        let value_pages =
+            zero_workspace_pages_per_chunk(1_024, &value_shape, DType::BF16, per_shape_budget)?;
+        let key_bytes =
+            key_pages * key_shape.iter().product::<usize>() * DType::BF16.size_in_bytes();
+        let value_bytes =
+            value_pages * value_shape.iter().product::<usize>() * DType::BF16.size_in_bytes();
+
+        assert!(key_pages < 1_024);
+        assert!(value_pages < 1_024);
+        assert!(key_bytes <= per_shape_budget);
+        assert!(value_bytes <= per_shape_budget);
+        assert!(key_bytes + value_bytes <= ACCELERATOR_WORKSPACE_BUDGET_BYTES);
         Ok(())
     }
 
