@@ -526,8 +526,40 @@ impl ResourceAuthority {
 
     /// Return planning headroom in the backend's canonical memory domain.
     /// CPU and Metal share one unified ledger in production, so CPU must not
-    /// read the now-zero host alias from that normalized vector.
+    /// read the now-zero host alias from that normalized vector. Guarded CUDA
+    /// must additionally respect live free device memory: checkpoint residency
+    /// can exceed its estimated ledger claim, and deferred state growth is
+    /// admitted against the same physical observation later.
     pub(crate) fn planning_headroom_bytes(&self, backend: BackendKind) -> Result<ResourceAmount> {
+        if self.capacity_enforcement == CapacityEnforcement::Guarded && backend == BackendKind::Cuda
+        {
+            let state = self.state.lock().map_err(|_| {
+                Error::InferenceError("resource authority mutex poisoned".to_string())
+            })?;
+            if let Some(reason) = state.poisoned.as_ref() {
+                return Err(Error::InferenceError(format!(
+                    "backend resource authority is poisoned and must be recreated: {reason}"
+                )));
+            }
+            let physical = self.normalized_physical_snapshot();
+            let ceiling = match self.provider.configured_budget() {
+                Some(budget) => normalize_resource_domains(budget, self.domain_policy)?,
+                None => physical.capacity,
+            };
+            let ledger_headroom = ceiling.positive_growth_over(state.ledger.used())?;
+            let live_headroom = physical
+                .available
+                .positive_growth_over(state.pending_resources()?)?;
+            return Ok(
+                match (ledger_headroom.device_bytes, live_headroom.device_bytes) {
+                    (ResourceAmount::Known(ledger), ResourceAmount::Known(live)) => {
+                        ResourceAmount::Known(ledger.min(live))
+                    }
+                    _ => ResourceAmount::Unknown,
+                },
+            );
+        }
+
         let headroom = self.planning_headroom()?;
         Ok(match (self.domain_policy, backend) {
             (ResourceDomainPolicy::SharedHostUnified, BackendKind::Cpu | BackendKind::Metal) => {
@@ -1088,6 +1120,13 @@ mod tests {
         }
     }
 
+    fn device_bytes(value: u64) -> ResourceVector {
+        ResourceVector {
+            device_bytes: ResourceAmount::Known(value),
+            ..ResourceVector::zero()
+        }
+    }
+
     #[test]
     fn reservation_is_transactional_and_releases_exactly_once() {
         let mut ledger = ResourceLedger::new(slots(2));
@@ -1364,6 +1403,50 @@ mod tests {
         assert_eq!(authority.planning_headroom().unwrap(), host_bytes(70));
         drop(lease);
         assert_eq!(authority.planning_headroom().unwrap(), host_bytes(100));
+    }
+
+    #[test]
+    fn guarded_cuda_planning_intersects_ledger_and_live_device_headroom() {
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: device_bytes(100),
+                available: device_bytes(25),
+                source: CapacitySource::Test,
+            },
+        })));
+        let _pending = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Cache, "pending"),
+                device_bytes(5),
+            )
+            .unwrap();
+
+        assert_eq!(authority.planning_headroom().unwrap(), device_bytes(95));
+        assert_eq!(
+            authority
+                .planning_headroom_bytes(BackendKind::Cuda)
+                .unwrap(),
+            ResourceAmount::Known(20)
+        );
+    }
+
+    #[test]
+    fn guarded_cuda_planning_preserves_a_lower_operator_budget() {
+        let authority = ResourceAuthority::new(Arc::new(BudgetProvider {
+            snapshot: PhysicalCapacitySnapshot {
+                capacity: device_bytes(100),
+                available: device_bytes(25),
+                source: CapacitySource::Test,
+            },
+            budget: device_bytes(15),
+        }));
+
+        assert_eq!(
+            authority
+                .planning_headroom_bytes(BackendKind::Cuda)
+                .unwrap(),
+            ResourceAmount::Known(15)
+        );
     }
 
     #[test]
