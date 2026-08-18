@@ -3819,21 +3819,22 @@ mod tests {
     }
 
     #[test]
-    fn cuda_chat_automatic_output_budget_reaches_backend_context_capacity() {
-        let context_capacity = 124_224;
-        let processor = RequestProcessor::new(EngineCoreConfig {
-            backend: BackendKind::Cuda,
-            max_seq_len: context_capacity,
-            ..EngineCoreConfig::default()
-        });
-        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
-            role: ChatRole::User,
-            content: "Hello".to_string(),
-        }]);
-        request.params.max_tokens = usize::MAX;
+    fn cuda_chat_automatic_output_budget_adapts_to_backend_context_capacity() {
+        for context_capacity in [16_384, 65_536, 262_144] {
+            let processor = RequestProcessor::new(EngineCoreConfig {
+                backend: BackendKind::Cuda,
+                max_seq_len: context_capacity,
+                ..EngineCoreConfig::default()
+            });
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Hello".to_string(),
+            }]);
+            request.params.max_tokens = usize::MAX;
 
-        let processed = processor.process(request).expect("CUDA chat request");
-        assert_eq!(processed.params.max_tokens, context_capacity);
+            let processed = processor.process(request).expect("CUDA chat request");
+            assert_eq!(processed.params.max_tokens, context_capacity);
+        }
     }
 
     #[test]
