@@ -530,12 +530,6 @@ impl ManagedKvCacheManager {
                 storage_dtype_hint: None,
             },
         )?;
-        if state_plan.paged_attention.len() != 1 {
-            return Err(Error::ModelLoadError(
-                "contiguous CUDA context fitting currently requires one paged-attention group"
-                    .into(),
-            ));
-        }
         let (maximum_allocation, _) = plan_managed_state_capacity(
             &state_plan,
             model_instance,
@@ -551,25 +545,40 @@ impl ManagedKvCacheManager {
             maximum_allocation.maximum_resources(&state_plan)?,
         )?;
         let steady_bytes = known_resource_bytes(steady_resources.device_bytes, "device")?;
-        let paged = &state_plan.paged_attention[0];
-        let maximum_blocks = maximum_allocation
-            .group_capacity(paged.group, paged.domain)?
-            .strategy
-            .maximum_blocks();
-        let maximum_paged_bytes = paged
-            .bytes_per_page
-            .checked_mul(u64::from(maximum_blocks))
-            .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))?;
+        let paged = state_plan
+            .paged_attention
+            .iter()
+            .map(|paged| CudaContiguousPagedGeometry {
+                page_tokens: paged.page_tokens,
+                bytes_per_page: paged.bytes_per_page,
+            })
+            .collect::<Vec<_>>();
+        let maximum_paged_bytes =
+            state_plan
+                .paged_attention
+                .iter()
+                .try_fold(0_u64, |total, paged| {
+                    let maximum_blocks = maximum_allocation
+                        .group_capacity(paged.group, paged.domain)?
+                        .strategy
+                        .maximum_blocks();
+                    total
+                        .checked_add(
+                            paged
+                                .bytes_per_page
+                                .checked_mul(u64::from(maximum_blocks))
+                                .ok_or_else(|| {
+                                    Error::ModelLoadError("CUDA KV byte plan overflow".into())
+                                })?,
+                        )
+                        .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))
+                })?;
         let fixed_state_bytes = steady_bytes
             .checked_sub(maximum_paged_bytes)
             .ok_or_else(|| Error::ModelLoadError("CUDA fixed state byte plan underflow".into()))?;
         let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
-        let minimum_bytes = cuda_contiguous_replacement_required_bytes(
-            minimum_tokens,
-            page_tokens_hint,
-            paged.bytes_per_page,
-            fixed_state_bytes,
-        )?;
+        let minimum_bytes =
+            cuda_contiguous_replacement_required_bytes(minimum_tokens, &paged, fixed_state_bytes)?;
         if minimum_bytes > budget_bytes {
             return Err(Error::ModelLoadError(format!(
                 "CUDA managed context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, contiguous_growth_peak_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
@@ -578,7 +587,7 @@ impl ManagedKvCacheManager {
         fit_cuda_contiguous_token_reach(
             maximum_tokens,
             page_tokens_hint,
-            paged.bytes_per_page,
+            &paged,
             fixed_state_bytes,
             budget_bytes,
         )
@@ -2128,47 +2137,80 @@ fn cuda_contiguous_replacement_peak_pages(maximum_pages: u32) -> Result<u64> {
     Ok(peak)
 }
 
-fn cuda_contiguous_replacement_required_bytes(
-    tokens: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaContiguousPagedGeometry {
     page_tokens: u32,
     bytes_per_page: u64,
+}
+
+/// Price the worst admission-barrier replacement across independently grown
+/// paged arenas. Every arena may already be at its final steady backing when
+/// another arena grows, but only the arena currently being replaced retains an
+/// additional old backing alongside its target allocation.
+fn cuda_contiguous_replacement_required_bytes(
+    tokens: u64,
+    paged: &[CudaContiguousPagedGeometry],
     fixed_state_bytes: u64,
 ) -> Result<u64> {
-    let pages = u32::try_from(tokens.div_ceil(u64::from(page_tokens)))
-        .map_err(|_| Error::ModelLoadError("CUDA KV page demand exceeds u32".into()))?;
-    let peak_pages = cuda_contiguous_replacement_peak_pages(pages)?;
-    bytes_per_page
-        .checked_mul(peak_pages)
-        .and_then(|bytes| bytes.checked_add(fixed_state_bytes))
+    if paged.is_empty() {
+        return Err(Error::InvalidInput(
+            "CUDA contiguous context fitting requires paged state".into(),
+        ));
+    }
+    let (steady_paged_bytes, largest_replacement_extra) =
+        paged
+            .iter()
+            .try_fold((0_u64, 0_u64), |(steady_total, largest_extra), geometry| {
+                if geometry.page_tokens == 0 || geometry.bytes_per_page == 0 {
+                    return Err(Error::InvalidInput(
+                        "CUDA contiguous context fitting requires non-zero paged geometry".into(),
+                    ));
+                }
+                let pages = u32::try_from(tokens.div_ceil(u64::from(geometry.page_tokens)))
+                    .map_err(|_| Error::ModelLoadError("CUDA KV page demand exceeds u32".into()))?;
+                let peak_pages = cuda_contiguous_replacement_peak_pages(pages)?;
+                let steady_bytes = geometry
+                    .bytes_per_page
+                    .checked_mul(u64::from(pages))
+                    .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))?;
+                let peak_bytes = geometry
+                    .bytes_per_page
+                    .checked_mul(peak_pages)
+                    .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))?;
+                let replacement_extra = peak_bytes.checked_sub(steady_bytes).ok_or_else(|| {
+                    Error::ModelLoadError("CUDA KV replacement peak underflow".into())
+                })?;
+                Ok((
+                    steady_total.checked_add(steady_bytes).ok_or_else(|| {
+                        Error::ModelLoadError("CUDA state peak byte plan overflow".into())
+                    })?,
+                    largest_extra.max(replacement_extra),
+                ))
+            })?;
+    fixed_state_bytes
+        .checked_add(steady_paged_bytes)
+        .and_then(|bytes| bytes.checked_add(largest_replacement_extra))
         .ok_or_else(|| Error::ModelLoadError("CUDA state peak byte plan overflow".into()))
 }
 
 fn fit_cuda_contiguous_token_reach(
     maximum_tokens: u64,
-    page_tokens: u32,
-    bytes_per_page: u64,
+    minimum_page_tokens: u32,
+    paged: &[CudaContiguousPagedGeometry],
     fixed_state_bytes: u64,
     budget_bytes: u64,
 ) -> Result<u64> {
-    let minimum_tokens = u64::from(page_tokens).min(maximum_tokens);
-    if cuda_contiguous_replacement_required_bytes(
-        maximum_tokens,
-        page_tokens,
-        bytes_per_page,
-        fixed_state_bytes,
-    )? <= budget_bytes
+    let minimum_tokens = u64::from(minimum_page_tokens).min(maximum_tokens);
+    if cuda_contiguous_replacement_required_bytes(maximum_tokens, paged, fixed_state_bytes)?
+        <= budget_bytes
     {
         return Ok(maximum_tokens);
     }
     let (mut low, mut high) = (minimum_tokens, maximum_tokens);
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        if cuda_contiguous_replacement_required_bytes(
-            middle,
-            page_tokens,
-            bytes_per_page,
-            fixed_state_bytes,
-        )? <= budget_bytes
+        if cuda_contiguous_replacement_required_bytes(middle, paged, fixed_state_bytes)?
+            <= budget_bytes
         {
             low = middle;
         } else {
@@ -3486,11 +3528,89 @@ mod tests {
         const BYTES_PER_PAGE: u64 = 4 * 1024 * 1024;
         const PEAK_PAGES_AT_64K: u64 = 1_536;
         let exact_peak = TENSOR_BYTES + BYTES_PER_PAGE * PEAK_PAGES_AT_64K;
+        let paged = [CudaContiguousPagedGeometry {
+            page_tokens: 64,
+            bytes_per_page: BYTES_PER_PAGE,
+        }];
         assert_eq!(
-            fit_cuda_contiguous_token_reach(262_144, 64, BYTES_PER_PAGE, TENSOR_BYTES, exact_peak,)
-                .unwrap(),
+            fit_cuda_contiguous_token_reach(262_144, 64, &paged, TENSOR_BYTES, exact_peak).unwrap(),
             65_536
         );
+    }
+
+    #[test]
+    fn qwen38_mtp_context_fitter_prices_both_paged_domains() {
+        const TENSOR_BYTES: u64 = 2_667_184_128;
+        const TARGET_BYTES_PER_PAGE: u64 = 4 * 1024 * 1024;
+        const MTP_BYTES_PER_PAGE: u64 = 256 * 1024;
+        const STEADY_PAGES_AT_64K: u64 = 1_024;
+        const PEAK_PAGES_AT_64K: u64 = 1_536;
+        let paged = [
+            CudaContiguousPagedGeometry {
+                page_tokens: 64,
+                bytes_per_page: TARGET_BYTES_PER_PAGE,
+            },
+            CudaContiguousPagedGeometry {
+                page_tokens: 64,
+                bytes_per_page: MTP_BYTES_PER_PAGE,
+            },
+        ];
+        let exact_peak = TENSOR_BYTES
+            + TARGET_BYTES_PER_PAGE * PEAK_PAGES_AT_64K
+            + MTP_BYTES_PER_PAGE * STEADY_PAGES_AT_64K;
+
+        assert_eq!(
+            cuda_contiguous_replacement_required_bytes(65_536, &paged, TENSOR_BYTES).unwrap(),
+            exact_peak
+        );
+        assert_eq!(
+            fit_cuda_contiguous_token_reach(262_144, 64, &paged, TENSOR_BYTES, exact_peak).unwrap(),
+            65_536
+        );
+    }
+
+    #[test]
+    fn multi_domain_cuda_context_fitter_handles_heterogeneous_page_geometry() {
+        let paged = [
+            CudaContiguousPagedGeometry {
+                page_tokens: 64,
+                bytes_per_page: 100,
+            },
+            CudaContiguousPagedGeometry {
+                page_tokens: 32,
+                bytes_per_page: 10,
+            },
+        ];
+        // At 65,536 tokens the arenas have 1,024 and 2,048 steady pages.
+        // Their replacement extras are respectively 51,200 and 10,240 bytes,
+        // so only the larger extra is simultaneous with aggregate steady state.
+        assert_eq!(
+            cuda_contiguous_replacement_required_bytes(65_536, &paged, 7).unwrap(),
+            7 + 102_400 + 20_480 + 51_200
+        );
+    }
+
+    #[test]
+    fn multi_domain_cuda_context_fitter_rejects_invalid_geometry() {
+        assert!(cuda_contiguous_replacement_required_bytes(64, &[], 0).is_err());
+        assert!(cuda_contiguous_replacement_required_bytes(
+            64,
+            &[CudaContiguousPagedGeometry {
+                page_tokens: 0,
+                bytes_per_page: 1,
+            }],
+            0,
+        )
+        .is_err());
+        assert!(cuda_contiguous_replacement_required_bytes(
+            64,
+            &[CudaContiguousPagedGeometry {
+                page_tokens: 1,
+                bytes_per_page: u64::MAX,
+            }],
+            0,
+        )
+        .is_err());
     }
 
     fn prefix_request(model: ModelInstanceId, tokens: Vec<u32>) -> EngineCoreRequest {
