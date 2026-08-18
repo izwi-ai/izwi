@@ -3819,6 +3819,24 @@ mod tests {
     }
 
     #[test]
+    fn cuda_chat_automatic_output_budget_reaches_backend_context_capacity() {
+        let context_capacity = 124_224;
+        let processor = RequestProcessor::new(EngineCoreConfig {
+            backend: BackendKind::Cuda,
+            max_seq_len: context_capacity,
+            ..EngineCoreConfig::default()
+        });
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }]);
+        request.params.max_tokens = usize::MAX;
+
+        let processed = processor.process(request).expect("CUDA chat request");
+        assert_eq!(processed.params.max_tokens, context_capacity);
+    }
+
+    #[test]
     fn direct_chat_preparation_rejects_oversized_and_deep_inputs_before_tokenization() {
         let oversized = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
@@ -3862,6 +3880,20 @@ mod tests {
             .enforce_chat_context_window(5)
             .expect("two output tokens remain");
         assert_eq!(request.params.max_tokens, 2);
+
+        let mut automatic = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        }])
+        .with_model_variant(ModelVariant::Qwen306B);
+        automatic.params.max_tokens = usize::MAX;
+        automatic
+            .install_chat_execution_preparation(ModelVariant::Qwen306B, vec![1, 2, 3], None, 8_192)
+            .unwrap();
+        automatic
+            .enforce_chat_context_window(8_192)
+            .expect("automatic output budget should use the exact remaining context");
+        assert_eq!(automatic.params.max_tokens, 8_189);
 
         let mut full = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,

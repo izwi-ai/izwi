@@ -239,7 +239,12 @@ pub fn max_new_tokens(
 ) -> usize {
     let requested = max_completion_tokens.or(max_tokens);
 
-    requested.unwrap_or(4096).clamp(1, 4096)
+    // Preserve an omitted OpenAI output limit until the exact prompt has been
+    // tokenized. The engine first bounds this sentinel by its backend context
+    // capacity, then `enforce_chat_context_window` reduces it to the loaded
+    // model's exact remaining context. This matches production serving engines
+    // such as vLLM and avoids imposing an unrelated API-layer token ceiling.
+    requested.unwrap_or(usize::MAX).max(1)
 }
 
 pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
@@ -582,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_models_default_to_4096_max_tokens_when_request_omits_limits() {
+    fn chat_models_leave_omitted_output_limits_for_exact_context_resolution() {
         for variant in [
             ModelVariant::Gemma34BIt,
             ModelVariant::Lfm2512BInstructGguf,
@@ -593,8 +598,22 @@ mod tests {
             ModelVariant::Qwen314BGguf,
             ModelVariant::Qwen352BGguf,
         ] {
-            assert_eq!(max_new_tokens(variant, None, None), 4096);
+            assert_eq!(max_new_tokens(variant, None, None), usize::MAX);
         }
+    }
+
+    #[test]
+    fn explicit_chat_output_limits_are_not_capped_at_4096() {
+        assert_eq!(
+            max_new_tokens(ModelVariant::Qwen3827BFp8, None, Some(32_768)),
+            32_768
+        );
+        assert_eq!(
+            max_new_tokens(ModelVariant::Qwen3827BFp8, Some(65_536), Some(32_768)),
+            65_536,
+            "max_completion_tokens must retain precedence over legacy max_tokens"
+        );
+        assert_eq!(max_new_tokens(ModelVariant::Qwen3827BFp8, Some(0), None), 1);
     }
 
     #[tokio::test]
