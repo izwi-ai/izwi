@@ -1484,7 +1484,7 @@ impl Engine {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
         staged_transaction_rows: Option<u32>,
-        fit_cuda_contiguous_context: bool,
+        fit_cuda_resident_context: bool,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let _step = self.step_gate.lock().await;
         self.core
@@ -1495,7 +1495,7 @@ impl Engine {
                 capability,
                 logical_context_tokens,
                 staged_transaction_rows,
-                fit_cuda_contiguous_context,
+                fit_cuda_resident_context,
             )
     }
 

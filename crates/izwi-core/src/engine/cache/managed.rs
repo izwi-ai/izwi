@@ -489,11 +489,10 @@ impl ManagedKvCacheManager {
         Ok(low)
     }
 
-    /// Fit a CUDA logical reach against the peak required by the current
-    /// contiguous growth implementation. Candle must keep the old backing
-    /// alive while allocating and copying the replacement, so steady-state
-    /// bytes alone are not an honest reach contract.
-    pub(crate) fn fit_cuda_contiguous_logical_token_reach(
+    /// Fit a CUDA logical reach whose complete paged backing is materialized
+    /// before Ready publication. This turns the live-capacity observation into
+    /// physical ownership instead of a revocable promise to grow later.
+    pub(crate) fn fit_cuda_resident_logical_token_reach(
         &self,
         model_instance: ModelInstanceId,
         contract: &InferenceStateContract,
@@ -578,13 +577,13 @@ impl ManagedKvCacheManager {
             .ok_or_else(|| Error::ModelLoadError("CUDA fixed state byte plan underflow".into()))?;
         let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
         let minimum_bytes =
-            cuda_contiguous_replacement_required_bytes(minimum_tokens, &paged, fixed_state_bytes)?;
+            cuda_resident_required_bytes(minimum_tokens, &paged, fixed_state_bytes)?;
         if minimum_bytes > budget_bytes {
             return Err(Error::ModelLoadError(format!(
-                "CUDA managed context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, contiguous_growth_peak_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                "CUDA managed context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, resident_state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
             )));
         }
-        fit_cuda_contiguous_token_reach(
+        fit_cuda_resident_token_reach(
             maximum_tokens,
             page_tokens_hint,
             &paged,
@@ -832,15 +831,35 @@ impl ManagedKvCacheManager {
         page_tokens_hint: usize,
         capability: &InferenceStateCapability,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
+        self.bind_request_with_capacity_policy(
+            model_instance,
+            backend,
+            capacity,
+            page_tokens_hint,
+            capability,
+            false,
+        )
+    }
+
+    pub(crate) fn bind_request_with_capacity_policy(
+        &mut self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        capacity: ManagedStateCapacityRequest,
+        page_tokens_hint: usize,
+        capability: &InferenceStateCapability,
+        materialize_cuda_paged_at_load: bool,
+    ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
         };
-        self.bind_model_state_with_capacity(
+        self.bind_model_state_with_capacity_policy(
             model_instance,
             backend,
             capacity,
             page_tokens_hint,
             contract,
+            materialize_cuda_paged_at_load,
         )
         .map(Some)
     }
@@ -852,6 +871,25 @@ impl ManagedKvCacheManager {
         capacity: ManagedStateCapacityRequest,
         page_tokens_hint: usize,
         contract: &InferenceStateContract,
+    ) -> Result<Arc<ManagedKvModelRuntime>> {
+        self.bind_model_state_with_capacity_policy(
+            model_instance,
+            backend,
+            capacity,
+            page_tokens_hint,
+            contract,
+            false,
+        )
+    }
+
+    fn bind_model_state_with_capacity_policy(
+        &mut self,
+        model_instance: ModelInstanceId,
+        backend: BackendKind,
+        capacity: ManagedStateCapacityRequest,
+        page_tokens_hint: usize,
+        contract: &InferenceStateContract,
+        materialize_cuda_paged_at_load: bool,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         validate_sliding_contract(contract, backend)?;
         if let Some(state) = self.models.get(&model_instance) {
@@ -891,8 +929,12 @@ impl ManagedKvCacheManager {
                 storage_dtype_hint: None,
             },
         )?;
-        let (allocation_plan, tensor_capacity) =
-            plan_managed_state_capacity(&state_plan_v2, model_instance, capacity)?;
+        let (allocation_plan, tensor_capacity) = plan_managed_state_capacity_with_policy(
+            &state_plan_v2,
+            model_instance,
+            capacity,
+            materialize_cuda_paged_at_load,
+        )?;
         let plan = ResolvedKvPlan::from_runtime_allocation(
             first_arena_generation,
             &state_plan_v2,
@@ -1925,6 +1967,15 @@ pub(crate) fn plan_managed_state_capacity(
     model_instance: ModelInstanceId,
     request: ManagedStateCapacityRequest,
 ) -> Result<(StateRuntimeAllocationPlan, Option<TensorStateCapacity>)> {
+    plan_managed_state_capacity_with_policy(state_plan, model_instance, request, false)
+}
+
+fn plan_managed_state_capacity_with_policy(
+    state_plan: &ResolvedStatePlan,
+    model_instance: ModelInstanceId,
+    request: ManagedStateCapacityRequest,
+    materialize_cuda_paged_at_load: bool,
+) -> Result<(StateRuntimeAllocationPlan, Option<TensorStateCapacity>)> {
     if request.total_paged_pages == 0
         || request.retained_sequence_rows == 0
         || request.staged_transaction_rows == 0
@@ -1998,7 +2049,11 @@ pub(crate) fn plan_managed_state_capacity(
         // pages needed for one long-context request must never multiply the
         // per-sequence recurrent/convolution state authorization.
         paged_sequence_capacity = paged_sequence_capacity.min(blocks);
-        let strategy = managed_paged_capacity_strategy(state_plan.backend, blocks);
+        let strategy = managed_paged_capacity_strategy(
+            state_plan.backend,
+            blocks,
+            materialize_cuda_paged_at_load,
+        );
         groups.push(GroupCapacityRequest {
             group: group.group,
             domain: group.domain,
@@ -2055,8 +2110,12 @@ pub(crate) fn plan_managed_state_capacity(
     Ok((allocation_plan, tensor_capacity))
 }
 
-fn managed_paged_capacity_strategy(backend: BackendKind, blocks: u32) -> CapacityStrategy {
-    if backend == BackendKind::Cuda && blocks > 64 {
+fn managed_paged_capacity_strategy(
+    backend: BackendKind,
+    blocks: u32,
+    materialize_cuda_paged_at_load: bool,
+) -> CapacityStrategy {
+    if backend == BackendKind::Cuda && blocks > 64 && !materialize_cuda_paged_at_load {
         let growth = cuda_paged_growth_geometry(blocks);
         CapacityStrategy::AdmissionGrowable {
             initial_blocks: growth.initial_pages,
@@ -2204,6 +2263,57 @@ fn cuda_contiguous_replacement_required_bytes(
         .checked_add(steady_paged_bytes)
         .and_then(|bytes| bytes.checked_add(largest_replacement_extra))
         .ok_or_else(|| Error::ModelLoadError("CUDA state peak byte plan overflow".into()))
+}
+
+fn cuda_resident_required_bytes(
+    tokens: u64,
+    paged: &[CudaContiguousPagedGeometry],
+    fixed_state_bytes: u64,
+) -> Result<u64> {
+    if paged.is_empty() {
+        return Err(Error::InvalidInput(
+            "CUDA resident context fitting requires paged state".into(),
+        ));
+    }
+    paged.iter().try_fold(fixed_state_bytes, |total, geometry| {
+        if geometry.page_tokens == 0 || geometry.bytes_per_page == 0 {
+            return Err(Error::InvalidInput(
+                "CUDA resident context fitting requires non-zero paged geometry".into(),
+            ));
+        }
+        let pages = tokens.div_ceil(u64::from(geometry.page_tokens));
+        total
+            .checked_add(
+                geometry
+                    .bytes_per_page
+                    .checked_mul(pages)
+                    .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))?,
+            )
+            .ok_or_else(|| Error::ModelLoadError("CUDA state byte plan overflow".into()))
+    })
+}
+
+fn fit_cuda_resident_token_reach(
+    maximum_tokens: u64,
+    minimum_page_tokens: u32,
+    paged: &[CudaContiguousPagedGeometry],
+    fixed_state_bytes: u64,
+    budget_bytes: u64,
+) -> Result<u64> {
+    let minimum_tokens = u64::from(minimum_page_tokens).min(maximum_tokens);
+    if cuda_resident_required_bytes(maximum_tokens, paged, fixed_state_bytes)? <= budget_bytes {
+        return Ok(maximum_tokens);
+    }
+    let (mut low, mut high) = (minimum_tokens, maximum_tokens);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if cuda_resident_required_bytes(middle, paged, fixed_state_bytes)? <= budget_bytes {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(low)
 }
 
 fn fit_cuda_contiguous_token_reach(
@@ -3115,7 +3225,7 @@ mod tests {
         for (backend, expected_initial) in
             [(BackendKind::Cuda, 64_u32), (BackendKind::Cpu, 256_u32)]
         {
-            let strategy = managed_paged_capacity_strategy(backend, 256);
+            let strategy = managed_paged_capacity_strategy(backend, 256, false);
             assert_eq!(strategy.initial_blocks(), expected_initial);
             assert_eq!(strategy.maximum_blocks(), 256);
             assert_eq!(
@@ -3123,6 +3233,10 @@ mod tests {
                 backend == BackendKind::Cuda
             );
         }
+        assert_eq!(
+            managed_paged_capacity_strategy(BackendKind::Cuda, 256, true),
+            CapacityStrategy::Fixed { blocks: 256 }
+        );
     }
 
     #[test]
@@ -3564,6 +3678,28 @@ mod tests {
         assert_eq!(
             fit_cuda_contiguous_token_reach(262_144, 64, &paged, TENSOR_BYTES, exact_peak).unwrap(),
             65_536
+        );
+    }
+
+    #[test]
+    fn qwen38_resident_context_fitter_uses_steady_backing_without_replacement_copy() {
+        const TENSOR_BYTES: u64 = 2_667_184_128;
+        const BYTES_PER_PAGE: u64 = 4 * 1024 * 1024;
+        const STEADY_PAGES_AT_64K: u64 = 1_024;
+        let exact_resident = TENSOR_BYTES + BYTES_PER_PAGE * STEADY_PAGES_AT_64K;
+        let paged = [CudaContiguousPagedGeometry {
+            page_tokens: 64,
+            bytes_per_page: BYTES_PER_PAGE,
+        }];
+
+        assert_eq!(
+            fit_cuda_resident_token_reach(262_144, 64, &paged, TENSOR_BYTES, exact_resident,)
+                .unwrap(),
+            65_536
+        );
+        assert!(
+            cuda_contiguous_replacement_required_bytes(65_536, &paged, TENSOR_BYTES).unwrap()
+                > exact_resident
         );
     }
 

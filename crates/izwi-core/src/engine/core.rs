@@ -2802,7 +2802,7 @@ impl EngineCore {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
         staged_transaction_rows: Option<u32>,
-        fit_cuda_contiguous_context: bool,
+        fit_cuda_resident_context: bool,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
             return Ok(None);
@@ -2810,14 +2810,13 @@ impl EngineCore {
         let backend = self.managed_kv_cache.worker_backend();
         let retained_sequence_rows = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
-        let fit_cuda_contiguous_context =
-            backend == BackendKind::Cuda && fit_cuda_contiguous_context;
+        let fit_cuda_resident_context = backend == BackendKind::Cuda && fit_cuda_resident_context;
         let staged_transaction_rows = staged_transaction_rows.unwrap_or(
             u32::try_from(self.config.max_staged_transactions).map_err(|_| {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
             })?,
         );
-        let logical_token_reach = if fit_cuda_contiguous_context {
+        let logical_token_reach = if fit_cuda_resident_context {
             let maximum_tokens = logical_context_tokens.ok_or_else(|| {
                 Error::ModelLoadError(
                     "CUDA managed state requires a positive loaded-model context limit".into(),
@@ -2825,7 +2824,7 @@ impl EngineCore {
             })?;
             Some(
                 self.managed_kv_cache
-                    .fit_cuda_contiguous_logical_token_reach(
+                    .fit_cuda_resident_logical_token_reach(
                         model_instance,
                         contract,
                         u64::try_from(maximum_tokens).map_err(|_| {
@@ -2848,7 +2847,7 @@ impl EngineCore {
         };
         let runtime = self
             .managed_kv_cache
-            .bind_request_with_capacity(
+            .bind_request_with_capacity_policy(
                 model_instance,
                 backend,
                 ManagedStateCapacityRequest {
@@ -2861,6 +2860,7 @@ impl EngineCore {
                 },
                 self.config.block_size,
                 capability,
+                fit_cuda_resident_context,
             )?
             .ok_or_else(|| {
                 Error::InferenceError(
