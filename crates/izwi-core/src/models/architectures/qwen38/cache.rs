@@ -146,7 +146,7 @@ pub(crate) fn qwen38_composite_cache_contract_with_mtp(
         StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
             header: retained_header(FULL_ATTENTION_DOMAIN),
             layers: attention_layers,
-            page_size: page_size.clone(),
+            page_size,
             accepted_dtypes: vec![dtype],
         }),
         StateDomainSpec::Tensor(TensorStateDomainSpec {
@@ -352,6 +352,45 @@ mod tests {
 
         assert_eq!(runtime.state_plan_v2().paged_attention.len(), 1);
         assert_eq!(runtime.state_plan_v2().non_paged.len(), 2);
+        assert!(runtime.tensor_state().is_some());
+    }
+
+    #[test]
+    fn mtp_composite_contract_allocates_two_independent_paged_arenas() {
+        use crate::backends::BackendKind;
+        use crate::engine::{ManagedKvCacheManager, ModelInstanceId};
+        use crate::kv::InferenceStateCapability;
+
+        let contract =
+            qwen38_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true).unwrap();
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                ModelInstanceId::new(72),
+                BackendKind::Cpu,
+                2,
+                32,
+                &InferenceStateCapability::Managed(contract),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(runtime.state_plan_v2().paged_attention.len(), 2);
+        assert_eq!(runtime.plan().groups.len(), 2);
+        let target = runtime
+            .plan()
+            .groups
+            .iter()
+            .find(|group| group.domain == FULL_ATTENTION_DOMAIN)
+            .expect("target attention arena");
+        let mtp = runtime
+            .plan()
+            .groups
+            .iter()
+            .find(|group| group.domain == MTP_ATTENTION_DOMAIN)
+            .expect("MTP attention arena");
+        assert_ne!(target.arena, mtp.arena);
+        assert!(target.bytes_per_page > mtp.bytes_per_page);
         assert!(runtime.tensor_state().is_some());
     }
 
