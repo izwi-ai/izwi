@@ -34,8 +34,8 @@ use super::cache::qwen38_composite_cache_contract_with_mtp;
 use super::mtp::{Qwen38MtpDepth, Qwen38MtpHead, Qwen38MtpPairBatch};
 use super::native::{ProjectionMaterialization, Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
 use super::telemetry::{
-    record_cuda_kv_provider, record_mtp_policy, record_mtp_round, record_sampling_bounded_cuda,
-    record_sampling_device_argmax, record_sampling_host,
+    record_cuda_kv_provider, record_mtp_policy, record_mtp_round, record_mtp_scalar_target_token,
+    record_sampling_bounded_cuda, record_sampling_device_argmax, record_sampling_host,
     snapshot as qwen38_optimization_telemetry_snapshot,
 };
 use super::text::{Qwen38ProjectionRepresentation, Qwen38TextModel, Qwen38TextRuntimeState};
@@ -47,7 +47,10 @@ const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
 const CUDA_BF16_KV_ENV: &str = "IZWI_QWEN38_CUDA_BF16_KV";
 const MTP_ENABLED_ENV: &str = "IZWI_QWEN38_MTP";
 const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
-const DEFAULT_MTP_DRAFT_TOKENS: usize = 3;
+// Qwen's production serving guidance starts native MTP at depth one. Deeper
+// recurrence increases proposal and rejected-prefix replay cost and remains an
+// explicit, evidence-driven override.
+const DEFAULT_MTP_DRAFT_TOKENS: usize = 1;
 const MAX_MTP_DRAFT_TOKENS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,6 +775,9 @@ impl Qwen38ChatModel {
                     "storage_dtype": format!("{:?}", self.kv_storage_provider.dtype()).to_ascii_lowercase(),
                     "fallback_reason": self.kv_storage_provider.fallback_reason(),
                     "runtime_validated": false,
+                    "quantized": false,
+                    "physical_format": "dense",
+                    "quantized_candidate_status": "unavailable_scale_contract_incomplete",
                 },
                 "mtp": {
                     "enabled": self.mtp_policy.enabled(),
@@ -782,6 +788,13 @@ impl Qwen38ChatModel {
                     "implementation_status": "implemented_unvalidated",
                     "runtime_validated": false,
                     "performance_certified": false,
+                    "scheduler_policy": "speculate_only_without_queue_pressure_or_concurrent_decode",
+                    "execution_evidence": {
+                        "speculative_round_counter": "mtp_rounds_total",
+                        "scalar_target_counter": "mtp_scalar_target_tokens_total",
+                        "accepted_draft_counter": "mtp_accepted_draft_tokens_total",
+                        "replayed_target_counter": "mtp_target_replay_tokens_total",
+                    },
                 },
             },
             "vision_enabled": false,
@@ -1043,6 +1056,7 @@ impl Qwen38ChatModel {
         while committed < input_budget && !state.finished {
             let remaining = input_budget - committed;
             if remaining == 1 {
+                record_mtp_scalar_target_token();
                 let pending = state.pending_token.ok_or_else(|| {
                     Error::InferenceError("Qwen3.8 MTP scalar tail has no pending token".into())
                 })?;
@@ -1893,11 +1907,11 @@ mod tests {
     }
 
     #[test]
-    fn mtp_policy_is_enabled_at_depth_three_by_default() {
+    fn mtp_policy_is_enabled_at_depth_one_by_default() {
         let policy = Qwen38MtpPolicy::resolve(None, None).unwrap();
-        assert_eq!(policy, Qwen38MtpPolicy::Enabled { draft_tokens: 3 });
+        assert_eq!(policy, Qwen38MtpPolicy::Enabled { draft_tokens: 1 });
         assert!(policy.enabled());
-        assert_eq!(policy.draft_tokens(), Some(3));
+        assert_eq!(policy.draft_tokens(), Some(1));
     }
 
     #[test]

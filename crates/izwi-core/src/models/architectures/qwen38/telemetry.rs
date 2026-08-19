@@ -51,6 +51,7 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub sampling_host_total: u64,
     pub mtp_enabled_loads_total: u64,
     pub mtp_disabled_loads_total: u64,
+    pub mtp_scalar_target_tokens_total: u64,
     pub mtp_rounds_total: u64,
     pub mtp_draft_tokens_total: u64,
     pub mtp_accepted_draft_tokens_total: u64,
@@ -108,6 +109,7 @@ counters!(
     SAMPLING_HOST,
     MTP_ENABLED_LOADS,
     MTP_DISABLED_LOADS,
+    MTP_SCALAR_TARGET_TOKENS,
     MTP_ROUNDS,
     MTP_DRAFT_TOKENS,
     MTP_ACCEPTED_DRAFT_TOKENS,
@@ -247,6 +249,15 @@ pub(crate) fn record_mtp_policy(enabled: bool) {
     }
 }
 
+/// Record a target-only decode token taken while the model has an MTP head.
+///
+/// The scheduler intentionally selects this path under queue pressure or when
+/// only one output slot remains. Keeping it distinct from speculative rounds
+/// prevents "MTP loaded" from being mistaken for "MTP executed".
+pub(crate) fn record_mtp_scalar_target_token() {
+    MTP_SCALAR_TARGET_TOKENS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn record_mtp_round(
     drafted: usize,
     accepted: usize,
@@ -321,6 +332,7 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         sampling_host_total: load!(SAMPLING_HOST),
         mtp_enabled_loads_total: load!(MTP_ENABLED_LOADS),
         mtp_disabled_loads_total: load!(MTP_DISABLED_LOADS),
+        mtp_scalar_target_tokens_total: load!(MTP_SCALAR_TARGET_TOKENS),
         mtp_rounds_total: load!(MTP_ROUNDS),
         mtp_draft_tokens_total: load!(MTP_DRAFT_TOKENS),
         mtp_accepted_draft_tokens_total: load!(MTP_ACCEPTED_DRAFT_TOKENS),
@@ -344,6 +356,7 @@ mod tests {
         assert_eq!(value["cuda_deltanet_decode_fallback_total"], 0);
         assert_eq!(value["cuda_deltanet_specialized_decode_fallback_total"], 0);
         assert_eq!(value["sampling_bounded_cuda_fallback_to_host_total"], 0);
+        assert_eq!(value["mtp_scalar_target_tokens_total"], 0);
         assert_eq!(value["mtp_rounds_total"], 0);
         assert_eq!(value["mtp_target_replay_tokens_total"], 0);
     }
@@ -387,6 +400,7 @@ mod tests {
         let before = snapshot();
         record_mtp_policy(true);
         record_mtp_policy(false);
+        record_mtp_scalar_target_token();
         record_mtp_round(3, 3, true, 4, 0);
         record_mtp_round(3, 1, false, 4, 2);
         let after = snapshot();
@@ -396,6 +410,10 @@ mod tests {
         );
         assert_eq!(
             after.mtp_disabled_loads_total - before.mtp_disabled_loads_total,
+            1
+        );
+        assert_eq!(
+            after.mtp_scalar_target_tokens_total - before.mtp_scalar_target_tokens_total,
             1
         );
         assert_eq!(after.mtp_rounds_total - before.mtp_rounds_total, 2);
