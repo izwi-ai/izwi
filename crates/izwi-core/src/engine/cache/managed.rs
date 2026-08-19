@@ -59,6 +59,10 @@ pub struct ManagedKvOperationSnapshot {
     /// Retained provider workspace reported by metered arenas.
     pub workspace_bytes: u64,
     pub workspace_bytes_observed_arenas: u64,
+    pub workspace_budget_bytes: u64,
+    pub workspace_budget_bytes_observed_arenas: u64,
+    pub workspace_high_water_bytes: u64,
+    pub workspace_high_water_bytes_observed_arenas: u64,
     pub workspace_allocations: u64,
     pub workspace_allocations_observed_arenas: u64,
     pub host_synchronizations: u64,
@@ -102,6 +106,18 @@ impl ManagedKvOperationSnapshot {
         self.workspace_bytes_observed_arenas = self
             .workspace_bytes_observed_arenas
             .saturating_add(other.workspace_bytes_observed_arenas);
+        self.workspace_budget_bytes = self
+            .workspace_budget_bytes
+            .saturating_add(other.workspace_budget_bytes);
+        self.workspace_budget_bytes_observed_arenas = self
+            .workspace_budget_bytes_observed_arenas
+            .saturating_add(other.workspace_budget_bytes_observed_arenas);
+        self.workspace_high_water_bytes = self
+            .workspace_high_water_bytes
+            .saturating_add(other.workspace_high_water_bytes);
+        self.workspace_high_water_bytes_observed_arenas = self
+            .workspace_high_water_bytes_observed_arenas
+            .saturating_add(other.workspace_high_water_bytes_observed_arenas);
         self.workspace_allocations = self
             .workspace_allocations
             .saturating_add(other.workspace_allocations);
@@ -717,6 +733,18 @@ impl ManagedKvCacheManager {
                             workspace_bytes: operation_stats.workspace_bytes.unwrap_or(0),
                             workspace_bytes_observed_arenas: u64::from(
                                 operation_stats.workspace_bytes.is_some(),
+                            ),
+                            workspace_budget_bytes: operation_stats
+                                .workspace_budget_bytes
+                                .unwrap_or(0),
+                            workspace_budget_bytes_observed_arenas: u64::from(
+                                operation_stats.workspace_budget_bytes.is_some(),
+                            ),
+                            workspace_high_water_bytes: operation_stats
+                                .workspace_high_water_bytes
+                                .unwrap_or(0),
+                            workspace_high_water_bytes_observed_arenas: u64::from(
+                                operation_stats.workspace_high_water_bytes.is_some(),
                             ),
                             workspace_allocations: operation_stats
                                 .workspace_allocations

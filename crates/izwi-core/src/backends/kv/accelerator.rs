@@ -225,6 +225,7 @@ struct RetiredAcceleratorWorkspace {
 struct AcceleratorWorkspacePool {
     budget_bytes: usize,
     reserved_bytes: usize,
+    high_water_bytes: usize,
     allocations: u64,
     retired: Vec<RetiredAcceleratorWorkspace>,
 }
@@ -235,6 +236,7 @@ impl std::fmt::Debug for AcceleratorWorkspacePool {
             .debug_struct("AcceleratorWorkspacePool")
             .field("budget_bytes", &self.budget_bytes)
             .field("reserved_bytes", &self.reserved_bytes)
+            .field("high_water_bytes", &self.high_water_bytes)
             .field("allocations", &self.allocations)
             .field("retired_entries", &self.retired.len())
             .finish()
@@ -246,6 +248,7 @@ impl AcceleratorWorkspacePool {
         Self {
             budget_bytes,
             reserved_bytes: 0,
+            high_water_bytes: 0,
             allocations: 0,
             retired: Vec::new(),
         }
@@ -303,6 +306,7 @@ impl AcceleratorWorkspacePool {
         }
         let tensor = Tensor::zeros(shape, dtype, device)?;
         self.reserved_bytes = requested_total;
+        self.high_water_bytes = self.high_water_bytes.max(requested_total);
         self.allocations = self.allocations.saturating_add(1);
         Ok(AcceleratorWorkspaceLease { key, tensor, bytes })
     }
@@ -2029,17 +2033,24 @@ impl KvArena for CandleAcceleratorKvArena {
     }
 
     fn operation_stats(&self) -> KvArenaOperationStats {
-        let (workspace_bytes, workspace_allocations) = self
+        let (
+            workspace_bytes,
+            workspace_budget_bytes,
+            workspace_high_water_bytes,
+            workspace_allocations,
+        ) = self
             .workspace_pool
             .lock()
             .ok()
             .map(|pool| {
                 (
                     u64::try_from(pool.reserved_bytes).ok(),
+                    u64::try_from(pool.budget_bytes).ok(),
+                    u64::try_from(pool.high_water_bytes).ok(),
                     Some(pool.allocations),
                 )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None, None));
         KvArenaOperationStats {
             slot_write_dispatches: self.slot_write_dispatches.load(Ordering::Relaxed),
             paged_prefill_dispatches: self.paged_prefill_dispatches.load(Ordering::Relaxed),
@@ -2063,6 +2074,8 @@ impl KvArena for CandleAcceleratorKvArena {
                     .saturating_mul(self.backing_generation.load(Ordering::Relaxed))
             }),
             workspace_bytes,
+            workspace_budget_bytes,
+            workspace_high_water_bytes,
             workspace_allocations,
             cpu_reference_attention_dispatches: 0,
             portable_attention_dispatches: self
@@ -2607,6 +2620,7 @@ mod tests {
         }
         assert_eq!(pool.allocations, 1);
         assert_eq!(pool.reserved_bytes, 64);
+        assert_eq!(pool.high_water_bytes, 64);
         assert_eq!(pool.retired.len(), 1);
         Ok(())
     }
@@ -2683,6 +2697,17 @@ mod tests {
         assert!(message.contains("requested_bytes=64"));
         assert!(message.contains("reserved_bytes=64"));
         assert!(message.contains("budget_bytes=64"));
+        Ok(())
+    }
+
+    #[test]
+    fn accelerator_workspace_high_water_survives_scratch_release() -> Result<()> {
+        let mut pool = AcceleratorWorkspacePool::new(128);
+        let workspace = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        pool.discard(workspace);
+
+        assert_eq!(pool.reserved_bytes, 0);
+        assert_eq!(pool.high_water_bytes, 64);
         Ok(())
     }
 

@@ -140,6 +140,10 @@ pub struct KvArenaOperationStats {
     /// Provider workspace bytes currently retained by the arena. `None`
     /// means the provider cannot meter this value yet.
     pub workspace_bytes: Option<u64>,
+    /// Configured hard ceiling for provider workspace retention.
+    pub workspace_budget_bytes: Option<u64>,
+    /// Largest provider workspace reservation observed since arena creation.
+    pub workspace_high_water_bytes: Option<u64>,
     /// Number of provider workspace allocations made by this arena.
     pub workspace_allocations: Option<u64>,
     pub cpu_reference_attention_dispatches: u64,

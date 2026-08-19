@@ -81,6 +81,42 @@ impl From<safetensors::SafeTensorError> for Error {
 
 impl From<candle_core::Error> for Error {
     fn from(e: candle_core::Error) -> Self {
-        Error::InferenceError(e.to_string())
+        let message = e.to_string();
+        if is_allocation_oom(&message) {
+            Error::Overloaded(format!(
+                "accelerator allocation could not be satisfied after managed-capacity admission: {message}"
+            ))
+        } else {
+            Error::InferenceError(message)
+        }
+    }
+}
+
+fn is_allocation_oom(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("cuda_error_out_of_memory")
+        || normalized.contains("out of memory")
+        || normalized.contains("outofmemory")
+        || normalized.contains("memory allocation failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candle_cuda_oom_becomes_typed_capacity_error() {
+        let error = Error::from(candle_core::Error::Msg(
+            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, out of memory)".into(),
+        ));
+        assert!(
+            matches!(error, Error::Overloaded(message) if message.contains("CUDA_ERROR_OUT_OF_MEMORY"))
+        );
+    }
+
+    #[test]
+    fn ordinary_candle_failures_remain_inference_errors() {
+        let error = Error::from(candle_core::Error::Msg("shape mismatch".into()));
+        assert!(matches!(error, Error::InferenceError(message) if message == "shape mismatch"));
     }
 }
