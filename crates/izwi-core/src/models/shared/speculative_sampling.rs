@@ -216,6 +216,56 @@ pub fn verify_greedy_prefix(
     })
 }
 
+/// Verify a greedy block from target token IDs that were selected on-device.
+///
+/// This is the zero-temperature, no-host-logits fast path. Callers that apply
+/// history-dependent penalties must use [`verify_greedy_prefix`] so each target
+/// argmax is computed after the appropriate staged history transform.
+pub fn verify_greedy_token_prefix(
+    draft_tokens: &[u32],
+    target_tokens: &[u32],
+    history: &mut Vec<u32>,
+) -> Result<SpeculativeVerification> {
+    let expected = draft_tokens
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidInput("speculative draft length overflow".into()))?;
+    if target_tokens.len() != expected {
+        return Err(Error::InvalidInput(format!(
+            "greedy speculative verification requires {expected} target tokens, got {}",
+            target_tokens.len()
+        )));
+    }
+
+    let mut staged_history = history.clone();
+    let mut emitted_tokens = Vec::with_capacity(expected);
+    for (index, draft_token) in draft_tokens.iter().copied().enumerate() {
+        let target = target_tokens[index];
+        if target != draft_token {
+            emitted_tokens.push(target);
+            staged_history.push(target);
+            *history = staged_history;
+            return Ok(SpeculativeVerification {
+                emitted_tokens,
+                accepted_draft_tokens: index,
+                draft_tokens: draft_tokens.len(),
+            });
+        }
+        emitted_tokens.push(draft_token);
+        staged_history.push(draft_token);
+    }
+
+    let bonus = target_tokens[draft_tokens.len()];
+    emitted_tokens.push(bonus);
+    staged_history.push(bonus);
+    *history = staged_history;
+    Ok(SpeculativeVerification {
+        emitted_tokens,
+        accepted_draft_tokens: draft_tokens.len(),
+        draft_tokens: draft_tokens.len(),
+    })
+}
+
 /// Losslessly verify a greedy draft block against the target distribution.
 ///
 /// For draft token `d`, the draft distribution is `q(d) = 1`. The token is
@@ -623,6 +673,23 @@ mod tests {
         assert!(verification.all_drafts_accepted());
         assert!(verification.emitted_bonus_token());
         assert_eq!(history, vec![3, 1, 2, 0]);
+    }
+
+    #[test]
+    fn on_device_greedy_tokens_verify_without_logits_or_rng() {
+        let mut history = vec![9];
+        let accepted = verify_greedy_token_prefix(&[1, 2], &[1, 2, 3], &mut history).unwrap();
+        assert_eq!(accepted.emitted_tokens, vec![1, 2, 3]);
+        assert!(accepted.all_drafts_accepted());
+        assert_eq!(history, vec![9, 1, 2, 3]);
+
+        let mut history = vec![9];
+        let rejected = verify_greedy_token_prefix(&[1, 2], &[1, 7, 3], &mut history).unwrap();
+        assert_eq!(rejected.emitted_tokens, vec![1, 7]);
+        assert_eq!(rejected.accepted_draft_tokens, 1);
+        assert_eq!(history, vec![9, 1, 7]);
+
+        assert!(verify_greedy_token_prefix(&[1], &[1], &mut Vec::new()).is_err());
     }
 
     #[test]

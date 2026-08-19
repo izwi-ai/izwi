@@ -28,7 +28,8 @@ use crate::models::shared::sampling::{
     bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 use crate::models::shared::speculative_sampling::{
-    propose_speculative_draft, verify_speculative_prefix, verify_speculative_proposals,
+    propose_speculative_draft, verify_greedy_token_prefix, verify_speculative_prefix,
+    verify_speculative_proposals,
 };
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
@@ -1178,33 +1179,48 @@ impl Qwen38ChatModel {
             let target_logits = self
                 .text_model
                 .project_target_hidden_span(&target_output.hidden_states)?;
-            let mut host_rows = Vec::with_capacity(target_inputs.len());
-            for row in 0..target_inputs.len() {
-                let mut values = logits_to_vec(&target_logits.i((0, row))?)?;
-                truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
-                host_rows.push(values);
-            }
             let mut verification_history = if state.track_history {
                 state.history_ids.clone()
             } else {
                 Vec::new()
             };
-            let verification = if stochastic_drafting {
-                verify_speculative_proposals(
-                    &draft_proposals,
-                    &host_rows,
-                    &state.config,
+            let verification = if !stochastic_drafting && !state.track_history {
+                let mut target_tokens = Vec::with_capacity(target_inputs.len());
+                for row in 0..target_inputs.len() {
+                    target_tokens.push(argmax_clamped(
+                        &target_logits.i((0, row))?,
+                        self.tokenizer.vocab_size,
+                    )?);
+                }
+                verify_greedy_token_prefix(
+                    &drafted.token_ids,
+                    &target_tokens,
                     &mut verification_history,
-                    &mut state.rng,
                 )?
             } else {
-                verify_speculative_prefix(
-                    &drafted.token_ids,
-                    &host_rows,
-                    &state.config,
-                    &mut verification_history,
-                    &mut state.rng,
-                )?
+                let mut host_rows = Vec::with_capacity(target_inputs.len());
+                for row in 0..target_inputs.len() {
+                    let mut values = logits_to_vec(&target_logits.i((0, row))?)?;
+                    truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                    host_rows.push(values);
+                }
+                if stochastic_drafting {
+                    verify_speculative_proposals(
+                        &draft_proposals,
+                        &host_rows,
+                        &state.config,
+                        &mut verification_history,
+                        &mut state.rng,
+                    )?
+                } else {
+                    verify_speculative_prefix(
+                        &drafted.token_ids,
+                        &host_rows,
+                        &state.config,
+                        &mut verification_history,
+                        &mut state.rng,
+                    )?
+                }
             };
 
             let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
