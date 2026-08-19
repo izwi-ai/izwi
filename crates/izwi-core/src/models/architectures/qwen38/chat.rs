@@ -27,7 +27,9 @@ use crate::models::shared::chat::{
 use crate::models::shared::sampling::{
     bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
-use crate::models::shared::speculative_sampling::verify_speculative_prefix;
+use crate::models::shared::speculative_sampling::{
+    propose_speculative_draft, verify_speculative_prefix, verify_speculative_proposals,
+};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen38_composite_cache_contract_with_mtp;
@@ -293,6 +295,7 @@ pub struct ChatDecodeState {
     next_text_position: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+    draft_rng: SimpleRng,
 }
 
 impl ChatDecodeState {
@@ -913,6 +916,7 @@ impl Qwen38ChatModel {
                     ))
                 }
             };
+        let draft_rng = rng.fork();
         Ok(ChatDecodeState {
             text_state,
             physical_kv: cache,
@@ -932,6 +936,7 @@ impl Qwen38ChatModel {
             next_text_position: prepared.next_text_position,
             config: config.clone(),
             rng,
+            draft_rng,
         })
     }
 
@@ -1115,13 +1120,36 @@ impl Qwen38ChatModel {
             let continuation_positions = (0..depth.get().saturating_sub(1))
                 .map(|offset| [state.next_text_position + offset; 3])
                 .collect::<Vec<_>>();
+            let stochastic_drafting = state.config.temperature > 1e-5;
+            let mut draft_history = if state.track_history {
+                state.history_ids.clone()
+            } else {
+                Vec::new()
+            };
+            let mut draft_proposals = Vec::with_capacity(depth.get());
             let drafted = head.draft_recurrently_with_text(
                 &self.text_model,
                 anchor_hidden,
                 depth,
                 &continuation_positions,
                 mtp,
-                |_, logits| argmax_clamped(&logits.i((0, 0))?, self.tokenizer.vocab_size),
+                |_, logits| {
+                    let logits = logits.i((0, 0))?;
+                    if !stochastic_drafting {
+                        return argmax_clamped(&logits, self.tokenizer.vocab_size);
+                    }
+                    let mut values = logits_to_vec(&logits)?;
+                    truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                    let proposal = propose_speculative_draft(
+                        &values,
+                        &state.config,
+                        &mut draft_history,
+                        &mut state.draft_rng,
+                    )?;
+                    let token = proposal.token_id;
+                    draft_proposals.push(proposal);
+                    Ok(token)
+                },
             );
             mtp.restore_logical_checkpoint(mtp_checkpoint)?;
             let drafted = drafted?;
@@ -1161,13 +1189,23 @@ impl Qwen38ChatModel {
             } else {
                 Vec::new()
             };
-            let verification = verify_speculative_prefix(
-                &drafted.token_ids,
-                &host_rows,
-                &state.config,
-                &mut verification_history,
-                &mut state.rng,
-            )?;
+            let verification = if stochastic_drafting {
+                verify_speculative_proposals(
+                    &draft_proposals,
+                    &host_rows,
+                    &state.config,
+                    &mut verification_history,
+                    &mut state.rng,
+                )?
+            } else {
+                verify_speculative_prefix(
+                    &drafted.token_ids,
+                    &host_rows,
+                    &state.config,
+                    &mut verification_history,
+                    &mut state.rng,
+                )?
+            };
 
             let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
             let mut kept = Vec::new();
@@ -1846,6 +1884,11 @@ impl SimpleRng {
         Self {
             state: seed ^ 0xA076_1D64_78BD_642F,
         }
+    }
+
+    fn fork(&mut self) -> Self {
+        let seed = (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32());
+        Self::new(seed)
     }
 
     fn next_u32(&mut self) -> u32 {

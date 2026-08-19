@@ -28,6 +28,43 @@ pub struct SpeculativeVerification {
     pub draft_tokens: usize,
 }
 
+/// One token proposed by a draft model together with the exact sampling
+/// distribution that produced it.
+///
+/// Retaining `q` is required for standard lossless speculative rejection
+/// sampling. Treating a sampled proposal as one-hot is valid only for greedy
+/// drafting and unnecessarily lowers acceptance for stochastic requests.
+#[derive(Debug, Clone)]
+pub struct SpeculativeDraft {
+    pub token_id: u32,
+    distribution: TargetDistribution,
+}
+
+/// Sample one draft token using the same transforms as target sampling.
+///
+/// `history` and `rng` are transactional: neither changes when constructing or
+/// sampling the proposal fails.
+pub fn propose_speculative_draft<R: RngCore + Clone>(
+    draft_logits: &[f32],
+    config: &ChatGenerationConfig,
+    history: &mut Vec<u32>,
+    rng: &mut R,
+) -> Result<SpeculativeDraft> {
+    let distribution = TargetDistribution::from_logits(draft_logits, config, history)?;
+    let mut staged_rng = rng.clone();
+    let token_id = if config.temperature <= GREEDY_TEMPERATURE_CUTOFF {
+        distribution.argmax()
+    } else {
+        distribution.sample(next_unit_f32(&mut staged_rng))
+    };
+    history.push(token_id);
+    *rng = staged_rng;
+    Ok(SpeculativeDraft {
+        token_id,
+        distribution,
+    })
+}
+
 impl SpeculativeVerification {
     pub fn all_drafts_accepted(&self) -> bool {
         self.accepted_draft_tokens == self.draft_tokens
@@ -56,6 +93,77 @@ pub fn verify_speculative_prefix<R: RngCore + Clone>(
     } else {
         verify_rejection_sampled_prefix(draft_tokens, target_logits, config, history, rng)
     }
+}
+
+/// Verify proposals while retaining their true draft distributions.
+///
+/// Greedy requests use exact prefix matching. Stochastic requests use the
+/// standard lossless acceptance probability `min(1, p(d) / q(d))` and sample
+/// a correction from normalized `max(p - q, 0)` after rejection.
+pub fn verify_speculative_proposals<R: RngCore + Clone>(
+    drafts: &[SpeculativeDraft],
+    target_logits: &[Vec<f32>],
+    config: &ChatGenerationConfig,
+    history: &mut Vec<u32>,
+    rng: &mut R,
+) -> Result<SpeculativeVerification> {
+    let draft_tokens = drafts
+        .iter()
+        .map(|draft| draft.token_id)
+        .collect::<Vec<_>>();
+    if config.temperature <= GREEDY_TEMPERATURE_CUTOFF {
+        return verify_greedy_prefix(&draft_tokens, target_logits, config, history);
+    }
+    validate_block(&draft_tokens, target_logits)?;
+    for (index, draft) in drafts.iter().enumerate() {
+        if draft.distribution.probability(draft.token_id) <= 0.0 {
+            return Err(Error::InvalidInput(format!(
+                "speculative draft token {} at index {index} has zero proposal probability",
+                draft.token_id
+            )));
+        }
+    }
+
+    let mut staged_history = history.clone();
+    let mut staged_rng = rng.clone();
+    let mut emitted_tokens = Vec::with_capacity(drafts.len() + 1);
+    for (index, draft) in drafts.iter().enumerate() {
+        let target =
+            TargetDistribution::from_logits(&target_logits[index], config, &staged_history)?;
+        let p = target.probability(draft.token_id);
+        let q = draft.distribution.probability(draft.token_id);
+        let acceptance = (p / q).min(1.0);
+        if next_unit_f32(&mut staged_rng) < acceptance {
+            emitted_tokens.push(draft.token_id);
+            staged_history.push(draft.token_id);
+            continue;
+        }
+
+        let correction =
+            target.sample_residual_against(&draft.distribution, next_unit_f32(&mut staged_rng))?;
+        emitted_tokens.push(correction);
+        staged_history.push(correction);
+        *history = staged_history;
+        *rng = staged_rng;
+        return Ok(SpeculativeVerification {
+            emitted_tokens,
+            accepted_draft_tokens: index,
+            draft_tokens: drafts.len(),
+        });
+    }
+
+    let bonus =
+        TargetDistribution::from_logits(&target_logits[drafts.len()], config, &staged_history)?
+            .sample(next_unit_f32(&mut staged_rng));
+    emitted_tokens.push(bonus);
+    staged_history.push(bonus);
+    *history = staged_history;
+    *rng = staged_rng;
+    Ok(SpeculativeVerification {
+        emitted_tokens,
+        accepted_draft_tokens: drafts.len(),
+        draft_tokens: drafts.len(),
+    })
 }
 
 /// Deterministically accept the longest draft prefix matching target argmaxes.
@@ -208,7 +316,7 @@ fn validate_block(draft_tokens: &[u32], target_logits: &[Vec<f32>]) -> Result<()
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TargetDistribution {
     // Sorted by descending target probability, then ascending token ID.
     candidates: Vec<(u32, f32)>,
@@ -316,6 +424,19 @@ impl TargetDistribution {
                 .iter()
                 .copied()
                 .filter(|(token, _)| *token != excluded),
+            draw,
+            "speculative residual distribution is empty after rejection",
+        )
+    }
+
+    fn sample_residual_against(&self, draft: &Self, draw: f32) -> Result<u32> {
+        sample_weighted(
+            self.candidates
+                .iter()
+                .filter_map(|(token, target_probability)| {
+                    let residual = *target_probability - draft.probability(*token);
+                    (residual > 0.0).then_some((*token, residual))
+                }),
             draw,
             "speculative residual distribution is empty after rejection",
         )
@@ -656,6 +777,80 @@ mod tests {
 
         assert_eq!(verification.emitted_tokens, vec![0, 1]);
         assert_eq!(rng, initial_rng);
+    }
+
+    #[test]
+    fn stochastic_proposals_use_p_over_q_and_residual_correction() {
+        let config = ChatGenerationConfig {
+            temperature: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let mut draft_history = Vec::new();
+        let mut draft_rng = ScriptedRng::new([0.1]);
+        let proposal = propose_speculative_draft(
+            &[4.0f32.ln(), 1.0f32.ln()],
+            &config,
+            &mut draft_history,
+            &mut draft_rng,
+        )
+        .unwrap();
+        assert_eq!(proposal.token_id, 0);
+        assert_eq!(draft_history, vec![0]);
+
+        // q(0)=0.8 and p(0)=0.4, so the acceptance probability is 0.5.
+        // A 0.75 draw rejects token 0; max(p-q, 0) contains only token 1.
+        let mut target_history = Vec::new();
+        let mut target_rng = ScriptedRng::new([0.75, 0.3]);
+        let verification = verify_speculative_proposals(
+            &[proposal],
+            &[vec![2.0f32.ln(), 3.0f32.ln()], vec![1.0, 0.0]],
+            &config,
+            &mut target_history,
+            &mut target_rng,
+        )
+        .unwrap();
+
+        assert_eq!(verification.emitted_tokens, vec![1]);
+        assert_eq!(verification.accepted_draft_tokens, 0);
+        assert_eq!(target_history, vec![1]);
+        assert_eq!(target_rng.cursor, 2);
+    }
+
+    #[test]
+    fn stochastic_proposal_and_target_rng_streams_are_independent() {
+        let config = ChatGenerationConfig {
+            temperature: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let mut draft_history = Vec::new();
+        let mut draft_rng = ScriptedRng::new([0.1]);
+        let proposal = propose_speculative_draft(
+            &[4.0f32.ln(), 1.0f32.ln()],
+            &config,
+            &mut draft_history,
+            &mut draft_rng,
+        )
+        .unwrap();
+        let draft_rng_after_proposal = draft_rng.clone();
+
+        let mut target_history = Vec::new();
+        let mut target_rng = ScriptedRng::new([0.1, 0.9]);
+        let verification = verify_speculative_proposals(
+            &[proposal],
+            &[
+                vec![9.0f32.ln(), 1.0f32.ln()],
+                vec![1.0f32.ln(), 9.0f32.ln()],
+            ],
+            &config,
+            &mut target_history,
+            &mut target_rng,
+        )
+        .unwrap();
+
+        assert_eq!(verification.emitted_tokens, vec![0, 1]);
+        assert!(verification.all_drafts_accepted());
+        assert_eq!(draft_rng, draft_rng_after_proposal);
+        assert_eq!(target_rng.cursor, 2);
     }
 
     #[test]
