@@ -76,7 +76,7 @@ From the root of the same checkout, with the warmed server listening on port
 
 ```bash
 scripts/bench/run-qwen38-l40s-evidence.sh \
-  --mtp-depth 3 \
+  --mtp-depth 1 \
   --server http://127.0.0.1:8080 \
   --izwi-bin target/release/izwi \
   --output target/qwen38-l40s-evidence
@@ -115,7 +115,7 @@ For another versioned NVIDIA hardware profile, use:
 ```bash
 scripts/bench/run-qwen38-cuda-evidence.sh \
   --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
-  --mtp-depth 3 \
+  --mtp-depth 1 \
   --server http://127.0.0.1:8080 \
   --izwi-bin target/release/izwi \
   --output target/qwen38-<profile>-evidence
@@ -127,6 +127,12 @@ observed provider, and resolved MTP policy. The selected server device must
 match every constraint in the manifest's hardware profile.
 
 ## Paired MTP validation
+
+Depth 1 is the production default and the first candidate to evaluate. Depths
+2 and 3 remain comparison cells, not presumed improvements. The loaded-model
+diagnostics distinguish speculative rounds from scheduler-selected scalar
+target tokens and publish acceptance, bonus, and target-replay ratios; an
+enabled head with only scalar observations is not active speculation.
 
 Collect four otherwise identical runs from fresh server processes. Do not rely
 on the default when recording evidence; set the process variables explicitly:

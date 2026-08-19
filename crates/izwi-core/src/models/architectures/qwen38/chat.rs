@@ -753,6 +753,28 @@ impl Qwen38ChatModel {
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
         let projection_representation = self.text_model.projection_representation();
         let representation = qwen38_representation_diagnostics(projection_representation);
+        let optimization_counters = qwen38_optimization_telemetry_snapshot();
+        let draft_acceptance_rate = ratio_or_none(
+            optimization_counters.mtp_accepted_draft_tokens_total,
+            optimization_counters.mtp_draft_tokens_total,
+        );
+        let bonus_rate = ratio_or_none(
+            optimization_counters.mtp_bonus_tokens_total,
+            optimization_counters.mtp_rounds_total,
+        );
+        let replay_amplification = ratio_or_none(
+            optimization_counters.mtp_target_replay_tokens_total,
+            optimization_counters.mtp_target_verified_tokens_total,
+        );
+        let observed_execution = match (
+            optimization_counters.mtp_rounds_total > 0,
+            optimization_counters.mtp_scalar_target_tokens_total > 0,
+        ) {
+            (true, true) => "mixed_speculative_and_scalar",
+            (true, false) => "speculative",
+            (false, true) => "scalar_only",
+            (false, false) => "not_observed",
+        };
         serde_json::json!({
             "checkpoint_revision": QWEN38_27B_FP8_REVISION,
             "checkpoint_format": "safetensors_block_fp8",
@@ -764,7 +786,7 @@ impl Qwen38ChatModel {
                 "scope": "qwen38_process_lifetime",
                 "cuda_runtime_validated": false,
                 "cuda_compute_capability": self.cuda_compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
-                "counters": qwen38_optimization_telemetry_snapshot(),
+                "counters": optimization_counters,
                 "managed_kv_counters_source": "runtime_metrics.kv_cache.models[].arenas[].operations",
                 "managed_kv_counter_coverage": [
                     "allocation",
@@ -794,6 +816,10 @@ impl Qwen38ChatModel {
                     "performance_certified": false,
                     "scheduler_policy": "speculate_only_without_queue_pressure_or_concurrent_decode",
                     "execution_evidence": {
+                        "observed_execution": observed_execution,
+                        "draft_acceptance_rate": draft_acceptance_rate,
+                        "bonus_rate": bonus_rate,
+                        "target_replay_to_verified_ratio": replay_amplification,
                         "speculative_round_counter": "mtp_rounds_total",
                         "scalar_target_counter": "mtp_scalar_target_tokens_total",
                         "accepted_draft_counter": "mtp_accepted_draft_tokens_total",
@@ -1187,10 +1213,10 @@ impl Qwen38ChatModel {
             let verification = if !stochastic_drafting && !state.track_history {
                 let mut target_tokens = Vec::with_capacity(target_inputs.len());
                 for row in 0..target_inputs.len() {
-                    target_tokens.push(argmax_clamped(
-                        &target_logits.i((0, row))?,
-                        self.tokenizer.vocab_size,
-                    )?);
+                    let token =
+                        argmax_clamped(&target_logits.i((0, row))?, self.tokenizer.vocab_size)?;
+                    record_sampling_device_argmax();
+                    target_tokens.push(token);
                 }
                 verify_greedy_token_prefix(
                     &drafted.token_ids,
@@ -1741,6 +1767,10 @@ fn truncate_logits_to_vocab(values: &mut Vec<f32>, vocab_size: usize) {
     }
 }
 
+fn ratio_or_none(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator != 0).then_some(numerator as f64 / denominator as f64)
+}
+
 fn no_valid_logits_error(values: &[f32]) -> Error {
     let mut nan = 0usize;
     let mut positive_infinity = 0usize;
@@ -1993,6 +2023,12 @@ mod tests {
         assert!(Qwen38MtpPolicy::resolve(None, Some("0")).is_err());
         assert!(Qwen38MtpPolicy::resolve(None, Some("4")).is_err());
         assert!(Qwen38MtpPolicy::resolve(None, Some("many")).is_err());
+    }
+
+    #[test]
+    fn mtp_diagnostic_ratios_do_not_report_nan_before_execution() {
+        assert_eq!(ratio_or_none(0, 0), None);
+        assert_eq!(ratio_or_none(3, 4), Some(0.75));
     }
 
     #[test]

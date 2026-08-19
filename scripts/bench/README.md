@@ -187,7 +187,7 @@ retain the output directory:
 
 ```bash
 scripts/bench/run-qwen38-l40s-evidence.sh \
-  --mtp-depth 3 \
+  --mtp-depth 1 \
   --server http://127.0.0.1:8080 \
   --izwi-bin target/release/izwi \
   --output target/qwen38-l40s-evidence
@@ -213,7 +213,7 @@ another NVIDIA GPU, create a separate versioned workload with a distinct
 ```bash
 scripts/bench/run-qwen38-cuda-evidence.sh \
   --workload benchmarks/manifests/qwen38-<profile>-evidence.json \
-  --mtp-depth 3 \
+  --mtp-depth 1 \
   --output target/qwen38-<profile>-evidence
 ```
 
@@ -238,6 +238,13 @@ explicitly disabled baseline; `1`, `2`, and `3` mean enabled MTP with that
 draft depth. The option does not configure the server. Restart the server for
 each cell with matching explicit settings so the runner can compare the
 requested policy with loaded-model diagnostics:
+
+Depth 1 is the production default and the first latency candidate to compare.
+Deeper cells remain mandatory for a complete profile certificate, but must not
+be promoted merely because their accepted length is higher: proposal work,
+recurrent-state replay, TTFT, completion TPS, and peak memory all participate
+in certification. At concurrency greater than one, scalar fallback is expected
+and aggregate throughput—not speculative acceptance—is the deciding metric.
 
 | Cell | Server settings | Runner setting |
 |---|---|---|
@@ -285,8 +292,20 @@ On a host without an NVIDIA device, the default is a non-zero failure. Local
 workflow validation can explicitly record unsupported without inventing data:
 
 ```bash
-scripts/bench/run-qwen38-l40s-evidence.sh --mtp-depth 3 --allow-unsupported
+scripts/bench/run-qwen38-l40s-evidence.sh --mtp-depth 1 --allow-unsupported
 scripts/bench/test-run-qwen38-cuda-evidence.sh
 scripts/bench/test-run-qwen38-l40s-evidence.sh
 scripts/bench/test-certify-qwen38-mtp-evidence.sh
 ```
+
+### Qwen3.8 KV cache precision
+
+The FP8 checkpoint describes weight storage, not KV cache storage. Loaded-model
+diagnostics must currently report `cuda_kv_storage.quantized=false` and
+`physical_format=dense`: CUDA and Metal use F16 by default, CPU uses F32, and
+CUDA has a separately opt-in, unvalidated BF16 candidate. FP8 KV stays
+unselectable until the implementation has calibrated per-layer K/V scales,
+scale-aware page mutation/accounting, fused paged prefill and decode kernels,
+and retained numerical, quality, memory, and latency evidence. A standalone
+dequantization pass is not an acceptable promotion path because it can erase
+the bandwidth benefit.
