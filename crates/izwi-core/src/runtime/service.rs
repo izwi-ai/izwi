@@ -4504,6 +4504,7 @@ mod tests {
             domain_id: 1,
             device_ordinal: Some(0),
             page_tokens: 16,
+            token_capacity: 160,
             bytes_per_page: 128,
             physical_bytes: 1_280,
             coordinator: ManagedKvCoordinatorSnapshot {
@@ -4524,6 +4525,8 @@ mod tests {
             authorized_tensor_bytes: 0,
             physical_bytes: 1_280,
             registered_sessions: 1,
+            single_sequence_token_capacity: 160,
+            full_context_sequence_capacity: 1,
             arenas: vec![arena(allocated_pages)],
         };
         let snapshot = crate::engine::ManagedKvRuntimeSnapshot {

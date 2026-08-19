@@ -152,6 +152,11 @@ pub struct ManagedKvCoordinatorSnapshot {
     pub capacity_pages: u64,
     pub allocated_pages: u64,
     pub free_pages: u64,
+    /// Pages promised to active requests for their complete prompt plus
+    /// maximum output budget. This is logical admission, not eager backing.
+    pub admission_claimed_pages: u64,
+    pub admission_available_pages: u64,
+    pub admission_claims: u64,
     pub table_refs: u64,
     pub prefix_refs: u64,
     pub execution_pins: u64,
@@ -167,6 +172,7 @@ pub struct ManagedKvArenaRuntimeSnapshot {
     pub domain_id: u32,
     pub device_ordinal: Option<u32>,
     pub page_tokens: u32,
+    pub token_capacity: u64,
     pub bytes_per_page: u64,
     pub physical_bytes: u64,
     pub coordinator: ManagedKvCoordinatorSnapshot,
@@ -188,6 +194,10 @@ pub struct ManagedKvModelRuntimeSnapshot {
     /// Compatibility total: resident paged bytes plus authorized tensor bytes.
     pub physical_bytes: u64,
     pub registered_sessions: u64,
+    /// Maximum logical token reach of one sequence across every state arena.
+    pub single_sequence_token_capacity: u64,
+    /// Number of maximum-reach sequences the fitted page pools can admit.
+    pub full_context_sequence_capacity: u64,
     pub arenas: Vec<ManagedKvArenaRuntimeSnapshot>,
 }
 
@@ -308,6 +318,7 @@ struct ManagedKvModelState {
     prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
     pending_prefixes: HashMap<PlanId, Vec<PendingPrefixCommit>>,
     registered_sessions: HashSet<SessionKey>,
+    capacity_claims: HashMap<SessionKey, Vec<(KvArenaId, u32)>>,
     tensor_sequences: HashMap<SessionKey, PhysicalStateSequenceId>,
     resource_lease: Option<ResourceLease>,
     materialized_resources: ResourceVector,
@@ -659,10 +670,27 @@ impl ManagedKvCacheManager {
                             .get(&group.arena)
                             .expect("resolved managed arena has a coordinator")
                             .stats();
+                        let admission_claimed_pages = state
+                            .capacity_claims
+                            .values()
+                            .flat_map(|claims| claims.iter())
+                            .filter_map(|(arena, pages)| {
+                                (*arena == group.arena).then_some(u64::from(*pages))
+                            })
+                            .sum::<u64>();
+                        let admission_claims = state
+                            .capacity_claims
+                            .values()
+                            .filter(|claims| claims.iter().any(|(arena, _)| *arena == group.arena))
+                            .count();
                         let coordinator = ManagedKvCoordinatorSnapshot {
                             capacity_pages: usize_to_u64(coordinator.capacity_pages),
                             allocated_pages: usize_to_u64(coordinator.allocated_pages),
                             free_pages: usize_to_u64(coordinator.free_pages),
+                            admission_claimed_pages,
+                            admission_available_pages: usize_to_u64(coordinator.capacity_pages)
+                                .saturating_sub(admission_claimed_pages),
+                            admission_claims: usize_to_u64(admission_claims),
                             table_refs: usize_to_u64(coordinator.table_refs),
                             prefix_refs: usize_to_u64(coordinator.prefix_refs),
                             execution_pins: usize_to_u64(coordinator.execution_pins),
@@ -723,6 +751,8 @@ impl ManagedKvCacheManager {
                             domain_id: group.domain.get(),
                             device_ordinal: group.arena.device_ordinal,
                             page_tokens: group.page_tokens,
+                            token_capacity: u64::from(group.capacity_pages)
+                                .saturating_mul(u64::from(group.page_tokens)),
                             bytes_per_page: group.bytes_per_page,
                             physical_bytes: arena.resident_bytes(),
                             coordinator,
@@ -745,6 +775,10 @@ impl ManagedKvCacheManager {
                     authorized_tensor_bytes: state.runtime.authorized_tensor_bytes(),
                     physical_bytes: state.runtime.physical_bytes(),
                     registered_sessions: usize_to_u64(state.registered_sessions.len()),
+                    single_sequence_token_capacity: state.runtime.logical_token_reach(),
+                    full_context_sequence_capacity: full_context_sequence_capacity(
+                        &state.runtime.plan,
+                    ),
                     arenas,
                 }
             })
@@ -1059,6 +1093,7 @@ impl ManagedKvCacheManager {
                 prefix_indexes,
                 pending_prefixes: HashMap::new(),
                 registered_sessions: HashSet::new(),
+                capacity_claims: HashMap::new(),
                 tensor_sequences: HashMap::new(),
                 resource_lease,
                 materialized_resources,
@@ -1144,7 +1179,17 @@ impl ManagedKvCacheManager {
                 "request carries a stale managed KV runtime".to_string(),
             ));
         }
-        ensure_session_tables(state, session)?;
+        let installed_claim = if let Some(request) = request {
+            ensure_capacity_claim(state, session, request)?
+        } else {
+            false
+        };
+        if let Err(error) = ensure_session_tables(state, session) {
+            if installed_claim {
+                state.capacity_claims.remove(session);
+            }
+            return Err(error);
+        }
 
         let mut domains = Vec::with_capacity(runtime.plan.groups.len());
         let mut pending_prefixes = Vec::new();
@@ -1771,6 +1816,7 @@ impl ManagedKvCacheManager {
                     .release(sequence)?;
             }
             state.registered_sessions.remove(session);
+            state.capacity_claims.remove(session);
         }
         Ok(())
     }
@@ -1786,6 +1832,12 @@ impl ManagedKvCacheManager {
         if !state.registered_sessions.is_empty() {
             return Err(Error::InferenceError(format!(
                 "managed KV model {} still has registered sessions",
+                model_instance.get()
+            )));
+        }
+        if !state.capacity_claims.is_empty() {
+            return Err(Error::InferenceError(format!(
+                "managed KV model {} still has logical capacity claims",
                 model_instance.get()
             )));
         }
@@ -1869,6 +1921,15 @@ fn add_coordinator_stats(
     totals.capacity_pages = totals.capacity_pages.saturating_add(arena.capacity_pages);
     totals.allocated_pages = totals.allocated_pages.saturating_add(arena.allocated_pages);
     totals.free_pages = totals.free_pages.saturating_add(arena.free_pages);
+    totals.admission_claimed_pages = totals
+        .admission_claimed_pages
+        .saturating_add(arena.admission_claimed_pages);
+    totals.admission_available_pages = totals
+        .admission_available_pages
+        .saturating_add(arena.admission_available_pages);
+    totals.admission_claims = totals
+        .admission_claims
+        .saturating_add(arena.admission_claims);
     totals.table_refs = totals.table_refs.saturating_add(arena.table_refs);
     totals.prefix_refs = totals.prefix_refs.saturating_add(arena.prefix_refs);
     totals.execution_pins = totals.execution_pins.saturating_add(arena.execution_pins);
@@ -2420,6 +2481,111 @@ fn ensure_session_tables(state: &mut ManagedKvModelState, session: &SessionKey) 
         registered.push((group.arena, group.domain));
     }
     Ok(())
+}
+
+/// Promise enough logical pages for the request's full prompt plus maximum
+/// output before its first CUDA/Metal/CPU dispatch. The promise is deliberately
+/// separate from physical page ownership: pages are still materialized and
+/// written incrementally, while admission cannot overbook the pool and fail at
+/// an arbitrary later decode step.
+fn ensure_capacity_claim(
+    state: &mut ManagedKvModelState,
+    session: &SessionKey,
+    request: &EngineCoreRequest,
+) -> Result<bool> {
+    if state.capacity_claims.contains_key(session) {
+        return Ok(false);
+    }
+    let requested_tokens = request
+        .num_prompt_tokens()
+        .checked_add(request.params.max_tokens.max(1))
+        .ok_or_else(|| Error::Overloaded("request token capacity demand overflowed".into()))?;
+    let requested_tokens = u64::try_from(requested_tokens)
+        .map_err(|_| Error::Overloaded("request token capacity demand exceeds u64".into()))?;
+
+    let mut requested_by_arena = HashMap::<KvArenaId, u64>::new();
+    for group in &state.runtime.plan.groups {
+        let window_tokens = sliding_window_for_domain(&state.contract, group.domain)?
+            .map(u64::from)
+            .unwrap_or(requested_tokens);
+        let retained_tokens = requested_tokens.min(window_tokens);
+        let required_pages = retained_tokens.div_ceil(u64::from(group.page_tokens));
+        let requested = requested_by_arena.entry(group.arena).or_default();
+        *requested = requested.saturating_add(required_pages);
+    }
+
+    for (arena, requested_pages) in &requested_by_arena {
+        let capacity_pages = state
+            .runtime
+            .plan
+            .groups
+            .iter()
+            .find(|group| group.arena == *arena)
+            .map(|group| u64::from(group.capacity_pages))
+            .ok_or_else(|| Error::InferenceError("managed capacity arena disappeared".into()))?;
+        if *requested_pages > capacity_pages {
+            let group = state
+                .runtime
+                .plan
+                .groups
+                .iter()
+                .find(|group| group.arena == *arena)
+                .expect("capacity arena group exists");
+            let token_capacity = capacity_pages.saturating_mul(u64::from(group.page_tokens));
+            return Err(Error::Overloaded(format!(
+                "request {} needs {requested_tokens} prompt-plus-output tokens, but managed state arena {} can retain at most {token_capacity} tokens ({} pages of {} tokens)",
+                request.id,
+                group.id.get(),
+                capacity_pages,
+                group.page_tokens
+            )));
+        }
+        let claimed_pages = state
+            .capacity_claims
+            .values()
+            .flat_map(|claims| claims.iter())
+            .filter_map(|(claimed_arena, pages)| {
+                (*claimed_arena == *arena).then_some(u64::from(*pages))
+            })
+            .sum::<u64>();
+        if claimed_pages.saturating_add(*requested_pages) > capacity_pages {
+            return Err(Error::Backpressure(format!(
+                "managed KV full-request admission is waiting: request {} needs {} pages, {} are already claimed, and arena capacity is {} pages",
+                request.id, requested_pages, claimed_pages, capacity_pages
+            )));
+        }
+    }
+
+    let claims = requested_by_arena
+        .into_iter()
+        .map(|(arena, pages)| {
+            u32::try_from(pages)
+                .map(|pages| (arena, pages))
+                .map_err(|_| Error::Overloaded("managed KV page claim exceeds u32".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    state.capacity_claims.insert(session.clone(), claims);
+    Ok(true)
+}
+
+fn full_context_sequence_capacity(plan: &ResolvedKvPlan) -> u64 {
+    let reach = plan
+        .groups
+        .iter()
+        .map(|group| u64::from(group.capacity_pages) * u64::from(group.page_tokens))
+        .min()
+        .unwrap_or(0);
+    if reach == 0 {
+        return 0;
+    }
+    plan.groups
+        .iter()
+        .map(|group| {
+            let pages = reach.div_ceil(u64::from(group.page_tokens));
+            u64::from(group.capacity_pages) / pages.max(1)
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 fn managed_prefix_namespace(
@@ -3842,6 +4008,7 @@ mod tests {
         }])
         .with_model_variant(variant);
         request.prompt_tokens = tokens;
+        request.params.max_tokens = 1;
         request
             .bind_execution_adapter(ExecutionAdapterBinding {
                 execution_group_id: ExecutionGroupId::new(1),
@@ -3903,6 +4070,121 @@ mod tests {
 
         manager.release_session(&session).expect("release");
         assert!(manager.snapshot(model, &session, domain).is_none());
+    }
+
+    #[test]
+    fn full_request_claim_prevents_late_decode_overcommit_and_releases_atomically() {
+        let model = ModelInstanceId::new(42);
+        let owner_session = SessionKey::new("capacity-owner".into(), 1);
+        let waiter_session = SessionKey::new("capacity-waiter".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut owner = prefix_request(model, (0..32).collect());
+        owner.params.max_tokens = 32;
+        let owner_reservation = manager
+            .prepare(
+                &runtime,
+                101,
+                &owner_session,
+                &sequence_work(0, 32),
+                Some(&owner),
+            )
+            .unwrap()
+            .unwrap();
+
+        let waiter = prefix_request(model, vec![7]);
+        let blocked = manager.prepare(
+            &runtime,
+            102,
+            &waiter_session,
+            &sequence_work(0, 1),
+            Some(&waiter),
+        );
+        assert!(
+            matches!(blocked, Err(Error::Backpressure(message)) if message.contains("full-request admission"))
+        );
+        let snapshot = manager.runtime_snapshot();
+        assert_eq!(
+            snapshot.models[0].arenas[0]
+                .coordinator
+                .admission_claimed_pages,
+            4
+        );
+        assert_eq!(
+            snapshot.models[0].arenas[0]
+                .coordinator
+                .admission_available_pages,
+            0
+        );
+
+        manager.finalize(&owner_reservation, None, false).unwrap();
+        manager.release_session(&owner_session).unwrap();
+        let admitted = manager
+            .prepare(
+                &runtime,
+                103,
+                &waiter_session,
+                &sequence_work(0, 1),
+                Some(&waiter),
+            )
+            .unwrap()
+            .unwrap();
+        manager.finalize(&admitted, None, false).unwrap();
+        manager.release_session(&waiter_session).unwrap();
+        assert_eq!(
+            manager.runtime_snapshot().models[0].arenas[0]
+                .coordinator
+                .admission_claimed_pages,
+            0
+        );
+    }
+
+    #[test]
+    fn one_request_larger_than_the_arena_fails_before_page_dispatch() {
+        let model = ModelInstanceId::new(43);
+        let session = SessionKey::new("oversized-capacity".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let request = prefix_request(model, (0..32).collect());
+
+        let result = manager.prepare(
+            &runtime,
+            104,
+            &session,
+            &sequence_work(0, 32),
+            Some(&request),
+        );
+
+        assert!(
+            matches!(result, Err(Error::Overloaded(message)) if message.contains("prompt-plus-output"))
+        );
+        assert_eq!(manager.runtime_snapshot().totals.registered_sessions, 0);
+        assert_eq!(
+            manager
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claims,
+            0
+        );
     }
 
     #[test]
@@ -4311,7 +4593,7 @@ mod tests {
             .bind_request(
                 model,
                 BackendKind::Cpu,
-                2,
+                4,
                 16,
                 &CacheCapability::Managed(contract),
             )
