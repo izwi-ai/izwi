@@ -887,18 +887,27 @@ impl Qwen38ChatModel {
             ));
         }
         let mut text_state = self.text_model.new_state();
-        let (logits, target_hidden_states) = self
-            .prefill_text_range_physical(
+        let (logits, final_target_hidden) = match (&self.mtp_head, mtp_cache.as_mut()) {
+            (Some(head), Some(mtp_cache)) => self.prefill_text_and_mtp_physical(
                 &prepared,
                 &mut text_state,
                 &mut cache,
-                0,
-                prepared.prompt_ids.len(),
-                true,
-            )?
-            .ok_or_else(|| {
-                Error::InferenceError("Qwen3.8 physical prefill produced no logits".into())
-            })?;
+                Some((head, mtp_cache)),
+            )?,
+            (None, None) => {
+                self.prefill_text_and_mtp_physical(&prepared, &mut text_state, &mut cache, None)?
+            }
+            (Some(_), None) => {
+                return Err(Error::InferenceError(
+                    "default-enabled Qwen3.8 MTP state has no managed MTP cache".into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(Error::InferenceError(
+                    "disabled Qwen3.8 MTP received an unexpected managed MTP cache".into(),
+                ))
+            }
+        };
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
         let mut history_ids =
@@ -918,30 +927,22 @@ impl Qwen38ChatModel {
                     if track_history {
                         history_ids.push(anchor);
                     }
-                    let prompt_embeddings =
-                        self.text_model.embed_token_ids(&prepared.prompt_ids)?;
                     let anchor_embedding = self.text_model.embed_token_ids(&[anchor])?;
-                    let pairs = Qwen38MtpPairBatch::shifted_prompt(
-                        &prompt_embeddings,
-                        &target_hidden_states,
-                        &anchor_embedding,
-                        &prepared.prompt_positions,
+                    let pairs = Qwen38MtpPairBatch::single(
+                        anchor_embedding,
+                        final_target_hidden,
+                        *prepared.prompt_positions.last().ok_or_else(|| {
+                            Error::InferenceError(
+                                "Qwen3.8 MTP prefill has no final prompt position".into(),
+                            )
+                        })?,
                     )?;
                     let hidden = head.forward_pairs(&pairs, mtp_cache)?;
-                    let final_hidden = hidden.narrow(1, hidden.dim(1)? - 1, 1)?;
-                    (None, Some(anchor), Some(anchor), Some(final_hidden))
+                    (None, Some(anchor), Some(anchor), Some(hidden))
                 }
                 (None, None) => (Some(logits), None, None, None),
-                (Some(_), None) => {
-                    return Err(Error::InferenceError(
-                        "default-enabled Qwen3.8 MTP state has no managed MTP cache".into(),
-                    ))
-                }
-                (None, Some(_)) => {
-                    return Err(Error::InferenceError(
-                        "disabled Qwen3.8 MTP received an unexpected managed MTP cache".into(),
-                    ))
-                }
+                // Cache/head consistency was validated before target prefill.
+                _ => unreachable!("Qwen3.8 MTP cache/head consistency changed during prefill"),
             };
         let draft_rng = rng.fork();
         Ok(ChatDecodeState {
@@ -1322,22 +1323,27 @@ impl Qwen38ChatModel {
             || config.stop_token_ids.contains(&token_id)
     }
 
-    fn prefill_text_range_physical(
+    /// Prefill the target and, when enabled, stream the shifted MTP prompt in
+    /// the same bounded chunks. Only the final target hidden row is retained.
+    ///
+    /// A prompt of N tokens contributes N-1 known shifted MTP pairs while the
+    /// target is running. The final pair depends on the sampled target anchor
+    /// and is appended by `start_decode_state_physical` after this returns.
+    fn prefill_text_and_mtp_physical(
         &self,
         prepared: &Qwen38PreparedPrompt,
         text_state: &mut Qwen38TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
-        start: usize,
-        end: usize,
-        compute_final_logits: bool,
-    ) -> Result<Option<(Tensor, Tensor)>> {
+        mut mtp: Option<(&Qwen38MtpHead, &mut PhysicalPagedKvCache)>,
+    ) -> Result<(Tensor, Tensor)> {
         let mut logits = None;
-        let mut hidden_chunks = Vec::new();
-        let mut chunk_start = start;
+        let mut final_hidden = None;
+        let end = prepared.prompt_ids.len();
+        let mut chunk_start = 0;
         let chunk_size = qwen38_prefill_chunk_size();
         while chunk_start < end {
             let chunk_end = (chunk_start + chunk_size).min(end);
-            let compute_logits = compute_final_logits && chunk_end == end;
+            let compute_logits = chunk_end == end;
             if let Some(output) = self.text_model.prefill_token_ids_with_hidden_physical(
                 &prepared.prompt_ids[chunk_start..chunk_end],
                 &prepared.prompt_positions[chunk_start..chunk_end],
@@ -1345,17 +1351,42 @@ impl Qwen38ChatModel {
                 cache,
                 compute_logits,
             )? {
-                hidden_chunks.push(output.hidden_states);
+                let known_rows = known_mtp_rows(chunk_start, chunk_end, end);
+                if known_rows > 0 {
+                    if let Some((head, mtp_cache)) = mtp.as_mut() {
+                        let embeddings = self.text_model.embed_token_ids(
+                            &prepared.prompt_ids[chunk_start + 1..chunk_start + 1 + known_rows],
+                        )?;
+                        let predecessor_hidden = output.hidden_states.narrow(1, 0, known_rows)?;
+                        let pairs = Qwen38MtpPairBatch::new(
+                            embeddings,
+                            predecessor_hidden,
+                            prepared.prompt_positions[chunk_start..chunk_start + known_rows]
+                                .to_vec(),
+                        )?;
+                        head.forward_pairs(&pairs, mtp_cache)?;
+                    }
+                }
+                if chunk_end == end {
+                    final_hidden = Some(output.hidden_states.narrow(
+                        1,
+                        output.hidden_states.dim(1)?.saturating_sub(1),
+                        1,
+                    )?);
+                }
                 if let Some(chunk_logits) = output.logits {
                     logits = Some(chunk_logits);
                 }
             }
             chunk_start = chunk_end;
         }
-        match logits {
-            Some(logits) => Ok(Some((logits, Tensor::cat(&hidden_chunks, 1)?))),
-            None => Ok(None),
-        }
+        let logits = logits.ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 physical prefill produced no logits".into())
+        })?;
+        let final_hidden = final_hidden.ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 physical prefill produced no hidden state".into())
+        })?;
+        Ok((logits, final_hidden))
     }
 
     fn prepare_prompt(
@@ -1386,6 +1417,12 @@ impl Qwen38ChatModel {
 
 fn build_text_positions(token_count: usize) -> Vec<[usize; 3]> {
     (0..token_count).map(|idx| [idx; 3]).collect()
+}
+
+fn known_mtp_rows(chunk_start: usize, chunk_end: usize, prompt_len: usize) -> usize {
+    chunk_end
+        .min(prompt_len.saturating_sub(1))
+        .saturating_sub(chunk_start)
 }
 
 fn render_prompt(
@@ -1956,6 +1993,25 @@ mod tests {
     use crate::models::shared::chat::ChatRequestConfig;
 
     use super::*;
+
+    #[test]
+    fn streamed_mtp_prefill_covers_every_shifted_prompt_row_once() {
+        let prompt_len = 1_025;
+        let chunk_size = 256;
+        let mut covered = 0;
+        let mut chunk_start = 0;
+        while chunk_start < prompt_len {
+            let chunk_end = (chunk_start + chunk_size).min(prompt_len);
+            covered += known_mtp_rows(chunk_start, chunk_end, prompt_len);
+            chunk_start = chunk_end;
+        }
+
+        assert_eq!(covered, prompt_len - 1);
+        assert_eq!(known_mtp_rows(0, 1, 1), 0);
+        assert_eq!(known_mtp_rows(0, 1, 2), 1);
+        assert_eq!(known_mtp_rows(768, 1_024, prompt_len), 256);
+        assert_eq!(known_mtp_rows(1_024, 1_025, prompt_len), 0);
+    }
 
     fn history_messages() -> Vec<ChatMessage> {
         vec![
