@@ -1170,6 +1170,40 @@ impl Scheduler {
         true
     }
 
+    /// Select the cheapest lower-priority capacity owner that can be replayed
+    /// without changing client-visible output. Once a token has been emitted,
+    /// generated-token history would be required for lossless recomputation;
+    /// those sessions therefore remain protected.
+    pub(crate) fn capacity_preemption_candidate(
+        &self,
+        candidates: impl IntoIterator<Item = SessionKey>,
+        blocked_priority: Priority,
+    ) -> Option<SessionKey> {
+        if !self.config.enable_preemption {
+            return None;
+        }
+        candidates
+            .into_iter()
+            .filter_map(|session| {
+                let metadata = self.requests.get(&session.request_id)?;
+                let running = self.running.get(&session.request_id)?;
+                (metadata.sequence_id == session.epoch
+                    && running.sequence_id == session.epoch
+                    && metadata.priority < blocked_priority
+                    && metadata.cache_policy.recompute_safe
+                    && metadata.cache_policy.cache_release_safe
+                    && !running.first_token_emitted)
+                    .then_some((metadata.priority, running.num_tokens_processed, session))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.request_id.cmp(&right.2.request_id))
+            })
+            .map(|(_, _, session)| session)
+    }
+
     /// Mark a request as finished and remove it.
     pub fn finish_request(&mut self, request_id: &RequestId) {
         self.remove_from_waiting(request_id);
@@ -2110,6 +2144,32 @@ mod tests {
         assert_eq!(restarted.prefill_requests.len(), 1);
         assert_eq!(restarted.prefill_requests[0].session_key(), session);
         assert_eq!(restarted.prefill_requests[0].num_computed_tokens, 0);
+    }
+
+    #[test]
+    fn capacity_preemption_protects_sessions_after_their_first_visible_token() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            enable_preemption: true,
+            max_batch_size: 1,
+            max_tokens_per_step: 4,
+            ..Default::default()
+        });
+        let request_id = "capacity-preemption-owner".to_string();
+        scheduler.add_request(&build_request(TaskType::Chat, &request_id, Priority::Low));
+        allow_recompute(&mut scheduler, &request_id);
+        let session = scheduler.schedule().prefill_requests[0].session_key();
+        scheduler.update_after_step(&request_id, 1, 0, 1.0);
+
+        assert_eq!(
+            scheduler.capacity_preemption_candidate([session.clone()], Priority::High),
+            Some(session.clone())
+        );
+
+        scheduler.update_after_step(&request_id, 1, 1, 1.0);
+        assert_eq!(
+            scheduler.capacity_preemption_candidate([session], Priority::High),
+            None
+        );
     }
 
     #[test]

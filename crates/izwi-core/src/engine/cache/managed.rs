@@ -826,6 +826,16 @@ impl ManagedKvCacheManager {
         self.worker_backend
     }
 
+    pub(crate) fn capacity_claim_sessions(
+        &self,
+        model_instance: ModelInstanceId,
+    ) -> Vec<SessionKey> {
+        self.models
+            .get(&model_instance)
+            .map(|state| state.capacity_claims.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub(crate) fn bind_request(
         &mut self,

@@ -707,6 +707,78 @@ impl EngineCore {
         }
     }
 
+    async fn preempt_unpublished_session_for_capacity(
+        &mut self,
+        blocked: &[super::scheduler::ScheduledRequest],
+    ) -> Result<bool> {
+        let Some((blocked_request, blocked_model)) = blocked
+            .iter()
+            .filter_map(|scheduled| {
+                let request = self.requests.get(&scheduled.request_id)?.clone();
+                let model = request.managed_cache_runtime()?.plan().model_instance;
+                Some((request, model))
+            })
+            .max_by_key(|(request, _)| request.priority)
+        else {
+            return Ok(false);
+        };
+        let candidates = self
+            .managed_kv_cache
+            .capacity_claim_sessions(blocked_model)
+            .into_iter()
+            .filter(|session| session.request_id != blocked_request.id)
+            .filter(|session| {
+                !self
+                    .active_plans
+                    .values()
+                    .any(|plan| &plan.session == session)
+                    && !self
+                        .active_managed_cache
+                        .values()
+                        .any(|reservation| &reservation.session == session)
+            });
+        let Some(victim) = self
+            .scheduler
+            .capacity_preemption_candidate(candidates, blocked_request.priority)
+        else {
+            return Ok(false);
+        };
+
+        let release = self.executor.cleanup_session(&victim).await;
+        if !release.confirmed {
+            warn!(
+                request_id = %victim.request_id,
+                session_epoch = victim.epoch,
+                "Executor could not confirm capacity-preemption cleanup"
+            );
+            return Ok(false);
+        }
+        self.managed_kv_cache.release_session(&victim)?;
+        if !self.scheduler.restart_request_for_recompute(&victim) {
+            return Err(Error::InferenceError(
+                "scheduler rejected a validated capacity-preemption restart".into(),
+            ));
+        }
+        self.clear_exact_execution_state(&victim);
+        let retry_at = Instant::now()
+            + self
+                .retry_policy
+                .execution_delay(2)
+                .max(Duration::from_millis(1));
+        if !self.scheduler.defer_execution_retry(&victim, retry_at) {
+            return Err(Error::InferenceError(
+                "scheduler rejected a capacity-preemption retry fence".into(),
+            ));
+        }
+        debug!(
+            request_id = %victim.request_id,
+            session_epoch = victim.epoch,
+            blocked_request_id = %blocked_request.id,
+            "Released an unpublished lower-priority session for managed KV capacity"
+        );
+        Ok(true)
+    }
+
     fn report_from_result(result: &ExecutorStepResult) -> ExecutionReport {
         let output = &result.output;
         ExecutionReport {
@@ -2218,6 +2290,14 @@ impl EngineCore {
         self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
+            && self
+                .preempt_unpublished_session_for_capacity(&capacity_blocked)
+                .await?
+        {
+            return Ok(None);
+        }
+        if decode_batches.is_empty()
+            && prefill_batches.is_empty()
             && self.pending_terminal_outputs.is_empty()
         {
             return Ok(None);
@@ -3278,7 +3358,15 @@ mod tests {
             profile.prefill = PrefillMode::Full;
             profile.cache_mode = CacheMode::ExternalPaged;
             profile.cache_release_safe = true;
+            profile.recompute_safe = true;
             Some(profile)
+        }
+
+        fn cleanup_session(
+            &self,
+            _session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            super::super::executor::CacheReleaseReport::confirmed(1)
         }
 
         fn execute_physical_batch(
@@ -5701,6 +5789,7 @@ mod tests {
         }])
         .with_model_variant(ModelVariant::Qwen306B);
         request.id = "managed-core".to_string();
+        request.params.max_tokens = 1;
         request
             .install_chat_execution_preparation(
                 ModelVariant::Qwen306B,
@@ -5731,6 +5820,10 @@ mod tests {
             .managed_kv_cache
             .snapshot(model_instance, &session, crate::kv::CacheDomainId::new(1))
             .is_none());
+        let released = core.managed_kv_cache.runtime_snapshot();
+        assert_eq!(released.totals.registered_sessions, 0);
+        assert_eq!(released.totals.coordinator.admission_claimed_pages, 0);
+        assert_eq!(released.totals.coordinator.active_transactions, 0);
     }
 
     #[tokio::test]
@@ -5800,6 +5893,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_capacity_preemption_reclaims_only_unpublished_recompute_safe_owner() {
+        let model_instance = ModelInstanceId::new(921);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                enable_preemption: true,
+                scheduling_policy: super::super::scheduler::SchedulingPolicy::Priority,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 1,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let mut owner = managed_test_request(
+            &mut core,
+            model_instance,
+            "preemptible-capacity-owner",
+            vec![1, 2, 3, 4],
+        );
+        owner.priority = super::super::Priority::Low;
+        core.add_request(owner).expect("add owner");
+        core.step().await.expect("commit owner prefill");
+        let owner_session = core
+            .get_session_key(&"preemptible-capacity-owner".to_string())
+            .expect("owner session");
+
+        let mut waiter = managed_test_request(
+            &mut core,
+            model_instance,
+            "priority-capacity-waiter",
+            vec![5, 6, 7, 8],
+        );
+        waiter.priority = super::super::Priority::High;
+        core.add_request(waiter).expect("add waiter");
+        assert!(core
+            .prepare_step()
+            .await
+            .expect("preemption is controlled backpressure")
+            .is_none());
+        assert!(core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &owner_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .is_none());
+        assert_eq!(
+            core.managed_kv_cache
+                .runtime_snapshot()
+                .totals
+                .coordinator
+                .admission_claimed_pages,
+            0
+        );
+
+        core.step().await.expect("higher priority waiter runs next");
+        let waiter_session = core
+            .get_session_key(&"priority-capacity-waiter".to_string())
+            .expect("waiter session");
+        assert!(core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &waiter_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn managed_kv_backpressure_defers_only_the_blocked_row() {
         let blocked_model = ModelInstanceId::new(93);
         let runnable_model = ModelInstanceId::new(94);
@@ -5860,15 +6030,16 @@ mod tests {
         let blocked_session = core
             .get_session_key(&"isolated-capacity-blocked".to_string())
             .expect("blocked session");
-        let blocked_snapshot = core
-            .managed_kv_cache
-            .snapshot(
-                blocked_model,
-                &blocked_session,
-                crate::kv::CacheDomainId::new(1),
-            )
-            .expect("blocked row owns an empty logical table");
-        assert_eq!(blocked_snapshot.committed_tokens, 0);
+        assert!(
+            core.managed_kv_cache
+                .snapshot(
+                    blocked_model,
+                    &blocked_session,
+                    crate::kv::CacheDomainId::new(1),
+                )
+                .is_none(),
+            "full-request admission must not register a table for a blocked row"
+        );
         assert!(core
             .active_plans
             .values()
