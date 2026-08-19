@@ -105,6 +105,15 @@ corresponding NVIDIA evidence is retained. The earlier fully expanded BF16
 weight plan required an 80 GB-class device; CPU and Metal continue to use their
 expanded F32 and F16 representations respectively.
 
+### Qwen3.8 multi-token prediction defaults
+
+Native Qwen3.8 MTP is enabled by default with one draft token on CPU, Metal,
+and CUDA. No environment variables are required for that default. Set
+`IZWI_QWEN38_MTP=0` and restart or reload the model to disable MTP. The
+`IZWI_QWEN38_MTP_DRAFT_TOKENS` setting controls proposal depth rather than
+enablement; its default is `1`, and supported explicit values are `1` through
+`3`.
+
 ---
 
 ## Managed Inference-State Support

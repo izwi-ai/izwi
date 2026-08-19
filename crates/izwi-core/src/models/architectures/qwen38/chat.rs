@@ -53,6 +53,7 @@ const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
 // Qwen's production serving guidance starts native MTP at depth one. Deeper
 // recurrence increases proposal and rejected-prefix replay cost and remains an
 // explicit, evidence-driven override.
+const DEFAULT_MTP_ENABLED: bool = true;
 const DEFAULT_MTP_DRAFT_TOKENS: usize = 1;
 const MAX_MTP_DRAFT_TOKENS: usize = 3;
 
@@ -72,7 +73,7 @@ impl Qwen38MtpPolicy {
 
     fn resolve(enabled: Option<&str>, draft_tokens: Option<&str>) -> Result<Self> {
         let enabled = match enabled.map(str::trim).map(str::to_ascii_lowercase) {
-            None => true,
+            None => DEFAULT_MTP_ENABLED,
             Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => true,
             Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => false,
             Some(value) => {
@@ -822,7 +823,8 @@ impl Qwen38ChatModel {
                 "mtp": {
                     "enabled": self.mtp_policy.enabled(),
                     "draft_tokens": self.mtp_policy.draft_tokens(),
-                    "default_enabled": true,
+                    "default_enabled": DEFAULT_MTP_ENABLED,
+                    "default_draft_tokens": DEFAULT_MTP_DRAFT_TOKENS,
                     "enabled_switch": MTP_ENABLED_ENV,
                     "depth_switch": MTP_DRAFT_TOKENS_ENV,
                     "implementation_status": "implemented_unvalidated",
@@ -2068,9 +2070,15 @@ mod tests {
     #[test]
     fn mtp_policy_is_enabled_at_depth_one_by_default() {
         let policy = Qwen38MtpPolicy::resolve(None, None).unwrap();
-        assert_eq!(policy, Qwen38MtpPolicy::Enabled { draft_tokens: 1 });
+        assert!(DEFAULT_MTP_ENABLED);
+        assert_eq!(
+            policy,
+            Qwen38MtpPolicy::Enabled {
+                draft_tokens: DEFAULT_MTP_DRAFT_TOKENS
+            }
+        );
         assert!(policy.enabled());
-        assert_eq!(policy.draft_tokens(), Some(1));
+        assert_eq!(policy.draft_tokens(), Some(DEFAULT_MTP_DRAFT_TOKENS));
     }
 
     #[test]
