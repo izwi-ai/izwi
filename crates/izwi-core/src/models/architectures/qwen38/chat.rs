@@ -791,6 +791,8 @@ impl Qwen38ChatModel {
                 "managed_kv_counter_coverage": [
                     "allocation",
                     "workspace",
+                    "workspace_budget_and_high_water",
+                    "full_request_page_claims",
                     "host_synchronization",
                     "attention_provider",
                     "cuda_graph"
@@ -804,6 +806,18 @@ impl Qwen38ChatModel {
                     "quantized": false,
                     "physical_format": "dense",
                     "quantized_candidate_status": "unavailable_scale_contract_incomplete",
+                },
+                "prefill": {
+                    "chunk_tokens": qwen38_prefill_chunk_size(),
+                    "target_hidden_retention": "final_row_only",
+                    "mtp_bootstrap": if self.mtp_policy.enabled() {
+                        "streamed_shifted_chunks"
+                    } else {
+                        "disabled"
+                    },
+                    "transient_memory_bound": "chunk_shaped",
+                    "chunk_override": "IZWI_QWEN38_PREFILL_CHUNK_SIZE",
+                    "maximum_chunk_tokens": MAX_PREFILL_CHUNK_SIZE,
                 },
                 "mtp": {
                     "enabled": self.mtp_policy.enabled(),

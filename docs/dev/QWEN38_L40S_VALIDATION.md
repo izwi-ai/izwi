@@ -217,6 +217,35 @@ deployment:
 7. The explicit `0` kill switch is exercised after the candidate run and is
    shown to restore the current fallback behavior.
 
+## Full-context capacity and cleanup matrix
+
+Run this matrix for every CUDA hardware profile, including the baseline cell;
+it is not L40S-specific. Use prompt lengths 8K, 16K, 24K, and 32K, plus the
+largest prompt/output boundary admitted by the loaded runtime. Repeat with MTP
+enabled and disabled, at concurrency 1, 2, and 4. Then run 20 sequential
+requests, cancel during long prefill and decode, disconnect a streaming client,
+and exercise priority preemption with `enable_preemption=true`.
+
+For each case, retain the managed-KV snapshot before, at peak, and after the
+request. The snapshot must show:
+
+- `single_sequence_token_capacity` and `full_context_sequence_capacity` match
+  the fitted pools rather than the checkpoint's theoretical context alone;
+- each arena's `token_capacity`, `admission_claimed_pages`, and
+  `admission_available_pages` account for the full prompt-plus-output budget;
+- `workspace_budget_bytes` is never exceeded and
+  `workspace_high_water_bytes` remains bounded;
+- registered sessions, admission claims, active transactions, allocated pages,
+  and live device bytes return to a stable post-request plateau after success,
+  error, cancellation, disconnect, and safe preemption.
+
+No cell may emit `CUDA_ERROR_OUT_OF_MEMORY`, silently truncate attention
+history, or lose/duplicate streamed output. A request that cannot fit alone
+must fail with a typed inference-capacity error before CUDA dispatch. Competing
+requests may wait for full-request admission. Preemption may reclaim only a
+lower-priority, recompute-safe session that has not emitted a token; sessions
+with client-visible output remain protected.
+
 Keep candidates default-off when evidence is incomplete, contradictory, or
 shows only compilation/dispatch eligibility. Promotion should be a separate,
 reviewable change bound to the retained bundles and an explicit runtime

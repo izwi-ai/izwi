@@ -147,6 +147,22 @@ For `Qwen3.8-27B-FP8` on CUDA, inspect the loaded entry returned by
 fail when free VRAM or allocator headroom is insufficient. It is not a native
 FP8 mode; see the [support matrix](/support-matrix#qwen38-cuda-weight-residency).
 
+For long-context requests, inspect `runtime_metrics.kv_cache.models` in the
+health/admin diagnostics. `single_sequence_token_capacity` is the largest
+sequence the fitted pools can retain, while `full_context_sequence_capacity`
+is how many such sequences fit concurrently. Each arena also reports
+`token_capacity`, full-request page claims, and workspace budget/high-water
+bytes. Izwi reserves the exact prompt plus requested maximum output logically
+before dispatch; reduce `max_tokens` or concurrency when that complete demand
+does not fit. It does not evict arbitrary tokens from an active full-attention
+sequence.
+
+`CUDA_ERROR_OUT_OF_MEMORY` should not be returned for ordinary managed-capacity
+pressure. If it appears after this version, capture the exact Git SHA, loaded
+model diagnostics, the managed-KV snapshots before/after the request, and the
+CUDA driver/device profile; treat it as an allocator/runtime defect rather than
+raising the advertised context limit.
+
 **Corrupted model:**
 ```bash
 izwi rm <model-name>
