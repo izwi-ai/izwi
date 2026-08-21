@@ -298,6 +298,11 @@ pub struct ChatDecodeState {
     /// Prompt tokens committed by scheduler-level chunked prefill so far.
     /// Equals the prompt length once prefill completed.
     prefill_progress: usize,
+    /// Set once a shared-step (multi-row) quantum committed tokens for this
+    /// session. The speculative head's cache and anchor hidden stop tracking
+    /// the target sequence across such quanta, so solo MTP drafting must stay
+    /// disabled afterwards instead of resuming from stale speculative state.
+    shared_step_committed: bool,
     config: ChatGenerationConfig,
     rng: SimpleRng,
     draft_rng: SimpleRng,
@@ -399,6 +404,7 @@ impl ChatDecodeState {
             decoder: self.decoder.clone(),
             assembled: self.assembled.clone(),
             finished: self.finished,
+            shared_step_committed: self.shared_step_committed,
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
             mtp_physical_kv: match mtp_cache {
                 Some(new_mtp) => self.mtp_physical_kv.replace(new_mtp),
@@ -421,6 +427,7 @@ impl ChatDecodeState {
             decoder,
             assembled,
             finished,
+            shared_step_committed,
         } = checkpoint;
         self.physical_kv = physical_kv;
         self.mtp_physical_kv = mtp_physical_kv;
@@ -434,6 +441,7 @@ impl ChatDecodeState {
         self.decoder = decoder;
         self.assembled = assembled;
         self.finished = finished;
+        self.shared_step_committed = shared_step_committed;
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -497,6 +505,7 @@ pub(crate) struct Qwen38SharedStepCheckpoint {
     decoder: IncrementalDecoder,
     assembled: String,
     finished: bool,
+    shared_step_committed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1097,6 +1106,7 @@ impl Qwen38ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             prefill_progress: prepared.prompt_ids.len(),
+            shared_step_committed: false,
             config: config.clone(),
             rng,
             draft_rng,
@@ -1158,6 +1168,7 @@ impl Qwen38ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             prefill_progress: 0,
+            shared_step_committed: false,
             config: config.clone(),
             rng,
             draft_rng,
@@ -1293,7 +1304,7 @@ impl Qwen38ChatModel {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        if states.len() == 1 {
+        if states.len() == 1 && !states[0].shared_step_committed {
             return Ok(vec![self.decode_quantum(states[0], 1)?]);
         }
         for state in states.iter() {
@@ -1349,6 +1360,9 @@ impl Qwen38ChatModel {
         }
         state.pending_token = Some(next);
         let delta = self.publish_token(state, next)?;
+        // The speculative head no longer tracks this sequence across shared
+        // steps; pin solo MTP drafting off for the rest of the session.
+        state.shared_step_committed = true;
         Ok(self.decode_step_result(state, delta, input_tokens_committed))
     }
 

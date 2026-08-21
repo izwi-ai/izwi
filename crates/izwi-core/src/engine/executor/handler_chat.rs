@@ -401,6 +401,12 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
+            if scheduled.is_prefill && qwen38_chunked_prefill && scheduled.num_computed_tokens > 0 {
+                return Err(Error::InferenceError(format!(
+                    "chunked prefill request {} lost its decode state before span continuation; retry requires a fresh prompt",
+                    request.id
+                )));
+            }
             let mut decode_state = match managed_cache.take() {
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35(_)) => {
                     Self::run_blocking(|| {

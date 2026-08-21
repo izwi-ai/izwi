@@ -297,6 +297,17 @@ UnifiedExecutor
         └── NativeExecutor   (current concrete implementation)
 ```
 
+**Continuous chat decode semantics.** The continuous stage dispatches N chat
+rows inside one engine step, but the per-row execution path is model-family
+specific. Dense families (Qwen3, Gemma3) run fused stacked-tensor attention
+through the paged-attention arena batch APIs. Hybrid families (Qwen3.8) run
+each row through its scalar candle-op forward within the shared step — one
+token per row per step — and disable MTP drafting for any session that has
+participated in a multi-row step, because the speculative head's cache stops
+tracking the target sequence across shared steps. `tensor_continuous_multirow_batches_total`
+therefore certifies co-scheduled rows, not fused kernels; use per-family
+evidence manifests before claiming kernel-level batching for a model.
+
 `UnifiedExecutor` provides an async-safe wrapper around any `ModelExecutor` implementation. `NativeExecutor` is the current concrete backend and manages per-task decode state:
 
 | Decode State Struct | Task |
