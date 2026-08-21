@@ -184,6 +184,36 @@ fn qwen3_managed_cache_for_row(
     physical_paged_cache_for_row(request, scheduled, reservation, group.domain, group.id)
 }
 
+/// Per-row scheduler-owned KV views for one continuous chat quantum. Dense
+/// families carry a single paged view; hybrid families also own an optional
+/// speculative arena that must swap with the same transaction.
+pub(super) enum ContinuousRowManagedCache {
+    Dense(PhysicalPagedKvCache),
+    Hybrid {
+        target: PhysicalPagedKvCache,
+        mtp: Option<PhysicalPagedKvCache>,
+    },
+}
+
+fn continuous_row_managed_caches_for_row(
+    request: &EngineCoreRequest,
+    scheduled: &ScheduledRequest,
+    reservation: &super::ManagedCacheReservation,
+) -> Result<ContinuousRowManagedCache> {
+    if matches!(
+        request.model_variant,
+        Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+    ) {
+        let Qwen38ManagedCaches { target, mtp } =
+            qwen38_managed_caches_for_row(request, scheduled, reservation)?;
+        Ok(ContinuousRowManagedCache::Hybrid { target, mtp })
+    } else {
+        Ok(ContinuousRowManagedCache::Dense(
+            qwen3_managed_cache_for_row(request, scheduled, reservation)?,
+        ))
+    }
+}
+
 /// Resolve one exact scheduler-owned paged-attention view without assuming
 /// that the row reservation contains only one state domain or physical group.
 fn physical_paged_cache_for_row(
@@ -1395,14 +1425,13 @@ impl ModelExecutor for NativeExecutor {
                         variant.family(),
                         crate::catalog::ModelFamily::Qwen35Chat
                             | crate::catalog::ModelFamily::Qwen38Chat
+                    ) || matches!(
+                        variant,
+                        ModelVariant::Qwen306B
+                            | ModelVariant::Qwen306B4Bit
+                            | ModelVariant::Qwen317B
+                            | ModelVariant::Qwen317B4Bit
                     )
-                        || matches!(
-                            variant,
-                            ModelVariant::Qwen306B
-                                | ModelVariant::Qwen306B4Bit
-                                | ModelVariant::Qwen317B
-                                | ModelVariant::Qwen317B4Bit
-                        )
                 }
                 super::types::TaskType::ASR => {
                     variant.family() == crate::catalog::ModelFamily::Qwen3Asr

@@ -64,6 +64,7 @@ use crate::models::architectures::qwen35::chat::{
 };
 use crate::models::architectures::qwen38::chat::{
     ChatDecodeState as Qwen38ChatDecodeState, Qwen38ChatModel, Qwen38PreparedPrompt,
+    Qwen38SharedStepCheckpoint,
 };
 use crate::models::architectures::sortformer::diarization::{
     SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerWorkspaceEstimate,
@@ -2626,6 +2627,7 @@ pub enum NativeChatDecodeState {
 pub(crate) enum NativeChatDecodeCheckpoint {
     Qwen3(Qwen3ChatDecodeCheckpoint),
     Gemma3(Gemma3ChatDecodeCheckpoint),
+    Qwen38(Qwen38SharedStepCheckpoint),
 }
 
 #[derive(Debug, Clone)]
@@ -2668,15 +2670,33 @@ impl NativeChatDecodeState {
     pub(crate) fn begin_continuous_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<NativeChatDecodeCheckpoint> {
         match self {
-            Self::Qwen3(state) => state
-                .begin_managed_quantum(cache)
-                .map(NativeChatDecodeCheckpoint::Qwen3),
-            Self::Gemma3(state) => state
-                .begin_managed_quantum(cache)
-                .map(NativeChatDecodeCheckpoint::Gemma3),
-            Self::Qwen35(_) | Self::Qwen38(_) => Err(Error::InvalidInput(
+            Self::Qwen3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Qwen3 state".into(),
+                    ));
+                }
+                state
+                    .begin_managed_quantum(cache)
+                    .map(NativeChatDecodeCheckpoint::Qwen3)
+            }
+            Self::Gemma3(state) => {
+                if mtp_cache.is_some() {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 MTP reservation was routed to a Gemma3 state".into(),
+                    ));
+                }
+                state
+                    .begin_managed_quantum(cache)
+                    .map(NativeChatDecodeCheckpoint::Gemma3)
+            }
+            Self::Qwen38(state) => state
+                .begin_shared_step_quantum(cache, mtp_cache)
+                .map(NativeChatDecodeCheckpoint::Qwen38),
+            Self::Qwen35(_) => Err(Error::InvalidInput(
                 "scalar chat state entered a continuous tensor quantum".into(),
             )),
         }
@@ -2693,6 +2713,10 @@ impl NativeChatDecodeState {
             }
             (Self::Gemma3(state), NativeChatDecodeCheckpoint::Gemma3(checkpoint)) => {
                 state.rollback_managed_quantum(checkpoint);
+                Ok(())
+            }
+            (Self::Qwen38(state), NativeChatDecodeCheckpoint::Qwen38(checkpoint)) => {
+                state.rollback_shared_step_quantum(checkpoint);
                 Ok(())
             }
             _ => Err(Error::InferenceError(

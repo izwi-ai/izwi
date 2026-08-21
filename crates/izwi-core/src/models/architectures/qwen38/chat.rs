@@ -353,6 +353,86 @@ impl ChatDecodeState {
         completions
     }
 
+    /// Swap in the scheduler-owned reservations for one shared-step quantum
+    /// and snapshot the pre-quantum state so a failed batch step can restore
+    /// every row exactly.
+    pub(crate) fn begin_shared_step_quantum(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<Qwen38SharedStepCheckpoint> {
+        let current = &self.physical_kv;
+        if current.arena().id() != cache.arena().id()
+            || current.context_len() != cache.context_len()
+        {
+            return Err(Error::InferenceError(
+                "Qwen3.8 shared-step KV reservation does not continue the session".into(),
+            ));
+        }
+        if self.uses_mtp_physical_kv() != mtp_cache.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3.8 shared-step MTP reservation does not match the decode state policy".into(),
+            ));
+        }
+        if let (Some(current_mtp), Some(new_mtp)) =
+            (self.mtp_physical_kv.as_ref(), mtp_cache.as_ref())
+        {
+            if current_mtp.arena().id() != new_mtp.arena().id()
+                || current_mtp.context_len() != new_mtp.context_len()
+            {
+                return Err(Error::InferenceError(
+                    "Qwen3.8 shared-step MTP KV reservation does not continue the session".into(),
+                ));
+            }
+        }
+        Ok(Qwen38SharedStepCheckpoint {
+            mtp_anchor_hidden: self.mtp_anchor_hidden.clone(),
+            unconsumed_output: self.unconsumed_output.clone(),
+            pending_token: self.pending_token,
+            bootstrap_token: self.bootstrap_token,
+            next_text_position: self.next_text_position,
+            history_ids: self.history_ids.clone(),
+            tokens_generated: self.tokens_generated,
+            decoder: self.decoder.clone(),
+            assembled: self.assembled.clone(),
+            finished: self.finished,
+            physical_kv: std::mem::replace(&mut self.physical_kv, cache),
+            mtp_physical_kv: match mtp_cache {
+                Some(new_mtp) => self.mtp_physical_kv.replace(new_mtp),
+                None => None,
+            },
+        })
+    }
+
+    pub(crate) fn rollback_shared_step_quantum(&mut self, checkpoint: Qwen38SharedStepCheckpoint) {
+        let Qwen38SharedStepCheckpoint {
+            physical_kv,
+            mtp_physical_kv,
+            mtp_anchor_hidden,
+            unconsumed_output,
+            pending_token,
+            bootstrap_token,
+            next_text_position,
+            history_ids,
+            tokens_generated,
+            decoder,
+            assembled,
+            finished,
+        } = checkpoint;
+        self.physical_kv = physical_kv;
+        self.mtp_physical_kv = mtp_physical_kv;
+        self.mtp_anchor_hidden = mtp_anchor_hidden;
+        self.unconsumed_output = unconsumed_output;
+        self.pending_token = pending_token;
+        self.bootstrap_token = bootstrap_token;
+        self.next_text_position = next_text_position;
+        self.history_ids = history_ids;
+        self.tokens_generated = tokens_generated;
+        self.decoder = decoder;
+        self.assembled = assembled;
+        self.finished = finished;
+    }
+
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
         let sequence = PhysicalStateSequenceId::new(sequence)?;
         if self
@@ -395,6 +475,25 @@ pub struct ChatDecodeStep {
     pub tokens_generated: usize,
     pub input_tokens_committed: usize,
     pub finished: bool,
+}
+
+/// Pre-quantum snapshot for shared-step continuous decode. Mirrors the Qwen3
+/// managed checkpoint: reservations are swapped for fresh views so staged KV
+/// writes under the new views are abandoned when the previous views are
+/// restored on rollback.
+pub(crate) struct Qwen38SharedStepCheckpoint {
+    physical_kv: PhysicalPagedKvCache,
+    mtp_physical_kv: Option<PhysicalPagedKvCache>,
+    mtp_anchor_hidden: Option<Tensor>,
+    unconsumed_output: Option<Tensor>,
+    pending_token: Option<u32>,
+    bootstrap_token: Option<u32>,
+    next_text_position: usize,
+    history_ids: Vec<u32>,
+    tokens_generated: usize,
+    decoder: IncrementalDecoder,
+    assembled: String,
+    finished: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -553,7 +553,7 @@ impl NativeExecutor {
         &self,
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
-        managed_caches: Vec<Option<PhysicalPagedKvCache>>,
+        managed_caches: Vec<Option<super::ContinuousRowManagedCache>>,
     ) -> Result<Vec<ModelSessionResult>> {
         if scheduled.is_empty()
             || scheduled
@@ -671,12 +671,20 @@ impl NativeExecutor {
                 ));
             }
             match managed_cache {
-                Some(cache) => {
-                    *checkpoint = Some(active_state.state.begin_continuous_quantum(cache)?);
+                Some(views) => {
+                    let (cache, mtp_cache) = match views {
+                        super::ContinuousRowManagedCache::Dense(cache) => (cache, None),
+                        super::ContinuousRowManagedCache::Hybrid { target, mtp } => (target, mtp),
+                    };
+                    *checkpoint = Some(
+                        active_state
+                            .state
+                            .begin_continuous_quantum(cache, mtp_cache)?,
+                    );
                 }
                 None if active_state.state.uses_managed_kv() => {
                     return Err(Error::InferenceError(
-                        "continuous managed Qwen3 session changed cache authority".to_string(),
+                        "continuous chat row lost its managed-cache reservation".to_string(),
                     ))
                 }
                 None => {}
