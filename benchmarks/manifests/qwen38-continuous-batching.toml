@@ -1,0 +1,35 @@
+# Exact-SHA CUDA continuous-batching certification workload for Qwen3.8-27B-FP8.
+# The Qwen3.8 chat adapter declares shared-step continuous decode support; solo
+# (c1) rows exercise the MTP scalar path and concurrent (c4/c8) rows exercise
+# multi-row shared-step batches. Run only with
+# scripts/bench/run-cuda-model-evidence.sh --require-continuous-batch-evidence.
+
+[[benchmarks]]
+name = "qwen38-chat-solo-mtp-c1"
+command = "chat"
+model = "Qwen3.8-27B-FP8"
+iterations = 8
+concurrent = 1
+warmup = true
+prompt = "In one sentence, explain why speculative decoding can raise throughput."
+max_tokens = 128
+
+[[benchmarks]]
+name = "qwen38-chat-continuous-c4"
+command = "chat"
+model = "Qwen3.8-27B-FP8"
+iterations = 8
+concurrent = 4
+warmup = true
+prompt = "In one sentence, explain why grouped-query attention reduces KV-cache memory."
+max_tokens = 128
+
+[[benchmarks]]
+name = "qwen38-chat-continuous-c8"
+command = "chat"
+model = "Qwen3.8-27B-FP8"
+iterations = 8
+concurrent = 8
+warmup = true
+prompt = "In one sentence, explain why continuous batching improves GPU utilization."
+max_tokens = 128

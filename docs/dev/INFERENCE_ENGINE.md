@@ -266,12 +266,13 @@ Handles the ingestion side:
 
 ### 5.4 Scheduler
 
-`Scheduler` (`engine/scheduler.rs`) implements a **continuous-batching** scheduler with two policies:
+`Scheduler` (`engine/scheduler/mod.rs`) implements a **continuous-batching** scheduler with three policies:
 
 ```rust
 pub enum SchedulingPolicy {
-    Fcfs,      // First-come, first-served (default)
-    Priority,  // Priority queue with preemption
+    Fcfs,         // First-come, first-served
+    Priority,     // Priority queue with preemption
+    WeightedFair, // Workload-class weighted fairness (default)
 }
 ```
 
@@ -279,10 +280,10 @@ Key `SchedulerConfig` parameters (all tunable via `EngineCoreConfig`):
 
 | Parameter | Default | Description |
 |---|---|---|
-| `max_num_seqs` | 256 | Maximum concurrent sequences |
-| `max_num_batched_tokens` | 8192 | Token budget per step |
-| `max_model_len` | model-dependent | Maximum sequence length |
-| `enable_chunked_prefill` | true | Split long prefills across steps |
+| `max_batch_size` | 8 | Maximum logical rows scheduled per step |
+| `max_tokens_per_step` | 384 | Token budget per scheduler step |
+| `max_seq_len` | model-dependent | Maximum sequence length |
+| `enable_chunked_prefill` | false | Split long prefills across steps (opt-in; Qwen3.8 chat only) |
 Physical managed-cache capacity is enforced during transactional batch
 preparation. Work that cannot reserve its pages is deferred without creating a
 second scheduler-side block table. VAD-triggered interruption remains separate

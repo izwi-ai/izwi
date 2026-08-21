@@ -101,6 +101,16 @@ Prefix reuse starts disabled. To enable it, set all three fields:
 }
 ```
 
+Server deployments can set the same policy without touching engine internals:
+config file `[runtime]` keys (`enable_prefix_caching`,
+`managed_prefix_cache_salt`, `max_prefix_cache_pages`) or environment variables
+(`IZWI_ENABLE_PREFIX_CACHING`, `IZWI_MANAGED_PREFIX_CACHE_SALT`,
+`IZWI_MAX_PREFIX_CACHE_PAGES`). Note that a model must also opt in through its
+cache contract: dense families (Qwen3, Gemma3, Voxtral, VibeVoice) participate,
+while hybrid families (Qwen3.5, Qwen3.8) currently declare prefix reuse
+disabled because their recurrent and convolution state has no checkpoint
+boundary for shared spans.
+
 Use a stable, non-secret namespace that changes whenever tenants or deployments
 must not share cache entries. Never reuse one namespace across mutually
 untrusted tenants. Rotate it after tokenizer, adapter, prompt-template, position,
