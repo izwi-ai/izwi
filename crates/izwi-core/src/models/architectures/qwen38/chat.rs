@@ -873,6 +873,22 @@ impl Qwen38ChatModel {
         true
     }
 
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        true
+    }
+
+    /// Conservative per-row workspace estimate for shared-step decode. Rows
+    /// advance through the scalar candle-op path, so no ragged collation
+    /// buffer beyond one hidden vector per row is required.
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        u64::try_from(self.text_model.hidden_size())
+            .ok()
+            .and_then(|hidden| hidden.checked_mul(4))
+            .ok_or_else(|| {
+                Error::Overloaded("continuous decode workspace estimate overflow".to_string())
+            })
+    }
+
     pub(crate) fn preferred_decode_tokens(&self) -> usize {
         self.mtp_policy
             .draft_tokens()
@@ -986,6 +1002,78 @@ impl Qwen38ChatModel {
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         self.decode_quantum(state, 1)
+    }
+
+    /// Advance every scheduled row by exactly one token inside one engine
+    /// step. A solo row delegates to [`Self::decode_quantum`] so scalar and
+    /// MTP speculative semantics are preserved bit-for-bit for single-user
+    /// load; multi-row batches run each row through the shared-step scalar
+    /// target path with MTP drafting disabled, because draft/verify state is
+    /// per-sequence and drafting would serialize the batch anyway.
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<Vec<ChatDecodeStep>> {
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        if states.len() == 1 {
+            return Ok(vec![self.decode_quantum(states[0], 1)?]);
+        }
+        for state in states.iter() {
+            if state.finished || state.tokens_generated >= state.max_new_tokens {
+                return Err(Error::InvalidInput(
+                    "continuous chat batch contains a terminal decode state".into(),
+                ));
+            }
+        }
+        let mut steps = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            steps.push(self.decode_shared_step_row(state)?);
+        }
+        Ok(steps)
+    }
+
+    /// One scalar target-model step for a shared-step batch row: publish any
+    /// bootstrapped token, otherwise forward the pending input token through
+    /// the candle-op physical path and sample the next token. Mirrors the
+    /// non-speculative tail of [`Self::decode_quantum`] exactly.
+    fn decode_shared_step_row(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if let Some(anchor) = state.bootstrap_token.take() {
+            let delta = self.publish_token(state, anchor)?;
+            return Ok(self.decode_step_result(state, delta, 0));
+        }
+
+        let mut input_tokens_committed = 0;
+        if let Some(pending) = state.pending_token.take() {
+            state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
+                pending,
+                [state.next_text_position; 3],
+                &mut state.text_state,
+                &mut state.physical_kv,
+            )?);
+            state.next_text_position = state.next_text_position.saturating_add(1);
+            input_tokens_committed = 1;
+        }
+
+        let history: &[u32] = if state.track_history {
+            &state.history_ids
+        } else {
+            &[]
+        };
+        let next = take_quantum_sample(
+            &mut state.unconsumed_output,
+            self.tokenizer.vocab_size,
+            &state.config,
+            history,
+            &mut state.rng,
+        )?;
+        if state.track_history {
+            state.history_ids.push(next);
+        }
+        state.pending_token = Some(next);
+        let delta = self.publish_token(state, next)?;
+        Ok(self.decode_step_result(state, delta, input_tokens_committed))
     }
 
     pub(crate) fn decode_quantum(

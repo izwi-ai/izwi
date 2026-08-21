@@ -2994,7 +2994,8 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
             Self::Gemma3(model) => model.supports_continuous_decode_batch(),
-            Self::Qwen35(_) | Self::Qwen38(_) | Self::Lfm2(_) => false,
+            Self::Qwen38(model) => model.supports_continuous_decode_batch(),
+            Self::Qwen35(_) | Self::Lfm2(_) => false,
         }
     }
 
@@ -3002,7 +3003,8 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Gemma3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
-            Self::Qwen35(_) | Self::Qwen38(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
+            Self::Qwen38(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Qwen35(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
                 "loaded chat model has no continuous decode workspace contract".to_string(),
             )),
         }
@@ -3297,7 +3299,32 @@ impl NativeChatModel {
                         .collect()
                 })
             }
-            Self::Qwen35(_) | Self::Qwen38(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
+            Self::Qwen38(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen38(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.8 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                model.decode_step_batch(&mut typed).map(|steps| {
+                    steps
+                        .into_iter()
+                        .map(|step| NativeChatDecodeStep {
+                            delta: step.delta,
+                            text: step.text,
+                            tokens_generated: step.tokens_generated,
+                            input_tokens_committed: 1,
+                            finished: step.finished,
+                        })
+                        .collect()
+                })
+            }
+            Self::Qwen35(_) | Self::Lfm2(_) => Err(Error::InvalidInput(
                 "Loaded chat model has no continuous tensor decode adapter".to_string(),
             )),
         }
