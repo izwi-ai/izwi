@@ -10,6 +10,11 @@ pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
 pub const ENV_MAX_SCHEDULER_BATCH_SIZE: &str = "IZWI_MAX_SCHEDULER_BATCH_SIZE";
+pub const ENV_ENABLE_PREFIX_CACHING: &str = "IZWI_ENABLE_PREFIX_CACHING";
+pub const ENV_MANAGED_PREFIX_CACHE_SALT: &str = "IZWI_MANAGED_PREFIX_CACHE_SALT";
+pub const ENV_MAX_PREFIX_CACHE_PAGES: &str = "IZWI_MAX_PREFIX_CACHE_PAGES";
+pub const ENV_ENABLE_CHUNKED_PREFILL: &str = "IZWI_ENABLE_CHUNKED_PREFILL";
+pub const ENV_CHUNKED_PREFILL_THRESHOLD: &str = "IZWI_CHUNKED_PREFILL_THRESHOLD";
 pub const ENV_MAX_RETAINED_SEQUENCES: &str = "IZWI_MAX_RETAINED_SEQUENCES";
 pub const ENV_MAX_STAGED_TRANSACTIONS: &str = "IZWI_MAX_STAGED_TRANSACTIONS";
 pub const ENV_MAX_QUEUED_REQUESTS: &str = "IZWI_MAX_QUEUED_REQUESTS";
@@ -33,6 +38,11 @@ pub struct ServeRuntimeConfig {
     pub backend: BackendPreference,
     pub max_batch_size: BatchSizePreference,
     pub max_scheduler_batch_size: usize,
+    pub enable_prefix_caching: bool,
+    pub managed_prefix_cache_salt: Option<String>,
+    pub max_prefix_cache_pages: usize,
+    pub enable_chunked_prefill: bool,
+    pub chunked_prefill_threshold: usize,
     pub max_retained_sequences: usize,
     pub max_staged_transactions: usize,
     pub max_queued_requests: usize,
@@ -55,6 +65,11 @@ impl Default for ServeRuntimeConfig {
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
+            enable_prefix_caching: default_enable_prefix_caching(),
+            managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
+            max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            enable_chunked_prefill: default_enable_chunked_prefill(),
+            chunked_prefill_threshold: default_chunked_prefill_threshold(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
@@ -101,6 +116,21 @@ impl ServeRuntimeConfig {
         if let Some(max_scheduler_batch_size) = overrides.max_scheduler_batch_size {
             self.max_scheduler_batch_size = max_scheduler_batch_size;
         }
+        if let Some(enable_prefix_caching) = overrides.enable_prefix_caching {
+            self.enable_prefix_caching = enable_prefix_caching;
+        }
+        if let Some(managed_prefix_cache_salt) = overrides.managed_prefix_cache_salt.as_ref() {
+            self.managed_prefix_cache_salt = Some(managed_prefix_cache_salt.clone());
+        }
+        if let Some(max_prefix_cache_pages) = overrides.max_prefix_cache_pages {
+            self.max_prefix_cache_pages = max_prefix_cache_pages;
+        }
+        if let Some(enable_chunked_prefill) = overrides.enable_chunked_prefill {
+            self.enable_chunked_prefill = enable_chunked_prefill;
+        }
+        if let Some(chunked_prefill_threshold) = overrides.chunked_prefill_threshold {
+            self.chunked_prefill_threshold = chunked_prefill_threshold;
+        }
         if let Some(max_retained_sequences) = overrides.max_retained_sequences {
             self.max_retained_sequences = max_retained_sequences;
         }
@@ -143,6 +173,11 @@ impl ServeRuntimeConfig {
             models_dir: self.models_dir.clone(),
             max_batch_size: self.max_batch_size,
             max_scheduler_batch_size: self.max_scheduler_batch_size.max(1),
+            enable_prefix_caching: self.enable_prefix_caching,
+            managed_prefix_cache_salt: self.managed_prefix_cache_salt.clone(),
+            max_prefix_cache_pages: self.max_prefix_cache_pages,
+            enable_chunked_prefill: self.enable_chunked_prefill,
+            chunked_prefill_threshold: self.chunked_prefill_threshold.max(1),
             max_retained_sequences: self.max_retained_sequences.max(1),
             max_staged_transactions: self.max_staged_transactions.max(1),
             max_queued_requests: self.max_queued_requests.max(1),
@@ -162,6 +197,11 @@ pub struct ServeRuntimeConfigOverrides {
     pub backend: Option<BackendPreference>,
     pub max_batch_size: Option<BatchSizePreference>,
     pub max_scheduler_batch_size: Option<usize>,
+    pub enable_prefix_caching: Option<bool>,
+    pub managed_prefix_cache_salt: Option<String>,
+    pub max_prefix_cache_pages: Option<usize>,
+    pub enable_chunked_prefill: Option<bool>,
+    pub chunked_prefill_threshold: Option<usize>,
     pub max_retained_sequences: Option<usize>,
     pub max_staged_transactions: Option<usize>,
     pub max_queued_requests: Option<usize>,
@@ -184,6 +224,11 @@ impl ServeRuntimeConfigOverrides {
             backend: read_env_backend(ENV_BACKEND, &[]),
             max_batch_size: read_env_batch_size(ENV_MAX_BATCH_SIZE, &[]),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
+            enable_prefix_caching: read_env_bool(ENV_ENABLE_PREFIX_CACHING, &[]),
+            managed_prefix_cache_salt: read_env_string(ENV_MANAGED_PREFIX_CACHE_SALT, &[]),
+            max_prefix_cache_pages: read_env_usize(ENV_MAX_PREFIX_CACHE_PAGES, &[]),
+            enable_chunked_prefill: read_env_bool(ENV_ENABLE_CHUNKED_PREFILL, &[]),
+            chunked_prefill_threshold: read_env_usize(ENV_CHUNKED_PREFILL_THRESHOLD, &[]),
             max_retained_sequences: read_env_usize(ENV_MAX_RETAINED_SEQUENCES, &[]),
             max_staged_transactions: read_env_usize(ENV_MAX_STAGED_TRANSACTIONS, &[]),
             max_queued_requests: read_env_usize(ENV_MAX_QUEUED_REQUESTS, &[]),
@@ -224,6 +269,26 @@ fn default_max_batch_size() -> BatchSizePreference {
 
 fn default_max_scheduler_batch_size() -> usize {
     8
+}
+
+fn default_enable_prefix_caching() -> bool {
+    false
+}
+
+fn default_managed_prefix_cache_salt() -> Option<String> {
+    None
+}
+
+fn default_max_prefix_cache_pages() -> usize {
+    128
+}
+
+fn default_enable_chunked_prefill() -> bool {
+    false
+}
+
+fn default_chunked_prefill_threshold() -> usize {
+    192
 }
 
 fn default_max_retained_sequences() -> usize {
@@ -346,6 +411,11 @@ mod tests {
         ENV_BACKEND,
         ENV_MAX_BATCH_SIZE,
         ENV_MAX_SCHEDULER_BATCH_SIZE,
+        ENV_ENABLE_PREFIX_CACHING,
+        ENV_MANAGED_PREFIX_CACHE_SALT,
+        ENV_MAX_PREFIX_CACHE_PAGES,
+        ENV_ENABLE_CHUNKED_PREFILL,
+        ENV_CHUNKED_PREFILL_THRESHOLD,
         ENV_MAX_RETAINED_SEQUENCES,
         ENV_MAX_STAGED_TRANSACTIONS,
         ENV_MAX_QUEUED_REQUESTS,
@@ -485,6 +555,42 @@ mod tests {
             ])
         );
         assert_eq!(overrides.ui_enabled, Some(false));
+        clear_env();
+    }
+
+    #[test]
+    fn env_exposes_prefix_cache_and_chunked_prefill_knobs() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+        std::env::set_var(ENV_ENABLE_PREFIX_CACHING, "true");
+        std::env::set_var(ENV_MANAGED_PREFIX_CACHE_SALT, "tenant-a");
+        std::env::set_var(ENV_MAX_PREFIX_CACHE_PAGES, "64");
+        std::env::set_var(ENV_ENABLE_CHUNKED_PREFILL, "1");
+        std::env::set_var(ENV_CHUNKED_PREFILL_THRESHOLD, "512");
+
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        let engine = resolved.engine_config();
+
+        assert!(resolved.enable_prefix_caching);
+        assert_eq!(
+            resolved.managed_prefix_cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(resolved.max_prefix_cache_pages, 64);
+        assert!(resolved.enable_chunked_prefill);
+        assert_eq!(resolved.chunked_prefill_threshold, 512);
+        assert!(engine.enable_prefix_caching);
+        assert_eq!(
+            engine.managed_prefix_cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(engine.max_prefix_cache_pages, 64);
+        assert!(engine.enable_chunked_prefill);
+        assert_eq!(engine.chunked_prefill_threshold, 512);
         clear_env();
     }
 

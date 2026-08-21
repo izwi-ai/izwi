@@ -62,6 +62,16 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_scheduler_batch_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_prefix_caching: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_prefix_cache_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prefix_cache_pages: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_chunked_prefill: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunked_prefill_threshold: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retained_sequences: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_staged_transactions: Option<usize>,
@@ -82,6 +92,11 @@ impl RuntimeConfig {
         self.backend.is_none()
             && self.max_batch_size.is_none()
             && self.max_scheduler_batch_size.is_none()
+            && self.enable_prefix_caching.is_none()
+            && self.managed_prefix_cache_salt.is_none()
+            && self.max_prefix_cache_pages.is_none()
+            && self.enable_chunked_prefill.is_none()
+            && self.chunked_prefill_threshold.is_none()
             && self.max_retained_sequences.is_none()
             && self.max_staged_transactions.is_none()
             && self.max_queued_requests.is_none()
@@ -163,6 +178,11 @@ impl Config {
                 backend: Some(defaults.backend),
                 max_batch_size: Some(defaults.max_batch_size),
                 max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
+                enable_prefix_caching: Some(defaults.enable_prefix_caching),
+                managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
+                max_prefix_cache_pages: Some(defaults.max_prefix_cache_pages),
+                enable_chunked_prefill: Some(defaults.enable_chunked_prefill),
+                chunked_prefill_threshold: Some(defaults.chunked_prefill_threshold),
                 max_retained_sequences: Some(defaults.max_retained_sequences),
                 max_staged_transactions: Some(defaults.max_staged_transactions),
                 max_queued_requests: Some(defaults.max_queued_requests),
@@ -194,6 +214,11 @@ impl Config {
             backend: self.runtime.backend,
             max_batch_size: self.runtime.max_batch_size,
             max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
+            enable_prefix_caching: self.runtime.enable_prefix_caching,
+            managed_prefix_cache_salt: self.runtime.managed_prefix_cache_salt.clone(),
+            max_prefix_cache_pages: self.runtime.max_prefix_cache_pages,
+            enable_chunked_prefill: self.runtime.enable_chunked_prefill,
+            chunked_prefill_threshold: self.runtime.chunked_prefill_threshold,
             max_retained_sequences: self.runtime.max_retained_sequences,
             max_staged_transactions: self.runtime.max_staged_transactions,
             max_queued_requests: self.runtime.max_queued_requests,
@@ -225,6 +250,21 @@ impl Config {
             }
             "runtime.max_scheduler_batch_size" => {
                 self.runtime.max_scheduler_batch_size = Some(parse_usize(value)?)
+            }
+            "runtime.enable_prefix_caching" => {
+                self.runtime.enable_prefix_caching = Some(parse_bool(value)?)
+            }
+            "runtime.managed_prefix_cache_salt" => {
+                self.runtime.managed_prefix_cache_salt = Some(parse_string(value)?)
+            }
+            "runtime.max_prefix_cache_pages" => {
+                self.runtime.max_prefix_cache_pages = Some(parse_usize(value)?)
+            }
+            "runtime.enable_chunked_prefill" => {
+                self.runtime.enable_chunked_prefill = Some(parse_bool(value)?)
+            }
+            "runtime.chunked_prefill_threshold" => {
+                self.runtime.chunked_prefill_threshold = Some(parse_usize(value)?)
             }
             "runtime.max_retained_sequences" => {
                 self.runtime.max_retained_sequences = Some(parse_usize(value)?)
@@ -287,6 +327,26 @@ impl Config {
             "runtime.max_scheduler_batch_size" => self
                 .runtime
                 .max_scheduler_batch_size
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.enable_prefix_caching" => {
+                self.runtime.enable_prefix_caching.map(toml::Value::Boolean)
+            }
+            "runtime.managed_prefix_cache_salt" => self
+                .runtime
+                .managed_prefix_cache_salt
+                .clone()
+                .map(toml::Value::String),
+            "runtime.max_prefix_cache_pages" => self
+                .runtime
+                .max_prefix_cache_pages
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.enable_chunked_prefill" => self
+                .runtime
+                .enable_chunked_prefill
+                .map(toml::Value::Boolean),
+            "runtime.chunked_prefill_threshold" => self
+                .runtime
+                .chunked_prefill_threshold
                 .map(|value| toml::Value::Integer(value as i64)),
             "runtime.max_retained_sequences" => self
                 .runtime
@@ -450,6 +510,11 @@ mod tests {
                 backend: Some(BackendPreference::Cpu),
                 max_batch_size: Some(BatchSizePreference::fixed(12).unwrap()),
                 max_scheduler_batch_size: Some(9),
+                enable_prefix_caching: Some(true),
+                managed_prefix_cache_salt: Some("tenant-a".to_string()),
+                max_prefix_cache_pages: Some(64),
+                enable_chunked_prefill: Some(true),
+                chunked_prefill_threshold: Some(256),
                 max_retained_sequences: Some(11),
                 max_staged_transactions: Some(3),
                 max_queued_requests: Some(91),
@@ -478,6 +543,14 @@ mod tests {
             Some(12)
         );
         assert_eq!(overrides.max_scheduler_batch_size, Some(9));
+        assert_eq!(overrides.enable_prefix_caching, Some(true));
+        assert_eq!(
+            overrides.managed_prefix_cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(overrides.max_prefix_cache_pages, Some(64));
+        assert_eq!(overrides.enable_chunked_prefill, Some(true));
+        assert_eq!(overrides.chunked_prefill_threshold, Some(256));
         assert_eq!(overrides.max_retained_sequences, Some(11));
         assert_eq!(overrides.max_staged_transactions, Some(3));
         assert_eq!(overrides.max_queued_requests, Some(91));

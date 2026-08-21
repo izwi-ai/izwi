@@ -505,6 +505,15 @@ pub struct EngineConfig {
     /// clamped to preserve capacity for at least one maximum-length request.
     #[serde(default = "default_max_prefix_cache_pages")]
     pub max_prefix_cache_pages: usize,
+
+    /// Enable scheduler-level chunked prefill so long prompts are admitted in
+    /// bounded token quanta instead of one monolithic prefill transaction.
+    #[serde(default = "default_enable_chunked_prefill")]
+    pub enable_chunked_prefill: bool,
+
+    /// Prompt length (tokens) above which chunked prefill applies.
+    #[serde(default = "default_chunked_prefill_threshold")]
+    pub chunked_prefill_threshold: usize,
 }
 
 impl Default for EngineConfig {
@@ -526,6 +535,8 @@ impl Default for EngineConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            enable_chunked_prefill: default_enable_chunked_prefill(),
+            chunked_prefill_threshold: default_chunked_prefill_threshold(),
         }
     }
 }
@@ -540,6 +551,14 @@ fn default_managed_prefix_cache_salt() -> Option<String> {
 
 fn default_max_prefix_cache_pages() -> usize {
     128
+}
+
+fn default_enable_chunked_prefill() -> bool {
+    false
+}
+
+fn default_chunked_prefill_threshold() -> usize {
+    192
 }
 
 fn default_models_dir() -> PathBuf {

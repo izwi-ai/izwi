@@ -1170,6 +1170,8 @@ impl RuntimeService {
             PrefixCachePolicy::Disabled => 0,
             PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
         };
+        core_config.enable_chunked_prefill = config.enable_chunked_prefill;
+        core_config.chunked_prefill_threshold = config.chunked_prefill_threshold.max(1);
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
