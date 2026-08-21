@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::models::registry::{NativeChatDecodeCheckpoint, NativeChatModel};
+use crate::models::registry::{NativeChatDecodeCheckpoint, NativeChatDecodeStep, NativeChatModel};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::ChatGenerationConfig;
 use crate::models::shared::chat::ChatMessage;
@@ -207,8 +207,14 @@ impl NativeExecutor {
                 "managed Qwen3 execution requires its exact row reservation".to_string(),
             ));
         }
+        let qwen38_chunked_prefill = self.config.enable_chunked_prefill
+            && matches!(
+                request.model_variant,
+                Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+            );
         if managed_cache.is_some()
             && scheduled.is_prefill
+            && !qwen38_chunked_prefill
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens != request.num_prompt_tokens())
         {
@@ -408,15 +414,30 @@ impl NativeExecutor {
                     })?
                 }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen38(_)) => {
+                    let chunked_first_quantum = scheduled.is_prefill
+                        && qwen38_chunked_prefill
+                        && scheduled.num_computed_tokens == 0
+                        && scheduled.num_tokens < request.num_prompt_tokens();
                     Self::run_blocking(|| {
-                        model.start_qwen38_decode_state_managed(
-                            messages,
-                            max_new_tokens,
-                            &generation_config,
-                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
-                            cache,
-                            mtp_cache.take(),
-                        )
+                        if chunked_first_quantum {
+                            model.start_qwen38_chunked_prefill_state_managed(
+                                messages,
+                                max_new_tokens,
+                                &generation_config,
+                                prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
+                                cache,
+                                mtp_cache.take(),
+                            )
+                        } else {
+                            model.start_qwen38_decode_state_managed(
+                                messages,
+                                max_new_tokens,
+                                &generation_config,
+                                prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
+                                cache,
+                                mtp_cache.take(),
+                            )
+                        }
                     })?
                 }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
@@ -466,8 +487,31 @@ impl NativeExecutor {
                 request.id.clone(),
             )));
         }
-        let step =
-            Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?;
+        let chunked_prefill_quantum = scheduled.is_prefill && qwen38_chunked_prefill;
+        let chunked_span_tokens = chunked_prefill_quantum.then_some(scheduled.num_tokens);
+        let step = if chunked_prefill_quantum {
+            let span_end = scheduled
+                .num_computed_tokens
+                .saturating_add(scheduled.num_tokens);
+            Self::run_blocking(|| {
+                model.continue_qwen38_chunked_prefill(
+                    &mut active_state.state,
+                    messages,
+                    &generation_config,
+                    prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
+                    span_end,
+                )
+            })?;
+            NativeChatDecodeStep {
+                delta: String::new(),
+                text: String::new(),
+                tokens_generated: active_state.last_tokens_generated,
+                input_tokens_committed: scheduled.num_tokens,
+                finished: false,
+            }
+        } else {
+            Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?
+        };
         if request.is_cancelled() {
             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                 request.id.clone(),
@@ -504,7 +548,9 @@ impl NativeExecutor {
             }
         }
 
-        let tokens_processed = if scheduled.is_prefill {
+        let tokens_processed = if let Some(span_tokens) = chunked_span_tokens {
+            span_tokens
+        } else if scheduled.is_prefill {
             request.num_prompt_tokens()
         } else {
             step.input_tokens_committed

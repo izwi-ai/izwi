@@ -3116,6 +3116,55 @@ impl NativeChatModel {
         }
     }
 
+    pub(crate) fn start_qwen38_chunked_prefill_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen38PreparedPrompt>,
+        target_cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen38(model) => Ok(NativeChatDecodeState::Qwen38(
+                model.begin_chunked_prefill_state_physical(
+                    messages,
+                    max_new_tokens,
+                    config,
+                    prepared,
+                    target_cache,
+                    mtp_cache,
+                )?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.8 chunked-prefill state was routed to another model family".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn continue_qwen38_chunked_prefill(
+        &self,
+        state: &mut NativeChatDecodeState,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen38PreparedPrompt>,
+        span_end: usize,
+    ) -> Result<bool> {
+        let NativeChatDecodeState::Qwen38(state) = state else {
+            return Err(Error::InvalidInput(
+                "managed Qwen3.8 chunked prefill was routed to another model family".into(),
+            ));
+        };
+        match self {
+            Self::Qwen38(model) => {
+                model.continue_chunked_prefill_physical(state, messages, config, prepared, span_end)
+            }
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.8 chunked prefill was routed to another model family".into(),
+            )),
+        }
+    }
+
     pub(crate) fn start_gemma3_decode_state_managed(
         &self,
         messages: &[ChatMessage],

@@ -597,6 +597,8 @@ pub struct WorkerConfig {
     pub max_tensor_batch_size: usize,
     /// Exact model variants enabled for static tensor execution on this worker.
     pub static_tensor_batch_variants: Arc<HashSet<ModelVariant>>,
+    /// Opt-in scheduler-level chunked prefill for resumable-prefill models.
+    pub enable_chunked_prefill: bool,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -651,6 +653,7 @@ impl Default for WorkerConfig {
             resource_authority: None,
             max_tensor_batch_size: 1,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
+            enable_chunked_prefill: false,
         }
     }
 }
@@ -683,6 +686,7 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             resource_authority: None,
             max_tensor_batch_size,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
+            enable_chunked_prefill: config.enable_chunked_prefill,
         }
     }
 }
@@ -1446,7 +1450,19 @@ impl ModelExecutor for NativeExecutor {
             && (!matches!(request.task_type, super::types::TaskType::ASR) || request.streaming)
         {
             profile.mode = ExecutionMode::Sequence;
-            profile.prefill = PrefillMode::Full;
+            // Scheduler-level chunked prefill is opt-in and currently
+            // supported by the Qwen3.8 span-resumable prefill path only;
+            // everything else keeps the monolithic full-prompt quantum.
+            profile.prefill = if self.config.enable_chunked_prefill
+                && matches!(request.task_type, super::types::TaskType::Chat)
+                && matches!(
+                    request.model_variant,
+                    Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+                ) {
+                PrefillMode::Incremental
+            } else {
+                PrefillMode::Full
+            };
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
@@ -2244,6 +2260,47 @@ mod tests {
 
         let params = NativeExecutor::to_tts_params(&request);
         assert_eq!(params.max_frames, ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES);
+    }
+
+    #[test]
+    fn chunked_prefill_classification_is_opt_in_and_qwen38_only() {
+        let mut request = EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::User,
+            content: "chunk me".to_string(),
+        }]);
+        request.model_variant = Some(ModelVariant::Qwen3827BFp8);
+        request.streaming = true;
+
+        let default_executor = NativeExecutor::new(WorkerConfig::default());
+        assert_eq!(
+            default_executor
+                .execution_profile(&request)
+                .unwrap()
+                .prefill,
+            PrefillMode::Full
+        );
+
+        let chunking_executor = NativeExecutor::new(WorkerConfig {
+            enable_chunked_prefill: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            chunking_executor
+                .execution_profile(&request)
+                .unwrap()
+                .prefill,
+            PrefillMode::Incremental
+        );
+
+        // Sibling hybrid without a resumable prefill path stays full.
+        request.model_variant = Some(ModelVariant::Qwen3508BGguf);
+        assert_eq!(
+            chunking_executor
+                .execution_profile(&request)
+                .unwrap()
+                .prefill,
+            PrefillMode::Full
+        );
     }
 
     #[test]

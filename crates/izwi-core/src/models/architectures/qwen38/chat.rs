@@ -295,6 +295,9 @@ pub struct ChatDecodeState {
     max_new_tokens: usize,
     finished: bool,
     next_text_position: usize,
+    /// Prompt tokens committed by scheduler-level chunked prefill so far.
+    /// Equals the prompt length once prefill completed.
+    prefill_progress: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
     draft_rng: SimpleRng,
@@ -1093,6 +1096,7 @@ impl Qwen38ChatModel {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared.next_text_position,
+            prefill_progress: prepared.prompt_ids.len(),
             config: config.clone(),
             rng,
             draft_rng,
@@ -1101,6 +1105,179 @@ impl Qwen38ChatModel {
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         self.decode_quantum(state, 1)
+    }
+
+    /// Create a decode state with an empty physical reservation and no
+    /// prefill progress. Prompt spans are appended by
+    /// [`Self::continue_chunked_prefill_physical`] under scheduler control.
+    pub(crate) fn begin_chunked_prefill_state_physical(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen38PreparedPrompt>,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<ChatDecodeState> {
+        let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        if prepared.prompt_ids.is_empty()
+            || cache.context_len() != 0
+            || mtp_cache.as_ref().is_some_and(|mtp| mtp.context_len() != 0)
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 chunked prefill requires a non-empty prompt and an empty reservation"
+                    .into(),
+            ));
+        }
+        if self.mtp_head.is_some() != mtp_cache.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3.8 chunked prefill MTP policy does not match its cache reservation".into(),
+            ));
+        }
+        let track_history =
+            config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let history_ids =
+            initial_penalty_history(&prepared.prompt_ids, max_new_tokens, track_history);
+        let mut rng = SimpleRng::new(config.seed);
+        let draft_rng = rng.fork();
+        Ok(ChatDecodeState {
+            text_state: self.text_model.new_state(),
+            physical_kv: cache,
+            mtp_physical_kv: mtp_cache,
+            mtp_anchor_hidden: None,
+            bootstrap_token: None,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: None,
+            history_ids,
+            decoder: IncrementalDecoder::new(true),
+            tokens_generated: 0,
+            track_history,
+            assembled: String::new(),
+            max_new_tokens: max_new_tokens.max(1),
+            finished: false,
+            next_text_position: prepared.next_text_position,
+            prefill_progress: 0,
+            config: config.clone(),
+            rng,
+            draft_rng,
+        })
+    }
+
+    /// Prefill the next scheduler-owned prompt span
+    /// `[state.prefill_progress, span_end)` into the state's physical cache.
+    /// Returns `true` when the prompt completed and the decode quantum is
+    /// seeded (logits or MTP bootstrap) exactly like the monolithic path;
+    /// returns `false` when more spans remain.
+    pub(crate) fn continue_chunked_prefill_physical(
+        &self,
+        state: &mut ChatDecodeState,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen38PreparedPrompt>,
+        span_end: usize,
+    ) -> Result<bool> {
+        let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        let total = prepared.prompt_ids.len();
+        let start = state.prefill_progress;
+        if start >= total {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 chunked prefill already completed for this session".into(),
+            ));
+        }
+        if span_end <= start || span_end > total {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.8 chunked prefill span [{start},{span_end}) is outside the remaining prompt of {total} tokens"
+            )));
+        }
+        if state.physical_kv.context_len() != start {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.8 chunked prefill cache holds {} tokens but the next span starts at {start}",
+                state.physical_kv.context_len()
+            )));
+        }
+        let compute_logits = span_end == total;
+        let output = self.text_model.prefill_token_ids_with_hidden_physical(
+            &prepared.prompt_ids[start..span_end],
+            &prepared.prompt_positions[start..span_end],
+            &mut state.text_state,
+            &mut state.physical_kv,
+            compute_logits,
+        )?;
+        let output = output.ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 chunked prefill span produced no output".into())
+        })?;
+        // Feed known-successor MTP pairs for the span exactly like the
+        // monolithic prefill loop; the final anchor pair is seeded below.
+        if let Some((head, mtp_cache)) = match (&self.mtp_head, state.mtp_physical_kv.as_mut()) {
+            (Some(head), Some(mtp_cache)) => Some((head, mtp_cache)),
+            _ => None,
+        } {
+            let known_rows = known_mtp_rows(start, span_end, total);
+            if known_rows > 0 {
+                let embeddings = self
+                    .text_model
+                    .embed_token_ids(&prepared.prompt_ids[start + 1..start + 1 + known_rows])?;
+                let predecessor_hidden = output.hidden_states.narrow(1, 0, known_rows)?;
+                let pairs = Qwen38MtpPairBatch::new(
+                    embeddings,
+                    predecessor_hidden,
+                    prepared.prompt_positions[start..start + known_rows].to_vec(),
+                )?;
+                head.forward_pairs(&pairs, mtp_cache)?;
+            }
+        }
+        if !compute_logits {
+            state.prefill_progress = span_end;
+            return Ok(false);
+        }
+
+        let logits = output.logits.ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 chunked prefill completion produced no logits".into())
+        })?;
+        let final_target_hidden =
+            output
+                .hidden_states
+                .narrow(1, output.hidden_states.dim(1)?.saturating_sub(1), 1)?;
+        match (&self.mtp_head, state.mtp_physical_kv.as_mut()) {
+            (Some(head), Some(mtp_cache)) => {
+                let history: &[u32] = if state.track_history {
+                    &state.history_ids
+                } else {
+                    &[]
+                };
+                let anchor = sample_next_token(
+                    &logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?;
+                if state.track_history {
+                    state.history_ids.push(anchor);
+                }
+                let anchor_embedding = self.text_model.embed_token_ids(&[anchor])?;
+                let pairs = Qwen38MtpPairBatch::single(
+                    anchor_embedding,
+                    final_target_hidden,
+                    *prepared.prompt_positions.last().ok_or_else(|| {
+                        Error::InferenceError(
+                            "Qwen3.8 chunked prefill has no final prompt position".into(),
+                        )
+                    })?,
+                )?;
+                let hidden = head.forward_pairs(&pairs, mtp_cache)?;
+                state.mtp_anchor_hidden = Some(hidden);
+                state.bootstrap_token = Some(anchor);
+                state.pending_token = Some(anchor);
+            }
+            (None, None) => {
+                state.unconsumed_output = Some(logits);
+            }
+            _ => unreachable!("Qwen3.8 chunked prefill cache/head consistency changed"),
+        }
+        state.prefill_progress = total;
+        Ok(true)
     }
 
     /// Advance every scheduled row by exactly one token inside one engine
