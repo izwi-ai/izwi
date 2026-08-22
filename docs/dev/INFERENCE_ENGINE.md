@@ -397,7 +397,12 @@ Each decode step:
 
 ### 6.3 Chunked Prefill
 
-When `enable_chunked_prefill = true`, long prompts are split into chunks of at most `max_num_batched_tokens` tokens. This allows the scheduler to interleave prefill chunks with decode steps, reducing time-to-first-token for concurrent requests.
+When `enable_chunked_prefill = true`, long prompts for models with
+span-resumable prefill (currently Qwen3.8 chat) are split into chunks of at
+most `chunked_prefill_threshold` tokens (adaptive under decode demand). This
+allows the scheduler to interleave prefill chunks with decode steps, reducing
+time-to-first-token for concurrent requests. The flag is exposed to operators
+via TOML/env (`IZWI_ENABLE_CHUNKED_PREFILL`, `IZWI_CHUNKED_PREFILL_THRESHOLD`).
 
 ---
 
