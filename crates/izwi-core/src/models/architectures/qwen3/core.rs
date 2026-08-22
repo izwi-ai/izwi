@@ -3753,6 +3753,38 @@ mod tests {
     }
 
     #[test]
+    fn managed_qwen3_chunked_prefill_matches_monolithic_final_logits() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let (full_arena, full_bindings) = test_managed_arena();
+        let (chunk_arena, chunk_bindings) = test_managed_arena();
+        let mut full_cache = test_managed_cache(full_arena, full_bindings, 0);
+        let mut chunk_cache = test_managed_cache(chunk_arena, chunk_bindings, 0);
+        let full_prompt = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &device).unwrap();
+        let first_chunk = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
+        let final_chunk = Tensor::from_vec(vec![2u32, 3], (1, 2), &device).unwrap();
+
+        let full = model
+            .forward_managed(&full_prompt, 0, &mut full_cache)
+            .unwrap();
+        model
+            .forward_managed(&first_chunk, 0, &mut chunk_cache)
+            .unwrap();
+        let chunked = model
+            .forward_managed(&final_chunk, 2, &mut chunk_cache)
+            .unwrap();
+
+        assert_tensor_close(
+            &full.narrow(1, 3, 1).unwrap(),
+            &chunked.narrow(1, 1, 1).unwrap(),
+        );
+        assert_eq!(full_cache.context_len(), 4);
+        assert_eq!(chunk_cache.context_len(), 4);
+        assert_eq!(full_cache.take_completed_writes().len(), 1);
+        assert_eq!(chunk_cache.take_completed_writes().len(), 2);
+    }
+
+    #[test]
     fn managed_qwen3_caller_embeddings_match_token_prefill() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);

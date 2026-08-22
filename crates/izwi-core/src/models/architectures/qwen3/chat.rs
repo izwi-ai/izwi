@@ -47,6 +47,9 @@ pub struct ChatDecodeState {
     /// next decode quantum consumes exactly this token, keeping physical KV
     /// progress aligned with the scheduler's input range.
     pending_token: Option<u32>,
+    /// Scheduler-visible prompt cursor. This stays logical even when a final
+    /// first span reuses an engine-owned physical prefix.
+    prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
     assembled: String,
@@ -59,6 +62,7 @@ pub(crate) struct ChatDecodeCheckpoint {
     unconsumed_output: Option<Tensor>,
     pos: usize,
     pending_token: Option<u32>,
+    prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
     assembled: String,
@@ -66,6 +70,10 @@ pub(crate) struct ChatDecodeCheckpoint {
 }
 
 impl ChatDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
     pub fn uses_managed_kv(&self) -> bool {
         true
     }
@@ -107,6 +115,7 @@ impl ChatDecodeState {
             unconsumed_output: self.unconsumed_output.clone(),
             pos: self.pos,
             pending_token: self.pending_token,
+            prefill_progress: self.prefill_progress,
             generated_ids: self.generated_ids.clone(),
             sampler: self.sampler.clone(),
             assembled: self.assembled.clone(),
@@ -120,6 +129,7 @@ impl ChatDecodeState {
         self.unconsumed_output = checkpoint.unconsumed_output;
         self.pos = checkpoint.pos;
         self.pending_token = checkpoint.pending_token;
+        self.prefill_progress = checkpoint.prefill_progress;
         self.generated_ids = checkpoint.generated_ids;
         self.sampler = checkpoint.sampler;
         self.assembled = checkpoint.assembled;
@@ -394,36 +404,104 @@ impl Qwen3ChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        mut cache: PhysicalPagedKvCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        let text_model = &self.text_model;
         let prompt_ids = self.build_prompt(messages)?;
-        let reused_prefix_tokens = cache.context_len();
-        if reused_prefix_tokens >= prompt_ids.len() {
+        let mut state =
+            self.begin_resumable_prefill_managed(&prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, &prompt_ids, 0, prompt_ids.len())?;
+        Ok(state)
+    }
+
+    pub(crate) fn begin_resumable_prefill_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if prompt_ids.is_empty() || cache.context_len() >= prompt_ids.len() {
             return Err(Error::InvalidInput(
-                "Qwen3 managed chat prefill must retain at least one private prompt token"
-                    .to_string(),
+                "Qwen3 resumable prefill requires at least one private prompt token".into(),
             ));
         }
-        let suffix = prompt_ids[reused_prefix_tokens..].to_vec();
-        let input_ids = Tensor::from_vec(
-            suffix,
-            (1, prompt_ids.len() - reused_prefix_tokens),
-            &self.device.device,
-        )?;
-        let embeds = text_model.forward_managed(&input_ids, reused_prefix_tokens, &mut cache)?;
-        let pos = prompt_ids.len();
+        let pos = cache.context_len();
         Ok(ChatDecodeState {
             cache,
-            unconsumed_output: Some(embeds),
+            unconsumed_output: None,
             pos,
             pending_token: None,
+            prefill_progress: 0,
             generated_ids: Vec::new(),
             sampler: ChatSampler::new(config.clone(), &prompt_ids),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
         })
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.prefill_progress != span_start
+            || span_start >= span_end
+            || span_end > prompt_ids.len()
+            || state.finished
+            || state.unconsumed_output.is_some()
+            || state.pending_token.is_some()
+            || !state.generated_ids.is_empty()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and prompt length {}",
+                state.prefill_progress,
+                prompt_ids.len()
+            )));
+        }
+        let physical_start = state.cache.context_len();
+        let final_first_span = span_start == 0 && span_end == prompt_ids.len();
+        if state.pos != physical_start
+            || (!final_first_span && physical_start != span_start)
+            || (final_first_span && physical_start >= span_end)
+        {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"
+            )));
+        }
+        let input_ids = Tensor::from_slice(
+            &prompt_ids[physical_start..span_end],
+            (1, span_end - physical_start),
+            &self.device.device,
+        )?;
+        let complete = span_end == prompt_ids.len();
+        let output = if complete {
+            Some(
+                self.text_model
+                    .forward_managed(&input_ids, physical_start, &mut state.cache)?,
+            )
+        } else {
+            let embeds = self.text_model.embeddings(&input_ids)?;
+            self.text_model.forward_managed_hidden_with_embeds(
+                &embeds,
+                physical_start,
+                &mut state.cache,
+                None,
+            )?;
+            None
+        };
+        if state.cache.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 resumable prefill committed physical cursor {} instead of {span_end}",
+                state.cache.context_len()
+            )));
+        }
+        state.pos = span_end;
+        state.prefill_progress = span_end;
+        state.unconsumed_output = output;
+        Ok(complete)
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {

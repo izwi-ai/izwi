@@ -1121,6 +1121,38 @@ mod tests {
     }
 
     #[test]
+    fn chunked_physical_prefill_matches_monolithic_final_logits() {
+        let mut config = tiny_config();
+        config.sliding_window = 8;
+        let model = Gemma3PhysicalModel::load(
+            config.clone(),
+            VarBuilder::from_tensors(tiny_weights(&config), DType::F32, &Device::Cpu),
+        )
+        .unwrap();
+        let mut full_cache = tiny_cache(&config);
+        let mut chunk_cache = tiny_cache(&config);
+        let full_prompt = Tensor::from_vec(vec![1u32, 7, 3, 11], (1, 4), &Device::Cpu).unwrap();
+        let first_chunk = Tensor::from_vec(vec![1u32, 7], (1, 2), &Device::Cpu).unwrap();
+        let final_chunk = Tensor::from_vec(vec![3u32, 11], (1, 2), &Device::Cpu).unwrap();
+
+        let full = model
+            .forward_physical(&full_prompt, 0, &mut full_cache)
+            .unwrap();
+        model
+            .forward_physical(&first_chunk, 0, &mut chunk_cache)
+            .unwrap();
+        let chunked = model
+            .forward_physical(&final_chunk, 2, &mut chunk_cache)
+            .unwrap();
+
+        assert_close(&full, &chunked);
+        assert_eq!(full_cache.context_len(), 4);
+        assert_eq!(chunk_cache.context_len(), 4);
+        assert_eq!(full_cache.take_completed_writes().len(), 1);
+        assert_eq!(chunk_cache.take_completed_writes().len(), 2);
+    }
+
+    #[test]
     fn physical_pages_match_dependency_cache_across_local_and_global_layers() {
         let config = tiny_config();
         let weights = tiny_weights(&config);

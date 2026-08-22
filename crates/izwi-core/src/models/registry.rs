@@ -3027,7 +3027,7 @@ impl NativeChatModel {
     /// on the same managed decode state. Incremental decode alone does not
     /// imply this stronger prefill safe-point contract.
     pub fn supports_resumable_prefill(&self) -> bool {
-        matches!(self, Self::Qwen38(_))
+        matches!(self, Self::Qwen3(_) | Self::Qwen38(_) | Self::Gemma3(_))
     }
 
     /// Whether one continuous model call executes all live rows through a
@@ -3137,10 +3137,19 @@ impl NativeChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         prepared: Option<&NativeChatPreparedPrompt>,
+        prompt_ids: &[u32],
         target_cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<NativeChatDecodeState> {
         match self {
+            Self::Qwen3(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
+                NativeChatDecodeState::Qwen3(model.begin_resumable_prefill_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    target_cache,
+                )?),
+            ),
             Self::Qwen38(model) => {
                 let prepared = match prepared {
                     Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
@@ -3151,6 +3160,12 @@ impl NativeChatModel {
                     })?),
                     None => None,
                 };
+                if prepared.is_some_and(|prepared| prepared.prompt_ids() != prompt_ids) {
+                    return Err(Error::InvalidInput(
+                        "resumable prefill prepared artifact disagrees with sealed prompt tokens"
+                            .into(),
+                    ));
+                }
                 Ok(NativeChatDecodeState::Qwen38(
                     model.begin_chunked_prefill_state_physical(
                         messages,
@@ -3162,8 +3177,16 @@ impl NativeChatModel {
                     )?,
                 ))
             }
+            Self::Gemma3(model) if prepared.is_none() && mtp_cache.is_none() => Ok(
+                NativeChatDecodeState::Gemma3(model.begin_resumable_prefill_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    target_cache,
+                )?),
+            ),
             _ => Err(Error::InvalidInput(
-                "chat model does not support resumable managed prefill".into(),
+                "chat model or prepared state does not support resumable managed prefill".into(),
             )),
         }
     }
@@ -3174,17 +3197,24 @@ impl NativeChatModel {
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
         prepared: Option<&NativeChatPreparedPrompt>,
+        prompt_ids: &[u32],
         span_start: usize,
         span_end: usize,
         prompt_tokens: usize,
     ) -> Result<bool> {
-        let NativeChatDecodeState::Qwen38(state) = state else {
-            return Err(Error::InvalidInput(
-                "resumable prefill state does not match the loaded chat model".into(),
-            ));
-        };
-        match self {
-            Self::Qwen38(model) => {
+        if prompt_ids.len() != prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "resumable prefill sealed {} prompt ids but scheduled {prompt_tokens}",
+                prompt_ids.len()
+            )));
+        }
+        let complete = match (self, state) {
+            (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) if prepared.is_none() => {
+                let complete =
+                    model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
                 let prepared = match prepared {
                     Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
                         Error::InvalidInput(
@@ -3194,6 +3224,12 @@ impl NativeChatModel {
                     })?),
                     None => None,
                 };
+                if prepared.is_some_and(|prepared| prepared.prompt_ids() != prompt_ids) {
+                    return Err(Error::InvalidInput(
+                        "resumable prefill prepared artifact disagrees with sealed prompt tokens"
+                            .into(),
+                    ));
+                }
                 let complete = model.continue_chunked_prefill_physical(
                     state,
                     messages,
@@ -3203,24 +3239,31 @@ impl NativeChatModel {
                     span_end,
                     prompt_tokens,
                 )?;
-                if state.prefill_progress() != span_end {
-                    return Err(Error::InferenceError(format!(
-                        "resumable prefill committed cursor {} instead of {span_end}",
-                        state.prefill_progress()
-                    )));
-                }
-                if complete != (span_end == prompt_tokens) {
-                    return Err(Error::InferenceError(
-                        "resumable prefill completion disagrees with the sealed prompt length"
-                            .into(),
-                    ));
-                }
-                Ok(complete)
+                (complete, state.prefill_progress())
             }
-            _ => Err(Error::InvalidInput(
-                "chat model does not support resumable managed prefill".into(),
-            )),
+            (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) if prepared.is_none() => {
+                let complete =
+                    model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            _ => {
+                return Err(Error::InvalidInput(
+                    "resumable prefill state does not match the loaded chat model".into(),
+                ))
+            }
+        };
+        if complete.1 != span_end {
+            return Err(Error::InferenceError(format!(
+                "resumable prefill committed cursor {} instead of {span_end}",
+                complete.1
+            )));
         }
+        if complete.0 != (span_end == prompt_tokens) {
+            return Err(Error::InferenceError(
+                "resumable prefill completion disagrees with the sealed prompt length".into(),
+            ));
+        }
+        Ok(complete.0)
     }
 
     pub(crate) fn start_gemma3_decode_state_managed(

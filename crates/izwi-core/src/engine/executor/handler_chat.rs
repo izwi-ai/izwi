@@ -462,6 +462,7 @@ impl NativeExecutor {
                             max_new_tokens,
                             &generation_config,
                             prepared_chat_prompt,
+                            &request.prompt_tokens,
                             cache,
                             mtp_cache.take(),
                         )
@@ -548,6 +549,7 @@ impl NativeExecutor {
                     messages,
                     &generation_config,
                     prepared_chat_prompt,
+                    &request.prompt_tokens,
                     span_start,
                     span_end,
                     request.num_prompt_tokens(),

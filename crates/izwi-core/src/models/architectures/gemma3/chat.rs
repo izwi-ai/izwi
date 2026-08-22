@@ -40,6 +40,9 @@ pub struct ChatDecodeState {
     unconsumed_logits: Option<Tensor>,
     position: usize,
     pending_token: Option<u32>,
+    /// Scheduler-visible prompt cursor, separate from a reused physical
+    /// prefix position on a final first span.
+    prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
     assembled: String,
@@ -53,6 +56,7 @@ pub(crate) struct ChatDecodeCheckpoint {
     unconsumed_logits: Option<Tensor>,
     position: usize,
     pending_token: Option<u32>,
+    prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
     assembled: String,
@@ -61,6 +65,10 @@ pub(crate) struct ChatDecodeCheckpoint {
 }
 
 impl ChatDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
     pub(crate) fn install_physical_reservation(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -93,6 +101,7 @@ impl ChatDecodeState {
             unconsumed_logits: self.unconsumed_logits.clone(),
             position: self.position,
             pending_token: self.pending_token,
+            prefill_progress: self.prefill_progress,
             generated_ids: self.generated_ids.clone(),
             sampler: self.sampler.clone(),
             assembled: self.assembled.clone(),
@@ -107,6 +116,7 @@ impl ChatDecodeState {
         self.unconsumed_logits = checkpoint.unconsumed_logits;
         self.position = checkpoint.position;
         self.pending_token = checkpoint.pending_token;
+        self.prefill_progress = checkpoint.prefill_progress;
         self.generated_ids = checkpoint.generated_ids;
         self.sampler = checkpoint.sampler;
         self.assembled = checkpoint.assembled;
@@ -615,34 +625,34 @@ impl Gemma3ChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        mut cache: PhysicalPagedKvCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let prompt_ids = self.build_prompt(messages)?;
-        if prompt_ids.is_empty() {
+        let mut state =
+            self.begin_resumable_prefill_managed(&prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, &prompt_ids, 0, prompt_ids.len())?;
+        Ok(state)
+    }
+
+    pub(crate) fn begin_resumable_prefill_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if prompt_ids.is_empty() || cache.context_len() >= prompt_ids.len() {
             return Err(Error::InvalidInput(
-                "Gemma prompt produced no tokens".to_string(),
+                "Gemma resumable prefill requires at least one private prompt token".into(),
             ));
         }
-        let reused_prefix = cache.context_len();
-        if reused_prefix >= prompt_ids.len() {
-            return Err(Error::InvalidInput(
-                "Gemma physical prefill must retain at least one private prompt token".into(),
-            ));
-        }
-        let private_prompt = &prompt_ids[reused_prefix..];
-        let input = Tensor::from_slice(
-            private_prompt,
-            (1, private_prompt.len()),
-            &self.device.device,
-        )?;
-        let logits = self
-            .text_model
-            .forward_physical(&input, reused_prefix, &mut cache)?;
+        let position = cache.context_len();
         Ok(ChatDecodeState {
             cache,
-            unconsumed_logits: Some(logits),
-            position: prompt_ids.len(),
+            unconsumed_logits: None,
+            position,
             pending_token: None,
+            prefill_progress: 0,
             generated_ids: Vec::new(),
             sampler: ChatSampler::new(config.clone(), &prompt_ids),
             assembled: String::new(),
@@ -650,6 +660,60 @@ impl Gemma3ChatModel {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
         })
+    }
+
+    pub(crate) fn continue_resumable_prefill(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.prefill_progress != span_start
+            || span_start >= span_end
+            || span_end > prompt_ids.len()
+            || state.finished
+            || state.unconsumed_logits.is_some()
+            || state.pending_token.is_some()
+            || !state.generated_ids.is_empty()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Gemma resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and prompt length {}",
+                state.prefill_progress,
+                prompt_ids.len()
+            )));
+        }
+        let physical_start = state.cache.context_len();
+        let final_first_span = span_start == 0 && span_end == prompt_ids.len();
+        if state.position != physical_start
+            || (!final_first_span && physical_start != span_start)
+            || (final_first_span && physical_start >= span_end)
+        {
+            return Err(Error::InferenceError(format!(
+                "Gemma resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"
+            )));
+        }
+        let input = Tensor::from_slice(
+            &prompt_ids[physical_start..span_end],
+            (1, span_end - physical_start),
+            &self.device.device,
+        )?;
+        let logits = self
+            .text_model
+            .forward_physical(&input, physical_start, &mut state.cache)?;
+        if state.cache.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Gemma resumable prefill committed physical cursor {} instead of {span_end}",
+                state.cache.context_len()
+            )));
+        }
+        state.position = span_end;
+        state.prefill_progress = span_end;
+        let complete = span_end == prompt_ids.len();
+        if complete {
+            state.unconsumed_logits = Some(logits);
+        }
+        Ok(complete)
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
