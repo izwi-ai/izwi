@@ -283,7 +283,7 @@ Key `SchedulerConfig` parameters (all tunable via `EngineCoreConfig`):
 | `max_batch_size` | 8 | Maximum logical rows scheduled per step |
 | `max_tokens_per_step` | 384 | Token budget per scheduler step |
 | `max_seq_len` | model-dependent | Maximum sequence length |
-| `enable_chunked_prefill` | false | Split long prefills across steps (opt-in; Qwen3.8 chat only) |
+| `enable_chunked_prefill` | false | Split long chat prefills across scheduler steps (opt-in) |
 Physical managed-cache capacity is enforced during transactional batch
 preparation. Work that cannot reserve its pages is deferred without creating a
 second scheduler-side block table. VAD-triggered interruption remains separate
@@ -297,16 +297,17 @@ UnifiedExecutor
         └── NativeExecutor   (current concrete implementation)
 ```
 
-**Continuous chat decode semantics.** The continuous stage dispatches N chat
-rows inside one engine step, but the per-row execution path is model-family
-specific. Dense families (Qwen3, Gemma3) run fused stacked-tensor attention
-through the paged-attention arena batch APIs. Hybrid families (Qwen3.8) run
-each row through its scalar candle-op forward within the shared step — one
-token per row per step — and disable MTP drafting for any session that has
-participated in a multi-row step, because the speculative head's cache stops
-tracking the target sequence across shared steps. `tensor_continuous_multirow_batches_total`
-therefore certifies co-scheduled rows, not fused kernels; use per-family
-evidence manifests before claiming kernel-level batching for a model.
+**Continuous chat decode semantics.** Qwen3, Qwen3.5, Qwen3.8, LFM2, and
+Gemma3 expose retained scheduler-owned state and a tensor-continuous adapter.
+Dense families share stacked projections and ragged paged attention. Hybrid
+families additionally partition recurrent state per row while sharing their
+compatible projections, MLPs, and attention calls. Sampling policy and RNG
+remain request-owned after the shared tensor forward. Qwen3.8 MTP remains a
+solo-row optimization; a multi-row transaction uses the target model's batched
+decode path. `tensor_continuous_multirow_batches_total` proves physical
+multi-row dispatch, while model call counters distinguish true model batching
+from scalar-envelope fallback. Retained exact-SHA evidence is still required
+before making backend-specific throughput claims.
 
 `UnifiedExecutor` provides an async-safe wrapper around any `ModelExecutor` implementation. `NativeExecutor` is the current concrete backend and manages per-task decode state:
 
@@ -397,9 +398,10 @@ Each decode step:
 
 ### 6.3 Chunked Prefill
 
-When `enable_chunked_prefill = true`, long prompts for models with
-span-resumable prefill (currently Qwen3.8 chat) are split into chunks of at
-most `chunked_prefill_threshold` tokens (adaptive under decode demand). This
+When `enable_chunked_prefill = true`, long prompts for chat models with an
+explicit span-resumable contract (Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma3)
+are split into chunks of at most `chunked_prefill_threshold` tokens (adaptive
+under decode demand). This
 allows the scheduler to interleave prefill chunks with decode steps, reducing
 time-to-first-token for concurrent requests. The flag is exposed to operators
 via TOML/env (`IZWI_ENABLE_CHUNKED_PREFILL`, `IZWI_CHUNKED_PREFILL_THRESHOLD`).

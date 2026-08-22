@@ -113,7 +113,8 @@ The protected workflow runs this stricter check separately from broad family
 coverage so generic Candle CUDA execution is not mislabeled as an optimized
 custom kernel.
 
-Continuous batching uses a dedicated concurrent Qwen3/Gemma manifest. The
+Continuous batching uses a dedicated concurrent manifest covering Qwen3,
+Qwen3.5, Qwen3.8, LFM2, and Gemma. The
 certificate rejects missing run-local multi-row continuous batches, zero work,
 width below two, or physical-batch rejections:
 
@@ -128,6 +129,31 @@ scripts/bench/validate-gpu-evidence-certificate.sh \
   --backend cuda --expected-git-sha "$git_sha" \
   --require-continuous-batch-evidence
 ```
+
+Chunked-prefill certification is separate because concurrency alone does not
+prove that one prompt crossed a resumable safe point. Start the exact-SHA
+server with chunked prefill enabled, then require every model case to report
+more prefill spans than completed samples:
+
+```bash
+scripts/bench/run-cuda-model-evidence.sh \
+  --manifest benchmarks/manifests/cuda-resumable-prefill.toml \
+  --require-resumable-prefill-evidence \
+  --output target/cuda-resumable-prefill-evidence
+scripts/bench/validate-gpu-evidence-certificate.sh \
+  --certificate target/cuda-resumable-prefill-evidence/certificate.json \
+  --backend cuda --expected-git-sha "$git_sha" \
+  --require-resumable-prefill-evidence
+```
+
+These manifests establish runtime behavior, not universal performance. Retain
+separate CPU, Apple Silicon, and NVIDIA before/after runs with the same model
+revision, prompt matrix, sampling policy, and concurrency. Promotion requires
+no quality regression and reviewed TTFT, inter-token latency, throughput,
+memory, host-read, metadata-upload, batch-width, and padding deltas for the
+exact hardware cell. CUDA-only custom Qwen3.8 kernels remain default-off until
+their own NVIDIA profile evidence passes; source compatibility with Qwen3.5
+does not qualify them for cross-family promotion.
 
 The ignored native CUDA GQA oracle fails if explicitly run without CUDA or if
 the observed provider is not `cuda_native`:

@@ -11,6 +11,7 @@ git_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 help=$($validator --help)
 grep -q 'Unsupported, skipped' <<<"$help"
 grep -q -- '--require-continuous-batch-evidence' <<<"$help"
+grep -q -- '--require-resumable-prefill-evidence' <<<"$help"
 
 jq -cn --arg git_sha "$git_sha" '
   [
@@ -92,7 +93,7 @@ jq -n --arg git_sha "$git_sha" '
     schema: "izwi.cuda-model-evidence.v1",
     status: "passed",
     run: {git_sha: $git_sha, worktree_clean: true},
-    requirements: {continuous_batch: true},
+    requirements: {continuous_batch: true, resumable_prefill: true},
     device: {
       build_git_sha: $git_sha,
       requested_backend: "cuda",
@@ -104,6 +105,7 @@ jq -n --arg git_sha "$git_sha" '
     cases: [{
       name: "qwen3-continuous",
       command: "chat",
+      samples: 8,
       quality_failed: 0,
       telemetry_delta_available: true,
       backend_kind: "cuda",
@@ -118,11 +120,21 @@ jq -n --arg git_sha "$git_sha" '
         capacity_rows: 32,
         useful_elements: 3072,
         materialized_elements: 4096
-      }
+      },
+      kernel_delta: {prefill_sequence_spans: 16, prefill_sequence_tokens: 2048}
     }]
   }' >"$tmp_dir/model-certificate.json"
 $validator --certificate "$tmp_dir/model-certificate.json" --backend cuda \
-  --expected-git-sha "$git_sha" --require-continuous-batch-evidence >/dev/null
+  --expected-git-sha "$git_sha" --require-continuous-batch-evidence \
+  --require-resumable-prefill-evidence >/dev/null
+
+jq '.cases[0].kernel_delta.prefill_sequence_spans = .cases[0].samples' \
+  "$tmp_dir/model-certificate.json" >"$tmp_dir/model-no-resume.json"
+if $validator --certificate "$tmp_dir/model-no-resume.json" --backend cuda \
+  --expected-git-sha "$git_sha" --require-resumable-prefill-evidence >/dev/null 2>&1; then
+  echo 'validator accepted a certificate without multiple prefill spans per sample' >&2
+  exit 1
+fi
 
 jq '.cases[0].batch_delta.continuous_batches = 0' "$tmp_dir/model-certificate.json" \
   >"$tmp_dir/model-no-continuous.json"

@@ -6189,6 +6189,25 @@ concurrent = [1, 2]
     }
 
     #[test]
+    fn cuda_chat_performance_manifests_cover_every_chat_family() {
+        let manifest_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/manifests");
+        for name in [
+            "cuda-continuous-batching.toml",
+            "cuda-resumable-prefill.toml",
+        ] {
+            let text = std::fs::read_to_string(manifest_root.join(name))
+                .expect("chat performance manifest");
+            let manifest: BenchmarkManifest =
+                toml::from_str(&text).expect("valid chat performance manifest");
+            let cases = expand_manifest_cases(&manifest).expect("unique chat performance cases");
+            assert_eq!(cases.len(), 5, "{name}");
+            assert!(cases.iter().all(|case| case.command == "chat"), "{name}");
+            assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
+        }
+    }
+
+    #[test]
     fn manifest_matrix_rejects_duplicate_expanded_names() {
         let manifest: BenchmarkManifest = toml::from_str(
             r#"

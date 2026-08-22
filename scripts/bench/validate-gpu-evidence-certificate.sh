@@ -13,6 +13,7 @@ Options:
   --backend metal|cuda                Required runtime backend
   --expected-git-sha SHA              Required 40-character source SHA
   --require-continuous-batch-evidence Require certified multi-row continuous batching
+  --require-resumable-prefill-evidence Require certified multi-span resumable prefill
   -h, --help                          Show this help
 
 The validator accepts izwi.gpu-kv-evidence.v1 for Metal/CUDA KV matrices and
@@ -26,6 +27,7 @@ certificate=
 backend=
 expected_git_sha=
 require_continuous=0
+require_resumable_prefill=0
 
 while (($#)); do
   case "$1" in
@@ -43,6 +45,10 @@ while (($#)); do
       ;;
     --require-continuous-batch-evidence)
       require_continuous=1
+      shift
+      ;;
+    --require-resumable-prefill-evidence)
+      require_resumable_prefill=1
       shift
       ;;
     -h|--help)
@@ -74,8 +80,8 @@ command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 schema=$(jq -r '.schema // empty' "$certificate")
 case "$schema" in
   izwi.gpu-kv-evidence.v1)
-    if ((require_continuous)); then
-      echo "error: KV-only evidence cannot certify model continuous batching" >&2
+    if ((require_continuous || require_resumable_prefill)); then
+      echo "error: KV-only evidence cannot certify model batching or resumable prefill" >&2
       exit 1
     fi
     if ! jq -e \
@@ -174,7 +180,8 @@ case "$schema" in
     fi
     if ! jq -e \
       --arg git_sha "$expected_git_sha" \
-      --argjson require_continuous "$require_continuous" '
+      --argjson require_continuous "$require_continuous" \
+      --argjson require_resumable_prefill "$require_resumable_prefill" '
         .schema == "izwi.cuda-model-evidence.v1" and
         .status == "passed" and
         .run.git_sha == $git_sha and
@@ -204,8 +211,15 @@ case "$schema" in
              .batch_delta.useful_elements > 0 and
              .batch_delta.materialized_elements >= .batch_delta.useful_elements and
              .batch_delta.physical_batch_rejections == 0)))
+        and
+        (($require_resumable_prefill == 0) or
+          (.requirements.resumable_prefill == true and
+           all(.cases[];
+             .command == "chat" and
+             .kernel_delta.prefill_sequence_spans > .samples and
+             .kernel_delta.prefill_sequence_tokens > .kernel_delta.prefill_sequence_spans)))
       ' "$certificate" >/dev/null; then
-      echo "error: CUDA model certificate failed exact-SHA, runtime, or continuous-batch validation" >&2
+      echo "error: CUDA model certificate failed exact-SHA, runtime, batching, or prefill validation" >&2
       exit 1
     fi
     ;;

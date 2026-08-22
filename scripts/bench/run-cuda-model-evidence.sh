@@ -13,6 +13,7 @@ allow_unsupported=0
 dry_run=0
 require_optimized_kernel_evidence=0
 require_continuous_batch_evidence=0
+require_resumable_prefill_evidence=0
 certificate_written=0
 started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -30,6 +31,8 @@ Options:
                         Require every case to observe a fused/paged/RoPE CUDA path
   --require-continuous-batch-evidence
                         Require every case to prove run-local multi-row continuous batching
+  --require-resumable-prefill-evidence
+                        Require every case to prove a prompt ran as multiple resumable spans
   --dry-run             Print the benchmark command without probing hardware/server
   -h, --help            Show this help
 
@@ -70,6 +73,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --require-continuous-batch-evidence)
             require_continuous_batch_evidence=1
+            shift
+            ;;
+        --require-resumable-prefill-evidence)
+            require_resumable_prefill_evidence=1
             shift
             ;;
         --dry-run)
@@ -141,6 +148,7 @@ write_status_certificate() {
         --argjson worktree_clean "${worktree_clean}" \
         --argjson require_optimized "${require_optimized_kernel_evidence}" \
         --argjson require_continuous "${require_continuous_batch_evidence}" \
+        --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" \
         '{
             schema: "izwi.cuda-model-evidence.v1",
             status: $status,
@@ -155,7 +163,8 @@ write_status_certificate() {
             },
             requirements: {
                 optimized_kernel: ($require_optimized == 1),
-                continuous_batch: ($require_continuous == 1)
+                continuous_batch: ($require_continuous == 1),
+                resumable_prefill: ($require_resumable_prefill == 1)
             },
             device: null,
             cases: [],
@@ -253,7 +262,8 @@ observability_path="${benchmark_dir}/observability.json"
 
 if ! jq -e \
     --argjson require_optimized "${require_optimized_kernel_evidence}" \
-    --argjson require_continuous "${require_continuous_batch_evidence}" '
+    --argjson require_continuous "${require_continuous_batch_evidence}" \
+    --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" '
     .schema_version == 1 and
     (.reports | length) > 0 and
     ([.reports[].name] | all(type == "string") and length == (unique | length)) and
@@ -308,6 +318,17 @@ if ! jq -e \
          $telemetry.after.engine.physical_batch_rejections_total ==
            $telemetry.before.engine.physical_batch_rejections_total)
     ] | all(. == true))) and
+    (($require_resumable_prefill == 0) or ([.reports[] |
+        .report as $report |
+        $report.telemetry as $telemetry |
+        (($telemetry.after.kernel_path.prefill_sequence_spans_total // 0) -
+         ($telemetry.before.kernel_path.prefill_sequence_spans_total // 0)) as $spans |
+        (($telemetry.after.kernel_path.prefill_sequence_tokens_total // 0) -
+         ($telemetry.before.kernel_path.prefill_sequence_tokens_total // 0)) as $tokens |
+        $report.command == "chat" and
+        $spans > ($report.samples | length) and
+        $tokens > $spans
+    ] | all(. == true))) and
     (($require_optimized == 0) or ([.reports[] |
         .report.telemetry as $telemetry |
         (((($telemetry.after.kernel_path.fused_attention_success_total // 0) -
@@ -318,7 +339,7 @@ if ! jq -e \
            ($telemetry.before.kernel_path.rope_kernel_total // 0)) > 0))
     ] | all(. == true)))
 ' "${report_path}" >/dev/null; then
-    fail "CUDA benchmark report failed case, sample, quality, runtime, continuous-batch, or optimized-kernel validation"
+    fail "CUDA benchmark report failed case, sample, quality, runtime, batching, prefill, or optimized-kernel validation"
 fi
 if ! jq -e --arg git_sha "${git_sha}" '.schema_version == 1 and .git_sha == $git_sha' \
     "${metadata_path}" >/dev/null; then
@@ -341,6 +362,7 @@ jq -n \
     --arg ended_at "${ended_at}" \
     --argjson require_optimized "${require_optimized_kernel_evidence}" \
     --argjson require_continuous "${require_continuous_batch_evidence}" \
+    --argjson require_resumable_prefill "${require_resumable_prefill_evidence}" \
     --slurpfile health "${health_path}" \
     --slurpfile report "${report_path}" \
     '{
@@ -357,7 +379,8 @@ jq -n \
         },
         requirements: {
             optimized_kernel: ($require_optimized == 1),
-            continuous_batch: ($require_continuous == 1)
+            continuous_batch: ($require_continuous == 1),
+            resumable_prefill: ($require_resumable_prefill == 1)
         },
         device: {
             build_git_sha: $health[0].runtime.build_git_sha,
@@ -438,6 +461,8 @@ jq -n \
                     host_read_bytes: ((.report.telemetry.after.kernel_path.host_read_bytes_total // 0) - (.report.telemetry.before.kernel_path.host_read_bytes_total // 0)),
                     dtype_cast_ops: ((.report.telemetry.after.kernel_path.dtype_cast_ops_total // 0) - (.report.telemetry.before.kernel_path.dtype_cast_ops_total // 0)),
                     layout_copy_ops: ((.report.telemetry.after.kernel_path.layout_copy_ops_total // 0) - (.report.telemetry.before.kernel_path.layout_copy_ops_total // 0)),
+                    prefill_sequence_spans: ((.report.telemetry.after.kernel_path.prefill_sequence_spans_total // 0) - (.report.telemetry.before.kernel_path.prefill_sequence_spans_total // 0)),
+                    prefill_sequence_tokens: ((.report.telemetry.after.kernel_path.prefill_sequence_tokens_total // 0) - (.report.telemetry.before.kernel_path.prefill_sequence_tokens_total // 0)),
                     rope_kernel: ((.report.telemetry.after.kernel_path.rope_kernel_total // 0) - (.report.telemetry.before.kernel_path.rope_kernel_total // 0)),
                     rope_manual: ((.report.telemetry.after.kernel_path.rope_manual_total // 0) - (.report.telemetry.before.kernel_path.rope_manual_total // 0)),
                     fused_attention_attempts: ((.report.telemetry.after.kernel_path.fused_attention_attempts_total // 0) - (.report.telemetry.before.kernel_path.fused_attention_attempts_total // 0)),
