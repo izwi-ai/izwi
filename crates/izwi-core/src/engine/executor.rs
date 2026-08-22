@@ -218,7 +218,11 @@ fn continuous_row_managed_caches_for_row(
     } else {
         let tensor_state = matches!(
             request.model_variant,
-            Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen35Chat
+            Some(variant) if matches!(
+                variant.family(),
+                crate::catalog::ModelFamily::Qwen35Chat
+                    | crate::catalog::ModelFamily::Lfm2Chat
+            )
         )
         .then_some(reservation.tensor_state)
         .flatten();

@@ -174,7 +174,7 @@ mod tests {
             (ModelVariant::Qwen306B, ExecutionMode::Sequence),
             (ModelVariant::Qwen306BGguf, ExecutionMode::Sequence),
             (ModelVariant::Qwen354BGguf, ExecutionMode::Sequence),
-            (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Atomic),
+            (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Sequence),
             (ModelVariant::Gemma34BIt, ExecutionMode::Sequence),
         ] {
             let plan = registry

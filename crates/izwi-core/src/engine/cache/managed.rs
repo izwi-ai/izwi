@@ -2754,11 +2754,13 @@ fn validate_sliding_contract(
     backend: BackendKind,
 ) -> Result<()> {
     for domain in &contract.domains {
-        if let Some(window_tokens) = sliding_window_for_domain(contract, domain.id())? {
-            if backend == BackendKind::Cuda {
-                return Err(Error::InvalidInput(format!(
-                    "managed CUDA KV cannot safely consume sliding window {window_tokens}: its paged kernel ABI has no first-page offset"
-                )));
+        if sliding_window_for_domain(contract, domain.id())?.is_some() {
+            // Every managed paged-attention backend carries the authoritative
+            // first-page offset in its decode and prefill metadata. Keep this
+            // match exhaustive so a future backend must make that contract an
+            // explicit admission decision.
+            match backend {
+                BackendKind::Cpu | BackendKind::Metal | BackendKind::Cuda => {}
             }
         }
     }
@@ -3132,6 +3134,31 @@ mod tests {
             )
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn homogeneous_sliding_contract_is_admitted_by_every_managed_backend() {
+        let contract = sliding_contract(31);
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            validate_sliding_contract(&contract, backend).unwrap_or_else(|error| {
+                panic!("{backend:?} should admit managed sliding-window KV: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn sliding_contract_admission_still_rejects_an_empty_paged_domain() {
+        let mut contract = sliding_contract(31);
+        let StateDomainSpec::PagedAttention(domain) = &mut contract.domains[0] else {
+            unreachable!()
+        };
+        domain.layers.clear();
+
+        let error = validate_sliding_contract(&contract, BackendKind::Cuda)
+            .expect_err("an empty paged-attention domain must remain invalid");
+        assert!(error
+            .to_string()
+            .contains("managed paged-attention domain has no layers"));
     }
 
     #[test]

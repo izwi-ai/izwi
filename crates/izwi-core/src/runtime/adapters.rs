@@ -166,12 +166,8 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        Qwen3Chat | Qwen35Chat | Qwen38Chat | Gemma3Chat => FamilyInferenceStatePolicy {
+        Qwen3Chat | Qwen35Chat | Qwen38Chat | Gemma3Chat | Lfm2Chat => FamilyInferenceStatePolicy {
             chat: Retained,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        Lfm2Chat => FamilyInferenceStatePolicy {
-            chat: Invocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
         Lfm25Audio => FamilyInferenceStatePolicy {
@@ -413,6 +409,7 @@ fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Gemma3Chat
+            | ModelFamily::Lfm2Chat
     ) {
         SequenceExecutionMode::Always
     } else {
@@ -757,10 +754,10 @@ mod tests {
             qwen_asr.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
         );
-        assert_eq!(lfm_chat.sequence_execution, SequenceExecutionMode::None);
+        assert_eq!(lfm_chat.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
             lfm_chat.state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::Retained
         );
         assert_eq!(
             scalar_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,

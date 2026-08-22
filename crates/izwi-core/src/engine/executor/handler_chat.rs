@@ -190,31 +190,6 @@ fn canonical_chat_terminal_text(streamed_text: &str, terminal_text: String) -> S
     }
 }
 
-fn with_lfm2_invocation_state<T>(
-    request: &EngineCoreRequest,
-    scheduled: &ScheduledRequest,
-    run: impl FnOnce(&mut PhysicalPagedKvCache, &mut crate::engine::InvocationTensorLease) -> Result<T>,
-) -> Result<T> {
-    let mut leases = super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
-    let output = {
-        let (paged, ring) = leases.lease_exact_kind_pair_mut(
-            crate::kv::v2::InvocationStateBackingKindV2::PagedAttention,
-            crate::kv::v2::InvocationStateBackingKindV2::Ring,
-        )?;
-        run(
-            paged.paged_cache_mut()?,
-            ring.typed_mut::<crate::engine::InvocationTensorLease>()?,
-        )?
-    };
-    let completions = leases.release()?;
-    if completions.len() != 2 {
-        return Err(Error::InferenceError(
-            "LFM2 chat returned an incomplete physical-state completion set".into(),
-        ));
-    }
-    Ok(output)
-}
-
 impl NativeExecutor {
     pub(super) fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
         request.chat_generation_config()
@@ -325,24 +300,12 @@ impl NativeExecutor {
                     }
                 };
 
-                let mut output = if matches!(model.as_ref(), NativeChatModel::Lfm2(_)) {
-                    with_lfm2_invocation_state(request, scheduled, |cache, shortconv| {
-                        model.generate_lfm2_with_callback_physical(
-                            messages,
-                            max_new_tokens,
-                            cache,
-                            shortconv,
-                            &mut emit,
-                        )
-                    })?
-                } else {
-                    model.generate_with_callback_and_config(
-                        messages,
-                        max_new_tokens,
-                        &generation_config,
-                        &mut emit,
-                    )?
-                };
+                let mut output = model.generate_with_callback_and_config(
+                    messages,
+                    max_new_tokens,
+                    &generation_config,
+                    &mut emit,
+                )?;
 
                 if let Some(tx) = stream_tx.as_ref() {
                     if stream_err.is_none() {
@@ -577,6 +540,15 @@ impl NativeExecutor {
         let mut final_text = step.text.clone();
         let finished = step.finished;
 
+        // Durable state must be fully staged before any externally visible
+        // token is emitted. A staging failure then remains an atomic row
+        // failure instead of leaking text from an uncommittable quantum.
+        if let Some(arena) = tensor_arena.as_ref() {
+            active_state
+                .state
+                .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
+        }
+
         if let Some(tx) = stream_tx.as_ref() {
             if !step.delta.is_empty() {
                 Self::stream_text_with_policy(
@@ -606,11 +578,6 @@ impl NativeExecutor {
         } else {
             step.input_tokens_committed
         };
-        if let Some(arena) = tensor_arena.as_ref() {
-            active_state
-                .state
-                .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
-        }
         let managed_cache_completions = active_state.state.take_managed_write_completions();
         if !finished {
             let mut guard = self.chat_decode_states.lock().map_err(|_| {

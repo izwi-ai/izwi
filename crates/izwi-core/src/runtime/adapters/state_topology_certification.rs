@@ -10,6 +10,7 @@ use super::*;
 enum CertifiedTopology {
     Stateless,
     RetainedPaged,
+    RetainedPagedRing,
     RetainedPagedAndInvocationPaged,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedTensorTensor,
@@ -27,7 +28,7 @@ impl CertifiedTopology {
     const fn lifetime(self) -> InferenceStateRequirement {
         match self {
             Self::Stateless => InferenceStateRequirement::Stateless,
-            Self::RetainedPaged | Self::RetainedPagedTensorTensor => {
+            Self::RetainedPaged | Self::RetainedPagedRing | Self::RetainedPagedTensorTensor => {
                 InferenceStateRequirement::Retained
             }
             Self::RetainedPagedAndInvocationPaged
@@ -64,8 +65,9 @@ fn certified_topology(
         // Gemma alternates full and sliding-window pages; every layer carries
         // the loaded attention softcap in the paged semantic contract.
         (Gemma3Chat, Chat) => RetainedPaged,
-        // LFM2 is request-scoped: sparse attention pages and ShortConv ring.
-        (Lfm2Chat, Chat) => InvocationPagedRing,
+        // LFM2 commits sparse attention pages and its ShortConv ring under one
+        // retained decoder-token transaction.
+        (Lfm2Chat, Chat) => RetainedPagedRing,
 
         // Qwen TTS retains talker pages plus tensor continuation state and
         // leases a separate predictor page domain per invocation.

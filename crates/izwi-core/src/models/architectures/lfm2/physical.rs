@@ -1,4 +1,4 @@
-//! Physical invocation-state contract shared by every LFM2 capability.
+//! Physical state contracts shared by the LFM2 chat and audio capabilities.
 
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -253,6 +253,28 @@ pub(crate) fn lfm2_main_invocation_contract(
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
 ) -> Result<InferenceStateContract> {
+    lfm2_main_contract(config, layout, ids, invocation_header)
+}
+
+/// Scheduler-owned cache contract for incremental LFM2 chat.
+///
+/// The semantic domains intentionally remain identical to the invocation
+/// contract shared with LFM2.5 Audio. Only their lifetime, placement, and
+/// checkpoint policy change so paged attention and ShortConv advance under one
+/// retained row transaction.
+pub(crate) fn lfm2_managed_cache_contract(
+    config: &Lfm2BackboneConfig,
+) -> Result<InferenceStateContract> {
+    let layout = Lfm2StateLayout::from_config(config)?;
+    lfm2_main_contract(config, &layout, Lfm2StateIds::CANONICAL, retained_header)
+}
+
+fn lfm2_main_contract(
+    config: &Lfm2BackboneConfig,
+    layout: &Lfm2StateLayout,
+    ids: Lfm2StateIds,
+    header: fn(StateDomainId, StateClock) -> StateDomainHeader,
+) -> Result<InferenceStateContract> {
     let head_dim = config.embedding_length / config.attention_head_count;
     let query_heads = u32::try_from(config.attention_head_count)
         .map_err(|_| Error::ModelLoadError("LFM2 query-head count exceeds u32".into()))?;
@@ -289,7 +311,7 @@ pub(crate) fn lfm2_main_invocation_contract(
     let preferred_tokens = u32::try_from(default_kv_page_size())
         .map_err(|_| Error::ModelLoadError("LFM2 page size exceeds u32".into()))?;
     let attention = StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
-        header: invocation_header(ids.attention, StateClock::DecoderTokens),
+        header: header(ids.attention, StateClock::DecoderTokens),
         layers,
         page_size: PageSizeConstraint {
             min_tokens: 1,
@@ -302,7 +324,7 @@ pub(crate) fn lfm2_main_invocation_contract(
     let hidden = u64::try_from(config.embedding_length)
         .map_err(|_| Error::ModelLoadError("LFM2 hidden width exceeds u64".into()))?;
     let shortconv = StateDomainSpec::Ring(RingStateDomainSpec {
-        header: invocation_header(ids.shortconv, StateClock::DecoderTokens),
+        header: header(ids.shortconv, StateClock::DecoderTokens),
         components_per_step: layout
             .shortconv_components
             .iter()
@@ -348,6 +370,17 @@ pub(crate) fn invocation_header(id: StateDomainId, clock: StateClock) -> StateDo
         placement: PlacementPolicy::BackendLocal,
         prefix: PrefixPolicy::Disabled,
         checkpoint: CheckpointPolicy::None,
+    }
+}
+
+fn retained_header(id: StateDomainId, clock: StateClock) -> StateDomainHeader {
+    StateDomainHeader {
+        id,
+        scope: StateScope::Retained,
+        clock,
+        placement: PlacementPolicy::BackendLocalWithHostOffload,
+        prefix: PrefixPolicy::Disabled,
+        checkpoint: CheckpointPolicy::Transactional,
     }
 }
 
@@ -507,6 +540,63 @@ mod tests {
     }
 
     #[test]
+    fn managed_contract_declares_one_transactional_retained_paged_ring_group() {
+        let contract = lfm2_managed_cache_contract(&config()).unwrap();
+        assert_eq!(contract.domains.len(), 2);
+        assert_eq!(contract.groups.len(), 1);
+        assert_eq!(
+            contract.groups[0].domains,
+            vec![LFM2_ATTENTION_STATE_DOMAIN, LFM2_SHORTCONV_STATE_DOMAIN]
+        );
+        assert!(!contract.groups[0].prefix_shareable);
+        for domain in &contract.domains {
+            assert_eq!(domain.header().scope, StateScope::Retained);
+            assert_eq!(domain.header().clock, StateClock::DecoderTokens);
+            assert_eq!(
+                domain.header().placement,
+                PlacementPolicy::BackendLocalWithHostOffload
+            );
+            assert_eq!(domain.header().prefix, PrefixPolicy::Disabled);
+            assert_eq!(domain.header().checkpoint, CheckpointPolicy::Transactional);
+        }
+
+        let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
+            panic!("first domain must be paged attention");
+        };
+        assert_eq!(
+            attention
+                .layers
+                .iter()
+                .map(|layer| layer.model_layer)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(attention.layers.iter().all(|layer| {
+            layer.pattern == AttentionPattern::SlidingWindow { window_tokens: 8 }
+        }));
+
+        let StateDomainSpec::Ring(shortconv) = &contract.domains[1] else {
+            panic!("second domain must be ShortConv ring");
+        };
+        assert_eq!(shortconv.capacity_steps, 3);
+        assert_eq!(shortconv.components_per_step.len(), 3);
+        assert!(shortconv.components_per_step.iter().all(|component| {
+            component.shape.dimensions
+                == vec![
+                    ShapeDimension {
+                        axis: ShapeAxis::Batch,
+                        extent: ShapeExtent::Fixed { value: 1 },
+                    },
+                    ShapeDimension {
+                        axis: ShapeAxis::Hidden,
+                        extent: ShapeExtent::Fixed { value: 16 },
+                    },
+                ]
+                && component.accepted_dtypes == vec![StateDType::F32]
+        }));
+    }
+
+    #[test]
     fn physical_spec_declares_one_atomic_paged_and_ring_group() {
         let stage = StageDescriptor {
             id: StageId::new(1),
@@ -534,6 +624,11 @@ mod tests {
             spec.invocation.groups[0].domains,
             vec![LFM2_ATTENTION_STATE_DOMAIN, LFM2_SHORTCONV_STATE_DOMAIN]
         );
+        assert!(spec.invocation.domains.iter().all(|domain| {
+            domain.header().scope == StateScope::Invocation
+                && domain.header().placement == PlacementPolicy::BackendLocal
+                && domain.header().checkpoint == CheckpointPolicy::None
+        }));
         let StateDomainSpec::PagedAttention(attention) = &spec.invocation.domains[0] else {
             panic!("first domain must be paged attention");
         };

@@ -80,7 +80,8 @@ pub(crate) fn validate_managed_state_plan_eligibility(
             ModelFamily::Qwen3Chat
                 | ModelFamily::Qwen35Chat
                 | ModelFamily::Qwen38Chat
-                | ModelFamily::Gemma3Chat,
+                | ModelFamily::Gemma3Chat
+                | ModelFamily::Lfm2Chat,
             CapabilityKind::Chat
         ) | (ModelFamily::Qwen3Asr, CapabilityKind::Asr)
             | (
@@ -175,6 +176,15 @@ mod tests {
         assert_eq!(
             validate_managed_state_plan_eligibility(
                 ModelVariant::Qwen306B,
+                CapabilityKind::Chat,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Lfm2512BInstructGguf,
                 CapabilityKind::Chat,
                 &plan,
             )

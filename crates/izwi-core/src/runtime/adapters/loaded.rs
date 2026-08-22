@@ -630,6 +630,7 @@ fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Qwen38Chat
+                | crate::catalog::ModelFamily::Lfm2Chat
         )
 }
 
@@ -1668,17 +1669,24 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_chat_models_with_batch_paths_select_the_continuous_stage() {
+    fn stateful_chat_models_with_batch_paths_select_the_continuous_stage() {
         let continuous = ContinuousPhysicalChatAdapterFactory;
         let scalar = ScalarExecutionAdapterFactory;
 
-        let qwen38 = chat_adapter_metadata(ModelVariant::Qwen3827BFp8);
-        assert!(continuous.supports(qwen38, BackendKind::Cpu));
-        assert!(!scalar.supports(qwen38, BackendKind::Cpu));
-
-        let qwen35 = chat_adapter_metadata(ModelVariant::Qwen3508BGguf);
-        assert!(continuous.supports(qwen35, BackendKind::Cpu));
-        assert!(!scalar.supports(qwen35, BackendKind::Cpu));
+        for variant in [
+            ModelVariant::Qwen3827BFp8,
+            ModelVariant::Qwen3508BGguf,
+            ModelVariant::Lfm2512BInstructGguf,
+        ] {
+            let metadata = chat_adapter_metadata(variant);
+            for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+                assert!(
+                    continuous.supports(metadata, backend),
+                    "{variant}/{backend:?}"
+                );
+                assert!(!scalar.supports(metadata, backend), "{variant}/{backend:?}");
+            }
+        }
     }
 
     #[test]
@@ -1861,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn lfm2_chat_fails_closed_without_physical_invocation_publication() {
+    fn lfm2_chat_fails_closed_without_managed_state_publication() {
         let registry = RuntimeAdapterRegistry::built_in();
         let error = LoadedModelBundle::bind(
             &registry,
@@ -1870,7 +1878,7 @@ mod tests {
             ModelVariant::Lfm2512BInstructGguf,
             BackendKind::Cpu,
         )
-        .expect_err("LFM2 chat must not seal without physical invocation state");
+        .expect_err("LFM2 chat must not seal without managed physical state");
         assert!(error
             .to_string()
             .contains("requires an explicit load-sealed ABI-v2 state publication"));
@@ -2381,8 +2389,11 @@ mod tests {
         assert_eq!(contract.stages[0].max_batch_size, 1);
         assert_eq!(
             contract.execution_profile.concurrency,
-            ConcurrencyClass::Exclusive
+            ConcurrencyClass::Batchable
         );
+        assert_eq!(contract.stages.len(), 2);
+        assert_eq!(contract.stages[1].batch_mode, NativeBatchMode::Continuous);
+        assert_eq!(contract.stages[1].max_batch_size, 1);
     }
 
     #[test]
@@ -2449,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_chunked_chat_opt_in_is_streaming_specific() {
+    fn lfm2_sequence_chat_remains_quantum_committed_when_streaming() {
         let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
             ExecutionGroupId::new(7),
@@ -2461,20 +2472,23 @@ mod tests {
         let adapter = draft.capabilities.get(&CapabilityKind::Chat).unwrap();
 
         let non_streaming = adapter.contract(StreamingRequirements::NONE).unwrap();
-        assert_eq!(non_streaming.execution_profile.mode, ExecutionMode::Atomic);
         assert_eq!(
-            non_streaming.stages[0].output_visibility,
-            OutputVisibility::AfterQuantumCommit
+            non_streaming.execution_profile.mode,
+            ExecutionMode::Sequence
         );
+        assert!(non_streaming
+            .stages
+            .iter()
+            .all(|stage| stage.output_visibility == OutputVisibility::AfterQuantumCommit));
 
         let streaming = adapter
             .contract(StreamingRequirements::native(true))
             .unwrap();
-        assert_eq!(streaming.execution_profile.mode, ExecutionMode::Atomic);
-        assert_eq!(
-            streaming.stages[0].output_visibility,
-            OutputVisibility::IncrementalCommitted
-        );
+        assert_eq!(streaming.execution_profile.mode, ExecutionMode::Sequence);
+        assert!(streaming
+            .stages
+            .iter()
+            .all(|stage| stage.output_visibility == OutputVisibility::AfterQuantumCommit));
     }
 
     #[test]
