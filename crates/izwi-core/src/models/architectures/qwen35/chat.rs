@@ -34,18 +34,6 @@ use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
-const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
-const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
-
-fn qwen35_prefill_chunk_size() -> usize {
-    std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
-        .min(MAX_PREFILL_CHUNK_SIZE)
-}
-
 /// Fully prepared Qwen3.5 prefill input. The runtime carries this exact
 /// artifact into the executor so media loading and vision encoding happen once.
 #[derive(Debug, Clone)]
@@ -109,11 +97,19 @@ pub struct ChatDecodeState {
     max_new_tokens: usize,
     finished: bool,
     next_text_position: usize,
+    /// Scheduler-visible prompt cursor, independent of text position IDs.
+    prefill_progress: usize,
+    /// Number of prepared vision rows consumed by committed prompt spans.
+    prefill_vision_progress: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
 }
 
 impl ChatDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
     pub(crate) fn uses_physical_kv(&self) -> bool {
         true
     }
@@ -569,38 +565,40 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen35PreparedPrompt>,
-        mut cache: PhysicalPagedKvCache,
+        cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        let mut state =
+            self.begin_resumable_prefill_state_physical(&prepared, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill_physical(
+            &mut state,
+            &prepared,
+            0,
+            prepared.prompt_ids.len(),
+        )?;
+        Ok(state)
+    }
+
+    pub(crate) fn begin_resumable_prefill_state_physical(
+        &self,
+        prepared: &Qwen35PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
         if prepared.prompt_ids.is_empty() || cache.context_len() != 0 {
             return Err(Error::InvalidInput(
                 "Qwen3.5 physical prefill requires a non-empty prompt and an empty reservation"
                     .into(),
             ));
         }
-        let mut text_state = self.text_model.new_state();
-        let logits = if prepared.vision_inputs.is_none() {
-            self.prefill_text_range_physical(
-                &prepared,
-                &mut text_state,
-                &mut cache,
-                0,
-                prepared.prompt_ids.len(),
-                true,
-            )?
-            .ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 physical prefill produced no logits".into())
-            })?
-        } else {
-            self.prefill_prompt_physical(&prepared, &mut text_state, &mut cache)?
-        };
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
         Ok(ChatDecodeState {
-            text_state,
+            text_state: self.text_model.new_state(),
             physical_kv: cache,
             physical_tensor_sequence: None,
-            unconsumed_output: Some(logits),
+            unconsumed_output: None,
             pending_token: None,
             history_ids: initial_penalty_history(
                 &prepared.prompt_ids,
@@ -614,9 +612,86 @@ impl Qwen35ChatModel {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared.next_text_position,
+            prefill_progress: 0,
+            prefill_vision_progress: 0,
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
         })
+    }
+
+    pub(crate) fn continue_resumable_prefill_physical(
+        &self,
+        state: &mut ChatDecodeState,
+        prepared: &Qwen35PreparedPrompt,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        if state.prefill_progress != span_start
+            || span_start >= span_end
+            || span_end > prepared.prompt_ids.len()
+            || state.finished
+            || state.unconsumed_output.is_some()
+            || state.pending_token.is_some()
+            || state.tokens_generated != 0
+            || state.physical_kv.context_len() != span_start
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 resumable prefill span [{span_start},{span_end}) is incompatible with cursor {} and prompt length {}",
+                state.prefill_progress,
+                prepared.prompt_ids.len()
+            )));
+        }
+        let complete = span_end == prepared.prompt_ids.len();
+        let mut logits = None;
+        let mut cursor = span_start;
+        while cursor < span_end {
+            if prepared.prompt_ids[cursor] == self.tokenizer.specials.image_pad {
+                let vision = prepared.vision_inputs.as_ref().ok_or_else(|| {
+                    Error::InvalidInput("Qwen3.5 image placeholder has no vision input".into())
+                })?;
+                let embedding = vision
+                    .embeddings
+                    .narrow(0, state.prefill_vision_progress, 1)?
+                    .reshape((1, 1, self.text_model.hidden_size()))?;
+                state.prefill_vision_progress += 1;
+                let output = self.text_model.forward_input_embedding_at_physical(
+                    &embedding,
+                    prepared.prompt_positions[cursor],
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                )?;
+                if complete && cursor + 1 == span_end {
+                    logits = Some(output);
+                }
+                cursor += 1;
+                continue;
+            }
+            let text_end = (cursor + 1..span_end)
+                .find(|index| prepared.prompt_ids[*index] == self.tokenizer.specials.image_pad)
+                .unwrap_or(span_end);
+            let compute_logits = complete && text_end == span_end;
+            logits = self.text_model.prefill_token_ids_physical(
+                &prepared.prompt_ids[cursor..text_end],
+                &prepared.prompt_positions[cursor..text_end],
+                &mut state.text_state,
+                &mut state.physical_kv,
+                compute_logits,
+            )?;
+            cursor = text_end;
+        }
+        if state.physical_kv.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 resumable prefill committed physical cursor {} instead of {span_end}",
+                state.physical_kv.context_len()
+            )));
+        }
+        state.prefill_progress = span_end;
+        if complete {
+            state.unconsumed_output = Some(logits.ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 final prefill span produced no logits".into())
+            })?);
+        }
+        Ok(complete)
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
@@ -700,83 +775,6 @@ impl Qwen35ChatModel {
             || token_id == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(token_id)
             || config.stop_token_ids.contains(&token_id)
-    }
-
-    fn prefill_text_range_physical(
-        &self,
-        prepared: &Qwen35PreparedPrompt,
-        text_state: &mut Qwen35TextRuntimeState,
-        cache: &mut PhysicalPagedKvCache,
-        start: usize,
-        end: usize,
-        compute_final_logits: bool,
-    ) -> Result<Option<Tensor>> {
-        let mut logits = None;
-        let mut chunk_start = start;
-        let chunk_size = qwen35_prefill_chunk_size();
-        while chunk_start < end {
-            let chunk_end = (chunk_start + chunk_size).min(end);
-            let compute_logits = compute_final_logits && chunk_end == end;
-            if let Some(chunk_logits) = self.text_model.prefill_token_ids_physical(
-                &prepared.prompt_ids[chunk_start..chunk_end],
-                &prepared.prompt_positions[chunk_start..chunk_end],
-                text_state,
-                cache,
-                compute_logits,
-            )? {
-                logits = Some(chunk_logits);
-            }
-            chunk_start = chunk_end;
-        }
-        Ok(logits)
-    }
-
-    fn prefill_prompt_physical(
-        &self,
-        prepared: &Qwen35PreparedPrompt,
-        text_state: &mut Qwen35TextRuntimeState,
-        cache: &mut PhysicalPagedKvCache,
-    ) -> Result<Tensor> {
-        let mut logits = None;
-        let mut vision_embedding_index = 0usize;
-        for (index, (&token_id, &position_ids)) in prepared
-            .prompt_ids
-            .iter()
-            .zip(&prepared.prompt_positions)
-            .enumerate()
-        {
-            let is_last = index + 1 == prepared.prompt_ids.len();
-            if token_id == self.tokenizer.specials.image_pad {
-                let vision = prepared.vision_inputs.as_ref().ok_or_else(|| {
-                    Error::InvalidInput("Qwen3.5 image placeholder has no vision input".into())
-                })?;
-                let embedding = vision
-                    .embeddings
-                    .narrow(0, vision_embedding_index, 1)?
-                    .reshape((1, 1, self.text_model.hidden_size()))?;
-                vision_embedding_index += 1;
-                let output = self.text_model.forward_input_embedding_at_physical(
-                    &embedding,
-                    position_ids,
-                    text_state,
-                    cache,
-                )?;
-                if is_last {
-                    logits = Some(output);
-                }
-            } else {
-                let output = self.text_model.forward_token_id_at_physical(
-                    token_id,
-                    position_ids,
-                    text_state,
-                    cache,
-                )?;
-                if is_last {
-                    logits = Some(output);
-                }
-            }
-        }
-        logits.ok_or_else(|| Error::InferenceError("Qwen3.5 physical prompt is empty".into()))
     }
 
     fn prepare_prompt(
@@ -1807,25 +1805,6 @@ mod tests {
         history.push(99);
         assert_eq!(&history[..prompt_ids.len()], prompt_ids.as_slice());
         assert!(initial_penalty_history(&prompt_ids, 8, false).is_empty());
-    }
-
-    #[test]
-    fn prefill_chunk_size_is_bounded_and_rejects_zero() {
-        let _guard = crate::env_test_lock().lock().expect("env lock");
-
-        std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
-        assert_eq!(qwen35_prefill_chunk_size(), DEFAULT_PREFILL_CHUNK_SIZE);
-
-        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "0");
-        assert_eq!(qwen35_prefill_chunk_size(), DEFAULT_PREFILL_CHUNK_SIZE);
-
-        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "64");
-        assert_eq!(qwen35_prefill_chunk_size(), 64);
-
-        std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "999999");
-        assert_eq!(qwen35_prefill_chunk_size(), MAX_PREFILL_CHUNK_SIZE);
-
-        std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
     }
 
     #[test]

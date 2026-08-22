@@ -3027,7 +3027,10 @@ impl NativeChatModel {
     /// on the same managed decode state. Incremental decode alone does not
     /// imply this stronger prefill safe-point contract.
     pub fn supports_resumable_prefill(&self) -> bool {
-        matches!(self, Self::Qwen3(_) | Self::Qwen38(_) | Self::Gemma3(_))
+        matches!(
+            self,
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen38(_) | Self::Gemma3(_)
+        )
     }
 
     /// Whether one continuous model call executes all live rows through a
@@ -3149,6 +3152,29 @@ impl NativeChatModel {
                     target_cache,
                 )?),
             ),
+            Self::Qwen35(model) if mtp_cache.is_none() => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5 resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Qwen35(
+                    model.begin_resumable_prefill_state_physical(
+                        prepared,
+                        max_new_tokens,
+                        config,
+                        target_cache,
+                    )?,
+                ))
+            }
             Self::Qwen38(model) => {
                 let prepared = match prepared {
                     Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
@@ -3211,6 +3237,24 @@ impl NativeChatModel {
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) if prepared.is_none() => {
                 let complete =
                     model.continue_resumable_prefill(state, prompt_ids, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5 resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                let complete = model
+                    .continue_resumable_prefill_physical(state, prepared, span_start, span_end)?;
                 (complete, state.prefill_progress())
             }
             (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
