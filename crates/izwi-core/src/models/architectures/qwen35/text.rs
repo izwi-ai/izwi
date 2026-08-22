@@ -540,12 +540,14 @@ impl Qwen35TextModel {
         })();
         let logits = match execution {
             Ok(logits) => logits,
-            Err(error) => return match completions.drain() {
-                Ok(()) => Err(error),
-                Err(drain) => Err(Error::InferenceError(format!(
+            Err(error) => {
+                return match completions.drain() {
+                    Ok(()) => Err(error),
+                    Err(drain) => Err(Error::InferenceError(format!(
                     "Qwen3.5 target batch failed: {error}; write-fence drain also failed: {drain}"
                 ))),
-            },
+                }
+            }
         };
         let completion = Arc::new(completions.seal()?);
         for (row, cache) in caches.iter_mut().enumerate() {

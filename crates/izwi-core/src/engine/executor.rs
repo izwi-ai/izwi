@@ -1479,15 +1479,14 @@ impl ModelExecutor for NativeExecutor {
                 }
                 super::types::TaskType::SpeechToSpeech => false,
             });
-        let resumable_prefill_proof =
-            if matches!(request.task_type, super::types::TaskType::Chat) {
-                request
-                    .prepared_chat_model_for_executor()
-                    .ok()
-                    .map(|model| model.supports_resumable_prefill())
-            } else {
-                None
-            };
+        let resumable_prefill_proof = if matches!(request.task_type, super::types::TaskType::Chat) {
+            request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .map(|model| model.supports_resumable_prefill())
+        } else {
+            None
+        };
 
         if implementation_incremental
             && (!matches!(request.task_type, super::types::TaskType::ASR) || request.streaming)
@@ -1634,9 +1633,10 @@ impl ModelExecutor for NativeExecutor {
                     execution.scheduled,
                     Some(&execution.batch.rows),
                 );
-                if result.as_ref().is_ok_and(|outputs| {
-                    outputs.iter().all(|output| output.output.error.is_none())
-                }) {
+                if result
+                    .as_ref()
+                    .is_ok_and(|outputs| outputs.iter().all(|output| output.output.error.is_none()))
+                {
                     crate::engine::metrics::record_engine_chat_model_dispatch(false, 1);
                 }
                 return result.map_err(|error| {

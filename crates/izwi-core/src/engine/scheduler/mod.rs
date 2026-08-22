@@ -2947,10 +2947,7 @@ mod tests {
             if let Some(prefill) = scheduled.prefill_requests.first() {
                 assert_eq!(prefill.request_id, incremental_id);
                 assert_eq!(scheduled.decode_requests.len(), 1);
-                assert_eq!(
-                    step,
-                    MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
-                );
+                assert_eq!(step, MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL);
                 return;
             }
             assert_eq!(

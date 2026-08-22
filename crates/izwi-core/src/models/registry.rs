@@ -3035,11 +3035,7 @@ impl NativeChatModel {
     pub fn supports_resumable_prefill(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3(_)
-                | Self::Qwen35(_)
-                | Self::Qwen38(_)
-                | Self::Gemma3(_)
-                | Self::Lfm2(_)
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen38(_) | Self::Gemma3(_) | Self::Lfm2(_)
         )
     }
 
@@ -3049,11 +3045,7 @@ impl NativeChatModel {
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3(_)
-                | Self::Qwen35(_)
-                | Self::Gemma3(_)
-                | Self::Qwen38(_)
-                | Self::Lfm2(_)
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Qwen38(_) | Self::Lfm2(_)
         )
     }
 
@@ -3314,12 +3306,8 @@ impl NativeChatModel {
                 (complete, state.prefill_progress())
             }
             (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) if prepared.is_none() => {
-                let complete = model.continue_resumable_prefill_managed(
-                    state,
-                    prompt_ids,
-                    span_start,
-                    span_end,
-                )?;
+                let complete = model
+                    .continue_resumable_prefill_managed(state, prompt_ids, span_start, span_end)?;
                 (complete, state.prefill_progress())
             }
             _ => {
