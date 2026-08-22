@@ -770,7 +770,10 @@ impl NativeExecutor {
             match managed_cache {
                 Some(views) => {
                     let (cache, mtp_cache, tensor_reservation) = match views {
-                        super::ContinuousRowManagedCache::Dense(cache) => (cache, None, None),
+                        super::ContinuousRowManagedCache::Dense {
+                            target,
+                            tensor_state,
+                        } => (target, None, tensor_state),
                         super::ContinuousRowManagedCache::Hybrid {
                             target,
                             mtp,

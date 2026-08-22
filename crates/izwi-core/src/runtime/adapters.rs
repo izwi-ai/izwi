@@ -795,7 +795,7 @@ mod tests {
             assert!(variants.contains(&ModelVariant::Qwen306BGguf));
             assert!(variants.contains(&ModelVariant::Gemma31BIt));
             assert!(variants.contains(&ModelVariant::Gemma34BIt));
-            assert!(!variants.contains(&ModelVariant::Qwen3508BGguf));
+            assert!(variants.contains(&ModelVariant::Qwen3508BGguf));
         }
     }
 

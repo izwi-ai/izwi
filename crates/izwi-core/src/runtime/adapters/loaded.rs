@@ -627,6 +627,7 @@ fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
         && matches!(
             metadata.model_variant.family(),
             crate::catalog::ModelFamily::Qwen3Chat
+                | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Qwen38Chat
         )
@@ -1667,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_chat_selects_the_continuous_stage_and_dense_hybrids_stay_scalar() {
+    fn hybrid_chat_models_with_batch_paths_select_the_continuous_stage() {
         let continuous = ContinuousPhysicalChatAdapterFactory;
         let scalar = ScalarExecutionAdapterFactory;
 
@@ -1675,11 +1676,9 @@ mod tests {
         assert!(continuous.supports(qwen38, BackendKind::Cpu));
         assert!(!scalar.supports(qwen38, BackendKind::Cpu));
 
-        // Hybrid sibling without batch support must not leak into the
-        // continuous stage.
         let qwen35 = chat_adapter_metadata(ModelVariant::Qwen3508BGguf);
-        assert!(!continuous.supports(qwen35, BackendKind::Cpu));
-        assert!(scalar.supports(qwen35, BackendKind::Cpu));
+        assert!(continuous.supports(qwen35, BackendKind::Cpu));
+        assert!(!scalar.supports(qwen35, BackendKind::Cpu));
     }
 
     #[test]

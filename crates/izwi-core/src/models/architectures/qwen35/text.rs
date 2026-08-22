@@ -5,6 +5,10 @@ use candle_nn::{ops, rotary_emb, Embedding};
 use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
+use crate::backends::kv::{
+    submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
+    PagedKvDecodeArgs,
+};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
@@ -14,6 +18,7 @@ use crate::kernels::{
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
@@ -426,6 +431,129 @@ impl Qwen35TextModel {
         self.forward_hidden_to_logits(&hidden)
     }
 
+    pub(crate) fn forward_token_ids_batch_at_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen35TextRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let batch_size = token_ids.len();
+        if batch_size == 0
+            || position_ids.len() != batch_size
+            || states.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 hybrid decode batch rows do not match".into(),
+            ));
+        }
+        for state in states.iter() {
+            self.validate_runtime_state(state)?;
+        }
+        let sparse_layers = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| {
+                matches!(layer.mixer, Qwen35Mixer::Full(_)).then_some(index as u32)
+            })
+            .collect::<Vec<_>>();
+        let first_full = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                Qwen35Mixer::Full(attention) => Some(attention),
+                Qwen35Mixer::Linear(_) => None,
+            })
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 model has no full-attention layer".into())
+            })?;
+        let start_positions = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        for cache in caches.iter() {
+            cache.validate_sparse_model(
+                &sparse_layers,
+                first_full.num_kv_heads,
+                first_full.head_dim,
+                first_full.head_dim,
+            )?;
+        }
+        let first = &*caches[0];
+        let slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena().lower_slots(&slots)?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
+        let execution = (|| -> Result<Tensor> {
+            let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
+            let mut hidden = self.token_embeddings.forward(&input)?;
+            let mut physical_layer = 0usize;
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                let mut layer_states = states
+                    .iter_mut()
+                    .map(|state| &mut state.layers[layer_index])
+                    .collect::<Vec<_>>();
+                for state in layer_states.iter_mut() {
+                    layer.ensure_state_initialized(state, &self.device)?;
+                }
+                let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+                hidden = layer.forward_physical_decode_batch(
+                    &hidden,
+                    &mut layer_states,
+                    position_ids,
+                    &cache_refs,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                    &mut physical_layer,
+                )?;
+                validate_qwen35_finite_tensor(
+                    &hidden,
+                    layer_index,
+                    layer.decode_diagnostic_path(),
+                    self.finite_diagnostics_enabled,
+                )?;
+            }
+            if physical_layer != sparse_layers.len() {
+                return Err(Error::InferenceError(
+                    "Qwen3.5 batched attention did not cover every sparse layer".into(),
+                ));
+            }
+            self.project_hidden_span(&hidden)
+        })();
+        let logits = match execution {
+            Ok(logits) => logits,
+            Err(error) => return match completions.drain() {
+                Ok(()) => Err(error),
+                Err(drain) => Err(Error::InferenceError(format!(
+                    "Qwen3.5 target batch failed: {error}; write-fence drain also failed: {drain}"
+                ))),
+            },
+        };
+        let completion = Arc::new(completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
+        }
+        Ok(logits)
+    }
+
     pub(crate) fn prefill_token_ids_physical(
         &self,
         token_ids: &[u32],
@@ -465,6 +593,29 @@ impl Qwen35TextModel {
         let hidden =
             self.forward_hidden_physical(input_embedding, &[position_ids], state, cache)?;
         self.forward_hidden_to_logits(&hidden)
+    }
+
+    pub(crate) fn prefill_input_embeddings_physical(
+        &self,
+        input_embeddings: &Tensor,
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        compute_logits: bool,
+    ) -> Result<Option<Tensor>> {
+        let (_, sequence_len, _) = input_embeddings.dims3()?;
+        if sequence_len == 0 || sequence_len != position_ids.len() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 embedding prefill span does not match its positions".into(),
+            ));
+        }
+        record_prefill_sequence_span(sequence_len);
+        let hidden = self.forward_hidden_physical(input_embeddings, position_ids, state, cache)?;
+        if !compute_logits {
+            return Ok(None);
+        }
+        let last = hidden.narrow(1, sequence_len - 1, 1)?;
+        self.forward_hidden_to_logits(&last).map(Some)
     }
 
     fn forward_hidden_physical(
@@ -544,6 +695,12 @@ impl Qwen35TextModel {
     }
 
     pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.project_hidden_span(hidden)?
+            .i((0, 0))
+            .map_err(Error::from)
+    }
+
+    fn project_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.output_norm.forward(hidden)?;
         validate_qwen35_finite_tensor(
             &hidden,
@@ -552,7 +709,6 @@ impl Qwen35TextModel {
             self.finite_diagnostics_enabled,
         )?;
         let logits = self.output.forward(&hidden)?;
-        let logits = logits.i((0, 0))?;
         validate_qwen35_finite_tensor(
             &logits,
             self.layers.len(),
@@ -662,6 +818,55 @@ impl Qwen35Layer {
                     position_ids,
                     cache,
                     prepared,
+                    *physical_layer,
+                )?;
+                *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
+                    Error::InvalidInput("Qwen3.5 physical layer ordinal overflow".into())
+                })?;
+                output
+            }
+        };
+        let hidden_states = (&residual + &mixed)?;
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        (&residual + &hidden_states).map_err(Error::from)
+    }
+
+    fn forward_physical_decode_batch(
+        &self,
+        hidden_states: &Tensor,
+        states: &mut [&mut Qwen35LayerRuntimeState],
+        position_ids: &[[usize; 3]],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        physical_layer: &mut usize,
+    ) -> Result<Tensor> {
+        let batch_size = hidden_states.dim(0)?;
+        if hidden_states.dim(1)? != 1
+            || batch_size == 0
+            || states.len() != batch_size
+            || position_ids.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 layer decode batch dimensions do not match".into(),
+            ));
+        }
+        let residual = hidden_states.clone();
+        let normalized = self.attn_norm.forward(hidden_states)?;
+        let mixed = match &self.mixer {
+            Qwen35Mixer::Linear(mixer) => mixer.forward_decode_batch(&normalized, states)?,
+            Qwen35Mixer::Full(mixer) => {
+                let output = mixer.forward_physical_decode_batch(
+                    &normalized,
+                    position_ids,
+                    caches,
+                    slots,
+                    metadata,
+                    completions,
                     *physical_layer,
                 )?;
                 *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
@@ -810,6 +1015,123 @@ impl Qwen35FullAttention {
             output
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
+        let output = (&output * &ops::sigmoid(&gate)?)?;
+        self.o_proj.forward(&output).map_err(Error::from)
+    }
+
+    fn forward_physical_decode_batch(
+        &self,
+        hidden_states: &Tensor,
+        position_ids: &[[usize; 3]],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let batch_size = hidden_states.dim(0)?;
+        if hidden_states.dim(1)? != 1
+            || batch_size == 0
+            || position_ids.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 full-attention decode batch dimensions do not match".into(),
+            ));
+        }
+        let first = caches[0];
+        if caches.iter().any(|cache| {
+            !Arc::ptr_eq(cache.arena(), first.arena())
+                || cache.layer_binding(physical_layer).ok()
+                    != first.layer_binding(physical_layer).ok()
+        }) {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 decode rows must share one arena and sparse layer binding".into(),
+            ));
+        }
+        if slots.arena_id() != first.arena().id() || slots.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 decode received an incompatible prepared slot map".into(),
+            ));
+        }
+        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
+            batch_size,
+            1,
+            self.num_heads,
+            self.head_dim * 2,
+        ))?;
+        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
+            batch_size,
+            1,
+            self.num_heads * self.head_dim,
+        ))?;
+        let key_states = self.k_proj.forward(hidden_states)?.reshape((
+            batch_size,
+            1,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let value_states = self.v_proj.forward(hidden_states)?.reshape((
+            batch_size,
+            1,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
+        let mut queries = Vec::with_capacity(batch_size);
+        let mut keys = Vec::with_capacity(batch_size);
+        let mut values = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let q_row = query_states.i(row)?.unsqueeze(0)?;
+            let k_row = key_states.i(row)?.unsqueeze(0)?;
+            let (q_row, k_row) = self.apply_rope(&q_row, &k_row, position_ids[row])?;
+            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+            values.push(
+                value_states
+                    .i(row)?
+                    .reshape((self.num_kv_heads, self.head_dim))?,
+            );
+        }
+        let query_refs = queries.iter().collect::<Vec<_>>();
+        let key_refs = keys.iter().collect::<Vec<_>>();
+        let value_refs = values.iter().collect::<Vec<_>>();
+        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
+        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
+        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        let storage_dtype = first.arena().config().dtype;
+        let output_dtype = queries.dtype();
+        let queries = queries.to_dtype(storage_dtype)?;
+        let keys = keys.to_dtype(storage_dtype)?;
+        let values = values.to_dtype(storage_dtype)?;
+        let binding = first.layer_binding(physical_layer)?;
+        let completion = first.arena().write_slots(
+            binding,
+            KvWriteArgs {
+                keys: &keys,
+                values: &values,
+                slots,
+            },
+        )?;
+        let (output, completion) = submit_ordered_after_write(completion, || {
+            first.arena().paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: metadata,
+                    softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                    softcap: None,
+                },
+            )
+        })?;
+        completions.collect(completion)?;
+        let output = output.to_dtype(output_dtype)?.reshape((
+            batch_size,
+            1,
+            self.num_heads * self.head_dim,
+        ))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
         self.o_proj.forward(&output).map_err(Error::from)
     }
@@ -1110,6 +1432,100 @@ impl Qwen35LinearAttention {
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
+        self.out_proj.forward(&output).map_err(Error::from)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        hidden_states: &Tensor,
+        states: &mut [&mut Qwen35LayerRuntimeState],
+    ) -> Result<Tensor> {
+        let batch_size = hidden_states.dim(0)?;
+        if hidden_states.dim(1)? != 1 || batch_size == 0 || states.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 linear-attention decode batch dimensions do not match".into(),
+            ));
+        }
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
+        let z = self.gate_proj.forward(hidden_states)?;
+        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
+        let alpha = self.alpha_proj.forward(hidden_states)?;
+        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
+            return Err(Error::InferenceError(format!(
+                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
+        let key_width = self.num_k_heads * self.head_k_dim;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let mut output_rows = Vec::with_capacity(batch_size);
+        let mut gate_rows = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let (conv_state, recurrent_state) = match &mut *states[row] {
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => (conv_state, recurrent_state),
+                _ => {
+                    return Err(Error::InferenceError(
+                        "Qwen3.5 layer runtime state does not match linear-attention layer".into(),
+                    ))
+                }
+            };
+            let mixed_qkv = mixed_qkv.i(row)?.unsqueeze(0)?;
+            let z = z.i(row)?.unsqueeze(0)?;
+            let alpha = alpha.i(row)?.unsqueeze(0)?;
+            let beta = beta.i(row)?.unsqueeze(0)?;
+            let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
+            let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
+            let query = mixed_qkv.narrow(2, 0, key_width)?.reshape((
+                1,
+                self.num_k_heads,
+                self.head_k_dim,
+            ))?;
+            let key = mixed_qkv.narrow(2, key_width, key_width)?.reshape((
+                1,
+                self.num_k_heads,
+                self.head_k_dim,
+            ))?;
+            let value = mixed_qkv.narrow(2, key_width * 2, value_width)?.reshape((
+                1,
+                self.num_v_heads,
+                self.head_v_dim,
+            ))?;
+            let mut query = l2norm(&query, 1e-6)?;
+            let mut key = l2norm(&key, 1e-6)?;
+            if self.num_v_heads != self.num_k_heads {
+                let repeats = self.num_v_heads / self.num_k_heads;
+                query = repeat_head_states(&query, repeats)?;
+                key = repeat_head_states(&key, repeats)?;
+            }
+            let current_state = if let Some(state) = recurrent_state.take() {
+                state
+            } else {
+                Tensor::zeros(
+                    (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                    value.dtype(),
+                    value.device(),
+                )?
+            };
+            let beta = beta.reshape((1, self.num_v_heads))?;
+            let g = g.reshape((1, self.num_v_heads))?;
+            let (output, next_state) =
+                recurrent_gated_delta(&query, &key, &value, &g, &beta, current_state)?;
+            *recurrent_state = Some(next_state);
+            output_rows.push(output.reshape((self.num_v_heads, self.head_v_dim))?);
+            gate_rows.push(z.reshape((self.num_v_heads, self.head_v_dim))?);
+        }
+        let output_refs = output_rows.iter().collect::<Vec<_>>();
+        let gate_refs = gate_rows.iter().collect::<Vec<_>>();
+        let output = Tensor::stack(&output_refs, 0)?;
+        let gate = Tensor::stack(&gate_refs, 0)?;
+        let output = self.norm.forward(&output, &gate)?.reshape((
+            batch_size,
+            1,
+            self.num_v_heads * self.head_v_dim,
+        ))?;
         self.out_proj.forward(&output).map_err(Error::from)
     }
 
@@ -1833,13 +2249,16 @@ mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
-        softplus, ConvRingState, Qwen35LayerRuntimeState, Qwen35TextRuntimeState,
+        softplus, ConvRingState, Qwen35GatedRmsNorm, Qwen35LayerRuntimeState,
+        Qwen35LinearAttention, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
+    use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
+    use candle_transformers::models::with_tracing::QMatMul;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
 
@@ -1852,6 +2271,132 @@ mod tests {
     fn retained_state_access_uses_the_contracts_canonical_domain_ids() {
         assert_eq!(recurrent_domain_v2(), RECURRENT_STATE_DOMAIN);
         assert_eq!(convolution_domain_v2(), CONVOLUTION_STATE_DOMAIN);
+    }
+
+    #[test]
+    fn batched_linear_decode_matches_independent_scalar_rows_with_ring_history() {
+        let device = &Device::Cpu;
+        let dense = |out: usize, input: usize, scale: f32| {
+            let weights = Tensor::from_vec(
+                (0..out * input)
+                    .map(|index| scale * ((index % input) + 1) as f32)
+                    .collect::<Vec<_>>(),
+                (out, input),
+                device,
+            )
+            .unwrap();
+            let weights = QTensor::quantize(&weights, GgmlDType::F32).unwrap();
+            QMatMul::from_weights(Arc::new(weights)).unwrap()
+        };
+        let conv_kernel = Tensor::from_vec(
+            (0..24)
+                .map(|index| 0.01 * ((index % 4) + 1) as f32)
+                .collect::<Vec<_>>(),
+            (6, 4),
+            device,
+        )
+        .unwrap();
+        let conv_kernel_slices = super::pre_slice_conv_kernel(&conv_kernel, 4).unwrap();
+        let mixer = Qwen35LinearAttention {
+            qkv_proj: dense(6, 4, 0.01),
+            gate_proj: dense(2, 4, 0.02),
+            beta_proj: dense(1, 4, -0.02),
+            alpha_proj: dense(1, 4, 0.03),
+            dt_bias: Tensor::zeros((1, 1, 1), DType::F32, device).unwrap(),
+            a: Tensor::full(-0.5f32, (1, 1, 1), device).unwrap(),
+            conv_kernel,
+            conv_kernel_slices,
+            norm: Qwen35GatedRmsNorm {
+                weight: Tensor::ones(2, DType::F32, device).unwrap(),
+                eps: 1e-6,
+            },
+            out_proj: dense(4, 2, 0.04),
+            num_k_heads: 1,
+            num_v_heads: 1,
+            head_k_dim: 2,
+            head_v_dim: 2,
+            conv_dim: 6,
+            kernel_size: 4,
+            tiled_recurrence_enabled: false,
+            tiled_recurrence_tile_size_override: None,
+        };
+        let initial_state = |row: usize| Qwen35LayerRuntimeState::Linear {
+            conv_state: Some(ConvRingState {
+                slots: (0..3)
+                    .map(|slot| {
+                        Tensor::full((row * 3 + slot + 1) as f32 * 0.01, (6, 1), device).unwrap()
+                    })
+                    .collect(),
+                next_idx: row,
+            }),
+            recurrent_state: None,
+        };
+        let initial = [initial_state(0), initial_state(1)];
+        let input = Tensor::from_vec(
+            vec![0.2f32, -0.1, 0.3, 0.4, -0.3, 0.5, 0.1, 0.2],
+            (2, 1, 4),
+            device,
+        )
+        .unwrap();
+        let mut scalar_states = initial.clone();
+        let scalar_rows = (0..2)
+            .map(|row| {
+                mixer
+                    .forward(
+                        &input.i(row).unwrap().unsqueeze(0).unwrap(),
+                        &mut scalar_states[row],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let scalar_refs = scalar_rows.iter().collect::<Vec<_>>();
+        let scalar = Tensor::cat(&scalar_refs, 0).unwrap();
+        let mut batch_states = initial;
+        let mut batch_refs = batch_states.iter_mut().collect::<Vec<_>>();
+        let batched = mixer.forward_decode_batch(&input, &mut batch_refs).unwrap();
+        let scalar_values = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let batch_values = batched.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (scalar, batch) in scalar_values.iter().zip(&batch_values) {
+            assert!((scalar - batch).abs() < 1e-5, "{scalar} != {batch}");
+        }
+        for (scalar, batch) in scalar_states.iter().zip(&batch_states) {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(scalar_conv),
+                recurrent_state: Some(scalar_recurrent),
+            } = scalar
+            else {
+                panic!("scalar row omitted hybrid state")
+            };
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(batch_conv),
+                recurrent_state: Some(batch_recurrent),
+            } = batch
+            else {
+                panic!("batch row omitted hybrid state")
+            };
+            assert_eq!(scalar_conv.next_idx, batch_conv.next_idx);
+            assert_eq!(scalar_conv.slots.len(), batch_conv.slots.len());
+            for (scalar, batch) in scalar_conv.slots.iter().zip(&batch_conv.slots) {
+                let scalar = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let batch = batch.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                for (scalar, batch) in scalar.iter().zip(&batch) {
+                    assert!((scalar - batch).abs() < 1e-5, "{scalar} != {batch}");
+                }
+            }
+            let scalar = scalar_recurrent
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let batch = batch_recurrent
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (scalar, batch) in scalar.iter().zip(&batch) {
+                assert!((scalar - batch).abs() < 1e-5, "{scalar} != {batch}");
+            }
+        }
     }
 
     #[test]

@@ -188,7 +188,10 @@ fn qwen3_managed_cache_for_row(
 /// families carry a single paged view; hybrid families also own an optional
 /// speculative arena that must swap with the same transaction.
 pub(super) enum ContinuousRowManagedCache {
-    Dense(PhysicalPagedKvCache),
+    Dense {
+        target: PhysicalPagedKvCache,
+        tensor_state: Option<super::ManagedTensorStateReservation>,
+    },
     Hybrid {
         target: PhysicalPagedKvCache,
         mtp: Option<PhysicalPagedKvCache>,
@@ -213,9 +216,16 @@ fn continuous_row_managed_caches_for_row(
             tensor_state: reservation.tensor_state,
         })
     } else {
-        Ok(ContinuousRowManagedCache::Dense(
-            qwen3_managed_cache_for_row(request, scheduled, reservation)?,
-        ))
+        let tensor_state = matches!(
+            request.model_variant,
+            Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen35Chat
+        )
+        .then_some(reservation.tensor_state)
+        .flatten();
+        Ok(ContinuousRowManagedCache::Dense {
+            target: qwen3_managed_cache_for_row(request, scheduled, reservation)?,
+            tensor_state,
+        })
     }
 }
 
