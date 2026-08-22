@@ -18,6 +18,56 @@ use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecu
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
 
+fn begins_resumable_prefill_state(scheduled: &ScheduledRequest, resumable_prefill: bool) -> bool {
+    scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens == 0
+}
+
+fn finish_resumable_prefill_step(
+    prefill_complete: bool,
+    last_tokens_generated: usize,
+    publish_bootstrap: impl FnOnce() -> Result<NativeChatDecodeStep>,
+) -> Result<NativeChatDecodeStep> {
+    if prefill_complete {
+        // Publish the already-computed first token in the same transaction as
+        // the final prompt span. No additional prompt KV write is performed.
+        return publish_bootstrap();
+    }
+    Ok(NativeChatDecodeStep {
+        delta: String::new(),
+        text: String::new(),
+        tokens_generated: last_tokens_generated,
+        input_tokens_committed: 0,
+        finished: false,
+    })
+}
+
+fn resumable_prefill_span(
+    scheduled: &ScheduledRequest,
+    prompt_tokens: usize,
+) -> Result<(usize, usize)> {
+    let start = scheduled.num_computed_tokens;
+    let end = start.checked_add(scheduled.num_tokens).ok_or_else(|| {
+        Error::InvalidInput("resumable prefill span overflowed prompt accounting".into())
+    })?;
+    let crate::engine::WorkUnit::SequenceStep { phase, input, .. } = &scheduled.work else {
+        return Err(Error::InvalidInput(
+            "resumable prefill requires sequence-prefill work".into(),
+        ));
+    };
+    if *phase != crate::engine::SequencePhase::Prefill
+        || input.start != start
+        || input.end != end
+        || start >= end
+        || end > prompt_tokens
+    {
+        return Err(Error::InvalidInput(format!(
+            "resumable prefill work [{}, {}) disagrees with scheduler span [{start}, {end}) for {prompt_tokens} prompt tokens",
+            input.start, input.end
+        )));
+    }
+    Ok((start, end))
+}
+
 #[derive(Debug, Default)]
 struct StreamDeltaBatch {
     emitted_first: bool,
@@ -207,14 +257,12 @@ impl NativeExecutor {
                 "managed Qwen3 execution requires its exact row reservation".to_string(),
             ));
         }
-        let qwen38_chunked_prefill = self.config.enable_chunked_prefill
-            && matches!(
-                request.model_variant,
-                Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen38Chat
-            );
+        let model = request.prepared_chat_model_for_executor()?;
+        let resumable_prefill =
+            self.config.enable_chunked_prefill && model.supports_resumable_prefill();
         if managed_cache.is_some()
             && scheduled.is_prefill
-            && !qwen38_chunked_prefill
+            && !resumable_prefill
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens != request.num_prompt_tokens())
         {
@@ -238,7 +286,6 @@ impl NativeExecutor {
         let stream_policy = request.stream_policy;
         let generation_config = Self::chat_generation_config(request);
         let session = scheduled.session_key();
-        let model = request.prepared_chat_model_for_executor()?;
         if mtp_cache.is_some() && !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
             return Err(Error::InferenceError(
                 "managed Qwen3.8 MTP cache was routed to another model family".into(),
@@ -401,13 +448,25 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
-            if scheduled.is_prefill && qwen38_chunked_prefill && scheduled.num_computed_tokens > 0 {
+            if scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens > 0 {
                 return Err(Error::InferenceError(format!(
-                    "chunked prefill request {} lost its decode state before span continuation; retry requires a fresh prompt",
+                    "resumable prefill request {} lost its decode state before span continuation; retry requires a fresh prompt",
                     request.id
                 )));
             }
             let mut decode_state = match managed_cache.take() {
+                Some(cache) if begins_resumable_prefill_state(scheduled, resumable_prefill) => {
+                    Self::run_blocking(|| {
+                        model.start_resumable_prefill_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt,
+                            cache,
+                            mtp_cache.take(),
+                        )
+                    })?
+                }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35(_)) => {
                     Self::run_blocking(|| {
                         model.start_qwen35_decode_state_managed(
@@ -420,30 +479,15 @@ impl NativeExecutor {
                     })?
                 }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen38(_)) => {
-                    let chunked_first_quantum = scheduled.is_prefill
-                        && qwen38_chunked_prefill
-                        && scheduled.num_computed_tokens == 0
-                        && scheduled.num_tokens < request.num_prompt_tokens();
                     Self::run_blocking(|| {
-                        if chunked_first_quantum {
-                            model.start_qwen38_chunked_prefill_state_managed(
-                                messages,
-                                max_new_tokens,
-                                &generation_config,
-                                prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
-                                cache,
-                                mtp_cache.take(),
-                            )
-                        } else {
-                            model.start_qwen38_decode_state_managed(
-                                messages,
-                                max_new_tokens,
-                                &generation_config,
-                                prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
-                                cache,
-                                mtp_cache.take(),
-                            )
-                        }
+                        model.start_qwen38_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
+                            cache,
+                            mtp_cache.take(),
+                        )
                     })?
                 }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
@@ -493,28 +537,27 @@ impl NativeExecutor {
                 request.id.clone(),
             )));
         }
-        let chunked_prefill_quantum = scheduled.is_prefill && qwen38_chunked_prefill;
-        let chunked_span_tokens = chunked_prefill_quantum.then_some(scheduled.num_tokens);
-        let step = if chunked_prefill_quantum {
-            let span_end = scheduled
-                .num_computed_tokens
-                .saturating_add(scheduled.num_tokens);
-            Self::run_blocking(|| {
-                model.continue_qwen38_chunked_prefill(
+        let resumable_prefill_quantum = scheduled.is_prefill && resumable_prefill;
+        let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
+        let step = if resumable_prefill_quantum {
+            let (span_start, span_end) =
+                resumable_prefill_span(scheduled, request.num_prompt_tokens())?;
+            let prefill_complete = Self::run_blocking(|| {
+                model.continue_resumable_prefill(
                     &mut active_state.state,
                     messages,
                     &generation_config,
-                    prepared_chat_prompt.and_then(|prepared| prepared.as_qwen38()),
+                    prepared_chat_prompt,
+                    span_start,
                     span_end,
+                    request.num_prompt_tokens(),
                 )
             })?;
-            NativeChatDecodeStep {
-                delta: String::new(),
-                text: String::new(),
-                tokens_generated: active_state.last_tokens_generated,
-                input_tokens_committed: scheduled.num_tokens,
-                finished: false,
-            }
+            finish_resumable_prefill_step(
+                prefill_complete,
+                active_state.last_tokens_generated,
+                || Self::run_blocking(|| model.decode_quantum(&mut active_state.state, 1)),
+            )?
         } else {
             Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?
         };
@@ -554,7 +597,7 @@ impl NativeExecutor {
             }
         }
 
-        let tokens_processed = if let Some(span_tokens) = chunked_span_tokens {
+        let tokens_processed = if let Some(span_tokens) = resumable_span_tokens {
             span_tokens
         } else if scheduled.is_prefill {
             request.num_prompt_tokens()
@@ -865,6 +908,82 @@ mod tests {
     use crate::engine::{GenerationParams, InputRange, SequencePhase, WorkUnit};
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
+
+    #[test]
+    fn final_first_span_still_bootstraps_resumable_prefill_state() {
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: "short-resumable-prompt".to_string(),
+            sequence_id: 1,
+            num_tokens: 16,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 0, end: 16 },
+                max_output_steps: 16,
+            },
+        };
+
+        assert!(begins_resumable_prefill_state(&scheduled, true));
+        assert!(!begins_resumable_prefill_state(&scheduled, false));
+        assert_eq!(resumable_prefill_span(&scheduled, 16).unwrap(), (0, 16));
+    }
+
+    #[test]
+    fn resumable_prefill_rejects_scheduler_work_cursor_mismatch() {
+        let scheduled = ScheduledRequest {
+            plan_id: 1,
+            request_id: "bad-resumable-span".to_string(),
+            sequence_id: 1,
+            num_tokens: 8,
+            is_prefill: true,
+            num_computed_tokens: 8,
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Prefill,
+                input: InputRange { start: 7, end: 16 },
+                max_output_steps: 8,
+            },
+        };
+
+        assert!(resumable_prefill_span(&scheduled, 16).is_err());
+    }
+
+    #[test]
+    fn final_resumable_prefill_span_publishes_its_bootstrap_token() {
+        let published = std::cell::Cell::new(false);
+        let step = finish_resumable_prefill_step(true, 0, || {
+            published.set(true);
+            Ok(NativeChatDecodeStep {
+                delta: "token".to_string(),
+                text: "token".to_string(),
+                tokens_generated: 1,
+                input_tokens_committed: 0,
+                finished: false,
+            })
+        })
+        .unwrap();
+
+        assert!(published.get());
+        assert_eq!(step.delta, "token");
+        assert_eq!(step.tokens_generated, 1);
+        assert_eq!(step.input_tokens_committed, 0);
+    }
+
+    #[test]
+    fn incomplete_resumable_prefill_span_does_not_publish_a_token() {
+        let published = std::cell::Cell::new(false);
+        let step = finish_resumable_prefill_step(false, 3, || {
+            published.set(true);
+            unreachable!("an incomplete prefill cannot publish its bootstrap")
+        })
+        .unwrap();
+
+        assert!(!published.get());
+        assert_eq!(step.tokens_generated, 3);
+        assert!(step.delta.is_empty());
+        assert_eq!(step.input_tokens_committed, 0);
+    }
 
     #[test]
     fn chat_handler_rejects_unprepared_public_prompt_tokens() {

@@ -309,6 +309,10 @@ pub struct ChatDecodeState {
 }
 
 impl ChatDecodeState {
+    pub(crate) fn prefill_progress(&self) -> usize {
+        self.prefill_progress
+    }
+
     pub(crate) fn uses_physical_kv(&self) -> bool {
         true
     }
@@ -1176,7 +1180,7 @@ impl Qwen38ChatModel {
     }
 
     /// Prefill the next scheduler-owned prompt span
-    /// `[state.prefill_progress, span_end)` into the state's physical cache.
+    /// `[span_start, span_end)` into the state's physical cache.
     /// Returns `true` when the prompt completed and the decode quantum is
     /// seeded (logits or MTP bootstrap) exactly like the monolithic path;
     /// returns `false` when more spans remain.
@@ -1186,11 +1190,23 @@ impl Qwen38ChatModel {
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
         prepared: Option<&Qwen38PreparedPrompt>,
+        span_start: usize,
         span_end: usize,
+        prompt_tokens: usize,
     ) -> Result<bool> {
         let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
         let total = prepared.prompt_ids.len();
         let start = state.prefill_progress;
+        if total != prompt_tokens {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.8 resumable prefill expected {prompt_tokens} prompt tokens but prepared {total}"
+            )));
+        }
+        if start != span_start {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.8 resumable prefill state is at {start} but the scheduler requested {span_start}"
+            )));
+        }
         if start >= total {
             return Err(Error::InvalidInput(
                 "Qwen3.8 chunked prefill already completed for this session".into(),

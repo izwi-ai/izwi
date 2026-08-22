@@ -21,6 +21,7 @@ use super::{InputRange, PlanId, SequencePhase, SessionKey, WorkUnit};
 use crate::model::ModelVariant;
 
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
+pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL: usize = 8;
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -372,6 +373,10 @@ pub struct Scheduler {
     /// waiting. This bounds starvation without pretending that a Full adapter
     /// can safely resume a scheduler-authored chunk.
     decode_only_steps_with_waiting_full_prefill: usize,
+    /// Decode-bearing transactions observed while a resumable prefill had no
+    /// scheduler slot. Unlike a full prefill, one incremental span can share
+    /// the transaction once this bounded wait expires.
+    decode_only_steps_with_waiting_incremental_prefill: usize,
 }
 
 /// Metadata for a request in the scheduler.
@@ -460,6 +465,7 @@ impl Scheduler {
             telemetry,
             class_service: HashMap::new(),
             decode_only_steps_with_waiting_full_prefill: 0,
+            decode_only_steps_with_waiting_incremental_prefill: 0,
         }
     }
 
@@ -532,7 +538,14 @@ impl Scheduler {
         }
         metadata.cache_policy = RequestCachePolicy {
             mode: Some(profile.cache_mode),
-            prefill: profile.prefill,
+            // Only an explicit incremental contract is scheduler-resumable.
+            // `None` is not a weaker form of incremental prefill; for a
+            // sequence with prompt tokens it must fail closed as indivisible.
+            prefill: if profile.prefill == PrefillMode::Incremental {
+                PrefillMode::Incremental
+            } else {
+                PrefillMode::Full
+            },
             decode_batch: profile.decode_batch,
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
@@ -551,10 +564,15 @@ impl Scheduler {
         self.update_dynamic_budget();
 
         let total_budget = self.current_token_budget();
-        let waiting_full_prefill = self.has_waiting_full_prefill();
+        let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now);
         let force_full_prefill_service = waiting_full_prefill
             && self.decode_only_steps_with_waiting_full_prefill
-                >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL.saturating_sub(1);
+                >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL;
+        let waiting_incremental_prefill = self.has_eligible_incremental_prefill(scheduling_now);
+        let force_incremental_prefill_service = !force_full_prefill_service
+            && waiting_incremental_prefill
+            && self.decode_only_steps_with_waiting_incremental_prefill
+                >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL;
         let latency_sensitive_waiting = self.has_latency_sensitive_waiting();
         let throughput_waiting_only =
             !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
@@ -595,6 +613,19 @@ impl Scheduler {
             // decode output or pretending it can honor a token chunk.
             decode_budget = 0;
             reserved_prefill_budget = total_budget;
+        } else if force_incremental_prefill_service {
+            // Preserve both a token budget and a physical row for one
+            // resumable span. The remaining rows/tokens can continue decode.
+            let forced_prefill_budget = if total_budget > 1 {
+                self.config
+                    .chunked_prefill_threshold
+                    .max(1)
+                    .min(total_budget - 1)
+            } else {
+                total_budget
+            };
+            reserved_prefill_budget = reserved_prefill_budget.max(forced_prefill_budget);
+            decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
         }
         let mut remaining_decode_budget = decode_budget;
 
@@ -714,6 +745,9 @@ impl Scheduler {
             if remaining_batch == 0 || remaining_decode_budget == 0 {
                 break;
             }
+            if force_incremental_prefill_service && remaining_batch <= 1 {
+                break;
+            }
             if self.config.policy == SchedulingPolicy::WeightedFair
                 && !self.waiting_members.is_empty()
                 && remaining_batch <= 1
@@ -764,15 +798,16 @@ impl Scheduler {
         }
 
         // Phase 2: schedule prefill requests.
-        let mut remaining_prefill_budget = if force_full_prefill_service {
-            reserved_prefill_budget
-        } else if self.config.enable_adaptive_batching
-            || self.config.policy == SchedulingPolicy::WeightedFair
-        {
-            reserved_prefill_budget.saturating_add(remaining_decode_budget)
-        } else {
-            remaining_decode_budget
-        };
+        let mut remaining_prefill_budget =
+            if force_full_prefill_service || force_incremental_prefill_service {
+                reserved_prefill_budget
+            } else if self.config.enable_adaptive_batching
+                || self.config.policy == SchedulingPolicy::WeightedFair
+            {
+                reserved_prefill_budget.saturating_add(remaining_decode_budget)
+            } else {
+                remaining_decode_budget
+            };
         let prefill_admission_cap = usize::MAX;
         let mut prefill_admissions = 0usize;
         let mut scheduling_full_prefill_batch = false;
@@ -824,6 +859,9 @@ impl Scheduler {
 
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
             if force_full_prefill_service && !full_prefill {
+                continue;
+            }
+            if force_incremental_prefill_service && full_prefill {
                 continue;
             }
             if !full_prefill && scheduling_full_prefill_batch {
@@ -919,6 +957,10 @@ impl Scheduler {
                 deferred_waiting.push(request_id);
                 continue;
             }
+            if force_incremental_prefill_service && full_prefill {
+                deferred_waiting.push(request_id);
+                continue;
+            }
             if !full_prefill && scheduling_full_prefill_batch {
                 deferred_waiting.push(request_id);
                 continue;
@@ -1007,19 +1049,6 @@ impl Scheduler {
             self.enqueue_waiting_request(request_id);
         }
 
-        let served_full_prefill = result.prefill_requests.iter().any(|scheduled| {
-            self.requests
-                .get(&scheduled.request_id)
-                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
-        });
-        if served_full_prefill || !waiting_full_prefill {
-            self.decode_only_steps_with_waiting_full_prefill = 0;
-        } else if !result.decode_requests.is_empty() {
-            self.decode_only_steps_with_waiting_full_prefill = self
-                .decode_only_steps_with_waiting_full_prefill
-                .saturating_add(1);
-        }
-
         result
     }
 
@@ -1065,6 +1094,45 @@ impl Scheduler {
             }
         }
         self.update_dynamic_budget();
+    }
+
+    /// Advance starvation debt once per successfully committed physical
+    /// transaction. Scheduler polling, retry deferral, and rolled-back model
+    /// work must not mutate this service clock.
+    pub(crate) fn record_committed_batch_service(
+        &mut self,
+        committed_requests: &[RequestId],
+        decode_transaction: bool,
+    ) {
+        if committed_requests.is_empty() {
+            return;
+        }
+        let served_full_prefill = !decode_transaction
+            && committed_requests.iter().any(|request_id| {
+                self.requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+            });
+        let served_incremental_prefill = !decode_transaction
+            && committed_requests.iter().any(|request_id| {
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                })
+            });
+        if served_full_prefill || !self.has_pending_full_prefill() {
+            self.decode_only_steps_with_waiting_full_prefill = 0;
+        } else if decode_transaction {
+            self.decode_only_steps_with_waiting_full_prefill = self
+                .decode_only_steps_with_waiting_full_prefill
+                .saturating_add(1);
+        }
+        if served_incremental_prefill || !self.has_pending_incremental_prefill() {
+            self.decode_only_steps_with_waiting_incremental_prefill = 0;
+        } else if decode_transaction {
+            self.decode_only_steps_with_waiting_incremental_prefill = self
+                .decode_only_steps_with_waiting_incremental_prefill
+                .saturating_add(1);
+        }
     }
 
     /// Release an uncommitted prefill quantum so the exact request session can
@@ -1818,21 +1886,67 @@ impl Scheduler {
         })
     }
 
-    fn has_waiting_full_prefill(&self) -> bool {
+    fn has_eligible_full_prefill(&self, now: Instant) -> bool {
         let running_full = self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
                 && !running.prefill_in_flight
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Full
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
+        });
+        running_full
+            || self.waiting_members.iter().any(|request_id| {
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Full
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
+            })
+    }
+
+    fn has_pending_full_prefill(&self) -> bool {
+        self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
                 && self
                     .requests
                     .get(request_id)
                     .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+        }) || self.waiting_members.iter().any(|request_id| {
+            self.requests
+                .get(request_id)
+                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+        })
+    }
+
+    fn has_eligible_incremental_prefill(&self, now: Instant) -> bool {
+        let running_incremental = self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && !running.prefill_in_flight
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
         });
-        running_full
+        running_incremental
             || self.waiting_members.iter().any(|request_id| {
-                self.requests
-                    .get(request_id)
-                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+                self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                        && metadata.retry_not_before.is_none_or(|retry| retry <= now)
+                })
             })
+    }
+
+    fn has_pending_incremental_prefill(&self) -> bool {
+        self.running.iter().any(|(request_id, running)| {
+            !running.prefill_complete
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                })
+        }) || self.waiting_members.iter().any(|request_id| {
+            self.requests
+                .get(request_id)
+                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental)
+        })
     }
 
     fn refresh_queue_age_sample(&mut self) {
@@ -2765,13 +2879,13 @@ mod tests {
         let full = build_request(TaskType::Chat, &full_id, Priority::Normal);
         assert!(scheduler.add_request(&full));
 
-        for step in 0..MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+        for step in 0..=MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
             let scheduled = scheduler.schedule();
             if !scheduled.prefill_requests.is_empty() {
                 assert_eq!(scheduled.prefill_requests.len(), 1);
                 assert_eq!(scheduled.prefill_requests[0].request_id, full_id);
                 assert!(scheduled.decode_requests.is_empty());
-                assert!(step < MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL);
+                assert_eq!(step, MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL);
                 return;
             }
             assert_eq!(
@@ -2780,8 +2894,124 @@ mod tests {
                 "decode unexpectedly absent at bounded-service step {step}: {scheduled:?}"
             );
             scheduler.update_after_step(&decode_id, 1, 1, 1.0);
+            scheduler.record_committed_batch_service(std::slice::from_ref(&decode_id), true);
         }
         panic!("full prefill was starved beyond the bounded decode-only window");
+    }
+
+    #[test]
+    fn waiting_incremental_prefill_gets_a_bounded_shared_slot() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 16,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: true,
+            chunked_prefill_threshold: 32,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+
+        let decode_ids = ["persistent-decode-a", "persistent-decode-b"];
+        let mut decode_requests = Vec::new();
+        for request_id in decode_ids {
+            let mut request = build_request(TaskType::Chat, request_id, Priority::Normal);
+            request.params.max_tokens = 64;
+            assert!(scheduler.add_request(&request));
+            decode_requests.push(request);
+        }
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill_requests.len(), 2);
+        for request in &decode_requests {
+            scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 1, 1.0);
+        }
+
+        let incremental_id = "bounded-incremental-prefill".to_string();
+        let mut incremental = build_request(TaskType::Chat, &incremental_id, Priority::Normal);
+        incremental.prompt_tokens = vec![7; 64];
+        assert!(scheduler.add_request(&incremental));
+        let epoch = scheduler.get_sequence_id(&incremental_id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(incremental_id.clone(), epoch), &profile,));
+
+        for step in 0..=MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL {
+            let debt_before = scheduler.decode_only_steps_with_waiting_incremental_prefill;
+            let scheduled = scheduler.schedule();
+            assert_eq!(
+                scheduler.decode_only_steps_with_waiting_incremental_prefill, debt_before,
+                "scheduler polling changed committed-service debt"
+            );
+            if let Some(prefill) = scheduled.prefill_requests.first() {
+                assert_eq!(prefill.request_id, incremental_id);
+                assert_eq!(scheduled.decode_requests.len(), 1);
+                assert_eq!(
+                    step,
+                    MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
+                );
+                return;
+            }
+            assert_eq!(
+                scheduled.decode_requests.len(),
+                2,
+                "decode rows disappeared before the bounded service step {step}: {scheduled:?}"
+            );
+            for request in &decode_requests {
+                scheduler.update_after_step(&request.id, 1, 1, 1.0);
+            }
+            scheduler.record_committed_batch_service(
+                &decode_requests
+                    .iter()
+                    .map(|request| request.id.clone())
+                    .collect::<Vec<_>>(),
+                true,
+            );
+        }
+        panic!("incremental prefill was starved beyond the bounded decode-only window");
+    }
+
+    #[test]
+    fn prefill_none_contract_cannot_be_misclassified_as_resumable() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let request_id = "none-is-not-resumable".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).unwrap();
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        assert_eq!(profile.prefill, PrefillMode::None);
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile,));
+
+        assert_eq!(
+            scheduler.requests[&request_id].cache_policy.prefill,
+            PrefillMode::Full
+        );
+    }
+
+    #[test]
+    fn retry_backoff_prefill_is_not_force_service_eligible() {
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        let request_id = "incremental-retry-backoff".to_string();
+        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        assert!(scheduler.add_request(&request));
+        allow_incremental_prefill(&mut scheduler, &request_id);
+        scheduler
+            .requests
+            .get_mut(&request_id)
+            .unwrap()
+            .retry_not_before = Some(Instant::now() + Duration::from_secs(60));
+        scheduler.decode_only_steps_with_waiting_incremental_prefill =
+            MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL - 1;
+        scheduler.record_committed_batch_service(&["decode-row".to_string()], true);
+
+        assert!(!scheduler.has_eligible_incremental_prefill(Instant::now()));
+        assert_eq!(
+            scheduler.decode_only_steps_with_waiting_incremental_prefill,
+            MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
+        );
     }
 
     #[test]
@@ -2980,6 +3210,7 @@ mod tests {
         let first = scheduler.schedule();
         assert_eq!(first.prefill_requests.len(), 1);
         scheduler.update_after_step(&req1_id, 4, 0, 1.0);
+        scheduler.finish_request(&req1_id);
 
         let req2_id = "prefix-reuser".to_string();
         let mut req2 = EngineCoreRequest::tts("prefix reuser");

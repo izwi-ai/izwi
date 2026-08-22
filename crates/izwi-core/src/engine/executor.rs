@@ -1350,6 +1350,17 @@ fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool 
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
 
+fn resolved_resumable_prefill_mode(
+    chunking_enabled: bool,
+    exact_model_proof: Option<bool>,
+) -> PrefillMode {
+    if chunking_enabled && exact_model_proof == Some(true) {
+        PrefillMode::Incremental
+    } else {
+        PrefillMode::Full
+    }
+}
+
 impl ModelExecutor for NativeExecutor {
     fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
         let variant = request.model_variant?;
@@ -1449,24 +1460,27 @@ impl ModelExecutor for NativeExecutor {
                 }
                 super::types::TaskType::SpeechToSpeech => false,
             });
+        let resumable_prefill_proof =
+            if matches!(request.task_type, super::types::TaskType::Chat) {
+                request
+                    .prepared_chat_model_for_executor()
+                    .ok()
+                    .map(|model| model.supports_resumable_prefill())
+            } else {
+                None
+            };
 
         if implementation_incremental
             && (!matches!(request.task_type, super::types::TaskType::ASR) || request.streaming)
         {
             profile.mode = ExecutionMode::Sequence;
-            // Scheduler-level chunked prefill is opt-in and currently
-            // supported by the Qwen3.8 span-resumable prefill path only;
-            // everything else keeps the monolithic full-prompt quantum.
-            profile.prefill = if self.config.enable_chunked_prefill
-                && matches!(request.task_type, super::types::TaskType::Chat)
-                && matches!(
-                    request.model_variant,
-                    Some(variant) if variant.family() == crate::catalog::ModelFamily::Qwen38Chat
-                ) {
-                PrefillMode::Incremental
-            } else {
-                PrefillMode::Full
-            };
+            // Scheduler-level spans require a stronger capability than
+            // incremental decode: the exact loaded family must publish a
+            // resumable prefill safe point. Unsupported families remain full.
+            profile.prefill = resolved_resumable_prefill_mode(
+                self.config.enable_chunked_prefill,
+                resumable_prefill_proof,
+            );
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
@@ -2326,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn chunked_prefill_classification_is_opt_in_and_qwen38_only() {
+    fn resumable_prefill_classification_is_opt_in_and_fail_closed() {
         let mut request = EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {
             role: crate::models::shared::chat::ChatRole::User,
             content: "chunk me".to_string(),
@@ -2352,7 +2366,7 @@ mod tests {
                 .execution_profile(&request)
                 .unwrap()
                 .prefill,
-            PrefillMode::Incremental
+            PrefillMode::Full
         );
 
         // Sibling hybrid without a resumable prefill path stays full.
@@ -2362,6 +2376,26 @@ mod tests {
                 .execution_profile(&request)
                 .unwrap()
                 .prefill,
+            PrefillMode::Full
+        );
+    }
+
+    #[test]
+    fn resumable_prefill_mode_requires_exact_positive_model_proof() {
+        assert_eq!(
+            resolved_resumable_prefill_mode(true, Some(true)),
+            PrefillMode::Incremental
+        );
+        assert_eq!(
+            resolved_resumable_prefill_mode(false, Some(true)),
+            PrefillMode::Full
+        );
+        assert_eq!(
+            resolved_resumable_prefill_mode(true, Some(false)),
+            PrefillMode::Full
+        );
+        assert_eq!(
+            resolved_resumable_prefill_mode(true, None),
             PrefillMode::Full
         );
     }

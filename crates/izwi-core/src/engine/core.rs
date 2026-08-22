@@ -533,7 +533,7 @@ impl EngineCore {
             });
         let profile = Self::apply_adapter_execution_contract(&request, raw_profile)?;
         if scheduled.is_prefill
-            && profile.prefill == PrefillMode::Full
+            && profile.prefill != PrefillMode::Incremental
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens < request.num_prompt_tokens())
         {
@@ -2409,6 +2409,8 @@ impl EngineCore {
                 record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
             }
 
+            let decode_transaction = batch.phase == ExecutionPhase::Decode;
+            let mut committed_service_requests = Vec::new();
             for result in batch.results {
                 let provenance = result.provenance;
                 let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
@@ -2435,10 +2437,25 @@ impl EngineCore {
                     }
                 }
                 match self.commit_executor_result(result, step_time_ms).await {
-                    Some(committed) => executor_outputs.push(committed),
+                    Some(committed) => {
+                        if (committed.output.tokens_processed > 0
+                            || committed.output.tokens_generated > 0)
+                            && matches!(
+                                committed.disposition,
+                                ExecutionDisposition::Progress
+                                    | ExecutionDisposition::Yielded(_)
+                                    | ExecutionDisposition::Finished(_)
+                            )
+                        {
+                            committed_service_requests.push(committed.session.request_id.clone());
+                        }
+                        executor_outputs.push(committed);
+                    }
                     None => record_engine_execution_outcome(provenance),
                 }
             }
+            self.scheduler
+                .record_committed_batch_service(&committed_service_requests, decode_transaction);
         }
         // Terminal events are a durable outbox until all fallible work for the
         // step has completed. Draining earlier can lose an abort/deadline event
@@ -6441,7 +6458,7 @@ mod tests {
         }
 
         let mut prefill_ms = HashMap::new();
-        for _ in 0..=super::super::scheduler::MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+        for _ in 0..=super::super::scheduler::MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL + 1 {
             let prepared = core
                 .prepare_step()
                 .await

@@ -3023,6 +3023,13 @@ impl NativeChatModel {
         }
     }
 
+    /// Whether scheduler-authored prompt spans can be committed and resumed
+    /// on the same managed decode state. Incremental decode alone does not
+    /// imply this stronger prefill safe-point contract.
+    pub fn supports_resumable_prefill(&self) -> bool {
+        matches!(self, Self::Qwen38(_))
+    }
+
     /// Whether one continuous model call executes all live rows through a
     /// single tensor-batched forward path. This is intentionally stricter than
     /// continuous scheduler membership: Qwen3.8 currently shares a transaction
@@ -3124,51 +3131,94 @@ impl NativeChatModel {
         }
     }
 
-    pub(crate) fn start_qwen38_chunked_prefill_state_managed(
+    pub(crate) fn start_resumable_prefill_state_managed(
         &self,
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen38PreparedPrompt>,
+        prepared: Option<&NativeChatPreparedPrompt>,
         target_cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<NativeChatDecodeState> {
         match self {
-            Self::Qwen38(model) => Ok(NativeChatDecodeState::Qwen38(
-                model.begin_chunked_prefill_state_physical(
-                    messages,
-                    max_new_tokens,
-                    config,
-                    prepared,
-                    target_cache,
-                    mtp_cache,
-                )?,
-            )),
+            Self::Qwen38(model) => {
+                let prepared = match prepared {
+                    Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
+                        Error::InvalidInput(
+                            "resumable prefill prepared artifact belongs to another model family"
+                                .into(),
+                        )
+                    })?),
+                    None => None,
+                };
+                Ok(NativeChatDecodeState::Qwen38(
+                    model.begin_chunked_prefill_state_physical(
+                        messages,
+                        max_new_tokens,
+                        config,
+                        prepared,
+                        target_cache,
+                        mtp_cache,
+                    )?,
+                ))
+            }
             _ => Err(Error::InvalidInput(
-                "managed Qwen3.8 chunked-prefill state was routed to another model family".into(),
+                "chat model does not support resumable managed prefill".into(),
             )),
         }
     }
 
-    pub(crate) fn continue_qwen38_chunked_prefill(
+    pub(crate) fn continue_resumable_prefill(
         &self,
         state: &mut NativeChatDecodeState,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen38PreparedPrompt>,
+        prepared: Option<&NativeChatPreparedPrompt>,
+        span_start: usize,
         span_end: usize,
+        prompt_tokens: usize,
     ) -> Result<bool> {
         let NativeChatDecodeState::Qwen38(state) = state else {
             return Err(Error::InvalidInput(
-                "managed Qwen3.8 chunked prefill was routed to another model family".into(),
+                "resumable prefill state does not match the loaded chat model".into(),
             ));
         };
         match self {
             Self::Qwen38(model) => {
-                model.continue_chunked_prefill_physical(state, messages, config, prepared, span_end)
+                let prepared = match prepared {
+                    Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
+                        Error::InvalidInput(
+                            "resumable prefill prepared artifact belongs to another model family"
+                                .into(),
+                        )
+                    })?),
+                    None => None,
+                };
+                let complete = model.continue_chunked_prefill_physical(
+                    state,
+                    messages,
+                    config,
+                    prepared,
+                    span_start,
+                    span_end,
+                    prompt_tokens,
+                )?;
+                if state.prefill_progress() != span_end {
+                    return Err(Error::InferenceError(format!(
+                        "resumable prefill committed cursor {} instead of {span_end}",
+                        state.prefill_progress()
+                    )));
+                }
+                if complete != (span_end == prompt_tokens) {
+                    return Err(Error::InferenceError(
+                        "resumable prefill completion disagrees with the sealed prompt length"
+                            .into(),
+                    ));
+                }
+                Ok(complete)
             }
             _ => Err(Error::InvalidInput(
-                "managed Qwen3.8 chunked prefill was routed to another model family".into(),
+                "chat model does not support resumable managed prefill".into(),
             )),
         }
     }
