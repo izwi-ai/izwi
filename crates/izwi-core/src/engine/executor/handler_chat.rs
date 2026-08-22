@@ -769,10 +769,28 @@ impl NativeExecutor {
             }
             match managed_cache {
                 Some(views) => {
-                    let (cache, mtp_cache) = match views {
-                        super::ContinuousRowManagedCache::Dense(cache) => (cache, None),
-                        super::ContinuousRowManagedCache::Hybrid { target, mtp } => (target, mtp),
+                    let (cache, mtp_cache, tensor_reservation) = match views {
+                        super::ContinuousRowManagedCache::Dense(cache) => (cache, None, None),
+                        super::ContinuousRowManagedCache::Hybrid {
+                            target,
+                            mtp,
+                            tensor_state,
+                        } => (target, mtp, tensor_state),
                     };
+                    let tensor_arena = request
+                        .managed_cache_runtime()
+                        .and_then(|runtime| runtime.tensor_state());
+                    if tensor_arena.is_some() != tensor_reservation.is_some() {
+                        return Err(Error::InferenceError(
+                            "continuous hybrid row lost its tensor-state reservation".into(),
+                        ));
+                    }
+                    if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
+                        active_state
+                            .state
+                            .bind_hybrid_tensor_sequence(reservation.sequence)?;
+                        active_state.state.restore_hybrid_tensor_state(arena)?;
+                    }
                     *checkpoint = Some(
                         active_state
                             .state
@@ -805,6 +823,17 @@ impl NativeExecutor {
             model.continuous_decode_is_tensor_batched(),
             live_width,
         );
+
+        for (index, _, active_state, _) in &mut active_states.rows {
+            if let Some(arena) = ordered_requests[*index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+            {
+                active_state
+                    .state
+                    .stage_hybrid_tensor_state(arena, scheduled[*index].plan_id)?;
+            }
+        }
 
         let mut continuing = vec![false; scheduled.len()];
         for ((index, _, active_state, _), step) in active_states.rows.iter_mut().zip(steps) {

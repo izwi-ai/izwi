@@ -1,5 +1,7 @@
 //! Recurrent multi-token-prediction head for native Qwen3.8 checkpoints.
 
+use std::sync::Arc;
+
 use candle_core::{Device, Module, Tensor};
 
 use super::native::{
@@ -11,7 +13,9 @@ use super::text::{
     Qwen38FullAttention, Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation,
     Qwen38RmsNorm, Qwen38TextModel,
 };
+use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 pub(crate) const QWEN38_MTP_MIN_DEPTH: usize = 1;
@@ -362,6 +366,112 @@ impl Qwen38MtpHead {
         self.forward_pairs(&pairs, cache)
     }
 
+    /// Advance one MTP pair for each independently retained decode row while
+    /// sharing the projection, attention, and MLP tensor dimensions.
+    pub(crate) fn forward_steps_batch(
+        &self,
+        token_embeddings: &Tensor,
+        predecessor_hidden: &Tensor,
+        position_ids: &[[usize; 3]],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch_size, token_count, hidden) = token_embeddings.dims3().map_err(|_| {
+            Error::InvalidInput(
+                "Qwen3.8 MTP batch embeddings must have shape [batch,1,hidden]".into(),
+            )
+        })?;
+        if batch_size == 0
+            || token_count != 1
+            || hidden != self.hidden_size
+            || predecessor_hidden.dims3()? != (batch_size, 1, hidden)
+            || position_ids.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 MTP decode batch rows do not match".into(),
+            ));
+        }
+        let (kv_heads, key_head_dim, value_head_dim) = self.attention.cache_geometry();
+        for cache in caches.iter() {
+            cache.validate_sparse_model_layers(&[(
+                self.model_layer,
+                kv_heads,
+                key_head_dim,
+                value_head_dim,
+            )])?;
+        }
+        let start_positions = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        let first = &*caches[0];
+        let slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena().lower_slots(&slots)?;
+        if lowered.arena_id() != first.arena().id() || lowered.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 MTP batch produced an incompatible slot map".into(),
+            ));
+        }
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
+
+        let execution = (|| -> Result<Tensor> {
+            let embedding = self.pre_fc_norm_embedding.forward(token_embeddings)?;
+            let predecessor = self.pre_fc_norm_hidden.forward(predecessor_hidden)?;
+            let fused = Tensor::cat(&[&embedding, &predecessor], 2)?;
+            let hidden_states = self.fc.forward(&fused)?;
+            let residual = hidden_states.clone();
+            let normalized = self.input_layernorm.forward(&hidden_states)?;
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let attended = self.attention.forward_physical_decode_batch(
+                &normalized,
+                position_ids,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                0,
+            )?;
+            let hidden_states = residual.broadcast_add(&attended)?;
+            let residual = hidden_states.clone();
+            let normalized = self.post_attention_layernorm.forward(&hidden_states)?;
+            let mlp = self.mlp.forward(&normalized)?;
+            let hidden_states = residual.broadcast_add(&mlp)?;
+            self.norm.forward(&hidden_states).map_err(Error::from)
+        })();
+        let hidden_states = match execution {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                return match completions.drain() {
+                    Ok(()) => Err(error),
+                    Err(drain) => Err(Error::InferenceError(format!(
+                        "Qwen3.8 MTP batch failed: {error}; write-fence drain also failed: {drain}"
+                    ))),
+                }
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
+        }
+        Ok(hidden_states)
+    }
+
     /// Reuse this one physical head for 1..=3 predictions.
     ///
     /// `first_lm_head_hidden` is normally the final row returned by the shifted
@@ -694,6 +804,50 @@ mod tests {
         PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0).unwrap()
     }
 
+    fn tiny_shared_caches(config: &Qwen38NativeConfig, rows: usize) -> Vec<PhysicalPagedKvCache> {
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(82),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let binding = KvLayerBinding {
+            model_layer: config.text.block_count as u32,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 4,
+                capacity_pages: (rows * 2) as u32,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: config.text.attention_head_count_kv as u32,
+                    key_head_dim: config.text.attention_key_length as u32,
+                    value_head_dim: config.text.attention_value_length as u32,
+                }],
+            })
+            .unwrap(),
+        );
+        (0..rows)
+            .map(|row| {
+                let blocks = (row * 2..row * 2 + 2)
+                    .map(|index| CacheBlockRef {
+                        arena: arena_id,
+                        group,
+                        index: index as u32,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
+            })
+            .collect()
+    }
+
     fn assert_close(actual: &Tensor, expected: &Tensor) {
         let actual = actual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let expected = expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -808,6 +962,60 @@ mod tests {
         assert_eq!(drafts.lm_head_hidden.len(), 3);
         assert_eq!(embed_calls, 2);
         assert_eq!(cache.context_len(), 4);
+    }
+
+    #[test]
+    fn batched_mtp_steps_match_independent_scalar_rows() {
+        let dir = TestDir::new("batch-head");
+        let config = tiny_config();
+        write_tiny_checkpoint(dir.path(), &config);
+        let tensors = IndexedSafetensors::open(dir.path()).unwrap();
+        let inventory = tensors.validate_mtp_tensor_manifest(&config).unwrap();
+        let head = Qwen38MtpHead::load_native(
+            &tensors,
+            &config,
+            &inventory,
+            &Device::Cpu,
+            ProjectionMaterialization::F32,
+        )
+        .unwrap();
+        let embeddings = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+            (2, 1, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let predecessors = Tensor::from_vec(
+            vec![3.0f32, 1.0, 2.0, 4.0, 2.0, 5.0, 1.0, 3.0],
+            (2, 1, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let positions = [[0, 0, 0], [0, 0, 0]];
+        let mut scalar_outputs = Vec::new();
+        for row in 0..2 {
+            let mut cache = tiny_cache(&config);
+            scalar_outputs.push(
+                head.forward_step(
+                    embeddings.narrow(0, row, 1).unwrap(),
+                    predecessors.narrow(0, row, 1).unwrap(),
+                    positions[row],
+                    &mut cache,
+                )
+                .unwrap(),
+            );
+            assert_eq!(cache.context_len(), 1);
+        }
+        let scalar_refs = scalar_outputs.iter().collect::<Vec<_>>();
+        let scalar = Tensor::cat(&scalar_refs, 0).unwrap();
+
+        let mut caches = tiny_shared_caches(&config, 2);
+        let mut cache_refs = caches.iter_mut().collect::<Vec<_>>();
+        let batched = head
+            .forward_steps_batch(&embeddings, &predecessors, &positions, &mut cache_refs)
+            .unwrap();
+        assert_close(&batched, &scalar);
+        assert!(caches.iter().all(|cache| cache.context_len() == 1));
     }
 
     #[test]

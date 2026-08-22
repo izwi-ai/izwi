@@ -93,13 +93,25 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
     }
 }
 
-/// Qwen3.8's current CUDA adapter executes one scalar row at a time even when
-/// the scheduler retains many parked sessions. Authorize one transactional
-/// scratch row without reducing the configured retained-session capacity.
-/// Other families and portable backends preserve the engine default.
-fn qwen38_cuda_staged_transaction_rows(variant: ModelVariant, backend: BackendKind) -> Option<u32> {
-    (variant.family() == crate::catalog::ModelFamily::Qwen38Chat && backend == BackendKind::Cuda)
-        .then_some(1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedChatCapacityPolicy {
+    /// `None` delegates staged transaction width to the engine-wide
+    /// `max_staged_transactions` setting.
+    staged_transaction_rows: Option<u32>,
+    /// CUDA Qwen3.8 still fits logical context against resident device
+    /// headroom; this is independent of staged transaction width.
+    fit_cuda_resident_context: bool,
+}
+
+fn managed_chat_capacity_policy(
+    variant: ModelVariant,
+    backend: BackendKind,
+) -> ManagedChatCapacityPolicy {
+    ManagedChatCapacityPolicy {
+        staged_transaction_rows: None,
+        fit_cuda_resident_context: variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+            && backend == BackendKind::Cuda,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1074,16 +1086,15 @@ impl ModelLifecycleController {
                                     "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
                                 )));
                             }
-                            let staged_transaction_rows =
-                                qwen38_cuda_staged_transaction_rows(variant, backend);
+                            let capacity_policy = managed_chat_capacity_policy(variant, backend);
                             let physical = self
                                 .core_engine
                                 .load_managed_model_cache_with_capacity_policy(
                                     model_instance_id,
                                     &loaded_cache,
                                     Some(loaded.max_context_tokens()?),
-                                    staged_transaction_rows,
-                                    staged_transaction_rows.is_some(),
+                                    capacity_policy.staged_transaction_rows,
+                                    capacity_policy.fit_cuda_resident_context,
                                 )
                                 .await?;
                             let physical = physical.ok_or_else(|| {
@@ -1796,13 +1807,12 @@ impl RuntimeService {
 mod tests {
     use super::{
         estimate_from_tensor_inventory, is_metal_command_buffer_oom,
-        loaded_asr_state_publication_route, model_memory_estimate, model_resource_plan,
-        plan_invocation_allocations, qwen38_cuda_staged_transaction_rows,
-        qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
-        select_lru_eviction_candidate, LoadedAsrStatePublicationRoute, ModelMemoryEstimate,
-        QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
-        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
-        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
+        loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
+        model_resource_plan, plan_invocation_allocations, qwen38_representation_memory_estimate,
+        qwen38_resource_plan, residency_budget_has_capacity, select_lru_eviction_candidate,
+        LoadedAsrStatePublicationRoute, ModelMemoryEstimate, QWEN38_BF16_ELEMENTS,
+        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
+        QWEN38_FP8_ELEMENTS, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
         QWEN38_Q8_0_BLOCK_ELEMENTS,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
@@ -1931,19 +1941,21 @@ mod tests {
     }
 
     #[test]
-    fn only_cuda_qwen38_uses_scalar_staged_state_capacity() {
-        assert_eq!(
-            qwen38_cuda_staged_transaction_rows(ModelVariant::Qwen3827BFp8, BackendKind::Cuda,),
-            Some(1)
-        );
-        assert_eq!(
-            qwen38_cuda_staged_transaction_rows(ModelVariant::Qwen3827BFp8, BackendKind::Metal,),
-            None
-        );
-        assert_eq!(
-            qwen38_cuda_staged_transaction_rows(ModelVariant::Qwen359BGguf, BackendKind::Cuda),
-            None
-        );
+    fn qwen38_uses_engine_staged_width_while_cuda_retains_context_fitting() {
+        let cuda_qwen38 =
+            managed_chat_capacity_policy(ModelVariant::Qwen3827BFp8, BackendKind::Cuda);
+        assert_eq!(cuda_qwen38.staged_transaction_rows, None);
+        assert!(cuda_qwen38.fit_cuda_resident_context);
+
+        let metal_qwen38 =
+            managed_chat_capacity_policy(ModelVariant::Qwen3827BFp8, BackendKind::Metal);
+        assert_eq!(metal_qwen38.staged_transaction_rows, None);
+        assert!(!metal_qwen38.fit_cuda_resident_context);
+
+        let cuda_qwen35 =
+            managed_chat_capacity_policy(ModelVariant::Qwen359BGguf, BackendKind::Cuda);
+        assert_eq!(cuda_qwen35.staged_transaction_rows, None);
+        assert!(!cuda_qwen35.fit_cuda_resident_context);
     }
 
     #[test]

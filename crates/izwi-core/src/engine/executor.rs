@@ -192,6 +192,7 @@ pub(super) enum ContinuousRowManagedCache {
     Hybrid {
         target: PhysicalPagedKvCache,
         mtp: Option<PhysicalPagedKvCache>,
+        tensor_state: Option<super::ManagedTensorStateReservation>,
     },
 }
 
@@ -206,7 +207,11 @@ fn continuous_row_managed_caches_for_row(
     ) {
         let Qwen38ManagedCaches { target, mtp } =
             qwen38_managed_caches_for_row(request, scheduled, reservation)?;
-        Ok(ContinuousRowManagedCache::Hybrid { target, mtp })
+        Ok(ContinuousRowManagedCache::Hybrid {
+            target,
+            mtp,
+            tensor_state: reservation.tensor_state,
+        })
     } else {
         Ok(ContinuousRowManagedCache::Dense(
             qwen3_managed_cache_for_row(request, scheduled, reservation)?,

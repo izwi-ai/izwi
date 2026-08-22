@@ -550,6 +550,29 @@ impl KvWriteCompletionCollector {
         })
     }
 
+    /// Wait for every completion collected so far without requiring the full
+    /// expected layer set. Error paths use this before abandoning a partially
+    /// executed model batch so no asynchronous write fence is orphaned.
+    pub(crate) fn drain(mut self) -> Result<()> {
+        let mut first_error = None;
+        for layer in &self.expected_layers {
+            let Some(completion) = self.completions.remove(layer) else {
+                continue;
+            };
+            if let Err(error) = completion.wait() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            } else if !completion.is_complete() && first_error.is_none() {
+                first_error = Some(Error::InferenceError(format!(
+                    "KV write fence for layer {}:{} returned before completion",
+                    layer.model_layer, layer.physical_layer
+                )));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn reject_completion(completion: KvWriteCompletion, message: String) -> Result<()> {
         if let Err(error) = completion.wait() {
             return Err(Error::InferenceError(format!(
@@ -1304,6 +1327,28 @@ mod tests {
             .expect("first completion");
 
         assert!(collector.seal().is_err());
+        assert_eq!(waits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_error_drain_permits_an_incomplete_layer_set() {
+        let arena = test_arena(1);
+        let layers = [layer(0, 0), layer(1, 1)];
+        let config = config(arena, &layers);
+        let slots = slots(arena, 1);
+        let waits = Arc::new(AtomicUsize::new(0));
+        let mut collector =
+            KvWriteCompletionCollector::new(&config, slots.clone()).expect("collector");
+        collector
+            .collect(completion(
+                arena,
+                layers[0],
+                slots,
+                TestFence::new(waits.clone()),
+            ))
+            .expect("first completion");
+
+        collector.drain().expect("partial error drain");
         assert_eq!(waits.load(Ordering::Relaxed), 1);
     }
 

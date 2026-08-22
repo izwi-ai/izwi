@@ -3799,7 +3799,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_scalar_cuda_staging_preserves_sessions_and_reclaims_exact_bytes() {
+    fn qwen38_staging_width_cost_is_independent_of_retained_sessions() {
         let state_plan = negotiate_state_plan(
             &qwen38_27b_tensor_contract(),
             &StateBackendPlanRequest {

@@ -298,11 +298,6 @@ pub struct ChatDecodeState {
     /// Prompt tokens committed by scheduler-level chunked prefill so far.
     /// Equals the prompt length once prefill completed.
     prefill_progress: usize,
-    /// Set once a shared-step (multi-row) quantum committed tokens for this
-    /// session. The speculative head's cache and anchor hidden stop tracking
-    /// the target sequence across such quanta, so solo MTP drafting must stay
-    /// disabled afterwards instead of resuming from stale speculative state.
-    shared_step_committed: bool,
     config: ChatGenerationConfig,
     rng: SimpleRng,
     draft_rng: SimpleRng,
@@ -398,6 +393,7 @@ impl ChatDecodeState {
             }
         }
         Ok(Qwen38SharedStepCheckpoint {
+            text_state: self.text_state.clone(),
             mtp_anchor_hidden: self.mtp_anchor_hidden.clone(),
             unconsumed_output: self.unconsumed_output.clone(),
             pending_token: self.pending_token,
@@ -408,7 +404,8 @@ impl ChatDecodeState {
             decoder: self.decoder.clone(),
             assembled: self.assembled.clone(),
             finished: self.finished,
-            shared_step_committed: self.shared_step_committed,
+            rng: self.rng.clone(),
+            draft_rng: self.draft_rng.clone(),
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
             mtp_physical_kv: match mtp_cache {
                 Some(new_mtp) => self.mtp_physical_kv.replace(new_mtp),
@@ -419,6 +416,7 @@ impl ChatDecodeState {
 
     pub(crate) fn rollback_shared_step_quantum(&mut self, checkpoint: Qwen38SharedStepCheckpoint) {
         let Qwen38SharedStepCheckpoint {
+            text_state,
             physical_kv,
             mtp_physical_kv,
             mtp_anchor_hidden,
@@ -431,8 +429,10 @@ impl ChatDecodeState {
             decoder,
             assembled,
             finished,
-            shared_step_committed,
+            rng,
+            draft_rng,
         } = checkpoint;
+        self.text_state = text_state;
         self.physical_kv = physical_kv;
         self.mtp_physical_kv = mtp_physical_kv;
         self.mtp_anchor_hidden = mtp_anchor_hidden;
@@ -445,7 +445,8 @@ impl ChatDecodeState {
         self.decoder = decoder;
         self.assembled = assembled;
         self.finished = finished;
-        self.shared_step_committed = shared_step_committed;
+        self.rng = rng;
+        self.draft_rng = draft_rng;
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -497,6 +498,7 @@ pub struct ChatDecodeStep {
 /// writes under the new views are abandoned when the previous views are
 /// restored on rollback.
 pub(crate) struct Qwen38SharedStepCheckpoint {
+    text_state: Qwen38TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
     mtp_physical_kv: Option<PhysicalPagedKvCache>,
     mtp_anchor_hidden: Option<Tensor>,
@@ -509,7 +511,8 @@ pub(crate) struct Qwen38SharedStepCheckpoint {
     decoder: IncrementalDecoder,
     assembled: String,
     finished: bool,
-    shared_step_committed: bool,
+    rng: SimpleRng,
+    draft_rng: SimpleRng,
 }
 
 #[derive(Debug, Clone)]
@@ -992,16 +995,53 @@ impl Qwen38ChatModel {
         true
     }
 
-    /// Conservative per-row workspace estimate for shared-step decode. Rows
-    /// advance through the scalar candle-op path, so no ragged collation
-    /// buffer beyond one hidden vector per row is required.
+    /// Conservative per-row workspace estimate for hybrid batch collation.
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        u64::try_from(self.text_model.hidden_size())
-            .ok()
-            .and_then(|hidden| hidden.checked_mul(4))
+        let cfg = &self.text_config;
+        let hidden = u64::try_from(cfg.embedding_length).ok();
+        let ff = u64::try_from(cfg.feed_forward_length).ok();
+        let q = cfg
+            .attention_head_count
+            .checked_mul(cfg.attention_key_length)
+            .and_then(|width| width.checked_mul(2))
+            .and_then(|width| u64::try_from(width).ok());
+        let kv = cfg
+            .attention_head_count_kv
+            .checked_mul(cfg.attention_key_length)
+            .and_then(|width| u64::try_from(width).ok());
+        let conv = cfg
+            .ssm_group_count
+            .checked_mul(cfg.ssm_state_size)
+            .and_then(|width| width.checked_mul(2))
+            .and_then(|width| width.checked_add(cfg.ssm_inner_size))
+            .and_then(|width| u64::try_from(width).ok());
+        let elements = hidden
+            .and_then(|hidden| hidden.checked_mul(8))
+            .and_then(|base| base.checked_add(ff?.checked_mul(2)?))
+            .and_then(|base| base.checked_add(q?))
+            .and_then(|base| base.checked_add(kv?.checked_mul(2)?))
+            .and_then(|base| base.checked_add(conv?))
+            .and_then(|target| {
+                if self.mtp_head.is_some() {
+                    target.checked_add(
+                        hidden?
+                            .checked_mul(8)?
+                            .checked_add(ff?.checked_mul(2)?)?
+                            .checked_add(q?)?
+                            .checked_add(kv?.checked_mul(2)?)?,
+                    )
+                } else {
+                    Some(target)
+                }
+            })
             .ok_or_else(|| {
                 Error::Overloaded("continuous decode workspace estimate overflow".to_string())
-            })
+            })?;
+        // The recurrent/attention collation tensors use F32 in portable and
+        // state-update paths even when projection activations use F16/BF16.
+        elements.checked_mul(4).ok_or_else(|| {
+            Error::Overloaded("continuous decode workspace byte estimate overflow".to_string())
+        })
     }
 
     pub(crate) fn preferred_decode_tokens(&self) -> usize {
@@ -1110,7 +1150,6 @@ impl Qwen38ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             prefill_progress: prepared.prompt_ids.len(),
-            shared_step_committed: false,
             config: config.clone(),
             rng,
             draft_rng,
@@ -1172,7 +1211,6 @@ impl Qwen38ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             prefill_progress: 0,
-            shared_step_committed: false,
             config: config.clone(),
             rng,
             draft_rng,
@@ -1308,11 +1346,9 @@ impl Qwen38ChatModel {
     }
 
     /// Advance every scheduled row by exactly one token inside one engine
-    /// step. A solo row delegates to [`Self::decode_quantum`] so scalar and
-    /// MTP speculative semantics are preserved bit-for-bit for single-user
-    /// load; multi-row batches run each row through the shared-step scalar
-    /// target path with MTP drafting disabled, because draft/verify state is
-    /// per-sequence and drafting would serialize the batch anyway.
+    /// step. A solo row retains MTP semantics. Shared rows batch
+    /// target-model projections, MLPs, and ragged full attention while keeping
+    /// every row's DeltaNet and convolution state transactionally independent.
     pub fn decode_step_batch(
         &self,
         states: &mut [&mut ChatDecodeState],
@@ -1320,66 +1356,100 @@ impl Qwen38ChatModel {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        if states.len() == 1 && !states[0].shared_step_committed {
-            return Ok(vec![self.decode_quantum(states[0], 1)?]);
-        }
         for state in states.iter() {
-            if state.finished || state.tokens_generated >= state.max_new_tokens {
+            if state.finished
+                || state.tokens_generated >= state.max_new_tokens
+                || state.bootstrap_token.is_some()
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.physical_kv.context_len() != state.next_text_position
+                || (self.mtp_head.is_some()
+                    && (state
+                        .mtp_physical_kv
+                        .as_ref()
+                        .is_none_or(|cache| cache.context_len() != state.next_text_position)
+                        || state.mtp_anchor_hidden.is_none()))
+                || (self.mtp_head.is_none()
+                    && (state.mtp_physical_kv.is_some() || state.mtp_anchor_hidden.is_some()))
+            {
                 return Err(Error::InvalidInput(
-                    "continuous chat batch contains a terminal decode state".into(),
+                    "continuous chat batch contains a non-decodable hybrid state".into(),
                 ));
             }
         }
-        let mut steps = Vec::with_capacity(states.len());
+        let state_count = states.len();
+        let mut token_ids = Vec::with_capacity(states.len());
+        let mut positions = Vec::with_capacity(states.len());
+        let mut text_states = Vec::with_capacity(states.len());
+        let mut caches = Vec::with_capacity(states.len());
         for state in states.iter_mut() {
-            steps.push(self.decode_shared_step_row(state)?);
+            let pending = state.pending_token.take().expect("pending token checked");
+            token_ids.push(pending);
+            positions.push([state.next_text_position; 3]);
+            text_states.push(&mut state.text_state);
+            caches.push(&mut state.physical_kv);
+        }
+        let target = self.text_model.forward_token_ids_batch_at_physical(
+            &token_ids,
+            &positions,
+            &mut text_states,
+            &mut caches,
+        )?;
+        drop(text_states);
+        drop(caches);
+
+        let mut sampled = Vec::with_capacity(state_count);
+        for (row, state) in states.iter_mut().enumerate() {
+            let history: &[u32] = if state.track_history {
+                &state.history_ids
+            } else {
+                &[]
+            };
+            sampled.push(sample_next_token(
+                &target.logits.i((row, 0))?,
+                self.tokenizer.vocab_size,
+                &state.config,
+                history,
+                &mut state.rng,
+            )?);
+        }
+
+        let mtp_hidden = if let Some(head) = self.mtp_head.as_ref() {
+            let embeddings = self.text_model.embed_decode_token_ids(&sampled)?;
+            let mut mtp_caches = states
+                .iter_mut()
+                .map(|state| {
+                    state.mtp_physical_kv.as_mut().ok_or_else(|| {
+                        Error::InferenceError("Qwen3.8 shared row lost its MTP cache".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let hidden = head.forward_steps_batch(
+                &embeddings,
+                &target.hidden_states,
+                &positions,
+                &mut mtp_caches,
+            )?;
+            Some(hidden)
+        } else {
+            None
+        };
+
+        let mut steps = Vec::with_capacity(state_count);
+        for (row, state) in states.iter_mut().enumerate() {
+            let next = sampled[row];
+            if state.track_history {
+                state.history_ids.push(next);
+            }
+            if let Some(hidden) = mtp_hidden.as_ref() {
+                state.mtp_anchor_hidden = Some(hidden.i(row)?.unsqueeze(0)?);
+            }
+            state.pending_token = Some(next);
+            state.next_text_position = state.next_text_position.saturating_add(1);
+            let delta = self.publish_token(state, next)?;
+            steps.push(self.decode_step_result(state, delta, 1));
         }
         Ok(steps)
-    }
-
-    /// One scalar target-model step for a shared-step batch row: publish any
-    /// bootstrapped token, otherwise forward the pending input token through
-    /// the candle-op physical path and sample the next token. Mirrors the
-    /// non-speculative tail of [`Self::decode_quantum`] exactly.
-    fn decode_shared_step_row(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
-        if let Some(anchor) = state.bootstrap_token.take() {
-            let delta = self.publish_token(state, anchor)?;
-            return Ok(self.decode_step_result(state, delta, 0));
-        }
-
-        let mut input_tokens_committed = 0;
-        if let Some(pending) = state.pending_token.take() {
-            state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
-                pending,
-                [state.next_text_position; 3],
-                &mut state.text_state,
-                &mut state.physical_kv,
-            )?);
-            state.next_text_position = state.next_text_position.saturating_add(1);
-            input_tokens_committed = 1;
-        }
-
-        let history: &[u32] = if state.track_history {
-            &state.history_ids
-        } else {
-            &[]
-        };
-        let next = take_quantum_sample(
-            &mut state.unconsumed_output,
-            self.tokenizer.vocab_size,
-            &state.config,
-            history,
-            &mut state.rng,
-        )?;
-        if state.track_history {
-            state.history_ids.push(next);
-        }
-        state.pending_token = Some(next);
-        let delta = self.publish_token(state, next)?;
-        // The speculative head no longer tracks this sequence across shared
-        // steps; pin solo MTP drafting off for the rest of the session.
-        state.shared_step_committed = true;
-        Ok(self.decode_step_result(state, delta, input_tokens_committed))
     }
 
     pub(crate) fn decode_quantum(
@@ -1405,7 +1475,7 @@ impl Qwen38ChatModel {
             return Ok(self.decode_step_result(state, delta, 0));
         }
 
-        if self.mtp_head.is_some() && !state.shared_step_committed {
+        if self.mtp_head.is_some() {
             return self.decode_mtp_quantum(state, input_budget.max(1));
         }
 
