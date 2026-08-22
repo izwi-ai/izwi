@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "metal")]
+use candle_core::Storage;
+#[cfg(feature = "metal")]
 use candle_core::{
     backend::BackendStorage, bail, CpuStorage, CustomOp2, CustomOp3, Layout, MetalStorage,
     Result as CandleResult, Shape,
@@ -2345,6 +2347,7 @@ struct DecodeGqaAttentionOp {
 #[derive(Debug, Clone)]
 struct PagedDecodeAttentionOp {
     metadata: Vec<u32>,
+    device_metadata: Tensor,
     batch_size: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -2693,12 +2696,20 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             .checked_mul(self.num_heads)
             .and_then(|value| value.checked_mul(self.value_head_dim))
             .ok_or_else(|| candle_core::Error::Msg("paged attention output overflow".into()))?;
+        let (metadata_storage, metadata_layout) = self.device_metadata.storage_and_layout();
+        let metadata_storage = match &*metadata_storage {
+            Storage::Metal(storage) => storage,
+            _ => bail!("izwi-paged-decode-attention-metal requires Metal metadata"),
+        };
+        if metadata_storage.dtype() != DType::U32
+            || !metadata_layout.is_contiguous()
+            || metadata_layout.shape().elem_count() != self.metadata.len()
+        {
+            bail!("izwi-paged-decode-attention-metal invalid device metadata")
+        }
+        let metadata_offset = metadata_layout.start_offset() * DType::U32.size_in_bytes();
         let device = q_storage.device().clone();
         let output = device.new_buffer(elem_count, dtype, "izwi-paged-decode-attention")?;
-        // One compact host-authored control buffer per physical batch. It holds
-        // context lengths, first-page offsets, and physical page ids; K/V
-        // remains in the arena.
-        let metadata = device.new_buffer_with_data(&self.metadata)?;
         let encoder = device.command_encoder()?;
         let reduction_width = self
             .key_head_dim
@@ -2754,7 +2765,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             encoder.set_output_buffer(3, Some(&partial_values), 0);
             encoder.set_output_buffer(4, Some(&partial_maxes), 0);
             encoder.set_output_buffer(5, Some(&partial_sums), 0);
-            encoder.set_input_buffer(6, Some(&metadata), 0);
+            encoder.set_input_buffer(6, Some(metadata_storage.buffer()), metadata_offset);
             encoder.set_bytes(7, &(self.batch_size as u32));
             encoder.set_bytes(8, &(self.num_heads as u32));
             encoder.set_bytes(9, &(self.num_kv_heads as u32));
@@ -2786,7 +2797,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             encoder.set_input_buffer(1, Some(&partial_maxes), 0);
             encoder.set_input_buffer(2, Some(&partial_sums), 0);
             encoder.set_output_buffer(3, Some(&output), 0);
-            encoder.set_input_buffer(4, Some(&metadata), 0);
+            encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
             encoder.set_bytes(5, &(self.num_heads as u32));
             encoder.set_bytes(6, &(self.value_head_dim as u32));
             encoder.set_bytes(7, &(METAL_PAGED_ATTENTION_PARTITION_TOKENS as u32));
@@ -2823,7 +2834,7 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                 v_layout.start_offset() * dtype.size_in_bytes(),
             );
             encoder.set_output_buffer(3, Some(&output), 0);
-            encoder.set_input_buffer(4, Some(&metadata), 0);
+            encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
             encoder.set_bytes(5, &(self.batch_size as u32));
             encoder.set_bytes(6, &(self.num_heads as u32));
             encoder.set_bytes(7, &(self.num_kv_heads as u32));
@@ -4790,6 +4801,7 @@ pub(crate) fn paged_decode_attention(
     k: &Tensor,
     v: &Tensor,
     metadata: Vec<u32>,
+    device_metadata: &Tensor,
     batch_size: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -4805,6 +4817,7 @@ pub(crate) fn paged_decode_attention(
         v,
         &PagedDecodeAttentionOp {
             metadata,
+            device_metadata: device_metadata.clone(),
             batch_size,
             num_heads,
             num_kv_heads,
@@ -5726,6 +5739,7 @@ mod tests {
         let key_data = vec![4.0f32, 0.0, 0.0, 2.0];
         let value_data = vec![1.0f32, 3.0, 5.0, -2.0];
         let metadata = vec![2, 0, 0];
+        let device_metadata = Tensor::from_vec(metadata.clone(), metadata.len(), &device).unwrap();
 
         for dtype in [DType::F32, DType::F16] {
             let query = Tensor::from_vec(query_data.clone(), (1, 1, 2), &device)
@@ -5746,6 +5760,7 @@ mod tests {
                     &keys,
                     &values,
                     metadata.clone(),
+                    &device_metadata,
                     1,
                     1,
                     1,
@@ -5826,11 +5841,14 @@ mod tests {
             metadata.push(context_len as u32);
             metadata.push(0);
             metadata.extend((0..page_count).map(|page| page as u32));
+            let device_metadata =
+                Tensor::from_vec(metadata.clone(), metadata.len(), &device).unwrap();
             let actual = paged_decode_attention(
                 &query,
                 &keys,
                 &values,
                 metadata,
+                &device_metadata,
                 1,
                 1,
                 1,

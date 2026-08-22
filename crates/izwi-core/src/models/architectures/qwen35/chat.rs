@@ -23,7 +23,7 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::sampling::{
-    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -1594,7 +1594,7 @@ fn sample_next_token(
         return argmax_clamped(logits, vocab_size);
     }
 
-    if let Some(candidates) = bounded_cuda_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates(
         logits,
         vocab_size,
         config.top_k,

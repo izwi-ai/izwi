@@ -743,6 +743,7 @@ impl InvocationStaticAttentionArena {
         metadata.extend(std::iter::repeat_n(memory_tokens, batch_size));
         metadata.extend(std::iter::repeat_n(0_u32, batch_size));
         metadata.extend(std::iter::repeat_n(0_u32, batch_size));
+        let device_metadata = Tensor::from_vec(metadata.clone(), metadata.len(), queries.device())?;
         let keys = layer.keys.as_tensor().reshape((
             1,
             page_tokens,
@@ -764,6 +765,7 @@ impl InvocationStaticAttentionArena {
             &keys,
             &values,
             metadata,
+            &device_metadata,
             batch_size,
             usize::try_from(layer.semantic.query_heads)
                 .map_err(|_| invalid("static-attention query heads exceed usize"))?,

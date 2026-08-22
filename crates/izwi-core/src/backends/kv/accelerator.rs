@@ -425,6 +425,7 @@ struct CachedDecodeDeviceMetadata {
 
 #[derive(Debug)]
 struct DecodeDeviceMetadata {
+    host_native_metadata: Vec<u32>,
     cumulative_queries: Tensor,
     cumulative_contexts: Tensor,
     block_table: Tensor,
@@ -455,6 +456,7 @@ impl ResidentAttentionPlan for CachedPrefillDeviceMetadata {
 impl CachedDecodeDeviceMetadata {
     fn device_metadata(&self) -> DecodeDeviceMetadata {
         DecodeDeviceMetadata {
+            host_native_metadata: self.host_native_metadata.clone(),
             cumulative_queries: self.cumulative_queries.clone(),
             cumulative_contexts: self.cumulative_contexts.clone(),
             block_table: self.block_table.clone(),
@@ -1217,6 +1219,7 @@ impl CandleAcceleratorKvArena {
         self.attention_plan_device_uploads
             .fetch_add(1, Ordering::Relaxed);
         Ok(DecodeDeviceMetadata {
+            host_native_metadata: native_metadata.to_vec(),
             cumulative_queries,
             cumulative_contexts: cumulative_contexts_device,
             block_table: block_table_device,
@@ -1235,10 +1238,7 @@ impl CandleAcceleratorKvArena {
         })
     }
 
-    fn cached_cuda_decode_plan(
-        &self,
-        batch: &KvDecodeBatchMetadata,
-    ) -> Result<DecodeDeviceMetadata> {
+    fn cached_decode_plan(&self, batch: &KvDecodeBatchMetadata) -> Result<DecodeDeviceMetadata> {
         {
             let mut cache = self.decode_metadata_cache.lock().map_err(|_| {
                 Error::InferenceError("accelerator decode metadata cache was poisoned".into())
@@ -1353,7 +1353,7 @@ impl CandleAcceleratorKvArena {
         args: PagedKvDecodeArgs<'_>,
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
-        let device_metadata = self.cached_cuda_decode_plan(args.batch)?;
+        let device_metadata = self.cached_decode_plan(args.batch)?;
         let tuning = self.cuda_paged_tuning(
             layer.key_head_dim,
             layer.value_head_dim,
@@ -1446,27 +1446,18 @@ impl CandleAcceleratorKvArena {
     ) -> Result<Tensor> {
         let batch_size = args.batch.sequences.len();
         let num_heads = args.queries.dims()[1];
-        let (table, cumulative, first_page_offsets, max_blocks, _) =
-            self.lower_decode_tables(args.batch)?;
-        let context_lens = cumulative
-            .windows(2)
-            .map(|window| window[1] - window[0])
-            .collect::<Vec<_>>();
-        let mut metadata =
-            Vec::with_capacity(context_lens.len() + first_page_offsets.len() + table.len());
-        metadata.extend(context_lens);
-        metadata.extend(first_page_offsets);
-        metadata.extend(table);
+        let device_metadata = self.cached_decode_plan(args.batch)?;
         Ok(crate::kernels::metal::paged_decode_attention(
             args.queries,
             &layer.keys,
             &layer.values,
-            metadata,
+            device_metadata.host_native_metadata,
+            &device_metadata.native_metadata,
             batch_size,
             num_heads,
             layer.num_kv_heads,
             self.config.page_tokens as usize,
-            max_blocks,
+            device_metadata.max_blocks,
             layer.key_head_dim,
             layer.value_head_dim,
             args.softmax_scale,
@@ -2957,16 +2948,16 @@ mod tests {
         let (table, cumulative, offsets, max_blocks, _) = arena.lower_decode_tables(&decode)?;
         let native = packed_decode_metadata(&cumulative, &offsets, &table);
         arena.cached_decode_device_metadata(&decode, &cumulative, &table, &native, max_blocks)?;
-        arena.cached_cuda_decode_plan(&decode)?;
+        arena.cached_decode_plan(&decode)?;
         let mut next_decode_generation = decode.clone();
         next_decode_generation.sequences[0].blocks[0].slot_generation = 2;
-        arena.cached_cuda_decode_plan(&next_decode_generation)?;
+        arena.cached_decode_plan(&next_decode_generation)?;
         let mut next_token = next_decode_generation.clone();
         next_token.sequences[0].context_len += 1;
         next_token.sequences[0].first_page_offset = 0;
         let (table, cumulative, offsets, _, _) = arena.lower_decode_tables(&next_token)?;
         let native = packed_decode_metadata(&cumulative, &offsets, &table);
-        let updated = arena.cached_cuda_decode_plan(&next_token)?;
+        let updated = arena.cached_decode_plan(&next_token)?;
         assert_eq!(updated.cumulative_contexts.to_vec1::<u32>()?, cumulative);
         assert_eq!(updated.native_metadata.to_vec1::<u32>()?, native);
         let stats = arena.operation_stats();

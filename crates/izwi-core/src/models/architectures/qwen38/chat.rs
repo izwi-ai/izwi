@@ -25,7 +25,7 @@ use crate::models::shared::chat::{
     ChatGenerationConfig, ChatMessage, ChatReasoningEffort, ChatRole,
 };
 use crate::models::shared::sampling::{
-    bounded_cuda_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 use crate::models::shared::speculative_sampling::{
     propose_speculative_draft, verify_greedy_token_prefix, verify_speculative_prefix,
@@ -2105,7 +2105,7 @@ fn sample_next_token(
     }
 
     let cuda_sampling_attempted = logits.device().is_cuda();
-    if let Some(candidates) = bounded_cuda_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates(
         logits,
         vocab_size,
         config.top_k,
@@ -2119,7 +2119,9 @@ fn sample_next_token(
             if let Some(sampled) =
                 sample_device_candidates(&candidates, config.top_p, rng.next_f32())
             {
-                record_sampling_bounded_cuda(true);
+                if cuda_sampling_attempted {
+                    record_sampling_bounded_cuda(true);
+                }
                 return Ok(sampled);
             }
         }

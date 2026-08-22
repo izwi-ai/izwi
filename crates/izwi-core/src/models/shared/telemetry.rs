@@ -147,6 +147,12 @@ pub fn record_decode_attention_path(path: DecodeAttentionPath) {
     }
 }
 
+/// Record one successful tensor-to-Rust scalar or vector materialization.
+///
+/// Callers must invoke this only after the read succeeds and must report the
+/// dtype and element count actually materialized, rather than the source
+/// tensor's wider logical shape. This keeps bounded sampling readbacks and
+/// full-vocabulary fallbacks distinguishable by their byte deltas.
 pub fn record_host_read(dtype: candle_core::DType, elements: usize) {
     HOST_READ_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let bytes = elements.saturating_mul(dtype.size_in_bytes()) as u64;
