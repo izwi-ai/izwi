@@ -30,6 +30,10 @@ const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::ne
 const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(10);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
+// Qwen3.8 MTP supports draft depths one through three, which requires an
+// isolated target quantum of depth + 1. Shared continuous batches remain one
+// work unit per row; this is an aggregate stage ceiling, not a default grant.
+const CONTINUOUS_CHAT_MAX_DECODE_QUANTUM: u64 = 4;
 static NEXT_ADAPTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Streaming has two independent meanings at the loaded-adapter boundary:
@@ -1311,12 +1315,16 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
         );
         decode.selector = StageWorkSelector::SequenceDecode;
         // `max_work_units` is the aggregate budget for the whole physical
-        // batch, not a per-row quantum. Continuous decode schedules exactly
-        // one token per row, so a width-N stage needs an N-unit budget or the
-        // second row can never join the batch.
-        decode.max_work_units = u64::try_from(decode.max_batch_size).map_err(|_| {
-            Error::Overloaded("continuous decode batch width exceeds work accounting".to_string())
-        })?;
+        // envelope. Shared continuous decode uses one token per row; an
+        // isolated model-preferred quantum may use up to four target inputs so
+        // Qwen3.8 MTP draft/verify remains reachable without queue pressure.
+        decode.max_work_units = u64::try_from(decode.max_batch_size)
+            .map_err(|_| {
+                Error::Overloaded(
+                    "continuous decode batch width exceeds work accounting".to_string(),
+                )
+            })?
+            .max(CONTINUOUS_CHAT_MAX_DECODE_QUANTUM);
         decode.max_workspace_bytes = CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES;
         prefill.validate()?;
         decode.validate()?;
@@ -2782,6 +2790,31 @@ mod tests {
         assert_eq!(
             contract.stages[1].max_workspace_bytes,
             CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES
+        );
+    }
+
+    #[test]
+    fn continuous_chat_stage_reserves_the_bounded_solo_speculation_quantum() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 1).unwrap();
+        let draft = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            ModelVariant::Qwen3827BFp8,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contract = draft
+            .capabilities
+            .get(&CapabilityKind::Chat)
+            .unwrap()
+            .contract(StreamingRequirements::native(true))
+            .unwrap();
+
+        assert_eq!(contract.stages[1].max_batch_size, 1);
+        assert_eq!(
+            contract.stages[1].max_work_units,
+            CONTINUOUS_CHAT_MAX_DECODE_QUANTUM
         );
     }
 }

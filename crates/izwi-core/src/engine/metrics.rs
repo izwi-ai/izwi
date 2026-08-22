@@ -76,6 +76,20 @@ pub const ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL: &str =
 pub const ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO: &str = "engine.executor.tensor_batch_fill_ratio";
 pub const ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO: &str =
     "engine.executor.tensor_batch_padding_ratio";
+pub const ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL: &str =
+    "engine.executor.model_tensor_batches_total";
+pub const ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL: &str =
+    "engine.executor.model_tensor_batch_rows_total";
+pub const ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH: &str =
+    "engine.executor.model_tensor_batch_max_width";
+pub const ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL: &str =
+    "engine.executor.model_scalar_row_dispatches_total";
+pub const ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL: &str =
+    "engine.executor.model_decode_calls_total";
+pub const ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL: &str =
+    "engine.executor.model_tensor_multirow_calls_total";
+pub const ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL: &str =
+    "engine.executor.continuous_envelope_scalar_fallbacks_total";
 
 pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
@@ -145,7 +159,7 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
-        description: "Observed model-native tensor batch dispatches.",
+        description: "Legacy physical batch envelopes declared native-batch by their adapter; use model_tensor_batches_total for proven tensor forwards.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
@@ -153,7 +167,7 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH,
-        description: "Largest observed model-native tensor batch width.",
+        description: "Largest legacy native-batch envelope width; use model_tensor_batch_max_width for proven tensor forwards.",
     },
     EngineMetricDescriptor {
         name: ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL,
@@ -215,6 +229,34 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         name: ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
         description: "Cumulative padded tensor elements as a fraction of materialized elements.",
     },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
+        description: "Model calls proven to execute their live rows in one tensor-batched forward path.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
+        description: "Rows executed by proven tensor-batched model forward paths.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH,
+        description: "Largest live row width observed in a proven tensor-batched model forward path.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL,
+        description: "Rows executed through scalar continuous-decode model paths.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
+        description: "Successful shape-valid continuous decode model call-path invocations.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
+        description: "Proven tensor-batched model call paths that executed at least two live rows.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
+        description: "Continuous physical envelopes executed through scalar model call paths.",
+    },
 ];
 
 static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -233,6 +275,13 @@ static ENGINE_TENSOR_BATCH_CAPACITY_ROWS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_BATCH_WORKSPACE_BYTES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MODEL_TENSOR_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MODEL_TENSOR_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MODEL_TENSOR_BATCH_MAX_WIDTH: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MODEL_SCALAR_ROW_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MODEL_DECODE_CALLS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MODEL_TENSOR_MULTIROW_CALLS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static ENGINE_DISPATCH_STATE_ROWS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static ENGINE_FAILURE_ORIGIN_ROWS: [AtomicU64; 9] = [
@@ -374,6 +423,13 @@ pub struct EngineBatchMetricsSnapshot {
     pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
+    pub model_tensor_batches_total: u64,
+    pub model_tensor_batch_rows_total: u64,
+    pub model_tensor_batch_max_width: u64,
+    pub model_scalar_row_dispatches_total: u64,
+    pub model_decode_calls_total: u64,
+    pub model_tensor_multirow_calls_total: u64,
+    pub continuous_envelope_scalar_fallbacks_total: u64,
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
@@ -460,6 +516,22 @@ pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
             ENGINE_REQUEST_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
         }
         BatchDispatchKind::Serial | BatchDispatchKind::NotDispatched => {}
+    }
+}
+
+pub(crate) fn record_engine_chat_model_dispatch(tensor_batched: bool, live_rows: usize) {
+    let live_rows = live_rows.max(1) as u64;
+    ENGINE_MODEL_DECODE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if tensor_batched {
+        ENGINE_MODEL_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+        ENGINE_MODEL_TENSOR_BATCH_ROWS.fetch_add(live_rows, Ordering::Relaxed);
+        ENGINE_MODEL_TENSOR_BATCH_MAX_WIDTH.fetch_max(live_rows, Ordering::Relaxed);
+        if live_rows >= 2 {
+            ENGINE_MODEL_TENSOR_MULTIROW_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        ENGINE_MODEL_SCALAR_ROW_DISPATCHES.fetch_add(live_rows, Ordering::Relaxed);
+        ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -571,6 +643,16 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
             materialized_elements.saturating_sub(useful_elements),
             materialized_elements,
         ),
+        model_tensor_batches_total: ENGINE_MODEL_TENSOR_BATCHES.load(Ordering::Relaxed),
+        model_tensor_batch_rows_total: ENGINE_MODEL_TENSOR_BATCH_ROWS.load(Ordering::Relaxed),
+        model_tensor_batch_max_width: ENGINE_MODEL_TENSOR_BATCH_MAX_WIDTH.load(Ordering::Relaxed),
+        model_scalar_row_dispatches_total: ENGINE_MODEL_SCALAR_ROW_DISPATCHES
+            .load(Ordering::Relaxed),
+        model_decode_calls_total: ENGINE_MODEL_DECODE_CALLS.load(Ordering::Relaxed),
+        model_tensor_multirow_calls_total: ENGINE_MODEL_TENSOR_MULTIROW_CALLS
+            .load(Ordering::Relaxed),
+        continuous_envelope_scalar_fallbacks_total: ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -1024,6 +1106,27 @@ mod tests {
         assert!(engine_tensor_batches_total() > tensor_before);
         assert!(engine_request_parallel_batches_total() > parallel_before);
         assert!(engine_tensor_batch_max_width() >= 3);
+    }
+
+    #[test]
+    fn model_dispatch_metrics_distinguish_true_tensor_batches_from_scalar_rows() {
+        let before = engine_batch_metrics_snapshot();
+        record_engine_chat_model_dispatch(true, 3);
+        record_engine_chat_model_dispatch(false, 2);
+        let after = engine_batch_metrics_snapshot();
+
+        assert!(after.model_tensor_batches_total > before.model_tensor_batches_total);
+        assert!(after.model_tensor_batch_rows_total >= before.model_tensor_batch_rows_total + 3);
+        assert!(after.model_tensor_batch_max_width >= 3);
+        assert!(
+            after.model_scalar_row_dispatches_total >= before.model_scalar_row_dispatches_total + 2
+        );
+        assert!(after.model_decode_calls_total >= before.model_decode_calls_total + 2);
+        assert!(after.model_tensor_multirow_calls_total > before.model_tensor_multirow_calls_total);
+        assert!(
+            after.continuous_envelope_scalar_fallbacks_total
+                > before.continuous_envelope_scalar_fallbacks_total
+        );
     }
 
     #[test]

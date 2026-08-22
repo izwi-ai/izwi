@@ -748,6 +748,7 @@ impl NativeExecutor {
             .iter_mut()
             .map(|(_, _, state, _)| &mut state.state)
             .collect::<Vec<_>>();
+        let live_width = state_refs.len();
         let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
         drop(state_refs);
         if steps.len() != active_states.rows.len() {
@@ -755,6 +756,10 @@ impl NativeExecutor {
                 "continuous chat model returned the wrong number of rows".to_string(),
             ));
         }
+        crate::engine::metrics::record_engine_chat_model_dispatch(
+            model.continuous_decode_is_tensor_batched(),
+            live_width,
+        );
 
         let mut continuing = vec![false; scheduled.len()];
         for ((index, _, active_state, _), step) in active_states.rows.iter_mut().zip(steps) {

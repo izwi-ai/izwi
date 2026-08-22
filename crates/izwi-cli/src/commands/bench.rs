@@ -114,6 +114,20 @@ struct EngineRuntimeTelemetrySnapshot {
     #[serde(default)]
     tensor_batch_padding_ratio: f64,
     #[serde(default)]
+    model_tensor_batches_total: u64,
+    #[serde(default)]
+    model_tensor_batch_rows_total: u64,
+    #[serde(default)]
+    model_tensor_batch_max_width: u64,
+    #[serde(default)]
+    model_scalar_row_dispatches_total: u64,
+    #[serde(default)]
+    model_decode_calls_total: u64,
+    #[serde(default)]
+    model_tensor_multirow_calls_total: u64,
+    #[serde(default)]
+    continuous_envelope_scalar_fallbacks_total: u64,
+    #[serde(default)]
     kv_cache: ManagedKvRuntimeSnapshot,
 }
 
@@ -1759,7 +1773,6 @@ async fn bench_chat(
     }
     let started_at = Utc::now();
     let run_start = Instant::now();
-    let metrics_before = fetch_runtime_metrics(server).await;
 
     if warmup {
         if options.interactive() {
@@ -1767,6 +1780,10 @@ async fn bench_chat(
         }
         let _ = run_chat_request(server, model, prompt, system, max_tokens).await?;
     }
+    // Evidence deltas must describe measured iterations only. In particular,
+    // a single-user warmup must not supply MTP or tensor-batch counters for a
+    // later concurrent case.
+    let metrics_before = fetch_runtime_metrics(server).await;
 
     let pb = progress_bar(options.interactive(), iterations as u64);
     pb.set_style(
@@ -2840,6 +2857,9 @@ async fn run_chat_request(
         "max_completion_tokens": max_tokens,
     });
 
+    // Client-observed TTFT includes request transmission, server admission,
+    // queueing, prefill, and response-header latency.
+    let started = Instant::now();
     let response = client
         .post(format!("{}/v1/chat/completions", server))
         .json(&request_body)
@@ -2856,7 +2876,6 @@ async fn run_chat_request(
         });
     }
 
-    let started = Instant::now();
     let mut first_delta_at: Option<f64> = None;
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;

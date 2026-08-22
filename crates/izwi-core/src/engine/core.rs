@@ -24,8 +24,8 @@ use super::execution::{
     ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
     ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
-    OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, StageId,
-    StageShapePolicy, WorkCost, WorkUnit,
+    OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase,
+    StageId, StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
@@ -235,6 +235,20 @@ impl PhysicalBatchAssembly {
         scheduled: super::scheduler::ScheduledRequest,
         row: ReadyQuantum,
     ) -> bool {
+        if self.physical_batch.mode == NativeBatchMode::Continuous
+            && !self.physical_batch.rows.is_empty()
+            && (row.cost.logical_units > 1
+                || self
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .any(|existing| existing.cost.logical_units > 1))
+        {
+            // Shared continuous envelopes are N rows by exactly one token.
+            // Model-authored multi-token quanta are isolated so membership can
+            // change only after their bounded transaction commits.
+            return false;
+        }
         let mut candidate = self.physical_batch.clone();
         candidate.rows.push(row);
         let Some(materialized) =
@@ -1131,6 +1145,35 @@ impl EngineCore {
         stage: Option<&super::StageDescriptor>,
     ) -> Result<WorkCost> {
         if let Some(prepared) = stage.and_then(|stage| request.prepared_stage_cost(stage.id)) {
+            if stage.is_some_and(|stage| stage.batch_mode == NativeBatchMode::Continuous) {
+                if let WorkUnit::SequenceStep {
+                    phase: SequencePhase::Decode,
+                    input,
+                    ..
+                } = work
+                {
+                    let input_units = u64::try_from(input.len()).map_err(|_| {
+                        Error::Overloaded(
+                            "continuous decode input exceeds work accounting".to_string(),
+                        )
+                    })?;
+                    if input_units > 1 {
+                        let tensor_elements = prepared
+                            .tensor_elements
+                            .checked_mul(input_units)
+                            .ok_or_else(|| {
+                                Error::Overloaded(
+                                    "continuous decode tensor cost overflowed".to_string(),
+                                )
+                            })?;
+                        return Ok(WorkCost::with_workspace(
+                            input_units,
+                            tensor_elements,
+                            prepared.workspace,
+                        ));
+                    }
+                }
+            }
             return Ok(prepared);
         }
         let logical_units = match work {
@@ -4998,6 +5041,124 @@ mod tests {
         );
         assert_eq!(batches[0].physical_batch().rows.len(), 2);
         assert_eq!(batches[0].physical_batch().budget.max_logical_units, 2);
+    }
+
+    #[test]
+    fn prepared_continuous_cost_scales_an_isolated_multi_token_quantum() {
+        let variant = ModelVariant::Qwen306BGguf;
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "continuous cost fixture".to_string(),
+        }])
+        .with_model_variant(variant);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(17),
+            "chat.decode.tensor_continuous",
+            &profile,
+            NativeBatchMode::Continuous,
+        );
+        stage.max_workspace_bytes = 32;
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: ExecutionGroupId::new(1),
+                model_instance_id: ModelInstanceId::new(2),
+                adapter_instance_id: AdapterInstanceId::new(3),
+                adapter_abi_revision: AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "chat".to_string(),
+                stages: Arc::from([stage.clone()]),
+            })
+            .unwrap();
+        request
+            .install_prepared_stage_cost(stage.id, WorkCost::new(1, 128, 32))
+            .unwrap();
+        let work = WorkUnit::SequenceStep {
+            phase: SequencePhase::Decode,
+            input: super::super::InputRange { start: 9, end: 13 },
+            max_output_steps: 4,
+        };
+
+        let cost = EngineCore::work_cost(&request, &work, Some(&stage)).unwrap();
+        assert_eq!(cost.logical_units, 4);
+        assert_eq!(cost.tensor_elements, 512);
+        assert_eq!(cost.workspace.workspace_bytes().unwrap(), 32);
+    }
+
+    #[test]
+    fn multi_token_continuous_quantum_cannot_join_another_row() {
+        let lane = BatchLaneKey {
+            execution_group: ExecutionGroupId::new(1),
+            model_instance: ModelInstanceId::new(2),
+            adapter_instance: AdapterInstanceId::new(3),
+            adapter_abi: AdapterAbiRevision::new(1),
+            capability_id: "chat".to_string(),
+            stage_id: StageId::new(4),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            compute_dtype: "f32".to_string(),
+            state_dtype: "f32".to_string(),
+            tensor_layout: "ragged".to_string(),
+            quantization: "none".to_string(),
+            state_schema: "test.v1".to_string(),
+            kernel_mode: "test".to_string(),
+            semantic_mode: "greedy".to_string(),
+            shape_bucket: "ragged".to_string(),
+        };
+        let first_scheduled = scheduled_decode("solo-quantum", 1);
+        let first_row = ReadyQuantum {
+            plan_id: first_scheduled.plan_id,
+            session: first_scheduled.session_key(),
+            lane: lane.clone(),
+            work: WorkUnit::SequenceStep {
+                phase: SequencePhase::Decode,
+                input: super::super::InputRange { start: 1, end: 5 },
+                max_output_steps: 4,
+            },
+            cost: WorkCost::new(4, 4, 0),
+            managed_cache: None,
+        };
+        let first_request = Arc::new(EngineCoreRequest::tts("solo quantum"));
+        let mut assembly = PhysicalBatchAssembly {
+            physical_batch: PhysicalBatch {
+                batch_id: BatchId::new(1),
+                lane: lane.clone(),
+                mode: NativeBatchMode::Continuous,
+                budget: BatchBudget {
+                    max_rows: 2,
+                    max_logical_units: 5,
+                    max_tensor_elements: 5,
+                    max_workspace_bytes: 0,
+                    max_padding_basis_points: 0,
+                    max_formation_delay: Duration::ZERO,
+                },
+                rows: vec![first_row],
+                materialized_tensor_elements: 4,
+                workspace: ResourceVector::zero(),
+            },
+            requests: vec![first_request],
+            scheduled: vec![first_scheduled],
+            output_visibility: OutputVisibility::AfterQuantumCommit,
+            shape_policy: StageShapePolicy::Ragged,
+            workspace_base_bytes: 0,
+        };
+        let second_scheduled = scheduled_decode("shared-row", 2);
+        let second_row = ReadyQuantum {
+            plan_id: second_scheduled.plan_id,
+            session: second_scheduled.session_key(),
+            lane,
+            work: second_scheduled.work.clone(),
+            cost: WorkCost::new(1, 1, 0),
+            managed_cache: None,
+        };
+
+        assert!(!assembly.try_push(
+            Arc::new(EngineCoreRequest::tts("shared row")),
+            second_scheduled,
+            second_row,
+        ));
+        assert_eq!(assembly.physical_batch.rows.len(), 1);
     }
 
     #[tokio::test]

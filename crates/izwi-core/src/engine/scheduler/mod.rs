@@ -721,20 +721,15 @@ impl Scheduler {
                 break;
             }
 
-            let mut num_tokens = self.decode_token_quanta(
+            let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
                 remaining_decode_tokens,
                 self.waiting_count() > 0,
                 overdue_ms,
                 workload_class,
                 preferred_decode_tokens,
+                continuous_decode,
             );
-            if continuous_decode {
-                // Membership can change only between committed model quanta.
-                // Keep each scheduler transaction to one decode token so new
-                // rows may join and finished/cancelled rows may leave promptly.
-                num_tokens = num_tokens.min(1);
-            }
             if num_tokens == 0 {
                 continue;
             }
@@ -1726,9 +1721,25 @@ impl Scheduler {
         overdue_ms: f64,
         workload_class: WorkloadClass,
         preferred_decode_tokens: usize,
+        continuous_decode: bool,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
         let preferred_decode_tokens = preferred_decode_tokens.max(1);
+        if continuous_decode {
+            let exact_solo = self.running.len() == 1
+                && self
+                    .running
+                    .values()
+                    .filter(|request| request.prefill_complete)
+                    .count()
+                    == 1
+                && !has_waiting_work
+                && overdue_ms <= 0.0;
+            if exact_solo && preferred_decode_tokens > 1 {
+                return preferred_decode_tokens.min(base).max(1);
+            }
+            return 1.min(base);
+        }
         if !self.config.enable_decode_quanta && preferred_decode_tokens == 1 {
             return 1.min(base);
         }
@@ -2787,7 +2798,8 @@ mod tests {
         };
         let mut scheduler = Scheduler::new(config);
         let request_id = "continuous-decode".to_string();
-        let request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        request.workload_class = WorkloadClass::Streaming;
         assert!(scheduler.add_request(&request));
         let epoch = scheduler.get_sequence_id(&request_id).unwrap();
         let mut profile =
@@ -2816,6 +2828,43 @@ mod tests {
                 max_output_steps: 1,
             }
         );
+    }
+
+    #[test]
+    fn continuous_decode_preserves_an_isolated_model_preferred_quantum() {
+        let config = SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 8,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: false,
+            enable_preemption: false,
+            enable_adaptive_batching: false,
+            enable_decode_quanta: false,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let request_id = "continuous-solo-quantum".to_string();
+        let mut request = build_request(TaskType::Chat, &request_id, Priority::Normal);
+        request.workload_class = WorkloadClass::Streaming;
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request_id).unwrap();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Full;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.preferred_decode_tokens = 4;
+        assert!(scheduler
+            .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile));
+
+        let prefill = scheduler.schedule();
+        assert_eq!(prefill.prefill_requests.len(), 1);
+        scheduler.update_after_step(&request_id, request.num_prompt_tokens(), 1, 1.0);
+
+        let decode = scheduler.schedule();
+        assert_eq!(decode.decode_requests.len(), 1);
+        assert_eq!(decode.decode_requests[0].num_tokens, 4);
     }
 
     #[test]

@@ -77,6 +77,13 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub workspace_domains: EngineWorkspaceDomainMetricsSnapshot,
     pub tensor_batch_fill_ratio: f64,
     pub tensor_batch_padding_ratio: f64,
+    pub model_tensor_batches_total: u64,
+    pub model_tensor_batch_rows_total: u64,
+    pub model_tensor_batch_max_width: u64,
+    pub model_scalar_row_dispatches_total: u64,
+    pub model_decode_calls_total: u64,
+    pub model_tensor_multirow_calls_total: u64,
+    pub continuous_envelope_scalar_fallbacks_total: u64,
     /// Exact backend-owned managed arenas, page ownership, and counters.
     pub kv_cache: ManagedKvRuntimeSnapshot,
 }

@@ -3023,6 +3023,14 @@ impl NativeChatModel {
         }
     }
 
+    /// Whether one continuous model call executes all live rows through a
+    /// single tensor-batched forward path. This is intentionally stricter than
+    /// continuous scheduler membership: Qwen3.8 currently shares a transaction
+    /// envelope while executing scalar rows.
+    pub fn continuous_decode_is_tensor_batched(&self) -> bool {
+        matches!(self, Self::Qwen3(_) | Self::Gemma3(_))
+    }
+
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),

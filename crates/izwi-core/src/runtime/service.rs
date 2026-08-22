@@ -24,8 +24,13 @@ use crate::engine::{
     EngineTask, GenerationParams, OutputFinishReason, ResourceAmount, ResourceVector, SessionKey,
     StreamingOutput, TaskType, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
-    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL, ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL,
-    ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL, ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
+    ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
+    ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL, ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
@@ -2651,6 +2656,14 @@ impl RuntimeService {
             workspace_domains: batch.workspace_domains,
             tensor_batch_fill_ratio: batch.tensor_batch_fill_ratio,
             tensor_batch_padding_ratio: batch.tensor_batch_padding_ratio,
+            model_tensor_batches_total: batch.model_tensor_batches_total,
+            model_tensor_batch_rows_total: batch.model_tensor_batch_rows_total,
+            model_tensor_batch_max_width: batch.model_tensor_batch_max_width,
+            model_scalar_row_dispatches_total: batch.model_scalar_row_dispatches_total,
+            model_decode_calls_total: batch.model_decode_calls_total,
+            model_tensor_multirow_calls_total: batch.model_tensor_multirow_calls_total,
+            continuous_envelope_scalar_fallbacks_total: batch
+                .continuous_envelope_scalar_fallbacks_total,
             kv_cache,
         }
     }
@@ -2790,6 +2803,41 @@ impl RuntimeService {
             payload,
             ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
             snapshot.tensor_continuous_multirow_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
+            snapshot.model_tensor_batches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
+            snapshot.model_tensor_batch_rows_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH,
+            snapshot.model_tensor_batch_max_width,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL,
+            snapshot.model_scalar_row_dispatches_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
+            snapshot.model_decode_calls_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
+            snapshot.model_tensor_multirow_calls_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
+            snapshot.continuous_envelope_scalar_fallbacks_total,
         );
         push_engine_metric(
             payload,
@@ -4442,6 +4490,13 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_tensor_static_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_continuous_batches_total"));
         assert!(payload.contains("izwi_engine_executor_tensor_continuous_multirow_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_model_decode_calls_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_batches_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_multirow_calls_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_batch_rows_total"));
+        assert!(payload.contains("izwi_engine_executor_model_tensor_batch_max_width"));
+        assert!(payload.contains("izwi_engine_executor_model_scalar_row_dispatches_total"));
+        assert!(payload.contains("izwi_engine_executor_continuous_envelope_scalar_fallbacks_total"));
         assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
         assert!(payload
             .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));

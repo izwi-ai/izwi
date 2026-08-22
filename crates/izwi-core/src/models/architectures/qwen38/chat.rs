@@ -1389,7 +1389,7 @@ impl Qwen38ChatModel {
             return Ok(self.decode_step_result(state, delta, 0));
         }
 
-        if self.mtp_head.is_some() {
+        if self.mtp_head.is_some() && !state.shared_step_committed {
             return self.decode_mtp_quantum(state, input_budget.max(1));
         }
 

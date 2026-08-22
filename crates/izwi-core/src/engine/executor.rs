@@ -1346,6 +1346,10 @@ impl NativeExecutor {
     }
 }
 
+fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
+    scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
+}
+
 impl ModelExecutor for NativeExecutor {
     fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
         let variant = request.model_variant?;
@@ -1584,6 +1588,31 @@ impl ModelExecutor for NativeExecutor {
                     width,
                     FailureOrigin::ExecutorValidation,
                 ));
+            }
+            if is_isolated_continuous_model_quantum(execution.scheduled) {
+                // An isolated model-preferred quantum is still planned through
+                // the continuous stage so it can yield back to shared
+                // membership afterwards, but its model work is scalar/MTP and
+                // must use the existing transactional scalar handler. This
+                // keeps tensor-batch telemetry truthful and preserves the
+                // shared handler's one-token-per-row invariant.
+                let result = self.execute_requests_with_rows(
+                    execution.requests,
+                    execution.scheduled,
+                    Some(&execution.batch.rows),
+                );
+                if result.as_ref().is_ok_and(|outputs| {
+                    outputs.iter().all(|output| output.output.error.is_none())
+                }) {
+                    crate::engine::metrics::record_engine_chat_model_dispatch(false, 1);
+                }
+                return result.map_err(|error| {
+                    PhysicalDispatchError::started(
+                        error,
+                        BatchDispatch::serial(),
+                        FailureOrigin::Model,
+                    )
+                });
             }
             return self
                 .execute_continuous_chat_requests_with_rows(
@@ -1877,6 +1906,40 @@ mod tests {
             device_ordinal: None,
             generation,
         }
+    }
+
+    #[test]
+    fn only_multi_token_solo_decode_uses_the_scalar_continuous_route() {
+        let scheduled = |num_tokens: usize, is_prefill: bool| ScheduledRequest {
+            plan_id: 1,
+            request_id: "route".to_string(),
+            sequence_id: 1,
+            num_tokens,
+            is_prefill,
+            num_computed_tokens: 0,
+            work: WorkUnit::SequenceStep {
+                phase: if is_prefill {
+                    crate::engine::SequencePhase::Prefill
+                } else {
+                    crate::engine::SequencePhase::Decode
+                },
+                input: crate::engine::InputRange {
+                    start: 0,
+                    end: num_tokens,
+                },
+                max_output_steps: num_tokens,
+            },
+        };
+
+        assert!(is_isolated_continuous_model_quantum(&[scheduled(4, false)]));
+        assert!(!is_isolated_continuous_model_quantum(&[scheduled(
+            1, false
+        )]));
+        assert!(!is_isolated_continuous_model_quantum(&[scheduled(4, true)]));
+        assert!(!is_isolated_continuous_model_quantum(&[
+            scheduled(1, false),
+            scheduled(1, false),
+        ]));
     }
 
     fn qwen38_test_reservation(domains: &[(CacheDomainId, KvArenaId)]) -> ManagedCacheReservation {
