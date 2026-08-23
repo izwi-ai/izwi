@@ -1251,22 +1251,260 @@ pub trait ModelExecutor: Send + Sync {
 /// tensor cache state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheReleaseReport {
+    pub outcome: CacheReleaseOutcome,
     pub confirmed: bool,
     pub released_sessions: usize,
+    pub busy_sessions: usize,
+}
+
+/// Typed executor cleanup result. `BusyInFlight` is deliberately distinct from
+/// a generic unconfirmed cleanup: the exact session is still owned by a model
+/// forward and must be retried after that forward reaches its RAII boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheReleaseOutcome {
+    Confirmed,
+    BusyInFlight,
+    Unconfirmed,
 }
 
 impl CacheReleaseReport {
     pub const fn confirmed(released_sessions: usize) -> Self {
         Self {
+            outcome: CacheReleaseOutcome::Confirmed,
             confirmed: true,
             released_sessions,
+            busy_sessions: 0,
+        }
+    }
+
+    pub const fn busy_in_flight(released_sessions: usize, busy_sessions: usize) -> Self {
+        Self {
+            outcome: CacheReleaseOutcome::BusyInFlight,
+            confirmed: false,
+            released_sessions,
+            busy_sessions,
         }
     }
 
     pub const fn unconfirmed() -> Self {
         Self {
+            outcome: CacheReleaseOutcome::Unconfirmed,
             confirmed: false,
             released_sessions: 0,
+            busy_sessions: 0,
+        }
+    }
+}
+
+enum ExecutorStateSlot<T> {
+    Ready(T),
+    InFlight,
+    Poisoned,
+}
+
+type ExecutorStateStore<T> = Mutex<HashMap<SessionKey, ExecutorStateSlot<T>>>;
+
+/// Exclusive ownership of one executor session state while a physical forward
+/// is running. The `InFlight` marker stays visible in the map for cleanup for
+/// the complete lifetime of this lease.
+///
+/// Before model state is mutated, dropping the lease restores a previously
+/// ready state. Once `mark_dirty` is called, an uncommitted unwind drops the
+/// possibly-mutated state and leaves a `Poisoned` marker so cleanup cannot
+/// mistake the temporary absence for a successful release.
+struct ExecutorStateLease<'a, T> {
+    store: &'a ExecutorStateStore<T>,
+    session: SessionKey,
+    state: Option<T>,
+    label: &'static str,
+    dirty: bool,
+    armed: bool,
+}
+
+impl<'a, T> ExecutorStateLease<'a, T> {
+    fn checkout(
+        store: &'a ExecutorStateStore<T>,
+        session: SessionKey,
+        label: &'static str,
+    ) -> Result<Self> {
+        use std::collections::hash_map::Entry;
+
+        let state = {
+            let mut states = store
+                .lock()
+                .map_err(|_| Error::InferenceError(format!("{label} state mutex poisoned")))?;
+            match states.entry(session.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(ExecutorStateSlot::InFlight);
+                    None
+                }
+                Entry::Occupied(mut entry) => match entry.get() {
+                    ExecutorStateSlot::Ready(_) => {
+                        let previous = entry.insert(ExecutorStateSlot::InFlight);
+                        let ExecutorStateSlot::Ready(state) = previous else {
+                            unreachable!("ready executor state changed under one mutex guard")
+                        };
+                        Some(state)
+                    }
+                    ExecutorStateSlot::InFlight => {
+                        return Err(Error::InferenceError(format!(
+                            "{label} session {}:{} is already in flight",
+                            session.request_id, session.epoch
+                        )))
+                    }
+                    ExecutorStateSlot::Poisoned => {
+                        return Err(Error::InferenceError(format!(
+                            "{label} session {}:{} is poisoned and requires cleanup",
+                            session.request_id, session.epoch
+                        )))
+                    }
+                },
+            }
+        };
+
+        Ok(Self {
+            store,
+            session,
+            state,
+            label,
+            dirty: false,
+            armed: true,
+        })
+    }
+
+    fn state(&self) -> Option<&T> {
+        self.state.as_ref()
+    }
+
+    fn state_mut(&mut self) -> Option<&mut T> {
+        self.state.as_mut()
+    }
+
+    fn require_state_mut(&mut self) -> Result<&mut T> {
+        self.state.as_mut().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "{} session {}:{} has no checked-out state",
+                self.label, self.session.request_id, self.session.epoch
+            ))
+        })
+    }
+
+    fn discard_state(&mut self) {
+        self.state.take();
+        self.dirty = false;
+    }
+
+    fn install_state(&mut self, state: T) -> Result<()> {
+        if self.state.is_some() {
+            return Err(Error::InferenceError(format!(
+                "{} session {}:{} replaced an owned state without releasing it",
+                self.label, self.session.request_id, self.session.epoch
+            )));
+        }
+        self.state = Some(state);
+        Ok(())
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    fn restore(mut self) -> Result<()> {
+        let state = self.state.take().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "{} session {}:{} cannot restore an empty state",
+                self.label, self.session.request_id, self.session.epoch
+            ))
+        })?;
+        let result = self.replace_in_flight(ExecutorStateSlot::Ready(state));
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+
+    fn release(mut self) -> Result<()> {
+        let mut states = self
+            .store
+            .lock()
+            .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
+        match states.get(&self.session) {
+            Some(ExecutorStateSlot::InFlight) => {
+                states.remove(&self.session);
+                self.armed = false;
+                Ok(())
+            }
+            _ => Err(self.transition_collision()),
+        }
+    }
+
+    fn replace_in_flight(&mut self, replacement: ExecutorStateSlot<T>) -> Result<()> {
+        let mut states = self
+            .store
+            .lock()
+            .map_err(|_| Error::InferenceError(format!("{} state mutex poisoned", self.label)))?;
+        match states.get(&self.session) {
+            Some(ExecutorStateSlot::InFlight) => {
+                states.insert(self.session.clone(), replacement);
+                Ok(())
+            }
+            _ => Err(self.transition_collision()),
+        }
+    }
+
+    fn transition_collision(&self) -> Error {
+        Error::InferenceError(format!(
+            "{} session {}:{} lost its in-flight ownership marker",
+            self.label, self.session.request_id, self.session.epoch
+        ))
+    }
+}
+
+impl<T> Drop for ExecutorStateLease<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        use std::collections::hash_map::Entry;
+        let mut states = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match states.entry(self.session.clone()) {
+            Entry::Occupied(mut entry) if matches!(entry.get(), ExecutorStateSlot::InFlight) => {
+                if self.dirty {
+                    entry.insert(ExecutorStateSlot::Poisoned);
+                } else if let Some(state) = self.state.take() {
+                    entry.insert(ExecutorStateSlot::Ready(state));
+                } else {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(entry) => {
+                // A missing marker means another path observed ownership that
+                // was not actually released. Fence the session until cleanup.
+                entry.insert(ExecutorStateSlot::Poisoned);
+                tracing::error!(
+                    request_id = %self.session.request_id,
+                    epoch = self.session.epoch,
+                    state = self.label,
+                    "executor state lease lost its in-flight marker"
+                );
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(ExecutorStateSlot::Poisoned);
+                tracing::error!(
+                    request_id = %self.session.request_id,
+                    epoch = self.session.epoch,
+                    state = self.label,
+                    "executor state lease collided with another visible state; session fenced until cleanup"
+                );
+            }
         }
     }
 }
@@ -1275,9 +1513,9 @@ pub struct NativeExecutor {
     config: WorkerConfig,
     initialized: bool,
     loaded_tts_model: Option<Arc<Qwen3TtsModel>>,
-    chat_decode_states: Mutex<HashMap<SessionKey, ActiveChatDecode>>,
-    asr_decode_states: Mutex<HashMap<SessionKey, ActiveAsrDecode>>,
-    qwen_tts_decode_states: Mutex<HashMap<SessionKey, ActiveQwenTtsDecode>>,
+    chat_decode_states: ExecutorStateStore<ActiveChatDecode>,
+    asr_decode_states: ExecutorStateStore<ActiveAsrDecode>,
+    qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
 }
 
 impl NativeExecutor {
@@ -1746,11 +1984,10 @@ impl ModelExecutor for NativeExecutor {
             return CacheReleaseReport::unconfirmed();
         };
 
-        let mut released = 0usize;
-        released = released.saturating_add(retain_other_sessions_locked(&mut chat, request_id));
-        released = released.saturating_add(retain_other_sessions_locked(&mut asr, request_id));
-        released = released.saturating_add(retain_other_sessions_locked(&mut tts, request_id));
-        CacheReleaseReport::confirmed(released)
+        let chat = cleanup_request_states_locked(&mut chat, request_id);
+        let asr = cleanup_request_states_locked(&mut asr, request_id);
+        let tts = cleanup_request_states_locked(&mut tts, request_id);
+        cleanup_report(chat.combine(asr).combine(tts))
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
@@ -1762,10 +1999,10 @@ impl ModelExecutor for NativeExecutor {
             return CacheReleaseReport::unconfirmed();
         };
 
-        let released = usize::from(chat.remove(session).is_some())
-            .saturating_add(usize::from(asr.remove(session).is_some()))
-            .saturating_add(usize::from(tts.remove(session).is_some()));
-        CacheReleaseReport::confirmed(released)
+        let chat = cleanup_session_state_locked(&mut chat, session);
+        let asr = cleanup_session_state_locked(&mut asr, session);
+        let tts = cleanup_session_state_locked(&mut tts, session);
+        cleanup_report(chat.combine(asr).combine(tts))
     }
 
     fn purge_model_cache(&self, _variant: ModelVariant) -> CacheReleaseReport {
@@ -1890,10 +2127,70 @@ impl UnifiedExecutor {
     }
 }
 
-fn retain_other_sessions_locked<T>(states: &mut HashMap<SessionKey, T>, request_id: &str) -> usize {
-    let before = states.len();
-    states.retain(|session, _| session.request_id != request_id);
-    before.saturating_sub(states.len())
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StateCleanupSummary {
+    released: usize,
+    busy: usize,
+}
+
+impl StateCleanupSummary {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            released: self.released.saturating_add(other.released),
+            busy: self.busy.saturating_add(other.busy),
+        }
+    }
+}
+
+fn cleanup_report(summary: StateCleanupSummary) -> CacheReleaseReport {
+    if summary.busy > 0 {
+        CacheReleaseReport::busy_in_flight(summary.released, summary.busy)
+    } else {
+        CacheReleaseReport::confirmed(summary.released)
+    }
+}
+
+fn cleanup_request_states_locked<T>(
+    states: &mut HashMap<SessionKey, ExecutorStateSlot<T>>,
+    request_id: &str,
+) -> StateCleanupSummary {
+    let mut summary = StateCleanupSummary::default();
+    states.retain(|session, slot| {
+        if session.request_id != request_id {
+            return true;
+        }
+        match slot {
+            ExecutorStateSlot::InFlight => {
+                summary.busy = summary.busy.saturating_add(1);
+                true
+            }
+            ExecutorStateSlot::Ready(_) | ExecutorStateSlot::Poisoned => {
+                summary.released = summary.released.saturating_add(1);
+                false
+            }
+        }
+    });
+    summary
+}
+
+fn cleanup_session_state_locked<T>(
+    states: &mut HashMap<SessionKey, ExecutorStateSlot<T>>,
+    session: &SessionKey,
+) -> StateCleanupSummary {
+    match states.get(session) {
+        Some(ExecutorStateSlot::InFlight) => StateCleanupSummary {
+            released: 0,
+            busy: 1,
+        },
+        Some(ExecutorStateSlot::Ready(_) | ExecutorStateSlot::Poisoned) => {
+            states.remove(session);
+            StateCleanupSummary {
+                released: 1,
+                busy: 0,
+            }
+        }
+        None => StateCleanupSummary::default(),
+    }
 }
 
 /// Decode base64-encoded audio to samples.
@@ -1930,6 +2227,118 @@ mod tests {
                 source: CapacitySource::Test,
             }
         }
+    }
+
+    #[test]
+    fn executor_state_lease_keeps_in_flight_ownership_visible_to_cleanup() {
+        let session = SessionKey::new("visible-in-flight".to_string(), 7);
+        let store = Mutex::new(HashMap::from([(
+            session.clone(),
+            ExecutorStateSlot::Ready("ready".to_string()),
+        )]));
+
+        let lease = ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+        assert_eq!(lease.state().map(String::as_str), Some("ready"));
+
+        let summary = {
+            let mut states = store.lock().unwrap();
+            cleanup_session_state_locked(&mut states, &session)
+        };
+        assert_eq!(
+            summary,
+            StateCleanupSummary {
+                released: 0,
+                busy: 1
+            }
+        );
+        drop(lease);
+
+        let states = store.lock().unwrap();
+        assert!(matches!(
+            states.get(&session),
+            Some(ExecutorStateSlot::Ready(state)) if state == "ready"
+        ));
+    }
+
+    #[test]
+    fn dirty_executor_state_unwind_is_poisoned_until_cleanup() {
+        let session = SessionKey::new("poison-on-unwind".to_string(), 3);
+        let store = Mutex::new(HashMap::from([(
+            session.clone(),
+            ExecutorStateSlot::Ready(41usize),
+        )]));
+
+        let mut lease =
+            ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+        lease.mark_dirty();
+        *lease.require_state_mut().unwrap() = 42;
+        drop(lease);
+
+        assert!(matches!(
+            store.lock().unwrap().get(&session),
+            Some(ExecutorStateSlot::Poisoned)
+        ));
+        assert!(ExecutorStateLease::checkout(&store, session.clone(), "test state").is_err());
+
+        let summary = {
+            let mut states = store.lock().unwrap();
+            cleanup_session_state_locked(&mut states, &session)
+        };
+        assert_eq!(
+            summary,
+            StateCleanupSummary {
+                released: 1,
+                busy: 0
+            }
+        );
+        assert!(!store.lock().unwrap().contains_key(&session));
+    }
+
+    #[test]
+    fn executor_state_lease_explicitly_restores_or_releases() {
+        let session = SessionKey::new("explicit-transition".to_string(), 2);
+        let store = Mutex::new(HashMap::new());
+
+        let mut lease =
+            ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+        lease.install_state(9usize).unwrap();
+        lease.mark_dirty();
+        lease.restore().unwrap();
+        assert!(matches!(
+            store.lock().unwrap().get(&session),
+            Some(ExecutorStateSlot::Ready(9))
+        ));
+
+        let lease = ExecutorStateLease::checkout(&store, session.clone(), "test state").unwrap();
+        lease.release().unwrap();
+        assert!(!store.lock().unwrap().contains_key(&session));
+    }
+
+    #[test]
+    fn native_cleanup_reports_busy_chat_tts_and_asr_sessions() {
+        let executor = NativeExecutor::new(WorkerConfig::default());
+        let session = SessionKey::new("all-modalities-in-flight".to_string(), 11);
+        executor
+            .chat_decode_states
+            .lock()
+            .unwrap()
+            .insert(session.clone(), ExecutorStateSlot::InFlight);
+        executor
+            .qwen_tts_decode_states
+            .lock()
+            .unwrap()
+            .insert(session.clone(), ExecutorStateSlot::InFlight);
+        executor
+            .asr_decode_states
+            .lock()
+            .unwrap()
+            .insert(session.clone(), ExecutorStateSlot::InFlight);
+
+        let report = executor.cleanup_session(&session);
+        assert_eq!(report.outcome, CacheReleaseOutcome::BusyInFlight);
+        assert!(!report.confirmed);
+        assert_eq!(report.released_sessions, 0);
+        assert_eq!(report.busy_sessions, 3);
     }
 
     fn qwen38_test_arena(generation: u32) -> KvArenaId {

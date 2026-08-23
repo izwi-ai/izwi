@@ -10,7 +10,9 @@ use super::super::request::EngineCoreRequest;
 use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::state::ActiveQwenTtsDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
+use super::{
+    ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
+};
 
 fn validate_qwen_tts_physical_bindings(
     has_managed_runtime: bool,
@@ -126,36 +128,44 @@ impl NativeExecutor {
         let session = scheduled.session_key();
 
         {
-            let mut active_state = {
-                let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
-                    Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
-                })?;
-                guard.remove(&session)
-            };
-
-            if active_state
-                .as_ref()
+            let mut state_lease = ExecutorStateLease::checkout(
+                &self.qwen_tts_decode_states,
+                session,
+                "Qwen TTS decode",
+            )?;
+            if state_lease
+                .state()
                 .map(|state| state.variant != variant)
                 .unwrap_or(false)
             {
-                active_state = None;
+                state_lease.discard_state();
             }
-            if let Some(state) = active_state.as_mut() {
-                state.state.install_retained_talker_reservation(
-                    talker_cache.take().ok_or_else(|| {
-                        Error::InferenceError(
-                            "active Qwen TTS state lost its talker reservation".to_string(),
-                        )
-                    })?,
-                )?;
+            if state_lease.state().is_some() {
+                state_lease.mark_dirty();
+                state_lease
+                    .require_state_mut()?
+                    .state
+                    .install_retained_talker_reservation(talker_cache.take().ok_or_else(
+                        || {
+                            Error::InferenceError(
+                                "active Qwen TTS state lost its talker reservation".to_string(),
+                            )
+                        },
+                    )?)?;
                 if let (Some(arena), Some(reservation)) =
                     (tensor_arena.as_ref(), tensor_reservation)
                 {
-                    state.state.bind_tensor_sequence(reservation.sequence)?;
-                    state.state.restore_tensor_state(arena)?;
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .bind_tensor_sequence(reservation.sequence)?;
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .restore_tensor_state(arena)?;
                 }
             }
-            let (model, new_model_lease) = if let Some(state) = active_state.as_ref() {
+            let (model, new_model_lease) = if let Some(state) = state_lease.state() {
                 (state.model.clone(), None)
             } else {
                 let (model, lease) = self.qwen_model_for_request(request)?;
@@ -164,10 +174,9 @@ impl NativeExecutor {
             let model_arc = model;
             let model = model_arc.as_ref();
 
-            let mut active_state = if let Some(state) = active_state {
-                state
-            } else {
+            if state_lease.state().is_none() {
                 if request.is_cancelled() {
+                    state_lease.release()?;
                     return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                         request.id.clone(),
                     )));
@@ -255,116 +264,144 @@ impl NativeExecutor {
                 if let Some(reservation) = tensor_reservation {
                     active.state.bind_tensor_sequence(reservation.sequence)?;
                 }
-                active
-            };
+                state_lease.install_state(active)?;
+            }
+
+            if request.is_cancelled() {
+                state_lease.release()?;
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
 
             let decode_iterations = qwen_tts_decode_iterations(scheduled);
-            let mut total_tokens_generated = 0usize;
-            let mut decode_steps_ran = 0usize;
-            let mut finished = false;
+            state_lease.mark_dirty();
+            let (
+                tokens_processed,
+                total_tokens_generated,
+                finished,
+                finished_samples,
+                phase_timing_override,
+                managed_cache_completions,
+            ) = {
+                let active_state = state_lease.require_state_mut()?;
+                let mut total_tokens_generated = 0usize;
+                let mut decode_steps_ran = 0usize;
+                let mut finished = false;
 
-            for _ in 0..decode_iterations {
-                if request.is_cancelled() {
-                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                        request.id.clone(),
-                    )));
+                for _ in 0..decode_iterations {
+                    if request.is_cancelled() {
+                        return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                            request.id.clone(),
+                        )));
+                    }
+                    let mut predictor = super::invocation_paged_lease_for_row(request, scheduled)?;
+                    let step = Self::run_blocking(|| {
+                        active_state.model.tts_decode_step_physical(
+                            &mut active_state.state,
+                            predictor.cache_mut(),
+                        )
+                    })?;
+                    let _predictor_completion = predictor.release()?;
+                    if request.is_cancelled() {
+                        return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                            request.id.clone(),
+                        )));
+                    }
+                    active_state.sampling_ms += step.sampling_ms;
+                    active_state.decode_ms += step.decode_ms;
+                    active_state.codec_ms += step.codec_ms;
+                    active_state.decode_steps = active_state.decode_steps.saturating_add(1);
+                    decode_steps_ran = decode_steps_ran.saturating_add(1);
+                    let step_tokens_generated = step
+                        .frames_generated
+                        .saturating_sub(active_state.last_frames_generated);
+                    active_state.last_frames_generated = step.frames_generated;
+                    total_tokens_generated =
+                        total_tokens_generated.saturating_add(step_tokens_generated);
+
+                    if !step.samples.is_empty() {
+                        if active_state.first_output_ms_since_start.is_none() {
+                            active_state.first_output_ms_since_start = Some(
+                                active_state.execution_started.elapsed().as_secs_f64() * 1000.0,
+                            );
+                        }
+                        active_state
+                            .audio_samples_accum
+                            .extend_from_slice(&step.samples);
+                        if let Some(tx) = stream_tx.as_ref() {
+                            Self::stream_audio_with_policy(
+                                tx,
+                                stream_policy,
+                                &request.id,
+                                &mut active_state.stream_sequence,
+                                step.samples.clone(),
+                                24_000,
+                                false,
+                            )?;
+                        }
+                    }
+
+                    if step.finished {
+                        if let Some(tx) = stream_tx.as_ref() {
+                            Self::stream_final_marker_with_policy(
+                                tx,
+                                stream_policy,
+                                &request.id,
+                                &mut active_state.stream_sequence,
+                            )?;
+                        }
+                        finished = true;
+                        break;
+                    }
                 }
-                let mut predictor = super::invocation_paged_lease_for_row(request, scheduled)?;
-                let step = Self::run_blocking(|| {
+
+                let tokens_processed = if scheduled.is_prefill {
+                    request.num_prompt_tokens()
+                } else {
+                    decode_steps_ran.max(1)
+                };
+                let postprocess_started = Instant::now();
+                let finished_samples = if finished {
+                    active_state.audio_samples_accum.clone()
+                } else {
+                    Vec::new()
+                };
+                active_state.postprocess_ms += postprocess_started.elapsed().as_secs_f64() * 1000.0;
+
+                let phase_timing_override = Some(ExecutorPhaseTiming {
+                    normalization_ms: Some(active_state.normalization_ms),
+                    prefill_ms: Some(active_state.prefill_ms),
+                    decode_ms: Some(active_state.decode_ms),
+                    sampling_ms: Some(active_state.sampling_ms),
+                    codec_ms: Some(active_state.codec_ms),
+                    postprocess_ms: Some(active_state.postprocess_ms),
+                    first_output_ms_since_start: active_state.first_output_ms_since_start,
+                    prefill_steps: Some(1),
+                    decode_steps: Some(active_state.decode_steps),
+                    ..ExecutorPhaseTiming::default()
+                });
+
+                if let Some(arena) = tensor_arena.as_ref() {
                     active_state
-                        .model
-                        .tts_decode_step_physical(&mut active_state.state, predictor.cache_mut())
-                })?;
-                let _predictor_completion = predictor.release()?;
-                if request.is_cancelled() {
-                    return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                        request.id.clone(),
-                    )));
+                        .state
+                        .stage_tensor_state(arena, scheduled.plan_id)?;
                 }
-                active_state.sampling_ms += step.sampling_ms;
-                active_state.decode_ms += step.decode_ms;
-                active_state.codec_ms += step.codec_ms;
-                active_state.decode_steps = active_state.decode_steps.saturating_add(1);
-                decode_steps_ran = decode_steps_ran.saturating_add(1);
-                let step_tokens_generated = step
-                    .frames_generated
-                    .saturating_sub(active_state.last_frames_generated);
-                active_state.last_frames_generated = step.frames_generated;
-                total_tokens_generated =
-                    total_tokens_generated.saturating_add(step_tokens_generated);
-
-                if !step.samples.is_empty() {
-                    if active_state.first_output_ms_since_start.is_none() {
-                        active_state.first_output_ms_since_start =
-                            Some(active_state.execution_started.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    active_state
-                        .audio_samples_accum
-                        .extend_from_slice(&step.samples);
-                    if let Some(tx) = stream_tx.as_ref() {
-                        Self::stream_audio_with_policy(
-                            tx,
-                            stream_policy,
-                            &request.id,
-                            &mut active_state.stream_sequence,
-                            step.samples.clone(),
-                            24_000,
-                            false,
-                        )?;
-                    }
-                }
-
-                if step.finished {
-                    if let Some(tx) = stream_tx.as_ref() {
-                        Self::stream_final_marker_with_policy(
-                            tx,
-                            stream_policy,
-                            &request.id,
-                            &mut active_state.stream_sequence,
-                        )?;
-                    }
-                    finished = true;
-                    break;
-                }
-            }
-
-            let tokens_processed = if scheduled.is_prefill {
-                request.num_prompt_tokens()
-            } else {
-                decode_steps_ran.max(1)
+                let managed_cache_completions = active_state.state.take_managed_write_completions();
+                (
+                    tokens_processed,
+                    total_tokens_generated,
+                    finished,
+                    finished_samples,
+                    phase_timing_override,
+                    managed_cache_completions,
+                )
             };
-            let postprocess_started = Instant::now();
-            let finished_samples = if finished {
-                active_state.audio_samples_accum.clone()
+
+            if finished {
+                state_lease.release()?;
             } else {
-                Vec::new()
-            };
-            active_state.postprocess_ms += postprocess_started.elapsed().as_secs_f64() * 1000.0;
-
-            let phase_timing_override = Some(ExecutorPhaseTiming {
-                normalization_ms: Some(active_state.normalization_ms),
-                prefill_ms: Some(active_state.prefill_ms),
-                decode_ms: Some(active_state.decode_ms),
-                sampling_ms: Some(active_state.sampling_ms),
-                codec_ms: Some(active_state.codec_ms),
-                postprocess_ms: Some(active_state.postprocess_ms),
-                first_output_ms_since_start: active_state.first_output_ms_since_start,
-                prefill_steps: Some(1),
-                decode_steps: Some(active_state.decode_steps),
-                ..ExecutorPhaseTiming::default()
-            });
-
-            if let Some(arena) = tensor_arena.as_ref() {
-                active_state
-                    .state
-                    .stage_tensor_state(arena, scheduled.plan_id)?;
-            }
-            let managed_cache_completions = active_state.state.take_managed_write_completions();
-            if !finished {
-                let mut guard = self.qwen_tts_decode_states.lock().map_err(|_| {
-                    Error::InferenceError("Qwen TTS decode state mutex poisoned".to_string())
-                })?;
-                guard.insert(session, active_state);
+                state_lease.restore()?;
             }
 
             Ok(ModelSessionResult::sequence(ExecutorOutput {

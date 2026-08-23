@@ -82,9 +82,9 @@ pub use execution::{
     WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
-    CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,
-    PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult, WorkerConfig,
-    REQUEST_DEADLINE_EXCEEDED,
+    CacheReleaseOutcome, CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor,
+    ModelSessionResult, PhysicalBatchExecution, PhysicalDispatchError, PhysicalDispatchResult,
+    WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
 };
 pub use metrics::{
     engine_batch_metrics_snapshot, engine_metric_catalog, engine_request_parallel_batches_total,

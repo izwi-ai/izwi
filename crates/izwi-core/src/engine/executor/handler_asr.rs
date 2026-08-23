@@ -10,7 +10,9 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
 use super::state::ActiveAsrDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
+use super::{
+    ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
+};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 const MAX_ASR_NEW_TOKENS: usize = 512;
@@ -167,21 +169,16 @@ impl NativeExecutor {
 
         if let Some(tx) = stream_tx.as_ref() {
             if !matches!(family, ModelFamily::Voxtral) {
-                let mut active_state = {
-                    let mut guard = self.asr_decode_states.lock().map_err(|_| {
-                        Error::InferenceError("ASR decode state mutex poisoned".to_string())
-                    })?;
-                    guard.remove(&session)
-                };
-
-                if active_state
-                    .as_ref()
+                let mut state_lease =
+                    ExecutorStateLease::checkout(&self.asr_decode_states, session, "ASR decode")?;
+                if state_lease
+                    .state()
                     .map(|state| state.variant != variant)
                     .unwrap_or(false)
                 {
-                    active_state = None;
+                    state_lease.discard_state();
                 }
-                let (model, new_model_lease) = if let Some(state) = active_state.as_ref() {
+                let (model, new_model_lease) = if let Some(state) = state_lease.state() {
                     (state.model.clone(), None)
                 } else {
                     let (model, lease) = self.asr_model_for_request(request, variant)?;
@@ -192,13 +189,17 @@ impl NativeExecutor {
                     && !matches!(family, ModelFamily::NemotronAsr)
                 {
                     let mut initial_media_decode_ms = None;
-                    let mut active_state = if let Some(mut state) = active_state {
+                    if state_lease.state().is_some() {
                         if let Some(cache) = managed_cache.take() {
-                            state.state.install_qwen3_managed_reservation(cache)?;
+                            state_lease.mark_dirty();
+                            state_lease
+                                .require_state_mut()?
+                                .state
+                                .install_qwen3_managed_reservation(cache)?;
                         }
-                        state
                     } else {
                         if request.is_cancelled() {
+                            state_lease.release()?;
                             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                                 request.id.clone(),
                             )));
@@ -313,7 +314,7 @@ impl NativeExecutor {
                                     .to_string(),
                             ));
                         }
-                        ActiveAsrDecode {
+                        state_lease.install_state(ActiveAsrDecode {
                             variant,
                             model: model.clone(),
                             _model_lease: new_model_lease
@@ -323,78 +324,105 @@ impl NativeExecutor {
                             stream_sequence: 0,
                             input_sample_rate: sample_rate,
                             input_sample_count: samples_len,
-                        }
-                    };
+                        })?;
+                    }
+
+                    if request.is_cancelled() {
+                        state_lease.release()?;
+                        return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                            request.id.clone(),
+                        )));
+                    }
 
                     let decode_iterations = if scheduled.is_prefill {
                         1
                     } else {
                         scheduled.num_tokens.max(1)
                     };
-                    let mut decode_steps_ran = 0usize;
-                    let mut total_tokens_generated = 0usize;
-                    let mut final_text = String::new();
-                    let mut finished = false;
+                    state_lease.mark_dirty();
+                    let (
+                        tokens_processed,
+                        total_tokens_generated,
+                        final_text,
+                        finished,
+                        input_sample_rate,
+                        input_sample_count,
+                        managed_cache_completions,
+                    ) = {
+                        let active_state = state_lease.require_state_mut()?;
+                        let mut decode_steps_ran = 0usize;
+                        let mut total_tokens_generated = 0usize;
+                        let mut final_text = String::new();
+                        let mut finished = false;
 
-                    for _ in 0..decode_iterations {
-                        if request.is_cancelled() {
-                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                                request.id.clone(),
-                            )));
-                        }
-                        let step = Self::run_blocking(|| {
-                            active_state.model.decode_step(&mut active_state.state)
-                        })?;
-                        if request.is_cancelled() {
-                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                                request.id.clone(),
-                            )));
-                        }
-                        decode_steps_ran = decode_steps_ran.saturating_add(1);
-                        let step_tokens_generated = step
-                            .tokens_generated
-                            .saturating_sub(active_state.last_tokens_generated);
-                        active_state.last_tokens_generated = step.tokens_generated;
-                        total_tokens_generated =
-                            total_tokens_generated.saturating_add(step_tokens_generated);
-                        final_text = step.text.clone();
+                        for _ in 0..decode_iterations {
+                            if request.is_cancelled() {
+                                return Ok(ModelSessionResult::cancelled(
+                                    ExecutorOutput::cancelled(request.id.clone()),
+                                ));
+                            }
+                            let step = Self::run_blocking(|| {
+                                active_state.model.decode_step(&mut active_state.state)
+                            })?;
+                            if request.is_cancelled() {
+                                return Ok(ModelSessionResult::cancelled(
+                                    ExecutorOutput::cancelled(request.id.clone()),
+                                ));
+                            }
+                            decode_steps_ran = decode_steps_ran.saturating_add(1);
+                            let step_tokens_generated = step
+                                .tokens_generated
+                                .saturating_sub(active_state.last_tokens_generated);
+                            active_state.last_tokens_generated = step.tokens_generated;
+                            total_tokens_generated =
+                                total_tokens_generated.saturating_add(step_tokens_generated);
+                            final_text = step.text.clone();
 
-                        if !step.delta.is_empty() {
-                            Self::stream_text_with_policy(
-                                tx,
-                                stream_policy,
-                                &request.id,
-                                &mut active_state.stream_sequence,
-                                step.delta,
-                            )?;
+                            if !step.delta.is_empty() {
+                                Self::stream_text_with_policy(
+                                    tx,
+                                    stream_policy,
+                                    &request.id,
+                                    &mut active_state.stream_sequence,
+                                    step.delta,
+                                )?;
+                            }
+                            if step.finished {
+                                Self::stream_final_marker_with_policy(
+                                    tx,
+                                    stream_policy,
+                                    &request.id,
+                                    &mut active_state.stream_sequence,
+                                )?;
+                                finished = true;
+                                break;
+                            }
                         }
-                        if step.finished {
-                            Self::stream_final_marker_with_policy(
-                                tx,
-                                stream_policy,
-                                &request.id,
-                                &mut active_state.stream_sequence,
-                            )?;
-                            finished = true;
-                            break;
-                        }
-                    }
 
-                    let tokens_processed = if scheduled.is_prefill {
-                        request.num_prompt_tokens()
-                    } else {
-                        decode_steps_ran.max(1)
+                        let tokens_processed = if scheduled.is_prefill {
+                            request.num_prompt_tokens()
+                        } else {
+                            decode_steps_ran.max(1)
+                        };
+                        let input_sample_rate = active_state.input_sample_rate;
+                        let input_sample_count = active_state.input_sample_count;
+                        let managed_cache_completions =
+                            active_state.state.take_managed_write_completions();
+                        (
+                            tokens_processed,
+                            total_tokens_generated,
+                            final_text,
+                            finished,
+                            input_sample_rate,
+                            input_sample_count,
+                            managed_cache_completions,
+                        )
                     };
-                    let input_sample_rate = active_state.input_sample_rate;
-                    let input_sample_count = active_state.input_sample_count;
-                    let managed_cache_completions =
-                        active_state.state.take_managed_write_completions();
 
-                    if !finished {
-                        let mut guard = self.asr_decode_states.lock().map_err(|_| {
-                            Error::InferenceError("ASR decode state mutex poisoned".to_string())
-                        })?;
-                        guard.insert(session, active_state);
+                    if finished {
+                        state_lease.release()?;
+                    } else {
+                        state_lease.restore()?;
                     }
 
                     return Ok(ModelSessionResult::sequence(ExecutorOutput {

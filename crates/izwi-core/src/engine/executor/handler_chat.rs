@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
@@ -13,7 +12,9 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::SessionKey;
 use super::state::ActiveChatDecode;
-use super::{ExecutorOutput, ExecutorPhaseTiming, ModelSessionResult, NativeExecutor};
+use super::{
+    ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
+};
 
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
@@ -76,36 +77,31 @@ struct StreamDeltaBatch {
 }
 
 struct ContinuousChatStateBatch<'a> {
-    store: &'a Mutex<HashMap<SessionKey, ActiveChatDecode>>,
     rows: Vec<(
         usize,
         SessionKey,
-        ActiveChatDecode,
+        ExecutorStateLease<'a, ActiveChatDecode>,
         Option<NativeChatDecodeCheckpoint>,
     )>,
     armed: bool,
 }
 
 impl<'a> ContinuousChatStateBatch<'a> {
-    fn new(
-        store: &'a Mutex<HashMap<SessionKey, ActiveChatDecode>>,
-        rows: Vec<(usize, SessionKey, ActiveChatDecode)>,
-    ) -> Self {
+    fn new(rows: Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveChatDecode>)>) -> Self {
         Self {
-            store,
             rows: rows
                 .into_iter()
-                .map(|(index, session, state)| (index, session, state, None))
+                .map(|(index, session, lease)| (index, session, lease, None))
                 .collect(),
             armed: true,
         }
     }
 
-    fn commit(mut self) -> Vec<(usize, SessionKey, ActiveChatDecode)> {
+    fn commit(mut self) -> Vec<(usize, SessionKey, ExecutorStateLease<'a, ActiveChatDecode>)> {
         self.armed = false;
         std::mem::take(&mut self.rows)
             .into_iter()
-            .map(|(index, session, state, _)| (index, session, state))
+            .map(|(index, session, lease, _)| (index, session, lease))
             .collect()
     }
 }
@@ -115,36 +111,27 @@ impl Drop for ContinuousChatStateBatch<'_> {
         if !self.armed {
             return;
         }
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (_, session, state, checkpoint) in &mut self.rows {
+        for (_, session, lease, checkpoint) in &mut self.rows {
             if let Some(checkpoint) = checkpoint.take() {
-                if let Err(error) = state.state.rollback_continuous_quantum(checkpoint) {
-                    tracing::error!(
-                        request_id = %session.request_id,
-                        epoch = session.epoch,
-                        %error,
-                        "continuous chat rollback failed"
-                    );
+                match lease
+                    .require_state_mut()
+                    .and_then(|state| state.state.rollback_continuous_quantum(checkpoint))
+                {
+                    Ok(()) => lease.mark_clean(),
+                    Err(error) => {
+                        tracing::error!(
+                            request_id = %session.request_id,
+                            epoch = session.epoch,
+                            %error,
+                            "continuous chat rollback failed; state fenced until cleanup"
+                        );
+                    }
                 }
             }
         }
-        for (_, session, state, _) in std::mem::take(&mut self.rows) {
-            match store.entry(session.clone()) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(state);
-                }
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    tracing::error!(
-                        request_id = %session.request_id,
-                        epoch = session.epoch,
-                        "continuous chat rollback collided with an active state"
-                    );
-                }
-            }
-        }
+        // Dropping each lease restores clean/rolled-back rows and poisons any
+        // row whose physical mutation could not be rolled back.
+        self.rows.clear();
     }
 }
 
@@ -369,29 +356,32 @@ impl NativeExecutor {
             }));
         }
 
-        let mut active_state = {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
-            })?;
-            // Prefill scheduling can happen after preemption; only recover state
-            // owned by this exact request incarnation.
-            guard.remove(&session)
-        };
-
-        if active_state
-            .as_ref()
+        // Prefill scheduling can happen after preemption; only recover state
+        // owned by this exact request incarnation. The in-flight marker remains
+        // visible to cleanup until this quantum is committed or released.
+        let mut state_lease =
+            ExecutorStateLease::checkout(&self.chat_decode_states, session, "chat decode")?;
+        if state_lease
+            .state()
             .map(|state| state.variant != variant)
             .unwrap_or(false)
         {
-            active_state = None;
+            state_lease.discard_state();
         }
 
-        let mut active_state = if let Some(mut state) = active_state {
+        if state_lease.state().is_some() {
             match managed_cache.take() {
-                Some(cache) => state
-                    .state
-                    .install_managed_reservations(cache, mtp_cache.take())?,
-                None if state.state.uses_managed_kv() => {
+                Some(cache) => {
+                    state_lease.mark_dirty();
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .install_managed_reservations(cache, mtp_cache.take())?;
+                }
+                None if state_lease
+                    .state()
+                    .is_some_and(|state| state.state.uses_managed_kv()) =>
+                {
                     return Err(Error::InferenceError(
                         "managed chat session lost its physical cache authority".to_string(),
                     ))
@@ -399,14 +389,19 @@ impl NativeExecutor {
                 None => {}
             }
             if let (Some(arena), Some(reservation)) = (tensor_arena.as_ref(), tensor_reservation) {
-                state
+                state_lease.mark_dirty();
+                state_lease
+                    .require_state_mut()?
                     .state
                     .bind_hybrid_tensor_sequence(reservation.sequence)?;
-                state.state.restore_hybrid_tensor_state(arena)?;
+                state_lease
+                    .require_state_mut()?
+                    .state
+                    .restore_hybrid_tensor_state(arena)?;
             }
-            state
         } else {
             if request.is_cancelled() {
+                state_lease.release()?;
                 return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                     request.id.clone(),
                 )));
@@ -481,14 +476,14 @@ impl NativeExecutor {
             if let Some(reservation) = tensor_reservation {
                 decode_state.bind_hybrid_tensor_sequence(reservation.sequence)?;
             }
-            ActiveChatDecode {
+            state_lease.install_state(ActiveChatDecode {
                 variant,
                 state: decode_state,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 streamed_text: String::new(),
-            }
-        };
+            })?;
+        }
 
         let input_budget = if scheduled.is_prefill {
             1
@@ -497,79 +492,88 @@ impl NativeExecutor {
         };
         let mut total_tokens_generated = 0usize;
         if request.is_cancelled() {
+            state_lease.release()?;
             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                 request.id.clone(),
             )));
         }
         let resumable_prefill_quantum = scheduled.is_prefill && resumable_prefill;
         let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
-        let step = if resumable_prefill_quantum {
-            let (span_start, span_end) =
-                resumable_prefill_span(scheduled, request.num_prompt_tokens())?;
-            let prefill_complete = Self::run_blocking(|| {
-                model.continue_resumable_prefill(
-                    &mut active_state.state,
-                    messages,
-                    &generation_config,
-                    prepared_chat_prompt,
-                    &request.prompt_tokens,
-                    span_start,
-                    span_end,
-                    request.num_prompt_tokens(),
-                )
-            })?;
-            finish_resumable_prefill_step(
-                prefill_complete,
-                active_state.last_tokens_generated,
-                || Self::run_blocking(|| model.decode_quantum(&mut active_state.state, 1)),
-            )?
-        } else {
-            Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?
+        let resumable_span = resumable_prefill_quantum
+            .then(|| resumable_prefill_span(scheduled, request.num_prompt_tokens()))
+            .transpose()?;
+        state_lease.mark_dirty();
+        let (step, final_text, finished, managed_cache_completions) = {
+            let active_state = state_lease.require_state_mut()?;
+            let step = if let Some((span_start, span_end)) = resumable_span {
+                let prefill_complete = Self::run_blocking(|| {
+                    model.continue_resumable_prefill(
+                        &mut active_state.state,
+                        messages,
+                        &generation_config,
+                        prepared_chat_prompt,
+                        &request.prompt_tokens,
+                        span_start,
+                        span_end,
+                        request.num_prompt_tokens(),
+                    )
+                })?;
+                finish_resumable_prefill_step(
+                    prefill_complete,
+                    active_state.last_tokens_generated,
+                    || Self::run_blocking(|| model.decode_quantum(&mut active_state.state, 1)),
+                )?
+            } else {
+                Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?
+            };
+            if request.is_cancelled() {
+                return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                    request.id.clone(),
+                )));
+            }
+
+            let step_tokens_generated = step
+                .tokens_generated
+                .saturating_sub(active_state.last_tokens_generated);
+            active_state.last_tokens_generated = step.tokens_generated;
+            total_tokens_generated = total_tokens_generated.saturating_add(step_tokens_generated);
+            let mut final_text = step.text.clone();
+            let finished = step.finished;
+
+            // Durable state must be fully staged before any externally visible
+            // token is emitted. A staging failure then remains an atomic row
+            // failure instead of leaking text from an uncommittable quantum.
+            if let Some(arena) = tensor_arena.as_ref() {
+                active_state
+                    .state
+                    .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
+            }
+
+            if let Some(tx) = stream_tx.as_ref() {
+                if !step.delta.is_empty() {
+                    Self::stream_text_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut active_state.stream_sequence,
+                        step.delta.clone(),
+                    )?;
+                    active_state.streamed_text.push_str(&step.delta);
+                }
+                if step.finished {
+                    Self::stream_final_marker_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut active_state.stream_sequence,
+                    )?;
+                    final_text =
+                        canonical_chat_terminal_text(&active_state.streamed_text, final_text);
+                }
+            }
+            let managed_cache_completions = active_state.state.take_managed_write_completions();
+            (step, final_text, finished, managed_cache_completions)
         };
-        if request.is_cancelled() {
-            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                request.id.clone(),
-            )));
-        }
-
-        let step_tokens_generated = step
-            .tokens_generated
-            .saturating_sub(active_state.last_tokens_generated);
-        active_state.last_tokens_generated = step.tokens_generated;
-        total_tokens_generated = total_tokens_generated.saturating_add(step_tokens_generated);
-        let mut final_text = step.text.clone();
-        let finished = step.finished;
-
-        // Durable state must be fully staged before any externally visible
-        // token is emitted. A staging failure then remains an atomic row
-        // failure instead of leaking text from an uncommittable quantum.
-        if let Some(arena) = tensor_arena.as_ref() {
-            active_state
-                .state
-                .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
-        }
-
-        if let Some(tx) = stream_tx.as_ref() {
-            if !step.delta.is_empty() {
-                Self::stream_text_with_policy(
-                    tx,
-                    stream_policy,
-                    &request.id,
-                    &mut active_state.stream_sequence,
-                    step.delta.clone(),
-                )?;
-                active_state.streamed_text.push_str(&step.delta);
-            }
-            if step.finished {
-                Self::stream_final_marker_with_policy(
-                    tx,
-                    stream_policy,
-                    &request.id,
-                    &mut active_state.stream_sequence,
-                )?;
-                final_text = canonical_chat_terminal_text(&active_state.streamed_text, final_text);
-            }
-        }
 
         let tokens_processed = if let Some(span_tokens) = resumable_span_tokens {
             span_tokens
@@ -578,12 +582,10 @@ impl NativeExecutor {
         } else {
             step.input_tokens_committed
         };
-        let managed_cache_completions = active_state.state.take_managed_write_completions();
-        if !finished {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
-            })?;
-            guard.insert(session, active_state);
+        if finished {
+            state_lease.release()?;
+        } else {
+            state_lease.restore()?;
         }
 
         Ok(ModelSessionResult::sequence(ExecutorOutput {
@@ -690,43 +692,33 @@ impl NativeExecutor {
             }
         }
 
-        let active_states = {
-            let mut guard = self.chat_decode_states.lock().map_err(|_| {
-                Error::InferenceError("Chat decode state mutex poisoned".to_string())
+        let mut checked_out_states = Vec::with_capacity(live_indices.len());
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            let session = scheduled[index].session_key();
+            let expected_variant = Self::resolve_variant(request)?;
+            let lease = ExecutorStateLease::checkout(
+                &self.chat_decode_states,
+                session.clone(),
+                "continuous chat decode",
+            )?;
+            let state = lease.state().ok_or_else(|| {
+                Error::InferenceError(format!(
+                    "continuous chat session {}:{} has no active decode state",
+                    session.request_id, session.epoch
+                ))
             })?;
-            for index in live_indices.iter().copied() {
-                let request = ordered_requests[index];
-                let session = scheduled[index].session_key();
-                let expected_variant = Self::resolve_variant(request)?;
-                let state = guard.get(&session).ok_or_else(|| {
-                    Error::InferenceError(format!(
-                        "continuous chat session {}:{} has no active decode state",
-                        session.request_id, session.epoch
-                    ))
-                })?;
-                if state.variant != expected_variant {
-                    return Err(Error::InferenceError(
-                        "continuous chat state variant does not match its request".to_string(),
-                    ));
-                }
+            if state.variant != expected_variant {
+                return Err(Error::InferenceError(
+                    "continuous chat state variant does not match its request".to_string(),
+                ));
             }
-            live_indices
-                .iter()
-                .copied()
-                .map(|index| {
-                    let session = scheduled[index].session_key();
-                    let state = guard
-                        .remove(&session)
-                        .expect("continuous chat state was validated under the same lock");
-                    (index, session, state)
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut active_states =
-            ContinuousChatStateBatch::new(&self.chat_decode_states, active_states);
+            checked_out_states.push((index, session, lease));
+        }
+        let mut active_states = ContinuousChatStateBatch::new(checked_out_states);
         let mut managed_caches = managed_caches;
 
-        for (index, _, active_state, checkpoint) in &mut active_states.rows {
+        for (index, _, lease, checkpoint) in &mut active_states.rows {
             let request = ordered_requests[*index];
             let managed_cache = managed_caches[*index].take();
             if request.managed_cache_runtime().is_some() != managed_cache.is_some() {
@@ -755,6 +747,8 @@ impl NativeExecutor {
                             "continuous hybrid row lost its tensor-state reservation".into(),
                         ));
                     }
+                    lease.mark_dirty();
+                    let active_state = lease.require_state_mut()?;
                     if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
                         active_state
                             .state
@@ -767,7 +761,10 @@ impl NativeExecutor {
                             .begin_continuous_quantum(cache, mtp_cache)?,
                     );
                 }
-                None if active_state.state.uses_managed_kv() => {
+                None if lease
+                    .state()
+                    .is_some_and(|state| state.state.uses_managed_kv()) =>
+                {
                     return Err(Error::InferenceError(
                         "continuous chat row lost its managed-cache reservation".to_string(),
                     ))
@@ -776,11 +773,14 @@ impl NativeExecutor {
             }
         }
 
+        for (_, _, lease, _) in &mut active_states.rows {
+            lease.mark_dirty();
+        }
         let mut state_refs = active_states
             .rows
             .iter_mut()
-            .map(|(_, _, state, _)| &mut state.state)
-            .collect::<Vec<_>>();
+            .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
+            .collect::<Result<Vec<_>>>()?;
         let live_width = state_refs.len();
         let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
         drop(state_refs);
@@ -794,11 +794,12 @@ impl NativeExecutor {
             live_width,
         );
 
-        for (index, _, active_state, _) in &mut active_states.rows {
+        for (index, _, lease, _) in &mut active_states.rows {
             if let Some(arena) = ordered_requests[*index]
                 .managed_cache_runtime()
                 .and_then(|runtime| runtime.tensor_state())
             {
+                let active_state = lease.require_state_mut()?;
                 active_state
                     .state
                     .stage_hybrid_tensor_state(arena, scheduled[*index].plan_id)?;
@@ -806,8 +807,9 @@ impl NativeExecutor {
         }
 
         let mut continuing = vec![false; scheduled.len()];
-        for ((index, _, active_state, _), step) in active_states.rows.iter_mut().zip(steps) {
+        for ((index, _, lease, _), step) in active_states.rows.iter_mut().zip(steps) {
             let request = ordered_requests[*index];
+            let active_state = lease.require_state_mut()?;
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
@@ -870,26 +872,17 @@ impl NativeExecutor {
         }
 
         let committed_states = active_states.commit();
-        if continuing.iter().any(|continuing| *continuing) {
-            let mut guard = self
-                .chat_decode_states
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for (index, session, state) in committed_states {
-                if !continuing[index] {
-                    continue;
-                }
-                match guard.entry(session) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(state);
-                    }
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
-                            ordered_requests[index].id.clone(),
-                            "continuous chat state collided during commit",
-                        )));
-                    }
-                }
+        for (index, _, lease) in committed_states {
+            let transition = if continuing[index] {
+                lease.restore()
+            } else {
+                lease.release()
+            };
+            if let Err(error) = transition {
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    ordered_requests[index].id.clone(),
+                    format!("continuous chat state transition failed: {error}"),
+                )));
             }
         }
         outputs
