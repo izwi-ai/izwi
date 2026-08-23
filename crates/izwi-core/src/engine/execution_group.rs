@@ -1106,16 +1106,80 @@ mod tests {
         delay: Duration,
     }
 
+    struct ReverseCompletionExecutor {
+        completion_order: Arc<std::sync::Mutex<Vec<BatchId>>>,
+        slow_batch: BatchId,
+    }
+
+    impl ModelExecutor for ReverseCompletionExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            execution.validate().expect("test physical batch");
+            if execution.batch.batch_id == self.slow_batch {
+                std::thread::sleep(Duration::from_millis(50));
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.completion_order
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(execution.batch.batch_id);
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::terminal(scheduled.request_id.clone()),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     impl ModelExecutor for ObservedPhysicalExecutor {
         fn execute_physical_batch(
             &self,
             execution: PhysicalBatchExecution<'_>,
         ) -> PhysicalDispatchResult {
             execution.validate().expect("test physical batch");
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let width = execution.scheduled.len().max(1);
+            let active = self.active.fetch_add(width, Ordering::SeqCst) + width;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             std::thread::sleep(self.delay);
-            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.active.fetch_sub(width, Ordering::SeqCst);
             let dispatch = execution.expected_dispatch();
             Ok(execution
                 .scheduled
@@ -1337,6 +1401,68 @@ mod tests {
         dispatch
     }
 
+    fn prepared_rows_with_policy(
+        batch_id: u64,
+        request_prefix: &str,
+        width: usize,
+        policy: PhysicalLaunchPolicy,
+    ) -> PreparedPhysicalDispatch {
+        let lane = lane();
+        let scheduled = (0..width)
+            .map(|row| {
+                scheduled(
+                    &format!("{request_prefix}-{row}"),
+                    batch_id * 10 + row as u64,
+                    row as u64 + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                let mut request = EngineCoreRequest::tts("parallel rows");
+                request.id = scheduled.request_id.clone();
+                Arc::new(request)
+            })
+            .collect::<Vec<_>>();
+        let rows = scheduled
+            .iter()
+            .map(|scheduled| ReadyQuantum {
+                plan_id: scheduled.plan_id,
+                session: scheduled.session_key(),
+                lane: lane.clone(),
+                work: scheduled.work.clone(),
+                cost: WorkCost::new(1, 1, 0),
+                managed_cache: None,
+            })
+            .collect::<Vec<_>>();
+        PreparedPhysicalDispatch::new(
+            ExecutionPhase::Prefill,
+            PhysicalBatch {
+                batch_id: BatchId::new(batch_id),
+                lane,
+                mode: NativeBatchMode::None,
+                budget: BatchBudget {
+                    max_rows: width,
+                    max_logical_units: width as u64,
+                    max_tensor_elements: width as u64,
+                    max_workspace_bytes: 0,
+                    max_padding_basis_points: 0,
+                    max_formation_delay: Duration::ZERO,
+                },
+                rows,
+                materialized_tensor_elements: width as u64,
+                workspace: ResourceVector::zero(),
+            },
+            requests,
+            scheduled,
+            OutputVisibility::AfterQuantumCommit,
+            Vec::new(),
+            policy,
+        )
+        .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mode_overlaps_certified_disjoint_physical_tickets() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -1404,6 +1530,108 @@ mod tests {
 
         assert_eq!(executed.batches.len(), 2);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scalar_tickets_respect_weighted_row_capacity() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active,
+            max_active: max_active.clone(),
+            delay: Duration::from_millis(40),
+        }));
+        let policy = PhysicalLaunchPolicy::concurrent(3).unwrap();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_rows_with_policy(105, "weighted-two", 2, policy),
+                prepared_rows_with_policy(106, "weighted-one", 1, policy),
+                prepared_rows_with_policy(107, "weighted-tail", 2, policy),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(3).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+
+        assert_eq!(executed.batches.len(), 3);
+        assert_eq!(max_active.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exclusive_wide_ticket_runs_alone_instead_of_being_rejected() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active,
+            max_active: max_active.clone(),
+            delay: Duration::from_millis(20),
+        }));
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_rows_with_policy(
+                    108,
+                    "wide-exclusive",
+                    4,
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                ),
+                prepared_rows_with_policy(
+                    109,
+                    "narrow-exclusive",
+                    1,
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                ),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+
+        assert_eq!(executed.batches.len(), 2);
+        assert!(executed
+            .batches
+            .iter()
+            .all(|batch| batch.report.dispatch.kind != BatchDispatchKind::NotDispatched));
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reverse_physical_completion_preserves_prepared_commit_order() {
+        let completion_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ReverseCompletionExecutor {
+            completion_order: completion_order.clone(),
+            slow_batch: BatchId::new(110),
+        }));
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_rows_with_policy(110, "slow-first", 1, policy),
+                prepared_rows_with_policy(111, "fast-second", 1, policy),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+
+        assert_eq!(
+            *completion_order
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            vec![BatchId::new(111), BatchId::new(110)]
+        );
+        assert_eq!(
+            executed
+                .batches
+                .iter()
+                .map(|batch| batch.physical_batch.batch_id)
+                .collect::<Vec<_>>(),
+            vec![BatchId::new(110), BatchId::new(111)]
+        );
     }
 
     #[test]
