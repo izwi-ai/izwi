@@ -87,22 +87,46 @@ pub use executor::{
     WorkerConfig, REQUEST_DEADLINE_EXCEEDED,
 };
 pub use metrics::{
-    engine_batch_metrics_snapshot, engine_metric_catalog, engine_request_parallel_batches_total,
+    engine_batch_metrics_snapshot, engine_metric_catalog,
+    engine_physical_execution_metrics_snapshot, engine_request_parallel_batches_total,
     engine_stream_backpressure_total, engine_stream_metrics_snapshot,
     engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
     prometheus_engine_metric_type, BenchmarkResult, EngineBatchMetricsSnapshot,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
-    EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor, EngineStreamMetricsSnapshot,
-    EngineWorkspaceDomainMetricsSnapshot, MetricsCollector, MetricsSnapshot,
-    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    EngineDurationMetricsSnapshot, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
+    EnginePhysicalDeferMetricsSnapshot, EnginePhysicalDeferReason,
+    EnginePhysicalExecutionMetricsSnapshot, EnginePhysicalExecutionMode,
+    EnginePhysicalFallbackMetricsSnapshot, EnginePhysicalFallbackReason,
+    EngineStreamMetricsSnapshot, EngineWorkspaceDomainMetricsSnapshot, MetricsCollector,
+    MetricsSnapshot, ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
     ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
     ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL, ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
     ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
-    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
-    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX,
+    ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL, ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX, ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP, ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+    ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
+    ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
     ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
@@ -535,6 +559,28 @@ impl OwnedStepContext {
 }
 
 impl Engine {
+    fn physical_execution_telemetry_mode(
+        mode: crate::config::PhysicalExecutionMode,
+    ) -> EnginePhysicalExecutionMode {
+        match mode {
+            crate::config::PhysicalExecutionMode::Serial => EnginePhysicalExecutionMode::Serial,
+            crate::config::PhysicalExecutionMode::Shadow => EnginePhysicalExecutionMode::Shadow,
+            crate::config::PhysicalExecutionMode::Concurrent => {
+                EnginePhysicalExecutionMode::Concurrent
+            }
+        }
+    }
+
+    fn physical_execution_telemetry_policy(
+        config: &EngineCoreConfig,
+    ) -> (EnginePhysicalExecutionMode, usize) {
+        let capacity = config.resolved_physical_execution_capacity();
+        (
+            Self::physical_execution_telemetry_mode(config.physical_execution_mode),
+            capacity.physical_launch_limit.get(),
+        )
+    }
+
     fn queue_capacity_from_env(key: &str) -> Option<usize> {
         std::env::var(key)
             .ok()
@@ -580,6 +626,12 @@ impl Engine {
 
         let model_registry = worker_config.model_registry.clone();
         let core = EngineCore::new_with_worker(config.clone(), worker_config)?;
+        let (physical_execution_mode, physical_execution_cap) =
+            Self::physical_execution_telemetry_policy(&config);
+        metrics::set_engine_effective_physical_execution(
+            physical_execution_mode,
+            physical_execution_cap,
+        );
         let request_processor = RequestProcessor::new(config.clone());
         let output_processor = OutputProcessor::new(config.sample_rate);
         let direct_request_preparation_capacity = config.max_batch_size.max(1);
@@ -2076,6 +2128,43 @@ mod tests {
         let config = EngineCoreConfig::default();
         let engine = Engine::new(config);
         assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn physical_execution_telemetry_mode_preserves_the_bounded_rollout_axis() {
+        for (configured, expected) in [
+            (
+                crate::config::PhysicalExecutionMode::Serial,
+                EnginePhysicalExecutionMode::Serial,
+            ),
+            (
+                crate::config::PhysicalExecutionMode::Shadow,
+                EnginePhysicalExecutionMode::Shadow,
+            ),
+            (
+                crate::config::PhysicalExecutionMode::Concurrent,
+                EnginePhysicalExecutionMode::Concurrent,
+            ),
+        ] {
+            assert_eq!(
+                Engine::physical_execution_telemetry_mode(configured),
+                expected
+            );
+        }
+
+        let mut shadow = EngineCoreConfig::default();
+        shadow.physical_execution_mode = crate::config::PhysicalExecutionMode::Shadow;
+        shadow.max_physical_in_flight = crate::config::PhysicalInFlightLimit::new(4).unwrap();
+        assert_eq!(
+            Engine::physical_execution_telemetry_policy(&shadow),
+            (EnginePhysicalExecutionMode::Shadow, 1)
+        );
+
+        shadow.physical_execution_mode = crate::config::PhysicalExecutionMode::Concurrent;
+        assert_eq!(
+            Engine::physical_execution_telemetry_policy(&shadow),
+            (EnginePhysicalExecutionMode::Concurrent, 4)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

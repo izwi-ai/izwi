@@ -6,7 +6,7 @@ mod tracing;
 
 pub(crate) use metrics::{
     push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
-    push_engine_metric_f64, RuntimeTelemetryCollector,
+    push_engine_metric_f64, push_engine_physical_execution_metrics, RuntimeTelemetryCollector,
 };
 pub use metrics::{
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,

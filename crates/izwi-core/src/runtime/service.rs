@@ -71,9 +71,10 @@ use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
     push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
-    push_engine_metric_f64, EngineRuntimeTelemetrySnapshot, RuntimeObservationContext,
-    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
-    RuntimeTelemetryCollector, RuntimeTelemetrySnapshot,
+    push_engine_metric_f64, push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
+    RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
+    RuntimeTelemetrySnapshot,
 };
 use crate::runtime::types::RuntimeRequestContext;
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
@@ -2674,6 +2675,7 @@ impl RuntimeService {
             model_tensor_multirow_calls_total: batch.model_tensor_multirow_calls_total,
             continuous_envelope_scalar_fallbacks_total: batch
                 .continuous_envelope_scalar_fallbacks_total,
+            physical_execution: batch.physical_execution,
             kv_cache,
         }
     }
@@ -2928,6 +2930,7 @@ impl RuntimeService {
             ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
             snapshot.tensor_batch_padding_ratio,
         );
+        push_engine_physical_execution_metrics(payload, &snapshot.physical_execution);
     }
 
     fn push_coordinator_prometheus_metrics(&self, payload: &mut String) {
@@ -4535,6 +4538,19 @@ mod tests {
         ));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_fill_ratio"));
         assert!(payload.contains("izwi_engine_executor_tensor_batch_padding_ratio"));
+        assert!(payload.contains("izwi_engine_executor_physical_execution_mode{mode=\"serial\"}"));
+        assert!(payload.contains("izwi_engine_executor_physical_execution_cap"));
+        assert!(payload.contains("izwi_engine_executor_physical_dispatches_in_flight"));
+        assert!(payload.contains("izwi_engine_executor_physical_dispatch_seconds_total"));
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_fallbacks_total{reason=\"uncertified_profile\"}"
+        ));
+        assert!(payload
+            .contains("izwi_engine_executor_physical_defers_total{reason=\"workspace_capacity\"}"));
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_workspace_high_water_bytes{domain=\"device\"}"
+        ));
+        assert!(payload.contains("izwi_engine_executor_physical_batch_fill_ratio"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_active_jobs gauge"));
         assert!(payload.contains("# TYPE izwi_inference_coordinator_admitted_total counter"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_memory_bytes"));
@@ -4545,6 +4561,12 @@ mod tests {
 
         let snapshot = runtime.telemetry_snapshot().await;
         assert_eq!(snapshot.coordinator, runtime.coordinator_snapshot());
+        assert!(snapshot.engine.physical_execution.effective_cap >= 1);
+        let serialized = serde_json::to_value(&snapshot).expect("serialize runtime telemetry");
+        let effective_mode = serialized["engine"]["physical_execution"]["effective_mode"]
+            .as_str()
+            .expect("bounded effective physical execution mode");
+        assert!(["serial", "shadow", "concurrent"].contains(&effective_mode));
         assert_eq!(
             snapshot.engine.kv_cache.memory_accounting,
             "resident_paged_plus_authorized_tensor"
