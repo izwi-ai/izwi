@@ -1413,8 +1413,23 @@ impl Qwen38ChatModel {
                 &mut state.rng,
             )?);
         }
+        let terminal_rows = states
+            .iter()
+            .zip(&sampled)
+            .map(|(state, token)| {
+                sample_finishes_row(
+                    self.is_stop_token(*token, &state.config),
+                    state.tokens_generated,
+                    state.max_new_tokens,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let mtp_hidden = if let Some(head) = self.mtp_head.as_ref() {
+            // The MTP forward also writes the scheduler-owned MTP KV domain
+            // for the input token consumed by the target above. Even terminal
+            // rows must participate so the multi-domain transaction can
+            // commit; only their next-anchor materialization is unnecessary.
             let embeddings = self.text_model.embed_decode_token_ids(&sampled)?;
             let mut mtp_caches = states
                 .iter_mut()
@@ -1441,12 +1456,20 @@ impl Qwen38ChatModel {
             if state.track_history {
                 state.history_ids.push(next);
             }
-            if let Some(hidden) = mtp_hidden.as_ref() {
-                state.mtp_anchor_hidden = Some(hidden.i(row)?.unsqueeze(0)?);
+            if !terminal_rows[row] {
+                if let Some(hidden) = mtp_hidden.as_ref() {
+                    state.mtp_anchor_hidden = Some(hidden.i(row)?.unsqueeze(0)?);
+                }
             }
-            state.pending_token = Some(next);
+            if terminal_rows[row] {
+                state.mtp_anchor_hidden = None;
+                state.pending_token = None;
+            } else {
+                state.pending_token = Some(next);
+            }
             state.next_text_position = state.next_text_position.saturating_add(1);
             let delta = self.publish_token(state, next)?;
+            debug_assert!(!terminal_rows[row] || state.finished);
             steps.push(self.decode_step_result(state, delta, 1));
         }
         Ok(steps)
@@ -1903,6 +1926,14 @@ fn known_mtp_rows(chunk_start: usize, chunk_end: usize, prompt_len: usize) -> us
     chunk_end
         .min(prompt_len.saturating_sub(1))
         .saturating_sub(chunk_start)
+}
+
+fn sample_finishes_row(
+    is_stop_token: bool,
+    tokens_generated: usize,
+    max_new_tokens: usize,
+) -> bool {
+    is_stop_token || tokens_generated.saturating_add(1) >= max_new_tokens
 }
 
 fn render_prompt(
@@ -2505,6 +2536,14 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(covered, prompt_len - 1, "boundaries={boundaries:?}");
         }
+    }
+
+    #[test]
+    fn terminal_mtp_rows_are_identified_before_anchor_retention() {
+        assert!(sample_finishes_row(true, 0, 32));
+        assert!(sample_finishes_row(false, 31, 32));
+        assert!(sample_finishes_row(false, usize::MAX, usize::MAX));
+        assert!(!sample_finishes_row(false, 30, 32));
     }
 
     fn history_messages() -> Vec<ChatMessage> {
