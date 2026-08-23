@@ -96,6 +96,56 @@ pub const ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL: &str =
     "engine.executor.model_tensor_multirow_calls_total";
 pub const ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL: &str =
     "engine.executor.continuous_envelope_scalar_fallbacks_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE: &str = "engine.executor.physical_execution_mode";
+pub const ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP: &str = "engine.executor.physical_execution_cap";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT: &str =
+    "engine.executor.physical_dispatches_in_flight";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT: &str =
+    "engine.executor.physical_dispatches_max_in_flight";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL: &str =
+    "engine.executor.physical_dispatches_started_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL: &str =
+    "engine.executor.physical_dispatches_completed_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL: &str =
+    "engine.executor.physical_dispatch_seconds_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL: &str =
+    "engine.executor.physical_dispatch_observations_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX: &str =
+    "engine.executor.physical_dispatch_seconds_max";
+pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL: &str =
+    "engine.executor.physical_cohort_wait_seconds_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL: &str =
+    "engine.executor.physical_cohort_wait_observations_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX: &str =
+    "engine.executor.physical_cohort_wait_seconds_max";
+pub const ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL: &str =
+    "engine.executor.physical_permit_wait_seconds_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL: &str =
+    "engine.executor.physical_permit_wait_observations_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX: &str =
+    "engine.executor.physical_permit_wait_seconds_max";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL: &str = "engine.executor.physical_batches_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH: &str =
+    "engine.executor.physical_batch_max_width";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL: &str =
+    "engine.executor.physical_batch_rows_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL: &str =
+    "engine.executor.physical_batch_capacity_rows_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL: &str =
+    "engine.executor.physical_batch_useful_elements_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL: &str =
+    "engine.executor.physical_batch_materialized_elements_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO: &str =
+    "engine.executor.physical_batch_fill_ratio";
+pub const ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO: &str =
+    "engine.executor.physical_batch_padding_ratio";
+pub const ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL: &str =
+    "engine.executor.physical_fallbacks_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL: &str = "engine.executor.physical_defers_total";
+pub const ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES: &str =
+    "engine.executor.physical_workspace_current_bytes";
+pub const ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES: &str =
+    "engine.executor.physical_workspace_high_water_bytes";
 
 pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
@@ -275,6 +325,114 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         name: ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
         description: "Continuous physical envelopes executed through scalar model call paths.",
     },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+        description: "Effective physical execution mode as a bounded one-hot mode label.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP,
+        description: "Effective upper bound on simultaneously active physical dispatches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT,
+        description: "Physical model dispatches currently inside the execution boundary.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT,
+        description: "Process high-water mark for simultaneous physical model dispatches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
+        description: "Physical model dispatches that entered the execution boundary.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL,
+        description: "Physical model dispatch scopes that exited the execution boundary.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
+        description: "Cumulative wall time spent inside physical model dispatch scopes.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
+        description: "Physical dispatch duration observations.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX,
+        description: "Longest observed physical dispatch duration in seconds.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL,
+        description: "Cumulative time eligible work spent waiting for physical cohort formation.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL,
+        description: "Physical cohort-formation wait observations.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX,
+        description: "Longest observed physical cohort-formation wait in seconds.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
+        description: "Cumulative time physical dispatches spent waiting for execution permits.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
+        description: "Physical execution-permit wait observations.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
+        description: "Longest observed physical execution-permit wait in seconds.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
+        description: "Successfully dispatched physical batches across scalar and native modes.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH,
+        description: "Largest successfully dispatched physical batch width.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL,
+        description: "Rows carried by successfully dispatched physical batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL,
+        description: "Configured row capacity of successfully dispatched physical batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL,
+        description: "Useful tensor elements carried by successfully dispatched physical batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+        description: "Materialized tensor elements, including padding, in physical batches.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
+        description: "Cumulative physical-batch row utilization against configured capacity.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO,
+        description: "Cumulative physical-batch padding as a fraction of materialized elements.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+        description: "Physical execution fallbacks by bounded reason label.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
+        description: "Physical execution deferrals by bounded reason label.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
+        description: "Workspace bytes held by active physical dispatches by bounded memory domain.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
+        description: "Process high-water workspace bytes held by physical dispatches by domain.",
+    },
 ];
 
 static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -321,6 +479,56 @@ static ENGINE_DEADLINE_PHASE_ROWS: [AtomicU64; 5] = [
     AtomicU64::new(0),
 ];
 static ENGINE_WORKSPACE_DOMAIN_BYTES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ENGINE_PHYSICAL_EXECUTION_MODE: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_EXECUTION_CAP: AtomicU64 = AtomicU64::new(1);
+static ENGINE_PHYSICAL_DISPATCHES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_DISPATCHES_STARTED: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_DISPATCHES_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_DISPATCH_DURATION_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_DISPATCH_DURATION_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_DISPATCH_DURATION_MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_COHORT_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_COHORT_WAIT_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_COHORT_WAIT_MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_PERMIT_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_PERMIT_WAIT_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_PERMIT_WAIT_MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCHES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCH_MAX_WIDTH: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCH_ROWS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCH_CAPACITY_ROWS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCH_USEFUL_ELEMENTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_PHYSICAL_FALLBACK_REASONS: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ENGINE_PHYSICAL_DEFER_REASONS: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -421,6 +629,331 @@ impl EngineWorkspaceDomainMetricsSnapshot {
     }
 }
 
+/// Effective, post-policy execution mode. The fixed variants are also the only
+/// label values exported for this dimension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u64)]
+pub enum EnginePhysicalExecutionMode {
+    #[default]
+    Serial = 0,
+    Shadow = 1,
+    Concurrent = 2,
+}
+
+impl EnginePhysicalExecutionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::Shadow => "shadow",
+            Self::Concurrent => "concurrent",
+        }
+    }
+
+    pub const fn labeled_values(self) -> [(&'static str, u64); 3] {
+        [
+            ("serial", matches!(self, Self::Serial) as u64),
+            ("shadow", matches!(self, Self::Shadow) as u64),
+            ("concurrent", matches!(self, Self::Concurrent) as u64),
+        ]
+    }
+
+    const fn from_metric_value(value: u64) -> Self {
+        match value {
+            1 => Self::Shadow,
+            2 => Self::Concurrent,
+            _ => Self::Serial,
+        }
+    }
+}
+
+/// Bounded causes for demoting otherwise eligible work to a safer execution
+/// path. Free-form diagnostics belong in logs or traces, not metric labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePhysicalFallbackReason {
+    PolicyDisabled,
+    UncertifiedProfile,
+    BackendUnsupported,
+    AdapterUnsupported,
+    BatchIncompatible,
+    ResourcePressure,
+    DispatchFailure,
+}
+
+impl EnginePhysicalFallbackReason {
+    const fn index(self) -> usize {
+        match self {
+            Self::PolicyDisabled => 0,
+            Self::UncertifiedProfile => 1,
+            Self::BackendUnsupported => 2,
+            Self::AdapterUnsupported => 3,
+            Self::BatchIncompatible => 4,
+            Self::ResourcePressure => 5,
+            Self::DispatchFailure => 6,
+        }
+    }
+}
+
+/// Bounded reasons why otherwise scheduled physical work was deferred without
+/// entering model execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePhysicalDeferReason {
+    CohortFormation,
+    ExecutionCapacity,
+    WorkspaceCapacity,
+    ManagedCacheCapacity,
+    TransactionLimit,
+    PhaseConflict,
+}
+
+impl EnginePhysicalDeferReason {
+    const fn index(self) -> usize {
+        match self {
+            Self::CohortFormation => 0,
+            Self::ExecutionCapacity => 1,
+            Self::WorkspaceCapacity => 2,
+            Self::ManagedCacheCapacity => 3,
+            Self::TransactionLimit => 4,
+            Self::PhaseConflict => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct EngineDurationMetricsSnapshot {
+    pub observations_total: u64,
+    pub total_seconds: f64,
+    pub max_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EnginePhysicalFallbackMetricsSnapshot {
+    pub policy_disabled: u64,
+    pub uncertified_profile: u64,
+    pub backend_unsupported: u64,
+    pub adapter_unsupported: u64,
+    pub batch_incompatible: u64,
+    pub resource_pressure: u64,
+    pub dispatch_failure: u64,
+}
+
+impl EnginePhysicalFallbackMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 7] {
+        [
+            ("policy_disabled", self.policy_disabled),
+            ("uncertified_profile", self.uncertified_profile),
+            ("backend_unsupported", self.backend_unsupported),
+            ("adapter_unsupported", self.adapter_unsupported),
+            ("batch_incompatible", self.batch_incompatible),
+            ("resource_pressure", self.resource_pressure),
+            ("dispatch_failure", self.dispatch_failure),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EnginePhysicalDeferMetricsSnapshot {
+    pub cohort_formation: u64,
+    pub execution_capacity: u64,
+    pub workspace_capacity: u64,
+    pub managed_cache_capacity: u64,
+    pub transaction_limit: u64,
+    pub phase_conflict: u64,
+}
+
+impl EnginePhysicalDeferMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 6] {
+        [
+            ("cohort_formation", self.cohort_formation),
+            ("execution_capacity", self.execution_capacity),
+            ("workspace_capacity", self.workspace_capacity),
+            ("managed_cache_capacity", self.managed_cache_capacity),
+            ("transaction_limit", self.transaction_limit),
+            ("phase_conflict", self.phase_conflict),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct EnginePhysicalExecutionMetricsSnapshot {
+    pub effective_mode: EnginePhysicalExecutionMode,
+    pub effective_cap: u64,
+    pub dispatches_in_flight: u64,
+    pub dispatches_max_in_flight: u64,
+    pub dispatches_started_total: u64,
+    pub dispatches_completed_total: u64,
+    pub dispatch_duration: EngineDurationMetricsSnapshot,
+    pub cohort_wait: EngineDurationMetricsSnapshot,
+    pub permit_wait: EngineDurationMetricsSnapshot,
+    pub batches_total: u64,
+    pub batch_max_width: u64,
+    pub batch_rows_total: u64,
+    pub batch_capacity_rows_total: u64,
+    pub batch_useful_elements_total: u64,
+    pub batch_materialized_elements_total: u64,
+    pub batch_fill_ratio: f64,
+    pub batch_padding_ratio: f64,
+    pub fallbacks: EnginePhysicalFallbackMetricsSnapshot,
+    pub defers: EnginePhysicalDeferMetricsSnapshot,
+    pub workspace_current: EngineWorkspaceDomainMetricsSnapshot,
+    pub workspace_high_water: EngineWorkspaceDomainMetricsSnapshot,
+}
+
+/// Drop-scoped accounting prevents cancellation or unwind from leaving the
+/// in-flight gauge elevated. It deliberately does not encode a result label;
+/// result provenance is already recorded by `record_engine_execution_outcome`.
+#[must_use = "dropping the guard closes the physical dispatch observation"]
+pub(crate) struct EnginePhysicalDispatchMetricsGuard {
+    started_at: Instant,
+}
+
+impl Drop for EnginePhysicalDispatchMetricsGuard {
+    fn drop(&mut self) {
+        record_duration(
+            self.started_at.elapsed(),
+            &ENGINE_PHYSICAL_DISPATCH_DURATION_NANOS,
+            &ENGINE_PHYSICAL_DISPATCH_DURATION_OBSERVATIONS,
+            &ENGINE_PHYSICAL_DISPATCH_DURATION_MAX_NANOS,
+        );
+        saturating_atomic_sub(&ENGINE_PHYSICAL_DISPATCHES_IN_FLIGHT, 1);
+        saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_COMPLETED, 1);
+    }
+}
+
+/// Drop-scoped workspace accounting mirrors the lifetime of the authoritative
+/// workspace lease without taking ownership of that lease.
+#[must_use = "dropping the guard releases current physical workspace accounting"]
+pub(crate) struct EnginePhysicalWorkspaceMetricsGuard {
+    bytes: [u64; 4],
+}
+
+impl Drop for EnginePhysicalWorkspaceMetricsGuard {
+    fn drop(&mut self) {
+        for (current, bytes) in ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES
+            .iter()
+            .zip(self.bytes)
+        {
+            saturating_atomic_sub(current, bytes);
+        }
+    }
+}
+
+pub(crate) fn set_engine_effective_physical_execution(
+    mode: EnginePhysicalExecutionMode,
+    cap: usize,
+) {
+    ENGINE_PHYSICAL_EXECUTION_MODE.store(mode as u64, Ordering::Relaxed);
+    ENGINE_PHYSICAL_EXECUTION_CAP.store(cap.max(1) as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn begin_engine_physical_dispatch() -> EnginePhysicalDispatchMetricsGuard {
+    let active = saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_IN_FLIGHT, 1);
+    ENGINE_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT.fetch_max(active, Ordering::Relaxed);
+    saturating_atomic_add(&ENGINE_PHYSICAL_DISPATCHES_STARTED, 1);
+    EnginePhysicalDispatchMetricsGuard {
+        started_at: Instant::now(),
+    }
+}
+
+pub(crate) fn begin_engine_physical_workspace(
+    resources: super::ResourceVector,
+) -> EnginePhysicalWorkspaceMetricsGuard {
+    let bytes = workspace_domain_bytes(resources);
+    for ((current, high_water), bytes) in ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES
+        .iter()
+        .zip(ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES.iter())
+        .zip(bytes)
+    {
+        let observed = saturating_atomic_add(current, bytes);
+        high_water.fetch_max(observed, Ordering::Relaxed);
+    }
+    EnginePhysicalWorkspaceMetricsGuard { bytes }
+}
+
+pub(crate) fn record_engine_physical_cohort_wait(duration: Duration) {
+    record_duration(
+        duration,
+        &ENGINE_PHYSICAL_COHORT_WAIT_NANOS,
+        &ENGINE_PHYSICAL_COHORT_WAIT_OBSERVATIONS,
+        &ENGINE_PHYSICAL_COHORT_WAIT_MAX_NANOS,
+    );
+}
+
+pub(crate) fn record_engine_physical_permit_wait(duration: Duration) {
+    record_duration(
+        duration,
+        &ENGINE_PHYSICAL_PERMIT_WAIT_NANOS,
+        &ENGINE_PHYSICAL_PERMIT_WAIT_OBSERVATIONS,
+        &ENGINE_PHYSICAL_PERMIT_WAIT_MAX_NANOS,
+    );
+}
+
+pub(crate) fn record_engine_physical_fallback(reason: EnginePhysicalFallbackReason) {
+    saturating_atomic_add(&ENGINE_PHYSICAL_FALLBACK_REASONS[reason.index()], 1);
+}
+
+pub(crate) fn record_engine_physical_defer(reason: EnginePhysicalDeferReason) {
+    saturating_atomic_add(&ENGINE_PHYSICAL_DEFER_REASONS[reason.index()], 1);
+}
+
+fn workspace_domain_bytes(resources: super::ResourceVector) -> [u64; 4] {
+    [
+        resources.host_bytes,
+        resources.device_bytes,
+        resources.unified_bytes,
+        resources.temporary_bytes,
+    ]
+    .map(|amount| match amount {
+        ResourceAmount::Known(bytes) => bytes,
+        ResourceAmount::Unknown => 0,
+    })
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn record_duration(
+    duration: Duration,
+    total: &AtomicU64,
+    observations: &AtomicU64,
+    maximum: &AtomicU64,
+) {
+    let nanos = duration_nanos(duration);
+    saturating_atomic_add(total, nanos);
+    saturating_atomic_add(observations, 1);
+    maximum.fetch_max(nanos, Ordering::Relaxed);
+}
+
+fn duration_snapshot(
+    total: &AtomicU64,
+    observations: &AtomicU64,
+    maximum: &AtomicU64,
+) -> EngineDurationMetricsSnapshot {
+    EngineDurationMetricsSnapshot {
+        observations_total: observations.load(Ordering::Relaxed),
+        total_seconds: Duration::from_nanos(total.load(Ordering::Relaxed)).as_secs_f64(),
+        max_seconds: Duration::from_nanos(maximum.load(Ordering::Relaxed)).as_secs_f64(),
+    }
+}
+
+fn saturating_atomic_add(value: &AtomicU64, amount: u64) -> u64 {
+    match value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    }) {
+        Ok(previous) => previous.saturating_add(amount),
+        Err(current) => current,
+    }
+}
+
+fn saturating_atomic_sub(value: &AtomicU64, amount: u64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineBatchMetricsSnapshot {
     pub incremental_prefill_quanta_committed_total: u64,
@@ -451,6 +984,7 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_decode_calls_total: u64,
     pub model_tensor_multirow_calls_total: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
+    pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
 }
 
 static ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED: AtomicU64 = AtomicU64::new(0);
@@ -574,6 +1108,22 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
         return;
     }
 
+    let useful_elements = batch.rows.iter().fold(0u64, |total, row| {
+        total.saturating_add(row.cost.tensor_elements)
+    });
+    saturating_atomic_add(&ENGINE_PHYSICAL_BATCHES, 1);
+    ENGINE_PHYSICAL_BATCH_MAX_WIDTH.fetch_max(batch.rows.len() as u64, Ordering::Relaxed);
+    saturating_atomic_add(&ENGINE_PHYSICAL_BATCH_ROWS, batch.rows.len() as u64);
+    saturating_atomic_add(
+        &ENGINE_PHYSICAL_BATCH_CAPACITY_ROWS,
+        batch.budget.max_rows as u64,
+    );
+    saturating_atomic_add(&ENGINE_PHYSICAL_BATCH_USEFUL_ELEMENTS, useful_elements);
+    saturating_atomic_add(
+        &ENGINE_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS,
+        batch.materialized_tensor_elements,
+    );
+
     let workspace_bytes = batch.workspace.workspace_bytes().unwrap_or(0);
     ENGINE_BATCH_WORKSPACE_BYTES.fetch_add(workspace_bytes, Ordering::Relaxed);
     for (index, amount) in [
@@ -603,9 +1153,6 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
     }
     ENGINE_TENSOR_BATCH_ROWS.fetch_add(batch.rows.len() as u64, Ordering::Relaxed);
     ENGINE_TENSOR_BATCH_CAPACITY_ROWS.fetch_add(batch.budget.max_rows as u64, Ordering::Relaxed);
-    let useful_elements = batch.rows.iter().fold(0u64, |total, row| {
-        total.saturating_add(row.cost.tensor_elements)
-    });
     ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS.fetch_add(useful_elements, Ordering::Relaxed);
     ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS
         .fetch_add(batch.materialized_tensor_elements, Ordering::Relaxed);
@@ -621,6 +1168,79 @@ pub fn engine_request_parallel_batches_total() -> u64 {
 
 pub fn engine_tensor_batch_max_width() -> u64 {
     ENGINE_TENSOR_BATCH_MAX_WIDTH.load(Ordering::Relaxed)
+}
+
+pub fn engine_physical_execution_metrics_snapshot() -> EnginePhysicalExecutionMetricsSnapshot {
+    let rows = ENGINE_PHYSICAL_BATCH_ROWS.load(Ordering::Relaxed);
+    let capacity_rows = ENGINE_PHYSICAL_BATCH_CAPACITY_ROWS.load(Ordering::Relaxed);
+    let useful_elements = ENGINE_PHYSICAL_BATCH_USEFUL_ELEMENTS.load(Ordering::Relaxed);
+    let materialized_elements = ENGINE_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS.load(Ordering::Relaxed);
+
+    EnginePhysicalExecutionMetricsSnapshot {
+        effective_mode: EnginePhysicalExecutionMode::from_metric_value(
+            ENGINE_PHYSICAL_EXECUTION_MODE.load(Ordering::Relaxed),
+        ),
+        effective_cap: ENGINE_PHYSICAL_EXECUTION_CAP.load(Ordering::Relaxed),
+        dispatches_in_flight: ENGINE_PHYSICAL_DISPATCHES_IN_FLIGHT.load(Ordering::Relaxed),
+        dispatches_max_in_flight: ENGINE_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT.load(Ordering::Relaxed),
+        dispatches_started_total: ENGINE_PHYSICAL_DISPATCHES_STARTED.load(Ordering::Relaxed),
+        dispatches_completed_total: ENGINE_PHYSICAL_DISPATCHES_COMPLETED.load(Ordering::Relaxed),
+        dispatch_duration: duration_snapshot(
+            &ENGINE_PHYSICAL_DISPATCH_DURATION_NANOS,
+            &ENGINE_PHYSICAL_DISPATCH_DURATION_OBSERVATIONS,
+            &ENGINE_PHYSICAL_DISPATCH_DURATION_MAX_NANOS,
+        ),
+        cohort_wait: duration_snapshot(
+            &ENGINE_PHYSICAL_COHORT_WAIT_NANOS,
+            &ENGINE_PHYSICAL_COHORT_WAIT_OBSERVATIONS,
+            &ENGINE_PHYSICAL_COHORT_WAIT_MAX_NANOS,
+        ),
+        permit_wait: duration_snapshot(
+            &ENGINE_PHYSICAL_PERMIT_WAIT_NANOS,
+            &ENGINE_PHYSICAL_PERMIT_WAIT_OBSERVATIONS,
+            &ENGINE_PHYSICAL_PERMIT_WAIT_MAX_NANOS,
+        ),
+        batches_total: ENGINE_PHYSICAL_BATCHES.load(Ordering::Relaxed),
+        batch_max_width: ENGINE_PHYSICAL_BATCH_MAX_WIDTH.load(Ordering::Relaxed),
+        batch_rows_total: rows,
+        batch_capacity_rows_total: capacity_rows,
+        batch_useful_elements_total: useful_elements,
+        batch_materialized_elements_total: materialized_elements,
+        batch_fill_ratio: ratio(rows, capacity_rows),
+        batch_padding_ratio: ratio(
+            materialized_elements.saturating_sub(useful_elements),
+            materialized_elements,
+        ),
+        fallbacks: EnginePhysicalFallbackMetricsSnapshot {
+            policy_disabled: ENGINE_PHYSICAL_FALLBACK_REASONS[0].load(Ordering::Relaxed),
+            uncertified_profile: ENGINE_PHYSICAL_FALLBACK_REASONS[1].load(Ordering::Relaxed),
+            backend_unsupported: ENGINE_PHYSICAL_FALLBACK_REASONS[2].load(Ordering::Relaxed),
+            adapter_unsupported: ENGINE_PHYSICAL_FALLBACK_REASONS[3].load(Ordering::Relaxed),
+            batch_incompatible: ENGINE_PHYSICAL_FALLBACK_REASONS[4].load(Ordering::Relaxed),
+            resource_pressure: ENGINE_PHYSICAL_FALLBACK_REASONS[5].load(Ordering::Relaxed),
+            dispatch_failure: ENGINE_PHYSICAL_FALLBACK_REASONS[6].load(Ordering::Relaxed),
+        },
+        defers: EnginePhysicalDeferMetricsSnapshot {
+            cohort_formation: ENGINE_PHYSICAL_DEFER_REASONS[0].load(Ordering::Relaxed),
+            execution_capacity: ENGINE_PHYSICAL_DEFER_REASONS[1].load(Ordering::Relaxed),
+            workspace_capacity: ENGINE_PHYSICAL_DEFER_REASONS[2].load(Ordering::Relaxed),
+            managed_cache_capacity: ENGINE_PHYSICAL_DEFER_REASONS[3].load(Ordering::Relaxed),
+            transaction_limit: ENGINE_PHYSICAL_DEFER_REASONS[4].load(Ordering::Relaxed),
+            phase_conflict: ENGINE_PHYSICAL_DEFER_REASONS[5].load(Ordering::Relaxed),
+        },
+        workspace_current: EngineWorkspaceDomainMetricsSnapshot {
+            host: ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES[0].load(Ordering::Relaxed),
+            device: ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES[1].load(Ordering::Relaxed),
+            unified: ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES[2].load(Ordering::Relaxed),
+            temporary: ENGINE_PHYSICAL_WORKSPACE_CURRENT_BYTES[3].load(Ordering::Relaxed),
+        },
+        workspace_high_water: EngineWorkspaceDomainMetricsSnapshot {
+            host: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[0].load(Ordering::Relaxed),
+            device: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[1].load(Ordering::Relaxed),
+            unified: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[2].load(Ordering::Relaxed),
+            temporary: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[3].load(Ordering::Relaxed),
+        },
+    }
 }
 
 pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
@@ -691,6 +1311,7 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
             .load(Ordering::Relaxed),
         continuous_envelope_scalar_fallbacks_total: ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS
             .load(Ordering::Relaxed),
+        physical_execution: engine_physical_execution_metrics_snapshot(),
     }
 }
 
@@ -1093,6 +1714,37 @@ mod tests {
         assert!(names.contains(ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO));
         assert!(names.contains(ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO));
+        for metric in [
+            ENGINE_EXECUTOR_PHYSICAL_EXECUTION_MODE,
+            ENGINE_EXECUTOR_PHYSICAL_EXECUTION_CAP,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_IN_FLIGHT,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_MAX_IN_FLIGHT,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_STARTED_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCHES_COMPLETED_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCH_OBSERVATIONS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_DISPATCH_SECONDS_MAX,
+            ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_OBSERVATIONS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_COHORT_WAIT_SECONDS_MAX,
+            ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_OBSERVATIONS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_MAX,
+            ENGINE_EXECUTOR_PHYSICAL_BATCHES_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_MAX_WIDTH,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_ROWS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_CAPACITY_ROWS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_USEFUL_ELEMENTS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_FILL_RATIO,
+            ENGINE_EXECUTOR_PHYSICAL_BATCH_PADDING_RATIO,
+            ENGINE_EXECUTOR_PHYSICAL_FALLBACKS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
+            ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
+            ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
+        ] {
+            assert!(names.contains(metric), "missing physical metric {metric}");
+        }
         assert_eq!(names.len(), ENGINE_METRIC_CATALOG.len());
     }
 
@@ -1193,6 +1845,92 @@ mod tests {
     }
 
     #[test]
+    fn physical_execution_metrics_have_bounded_dimensions_and_drop_scoped_lifecycle() {
+        let before = engine_physical_execution_metrics_snapshot();
+        set_engine_effective_physical_execution(EnginePhysicalExecutionMode::Concurrent, 4);
+        record_engine_physical_cohort_wait(Duration::from_millis(3));
+        record_engine_physical_permit_wait(Duration::from_millis(5));
+        record_engine_physical_fallback(EnginePhysicalFallbackReason::UncertifiedProfile);
+        record_engine_physical_defer(EnginePhysicalDeferReason::WorkspaceCapacity);
+
+        let first_dispatch = begin_engine_physical_dispatch();
+        let second_dispatch = begin_engine_physical_dispatch();
+        let workspace = begin_engine_physical_workspace(ResourceVector {
+            host_bytes: ResourceAmount::Known(11),
+            device_bytes: ResourceAmount::Known(13),
+            unified_bytes: ResourceAmount::Known(17),
+            temporary_bytes: ResourceAmount::Known(19),
+            ..ResourceVector::zero()
+        });
+
+        let active = engine_physical_execution_metrics_snapshot();
+        assert_eq!(
+            active.effective_mode,
+            EnginePhysicalExecutionMode::Concurrent
+        );
+        assert_eq!(active.effective_cap, 4);
+        assert_eq!(
+            active.effective_mode.labeled_values(),
+            [("serial", 0), ("shadow", 0), ("concurrent", 1)]
+        );
+        assert_eq!(active.dispatches_in_flight, before.dispatches_in_flight + 2);
+        assert!(active.dispatches_max_in_flight >= active.dispatches_in_flight);
+        assert!(active.dispatches_started_total >= before.dispatches_started_total + 2);
+        assert!(active.cohort_wait.observations_total > before.cohort_wait.observations_total);
+        assert!(active.cohort_wait.total_seconds >= before.cohort_wait.total_seconds + 0.003);
+        assert!(active.permit_wait.observations_total > before.permit_wait.observations_total);
+        assert!(active.permit_wait.total_seconds >= before.permit_wait.total_seconds + 0.005);
+        assert_eq!(
+            active.dispatch_duration.observations_total,
+            before.dispatch_duration.observations_total
+        );
+        assert!(active.fallbacks.uncertified_profile > before.fallbacks.uncertified_profile);
+        assert!(active.defers.workspace_capacity > before.defers.workspace_capacity);
+        assert_eq!(
+            active.fallbacks.labeled_values().map(|(reason, _)| reason),
+            [
+                "policy_disabled",
+                "uncertified_profile",
+                "backend_unsupported",
+                "adapter_unsupported",
+                "batch_incompatible",
+                "resource_pressure",
+                "dispatch_failure",
+            ]
+        );
+        assert_eq!(
+            active.defers.labeled_values().map(|(reason, _)| reason),
+            [
+                "cohort_formation",
+                "execution_capacity",
+                "workspace_capacity",
+                "managed_cache_capacity",
+                "transaction_limit",
+                "phase_conflict",
+            ]
+        );
+        assert!(active.workspace_current.host >= before.workspace_current.host + 11);
+        assert!(active.workspace_current.device >= before.workspace_current.device + 13);
+        assert!(active.workspace_current.unified >= before.workspace_current.unified + 17);
+        assert!(active.workspace_current.temporary >= before.workspace_current.temporary + 19);
+        assert!(active.workspace_high_water.host >= active.workspace_current.host);
+        assert!(active.workspace_high_water.device >= active.workspace_current.device);
+
+        drop(workspace);
+        drop(second_dispatch);
+        drop(first_dispatch);
+        let after = engine_physical_execution_metrics_snapshot();
+        assert_eq!(after.dispatches_in_flight, before.dispatches_in_flight);
+        assert!(after.dispatches_completed_total >= before.dispatches_completed_total + 2);
+        assert!(
+            after.dispatch_duration.observations_total
+                >= before.dispatch_duration.observations_total + 2
+        );
+        assert_eq!(after.workspace_current, before.workspace_current);
+        assert!(after.workspace_high_water.host >= active.workspace_current.host);
+    }
+
+    #[test]
     fn physical_batch_metrics_measure_fill_padding_workspace_and_rejection() {
         let lane = BatchLaneKey {
             execution_group: ExecutionGroupId::new(1),
@@ -1249,11 +1987,13 @@ mod tests {
         batch.validate().unwrap();
 
         let before = engine_batch_metrics_snapshot();
+        let physical_before = engine_physical_execution_metrics_snapshot();
         record_engine_physical_batch(
             &batch,
             BatchDispatch::new(BatchDispatchKind::TensorStatic, 2),
         );
         let dispatched = engine_batch_metrics_snapshot();
+        let physical_dispatched = engine_physical_execution_metrics_snapshot();
         assert!(dispatched.tensor_static_batches_total > before.tensor_static_batches_total);
         assert!(dispatched.tensor_batch_rows_total >= before.tensor_batch_rows_total + 2);
         assert!(
@@ -1273,6 +2013,23 @@ mod tests {
         assert!(dispatched.workspace_domains.device >= before.workspace_domains.device + 2);
         assert!(dispatched.workspace_domains.unified >= before.workspace_domains.unified + 3);
         assert!(dispatched.workspace_domains.temporary >= before.workspace_domains.temporary + 2);
+        assert!(physical_dispatched.batches_total > physical_before.batches_total);
+        assert!(physical_dispatched.batch_max_width >= 2);
+        assert!(physical_dispatched.batch_rows_total >= physical_before.batch_rows_total + 2);
+        assert!(
+            physical_dispatched.batch_capacity_rows_total
+                >= physical_before.batch_capacity_rows_total + 4
+        );
+        assert!(
+            physical_dispatched.batch_useful_elements_total
+                >= physical_before.batch_useful_elements_total + 20
+        );
+        assert!(
+            physical_dispatched.batch_materialized_elements_total
+                >= physical_before.batch_materialized_elements_total + 30
+        );
+        assert!(physical_dispatched.batch_fill_ratio > 0.0);
+        assert!(physical_dispatched.batch_padding_ratio > 0.0);
 
         record_engine_physical_batch(
             &batch,
