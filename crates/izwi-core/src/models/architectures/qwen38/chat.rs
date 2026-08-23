@@ -2493,6 +2493,18 @@ mod tests {
         assert_eq!(known_mtp_rows(0, 1, 2), 1);
         assert_eq!(known_mtp_rows(768, 1_024, prompt_len), 256);
         assert_eq!(known_mtp_rows(1_024, 1_025, prompt_len), 0);
+
+        for boundaries in [
+            vec![0, 1, prompt_len],
+            vec![0, 17, 511, 512, 1_024, prompt_len],
+            (0..=prompt_len).collect::<Vec<_>>(),
+        ] {
+            let covered = boundaries
+                .windows(2)
+                .map(|span| known_mtp_rows(span[0], span[1], prompt_len))
+                .sum::<usize>();
+            assert_eq!(covered, prompt_len - 1, "boundaries={boundaries:?}");
+        }
     }
 
     fn history_messages() -> Vec<ChatMessage> {

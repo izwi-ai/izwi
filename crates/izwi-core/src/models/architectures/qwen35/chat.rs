@@ -45,6 +45,25 @@ fn qwen35_prefill_chunk_size() -> usize {
         .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
         .min(MAX_PREFILL_CHUNK_SIZE)
 }
+
+fn next_prefill_segment_end(
+    prompt_ids: &[u32],
+    cursor: usize,
+    span_end: usize,
+    image_pad: u32,
+    chunk_size: usize,
+) -> Result<(usize, bool)> {
+    if cursor >= span_end || span_end > prompt_ids.len() || chunk_size == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 prefill segment bounds are invalid".into(),
+        ));
+    }
+    let image = prompt_ids[cursor] == image_pad;
+    let boundary = (cursor + 1..span_end)
+        .find(|index| (prompt_ids[*index] == image_pad) != image)
+        .unwrap_or(span_end);
+    Ok((boundary.min(cursor.saturating_add(chunk_size)), image))
+}
 /// Fully prepared Qwen3.5 prefill input. The runtime carries this exact
 /// artifact into the executor so media loading and vision encoding happen once.
 #[derive(Debug, Clone)]
@@ -751,44 +770,43 @@ impl Qwen35ChatModel {
         let mut cursor = span_start;
         let chunk_size = qwen35_prefill_chunk_size();
         while cursor < span_end {
-            if prepared.prompt_ids[cursor] == self.tokenizer.specials.image_pad {
+            let (segment_end, image_segment) = next_prefill_segment_end(
+                &prepared.prompt_ids,
+                cursor,
+                span_end,
+                self.tokenizer.specials.image_pad,
+                chunk_size,
+            )?;
+            if image_segment {
                 let vision = prepared.vision_inputs.as_ref().ok_or_else(|| {
                     Error::InvalidInput("Qwen3.5 image placeholder has no vision input".into())
                 })?;
-                let image_end = (cursor + 1..span_end)
-                    .find(|index| prepared.prompt_ids[*index] != self.tokenizer.specials.image_pad)
-                    .unwrap_or(span_end)
-                    .min(cursor.saturating_add(chunk_size));
-                let image_count = image_end - cursor;
+                let image_count = segment_end - cursor;
                 let embeddings = vision
                     .embeddings
                     .narrow(0, state.prefill_vision_progress, image_count)?
                     .reshape((1, image_count, self.text_model.hidden_size()))?;
-                let compute_logits = complete && image_end == span_end;
+                let compute_logits = complete && segment_end == span_end;
                 logits = self.text_model.prefill_input_embeddings_physical(
                     &embeddings,
-                    &prepared.prompt_positions[cursor..image_end],
+                    &prepared.prompt_positions[cursor..segment_end],
                     &mut state.text_state,
                     &mut state.physical_kv,
                     compute_logits,
                 )?;
                 state.prefill_vision_progress += image_count;
-                cursor = image_end;
+                cursor = segment_end;
                 continue;
             }
-            let text_end = (cursor + 1..span_end)
-                .find(|index| prepared.prompt_ids[*index] == self.tokenizer.specials.image_pad)
-                .unwrap_or(span_end)
-                .min(cursor.saturating_add(chunk_size));
-            let compute_logits = complete && text_end == span_end;
+            let compute_logits = complete && segment_end == span_end;
             logits = self.text_model.prefill_token_ids_physical(
-                &prepared.prompt_ids[cursor..text_end],
-                &prepared.prompt_positions[cursor..text_end],
+                &prepared.prompt_ids[cursor..segment_end],
+                &prepared.prompt_positions[cursor..segment_end],
                 &mut state.text_state,
                 &mut state.physical_kv,
                 compute_logits,
             )?;
-            cursor = text_end;
+            cursor = segment_end;
         }
         if state.physical_kv.context_len() != span_end {
             return Err(Error::InferenceError(format!(
@@ -2050,6 +2068,39 @@ mod tests {
         std::env::set_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE", "999999");
         assert_eq!(qwen35_prefill_chunk_size(), MAX_PREFILL_CHUNK_SIZE);
         std::env::remove_var("IZWI_QWEN35_PREFILL_CHUNK_SIZE");
+    }
+
+    #[test]
+    fn multimodal_prefill_segmentation_is_partition_invariant() {
+        let image_pad = 99;
+        let prompt = [1, 2, image_pad, image_pad, image_pad, 3, 4, image_pad, 5];
+        let classify = |spans: &[(usize, usize)]| {
+            let mut rows = Vec::new();
+            for &(start, end) in spans {
+                let mut cursor = start;
+                while cursor < end {
+                    let (segment_end, image) =
+                        next_prefill_segment_end(&prompt, cursor, end, image_pad, 2)
+                            .expect("valid segment");
+                    rows.extend((cursor..segment_end).map(|index| (index, image)));
+                    cursor = segment_end;
+                }
+            }
+            rows
+        };
+
+        let monolithic = classify(&[(0, prompt.len())]);
+        let scheduler_chunked = classify(&[(0, 3), (3, 6), (6, prompt.len())]);
+        assert_eq!(scheduler_chunked, monolithic);
+        assert_eq!(
+            monolithic
+                .iter()
+                .filter(|(_, image)| *image)
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 7]
+        );
+        assert!(next_prefill_segment_end(&prompt, 0, prompt.len(), image_pad, 0).is_err());
     }
 
     #[test]

@@ -1726,4 +1726,79 @@ mod tests {
         );
         assert_eq!(full_ring.dtype(), DType::F32);
     }
+
+    #[test]
+    fn retained_shortconv_decode_rows_match_scalar_oracles_and_rollback() {
+        let device = &Device::Cpu;
+        let component = StateComponentId::new(2);
+        let initial = || Lfm2ShortConvRuntimeState {
+            cursor: 0,
+            capacity: 3,
+            hidden: 2,
+            components: vec![(component, None)],
+        };
+        let weight =
+            Tensor::from_vec(vec![0.2f32, 0.3, 0.5, -0.1, 0.4, 0.7], (2, 3), device).unwrap();
+        let history =
+            Tensor::from_vec(vec![0.1f32, 0.2, 0.3, -0.2, 0.1, 0.6], (1, 2, 3), device).unwrap();
+        let mut rows = [initial(), initial()];
+        rows[0].apply(component, &history, &weight).unwrap();
+        rows[0].advance(3).unwrap();
+        rows[1]
+            .apply(component, &history.narrow(2, 1, 2).unwrap(), &weight)
+            .unwrap();
+        rows[1].advance(2).unwrap();
+        let checkpoints = rows.clone();
+        let inputs = Tensor::from_vec(vec![0.9f32, -0.4, -0.7, 0.8], (2, 2, 1), device).unwrap();
+
+        let batch_outputs = (0..2)
+            .map(|row| {
+                rows[row]
+                    .apply(component, &inputs.narrow(0, row, 1).unwrap(), &weight)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for row in &mut rows {
+            row.advance(1).unwrap();
+        }
+
+        for row in 0..2 {
+            let mut oracle = checkpoints[row].clone();
+            let expected = oracle
+                .apply(component, &inputs.narrow(0, row, 1).unwrap(), &weight)
+                .unwrap();
+            oracle.advance(1).unwrap();
+            assert_eq!(
+                batch_outputs[row]
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                expected.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+            assert_eq!(rows[row].cursor, oracle.cursor);
+            assert_eq!(
+                rows[row].components[0]
+                    .1
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                oracle.components[0]
+                    .1
+                    .as_ref()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            );
+        }
+
+        rows = checkpoints.clone();
+        assert_eq!(rows[0].cursor, 3);
+        assert_eq!(rows[1].cursor, 2);
+    }
 }
