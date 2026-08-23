@@ -462,10 +462,10 @@ impl Qwen3ChatModel {
             )));
         }
         let physical_start = state.cache.context_len();
-        let final_first_span = span_start == 0 && span_end == prompt_ids.len();
+        let first_span = span_start == 0;
         if state.pos != physical_start
-            || (!final_first_span && physical_start != span_start)
-            || (final_first_span && physical_start >= span_end)
+            || (!first_span && physical_start != span_start)
+            || (first_span && physical_start >= span_end)
         {
             return Err(Error::InferenceError(format!(
                 "Qwen3 resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"

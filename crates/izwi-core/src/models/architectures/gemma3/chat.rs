@@ -41,7 +41,7 @@ pub struct ChatDecodeState {
     position: usize,
     pending_token: Option<u32>,
     /// Scheduler-visible prompt cursor, separate from a reused physical
-    /// prefix position on a final first span.
+    /// prefix position on the first scheduler-visible span.
     prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
@@ -684,10 +684,10 @@ impl Gemma3ChatModel {
             )));
         }
         let physical_start = state.cache.context_len();
-        let final_first_span = span_start == 0 && span_end == prompt_ids.len();
+        let first_span = span_start == 0;
         if state.position != physical_start
-            || (!final_first_span && physical_start != span_start)
-            || (final_first_span && physical_start >= span_end)
+            || (!first_span && physical_start != span_start)
+            || (first_span && physical_start >= span_end)
         {
             return Err(Error::InferenceError(format!(
                 "Gemma resumable prefill physical cursor {physical_start} is incompatible with logical span [{span_start},{span_end})"

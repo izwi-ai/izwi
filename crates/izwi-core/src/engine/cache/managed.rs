@@ -1247,7 +1247,10 @@ impl ManagedKvCacheManager {
             }
             let prefix_eligible = snapshot.committed_tokens == 0
                 && input.start == 0
-                && request.is_some_and(|request| input.end == request.prompt_tokens.len())
+                // Prefix reuse is bounded by this transaction's committed
+                // target below, so the first scheduler-visible chunk does not
+                // need to cover the entire logical prompt.
+                && request.is_some_and(|request| input.end <= request.prompt_tokens.len())
                 && target_committed_tokens > 1
                 && prefix_enabled_for_domain(&state.contract, group.domain);
             let prefix_match = if prefix_eligible {
@@ -4485,6 +4488,66 @@ mod tests {
         assert_eq!(telemetry.avoided_prefill_tokens, 64);
         manager.finalize(&second, None, false).expect("abort");
         assert_eq!(manager.telemetry_snapshot().transaction_aborts, 1);
+    }
+
+    #[test]
+    fn salted_prefix_reuse_is_bounded_to_the_first_incremental_prefill_target() {
+        let model = ModelInstanceId::new(451);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([10; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let source_request = prefix_request(model, tokens.clone());
+        let source_session = SessionKey::new("chunk-prefix-source".into(), 1);
+        let source = manager
+            .prepare(
+                &runtime,
+                211,
+                &source_session,
+                &sequence_work(0, tokens.len()),
+                Some(&source_request),
+            )
+            .expect("source prepare")
+            .expect("source reservation");
+        manager
+            .finalize(
+                &source,
+                Some(&source.completed_write_receipt_for_test()),
+                true,
+            )
+            .expect("source commit");
+        manager.release_session(&source_session).expect("release");
+
+        let mut resumed_tokens = tokens;
+        *resumed_tokens.last_mut().expect("last token") = 999;
+        let resumed_request = prefix_request(model, resumed_tokens);
+        let resumed_session = SessionKey::new("chunk-prefix-resumed".into(), 1);
+        let first_chunk = manager
+            .prepare(
+                &runtime,
+                212,
+                &resumed_session,
+                &sequence_work(0, 49),
+                Some(&resumed_request),
+            )
+            .expect("chunk prepare")
+            .expect("chunk reservation");
+
+        assert_eq!(first_chunk.domains[0].target_committed_tokens, 49);
+        assert_eq!(first_chunk.domains[0].execution_start_tokens, 32);
+        assert!(first_chunk.domains[0].execution_start_tokens < 49);
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.prefix_hits, 1);
+        assert_eq!(telemetry.reused_tokens, 32);
+        manager.finalize(&first_chunk, None, false).expect("abort");
     }
 
     #[test]
