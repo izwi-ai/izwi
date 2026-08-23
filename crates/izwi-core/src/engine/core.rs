@@ -2112,7 +2112,7 @@ impl EngineCore {
             .get(&progress.batch_id)
             .ok_or_else(|| {
                 StreamProgressRejection::invalid(
-                    "stream progress references no in-flight physical dispatch",
+                    "stream progress references an inactive physical batch",
                 )
             })?;
         if dispatch.output_visibility != OutputVisibility::IncrementalCommitted
@@ -2124,7 +2124,7 @@ impl EngineCore {
                 .any(|row| row.plan_id == progress.plan_id && row.session == progress.session)
         {
             return Err(StreamProgressRejection::invalid(
-                "stream progress does not match its in-flight dispatch ticket",
+                "stream progress physical batch fence does not match its in-flight dispatch ticket",
             ));
         }
 
@@ -4786,15 +4786,42 @@ mod tests {
 
         let lane = EngineCore::batch_lane(&plan, WorkCost::new(1, 1, 0));
         let batch_id = BatchId::new(81);
-        core.active_stream_batches.insert(
-            batch_id,
-            ActiveStreamBatch {
-                lane: lane.clone(),
-                output_visibility: OutputVisibility::IncrementalCommitted,
-                rows: HashMap::from([(plan_id, session.clone())]),
-            },
-        );
         let request = core.requests.get(&request_id).unwrap().clone();
+        let scheduled = ScheduledRequest {
+            plan_id,
+            request_id: request_id.clone(),
+            sequence_id: session.epoch,
+            num_tokens: 1,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work: plan.work.clone(),
+        };
+        let dispatch = PreparedPhysicalDispatch::new(
+            ExecutionPhase::Prefill,
+            PhysicalBatch {
+                batch_id,
+                lane: lane.clone(),
+                mode: NativeBatchMode::None,
+                budget: BatchBudget::width_one(),
+                rows: vec![ReadyQuantum {
+                    plan_id,
+                    session: session.clone(),
+                    lane: lane.clone(),
+                    work: plan.work.clone(),
+                    cost: WorkCost::new(1, 1, 0),
+                    managed_cache: None,
+                }],
+                materialized_tensor_elements: 1,
+                workspace: ResourceVector::zero(),
+            },
+            vec![request.clone()],
+            vec![scheduled],
+            OutputVisibility::IncrementalCommitted,
+            Vec::new(),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+        )
+        .unwrap();
+        core.register_prepared_physical_dispatch(&dispatch).unwrap();
         let staging = request.stream_staging_buffer();
         let (progress_tx, mut progress_rx) = mpsc::channel(8);
         let binding = request
@@ -4878,6 +4905,7 @@ mod tests {
 
         drop(next_progress);
         drop(binding);
+        drop(dispatch);
         drop(request);
         Arc::get_mut(core.requests.get_mut(&request_id).expect("active request"))
             .expect("core owns the last request reference")
