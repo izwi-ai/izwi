@@ -90,7 +90,8 @@ fi
 
 jq -n --arg git_sha "$git_sha" '
   {
-    schema: "izwi.cuda-model-evidence.v1",
+    schema: "izwi.model-evidence.v2",
+    backend: "cuda",
     status: "passed",
     run: {git_sha: $git_sha, worktree_clean: true},
     requirements: {continuous_batch: true, resumable_prefill: true},
@@ -98,7 +99,7 @@ jq -n --arg git_sha "$git_sha" '
       build_git_sha: $git_sha,
       requested_backend: "cuda",
       selected_backend: "cuda",
-      cuda_compiled: true,
+      backend_compiled: true,
       driver_available: true,
       device_usable: true
     },
@@ -133,6 +134,19 @@ jq -n --arg git_sha "$git_sha" '
 $validator --certificate "$tmp_dir/model-certificate.json" --backend cuda \
   --expected-git-sha "$git_sha" --require-continuous-batch-evidence \
   --require-resumable-prefill-evidence >/dev/null
+
+for portable_backend in cpu metal; do
+  jq --arg backend "$portable_backend" '
+    .backend = $backend |
+    .device.requested_backend = $backend |
+    .device.selected_backend = $backend |
+    .cases[0].backend_kind = $backend |
+    .cases[0].actual_device_kind = $backend
+  ' "$tmp_dir/model-certificate.json" >"$tmp_dir/model-${portable_backend}.json"
+  $validator --certificate "$tmp_dir/model-${portable_backend}.json" \
+    --backend "$portable_backend" --expected-git-sha "$git_sha" \
+    --require-continuous-batch-evidence --require-resumable-prefill-evidence >/dev/null
+done
 
 jq '.cases[0].prefill_delta.multispan_requests = .cases[0].samples - 1' \
   "$tmp_dir/model-certificate.json" >"$tmp_dir/model-no-resume.json"

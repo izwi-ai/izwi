@@ -1,0 +1,20 @@
+# Exact-SHA Metal continuous-batching certification workload for every chat family.
+# Run the server with tensor batch size Auto (width two on Metal).
+
+[[benchmarks]]
+name = "chat-continuous-c2"
+command = "chat"
+iterations = 4
+concurrent = 2
+warmup = true
+prompt = "In one sentence, explain why continuous batching improves inference responsiveness."
+max_tokens = 64
+
+[benchmarks.matrix]
+model = [
+  "Qwen3-0.6B-GGUF",
+  "Qwen3.5-0.8B",
+  "Qwen3.8-27B-FP8",
+  "LFM2.5-1.2B-Instruct-GGUF",
+  "Gemma-3-1b-it",
+]

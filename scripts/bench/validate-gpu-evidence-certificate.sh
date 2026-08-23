@@ -4,22 +4,22 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Validate a retained exact-SHA GPU evidence certificate.
+Validate a retained exact-SHA backend evidence certificate.
 
 Usage: scripts/bench/validate-gpu-evidence-certificate.sh OPTIONS
 
 Options:
   --certificate PATH                  Certificate JSON to validate
-  --backend metal|cuda                Required runtime backend
+  --backend cpu|metal|cuda            Required runtime backend
   --expected-git-sha SHA              Required 40-character source SHA
   --require-continuous-batch-evidence Require certified multi-row continuous batching
   --require-resumable-prefill-evidence Require certified multi-span resumable prefill
   -h, --help                          Show this help
 
-The validator accepts izwi.gpu-kv-evidence.v1 for Metal/CUDA KV matrices and
-izwi.cuda-model-evidence.v1 for CUDA model evidence. Unsupported, skipped,
-dirty-worktree, wrong-provider, missing-cell, and SHA-mismatched certificates
-are rejected.
+The validator accepts izwi.gpu-kv-evidence.v1 for Metal/CUDA KV matrices,
+legacy izwi.cuda-model-evidence.v1, and backend-neutral izwi.model-evidence.v2.
+Unsupported, skipped, dirty-worktree, wrong-provider, missing-cell, and
+SHA-mismatched certificates are rejected.
 EOF
 }
 
@@ -68,8 +68,8 @@ if [[ -z "$certificate" || ! -s "$certificate" ]]; then
   exit 2
 fi
 case "$backend" in
-  metal|cuda) ;;
-  *) echo "error: --backend must be metal or cuda" >&2; exit 2 ;;
+  cpu|metal|cuda) ;;
+  *) echo "error: --backend must be cpu, metal, or cuda" >&2; exit 2 ;;
 esac
 if [[ ! "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo "error: --expected-git-sha must be a lowercase 40-character Git SHA" >&2
@@ -80,6 +80,10 @@ command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 schema=$(jq -r '.schema // empty' "$certificate")
 case "$schema" in
   izwi.gpu-kv-evidence.v1)
+    if [[ "$backend" == cpu ]]; then
+      echo "error: GPU KV evidence cannot certify a CPU runtime" >&2
+      exit 1
+    fi
     if ((require_continuous || require_resumable_prefill)); then
       echo "error: KV-only evidence cannot certify model batching or resumable prefill" >&2
       exit 1
@@ -173,31 +177,36 @@ case "$schema" in
       exit 1
     fi
     ;;
-  izwi.cuda-model-evidence.v1)
-    if [[ "$backend" != cuda ]]; then
-      echo "error: CUDA model evidence cannot certify a Metal runtime" >&2
+  izwi.cuda-model-evidence.v1|izwi.model-evidence.v2)
+    if [[ "$schema" == izwi.cuda-model-evidence.v1 && "$backend" != cuda ]]; then
+      echo "error: legacy CUDA model evidence cannot certify another runtime" >&2
       exit 1
     fi
     if ! jq -e \
+      --arg schema "$schema" \
+      --arg backend "$backend" \
       --arg git_sha "$expected_git_sha" \
       --argjson require_continuous "$require_continuous" \
       --argjson require_resumable_prefill "$require_resumable_prefill" '
-        .schema == "izwi.cuda-model-evidence.v1" and
+        .schema == $schema and
+        (if $schema == "izwi.model-evidence.v2" then .backend == $backend else $backend == "cuda" end) and
         .status == "passed" and
         .run.git_sha == $git_sha and
         .run.worktree_clean == true and
         .device.build_git_sha == $git_sha and
-        .device.requested_backend == "cuda" and
-        .device.selected_backend == "cuda" and
-        .device.cuda_compiled == true and
+        .device.requested_backend == $backend and
+        .device.selected_backend == $backend and
+        (if $schema == "izwi.model-evidence.v2" then
+           .device.backend_compiled == true
+         else .device.cuda_compiled == true end) and
         .device.driver_available == true and
         .device.device_usable == true and
         (.cases | length) > 0 and
         all(.cases[];
           .quality_failed == 0 and
           .telemetry_delta_available == true and
-          .backend_kind == "cuda" and
-          .actual_device_kind == "cuda") and
+          .backend_kind == $backend and
+          .actual_device_kind == $backend) and
         (($require_continuous == 0) or
           (.requirements.continuous_batch == true and
            all(.cases[];
@@ -225,7 +234,7 @@ case "$schema" in
              .prefill_delta.committed_quanta > .prefill_delta.multispan_requests and
              .prefill_delta.committed_tokens > .prefill_delta.committed_quanta)))
       ' "$certificate" >/dev/null; then
-      echo "error: CUDA model certificate failed exact-SHA, runtime, batching, or prefill validation" >&2
+      echo "error: model certificate failed exact-SHA, runtime, batching, or prefill validation" >&2
       exit 1
     fi
     ;;

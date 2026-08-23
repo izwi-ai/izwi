@@ -83,17 +83,17 @@ Validate argument routing and capability classification without compiling:
 scripts/bench/test-run-kv-cache-matrix.sh
 ```
 
-## CUDA model evidence
+## Backend model evidence
 
-`run-cuda-model-evidence.sh` wraps an existing strict benchmark manifest in a
-versioned certification bundle. Unlike compile-only CUDA CI, it requires an
-observed NVIDIA device, a CUDA-selected local Izwi server, zero failed quality
-gates, telemetry for every case, and loaded-model telemetry reporting
-`actual_device_kind=cuda`. Certification additionally requires the running
+`run-model-evidence.sh` wraps an existing strict benchmark manifest in a
+versioned CPU, Metal, or CUDA certification bundle. It requires the requested
+backend to be selected by the local Izwi server, zero failed quality gates,
+telemetry for every case, and matching `actual_device_kind`. CUDA additionally
+requires an observed NVIDIA device. Certification requires the running
 server's compile-time Git SHA to match the checked-out CLI/repository SHA.
 
 ```bash
-scripts/bench/run-cuda-model-evidence.sh \
+scripts/bench/run-model-evidence.sh --backend cuda \
   --manifest benchmarks/manifests/cuda-family-api.toml \
   --server http://127.0.0.1:8080 \
   --output target/cuda-model-evidence
@@ -113,41 +113,42 @@ The protected workflow runs this stricter check separately from broad family
 coverage so generic Candle CUDA execution is not mislabeled as an optimized
 custom kernel.
 
-Continuous batching uses a dedicated concurrent manifest covering Qwen3,
-Qwen3.5, Qwen3.8, LFM2, and Gemma. The
+Continuous batching uses CPU, Metal, and CUDA concurrent manifests covering
+Qwen3, Qwen3.5, Qwen3.8, LFM2, and Gemma. The
 certificate rejects missing run-local multi-row continuous batches, zero work,
 width below two, or physical-batch rejections:
 
 ```bash
 git_sha=$(git rev-parse HEAD)
-scripts/bench/run-cuda-model-evidence.sh \
-  --manifest benchmarks/manifests/cuda-continuous-batching.toml \
+backend=cuda # use cpu or metal with the matching manifest
+scripts/bench/run-model-evidence.sh --backend "$backend" \
+  --manifest "benchmarks/manifests/${backend}-continuous-batching.toml" \
   --require-continuous-batch-evidence \
-  --output target/cuda-continuous-batching-evidence
+  --output "target/${backend}-continuous-batching-evidence"
 scripts/bench/validate-gpu-evidence-certificate.sh \
-  --certificate target/cuda-continuous-batching-evidence/certificate.json \
-  --backend cuda --expected-git-sha "$git_sha" \
+  --certificate "target/${backend}-continuous-batching-evidence/certificate.json" \
+  --backend "$backend" --expected-git-sha "$git_sha" \
   --require-continuous-batch-evidence
 ```
 
 Chunked-prefill certification is separate because concurrency alone does not
 prove that one prompt crossed a resumable safe point. Start the exact-SHA
-server with chunked prefill enabled, then require every model case to report
-more prefill spans than completed samples:
+server with chunked prefill enabled, then require every model case to commit at
+least two scheduler-visible prefill quanta:
 
 ```bash
-scripts/bench/run-cuda-model-evidence.sh \
-  --manifest benchmarks/manifests/cuda-resumable-prefill.toml \
+scripts/bench/run-model-evidence.sh --backend "$backend" \
+  --manifest "benchmarks/manifests/${backend}-resumable-prefill.toml" \
   --require-resumable-prefill-evidence \
-  --output target/cuda-resumable-prefill-evidence
+  --output "target/${backend}-resumable-prefill-evidence"
 scripts/bench/validate-gpu-evidence-certificate.sh \
-  --certificate target/cuda-resumable-prefill-evidence/certificate.json \
-  --backend cuda --expected-git-sha "$git_sha" \
+  --certificate "target/${backend}-resumable-prefill-evidence/certificate.json" \
+  --backend "$backend" --expected-git-sha "$git_sha" \
   --require-resumable-prefill-evidence
 ```
 
-These manifests establish runtime behavior, not universal performance. Retain
-separate CPU, Apple Silicon, and NVIDIA before/after runs with the same model
+These certificates establish runtime behavior, not universal performance.
+Retain CPU, Apple Silicon, and NVIDIA before/after runs with the same model
 revision, prompt matrix, sampling policy, and concurrency. Promotion requires
 no quality regression and reviewed TTFT, inter-token latency, throughput,
 memory, host-read, metadata-upload, batch-width, and padding deltas for the

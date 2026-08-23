@@ -6195,10 +6195,14 @@ concurrent = [1, 2]
     }
 
     #[test]
-    fn cuda_chat_performance_manifests_cover_every_chat_family() {
+    fn backend_chat_performance_manifests_cover_every_chat_family() {
         let manifest_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
         for name in [
+            "cpu-continuous-batching.toml",
+            "cpu-resumable-prefill.toml",
+            "metal-continuous-batching.toml",
+            "metal-resumable-prefill.toml",
             "cuda-continuous-batching.toml",
             "cuda-resumable-prefill.toml",
         ] {

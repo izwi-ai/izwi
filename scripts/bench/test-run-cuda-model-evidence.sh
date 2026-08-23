@@ -4,6 +4,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 runner="${repo_root}/scripts/bench/run-cuda-model-evidence.sh"
+generic_runner="${repo_root}/scripts/bench/run-model-evidence.sh"
 manifest="${repo_root}/benchmarks/manifests/vibevoice-cuda.toml"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -13,18 +14,27 @@ grep -q -- '--allow-unsupported' <<<"${help}"
 grep -q -- '--require-optimized-kernel-evidence' <<<"${help}"
 grep -q -- '--require-continuous-batch-evidence' <<<"${help}"
 grep -q -- '--require-resumable-prefill-evidence' <<<"${help}"
-grep -q 'actual_device_kind=cuda' <<<"${help}"
+grep -q 'selected backend health' <<<"${help}"
 
 dry_output=$(${runner} --manifest "${manifest}" --output "${tmp_dir}/dry" --dry-run \
     --require-continuous-batch-evidence --require-resumable-prefill-evidence)
 grep -q 'IZWI_BENCH_QUALITY_MODE=strict' <<<"${dry_output}"
 grep -q -- '--artifact-dir' <<<"${dry_output}"
-jq -e '.schema == "izwi.cuda-model-evidence.v1" and .status == "unsupported" and
+jq -e '.schema == "izwi.model-evidence.v2" and .backend == "cuda" and .status == "unsupported" and
        .reason == "dry_run" and .requirements.continuous_batch == true and
        .requirements.resumable_prefill == true and
        (.run.worktree_clean | type == "boolean")' \
     "${tmp_dir}/dry/certificate.json" >/dev/null
 [[ ! -e "${tmp_dir}/dry/benchmark" ]]
+
+for portable_backend in cpu metal; do
+    ${generic_runner} --backend "${portable_backend}" --manifest "${manifest}" \
+        --output "${tmp_dir}/${portable_backend}-dry" --dry-run >/dev/null
+    jq -e --arg backend "${portable_backend}" '
+        .schema == "izwi.model-evidence.v2" and .backend == $backend and
+        .status == "unsupported" and .reason == "dry_run"
+    ' "${tmp_dir}/${portable_backend}-dry/certificate.json" >/dev/null
+done
 
 if IZWI_CUDA_EVIDENCE_NVIDIA_SMI=/usr/bin/false \
     ${runner} --manifest "${manifest}" --output "${tmp_dir}/required" >/dev/null 2>&1; then
