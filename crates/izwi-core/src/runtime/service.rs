@@ -43,7 +43,10 @@ use crate::engine::{
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
     ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_SCHEDULER_QUEUE_DEPTH,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO,
+    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
+    ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
     ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL, ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
     ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, REQUEST_DEADLINE_EXCEEDED,
@@ -2632,6 +2635,11 @@ impl RuntimeService {
         EngineRuntimeTelemetrySnapshot {
             scheduler_queue_depth: queue_depth,
             scheduler_running_requests: running_requests,
+            incremental_prefill_quanta_committed_total: batch
+                .incremental_prefill_quanta_committed_total,
+            incremental_prefill_tokens_committed_total: batch
+                .incremental_prefill_tokens_committed_total,
+            multispan_prefill_requests_total: batch.multispan_prefill_requests_total,
             stream_backpressure_total: stream.backpressure_total,
             stream_checkpoints_committed_total: stream.checkpoints_committed_total,
             stream_checkpoint_rejections_total: stream.checkpoint_rejections_total,
@@ -2679,6 +2687,21 @@ impl RuntimeService {
             payload,
             ENGINE_SCHEDULER_RUNNING_REQUESTS,
             snapshot.scheduler_running_requests,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+            snapshot.incremental_prefill_quanta_committed_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
+            snapshot.incremental_prefill_tokens_committed_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL,
+            snapshot.multispan_prefill_requests_total,
         );
         push_engine_metric(
             payload,

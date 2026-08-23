@@ -210,14 +210,20 @@ case "$schema" in
              .batch_delta.max_width_after >= 2 and
              .batch_delta.useful_elements > 0 and
              .batch_delta.materialized_elements >= .batch_delta.useful_elements and
+             .batch_delta.model_tensor_batches > 0 and
+             .batch_delta.model_multirow_calls > 0 and
+             .batch_delta.model_rows > .batch_delta.model_multirow_calls and
+             .batch_delta.model_max_width_after >= 2 and
+             .batch_delta.continuous_scalar_fallbacks == 0 and
              .batch_delta.physical_batch_rejections == 0)))
         and
         (($require_resumable_prefill == 0) or
           (.requirements.resumable_prefill == true and
            all(.cases[];
              .command == "chat" and
-             .kernel_delta.prefill_sequence_spans > .samples and
-             .kernel_delta.prefill_sequence_tokens > .kernel_delta.prefill_sequence_spans)))
+             .prefill_delta.multispan_requests >= .samples and
+             .prefill_delta.committed_quanta > .prefill_delta.multispan_requests and
+             .prefill_delta.committed_tokens > .prefill_delta.committed_quanta)))
       ' "$certificate" >/dev/null; then
       echo "error: CUDA model certificate failed exact-SHA, runtime, batching, or prefill validation" >&2
       exit 1

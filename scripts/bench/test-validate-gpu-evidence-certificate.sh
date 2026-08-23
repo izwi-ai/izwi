@@ -119,8 +119,14 @@ jq -n --arg git_sha "$git_sha" '
         rows: 24,
         capacity_rows: 32,
         useful_elements: 3072,
-        materialized_elements: 4096
+        materialized_elements: 4096,
+        model_tensor_batches: 4,
+        model_rows: 24,
+        model_multirow_calls: 3,
+        model_max_width_after: 8,
+        continuous_scalar_fallbacks: 0
       },
+      prefill_delta: {committed_quanta: 16, committed_tokens: 2048, multispan_requests: 8},
       kernel_delta: {prefill_sequence_spans: 16, prefill_sequence_tokens: 2048}
     }]
   }' >"$tmp_dir/model-certificate.json"
@@ -128,11 +134,19 @@ $validator --certificate "$tmp_dir/model-certificate.json" --backend cuda \
   --expected-git-sha "$git_sha" --require-continuous-batch-evidence \
   --require-resumable-prefill-evidence >/dev/null
 
-jq '.cases[0].kernel_delta.prefill_sequence_spans = .cases[0].samples' \
+jq '.cases[0].prefill_delta.multispan_requests = .cases[0].samples - 1' \
   "$tmp_dir/model-certificate.json" >"$tmp_dir/model-no-resume.json"
 if $validator --certificate "$tmp_dir/model-no-resume.json" --backend cuda \
   --expected-git-sha "$git_sha" --require-resumable-prefill-evidence >/dev/null 2>&1; then
   echo 'validator accepted a certificate without multiple prefill spans per sample' >&2
+  exit 1
+fi
+
+jq '.cases[0].batch_delta.continuous_scalar_fallbacks = 1' \
+  "$tmp_dir/model-certificate.json" >"$tmp_dir/model-scalar-fallback.json"
+if $validator --certificate "$tmp_dir/model-scalar-fallback.json" --backend cuda \
+  --expected-git-sha "$git_sha" --require-continuous-batch-evidence >/dev/null 2>&1; then
+  echo 'validator accepted a scalar model fallback inside a continuous envelope' >&2
   exit 1
 fi
 

@@ -55,6 +55,9 @@ pub struct InferenceBrokerRuntimeTelemetrySnapshot {
 pub struct EngineRuntimeTelemetrySnapshot {
     pub scheduler_queue_depth: u64,
     pub scheduler_running_requests: u64,
+    pub incremental_prefill_quanta_committed_total: u64,
+    pub incremental_prefill_tokens_committed_total: u64,
+    pub multispan_prefill_requests_total: u64,
     pub stream_backpressure_total: u64,
     pub stream_checkpoints_committed_total: u64,
     pub stream_checkpoint_rejections_total: u64,

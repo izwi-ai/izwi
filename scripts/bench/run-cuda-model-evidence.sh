@@ -305,6 +305,12 @@ if ! jq -e \
           $telemetry.before.engine.tensor_batch_useful_elements_total) as $useful_elements |
          ($telemetry.after.engine.tensor_batch_materialized_elements_total -
           $telemetry.before.engine.tensor_batch_materialized_elements_total) as $materialized_elements |
+         (($telemetry.after.engine.model_tensor_multirow_calls_total // 0) -
+          ($telemetry.before.engine.model_tensor_multirow_calls_total // 0)) as $model_multirow_calls |
+         (($telemetry.after.engine.model_tensor_batch_rows_total // 0) -
+          ($telemetry.before.engine.model_tensor_batch_rows_total // 0)) as $model_rows |
+         (($telemetry.after.engine.continuous_envelope_scalar_fallbacks_total // 0) -
+          ($telemetry.before.engine.continuous_envelope_scalar_fallbacks_total // 0)) as $scalar_fallbacks |
          $report.command == "chat" and
          $report.config.concurrent >= 2 and
          $continuous > 0 and
@@ -315,19 +321,26 @@ if ! jq -e \
          $useful_elements > 0 and
          $materialized_elements >= $useful_elements and
          $telemetry.after.engine.tensor_batch_max_width >= 2 and
+         $model_multirow_calls > 0 and
+         $model_rows > $model_multirow_calls and
+         ($telemetry.after.engine.model_tensor_batch_max_width // 0) >= 2 and
+         $scalar_fallbacks == 0 and
          $telemetry.after.engine.physical_batch_rejections_total ==
            $telemetry.before.engine.physical_batch_rejections_total)
     ] | all(. == true))) and
     (($require_resumable_prefill == 0) or ([.reports[] |
         .report as $report |
         $report.telemetry as $telemetry |
-        (($telemetry.after.kernel_path.prefill_sequence_spans_total // 0) -
-         ($telemetry.before.kernel_path.prefill_sequence_spans_total // 0)) as $spans |
-        (($telemetry.after.kernel_path.prefill_sequence_tokens_total // 0) -
-         ($telemetry.before.kernel_path.prefill_sequence_tokens_total // 0)) as $tokens |
+        (($telemetry.after.engine.incremental_prefill_quanta_committed_total // 0) -
+         ($telemetry.before.engine.incremental_prefill_quanta_committed_total // 0)) as $quanta |
+        (($telemetry.after.engine.incremental_prefill_tokens_committed_total // 0) -
+         ($telemetry.before.engine.incremental_prefill_tokens_committed_total // 0)) as $tokens |
+        (($telemetry.after.engine.multispan_prefill_requests_total // 0) -
+         ($telemetry.before.engine.multispan_prefill_requests_total // 0)) as $requests |
         $report.command == "chat" and
-        $spans > ($report.samples | length) and
-        $tokens > $spans
+        $requests >= ($report.samples | length) and
+        $quanta > $requests and
+        $tokens > $quanta
     ] | all(. == true))) and
     (($require_optimized == 0) or ([.reports[] |
         .report.telemetry as $telemetry |
@@ -428,6 +441,14 @@ jq -n \
              ($telemetry.before.engine.tensor_batch_materialized_elements_total // 0)) as $materialized_elements |
             (($telemetry.after.engine.batch_workspace_bytes_total // 0) -
              ($telemetry.before.engine.batch_workspace_bytes_total // 0)) as $workspace_bytes |
+            (($telemetry.after.engine.model_tensor_batches_total // 0) -
+             ($telemetry.before.engine.model_tensor_batches_total // 0)) as $model_tensor_batches |
+            (($telemetry.after.engine.model_tensor_batch_rows_total // 0) -
+             ($telemetry.before.engine.model_tensor_batch_rows_total // 0)) as $model_rows |
+            (($telemetry.after.engine.model_tensor_multirow_calls_total // 0) -
+             ($telemetry.before.engine.model_tensor_multirow_calls_total // 0)) as $model_multirow_calls |
+            (($telemetry.after.engine.continuous_envelope_scalar_fallbacks_total // 0) -
+             ($telemetry.before.engine.continuous_envelope_scalar_fallbacks_total // 0)) as $scalar_fallbacks |
             {
                 name: .name,
                 command: .report.command,
@@ -454,7 +475,17 @@ jq -n \
                     padding_ratio: (if $materialized_elements > 0 then
                         1 - ($useful_elements / $materialized_elements)
                       else null end),
-                    workspace_bytes: $workspace_bytes
+                    workspace_bytes: $workspace_bytes,
+                    model_tensor_batches: $model_tensor_batches,
+                    model_rows: $model_rows,
+                    model_multirow_calls: $model_multirow_calls,
+                    model_max_width_after: ($telemetry.after.engine.model_tensor_batch_max_width // 0),
+                    continuous_scalar_fallbacks: $scalar_fallbacks
+                },
+                prefill_delta: {
+                    committed_quanta: ((.report.telemetry.after.engine.incremental_prefill_quanta_committed_total // 0) - (.report.telemetry.before.engine.incremental_prefill_quanta_committed_total // 0)),
+                    committed_tokens: ((.report.telemetry.after.engine.incremental_prefill_tokens_committed_total // 0) - (.report.telemetry.before.engine.incremental_prefill_tokens_committed_total // 0)),
+                    multispan_requests: ((.report.telemetry.after.engine.multispan_prefill_requests_total // 0) - (.report.telemetry.before.engine.multispan_prefill_requests_total // 0))
                 },
                 kernel_delta: {
                     host_read_ops: ((.report.telemetry.after.kernel_path.host_read_ops_total // 0) - (.report.telemetry.before.kernel_path.host_read_ops_total // 0)),

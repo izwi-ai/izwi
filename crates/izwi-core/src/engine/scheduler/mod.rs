@@ -437,6 +437,8 @@ struct RunningRequest {
     prefill_complete: bool,
     /// Whether a prefill quantum has been scheduled but not yet committed.
     prefill_in_flight: bool,
+    /// Scheduler-visible incremental-prefill quanta committed for this request.
+    incremental_prefill_quanta_committed: usize,
     /// Priority of this request
     priority: Priority,
     /// Coarse latency/throughput class for this request.
@@ -1007,6 +1009,7 @@ impl Scheduler {
                 // complete prompt was actually consumed.
                 prefill_complete: false,
                 prefill_in_flight: true,
+                incremental_prefill_quanta_committed: 0,
                 priority: metadata.priority,
                 workload_class: metadata.workload_class,
                 first_token_emitted: false,
@@ -1065,11 +1068,26 @@ impl Scheduler {
                 metadata.retry_not_before = None;
             }
         }
+        let incremental_prefill = self
+            .requests
+            .get(request_id)
+            .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental);
         if let Some(running) = self.running.get_mut(request_id) {
+            let committed_incremental_prefill =
+                incremental_prefill && !running.prefill_complete && tokens_processed > 0;
             running.prefill_in_flight = false;
             running.paused = false;
             running.num_tokens_processed += tokens_processed;
             running.num_tokens_generated += tokens_generated;
+            if committed_incremental_prefill {
+                running.incremental_prefill_quanta_committed = running
+                    .incremental_prefill_quanta_committed
+                    .saturating_add(1);
+                crate::engine::metrics::record_engine_incremental_prefill_commit(
+                    tokens_processed,
+                    running.incremental_prefill_quanta_committed == 2,
+                );
+            }
 
             // Check if prefill is now complete
             if let Some(metadata) = self.requests.get(request_id) {
@@ -1225,6 +1243,7 @@ impl Scheduler {
         }
 
         running.num_tokens_processed = 0;
+        running.incremental_prefill_quanta_committed = 0;
         running.num_tokens_generated = 0;
         running.prefill_complete = false;
         running.prefill_in_flight = false;
@@ -2718,6 +2737,7 @@ mod tests {
 
     #[test]
     fn incremental_prefill_continues_after_committed_partial_step() {
+        let telemetry_before = crate::engine::metrics::engine_batch_metrics_snapshot();
         let config = SchedulerConfig {
             max_batch_size: 1,
             max_tokens_per_step: 4,
@@ -2762,6 +2782,20 @@ mod tests {
                 input: InputRange { start: 4, end: 8 },
                 max_output_steps: 4,
             }
+        );
+        scheduler.update_after_step(&request_id, 4, 0, 1.0);
+        let telemetry_after = crate::engine::metrics::engine_batch_metrics_snapshot();
+        assert!(
+            telemetry_after.incremental_prefill_quanta_committed_total
+                >= telemetry_before.incremental_prefill_quanta_committed_total + 2
+        );
+        assert!(
+            telemetry_after.incremental_prefill_tokens_committed_total
+                >= telemetry_before.incremental_prefill_tokens_committed_total + 8
+        );
+        assert!(
+            telemetry_after.multispan_prefill_requests_total
+                > telemetry_before.multispan_prefill_requests_total
         );
     }
 

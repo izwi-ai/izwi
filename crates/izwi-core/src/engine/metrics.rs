@@ -29,6 +29,12 @@ pub struct EngineMetricDescriptor {
 pub const ENGINE_SCHEDULER_QUEUE_DEPTH: &str = "engine.scheduler.queue_depth";
 pub const ENGINE_SCHEDULER_RUNNING_REQUESTS: &str = "engine.scheduler.running_requests";
 pub const ENGINE_SCHEDULER_STEP_TOKENS_TOTAL: &str = "engine.scheduler.step_tokens_total";
+pub const ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL: &str =
+    "engine.scheduler.incremental_prefill_quanta_committed_total";
+pub const ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL: &str =
+    "engine.scheduler.incremental_prefill_tokens_committed_total";
+pub const ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL: &str =
+    "engine.scheduler.multispan_prefill_requests_total";
 pub const ENGINE_KV_CACHE_HITS_TOTAL: &str = "engine.kv_cache.hits_total";
 pub const ENGINE_KV_CACHE_MISSES_TOTAL: &str = "engine.kv_cache.misses_total";
 pub const ENGINE_KV_CACHE_EVICTIONS_TOTAL: &str = "engine.kv_cache.evictions_total";
@@ -103,6 +109,18 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
         description: "Tokens admitted into scheduler execution steps.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+        description: "Successfully committed scheduler-visible incremental-prefill quanta.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
+        description: "Prompt tokens committed by scheduler-visible incremental-prefill quanta.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL,
+        description: "Requests observed committing at least two incremental-prefill quanta.",
     },
     EngineMetricDescriptor {
         name: ENGINE_KV_CACHE_HITS_TOTAL,
@@ -405,6 +423,9 @@ impl EngineWorkspaceDomainMetricsSnapshot {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineBatchMetricsSnapshot {
+    pub incremental_prefill_quanta_committed_total: u64,
+    pub incremental_prefill_tokens_committed_total: u64,
+    pub multispan_prefill_requests_total: u64,
     pub tensor_batches_total: u64,
     pub tensor_static_batches_total: u64,
     pub tensor_continuous_batches_total: u64,
@@ -430,6 +451,18 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_decode_calls_total: u64,
     pub model_tensor_multirow_calls_total: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
+}
+
+static ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED: AtomicU64 = AtomicU64::new(0);
+static ENGINE_INCREMENTAL_PREFILL_TOKENS_COMMITTED: AtomicU64 = AtomicU64::new(0);
+static ENGINE_MULTISPAN_PREFILL_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_engine_incremental_prefill_commit(tokens: usize, became_multispan: bool) {
+    ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED.fetch_add(1, Ordering::Relaxed);
+    ENGINE_INCREMENTAL_PREFILL_TOKENS_COMMITTED.fetch_add(tokens as u64, Ordering::Relaxed);
+    if became_multispan {
+        ENGINE_MULTISPAN_PREFILL_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
@@ -596,6 +629,11 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
     let useful_elements = ENGINE_TENSOR_BATCH_USEFUL_ELEMENTS.load(Ordering::Relaxed);
     let materialized_elements = ENGINE_TENSOR_BATCH_MATERIALIZED_ELEMENTS.load(Ordering::Relaxed);
     EngineBatchMetricsSnapshot {
+        incremental_prefill_quanta_committed_total: ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED
+            .load(Ordering::Relaxed),
+        incremental_prefill_tokens_committed_total: ENGINE_INCREMENTAL_PREFILL_TOKENS_COMMITTED
+            .load(Ordering::Relaxed),
+        multispan_prefill_requests_total: ENGINE_MULTISPAN_PREFILL_REQUESTS.load(Ordering::Relaxed),
         tensor_batches_total: engine_tensor_batches_total(),
         tensor_static_batches_total: ENGINE_TENSOR_STATIC_BATCHES.load(Ordering::Relaxed),
         tensor_continuous_batches_total: ENGINE_TENSOR_CONTINUOUS_BATCHES.load(Ordering::Relaxed),

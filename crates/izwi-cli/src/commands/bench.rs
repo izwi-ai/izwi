@@ -84,6 +84,12 @@ struct EngineRuntimeTelemetrySnapshot {
     #[serde(default)]
     scheduler_running_requests: u64,
     #[serde(default)]
+    incremental_prefill_quanta_committed_total: u64,
+    #[serde(default)]
+    incremental_prefill_tokens_committed_total: u64,
+    #[serde(default)]
+    multispan_prefill_requests_total: u64,
+    #[serde(default)]
     stream_backpressure_total: u64,
     #[serde(default)]
     tensor_batches_total: u64,
