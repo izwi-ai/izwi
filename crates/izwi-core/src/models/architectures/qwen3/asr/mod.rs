@@ -3273,6 +3273,7 @@ mod tests {
             domain: ExecutionDomain::ExecutionGroup,
             progress,
             concurrency: ConcurrencyClass::Exclusive,
+            physical_launch_policy: crate::engine::PhysicalLaunchPolicy::ExecutionGroupExclusive,
             batch_mode: NativeBatchMode::None,
             max_batch_size: 1,
             max_work_units: 1,

@@ -312,6 +312,7 @@ mod tests {
             progress: StageProgressKind::Atomic,
             batch_mode: NativeBatchMode::None,
             concurrency: ConcurrencyClass::Exclusive,
+            physical_launch_policy: crate::engine::PhysicalLaunchPolicy::ExecutionGroupExclusive,
             max_batch_size: 1,
             max_work_units: 1,
             workspace_base_bytes: 256,

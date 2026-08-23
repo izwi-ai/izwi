@@ -450,6 +450,7 @@ mod tests {
             domain: ExecutionDomain::ExecutionGroup,
             progress: StageProgressKind::Atomic,
             concurrency: ConcurrencyClass::Batchable,
+            physical_launch_policy: crate::engine::PhysicalLaunchPolicy::ExecutionGroupExclusive,
             batch_mode: NativeBatchMode::None,
             max_batch_size: 2,
             max_work_units: 1,

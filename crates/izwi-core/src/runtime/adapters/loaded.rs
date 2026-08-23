@@ -8,7 +8,8 @@ use crate::engine::ManagedKvModelRuntime;
 use crate::engine::{
     AdapterAbiRevision, AdapterInstanceId, CacheMode, CancellationGranularity, ConcurrencyClass,
     ExecutionAdapterBinding, ExecutionGroupId, ExecutionMode, ExecutionProfile, ModelInstanceId,
-    NativeBatchMode, OutputVisibility, PrefillMode, StageDescriptor, StageId, StageWorkSelector,
+    NativeBatchMode, OutputVisibility, PhysicalLaunchPolicy, PrefillMode, StageDescriptor, StageId,
+    StageShapePolicy, StageWorkSelector,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -24,10 +25,10 @@ use super::{
     RuntimeAdapterRegistry, StreamingMode,
 };
 
-const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(7);
-const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(8);
-const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(9);
-const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(10);
+const SCALAR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(11);
+const STATIC_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(12);
+const CONTINUOUS_TENSOR_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(13);
+const NEMOTRON_REALTIME_ADAPTER_ABI: AdapterAbiRevision = AdapterAbiRevision::new(14);
 const STATIC_TTS_MAX_BATCH_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONTINUOUS_CHAT_MAX_BATCH_WORKSPACE_BYTES: u64 = 16 * 1024 * 1024;
 // Qwen3.8 MTP supports draft depths one through three, which requires an
@@ -92,6 +93,30 @@ fn scalar_request_parallelism(backend_kind: BackendKind, configured: usize) -> u
     }
 }
 
+/// Closed certification table for overlapping physical model calls.
+///
+/// Whisper's CPU graph is reentrant: loaded weights and preprocessing plans are
+/// immutable, while decoder self-attention and cross-attention state are exact
+/// per-row invocation leases. Metal/CUDA kernels and every other loaded model
+/// remain execution-group serialized until separately certified.
+fn certified_physical_launch_policy(
+    metadata: AdapterMetadata,
+    backend_kind: BackendKind,
+    adapter_abi_revision: AdapterAbiRevision,
+    max_in_flight_per_model: usize,
+) -> Result<PhysicalLaunchPolicy> {
+    if backend_kind == BackendKind::Cpu
+        && metadata.capability == CapabilityKind::Asr
+        && metadata.model_variant == ModelVariant::WhisperLargeV3Turbo
+        && adapter_abi_revision == SCALAR_ADAPTER_ABI
+        && max_in_flight_per_model > 1
+    {
+        PhysicalLaunchPolicy::concurrent(max_in_flight_per_model)
+    } else {
+        Ok(PhysicalLaunchPolicy::ExecutionGroupExclusive)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedExecutionContract {
     pub(crate) execution_group_id: ExecutionGroupId,
@@ -104,7 +129,57 @@ pub(crate) struct LoadedExecutionContract {
 }
 
 impl LoadedExecutionContract {
+    fn validate_physical_launch_policy(&self) -> Result<()> {
+        if !self.execution_profile.resolved_from_loaded_model {
+            return Err(Error::ModelLoadError(
+                "loaded execution contract is not resolved from an exact model instance".into(),
+            ));
+        }
+        if self.execution_profile.model_variant != Some(self.metadata.model_variant) {
+            return Err(Error::ModelLoadError(
+                "loaded execution contract model identity does not match adapter metadata".into(),
+            ));
+        }
+
+        let declared = self.execution_profile.effective_physical_launch_policy();
+        let certified = certified_physical_launch_policy(
+            self.metadata,
+            self.execution_profile.backend,
+            self.adapter_abi_revision,
+            self.execution_profile.max_batch_size,
+        )?;
+        if declared != certified {
+            return Err(Error::ModelLoadError(format!(
+                "loaded model {} capability {:?} declared uncertified physical launch policy {declared:?}; certified policy is {certified:?}",
+                self.metadata.model_variant, self.metadata.capability,
+            )));
+        }
+        if self
+            .stages
+            .iter()
+            .any(|stage| stage.physical_launch_policy != declared)
+        {
+            return Err(Error::ModelLoadError(
+                "loaded execution stage launch policy does not match its sealed profile".into(),
+            ));
+        }
+        if matches!(declared, PhysicalLaunchPolicy::Concurrent { .. })
+            && (self.execution_profile.concurrency != ConcurrencyClass::Batchable
+                || self.stages.iter().any(|stage| {
+                    stage.batch_mode != NativeBatchMode::None
+                        || stage.concurrency != ConcurrencyClass::Batchable
+                        || stage.shape_policy != StageShapePolicy::Independent
+                }))
+        {
+            return Err(Error::ModelLoadError(
+                "concurrent physical launches require independently shaped scalar rows".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn adapter_binding(&self) -> Result<ExecutionAdapterBinding> {
+        self.validate_physical_launch_policy()?;
         let binding = ExecutionAdapterBinding {
             execution_group_id: self.execution_group_id,
             model_instance_id: self.model_instance_id,
@@ -220,10 +295,33 @@ fn loaded_execution_contracts(
         });
         requirements.push(StreamingRequirements::native(true));
     }
-    requirements
+    let contracts = requirements
         .into_iter()
-        .map(|requirements| execution.contract(requirements))
-        .collect()
+        .map(|requirements| {
+            let contract = execution.contract(requirements)?;
+            contract.validate_physical_launch_policy()?;
+            Ok(contract)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let launch_policy = contracts
+        .first()
+        .map(|contract| {
+            contract
+                .execution_profile
+                .effective_physical_launch_policy()
+        })
+        .ok_or_else(|| Error::ModelLoadError("loaded adapter produced no contracts".into()))?;
+    if contracts.iter().any(|contract| {
+        contract
+            .execution_profile
+            .effective_physical_launch_policy()
+            != launch_policy
+    }) {
+        return Err(Error::ModelLoadError(
+            "one loaded adapter instance produced inconsistent launch policies".into(),
+        ));
+    }
+    Ok(contracts)
 }
 
 impl LoadedCapabilityDescriptor {
@@ -521,7 +619,9 @@ impl LoadedCapabilityDescriptor {
     }
 
     fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
-        self.execution.contract(streaming)
+        let contract = self.execution.contract(streaming)?;
+        contract.validate_physical_launch_policy()?;
+        Ok(contract)
     }
 
     fn binding(&self, streaming: StreamingRequirements) -> Result<LoadedCapabilityBinding> {
@@ -866,6 +966,12 @@ fn scalar_contract(
     } else {
         ConcurrencyClass::Exclusive
     };
+    execution_profile.physical_launch_policy = certified_physical_launch_policy(
+        metadata,
+        backend_kind,
+        adapter_abi_revision,
+        execution_profile.max_batch_size,
+    )?;
 
     let mut stage = StageDescriptor::from_execution_profile(
         StageId::new(0),
@@ -2314,6 +2420,133 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn loaded_launch_policy_matrix_only_certifies_cpu_whisper_asr() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
+
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            for (index, variant) in ModelVariant::all().iter().copied().enumerate() {
+                let draft = LoadedModelBundleDraft::build(
+                    &registry,
+                    ExecutionGroupId::new(41),
+                    ModelInstanceId::new(index as u64 + 1),
+                    variant,
+                    backend,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("failed to build {variant} for {backend:?}: {error}")
+                });
+                for execution in draft.capabilities.values() {
+                    let metadata = execution.metadata();
+                    for contract in
+                        loaded_execution_contracts(execution.as_ref()).unwrap_or_else(|error| {
+                            panic!(
+                                "failed launch contract for {variant} {:?} on {backend:?}: {error}",
+                                metadata.capability
+                            )
+                        })
+                    {
+                        let expected = if backend == BackendKind::Cpu
+                            && variant == ModelVariant::WhisperLargeV3Turbo
+                            && metadata.capability == CapabilityKind::Asr
+                        {
+                            PhysicalLaunchPolicy::concurrent(3).unwrap()
+                        } else {
+                            PhysicalLaunchPolicy::ExecutionGroupExclusive
+                        };
+                        assert_eq!(
+                            contract.execution_profile.physical_launch_policy, expected,
+                            "{variant} {:?} on {backend:?}",
+                            metadata.capability
+                        );
+                        assert!(contract
+                            .stages
+                            .iter()
+                            .all(|stage| stage.physical_launch_policy == expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_contracts_reject_unknown_policy_and_stage_profile_mismatch() {
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
+        let unknown = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(42),
+            ModelInstanceId::new(1),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let base = unknown
+            .execution_contracts(CapabilityKind::Tts)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            base.execution_profile.concurrency,
+            ConcurrencyClass::Batchable
+        );
+        assert_eq!(
+            base.execution_profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        for policy in [
+            PhysicalLaunchPolicy::ModelExclusive,
+            PhysicalLaunchPolicy::concurrent(3).unwrap(),
+        ] {
+            let mut contract = base.clone();
+            contract.execution_profile.physical_launch_policy = policy;
+            contract.stages = contract
+                .stages
+                .iter()
+                .cloned()
+                .map(|mut stage| {
+                    stage.physical_launch_policy = policy;
+                    stage
+                })
+                .collect::<Vec<_>>()
+                .into();
+            let error = contract
+                .validate_physical_launch_policy()
+                .expect_err("uncertified model policy must fail closed");
+            assert!(error
+                .to_string()
+                .contains("uncertified physical launch policy"));
+        }
+
+        let whisper = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(43),
+            ModelInstanceId::new(2),
+            ModelVariant::WhisperLargeV3Turbo,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let mut mismatch = whisper
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .remove(0);
+        let mut stale_abi = mismatch.clone();
+        stale_abi.adapter_abi_revision = AdapterAbiRevision::new(7);
+        let error = stale_abi
+            .validate_physical_launch_policy()
+            .expect_err("an uncertified adapter ABI must not inherit concurrency");
+        assert!(error
+            .to_string()
+            .contains("uncertified physical launch policy"));
+
+        let mut stages = mismatch.stages.to_vec();
+        stages[0].physical_launch_policy = PhysicalLaunchPolicy::ExecutionGroupExclusive;
+        mismatch.stages = stages.into();
+        let error = mismatch
+            .validate_physical_launch_policy()
+            .expect_err("stage/profile launch-policy mismatch must fail closed");
+        assert!(error.to_string().contains("stage launch policy"));
     }
 
     #[test]

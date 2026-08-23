@@ -256,6 +256,10 @@ pub struct StageDescriptor {
     pub domain: ExecutionDomain,
     pub progress: StageProgressKind,
     pub concurrency: ConcurrencyClass,
+    /// Load-sealed certification for overlap between distinct physical calls.
+    /// This remains independent from row formation within one physical batch.
+    #[serde(default)]
+    pub physical_launch_policy: PhysicalLaunchPolicy,
     pub batch_mode: NativeBatchMode,
     pub max_batch_size: usize,
     pub max_work_units: u64,
@@ -315,6 +319,7 @@ impl StageDescriptor {
             },
             progress,
             concurrency,
+            physical_launch_policy: profile.effective_physical_launch_policy(),
             batch_mode,
             max_batch_size: profile.max_batch_size.max(1),
             max_work_units: u64::MAX,
@@ -376,6 +381,19 @@ impl StageDescriptor {
         {
             return Err(Error::InvalidInput(
                 "request-parallel stages must use independent row shapes".to_string(),
+            ));
+        }
+        if matches!(
+            self.physical_launch_policy,
+            PhysicalLaunchPolicy::Concurrent { .. }
+        ) && (self.domain != ExecutionDomain::ExecutionGroup
+            || self.batch_mode != NativeBatchMode::None
+            || self.concurrency != ConcurrencyClass::Batchable
+            || self.shape_policy != StageShapePolicy::Independent)
+        {
+            return Err(Error::InvalidInput(
+                "concurrent physical launches require independent scalar execution-group rows"
+                    .to_string(),
             ));
         }
         if self.shape_policy != StageShapePolicy::Padded && self.max_padding_basis_points != 0 {
@@ -2253,6 +2271,10 @@ mod tests {
         assert_eq!(stage.batch_mode, NativeBatchMode::None);
         assert_eq!(stage.progress, StageProgressKind::Atomic);
         assert_eq!(
+            stage.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        assert_eq!(
             profile.physical_launch_policy,
             PhysicalLaunchPolicy::ExecutionGroupExclusive
         );
@@ -2276,6 +2298,22 @@ mod tests {
                 .effective_max_in_flight_per_model(PhysicalInFlightLimit::new(8).unwrap()),
             1
         );
+
+        profile.resolved_from_loaded_model = true;
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "tensor.batchable",
+            &profile,
+            NativeBatchMode::Static,
+        );
+        assert_eq!(stage.concurrency, ConcurrencyClass::Batchable);
+        assert_eq!(
+            stage.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        let mut falsely_concurrent = stage;
+        falsely_concurrent.physical_launch_policy = PhysicalLaunchPolicy::concurrent(8).unwrap();
+        assert!(falsely_concurrent.validate().is_err());
     }
 
     #[test]
@@ -2338,6 +2376,23 @@ mod tests {
         let legacy: ExecutionProfile = serde_json::from_value(legacy).unwrap();
         assert_eq!(
             legacy.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        let stage = StageDescriptor::from_execution_profile(
+            StageId::new(1),
+            "legacy-stage",
+            &profile,
+            NativeBatchMode::None,
+        );
+        let mut legacy_stage = serde_json::to_value(&stage).unwrap();
+        legacy_stage
+            .as_object_mut()
+            .unwrap()
+            .remove("physical_launch_policy");
+        let legacy_stage: StageDescriptor = serde_json::from_value(legacy_stage).unwrap();
+        assert_eq!(
+            legacy_stage.physical_launch_policy,
             PhysicalLaunchPolicy::ExecutionGroupExclusive
         );
 
@@ -2409,6 +2464,7 @@ mod tests {
             domain: ExecutionDomain::ExecutionGroup,
             progress: StageProgressKind::Atomic,
             concurrency: ConcurrencyClass::Batchable,
+            physical_launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
             batch_mode: NativeBatchMode::Continuous,
             max_batch_size: 2,
             max_work_units: 2,
@@ -2512,6 +2568,23 @@ mod tests {
         batch.materialized_tensor_elements = 10;
         batch.rows[0].lane.shape_bucket = "tokens.2".to_string();
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn loaded_model_adapter_and_abi_identity_prevent_cross_cohorting() {
+        let baseline = lane();
+
+        let mut reloaded_model = baseline.clone();
+        reloaded_model.model_instance = ModelInstanceId::new(99);
+        assert_ne!(baseline, reloaded_model);
+
+        let mut reloaded_adapter = baseline.clone();
+        reloaded_adapter.adapter_instance = AdapterInstanceId::new(99);
+        assert_ne!(baseline, reloaded_adapter);
+
+        let mut upgraded_adapter = baseline.clone();
+        upgraded_adapter.adapter_abi = AdapterAbiRevision::new(99);
+        assert_ne!(baseline, upgraded_adapter);
     }
 
     #[test]
