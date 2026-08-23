@@ -5,7 +5,10 @@ use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
-use crate::config::{resolve_kv_cache_policy, BatchSizePreference, ResolvedKvCachePolicy};
+use crate::config::{
+    resolve_kv_cache_policy, BatchSizePreference, PhysicalExecutionCapacity, PhysicalExecutionMode,
+    PhysicalInFlightLimit, ResolvedKvCachePolicy,
+};
 use crate::model::ModelVariant;
 use crate::Result;
 
@@ -69,6 +72,15 @@ pub struct EngineCoreConfig {
     /// Automatic or explicitly fixed physical tensor invocation width.
     #[serde(default)]
     pub max_tensor_batch_size: BatchSizePreference,
+
+    /// Rollout mode for overlapping separate physical inference launches.
+    #[serde(default)]
+    pub physical_execution_mode: PhysicalExecutionMode,
+
+    /// Prospective engine-wide physical launch ceiling. Serial and Shadow
+    /// modes still resolve actual physical execution to one in-flight launch.
+    #[serde(default)]
+    pub max_physical_in_flight: PhysicalInFlightLimit,
 
     /// Maximum retained sequence/session rows in managed model state.
     #[serde(default = "default_max_retained_sequences")]
@@ -355,6 +367,8 @@ impl Default for EngineCoreConfig {
             models_dir: default_models_dir(),
             max_batch_size: default_max_batch_size(),
             max_tensor_batch_size: BatchSizePreference::Auto,
+            physical_execution_mode: PhysicalExecutionMode::Serial,
+            max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
@@ -397,6 +411,12 @@ impl Default for EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
+    /// Resolve rollout-aware dispatch and physical-launch capacity axes.
+    pub fn resolved_physical_execution_capacity(&self) -> PhysicalExecutionCapacity {
+        self.physical_execution_mode
+            .resolve_capacity(self.max_physical_in_flight)
+    }
+
     /// Apply the CUDA-native context ceiling and ensure a single paged-state
     /// group has enough pages to reach it. CPU and Metal retain the configured
     /// sequence and cache defaults exactly.
@@ -445,7 +465,9 @@ mod managed_kv_default_tests {
         CUDA_MAX_NATIVE_CONTEXT_TOKENS,
     };
     use crate::backends::BackendKind;
-    use crate::config::{KvCacheDtype, PrefixCachePolicy};
+    use crate::config::{
+        KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
+    };
     use crate::model::ModelVariant;
 
     #[test]
@@ -457,6 +479,25 @@ mod managed_kv_default_tests {
         assert_eq!(policy.effective.page_size, 64);
         assert_eq!(policy.effective.dtype, KvCacheDtype::Float16);
         assert_eq!(policy.effective.prefix, PrefixCachePolicy::Disabled);
+    }
+
+    #[test]
+    fn physical_execution_defaults_remain_serial_and_capacity_axes_are_distinct() {
+        let config = EngineCoreConfig::default();
+        assert_eq!(
+            config.physical_execution_mode,
+            PhysicalExecutionMode::Serial
+        );
+        assert_eq!(config.max_physical_in_flight.get(), 1);
+        assert_eq!(config.max_batch_size, 8);
+        assert!(config.max_tensor_batch_size.resolve(config.backend) >= 2);
+
+        let mut shadow = config;
+        shadow.physical_execution_mode = PhysicalExecutionMode::Shadow;
+        shadow.max_physical_in_flight = PhysicalInFlightLimit::new(4).unwrap();
+        let capacity = shadow.resolved_physical_execution_capacity();
+        assert_eq!(capacity.candidate_dispatch_limit.get(), 4);
+        assert_eq!(capacity.physical_launch_limit.get(), 1);
     }
 
     #[test]

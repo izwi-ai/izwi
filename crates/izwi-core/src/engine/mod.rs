@@ -76,9 +76,10 @@ pub use execution::{
     ManagedCacheDomainReceipt, ManagedCacheDomainReservation, ManagedCacheReceipt,
     ManagedCacheReservation, ManagedTensorStateReservation, MembershipSafePoint, ModelInstanceId,
     NativeBatchMode, OutcomeProvenance, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
-    PhysicalBatchRowReport, PlanId, PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase,
-    SessionEpoch, SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy,
-    StageWorkSelector, StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
+    PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum,
+    RetryDisposition, SequencePhase, SessionEpoch, SessionKey, StageDescriptor, StageId,
+    StageProgressKind, StageShapePolicy, StageWorkSelector, StateDisposition, TerminalOutcome,
+    WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{
     CacheReleaseReport, ExecutorOutput, ExecutorStepResult, ModelExecutor, ModelSessionResult,

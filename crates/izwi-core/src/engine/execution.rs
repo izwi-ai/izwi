@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backends::kv::KvWriteBatchCompletion;
 use crate::backends::BackendKind;
+use crate::config::PhysicalInFlightLimit;
 use crate::engine::cache::coordinator::GroupBlockTable;
 use crate::error::{Error, Result};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvSlotRef};
@@ -758,8 +759,57 @@ pub enum CancellationGranularity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {
+    /// One logical row per physical-batch envelope.
     Exclusive,
+    /// Multiple compatible rows may share one physical-batch envelope, either
+    /// as a tensor invocation or as independent compatibility rows. This does
+    /// not certify overlap between distinct physical model calls.
     Batchable,
+}
+
+/// Backend/model certification for overlapping distinct physical launches.
+///
+/// This is intentionally separate from [`ConcurrencyClass`], which describes
+/// row formation within one physical invocation. Policies fail closed to
+/// execution-group serialization until a loaded backend/model contract
+/// explicitly certifies a narrower scope or concurrent model calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PhysicalLaunchPolicy {
+    #[default]
+    ExecutionGroupExclusive,
+    ModelExclusive,
+    Concurrent {
+        /// Per-model ceiling, independently clamped by the engine-wide
+        /// physical in-flight limit.
+        max_in_flight_per_model: PhysicalInFlightLimit,
+    },
+}
+
+impl PhysicalLaunchPolicy {
+    pub fn concurrent(max_in_flight_per_model: usize) -> Result<Self> {
+        Ok(Self::Concurrent {
+            max_in_flight_per_model: PhysicalInFlightLimit::new(max_in_flight_per_model).map_err(
+                |_| {
+                    Error::InvalidInput(
+                        "concurrent physical launch policy requires a non-zero per-model limit"
+                            .to_string(),
+                    )
+                },
+            )?,
+        })
+    }
+
+    /// Effective same-model overlap after applying the engine-wide physical
+    /// launch limit. Group/model-exclusive policies always resolve to one.
+    pub fn effective_max_in_flight_per_model(self, engine_limit: PhysicalInFlightLimit) -> usize {
+        match self {
+            Self::ExecutionGroupExclusive | Self::ModelExclusive => 1,
+            Self::Concurrent {
+                max_in_flight_per_model,
+            } => max_in_flight_per_model.get().min(engine_limit.get()),
+        }
+    }
 }
 
 /// Effective execution behavior for one model/request/backend combination.
@@ -779,6 +829,10 @@ pub struct ExecutionProfile {
     pub cache_mode: CacheMode,
     pub cancellation: CancellationGranularity,
     pub concurrency: ConcurrencyClass,
+    /// Certification for overlap between separate physical calls. Missing or
+    /// unsealed contracts remain execution-group exclusive.
+    #[serde(default)]
+    pub physical_launch_policy: PhysicalLaunchPolicy,
     pub recompute_safe: bool,
     /// The executor can synchronously prove that all model-owned cache state
     /// for an exact session has been released before recomputation or reuse.
@@ -819,6 +873,7 @@ impl ExecutionProfile {
                 }
             },
             concurrency: ConcurrencyClass::Exclusive,
+            physical_launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
             recompute_safe: false,
             cache_release_safe: false,
             prefix_reuse_safe: false,
@@ -851,6 +906,17 @@ impl ExecutionProfile {
             } else {
                 1
             },
+        }
+    }
+
+    /// Return the launch policy that may be consumed by physical admission.
+    /// Catalog or fallback profiles cannot promote execution concurrency even
+    /// if an unsealed policy value was copied into the profile.
+    pub fn effective_physical_launch_policy(&self) -> PhysicalLaunchPolicy {
+        if self.resolved_from_loaded_model {
+            self.physical_launch_policy
+        } else {
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
         }
     }
 }
@@ -2186,7 +2252,101 @@ mod tests {
         assert_eq!(stage.max_batch_size, 1);
         assert_eq!(stage.batch_mode, NativeBatchMode::None);
         assert_eq!(stage.progress, StageProgressKind::Atomic);
+        assert_eq!(
+            profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
         assert!(stage.validate().is_ok());
+    }
+
+    #[test]
+    fn tensor_batchability_does_not_certify_overlapping_physical_launches() {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cuda, None, ExecutionMode::Atomic);
+        profile.concurrency = ConcurrencyClass::Batchable;
+        profile.max_batch_size = 8;
+
+        assert_eq!(
+            profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+        assert_eq!(
+            profile
+                .physical_launch_policy
+                .effective_max_in_flight_per_model(PhysicalInFlightLimit::new(8).unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn unresolved_profiles_cannot_promote_physical_launches() {
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Atomic);
+        profile.physical_launch_policy = PhysicalLaunchPolicy::concurrent(4).unwrap();
+
+        assert_eq!(
+            profile.effective_physical_launch_policy(),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        profile.resolved_from_loaded_model = true;
+        assert_eq!(
+            profile.effective_physical_launch_policy(),
+            PhysicalLaunchPolicy::concurrent(4).unwrap()
+        );
+    }
+
+    #[test]
+    fn physical_launch_policy_clamps_model_and_engine_capacity_axes() {
+        let engine_limit = PhysicalInFlightLimit::new(4).unwrap();
+        assert_eq!(
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+                .effective_max_in_flight_per_model(engine_limit),
+            1
+        );
+        assert_eq!(
+            PhysicalLaunchPolicy::ModelExclusive.effective_max_in_flight_per_model(engine_limit),
+            1
+        );
+        assert_eq!(
+            PhysicalLaunchPolicy::concurrent(3)
+                .unwrap()
+                .effective_max_in_flight_per_model(engine_limit),
+            3
+        );
+        assert_eq!(
+            PhysicalLaunchPolicy::concurrent(8)
+                .unwrap()
+                .effective_max_in_flight_per_model(engine_limit),
+            4
+        );
+        assert!(PhysicalLaunchPolicy::concurrent(0).is_err());
+    }
+
+    #[test]
+    fn physical_launch_policy_deserialization_fails_closed() {
+        let profile = ExecutionProfile::fail_closed(
+            BackendKind::Cpu,
+            Some(ModelVariant::Qwen306B),
+            ExecutionMode::Atomic,
+        );
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("physical_launch_policy");
+        let legacy: ExecutionProfile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
+
+        for invalid in [
+            r#"{"kind":"concurrent","max_in_flight_per_model":0}"#,
+            r#"{"kind":"backend_default"}"#,
+        ] {
+            assert!(serde_json::from_str::<PhysicalLaunchPolicy>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -3128,6 +3288,10 @@ mod tests {
         assert_eq!(profile.prefill, PrefillMode::None);
         assert_eq!(profile.cache_mode, CacheMode::None);
         assert_eq!(profile.concurrency, ConcurrencyClass::Exclusive);
+        assert_eq!(
+            profile.physical_launch_policy,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive
+        );
         assert!(!profile.resolved_from_loaded_model);
         assert!(!capabilities.incremental_prefill);
         assert!(!capabilities.incremental_decode);

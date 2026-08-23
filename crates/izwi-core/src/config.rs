@@ -254,6 +254,126 @@ impl<'de> Deserialize<'de> for BatchSizePreference {
     }
 }
 
+/// Rollout mode for overlapping distinct physical inference launches.
+///
+/// This does not enable or disable inference. `Serial` retains the current
+/// one-launch-at-a-time behavior, `Shadow` may evaluate concurrent dispatch
+/// decisions while still launching serially, and `Concurrent` permits the
+/// resolved physical launch limit to exceed one. Tensor batch width, scheduler
+/// rows, retained sessions, and queued requests are independent capacities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalExecutionMode {
+    #[default]
+    Serial,
+    Shadow,
+    Concurrent,
+}
+
+impl fmt::Display for PhysicalExecutionMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Serial => "serial",
+            Self::Shadow => "shadow",
+            Self::Concurrent => "concurrent",
+        })
+    }
+}
+
+impl FromStr for PhysicalExecutionMode {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "serial" => Ok(Self::Serial),
+            "shadow" => Ok(Self::Shadow),
+            "concurrent" => Ok(Self::Concurrent),
+            _ => Err(Error::ConfigError(format!(
+                "invalid physical execution mode {value:?}; expected 'serial', 'shadow', or 'concurrent'"
+            ))),
+        }
+    }
+}
+
+/// Non-zero engine-wide ceiling for simultaneously owned physical launches.
+///
+/// A distinct type prevents this capacity from being confused with the width
+/// of one tensor invocation or with any logical scheduler/session capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PhysicalInFlightLimit(NonZeroUsize);
+
+impl PhysicalInFlightLimit {
+    pub fn new(limit: usize) -> Result<Self> {
+        NonZeroUsize::new(limit).map(Self).ok_or_else(|| {
+            Error::ConfigError("max physical in-flight must be greater than zero".into())
+        })
+    }
+
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for PhysicalInFlightLimit {
+    fn default() -> Self {
+        Self(NonZeroUsize::MIN)
+    }
+}
+
+impl fmt::Display for PhysicalInFlightLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for PhysicalInFlightLimit {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let limit = value.trim().parse::<usize>().map_err(|_| {
+            Error::ConfigError(format!(
+                "invalid max physical in-flight {value:?}; expected a positive integer"
+            ))
+        })?;
+        Self::new(limit)
+    }
+}
+
+/// Resolved launch capacities for dispatch planning and physical execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalExecutionCapacity {
+    /// Candidate dispatches the rollout may evaluate. Shadow mode can exceed
+    /// one here without permitting overlapping model calls.
+    pub candidate_dispatch_limit: PhysicalInFlightLimit,
+    /// Physical model calls that may actually overlap. Only Concurrent mode
+    /// can resolve this axis above one.
+    pub physical_launch_limit: PhysicalInFlightLimit,
+}
+
+impl PhysicalExecutionMode {
+    pub fn resolve_capacity(
+        self,
+        configured_limit: PhysicalInFlightLimit,
+    ) -> PhysicalExecutionCapacity {
+        let serial = PhysicalInFlightLimit::default();
+        match self {
+            Self::Serial => PhysicalExecutionCapacity {
+                candidate_dispatch_limit: serial,
+                physical_launch_limit: serial,
+            },
+            Self::Shadow => PhysicalExecutionCapacity {
+                candidate_dispatch_limit: configured_limit,
+                physical_launch_limit: serial,
+            },
+            Self::Concurrent => PhysicalExecutionCapacity {
+                candidate_dispatch_limit: configured_limit,
+                physical_launch_limit: configured_limit,
+            },
+        }
+    }
+}
+
 /// Requested storage dtype for retained KV state.
 ///
 /// Quantized variants remain deserializable so old configuration files fail
@@ -450,6 +570,15 @@ pub struct EngineConfig {
     #[serde(default)]
     pub max_batch_size: BatchSizePreference,
 
+    /// Rollout mode for overlapping separate physical inference launches.
+    #[serde(default)]
+    pub physical_execution_mode: PhysicalExecutionMode,
+
+    /// Prospective engine-wide physical launch ceiling. Serial and Shadow
+    /// modes still resolve actual physical execution to one in-flight launch.
+    #[serde(default)]
+    pub max_physical_in_flight: PhysicalInFlightLimit,
+
     /// Maximum logical rows selected by one scheduler step.
     #[serde(default = "default_max_scheduler_batch_size")]
     pub max_scheduler_batch_size: usize,
@@ -524,6 +653,8 @@ impl Default for EngineConfig {
         Self {
             models_dir: default_models_dir(),
             max_batch_size: BatchSizePreference::Auto,
+            physical_execution_mode: PhysicalExecutionMode::Serial,
+            max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
@@ -611,6 +742,12 @@ fn default_kv_page_size() -> usize {
 }
 
 impl EngineConfig {
+    /// Resolve rollout-aware dispatch and physical-launch capacity axes.
+    pub fn resolved_physical_execution_capacity(&self) -> PhysicalExecutionCapacity {
+        self.physical_execution_mode
+            .resolve_capacity(self.max_physical_in_flight)
+    }
+
     /// Numeric portable ceiling used until model load resolves an automatic
     /// context against the concrete memory plan. Explicit operator intent is
     /// preserved; Auto starts from the historical safe portable baseline.
@@ -813,7 +950,8 @@ fn get_num_cpus() -> usize {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        BatchSizePreference, ContextLengthPreference, EngineConfig, KvCacheDtype, PrefixCachePolicy,
+        BatchSizePreference, ContextLengthPreference, EngineConfig, KvCacheDtype,
+        PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::backends::BackendKind;
 
@@ -849,6 +987,55 @@ mod managed_kv_default_tests {
         assert_eq!(config.max_staged_transactions, 8);
         assert_eq!(config.max_queued_requests, 128);
         assert_eq!(config.max_batch_size.resolve(BackendKind::Cpu), 2);
+        assert_eq!(
+            config.physical_execution_mode,
+            PhysicalExecutionMode::Serial
+        );
+        assert_eq!(config.max_physical_in_flight.get(), 1);
+        let capacity = config.resolved_physical_execution_capacity();
+        assert_eq!(capacity.candidate_dispatch_limit.get(), 1);
+        assert_eq!(capacity.physical_launch_limit.get(), 1);
+    }
+
+    #[test]
+    fn physical_execution_modes_resolve_candidate_and_launch_axes() {
+        let configured = PhysicalInFlightLimit::new(4).unwrap();
+        let cases = [
+            (PhysicalExecutionMode::Serial, 1, 1),
+            (PhysicalExecutionMode::Shadow, 4, 1),
+            (PhysicalExecutionMode::Concurrent, 4, 4),
+        ];
+
+        for (mode, expected_candidates, expected_launches) in cases {
+            let capacity = mode.resolve_capacity(configured);
+            assert_eq!(capacity.candidate_dispatch_limit.get(), expected_candidates);
+            assert_eq!(capacity.physical_launch_limit.get(), expected_launches);
+        }
+    }
+
+    #[test]
+    fn physical_execution_configuration_is_fail_closed() {
+        let shadow: EngineConfig = serde_json::from_str(
+            r#"{"physical_execution_mode":"shadow","max_physical_in_flight":4}"#,
+        )
+        .unwrap();
+        let capacity = shadow.resolved_physical_execution_capacity();
+        assert_eq!(capacity.candidate_dispatch_limit.get(), 4);
+        assert_eq!(capacity.physical_launch_limit.get(), 1);
+
+        for invalid in [
+            r#"{"physical_execution_mode":"on"}"#,
+            r#"{"physical_execution_mode":"off"}"#,
+            r#"{"physical_execution_mode":"parallel"}"#,
+            r#"{"max_physical_in_flight":0}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<EngineConfig>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+
+        assert!(PhysicalInFlightLimit::new(0).is_err());
     }
 
     #[test]

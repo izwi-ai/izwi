@@ -75,7 +75,10 @@ pub use engine::{
 };
 
 // Legacy re-exports for backward compatibility
-pub use config::{BatchSizePreference, ContextLengthPreference, EngineConfig};
+pub use config::{
+    BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionCapacity,
+    PhysicalExecutionMode, PhysicalInFlightLimit,
+};
 pub use error::{Error, Result};
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use runtime::{

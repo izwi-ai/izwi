@@ -2,13 +2,18 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::backends::BackendPreference;
-use crate::config::{BatchSizePreference, ContextLengthPreference, EngineConfig};
+use crate::config::{
+    BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionMode,
+    PhysicalInFlightLimit,
+};
 
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
 pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
+pub const ENV_PHYSICAL_EXECUTION_MODE: &str = "IZWI_PHYSICAL_EXECUTION_MODE";
+pub const ENV_MAX_PHYSICAL_IN_FLIGHT: &str = "IZWI_MAX_PHYSICAL_IN_FLIGHT";
 pub const ENV_MAX_SCHEDULER_BATCH_SIZE: &str = "IZWI_MAX_SCHEDULER_BATCH_SIZE";
 pub const ENV_ENABLE_PREFIX_CACHING: &str = "IZWI_ENABLE_PREFIX_CACHING";
 pub const ENV_MANAGED_PREFIX_CACHE_SALT: &str = "IZWI_MANAGED_PREFIX_CACHE_SALT";
@@ -37,6 +42,8 @@ pub struct ServeRuntimeConfig {
     pub models_dir: PathBuf,
     pub backend: BackendPreference,
     pub max_batch_size: BatchSizePreference,
+    pub physical_execution_mode: PhysicalExecutionMode,
+    pub max_physical_in_flight: PhysicalInFlightLimit,
     pub max_scheduler_batch_size: usize,
     pub enable_prefix_caching: bool,
     pub managed_prefix_cache_salt: Option<String>,
@@ -64,6 +71,8 @@ impl Default for ServeRuntimeConfig {
             models_dir: default_models_dir(),
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
+            physical_execution_mode: PhysicalExecutionMode::Serial,
+            max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
@@ -112,6 +121,12 @@ impl ServeRuntimeConfig {
         }
         if let Some(max_batch_size) = overrides.max_batch_size {
             self.max_batch_size = max_batch_size;
+        }
+        if let Some(physical_execution_mode) = overrides.physical_execution_mode {
+            self.physical_execution_mode = physical_execution_mode;
+        }
+        if let Some(max_physical_in_flight) = overrides.max_physical_in_flight {
+            self.max_physical_in_flight = max_physical_in_flight;
         }
         if let Some(max_scheduler_batch_size) = overrides.max_scheduler_batch_size {
             self.max_scheduler_batch_size = max_scheduler_batch_size;
@@ -172,6 +187,8 @@ impl ServeRuntimeConfig {
         EngineConfig {
             models_dir: self.models_dir.clone(),
             max_batch_size: self.max_batch_size,
+            physical_execution_mode: self.physical_execution_mode,
+            max_physical_in_flight: self.max_physical_in_flight,
             max_scheduler_batch_size: self.max_scheduler_batch_size.max(1),
             enable_prefix_caching: self.enable_prefix_caching,
             managed_prefix_cache_salt: self.managed_prefix_cache_salt.clone(),
@@ -196,6 +213,8 @@ pub struct ServeRuntimeConfigOverrides {
     pub models_dir: Option<PathBuf>,
     pub backend: Option<BackendPreference>,
     pub max_batch_size: Option<BatchSizePreference>,
+    pub physical_execution_mode: Option<PhysicalExecutionMode>,
+    pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
     pub max_scheduler_batch_size: Option<usize>,
     pub enable_prefix_caching: Option<bool>,
     pub managed_prefix_cache_salt: Option<String>,
@@ -223,6 +242,14 @@ impl ServeRuntimeConfigOverrides {
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),
             backend: read_env_backend(ENV_BACKEND, &[]),
             max_batch_size: read_env_batch_size(ENV_MAX_BATCH_SIZE, &[]),
+            physical_execution_mode: read_env_physical_execution_mode(
+                ENV_PHYSICAL_EXECUTION_MODE,
+                &[],
+            ),
+            max_physical_in_flight: read_env_physical_in_flight_limit(
+                ENV_MAX_PHYSICAL_IN_FLIGHT,
+                &[],
+            ),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
             enable_prefix_caching: read_env_bool(ENV_ENABLE_PREFIX_CACHING, &[]),
             managed_prefix_cache_salt: read_env_string(ENV_MANAGED_PREFIX_CACHE_SALT, &[]),
@@ -375,6 +402,20 @@ fn read_env_batch_size(primary: &str, aliases: &[&str]) -> Option<BatchSizePrefe
     first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
 }
 
+fn read_env_physical_execution_mode(
+    primary: &str,
+    aliases: &[&str],
+) -> Option<PhysicalExecutionMode> {
+    first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
+}
+
+fn read_env_physical_in_flight_limit(
+    primary: &str,
+    aliases: &[&str],
+) -> Option<PhysicalInFlightLimit> {
+    first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
+}
+
 fn read_env_context(primary: &str, aliases: &[&str]) -> Option<ContextLengthPreference> {
     first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
 }
@@ -410,6 +451,8 @@ mod tests {
         ENV_MODELS_DIR,
         ENV_BACKEND,
         ENV_MAX_BATCH_SIZE,
+        ENV_PHYSICAL_EXECUTION_MODE,
+        ENV_MAX_PHYSICAL_IN_FLIGHT,
         ENV_MAX_SCHEDULER_BATCH_SIZE,
         ENV_ENABLE_PREFIX_CACHING,
         ENV_MANAGED_PREFIX_CACHE_SALT,
@@ -600,6 +643,8 @@ mod tests {
             models_dir: PathBuf::from("/tmp/izwi-models"),
             backend: BackendPreference::Cpu,
             max_batch_size: BatchSizePreference::fixed(12).unwrap(),
+            physical_execution_mode: PhysicalExecutionMode::Shadow,
+            max_physical_in_flight: PhysicalInFlightLimit::new(3).unwrap(),
             max_scheduler_batch_size: 9,
             max_retained_sequences: 10,
             max_staged_transactions: 3,
@@ -612,11 +657,41 @@ mod tests {
 
         assert_eq!(engine.models_dir, PathBuf::from("/tmp/izwi-models"));
         assert_eq!(engine.max_batch_size.fixed_rows(), Some(12));
+        assert_eq!(
+            engine.physical_execution_mode,
+            PhysicalExecutionMode::Shadow
+        );
+        assert_eq!(engine.max_physical_in_flight.get(), 3);
         assert_eq!(engine.max_scheduler_batch_size, 9);
         assert_eq!(engine.max_retained_sequences, 10);
         assert_eq!(engine.max_staged_transactions, 3);
         assert_eq!(engine.max_queued_requests, 77);
         assert_eq!(engine.backend, BackendPreference::Cpu);
         assert_eq!(engine.num_threads, 6);
+    }
+
+    #[test]
+    fn env_exposes_fail_closed_physical_execution_controls() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+        std::env::set_var(ENV_PHYSICAL_EXECUTION_MODE, "shadow");
+        std::env::set_var(ENV_MAX_PHYSICAL_IN_FLIGHT, "4");
+
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert_eq!(
+            resolved.physical_execution_mode,
+            PhysicalExecutionMode::Shadow
+        );
+        assert_eq!(resolved.max_physical_in_flight.get(), 4);
+        let capacity = resolved
+            .engine_config()
+            .resolved_physical_execution_capacity();
+        assert_eq!(capacity.candidate_dispatch_limit.get(), 4);
+        assert_eq!(capacity.physical_launch_limit.get(), 1);
+        clear_env();
     }
 }

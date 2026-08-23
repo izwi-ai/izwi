@@ -1164,6 +1164,8 @@ impl RuntimeService {
         core_config.models_dir = config.models_dir.clone();
         core_config.max_batch_size = config.max_scheduler_batch_size.max(1);
         core_config.max_tensor_batch_size = config.max_batch_size;
+        core_config.physical_execution_mode = config.physical_execution_mode;
+        core_config.max_physical_in_flight = config.max_physical_in_flight;
         core_config.max_retained_sequences = config.max_retained_sequences.max(1);
         core_config.max_staged_transactions = config.max_staged_transactions.max(1);
         core_config.max_queued_requests = config.max_queued_requests.max(1);
