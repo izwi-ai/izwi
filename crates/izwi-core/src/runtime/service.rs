@@ -1197,7 +1197,12 @@ impl RuntimeService {
         )?);
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
-        let execution_parallelism = worker_config.request_parallelism;
+        let execution_parallelism = worker_config.request_parallelism.max(
+            core_config
+                .resolved_physical_execution_capacity()
+                .physical_launch_limit
+                .get(),
+        );
         let coordinator = Arc::new(InferenceCoordinator::new_with_device(
             selected_backend_kind,
             device.clone(),
@@ -1207,6 +1212,8 @@ impl RuntimeService {
         let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
+        worker_config.physical_execution_admission =
+            Some(coordinator.physical_execution_admission());
         let core_engine = Arc::new(CoreEngine::new_with_worker(core_config, worker_config)?);
         let backend_router = BackendRouter::from_context(backend_context);
         let tokenizer = Arc::new(RwLock::new(None));
@@ -1545,7 +1552,6 @@ impl RuntimeService {
         }
 
         let engine = self.core_engine.clone();
-        let coordinator = self.coordinator.clone();
         let waiters = self.completion_waiters.clone();
         let telemetry = self.telemetry.clone();
         let wakeup = self.step_driver_wakeup.clone();
@@ -1561,11 +1567,9 @@ impl RuntimeService {
                     idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                     continue;
                 }
-                let step_result = std::panic::AssertUnwindSafe(
-                    coordinator.run_engine_step(engine.step_for_dispatch()),
-                )
-                .catch_unwind()
-                .await;
+                let step_result = std::panic::AssertUnwindSafe(engine.step_for_dispatch())
+                    .catch_unwind()
+                    .await;
                 match step_result {
                     Ok(Ok(outputs)) => {
                         if outputs.is_empty() {

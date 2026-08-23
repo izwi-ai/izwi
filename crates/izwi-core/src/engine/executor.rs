@@ -39,9 +39,10 @@ use super::execution::{
     BatchDispatch, CacheMode, CancellationGranularity, ConcurrencyClass, DispatchState,
     ExecutionCapabilities, ExecutionDisposition, ExecutionFailure, ExecutionMode, ExecutionProfile,
     FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, NativeBatchMode,
-    OutcomeProvenance, PhysicalBatch, PlanId, PrefillMode, RetryDisposition, SessionKey,
-    StageProgressKind, WorkUnit, YieldReason,
+    OutcomeProvenance, PhysicalBatch, PhysicalLaunchPolicy, PlanId, PrefillMode, RetryDisposition,
+    SessionKey, StageProgressKind, WorkUnit, YieldReason,
 };
+use super::metrics::{begin_engine_physical_dispatch, record_engine_physical_permit_wait};
 use super::output::StreamingOutput;
 use super::request::EngineCoreRequest;
 use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
@@ -58,6 +59,7 @@ use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
+use crate::runtime::PhysicalExecutionAdmission;
 use state::{ActiveAsrDecode, ActiveChatDecode, ActiveQwenTtsDecode};
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
@@ -589,6 +591,9 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
+/// Hard upper bound for scoped CPU row workers in one physical dispatch.
+const MAX_CPU_REQUEST_PARALLELISM: usize = 4;
+
 /// Configuration for the model executor.
 #[derive(Clone)]
 pub struct WorkerConfig {
@@ -612,6 +617,9 @@ pub struct WorkerConfig {
     pub model_registry: Option<Arc<ModelRegistry>>,
     /// Shared physical resource authority used for bounded executor workspaces.
     pub resource_authority: Option<Arc<ResourceAuthority>>,
+    /// Shared physical-launch admission. Runtime services replace the local
+    /// fail-closed gate with their coordinator-owned handle.
+    pub(crate) physical_execution_admission: Option<PhysicalExecutionAdmission>,
     /// Maximum width of a model-native tensor batch on this backend.
     pub max_tensor_batch_size: usize,
     /// Exact model variants enabled for static tensor execution on this worker.
@@ -638,6 +646,13 @@ impl std::fmt::Debug for WorkerConfig {
             .field(
                 "resource_authority",
                 &self.resource_authority.as_ref().map(|_| "<shared>"),
+            )
+            .field(
+                "physical_execution_admission",
+                &self
+                    .physical_execution_admission
+                    .as_ref()
+                    .map(PhysicalExecutionAdmission::capacity),
             )
             .field("max_tensor_batch_size", &self.max_tensor_batch_size)
             .field(
@@ -666,10 +681,11 @@ impl Default for WorkerConfig {
             dtype: "float32".to_string(),
             kv_cache_dtype: "float16".to_string(),
             num_threads,
-            request_parallelism: Self::request_parallelism_for(backend_kind),
+            request_parallelism: Self::request_parallelism_for(backend_kind, num_threads),
             kv_page_size: 64,
             model_registry: None,
             resource_authority: None,
+            physical_execution_admission: Some(PhysicalExecutionAdmission::standalone(1)),
             max_tensor_batch_size: 1,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
             enable_chunked_prefill: false,
@@ -688,10 +704,7 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             .resolve(backend_kind)
             .min(Self::tensor_batch_cap(backend_kind))
             .max(1);
-        let request_parallelism = Self::resolve_batch_request_parallelism(
-            backend_kind,
-            Self::request_parallelism_override(),
-        );
+        let request_parallelism = Self::request_parallelism_for(backend_kind, num_threads);
         Self {
             models_dir: config.models_dir.clone(),
             backend: backend_kind,
@@ -703,6 +716,12 @@ impl From<&EngineCoreConfig> for WorkerConfig {
             kv_page_size: config.block_size.max(1),
             model_registry: None,
             resource_authority: None,
+            physical_execution_admission: Some(PhysicalExecutionAdmission::standalone(
+                config
+                    .resolved_physical_execution_capacity()
+                    .physical_launch_limit
+                    .get(),
+            )),
             max_tensor_batch_size,
             static_tensor_batch_variants: Arc::new(HashSet::new()),
             enable_chunked_prefill: config.enable_chunked_prefill,
@@ -727,33 +746,49 @@ impl WorkerConfig {
             .filter(|value| *value > 0)
     }
 
-    fn resolve_request_parallelism(backend: BackendKind, override_value: Option<usize>) -> usize {
+    fn available_cpu_capacity() -> usize {
+        std::thread::available_parallelism()
+            .map(|capacity| capacity.get())
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn resolve_request_parallelism(
+        backend: BackendKind,
+        configured_intra_op_threads: usize,
+        available_cpu_capacity: usize,
+        override_value: Option<usize>,
+    ) -> usize {
         // Candle's Metal path is intentionally serialized in dispatch. Do not
         // let an environment override inflate coordinator capacity beyond what
         // the executor can actually run concurrently.
         if backend == BackendKind::Metal {
             return 1;
         }
-        let default_parallelism = match backend {
-            // CPU workloads already use `num_threads` for BLAS/Rayon/intra-op work, so
-            // keep inter-request fan-out conservative unless explicitly overridden.
-            BackendKind::Cpu => 1,
-            BackendKind::Metal => unreachable!("Metal is clamped above"),
-            BackendKind::Cuda => 1,
-        };
 
-        override_value.unwrap_or(default_parallelism).max(1)
+        if backend == BackendKind::Cpu {
+            let cpu_capacity = available_cpu_capacity.max(1);
+            let hard_cap = cpu_capacity.min(MAX_CPU_REQUEST_PARALLELISM);
+            let automatic = (cpu_capacity / configured_intra_op_threads.max(1)).max(1);
+            // Preserve the operator override as the selected value, then keep
+            // both automatic and explicit widths within the process-visible
+            // CPU allocation and the executor's conservative worker ceiling.
+            return override_value.unwrap_or(automatic).clamp(1, hard_cap);
+        }
+
+        // CUDA does not gain automatic scalar concurrency here. Preserve the
+        // existing explicit override contract without coupling it to host CPU
+        // capacity; accelerator launch policy is sealed independently.
+        override_value.unwrap_or(1).max(1)
     }
 
-    fn request_parallelism_for(backend: BackendKind) -> usize {
-        Self::resolve_request_parallelism(backend, Self::request_parallelism_override())
-    }
-
-    fn resolve_batch_request_parallelism(
-        backend: BackendKind,
-        override_value: Option<usize>,
-    ) -> usize {
-        Self::resolve_request_parallelism(backend, override_value)
+    fn request_parallelism_for(backend: BackendKind, configured_intra_op_threads: usize) -> usize {
+        Self::resolve_request_parallelism(
+            backend,
+            configured_intra_op_threads,
+            Self::available_cpu_capacity(),
+            Self::request_parallelism_override(),
+        )
     }
 }
 
@@ -2021,11 +2056,13 @@ struct BatchWorkspaceContext {
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
     batch_workspace: Option<BatchWorkspaceContext>,
+    physical_execution_admission: Option<PhysicalExecutionAdmission>,
 }
 
 impl UnifiedExecutor {
     /// Create a new unified executor with native backend.
     pub fn new_native(config: WorkerConfig) -> Self {
+        let physical_execution_admission = config.physical_execution_admission.clone();
         let batch_workspace =
             config
                 .resource_authority
@@ -2037,6 +2074,7 @@ impl UnifiedExecutor {
         Self {
             inner: Arc::new(RwLock::new(Box::new(NativeExecutor::new(config)))),
             batch_workspace,
+            physical_execution_admission,
         }
     }
 
@@ -2045,7 +2083,43 @@ impl UnifiedExecutor {
         Self {
             inner: Arc::new(RwLock::new(executor)),
             batch_workspace: None,
+            physical_execution_admission: None,
         }
+    }
+
+    fn explicit_physical_launch_policy(
+        batch: &PhysicalBatch,
+        requests: &[&EngineCoreRequest],
+    ) -> PhysicalLaunchPolicy {
+        if requests.len() != batch.rows.len() {
+            return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+        }
+        let mut policy = None;
+        for (request, row) in requests.iter().zip(&batch.rows) {
+            let Some(binding) = request.execution_adapter_binding() else {
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            };
+            if binding.execution_group_id != batch.lane.execution_group
+                || binding.model_instance_id != batch.lane.model_instance
+                || binding.adapter_instance_id != batch.lane.adapter_instance
+                || binding.adapter_abi_revision != batch.lane.adapter_abi
+                || binding.capability_id != batch.lane.capability_id
+            {
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            }
+            let Ok(stage) = binding.stage_for_work(&row.work) else {
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            };
+            if stage.id != batch.lane.stage_id || stage.batch_mode != batch.mode {
+                return PhysicalLaunchPolicy::ExecutionGroupExclusive;
+            }
+            match policy {
+                None => policy = Some(stage.physical_launch_policy),
+                Some(active) if active == stage.physical_launch_policy => {}
+                Some(_) => return PhysicalLaunchPolicy::ExecutionGroupExclusive,
+            }
+        }
+        policy.unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive)
     }
 
     pub(super) fn reserve_batch_workspace(
@@ -2079,6 +2153,29 @@ impl UnifiedExecutor {
         requests: &[&EngineCoreRequest],
         scheduled: &[ScheduledRequest],
     ) -> PhysicalDispatchResult {
+        let width = batch.rows.len().max(1);
+        let _execution = if let Some(admission) = &self.physical_execution_admission {
+            let launch_policy = Self::explicit_physical_launch_policy(batch, requests);
+            let deadline = requests.iter().filter_map(|request| request.deadline).min();
+            let permit_wait_started = std::time::Instant::now();
+            let acquired = admission
+                .acquire_dispatch(launch_policy, batch.mode, width, deadline)
+                .await;
+            record_engine_physical_permit_wait(permit_wait_started.elapsed());
+            match acquired {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    return Err(PhysicalDispatchError::not_started(
+                        error,
+                        width,
+                        FailureOrigin::DispatchCoordination,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let _physical_dispatch = begin_engine_physical_dispatch();
         let executor = self.inner.read().await;
         executor.execute_physical_batch(PhysicalBatchExecution {
             batch,
@@ -2496,6 +2593,15 @@ mod tests {
     fn test_worker_config_default() {
         let config = WorkerConfig::default();
         assert_eq!(config.backend, config.backend_context.backend_kind);
+        assert_eq!(
+            config.request_parallelism,
+            WorkerConfig::resolve_request_parallelism(
+                config.backend,
+                config.num_threads,
+                WorkerConfig::available_cpu_capacity(),
+                WorkerConfig::request_parallelism_override(),
+            )
+        );
     }
 
     #[test]
@@ -2537,7 +2643,15 @@ mod tests {
 
         let config = WorkerConfig::from(&engine);
         assert_eq!(config.backend, config.backend_context.backend_kind);
-        assert_eq!(config.request_parallelism, 1);
+        assert_eq!(
+            config.request_parallelism,
+            WorkerConfig::resolve_request_parallelism(
+                BackendKind::Cpu,
+                engine.num_threads,
+                WorkerConfig::available_cpu_capacity(),
+                WorkerConfig::request_parallelism_override(),
+            )
+        );
         assert_eq!(
             config.backend_context.source,
             BackendSelectionSource::Config
@@ -2545,38 +2659,58 @@ mod tests {
     }
 
     #[test]
-    fn test_request_parallelism_defaults_are_backend_aware() {
+    fn cpu_request_parallelism_uses_available_capacity_and_intra_op_threads() {
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 8, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 16, None),
+            2
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 32, None),
+            MAX_CPU_REQUEST_PARALLELISM
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 1, 128, None),
+            MAX_CPU_REQUEST_PARALLELISM
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 64, 8, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 0, 0, None),
             1
         );
+    }
+
+    #[test]
+    fn request_parallelism_override_precedes_auto_with_backend_clamps() {
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, Some(3)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 32, Some(3)),
             3
         );
         assert_eq!(
-            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, Some(3)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 8, 32, Some(usize::MAX)),
+            MAX_CPU_REQUEST_PARALLELISM
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cpu, 1, 2, Some(3)),
+            2
+        );
+        assert_eq!(
+            WorkerConfig::resolve_request_parallelism(BackendKind::Metal, 1, 32, Some(3)),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, None),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, None),
             1
         );
         assert_eq!(
-            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Cuda, Some(4)),
+            WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, Some(4)),
             4
-        );
-        assert_eq!(
-            WorkerConfig::resolve_batch_request_parallelism(BackendKind::Metal, None),
-            1
         );
     }
 
@@ -2593,7 +2727,15 @@ mod tests {
                 worker.max_tensor_batch_size,
                 engine.max_tensor_batch_size.resolve(worker.backend)
             );
-            assert_eq!(worker.request_parallelism, 1);
+            assert_eq!(
+                worker.request_parallelism,
+                WorkerConfig::resolve_request_parallelism(
+                    backend,
+                    engine.num_threads,
+                    WorkerConfig::available_cpu_capacity(),
+                    WorkerConfig::request_parallelism_override(),
+                )
+            );
             assert_eq!(engine.max_batch_size, 19);
         }
     }

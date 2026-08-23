@@ -2472,6 +2472,65 @@ mod tests {
     }
 
     #[test]
+    fn cpu_row_parallelism_keeps_whisper_scalar_and_tts_non_native() {
+        let request_parallelism = 4;
+        let registry =
+            RuntimeAdapterRegistry::built_in_with_execution_limits(2, request_parallelism).unwrap();
+        let whisper = LoadedModelBundleDraft::build(
+            &registry,
+            ExecutionGroupId::new(44),
+            ModelInstanceId::new(1),
+            ModelVariant::WhisperLargeV3Turbo,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let whisper = whisper
+            .execution_contracts(CapabilityKind::Asr)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            whisper.execution_profile.max_batch_size,
+            request_parallelism
+        );
+        assert_eq!(
+            whisper.execution_profile.physical_launch_policy,
+            PhysicalLaunchPolicy::concurrent(request_parallelism).unwrap()
+        );
+        assert!(whisper.stages.iter().all(|stage| {
+            stage.batch_mode == NativeBatchMode::None
+                && stage.shape_policy == StageShapePolicy::Independent
+        }));
+
+        for (index, variant) in [
+            ModelVariant::Kokoro82M,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tts = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(45),
+                ModelInstanceId::new(index as u64 + 2),
+                variant,
+                BackendKind::Cpu,
+            )
+            .unwrap();
+            for contract in tts.execution_contracts(CapabilityKind::Tts).unwrap() {
+                assert_eq!(
+                    contract.execution_profile.physical_launch_policy,
+                    PhysicalLaunchPolicy::ExecutionGroupExclusive
+                );
+                assert!(!contract.execution_profile.capabilities().native_batch);
+                assert!(contract
+                    .stages
+                    .iter()
+                    .all(|stage| stage.batch_mode == NativeBatchMode::None));
+            }
+        }
+    }
+
+    #[test]
     fn loaded_contracts_reject_unknown_policy_and_stage_profile_mismatch() {
         let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 3).unwrap();
         let unknown = LoadedModelBundleDraft::build(

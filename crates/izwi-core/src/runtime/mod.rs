@@ -33,6 +33,7 @@ pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceCapability, ConformanceExecutionClass,
 };
+pub(crate) use coordinator::PhysicalExecutionAdmission;
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub use service::RuntimeService;
 pub use telemetry::{
