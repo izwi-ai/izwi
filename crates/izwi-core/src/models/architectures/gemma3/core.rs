@@ -11,6 +11,7 @@ use crate::backends::kv::{
     PagedKvDecodeArgs,
 };
 use crate::error::{Error, Result};
+use crate::kernels::{try_fused_rms_norm, try_fused_rope_pair_bshd};
 use crate::kv::v2::{
     AttentionLogitSoftcap, AttentionMask, AttentionPattern, CheckpointPolicy,
     InferenceStateContract, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
@@ -21,6 +22,7 @@ use crate::kv::v2::{
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::telemetry::{record_rope_kernel, record_rope_manual};
 
 fn gemma_attention_geometry(config: &Config) -> Result<AttentionGeometry> {
     for (name, value) in [
@@ -51,7 +53,7 @@ fn gemma_attention_geometry(config: &Config) -> Result<AttentionGeometry> {
 
 #[derive(Debug, Clone)]
 struct GemmaRmsNorm {
-    weight: Tensor,
+    adjusted_weight: Tensor,
     eps: f64,
     cuda_candle_kernel: bool,
 }
@@ -59,8 +61,9 @@ struct GemmaRmsNorm {
 impl GemmaRmsNorm {
     fn load(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let cuda_candle_kernel = gemma_cuda_rms_norm_enabled(vb.device());
+        let adjusted_weight = (vb.get(dim, "weight")? + 1.0)?.contiguous()?;
         Ok(Self {
-            weight: vb.get(dim, "weight")?,
+            adjusted_weight,
             eps,
             cuda_candle_kernel,
         })
@@ -69,9 +72,15 @@ impl GemmaRmsNorm {
 
 impl Module for GemmaRmsNorm {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
-        let adjusted_weight = (&self.weight + 1.0)?;
+        if input.device().is_metal() || self.cuda_candle_kernel {
+            if let Some(output) =
+                try_fused_rms_norm(&input.contiguous()?, &self.adjusted_weight, self.eps)
+            {
+                return Ok(output);
+            }
+        }
         if self.cuda_candle_kernel {
-            return candle_nn::ops::rms_norm(input, &adjusted_weight, self.eps as f32);
+            return candle_nn::ops::rms_norm(input, &self.adjusted_weight, self.eps as f32);
         }
         let input_dtype = input.dtype();
         let internal_dtype = match input_dtype {
@@ -84,7 +93,7 @@ impl Module for GemmaRmsNorm {
         input
             .broadcast_div(&(variance + self.eps)?.sqrt()?)?
             .to_dtype(input_dtype)?
-            .broadcast_mul(&adjusted_weight)
+            .broadcast_mul(&self.adjusted_weight)
     }
 }
 
@@ -108,6 +117,7 @@ fn gemma_cuda_rms_norm_policy(is_cuda: bool, override_enabled: Option<bool>) -> 
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    cos_sin: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -133,19 +143,36 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((config.max_position_embeddings, 1))?;
         let frequencies = positions.matmul(&inverse_frequency)?;
-        Ok(Self {
-            sin: frequencies.sin()?,
-            cos: frequencies.cos()?,
-        })
+        let sin = frequencies.sin()?;
+        let cos = frequencies.cos()?;
+        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
+        Ok(Self { sin, cos, cos_sin })
     }
 
     fn apply(&self, query: &Tensor, key: &Tensor, position: usize) -> Result<(Tensor, Tensor)> {
-        let sequence_len = query.dim(2)?;
+        let sequence_len = query.dim(1)?;
         let cos = self.cos.narrow(0, position, sequence_len)?;
         let sin = self.sin.narrow(0, position, sequence_len)?;
+        if query.device().is_metal() || query.device().is_cuda() {
+            let packed = self
+                .cos_sin
+                .narrow(0, position, sequence_len)?
+                .contiguous()?;
+            if let Some((query, key)) =
+                try_fused_rope_pair_bshd(&query.contiguous()?, &key.contiguous()?, &packed)
+            {
+                record_rope_kernel();
+                record_rope_kernel();
+                return Ok((query, key));
+            }
+        }
+        record_rope_manual();
+        record_rope_manual();
+        let query = query.transpose(1, 2)?.contiguous()?;
+        let key = key.transpose(1, 2)?.contiguous()?;
         Ok((
-            candle_nn::rotary_emb::rope(&query.contiguous()?, &cos, &sin)?,
-            candle_nn::rotary_emb::rope(&key.contiguous()?, &cos, &sin)?,
+            candle_nn::rotary_emb::rope(&query, &cos, &sin)?.transpose(1, 2)?,
+            candle_nn::rotary_emb::rope(&key, &cos, &sin)?.transpose(1, 2)?,
         ))
     }
 }
@@ -267,16 +294,16 @@ impl GemmaAttention {
                 "Gemma physical attention requires one non-empty sequence".into(),
             ));
         }
-        let query = self
-            .query
-            .forward(input)?
-            .reshape((batch, sequence, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key = self
-            .key
-            .forward(input)?
-            .reshape((batch, sequence, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let query =
+            self.query
+                .forward(input)?
+                .reshape((batch, sequence, self.num_heads, self.head_dim))?;
+        let key = self.key.forward(input)?.reshape((
+            batch,
+            sequence,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
         let value = self
             .value
             .forward(input)?
@@ -286,11 +313,9 @@ impl GemmaAttention {
         let key = self.key_norm.forward(&key)?;
         let (query, key) = self.rotary.apply(&query, &key, position)?;
         let query = query
-            .transpose(1, 2)?
             .reshape((sequence, self.num_heads, self.head_dim))?
             .contiguous()?;
         let key = key
-            .transpose(1, 2)?
             .reshape((sequence, self.num_kv_heads, self.head_dim))?
             .contiguous()?;
         let attended = cache.write_and_attend_with_semantics(
@@ -333,16 +358,14 @@ impl GemmaAttention {
                 "Gemma physical decode rows must share one arena and layer binding".into(),
             ));
         }
-        let query = self
-            .query
-            .forward(input)?
-            .reshape((batch, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let query =
+            self.query
+                .forward(input)?
+                .reshape((batch, 1, self.num_heads, self.head_dim))?;
         let key = self
             .key
             .forward(input)?
-            .reshape((batch, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .reshape((batch, 1, self.num_kv_heads, self.head_dim))?;
         let value =
             self.value
                 .forward(input)?
@@ -836,15 +859,16 @@ mod tests {
         )
         .expect("input");
         let weight = Tensor::from_vec(vec![0.1f32, -0.2, 0.05, 0.3], 4, device).expect("weight");
+        let adjusted_weight = (&weight + 1.0).unwrap();
         let reference = GemmaRmsNorm {
-            weight: weight.clone(),
+            adjusted_weight: adjusted_weight.clone(),
             eps: 1e-6,
             cuda_candle_kernel: false,
         }
         .forward(&input)
         .expect("reference");
         let candle = GemmaRmsNorm {
-            weight,
+            adjusted_weight,
             eps: 1e-6,
             cuda_candle_kernel: true,
         }
