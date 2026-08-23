@@ -30,8 +30,14 @@ use super::scheduler::ScheduledRequest;
 #[cfg(test)]
 use crate::error::Result;
 
-/// One compatibility-checked physical executor call.
-pub(super) struct PreparedExecutionBatch {
+/// One immutable, compatibility-checked physical executor call.
+///
+/// The ticket owns every input needed after the core lock is released. Its
+/// physical envelope carries exact batch, lane/model, row/session/plan, work,
+/// workspace, and managed-cache fences; the remaining fields retain immutable
+/// request/model leases, scheduler inputs, phase, and progress visibility.
+pub(super) struct PreparedPhysicalDispatch {
+    phase: ExecutionPhase,
     physical_batch: PhysicalBatch,
     requests: Vec<Arc<EngineCoreRequest>>,
     scheduled: Vec<ScheduledRequest>,
@@ -39,49 +45,90 @@ pub(super) struct PreparedExecutionBatch {
     managed_cache_reservations: Vec<super::ManagedCacheReservation>,
 }
 
-impl PreparedExecutionBatch {
+impl PreparedPhysicalDispatch {
     pub(super) fn new(
+        phase: ExecutionPhase,
         physical_batch: PhysicalBatch,
         requests: Vec<Arc<EngineCoreRequest>>,
         scheduled: Vec<ScheduledRequest>,
         output_visibility: OutputVisibility,
-    ) -> Self {
-        Self {
-            physical_batch,
-            requests,
-            scheduled,
-            output_visibility,
-            managed_cache_reservations: Vec::new(),
-        }
-    }
-
-    pub(super) fn with_managed_cache_reservations(
-        mut self,
-        reservations: Vec<super::ManagedCacheReservation>,
+        managed_cache_reservations: Vec<super::ManagedCacheReservation>,
     ) -> crate::error::Result<Self> {
-        let rows = self
-            .physical_batch
+        physical_batch.validate()?;
+        if requests.len() != physical_batch.rows.len()
+            || scheduled.len() != physical_batch.rows.len()
+        {
+            return Err(crate::error::Error::InvalidInput(
+                "physical dispatch ticket inputs do not match its row count".to_string(),
+            ));
+        }
+
+        let mut sessions = HashSet::with_capacity(physical_batch.rows.len());
+        let mut plans = HashSet::with_capacity(physical_batch.rows.len());
+        for ((request, scheduled), row) in requests.iter().zip(&scheduled).zip(&physical_batch.rows)
+        {
+            if request.id != scheduled.request_id
+                || scheduled.session_key() != row.session
+                || scheduled.plan_id != row.plan_id
+                || scheduled.work != row.work
+            {
+                return Err(crate::error::Error::InvalidInput(
+                    "physical dispatch ticket row inputs cross an exact request or plan fence"
+                        .to_string(),
+                ));
+            }
+            if scheduled.is_prefill != (phase == ExecutionPhase::Prefill) {
+                return Err(crate::error::Error::InvalidInput(
+                    "physical dispatch ticket phase disagrees with its scheduled row".to_string(),
+                ));
+            }
+            if !sessions.insert(row.session.clone()) || !plans.insert(row.plan_id) {
+                return Err(crate::error::Error::InvalidInput(
+                    "physical dispatch ticket contains a duplicate session or plan quantum"
+                        .to_string(),
+                ));
+            }
+            if let Some(binding) = request.execution_adapter_binding() {
+                let adapter = binding.key_for_stage(physical_batch.lane.stage_id)?;
+                if adapter.execution_group_id != physical_batch.lane.execution_group
+                    || adapter.model_instance_id != physical_batch.lane.model_instance
+                    || adapter.adapter_instance_id != physical_batch.lane.adapter_instance
+                    || adapter.adapter_abi_revision != physical_batch.lane.adapter_abi
+                    || adapter.capability_id != physical_batch.lane.capability_id
+                {
+                    return Err(crate::error::Error::InvalidInput(
+                        "physical dispatch ticket crossed its loaded adapter/model fence"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        let rows = physical_batch
             .rows
             .iter()
             .map(|row| ((row.session.clone(), row.plan_id), row))
             .collect::<HashMap<_, _>>();
-        let mut attached = HashSet::with_capacity(reservations.len());
-        for reservation in &reservations {
+        let mut attached = HashSet::with_capacity(managed_cache_reservations.len());
+        for reservation in &managed_cache_reservations {
             let key = (reservation.session.clone(), reservation.txn_id);
             if !attached.insert(key.clone()) {
                 return Err(crate::error::Error::InvalidInput(
-                    "prepared batch contains a duplicate managed-cache reservation".to_string(),
+                    "physical dispatch ticket contains a duplicate managed-cache reservation"
+                        .to_string(),
                 ));
             }
             let row = rows.get(&key).ok_or_else(|| {
                 crate::error::Error::InvalidInput(
-                    "prepared batch contains a foreign managed-cache reservation".to_string(),
+                    "physical dispatch ticket contains a foreign managed-cache reservation"
+                        .to_string(),
                 )
             })?;
             reservation.validate_for_row(row)?;
             if row.managed_cache.as_ref() != Some(reservation) {
                 return Err(crate::error::Error::InvalidInput(
-                    "prepared managed-cache metadata differs from its row envelope".to_string(),
+                    "physical dispatch managed-cache metadata differs from its row envelope"
+                        .to_string(),
                 ));
             }
         }
@@ -91,41 +138,61 @@ impl PreparedExecutionBatch {
             })
         }) {
             return Err(crate::error::Error::InvalidInput(
-                "prepared batch omitted a row managed-cache reservation".to_string(),
+                "physical dispatch ticket omitted a row managed-cache reservation".to_string(),
             ));
         }
-        self.managed_cache_reservations = reservations;
-        Ok(self)
+
+        Ok(Self {
+            phase,
+            physical_batch,
+            requests,
+            scheduled,
+            output_visibility,
+            managed_cache_reservations,
+        })
     }
 
-    #[cfg(test)]
+    pub(super) const fn phase(&self) -> ExecutionPhase {
+        self.phase
+    }
+
     pub(super) fn physical_batch(&self) -> &PhysicalBatch {
         &self.physical_batch
+    }
+
+    pub(super) fn scheduled(&self) -> &[ScheduledRequest] {
+        &self.scheduled
+    }
+
+    pub(super) const fn output_visibility(&self) -> OutputVisibility {
+        self.output_visibility
+    }
+
+    pub(super) fn managed_cache_reservations(&self) -> &[super::ManagedCacheReservation] {
+        &self.managed_cache_reservations
     }
 }
 
 /// Immutable work detached from the mutable engine state.
 pub(super) struct PreparedEngineStep {
     executor: UnifiedExecutor,
-    decode_batches: Vec<PreparedExecutionBatch>,
-    prefill_batches: Vec<PreparedExecutionBatch>,
+    dispatches: Vec<PreparedPhysicalDispatch>,
 }
 
 impl PreparedEngineStep {
     pub(super) fn new(
         executor: UnifiedExecutor,
-        decode_batches: Vec<PreparedExecutionBatch>,
-        prefill_batches: Vec<PreparedExecutionBatch>,
+        dispatches: Vec<PreparedPhysicalDispatch>,
     ) -> Self {
         Self {
             executor,
-            decode_batches,
-            prefill_batches,
+            dispatches,
         }
     }
 }
 
 /// Results that can only be applied by the engine's commit phase.
+#[derive(Clone)]
 pub(super) struct ExecutedEngineStep {
     pub(super) batches: Vec<ExecutedPhysicalBatch>,
 }
@@ -224,6 +291,7 @@ impl ExecutionPhase {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ExecutedPhysicalBatch {
     pub(super) phase: ExecutionPhase,
     pub(super) physical_batch: PhysicalBatch,
@@ -244,57 +312,45 @@ impl ExecutionGroupRunner {
     ) -> ExecutedEngineStep {
         // Physical device work is deliberately serialized for every backend.
         // Tensor adapters may still fan out inside one physical batch.
-        let mut batches = execute_batches(
+        let batches = execute_dispatches(
             &prepared.executor,
-            ExecutionPhase::Decode,
-            prepared.decode_batches,
+            prepared.dispatches,
             &progress_tx,
             &progress_budget,
         )
         .await;
-        let mut prefill_batches = execute_batches(
-            &prepared.executor,
-            ExecutionPhase::Prefill,
-            prepared.prefill_batches,
-            &progress_tx,
-            &progress_budget,
-        )
-        .await;
-        batches.append(&mut prefill_batches);
 
         ExecutedEngineStep { batches }
     }
 }
 
-async fn execute_batches(
+async fn execute_dispatches(
     executor: &UnifiedExecutor,
-    phase: ExecutionPhase,
-    batches: Vec<PreparedExecutionBatch>,
+    dispatches: Vec<PreparedPhysicalDispatch>,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
 ) -> Vec<ExecutedPhysicalBatch> {
-    if batches.is_empty() {
+    if dispatches.is_empty() {
         return Vec::new();
     }
 
     let mut executed = Vec::new();
-    for batch in batches {
+    for dispatch in dispatches {
         let batch_started = Instant::now();
-        if let Some(results) = pre_dispatch_deadline_results(&batch, Instant::now()) {
+        if let Some(results) = pre_dispatch_deadline_results(&dispatch, Instant::now()) {
             executed.push(executed_batch(
-                phase,
-                batch,
+                dispatch,
                 results,
                 batch_started.elapsed(),
                 super::ResourceVector::zero(),
             ));
             continue;
         }
-        let workspace = match executor.reserve_batch_workspace(&batch.physical_batch) {
+        let workspace = match executor.reserve_batch_workspace(&dispatch.physical_batch) {
             Ok(workspace) => workspace,
             Err(error) => {
-                let dispatch = super::BatchDispatch::not_dispatched(batch.scheduled.len());
-                let results = batch
+                let batch_dispatch = super::BatchDispatch::not_dispatched(dispatch.scheduled.len());
+                let results = dispatch
                     .scheduled
                     .iter()
                     .map(|scheduled| {
@@ -302,7 +358,7 @@ async fn execute_batches(
                             scheduled,
                             format!("physical batch workspace admission failed: {error}"),
                         );
-                        result.dispatch = dispatch;
+                        result.dispatch = batch_dispatch;
                         result.provenance = OutcomeProvenance::failure(
                             FailureOrigin::WorkspaceAdmission,
                             DispatchState::NotStarted,
@@ -311,8 +367,7 @@ async fn execute_batches(
                     })
                     .collect();
                 executed.push(executed_batch(
-                    phase,
-                    batch,
+                    dispatch,
                     results,
                     batch_started.elapsed(),
                     super::ResourceVector::zero(),
@@ -320,23 +375,23 @@ async fn execute_batches(
                 continue;
             }
         };
-        if let Some(results) = pre_dispatch_deadline_results(&batch, Instant::now()) {
+        if let Some(results) = pre_dispatch_deadline_results(&dispatch, Instant::now()) {
             drop(workspace);
             executed.push(executed_batch(
-                phase,
-                batch,
+                dispatch,
                 results,
                 batch_started.elapsed(),
                 super::ResourceVector::zero(),
             ));
             continue;
         }
-        let stream_bindings = match bind_stream_quantum(&batch, progress_tx, progress_budget) {
+        let stream_bindings = match bind_stream_quantum(&dispatch, progress_tx, progress_budget) {
             Ok(bindings) => bindings,
             Err(error) => {
                 drop(workspace);
-                let dispatch = super::BatchDispatch::not_dispatched(batch.scheduled.len().max(1));
-                let results = batch
+                let batch_dispatch =
+                    super::BatchDispatch::not_dispatched(dispatch.scheduled.len().max(1));
+                let results = dispatch
                     .scheduled
                     .iter()
                     .map(|scheduled| {
@@ -344,7 +399,7 @@ async fn execute_batches(
                             scheduled,
                             format!("stream quantum binding failed: {error}"),
                         )
-                        .with_dispatch(dispatch)
+                        .with_dispatch(batch_dispatch)
                         .with_provenance(OutcomeProvenance::failure(
                             FailureOrigin::ExecutorValidation,
                             DispatchState::NotStarted,
@@ -352,8 +407,7 @@ async fn execute_batches(
                     })
                     .collect();
                 executed.push(executed_batch(
-                    phase,
-                    batch,
+                    dispatch,
                     results,
                     batch_started.elapsed(),
                     super::ResourceVector::zero(),
@@ -361,19 +415,22 @@ async fn execute_batches(
                 continue;
             }
         };
-        let observed_workspace = batch.physical_batch.workspace;
-        let expected_dispatch = batch.physical_batch.expected_dispatch();
-        let request_refs: Vec<_> = batch.requests.iter().map(Arc::as_ref).collect();
+        let observed_workspace = dispatch.physical_batch.workspace;
+        let expected_dispatch = dispatch.physical_batch.expected_dispatch();
+        let request_refs: Vec<_> = dispatch.requests.iter().map(Arc::as_ref).collect();
         let result = executor
-            .execute_physical_batch(&batch.physical_batch, &request_refs, &batch.scheduled)
+            .execute_physical_batch(&dispatch.physical_batch, &request_refs, &dispatch.scheduled)
             .await;
-        let mut results =
-            reconcile_executor_outputs(phase.label(), &batch.scheduled, expected_dispatch, result);
-        apply_post_dispatch_deadlines(&batch, Instant::now(), &mut results);
+        let mut results = reconcile_executor_outputs(
+            dispatch.phase.label(),
+            &dispatch.scheduled,
+            expected_dispatch,
+            result,
+        );
+        apply_post_dispatch_deadlines(&dispatch, Instant::now(), &mut results);
         drop(stream_bindings);
         executed.push(executed_batch(
-            phase,
-            batch,
+            dispatch,
             results,
             batch_started.elapsed(),
             observed_workspace,
@@ -384,7 +441,7 @@ async fn execute_batches(
 }
 
 fn bind_stream_quantum(
-    batch: &PreparedExecutionBatch,
+    batch: &PreparedPhysicalDispatch,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
     progress_budget: &Arc<StreamProgressBudget>,
 ) -> crate::error::Result<Vec<StreamBindingGuard>> {
@@ -415,7 +472,7 @@ fn bind_stream_quantum(
 }
 
 fn pre_dispatch_deadline_results(
-    batch: &PreparedExecutionBatch,
+    batch: &PreparedPhysicalDispatch,
     now: Instant,
 ) -> Option<Vec<ExecutorStepResult>> {
     if batch.requests.len() != batch.scheduled.len() {
@@ -488,7 +545,7 @@ fn pre_dispatch_deadline_results(
 }
 
 fn apply_post_dispatch_deadlines(
-    batch: &PreparedExecutionBatch,
+    batch: &PreparedPhysicalDispatch,
     now: Instant,
     results: &mut [ExecutorStepResult],
 ) {
@@ -521,12 +578,12 @@ fn apply_post_dispatch_deadlines(
 }
 
 fn executed_batch(
-    phase: ExecutionPhase,
-    batch: PreparedExecutionBatch,
+    batch: PreparedPhysicalDispatch,
     results: Vec<ExecutorStepResult>,
     elapsed: Duration,
     observed_resources: super::ResourceVector,
 ) -> ExecutedPhysicalBatch {
+    let phase = batch.phase;
     let dispatch = results
         .first()
         .map(|result| result.dispatch)
@@ -912,9 +969,10 @@ mod tests {
         batch_id: u64,
         request: EngineCoreRequest,
         scheduled: ScheduledRequest,
-    ) -> PreparedExecutionBatch {
+    ) -> PreparedPhysicalDispatch {
         let lane = lane();
-        PreparedExecutionBatch::new(
+        PreparedPhysicalDispatch::new(
+            ExecutionPhase::Prefill,
             PhysicalBatch {
                 batch_id: BatchId::new(batch_id),
                 lane: lane.clone(),
@@ -934,7 +992,79 @@ mod tests {
             vec![Arc::new(request)],
             vec![scheduled],
             OutputVisibility::AfterQuantumCommit,
+            Vec::new(),
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn prepared_physical_dispatch_rejects_duplicate_session_or_plan_quantum() {
+        let build = |batch_id: u64, scheduled: Vec<ScheduledRequest>| {
+            let lane = lane();
+            let requests = scheduled
+                .iter()
+                .map(|scheduled| {
+                    let mut request = EngineCoreRequest::tts("duplicate ticket fence");
+                    request.id = scheduled.request_id.clone();
+                    Arc::new(request)
+                })
+                .collect::<Vec<_>>();
+            let rows = scheduled
+                .iter()
+                .map(|scheduled| ReadyQuantum {
+                    plan_id: scheduled.plan_id,
+                    session: scheduled.session_key(),
+                    lane: lane.clone(),
+                    work: scheduled.work.clone(),
+                    cost: WorkCost::new(1, 1, 0),
+                    managed_cache: None,
+                })
+                .collect::<Vec<_>>();
+            PreparedPhysicalDispatch::new(
+                ExecutionPhase::Prefill,
+                PhysicalBatch {
+                    batch_id: BatchId::new(batch_id),
+                    lane,
+                    mode: NativeBatchMode::None,
+                    budget: BatchBudget {
+                        max_rows: 2,
+                        max_logical_units: 2,
+                        max_tensor_elements: 2,
+                        max_workspace_bytes: 0,
+                        max_padding_basis_points: 0,
+                        max_formation_delay: Duration::ZERO,
+                    },
+                    rows,
+                    materialized_tensor_elements: 2,
+                    workspace: ResourceVector::zero(),
+                },
+                requests,
+                scheduled,
+                OutputVisibility::AfterQuantumCommit,
+                Vec::new(),
+            )
+            .err()
+            .expect("duplicate ticket must be rejected")
+        };
+
+        let duplicate_session = build(
+            90,
+            vec![
+                scheduled("same-session", 1, 7),
+                scheduled("same-session", 2, 7),
+            ],
+        );
+        assert!(duplicate_session
+            .to_string()
+            .contains("duplicate session or plan"));
+
+        let duplicate_plan = build(
+            91,
+            vec![scheduled("plan-a", 3, 8), scheduled("plan-b", 3, 9)],
+        );
+        assert!(duplicate_plan
+            .to_string()
+            .contains("duplicate session or plan"));
     }
 
     async fn execute_prepared(prepared: PreparedEngineStep) -> ExecutedEngineStep {
@@ -955,11 +1085,8 @@ mod tests {
         request.id = "typed-progress".to_string();
         let scheduled = scheduled("typed-progress", 9, 0);
         let session = scheduled.session_key();
-        let prepared = PreparedEngineStep::new(
-            executor,
-            Vec::new(),
-            vec![prepared_batch(9, request, scheduled)],
-        );
+        let prepared =
+            PreparedEngineStep::new(executor, vec![prepared_batch(9, request, scheduled)]);
         let mut executed = execute_prepared(prepared).await;
 
         executed.apply_stream_delivery_failures(&[StreamDeliveryFailure {
@@ -1122,13 +1249,15 @@ mod tests {
         };
         let prepared = PreparedEngineStep::new(
             executor,
-            Vec::new(),
-            vec![PreparedExecutionBatch::new(
+            vec![PreparedPhysicalDispatch::new(
+                ExecutionPhase::Prefill,
                 physical_batch,
                 vec![Arc::new(request)],
                 vec![scheduled],
                 OutputVisibility::AfterQuantumCommit,
-            )],
+                Vec::new(),
+            )
+            .unwrap()],
         );
 
         let executed = execute_prepared(prepared).await;
@@ -1167,7 +1296,6 @@ mod tests {
         expired.deadline = Some(Instant::now() + Duration::from_millis(20));
         let prepared = PreparedEngineStep::new(
             executor,
-            Vec::new(),
             vec![
                 prepared_batch(11, first, scheduled("first", 11, 1)),
                 prepared_batch(12, expired, scheduled("expired", 12, 1)),
@@ -1234,13 +1362,15 @@ mod tests {
         };
         let prepared = PreparedEngineStep::new(
             executor,
-            Vec::new(),
-            vec![PreparedExecutionBatch::new(
+            vec![PreparedPhysicalDispatch::new(
+                ExecutionPhase::Prefill,
                 physical_batch,
                 vec![Arc::new(expired_request), Arc::new(live_request)],
                 vec![expired, live],
                 OutputVisibility::AfterQuantumCommit,
-            )],
+                Vec::new(),
+            )
+            .unwrap()],
         );
 
         let executed = execute_prepared(prepared).await;
@@ -1285,7 +1415,6 @@ mod tests {
         request.deadline = Some(Instant::now() + Duration::from_millis(20));
         let prepared = PreparedEngineStep::new(
             executor,
-            Vec::new(),
             vec![prepared_batch(
                 13,
                 request,
@@ -1353,13 +1482,15 @@ mod tests {
         };
         let prepared = PreparedEngineStep::new(
             executor,
-            Vec::new(),
-            vec![PreparedExecutionBatch::new(
+            vec![PreparedPhysicalDispatch::new(
+                ExecutionPhase::Prefill,
                 physical_batch,
                 vec![Arc::new(request)],
                 vec![scheduled],
                 OutputVisibility::AfterQuantumCommit,
-            )],
+                Vec::new(),
+            )
+            .unwrap()],
         );
 
         let executed = execute_prepared(prepared).await;

@@ -323,6 +323,11 @@ struct OwnedStepContext {
 }
 
 impl OwnedStepContext {
+    async fn rollback_abandoned_dispatches(&self) {
+        let mut core = self.core.write().await;
+        core.rollback_all_in_flight_dispatches();
+    }
+
     fn take_completion_sender(
         &self,
         session: &SessionKey,
@@ -434,9 +439,11 @@ impl OwnedStepContext {
                     break match result {
                         Ok(executed) => executed,
                         Err(error) if error.is_panic() => {
+                            self.rollback_abandoned_dispatches().await;
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
+                            self.rollback_abandoned_dispatches().await;
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));

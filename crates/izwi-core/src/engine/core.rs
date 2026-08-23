@@ -29,7 +29,7 @@ use super::execution::{
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
-    PreparedExecutionBatch,
+    PreparedPhysicalDispatch,
 };
 use super::executor::REQUEST_DEADLINE_EXCEEDED;
 use super::executor::{
@@ -132,11 +132,78 @@ struct PhysicalBatchAssembly {
     workspace_base_bytes: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveStreamBatch {
     lane: BatchLaneKey,
     output_visibility: OutputVisibility,
     rows: HashMap<u64, super::SessionKey>,
+}
+
+/// Core-owned identity snapshot for one physical ticket that has left the
+/// core lock but has not yet committed or rolled back.
+#[derive(Debug, Clone)]
+struct InFlightPhysicalDispatch {
+    phase: ExecutionPhase,
+    physical_batch: PhysicalBatch,
+    scheduled: Vec<super::scheduler::ScheduledRequest>,
+    output_visibility: OutputVisibility,
+    managed_cache_reservations: Vec<super::ManagedCacheReservation>,
+}
+
+impl InFlightPhysicalDispatch {
+    fn from_prepared(dispatch: &PreparedPhysicalDispatch) -> Self {
+        Self {
+            phase: dispatch.phase(),
+            physical_batch: dispatch.physical_batch().clone(),
+            scheduled: dispatch.scheduled().to_vec(),
+            output_visibility: dispatch.output_visibility(),
+            managed_cache_reservations: dispatch.managed_cache_reservations().to_vec(),
+        }
+    }
+
+    fn contains_session(&self, session: &super::SessionKey) -> bool {
+        self.physical_batch
+            .rows
+            .iter()
+            .any(|row| &row.session == session)
+    }
+
+    fn contains_plan(&self, plan_id: u64) -> bool {
+        self.physical_batch
+            .rows
+            .iter()
+            .any(|row| row.plan_id == plan_id)
+    }
+
+    fn stream_fence(&self) -> Option<ActiveStreamBatch> {
+        (self.output_visibility == OutputVisibility::IncrementalCommitted).then(|| {
+            ActiveStreamBatch {
+                lane: self.physical_batch.lane.clone(),
+                output_visibility: self.output_visibility,
+                rows: self
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .map(|row| (row.plan_id, row.session.clone()))
+                    .collect(),
+            }
+        })
+    }
+
+    fn validate_completion(
+        &self,
+        completed: &super::execution_group::ExecutedPhysicalBatch,
+    ) -> Result<()> {
+        if self.phase != completed.phase
+            || self.physical_batch != completed.physical_batch
+            || self.managed_cache_reservations != completed.managed_cache_reservations
+        {
+            return Err(Error::InferenceError(
+                "physical completion does not match its registered dispatch ticket".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn resolve_managed_token_reach(
@@ -348,6 +415,8 @@ pub struct EngineCore {
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
     active_plans: HashMap<u64, ExecutionPlan>,
+    /// Exact physical tickets currently owned outside the core lock.
+    in_flight_dispatches: HashMap<BatchId, InFlightPhysicalDispatch>,
     /// Prepared physical KV transactions keyed by their exact execution plan.
     active_managed_cache: HashMap<u64, super::ManagedCacheReservation>,
     /// Terminal sessions whose table release waits for an in-flight row.
@@ -510,6 +579,21 @@ impl EngineCore {
         &mut self,
         scheduled: &super::scheduler::ScheduledRequest,
     ) -> Result<()> {
+        let session = scheduled.session_key();
+        if self.active_plans.contains_key(&scheduled.plan_id)
+            || self
+                .active_plans
+                .values()
+                .any(|plan| plan.session == session)
+            || self.in_flight_dispatches.values().any(|dispatch| {
+                dispatch.contains_plan(scheduled.plan_id) || dispatch.contains_session(&session)
+            })
+        {
+            return Err(Error::InferenceError(format!(
+                "execution plan {} duplicates an active session or plan quantum",
+                scheduled.plan_id
+            )));
+        }
         let request = self
             .requests
             .get(&scheduled.request_id)
@@ -643,27 +727,53 @@ impl EngineCore {
             tracker.transition(running_state)?;
         }
         tracker.begin_plan(&plan)?;
-        if self.active_plans.insert(plan.plan_id, plan).is_some() {
-            return Err(Error::InferenceError(format!(
-                "execution plan {} was prepared twice",
-                scheduled.plan_id
-            )));
-        }
+        let replaced = self.active_plans.insert(plan.plan_id, plan);
+        debug_assert!(
+            replaced.is_none(),
+            "active plan was preflight-checked above"
+        );
         Ok(())
     }
 
     fn rollback_unexecuted_schedule(&mut self, scheduled: &[super::scheduler::ScheduledRequest]) {
-        let rolled_back_plans = scheduled
+        let requested_plans = scheduled
             .iter()
             .map(|scheduled| scheduled.plan_id)
             .collect::<HashSet<_>>();
+        let registered_batches = self
+            .in_flight_dispatches
+            .iter()
+            .filter(|(_, dispatch)| {
+                dispatch
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .any(|row| requested_plans.contains(&row.plan_id))
+            })
+            .map(|(batch_id, _)| *batch_id)
+            .collect::<Vec<_>>();
+        let mut exact_schedule = scheduled.to_vec();
+        let mut exact_plans = requested_plans;
+        for batch_id in registered_batches {
+            let Some(dispatch) = self.in_flight_dispatches.remove(&batch_id) else {
+                continue;
+            };
+            self.active_stream_batches.remove(&batch_id);
+            for row in dispatch.scheduled {
+                if exact_plans.insert(row.plan_id) {
+                    exact_schedule.push(row);
+                }
+            }
+        }
+
+        let rolled_back_plans = exact_plans;
         self.active_stream_batches.retain(|_, batch| {
             !batch
                 .rows
                 .keys()
                 .any(|plan_id| rolled_back_plans.contains(plan_id))
         });
-        for scheduled in scheduled {
+        for scheduled in &exact_schedule {
             let session = scheduled.session_key();
             if let Some(reservation) = self.active_managed_cache.remove(&scheduled.plan_id) {
                 if let Err(error) = self.managed_kv_cache.finalize(&reservation, None, false) {
@@ -701,6 +811,20 @@ impl EngineCore {
             self.scheduler.release_execution_quantum_for_retry(&session);
             self.release_managed_session_if_ready(&session);
         }
+    }
+
+    /// Roll back every registered physical ticket. The main engine driver uses
+    /// this hook when a prepared dispatch can no longer produce a completion
+    /// (for example, a cancelled/join-failed runner task).
+    pub(super) fn rollback_all_in_flight_dispatches(&mut self) -> usize {
+        let scheduled = self
+            .in_flight_dispatches
+            .values()
+            .flat_map(|dispatch| dispatch.scheduled.iter().cloned())
+            .collect::<Vec<_>>();
+        let count = self.in_flight_dispatches.len();
+        self.rollback_unexecuted_schedule(&scheduled);
+        count
     }
 
     fn defer_unexecuted_schedule_for_capacity(
@@ -1290,13 +1414,76 @@ impl EngineCore {
         Ok(batch_id)
     }
 
+    fn register_prepared_physical_dispatch(
+        &mut self,
+        dispatch: &PreparedPhysicalDispatch,
+    ) -> Result<()> {
+        let in_flight = InFlightPhysicalDispatch::from_prepared(dispatch);
+        let batch_id = in_flight.physical_batch.batch_id;
+        if !self.in_flight_dispatches.is_empty() {
+            return Err(Error::InferenceError(
+                "strict-serial execution already owns an in-flight physical dispatch".to_string(),
+            ));
+        }
+        if self.in_flight_dispatches.contains_key(&batch_id) {
+            return Err(Error::InferenceError(
+                "physical dispatch batch identity was registered twice".to_string(),
+            ));
+        }
+
+        for row in &in_flight.physical_batch.rows {
+            let plan = self.active_plans.get(&row.plan_id).ok_or_else(|| {
+                Error::InferenceError(
+                    "physical dispatch row has no active execution plan".to_string(),
+                )
+            })?;
+            if plan.session != row.session || plan.work != row.work {
+                return Err(Error::InferenceError(
+                    "physical dispatch row crossed its active plan fence".to_string(),
+                ));
+            }
+            if self.in_flight_dispatches.values().any(|active| {
+                active.contains_plan(row.plan_id) || active.contains_session(&row.session)
+            }) {
+                return Err(Error::InferenceError(
+                    "physical dispatch duplicated an in-flight session or plan quantum".to_string(),
+                ));
+            }
+            match (
+                row.managed_cache.as_ref(),
+                self.active_managed_cache.get(&row.plan_id),
+            ) {
+                (None, None) => {}
+                (Some(row), Some(active)) if row == active => {}
+                _ => {
+                    return Err(Error::InferenceError(
+                        "physical dispatch row crossed its active managed-cache fence".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let stream_fence = in_flight.stream_fence();
+        if stream_fence.is_some() && self.active_stream_batches.contains_key(&batch_id) {
+            return Err(Error::InferenceError(
+                "physical stream batch identity was registered twice".to_string(),
+            ));
+        }
+        self.in_flight_dispatches.insert(batch_id, in_flight);
+        if let Some(stream_fence) = stream_fence {
+            self.active_stream_batches.insert(batch_id, stream_fence);
+        }
+        Ok(())
+    }
+
     fn form_physical_batches(
         &mut self,
+        phase: ExecutionPhase,
         requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
         capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
         transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
-    ) -> Result<Vec<PreparedExecutionBatch>> {
+    ) -> Result<Vec<PreparedPhysicalDispatch>> {
         let available = requests
             .iter()
             .map(|request| request.id.clone())
@@ -1450,43 +1637,22 @@ impl EngineCore {
                 transaction_deferred.extend(assembly.scheduled);
                 continue;
             }
-            if assembly.output_visibility == OutputVisibility::IncrementalCommitted {
-                let rows = assembly
-                    .physical_batch
-                    .rows
-                    .iter()
-                    .map(|row| (row.plan_id, row.session.clone()))
-                    .collect();
-                let fence = ActiveStreamBatch {
-                    lane: assembly.physical_batch.lane.clone(),
-                    output_visibility: assembly.output_visibility,
-                    rows,
-                };
-                if self
-                    .active_stream_batches
-                    .insert(assembly.physical_batch.batch_id, fence)
-                    .is_some()
-                {
-                    return Err(Error::InferenceError(
-                        "physical stream batch identity was registered twice".to_string(),
-                    ));
-                }
-            }
             let reservations = assembly
                 .physical_batch
                 .rows
                 .iter()
                 .filter_map(|row| row.managed_cache.clone())
                 .collect();
-            prepared.push(
-                PreparedExecutionBatch::new(
-                    assembly.physical_batch,
-                    assembly.requests,
-                    assembly.scheduled,
-                    assembly.output_visibility,
-                )
-                .with_managed_cache_reservations(reservations)?,
-            );
+            let dispatch = PreparedPhysicalDispatch::new(
+                phase,
+                assembly.physical_batch,
+                assembly.requests,
+                assembly.scheduled,
+                assembly.output_visibility,
+                reservations,
+            )?;
+            self.register_prepared_physical_dispatch(&dispatch)?;
+            prepared.push(dispatch);
         }
         Ok(prepared)
     }
@@ -1671,6 +1837,7 @@ impl EngineCore {
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
             active_plans: HashMap::new(),
+            in_flight_dispatches: HashMap::new(),
             active_managed_cache: HashMap::new(),
             pending_managed_releases: HashSet::new(),
             active_stream_batches: HashMap::new(),
@@ -1793,6 +1960,13 @@ impl EngineCore {
 
     fn clear_exact_execution_state(&mut self, session: &super::SessionKey) {
         if self
+            .in_flight_dispatches
+            .values()
+            .any(|dispatch| dispatch.contains_session(session))
+        {
+            return;
+        }
+        if self
             .execution_trackers
             .get(&session.request_id)
             .is_some_and(|tracker| tracker.session() == session)
@@ -1889,6 +2063,27 @@ impl EngineCore {
         {
             return Err(StreamProgressRejection::invalid(
                 "stream progress is not authorized by the active adapter stage",
+            ));
+        }
+
+        let dispatch = self
+            .in_flight_dispatches
+            .get(&progress.batch_id)
+            .ok_or_else(|| {
+                StreamProgressRejection::invalid(
+                    "stream progress references no in-flight physical dispatch",
+                )
+            })?;
+        if dispatch.output_visibility != OutputVisibility::IncrementalCommitted
+            || dispatch.physical_batch.lane != progress.lane
+            || !dispatch
+                .physical_batch
+                .rows
+                .iter()
+                .any(|row| row.plan_id == progress.plan_id && row.session == progress.session)
+        {
+            return Err(StreamProgressRejection::invalid(
+                "stream progress does not match its in-flight dispatch ticket",
             ));
         }
 
@@ -2082,9 +2277,11 @@ impl EngineCore {
                     break match result {
                         Ok(executed) => executed,
                         Err(error) if error.is_panic() => {
+                            self.rollback_all_in_flight_dispatches();
                             std::panic::resume_unwind(error.into_panic())
                         }
                         Err(error) => {
+                            self.rollback_all_in_flight_dispatches();
                             return Err(Error::InferenceError(format!(
                                 "execution group task was cancelled: {error}"
                             )));
@@ -2203,6 +2400,13 @@ impl EngineCore {
             self.initialize().await?;
         }
 
+        // Decode and prefill share one physical-quantum ownership fence. The
+        // current rollout remains strictly serial, so do not poll the
+        // scheduler again until the registered ticket commits or rolls back.
+        if !self.in_flight_dispatches.is_empty() {
+            return Ok(None);
+        }
+
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
         self.reconcile_due_cleanup().await;
@@ -2288,6 +2492,7 @@ impl EngineCore {
         let mut capacity_blocked = Vec::new();
         let mut transaction_deferred = Vec::new();
         let decode_batches = match self.form_physical_batches(
+            ExecutionPhase::Decode,
             &decode_requests,
             &decode_scheduled,
             &mut capacity_blocked,
@@ -2306,6 +2511,7 @@ impl EngineCore {
         };
         let prefill_batches = if decode_batches.is_empty() {
             match self.form_physical_batches(
+                ExecutionPhase::Prefill,
                 &prefill_requests,
                 &prefill_scheduled,
                 &mut capacity_blocked,
@@ -2346,10 +2552,11 @@ impl EngineCore {
             return Ok(None);
         }
 
+        let mut dispatches = decode_batches;
+        dispatches.extend(prefill_batches);
         Ok(Some(PreparedEngineStep::new(
             self.executor.clone(),
-            decode_batches,
-            prefill_batches,
+            dispatches,
         )))
     }
 
@@ -2368,11 +2575,35 @@ impl EngineCore {
             Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
         let mut stream_deliveries = Vec::new();
         for mut batch in batches {
-            self.active_stream_batches
-                .remove(&batch.physical_batch.batch_id);
+            let batch_id = batch.physical_batch.batch_id;
+            let Some(in_flight) = self.in_flight_dispatches.remove(&batch_id) else {
+                warn!(
+                    batch_id = batch_id.get(),
+                    "Ignoring a stale or duplicate physical completion"
+                );
+                continue;
+            };
+            let active_stream_fence = self.active_stream_batches.remove(&batch_id);
+            if let Err(error) = in_flight.validate_completion(&batch) {
+                warn!(
+                    batch_id = batch_id.get(),
+                    error = %error,
+                    "Rolling back a physical completion that crossed its dispatch ticket"
+                );
+                self.rollback_unexecuted_schedule(&in_flight.scheduled);
+                continue;
+            }
+            if active_stream_fence != in_flight.stream_fence() {
+                warn!(
+                    batch_id = batch_id.get(),
+                    "Rolling back a physical completion with a mismatched progress fence"
+                );
+                self.rollback_unexecuted_schedule(&in_flight.scheduled);
+                continue;
+            }
             if let Err(error) = batch
                 .report
-                .validate_against(&batch.physical_batch, &self.active_plans)
+                .validate_against(&in_flight.physical_batch, &self.active_plans)
             {
                 warn!(
                     batch_id = batch.physical_batch.batch_id.get(),
@@ -3205,6 +3436,7 @@ impl EngineCore {
         self.request_phase_timings.clear();
         self.execution_trackers.clear();
         self.active_plans.clear();
+        self.in_flight_dispatches.clear();
         self.active_stream_batches.clear();
         self.stream_sequence_cursors.clear();
         self.incremental_stream_sessions.clear();
@@ -4697,8 +4929,15 @@ mod tests {
             .map(|item| core.requests.get(&item.request_id).unwrap().clone())
             .collect::<Vec<_>>();
 
+        let active_plans = core.active_plans.clone();
         let joined = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut Vec::new())
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
             .unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].physical_batch().rows.len(), 2);
@@ -4713,6 +4952,8 @@ mod tests {
             joined[0].physical_batch().lane.model_instance,
             super::super::ModelInstanceId::new(2)
         );
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        core.active_plans.extend(active_plans);
 
         core.active_plans
             .get_mut(&scheduled[1].plan_id)
@@ -4724,7 +4965,13 @@ mod tests {
             .model_instance_id = super::super::ModelInstanceId::new(9);
         let mut deferred = Vec::new();
         let split = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut deferred)
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                &mut Vec::new(),
+                &mut deferred,
+            )
             .unwrap();
         assert_eq!(split.len(), 1);
         assert_eq!(split[0].physical_batch().rows.len(), 1);
@@ -4862,7 +5109,13 @@ mod tests {
 
         let mut deferred = Vec::new();
         let batches = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut deferred)
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                &mut Vec::new(),
+                &mut deferred,
+            )
             .unwrap();
         let widths = batches
             .iter()
@@ -4964,7 +5217,13 @@ mod tests {
 
         let mut deferred = Vec::new();
         let batches = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut deferred)
+            .form_physical_batches(
+                ExecutionPhase::Prefill,
+                &requests,
+                &scheduled,
+                &mut Vec::new(),
+                &mut deferred,
+            )
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(deferred.len(), 1);
@@ -5049,7 +5308,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         let batches = core
-            .form_physical_batches(&requests, &scheduled, &mut Vec::new(), &mut Vec::new())
+            .form_physical_batches(
+                ExecutionPhase::Decode,
+                &requests,
+                &scheduled,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(
@@ -6495,6 +6760,115 @@ mod tests {
 
         assert!((prefill_ms["fast-batch"] - 7.0).abs() < 0.001);
         assert!((prefill_ms["slow-batch"] - 31.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn in_flight_quantum_blocks_duplicate_preparation_and_clears_on_commit_and_rollback() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let mut request = EngineCoreRequest::tts("one physical quantum at a time");
+        request.id = "ticket-serial".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+
+        let prefill = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("prefill dispatch");
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+        assert_eq!(
+            core.in_flight_dispatches.values().next().unwrap().phase,
+            ExecutionPhase::Prefill
+        );
+        assert!(core.prepare_step().await.unwrap().is_none());
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+
+        let executed = core.execute_prepared_with_progress(prefill).await.unwrap();
+        core.commit_step(executed).await.unwrap();
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_stream_batches.is_empty());
+
+        let decode = core.prepare_step().await.unwrap().expect("decode dispatch");
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+        assert_eq!(
+            core.in_flight_dispatches.values().next().unwrap().phase,
+            ExecutionPhase::Decode
+        );
+        assert!(core.prepare_step().await.unwrap().is_none());
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        assert_eq!(core.active_plans.len(), 1);
+
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+        assert!(core.active_managed_cache.is_empty());
+        assert!(core.active_stream_batches.is_empty());
+        drop(decode);
+    }
+
+    #[tokio::test]
+    async fn stale_and_duplicate_physical_completion_cannot_cross_the_dispatch_registry() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let mut request = EngineCoreRequest::tts("completion identity fence");
+        request.id = "ticket-completion".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("registered dispatch");
+        let registered_batch_id = *core.in_flight_dispatches.keys().next().unwrap();
+        let exact = core.execute_prepared_with_progress(prepared).await.unwrap();
+        let duplicate = exact.clone();
+        let mut stale = exact.clone();
+        stale.batches[0].physical_batch.batch_id = BatchId::new(u64::MAX);
+        stale.batches[0].report.batch_id = BatchId::new(u64::MAX);
+
+        let stale_commit = core.commit_step(stale).await.unwrap();
+        assert!(stale_commit.outputs.is_empty());
+        assert!(core.in_flight_dispatches.contains_key(&registered_batch_id));
+        assert_eq!(core.active_plans.len(), 1);
+
+        core.commit_step(exact).await.unwrap();
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
+
+        let duplicate_commit = core.commit_step(duplicate).await.unwrap();
+        assert!(duplicate_commit.outputs.is_empty());
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
     }
 
     #[tokio::test]
