@@ -1,28 +1,34 @@
-//! Serialized physical execution for one engine execution group.
+//! Bounded physical execution for one engine execution group.
 //!
 //! The scheduler and lifecycle state live in [`super::core::EngineCore`], but
 //! model forwards must not run while that mutable state is locked. A prepared
 //! step owns immutable request snapshots and exact scheduler transactions; the
-//! runner consumes those batches serially and returns results for a later
-//! fenced commit.
+//! runner consumes those batches according to their sealed launch policies and
+//! returns results for a later fenced commit.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tracing::warn;
+
+use crate::config::{PhysicalExecutionMode, PhysicalInFlightLimit};
 
 use super::execution::{
     DeadlinePhase, DispatchState, ExecutionDisposition, ExecutionFailure, ExecutionReport,
     FailureKind, FailureOrigin, FailureScope, FinishReason, HealthImpact, OutcomeProvenance,
-    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, RetryDisposition,
-    StateDisposition,
+    OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport,
+    PhysicalLaunchPolicy, RetryDisposition, StateDisposition,
 };
 use super::executor::{
     ExecutorOutput, ExecutorStepResult, PhysicalDispatchResult, StreamDeliveryFailure,
     StreamDeliveryFailureKind, UnifiedExecutor,
 };
+use super::metrics::begin_engine_physical_workspace;
 use super::request::{
     EngineCoreRequest, FencedStreamProgress, StreamBindingGuard, StreamProgressBudget,
 };
@@ -36,6 +42,7 @@ use crate::error::Result;
 /// physical envelope carries exact batch, lane/model, row/session/plan, work,
 /// workspace, and managed-cache fences; the remaining fields retain immutable
 /// request/model leases, scheduler inputs, phase, and progress visibility.
+#[derive(Clone)]
 pub(super) struct PreparedPhysicalDispatch {
     phase: ExecutionPhase,
     physical_batch: PhysicalBatch,
@@ -43,6 +50,7 @@ pub(super) struct PreparedPhysicalDispatch {
     scheduled: Vec<ScheduledRequest>,
     output_visibility: OutputVisibility,
     managed_cache_reservations: Vec<super::ManagedCacheReservation>,
+    launch_policy: PhysicalLaunchPolicy,
 }
 
 impl PreparedPhysicalDispatch {
@@ -53,6 +61,7 @@ impl PreparedPhysicalDispatch {
         scheduled: Vec<ScheduledRequest>,
         output_visibility: OutputVisibility,
         managed_cache_reservations: Vec<super::ManagedCacheReservation>,
+        launch_policy: PhysicalLaunchPolicy,
     ) -> crate::error::Result<Self> {
         physical_batch.validate()?;
         if requests.len() != physical_batch.rows.len()
@@ -149,6 +158,7 @@ impl PreparedPhysicalDispatch {
             scheduled,
             output_visibility,
             managed_cache_reservations,
+            launch_policy,
         })
     }
 
@@ -171,12 +181,18 @@ impl PreparedPhysicalDispatch {
     pub(super) fn managed_cache_reservations(&self) -> &[super::ManagedCacheReservation] {
         &self.managed_cache_reservations
     }
+
+    pub(super) const fn launch_policy(&self) -> PhysicalLaunchPolicy {
+        self.launch_policy
+    }
 }
 
 /// Immutable work detached from the mutable engine state.
 pub(super) struct PreparedEngineStep {
     executor: UnifiedExecutor,
     dispatches: Vec<PreparedPhysicalDispatch>,
+    physical_execution_mode: PhysicalExecutionMode,
+    max_physical_in_flight: PhysicalInFlightLimit,
 }
 
 impl PreparedEngineStep {
@@ -184,9 +200,25 @@ impl PreparedEngineStep {
         executor: UnifiedExecutor,
         dispatches: Vec<PreparedPhysicalDispatch>,
     ) -> Self {
+        Self::with_execution_policy(
+            executor,
+            dispatches,
+            PhysicalExecutionMode::Serial,
+            PhysicalInFlightLimit::default(),
+        )
+    }
+
+    pub(super) fn with_execution_policy(
+        executor: UnifiedExecutor,
+        dispatches: Vec<PreparedPhysicalDispatch>,
+        physical_execution_mode: PhysicalExecutionMode,
+        max_physical_in_flight: PhysicalInFlightLimit,
+    ) -> Self {
         Self {
             executor,
             dispatches,
+            physical_execution_mode,
+            max_physical_in_flight,
         }
     }
 }
@@ -310,11 +342,11 @@ impl ExecutionGroupRunner {
         progress_tx: mpsc::Sender<FencedStreamProgress>,
         progress_budget: Arc<StreamProgressBudget>,
     ) -> ExecutedEngineStep {
-        // Physical device work is deliberately serialized for every backend.
-        // Tensor adapters may still fan out inside one physical batch.
         let batches = execute_dispatches(
             &prepared.executor,
             prepared.dispatches,
+            prepared.physical_execution_mode,
+            prepared.max_physical_in_flight,
             &progress_tx,
             &progress_budget,
         )
@@ -325,6 +357,240 @@ impl ExecutionGroupRunner {
 }
 
 async fn execute_dispatches(
+    executor: &UnifiedExecutor,
+    dispatches: Vec<PreparedPhysicalDispatch>,
+    mode: PhysicalExecutionMode,
+    max_physical_in_flight: PhysicalInFlightLimit,
+    progress_tx: &mpsc::Sender<FencedStreamProgress>,
+    progress_budget: &Arc<StreamProgressBudget>,
+) -> Vec<ExecutedPhysicalBatch> {
+    if mode != PhysicalExecutionMode::Concurrent
+        || max_physical_in_flight.get() == 1
+        || dispatches.len() < 2
+    {
+        return execute_dispatches_serial(executor, dispatches, progress_tx, progress_budget).await;
+    }
+
+    execute_dispatches_concurrent(
+        executor,
+        dispatches,
+        max_physical_in_flight,
+        progress_tx,
+        progress_budget,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct ActivePhysicalLaunch {
+    index: usize,
+    model_instance: super::ModelInstanceId,
+    policy: PhysicalLaunchPolicy,
+    units: usize,
+}
+
+fn physical_launch_units(dispatch: &PreparedPhysicalDispatch) -> usize {
+    if matches!(
+        dispatch.launch_policy,
+        PhysicalLaunchPolicy::Concurrent { .. }
+    ) && dispatch.physical_batch.mode == super::NativeBatchMode::None
+    {
+        dispatch.physical_batch.rows.len().max(1)
+    } else {
+        1
+    }
+}
+
+fn launch_is_compatible(
+    candidate: &PreparedPhysicalDispatch,
+    active: &[ActivePhysicalLaunch],
+    engine_limit: PhysicalInFlightLimit,
+) -> bool {
+    let candidate_units = physical_launch_units(candidate);
+    let active_units = active.iter().map(|launch| launch.units).sum::<usize>();
+    if candidate_units > engine_limit.get()
+        || active_units.saturating_add(candidate_units) > engine_limit.get()
+    {
+        return false;
+    }
+    if active
+        .iter()
+        .any(|launch| launch.policy == PhysicalLaunchPolicy::ExecutionGroupExclusive)
+    {
+        return false;
+    }
+
+    let model_instance = candidate.physical_batch.lane.model_instance;
+    match candidate.launch_policy {
+        PhysicalLaunchPolicy::ExecutionGroupExclusive => active.is_empty(),
+        PhysicalLaunchPolicy::ModelExclusive => !active
+            .iter()
+            .any(|launch| launch.model_instance == model_instance),
+        policy @ PhysicalLaunchPolicy::Concurrent { .. } => {
+            let same_model = active
+                .iter()
+                .filter(|launch| launch.model_instance == model_instance)
+                .collect::<Vec<_>>();
+            let same_model_limit = same_model.iter().fold(
+                policy.effective_max_in_flight_per_model(engine_limit),
+                |limit, launch| {
+                    limit.min(
+                        launch
+                            .policy
+                            .effective_max_in_flight_per_model(engine_limit),
+                    )
+                },
+            );
+            !same_model
+                .iter()
+                .any(|launch| launch.policy == PhysicalLaunchPolicy::ModelExclusive)
+                && same_model.iter().map(|launch| launch.units).sum::<usize>() + candidate_units
+                    <= same_model_limit
+        }
+    }
+}
+
+type PhysicalLaunchFuture =
+    Pin<Box<dyn Future<Output = (ActivePhysicalLaunch, ExecutedPhysicalBatch)> + Send>>;
+
+fn failed_physical_task_completion(
+    dispatch: PreparedPhysicalDispatch,
+    message: String,
+) -> ExecutedPhysicalBatch {
+    let expected_dispatch = dispatch.physical_batch.expected_dispatch();
+    let results = dispatch
+        .scheduled
+        .iter()
+        .map(|scheduled| {
+            failed_step_result(scheduled, message.clone())
+                .with_dispatch(expected_dispatch)
+                .with_provenance(OutcomeProvenance::failure(
+                    FailureOrigin::Panic,
+                    DispatchState::Started,
+                ))
+        })
+        .collect();
+    executed_batch(
+        dispatch,
+        results,
+        Duration::ZERO,
+        super::ResourceVector::zero(),
+    )
+}
+
+fn rejected_physical_dispatch_completion(
+    dispatch: PreparedPhysicalDispatch,
+    message: String,
+) -> ExecutedPhysicalBatch {
+    let width = dispatch.scheduled.len().max(1);
+    let results = dispatch
+        .scheduled
+        .iter()
+        .map(|scheduled| {
+            failed_step_result(scheduled, message.clone())
+                .with_dispatch(super::BatchDispatch::not_dispatched(width))
+                .with_provenance(OutcomeProvenance::failure(
+                    FailureOrigin::DispatchCoordination,
+                    DispatchState::NotStarted,
+                ))
+        })
+        .collect();
+    executed_batch(
+        dispatch,
+        results,
+        Duration::ZERO,
+        super::ResourceVector::zero(),
+    )
+}
+
+async fn execute_dispatches_concurrent(
+    executor: &UnifiedExecutor,
+    dispatches: Vec<PreparedPhysicalDispatch>,
+    engine_limit: PhysicalInFlightLimit,
+    progress_tx: &mpsc::Sender<FencedStreamProgress>,
+    progress_budget: &Arc<StreamProgressBudget>,
+) -> Vec<ExecutedPhysicalBatch> {
+    let result_count = dispatches.len();
+    let mut pending = dispatches
+        .into_iter()
+        .enumerate()
+        .collect::<std::collections::VecDeque<_>>();
+    let mut launches = FuturesUnordered::<PhysicalLaunchFuture>::new();
+    let mut active = Vec::<ActivePhysicalLaunch>::new();
+    let mut completed = vec![None; result_count];
+
+    while !pending.is_empty() || !launches.is_empty() {
+        while let Some((index, dispatch)) = pending.front() {
+            if physical_launch_units(dispatch) > engine_limit.get() {
+                let index = *index;
+                let (_, dispatch) = pending
+                    .pop_front()
+                    .expect("front dispatch disappeared before rejection");
+                completed[index] = Some(rejected_physical_dispatch_completion(
+                    dispatch,
+                    "physical dispatch width exceeds the configured launch capacity".to_string(),
+                ));
+                continue;
+            }
+            if !launch_is_compatible(dispatch, &active, engine_limit) {
+                break;
+            }
+            let index = *index;
+            let (_, dispatch) = pending
+                .pop_front()
+                .expect("front dispatch disappeared before launch");
+            let launch = ActivePhysicalLaunch {
+                index,
+                model_instance: dispatch.physical_batch.lane.model_instance,
+                policy: dispatch.launch_policy,
+                units: physical_launch_units(&dispatch),
+            };
+            active.push(launch);
+            let recovery = dispatch.clone();
+            let task_executor = executor.clone();
+            let task_progress_tx = progress_tx.clone();
+            let task_progress_budget = progress_budget.clone();
+            let task = tokio::spawn(async move {
+                let mut executed = execute_dispatches_serial(
+                    &task_executor,
+                    vec![dispatch],
+                    &task_progress_tx,
+                    &task_progress_budget,
+                )
+                .await;
+                executed
+                    .pop()
+                    .expect("one prepared dispatch must produce one completion")
+            });
+            launches.push(Box::pin(async move {
+                let batch = match task.await {
+                    Ok(batch) => batch,
+                    Err(error) => failed_physical_task_completion(
+                        recovery,
+                        format!("physical dispatch task failed: {error}"),
+                    ),
+                };
+                (launch, batch)
+            }));
+        }
+
+        let Some((launch, batch)) = launches.next().await else {
+            break;
+        };
+        active.retain(|candidate| candidate.index != launch.index);
+        completed[launch.index] = Some(batch);
+    }
+
+    completed
+        .into_iter()
+        .enumerate()
+        .map(|(index, batch)| {
+            batch.unwrap_or_else(|| panic!("physical dispatch {index} produced no completion"))
+        })
+        .collect()
+}
+
+async fn execute_dispatches_serial(
     executor: &UnifiedExecutor,
     dispatches: Vec<PreparedPhysicalDispatch>,
     progress_tx: &mpsc::Sender<FencedStreamProgress>,
@@ -375,6 +641,9 @@ async fn execute_dispatches(
                 continue;
             }
         };
+        let _workspace_metrics = workspace
+            .as_ref()
+            .map(|_| begin_engine_physical_workspace(dispatch.physical_batch.workspace));
         if let Some(results) = pre_dispatch_deadline_results(&dispatch, Instant::now()) {
             drop(workspace);
             executed.push(executed_batch(
@@ -831,6 +1100,65 @@ mod tests {
         delay: Duration,
     }
 
+    struct ObservedPhysicalExecutor {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl ModelExecutor for ObservedPhysicalExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            execution.validate().expect("test physical batch");
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::terminal(scheduled.request_id.clone()),
+                    )
+                    .with_dispatch(dispatch)
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical boundary must own dispatch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     impl ModelExecutor for SleepingPhysicalExecutor {
         fn execute_physical_batch(
             &self,
@@ -993,8 +1321,89 @@ mod tests {
             vec![scheduled],
             OutputVisibility::AfterQuantumCommit,
             Vec::new(),
+            PhysicalLaunchPolicy::ExecutionGroupExclusive,
         )
         .unwrap()
+    }
+
+    fn prepared_batch_with_policy(
+        batch_id: u64,
+        request: EngineCoreRequest,
+        scheduled: ScheduledRequest,
+        policy: PhysicalLaunchPolicy,
+    ) -> PreparedPhysicalDispatch {
+        let mut dispatch = prepared_batch(batch_id, request, scheduled);
+        dispatch.launch_policy = policy;
+        dispatch
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mode_overlaps_certified_disjoint_physical_tickets() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active,
+            max_active: max_active.clone(),
+            delay: Duration::from_millis(50),
+        }));
+        let policy = PhysicalLaunchPolicy::concurrent(2).unwrap();
+        let mut first = EngineCoreRequest::tts("first concurrent");
+        first.id = "first-concurrent".to_string();
+        let mut second = EngineCoreRequest::tts("second concurrent");
+        second.id = "second-concurrent".to_string();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_batch_with_policy(
+                    101,
+                    first,
+                    scheduled("first-concurrent", 101, 1),
+                    policy,
+                ),
+                prepared_batch_with_policy(
+                    102,
+                    second,
+                    scheduled("second-concurrent", 102, 1),
+                    policy,
+                ),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+
+        assert_eq!(executed.batches.len(), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mode_keeps_group_exclusive_tickets_serial() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ObservedPhysicalExecutor {
+            active,
+            max_active: max_active.clone(),
+            delay: Duration::from_millis(25),
+        }));
+        let mut first = EngineCoreRequest::tts("first exclusive");
+        first.id = "first-exclusive".to_string();
+        let mut second = EngineCoreRequest::tts("second exclusive");
+        second.id = "second-exclusive".to_string();
+        let prepared = PreparedEngineStep::with_execution_policy(
+            executor,
+            vec![
+                prepared_batch(103, first, scheduled("first-exclusive", 103, 1)),
+                prepared_batch(104, second, scheduled("second-exclusive", 104, 1)),
+            ],
+            PhysicalExecutionMode::Concurrent,
+            PhysicalInFlightLimit::new(2).unwrap(),
+        );
+
+        let executed = execute_prepared(prepared).await;
+
+        assert_eq!(executed.batches.len(), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1042,6 +1451,7 @@ mod tests {
                 scheduled,
                 OutputVisibility::AfterQuantumCommit,
                 Vec::new(),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
             )
             .err()
             .expect("duplicate ticket must be rejected")
@@ -1256,6 +1666,7 @@ mod tests {
                 vec![scheduled],
                 OutputVisibility::AfterQuantumCommit,
                 Vec::new(),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
             )
             .unwrap()],
         );
@@ -1369,6 +1780,7 @@ mod tests {
                 vec![expired, live],
                 OutputVisibility::AfterQuantumCommit,
                 Vec::new(),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
             )
             .unwrap()],
         );
@@ -1489,6 +1901,7 @@ mod tests {
                 vec![scheduled],
                 OutputVisibility::AfterQuantumCommit,
                 Vec::new(),
+                PhysicalLaunchPolicy::ExecutionGroupExclusive,
             )
             .unwrap()],
         );

@@ -24,8 +24,8 @@ use super::execution::{
     ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan, ExecutionProfile,
     ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
     FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
-    OutputVisibility, PhysicalBatch, PrefillMode, ReadyQuantum, RetryDisposition, SequencePhase,
-    StageId, StageShapePolicy, WorkCost, WorkUnit,
+    OutputVisibility, PhysicalBatch, PhysicalLaunchPolicy, PrefillMode, ReadyQuantum,
+    RetryDisposition, SequencePhase, StageId, StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
@@ -130,6 +130,7 @@ struct PhysicalBatchAssembly {
     output_visibility: super::OutputVisibility,
     shape_policy: StageShapePolicy,
     workspace_base_bytes: u64,
+    launch_policy: PhysicalLaunchPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +149,7 @@ struct InFlightPhysicalDispatch {
     scheduled: Vec<super::scheduler::ScheduledRequest>,
     output_visibility: OutputVisibility,
     managed_cache_reservations: Vec<super::ManagedCacheReservation>,
+    launch_policy: PhysicalLaunchPolicy,
 }
 
 impl InFlightPhysicalDispatch {
@@ -158,6 +160,7 @@ impl InFlightPhysicalDispatch {
             scheduled: dispatch.scheduled().to_vec(),
             output_visibility: dispatch.output_visibility(),
             managed_cache_reservations: dispatch.managed_cache_reservations().to_vec(),
+            launch_policy: dispatch.launch_policy(),
         }
     }
 
@@ -1420,9 +1423,14 @@ impl EngineCore {
     ) -> Result<()> {
         let in_flight = InFlightPhysicalDispatch::from_prepared(dispatch);
         let batch_id = in_flight.physical_batch.batch_id;
-        if !self.in_flight_dispatches.is_empty() {
+        let candidate_limit = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        if self.in_flight_dispatches.len() >= candidate_limit {
             return Err(Error::InferenceError(
-                "strict-serial execution already owns an in-flight physical dispatch".to_string(),
+                "physical dispatch candidate limit is already fully owned".to_string(),
             ));
         }
         if self.in_flight_dispatches.contains_key(&batch_id) {
@@ -1440,6 +1448,17 @@ impl EngineCore {
             if plan.session != row.session || plan.work != row.work {
                 return Err(Error::InferenceError(
                     "physical dispatch row crossed its active plan fence".to_string(),
+                ));
+            }
+            let sealed_launch_policy = plan
+                .stage
+                .as_ref()
+                .map(|stage| stage.physical_launch_policy)
+                .unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive);
+            if sealed_launch_policy != in_flight.launch_policy {
+                return Err(Error::InferenceError(
+                    "physical dispatch launch policy differs from its sealed stage contract"
+                        .to_string(),
                 ));
             }
             if self.in_flight_dispatches.values().any(|active| {
@@ -1516,13 +1535,30 @@ impl EngineCore {
                 })?;
             let cost = Self::work_cost(&request, &plan.work, plan.stage.as_ref())?;
             let lane = Self::batch_lane(&plan, cost);
-            let (budget, shape_policy) = Self::batch_budget(&plan)?;
+            let (mut budget, shape_policy) = Self::batch_budget(&plan)?;
             let output_visibility = plan
                 .stage
                 .as_ref()
                 .map_or(super::OutputVisibility::AfterQuantumCommit, |stage| {
                     stage.output_visibility
                 });
+            let launch_policy = plan
+                .stage
+                .as_ref()
+                .map(|stage| stage.physical_launch_policy)
+                .unwrap_or(PhysicalLaunchPolicy::ExecutionGroupExclusive);
+            if self.config.physical_execution_mode
+                == crate::config::PhysicalExecutionMode::Concurrent
+                && matches!(launch_policy, PhysicalLaunchPolicy::Concurrent { .. })
+            {
+                let launch_limit = self
+                    .config
+                    .resolved_physical_execution_capacity()
+                    .physical_launch_limit;
+                budget.max_rows = budget
+                    .max_rows
+                    .min(launch_policy.effective_max_in_flight_per_model(launch_limit));
+            }
             let planned_work = plan.work.clone();
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
                 self.managed_kv_cache.prepare(
@@ -1578,6 +1614,7 @@ impl EngineCore {
                         || assembly.physical_batch.budget != budget
                         || assembly.output_visibility != output_visibility
                         || assembly.shape_policy != shape_policy
+                        || assembly.launch_policy != launch_policy
                     {
                         continue;
                     }
@@ -1623,17 +1660,20 @@ impl EngineCore {
                     output_visibility,
                     shape_policy,
                     workspace_base_bytes,
+                    launch_policy,
                 });
             }
         }
 
-        // The execution group commits only after every physical batch in an
-        // engine step completes. Bound the transaction to one physical launch
-        // so an incompatible/slow lane cannot amplify head-of-line latency for
-        // cancellation, new admissions, or already-finished rows.
-        let mut prepared = Vec::with_capacity(assemblies.len().min(1));
+        let candidate_limit = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        let available_candidates = candidate_limit.saturating_sub(self.in_flight_dispatches.len());
+        let mut prepared = Vec::with_capacity(assemblies.len().min(available_candidates));
         for (index, assembly) in assemblies.into_iter().enumerate() {
-            if index > 0 {
+            if index >= available_candidates {
                 transaction_deferred.extend(assembly.scheduled);
                 continue;
             }
@@ -1650,6 +1690,7 @@ impl EngineCore {
                 assembly.scheduled,
                 assembly.output_visibility,
                 reservations,
+                assembly.launch_policy,
             )?;
             self.register_prepared_physical_dispatch(&dispatch)?;
             prepared.push(dispatch);
@@ -2509,7 +2550,12 @@ impl EngineCore {
                 return Err(error);
             }
         };
-        let prefill_batches = if decode_batches.is_empty() {
+        let candidate_capacity = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        let prefill_batches = if self.in_flight_dispatches.len() < candidate_capacity {
             match self.form_physical_batches(
                 ExecutionPhase::Prefill,
                 &prefill_requests,
@@ -2529,9 +2575,9 @@ impl EngineCore {
                 }
             }
         } else {
-            // Decode and prefill have distinct shapes and safe points. Preserve
-            // one physical transaction per engine step; the scheduler will
-            // reconsider these prefills immediately after decode commits.
+            // The candidate transaction is full. The scheduler will
+            // reconsider these prefills immediately after the owned tickets
+            // commit or roll back.
             transaction_deferred.extend(prefill_scheduled.iter().cloned());
             Vec::new()
         };
@@ -2554,9 +2600,12 @@ impl EngineCore {
 
         let mut dispatches = decode_batches;
         dispatches.extend(prefill_batches);
-        Ok(Some(PreparedEngineStep::new(
+        let capacity = self.config.resolved_physical_execution_capacity();
+        Ok(Some(PreparedEngineStep::with_execution_policy(
             self.executor.clone(),
             dispatches,
+            self.config.physical_execution_mode,
+            capacity.physical_launch_limit,
         )))
     }
 
@@ -5424,6 +5473,7 @@ mod tests {
             output_visibility: OutputVisibility::AfterQuantumCommit,
             shape_policy: StageShapePolicy::Ragged,
             workspace_base_bytes: 0,
+            launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
         };
         let second_scheduled = scheduled_decode("shared-row", 2);
         let second_row = ReadyQuantum {
@@ -6760,6 +6810,102 @@ mod tests {
 
         assert!((prefill_ms["fast-batch"] - 7.0).abs() < 0.001);
         assert!((prefill_ms["slow-batch"] - 31.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_owns_multiple_candidate_tickets_but_executes_them_serially() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct ShadowExecutor {
+            active: Arc<std::sync::atomic::AtomicUsize>,
+            max_active: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ModelExecutor for ShadowExecutor {
+            fn execute_physical_batch(
+                &self,
+                execution: super::super::PhysicalBatchExecution<'_>,
+            ) -> super::super::PhysicalDispatchResult {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(execution
+                    .scheduled
+                    .iter()
+                    .map(|scheduled| {
+                        ExecutorStepResult::new(
+                            scheduled,
+                            ExecutorOutput::terminal(scheduled.request_id.clone()),
+                        )
+                        .with_dispatch(execution.expected_dispatch())
+                    })
+                    .collect())
+            }
+
+            fn execute_prefill(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[super::super::scheduler::ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("physical boundary must own dispatch")
+            }
+
+            fn execute_decode(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[super::super::scheduler::ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("physical boundary must own dispatch")
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn initialize(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let executor = UnifiedExecutor::new_for_test(Box::new(ShadowExecutor {
+            active,
+            max_active: max_active.clone(),
+        }));
+        let config = EngineCoreConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            physical_execution_mode: crate::config::PhysicalExecutionMode::Shadow,
+            max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        for request_id in ["shadow-a", "shadow-b"] {
+            let mut request = EngineCoreRequest::tts(request_id);
+            request.id = request_id.to_string();
+            request.prompt_tokens = vec![1];
+            core.add_request(request).unwrap();
+        }
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("shadow candidate tickets");
+        assert_eq!(core.in_flight_dispatches.len(), 2);
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        assert_eq!(executed.batches.len(), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        core.commit_step(executed).await.unwrap();
+        assert!(core.in_flight_dispatches.is_empty());
     }
 
     #[tokio::test]
