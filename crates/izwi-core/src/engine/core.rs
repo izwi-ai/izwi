@@ -437,6 +437,10 @@ pub struct EngineCore {
     /// Consecutive retryable executor failures for each exact session.
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
     retry_policy: LifecycleRetryPolicy,
+    /// Phase preferred when decode and prefill compete for a single physical
+    /// candidate slot. It advances only after the preferred phase actually
+    /// owns a ticket, so blocked work does not waste the device opportunity.
+    next_single_candidate_phase: ExecutionPhase,
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
@@ -454,6 +458,57 @@ impl EngineCore {
         profile.max_batch_size = 1;
         profile.concurrency = ConcurrencyClass::Exclusive;
         profile
+    }
+
+    fn candidate_phase_quotas(
+        capacity: usize,
+        decode_work: usize,
+        prefill_work: usize,
+        single_slot_preference: ExecutionPhase,
+    ) -> (usize, usize) {
+        let capacity = capacity.max(1);
+        match (decode_work > 0, prefill_work > 0) {
+            (false, false) => (0, 0),
+            (true, false) => (capacity, 0),
+            (false, true) => (0, capacity),
+            (true, true) if capacity == 1 => match single_slot_preference {
+                ExecutionPhase::Decode => (1, 0),
+                ExecutionPhase::Prefill => (0, 1),
+            },
+            (true, true) => {
+                // Reserve enough candidate slots for the scheduler's decode
+                // selection while preserving at least one prefill slot. Prefill
+                // forms first, so any unused reservation is immediately
+                // available to decode formation below.
+                let decode = decode_work.min(capacity - 1).max(1);
+                let prefill = prefill_work.min(capacity - decode).max(1);
+                (decode, prefill)
+            }
+        }
+    }
+
+    fn alternate_candidate_phase(phase: ExecutionPhase) -> ExecutionPhase {
+        match phase {
+            ExecutionPhase::Decode => ExecutionPhase::Prefill,
+            ExecutionPhase::Prefill => ExecutionPhase::Decode,
+        }
+    }
+
+    fn next_candidate_preference(
+        current: ExecutionPhase,
+        both_phases: bool,
+        decode_admitted: bool,
+        prefill_admitted: bool,
+    ) -> ExecutionPhase {
+        let preferred_admitted = match current {
+            ExecutionPhase::Decode => decode_admitted,
+            ExecutionPhase::Prefill => prefill_admitted,
+        };
+        if both_phases && preferred_admitted {
+            Self::alternate_candidate_phase(current)
+        } else {
+            current
+        }
     }
 
     fn apply_adapter_execution_contract(
@@ -1500,6 +1555,7 @@ impl EngineCore {
         phase: ExecutionPhase,
         requests: &[Arc<EngineCoreRequest>],
         scheduled: &[super::scheduler::ScheduledRequest],
+        max_candidates: usize,
         capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
         transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
     ) -> Result<Vec<PreparedPhysicalDispatch>> {
@@ -1677,7 +1733,9 @@ impl EngineCore {
             .resolved_physical_execution_capacity()
             .candidate_dispatch_limit
             .get();
-        let available_candidates = candidate_limit.saturating_sub(self.in_flight_dispatches.len());
+        let available_candidates = candidate_limit
+            .saturating_sub(self.in_flight_dispatches.len())
+            .min(max_candidates);
         let mut prepared = Vec::with_capacity(assemblies.len().min(available_candidates));
         for (index, assembly) in assemblies.into_iter().enumerate() {
             if index >= available_candidates {
@@ -1894,6 +1952,7 @@ impl EngineCore {
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
+            next_single_candidate_phase: ExecutionPhase::Decode,
             initialized: false,
             next_batch_id: 1,
         })
@@ -2539,34 +2598,30 @@ impl EngineCore {
 
         let mut capacity_blocked = Vec::new();
         let mut transaction_deferred = Vec::new();
-        let decode_batches = match self.form_physical_batches(
-            ExecutionPhase::Decode,
-            &decode_requests,
-            &decode_scheduled,
-            &mut capacity_blocked,
-            &mut transaction_deferred,
-        ) {
-            Ok(batches) => batches,
-            Err(Error::Backpressure(reason)) => {
-                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
-                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
-                return Ok(None);
-            }
-            Err(error) => {
-                self.rollback_unexecuted_schedule(&all_scheduled);
-                return Err(error);
-            }
-        };
         let candidate_capacity = self
             .config
             .resolved_physical_execution_capacity()
             .candidate_dispatch_limit
             .get();
-        let prefill_batches = if self.in_flight_dispatches.len() < candidate_capacity {
-            match self.form_physical_batches(
+        let both_phases = !decode_scheduled.is_empty() && !prefill_scheduled.is_empty();
+        let (decode_quota, prefill_quota) = Self::candidate_phase_quotas(
+            candidate_capacity,
+            decode_scheduled.len(),
+            prefill_scheduled.len(),
+            self.next_single_candidate_phase,
+        );
+        let mut decode_batches = Vec::new();
+        let mut prefill_batches = Vec::new();
+
+        // With multiple candidate slots, form the reserved prefill service
+        // first. Decode then consumes every unused slot, preserving utilization
+        // without allowing its larger runnable population to erase prefill.
+        if prefill_quota > 0 {
+            prefill_batches = match self.form_physical_batches(
                 ExecutionPhase::Prefill,
                 &prefill_requests,
                 &prefill_scheduled,
+                prefill_quota,
                 &mut capacity_blocked,
                 &mut transaction_deferred,
             ) {
@@ -2580,14 +2635,103 @@ impl EngineCore {
                     self.rollback_unexecuted_schedule(&all_scheduled);
                     return Err(error);
                 }
+            };
+        }
+
+        let decode_limit = candidate_capacity.saturating_sub(self.in_flight_dispatches.len());
+        if decode_quota > 0 && decode_limit > 0 {
+            decode_batches = match self.form_physical_batches(
+                ExecutionPhase::Decode,
+                &decode_requests,
+                &decode_scheduled,
+                decode_limit,
+                &mut capacity_blocked,
+                &mut transaction_deferred,
+            ) {
+                Ok(batches) => batches,
+                Err(Error::Backpressure(reason)) => {
+                    self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                    debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
+            };
+        } else if !decode_scheduled.is_empty() && !(candidate_capacity == 1 && both_phases) {
+            transaction_deferred.extend(decode_scheduled.iter().cloned());
+        }
+
+        // A single candidate alternates only while both phases are runnable.
+        // If the preferred phase cannot form a ticket, immediately offer the
+        // slot to its peer rather than idling the physical lane.
+        if candidate_capacity == 1 {
+            let preferred_admitted = match self.next_single_candidate_phase {
+                ExecutionPhase::Decode => !decode_batches.is_empty(),
+                ExecutionPhase::Prefill => !prefill_batches.is_empty(),
+            };
+            if both_phases && !preferred_admitted && self.in_flight_dispatches.is_empty() {
+                match self.next_single_candidate_phase {
+                    ExecutionPhase::Decode => {
+                        prefill_batches = match self.form_physical_batches(
+                            ExecutionPhase::Prefill,
+                            &prefill_requests,
+                            &prefill_scheduled,
+                            1,
+                            &mut capacity_blocked,
+                            &mut transaction_deferred,
+                        ) {
+                            Ok(batches) => batches,
+                            Err(Error::Backpressure(reason)) => {
+                                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                                return Ok(None);
+                            }
+                            Err(error) => {
+                                self.rollback_unexecuted_schedule(&all_scheduled);
+                                return Err(error);
+                            }
+                        };
+                    }
+                    ExecutionPhase::Prefill => {
+                        decode_batches = match self.form_physical_batches(
+                            ExecutionPhase::Decode,
+                            &decode_requests,
+                            &decode_scheduled,
+                            1,
+                            &mut capacity_blocked,
+                            &mut transaction_deferred,
+                        ) {
+                            Ok(batches) => batches,
+                            Err(Error::Backpressure(reason)) => {
+                                self.defer_unexecuted_schedule_for_capacity(&all_scheduled);
+                                debug!(reason = %reason, "Deferring scheduled work for managed KV capacity");
+                                return Ok(None);
+                            }
+                            Err(error) => {
+                                self.rollback_unexecuted_schedule(&all_scheduled);
+                                return Err(error);
+                            }
+                        };
+                    }
+                }
             }
-        } else {
-            // The candidate transaction is full. The scheduler will
-            // reconsider these prefills immediately after the owned tickets
-            // commit or roll back.
+
+            self.next_single_candidate_phase = Self::next_candidate_preference(
+                self.next_single_candidate_phase,
+                both_phases,
+                !decode_batches.is_empty(),
+                !prefill_batches.is_empty(),
+            );
+        }
+
+        if prefill_quota == 0 && !prefill_scheduled.is_empty() && prefill_batches.is_empty() {
             transaction_deferred.extend(prefill_scheduled.iter().cloned());
-            Vec::new()
-        };
+        }
+        if decode_quota == 0 && !decode_scheduled.is_empty() && decode_batches.is_empty() {
+            transaction_deferred.extend(decode_scheduled.iter().cloned());
+        }
         self.rollback_unexecuted_schedule(&transaction_deferred);
         self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
         if decode_batches.is_empty()
@@ -3527,6 +3671,73 @@ mod tests {
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn single_candidate_admission_alternates_under_sustained_decode_and_prefill() {
+        let mut preference = ExecutionPhase::Decode;
+        let mut admitted = Vec::new();
+
+        for _ in 0..6 {
+            let (decode, prefill) = EngineCore::candidate_phase_quotas(1, 32, 32, preference);
+            let phase = match (decode, prefill) {
+                (1, 0) => ExecutionPhase::Decode,
+                (0, 1) => ExecutionPhase::Prefill,
+                other => panic!("single candidate produced invalid phase quotas {other:?}"),
+            };
+            admitted.push(phase);
+            preference = EngineCore::next_candidate_preference(
+                preference,
+                true,
+                phase == ExecutionPhase::Decode,
+                phase == ExecutionPhase::Prefill,
+            );
+        }
+
+        assert_eq!(
+            admitted,
+            vec![
+                ExecutionPhase::Decode,
+                ExecutionPhase::Prefill,
+                ExecutionPhase::Decode,
+                ExecutionPhase::Prefill,
+                ExecutionPhase::Decode,
+                ExecutionPhase::Prefill,
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_candidate_admission_reserves_both_phases_without_wasting_width() {
+        for (decode_work, prefill_work, expected) in
+            [(32, 32, (3, 1)), (1, 32, (1, 3)), (32, 1, (3, 1))]
+        {
+            let quotas = EngineCore::candidate_phase_quotas(
+                4,
+                decode_work,
+                prefill_work,
+                ExecutionPhase::Decode,
+            );
+            assert_eq!(quotas, expected);
+            assert!(quotas.0 > 0, "decode lost reserved service");
+            assert!(quotas.1 > 0, "prefill lost reserved service");
+            assert_eq!(quotas.0 + quotas.1, 4, "candidate width was wasted");
+        }
+    }
+
+    #[test]
+    fn blocked_single_slot_preference_does_not_advance_or_idle_its_peer() {
+        let preference = ExecutionPhase::Decode;
+        assert_eq!(
+            EngineCore::next_candidate_preference(preference, true, false, true),
+            ExecutionPhase::Decode,
+            "a blocked preferred phase must retain its next service opportunity"
+        );
+        assert_eq!(
+            EngineCore::candidate_phase_quotas(1, 8, 8, ExecutionPhase::Prefill),
+            (0, 1),
+            "the peer phase must remain eligible for the current physical slot"
+        );
+    }
 
     #[test]
     fn managed_token_reach_honors_portable_context_and_preserves_cuda_ceiling() {
@@ -5019,6 +5230,7 @@ mod tests {
                 ExecutionPhase::Prefill,
                 &requests,
                 &scheduled,
+                usize::MAX,
                 &mut Vec::new(),
                 &mut Vec::new(),
             )
@@ -5053,6 +5265,7 @@ mod tests {
                 ExecutionPhase::Prefill,
                 &requests,
                 &scheduled,
+                usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
             )
@@ -5197,6 +5410,7 @@ mod tests {
                 ExecutionPhase::Prefill,
                 &requests,
                 &scheduled,
+                usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
             )
@@ -5305,6 +5519,7 @@ mod tests {
                 ExecutionPhase::Prefill,
                 &requests,
                 &scheduled,
+                usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
             )
@@ -5396,6 +5611,7 @@ mod tests {
                 ExecutionPhase::Decode,
                 &requests,
                 &scheduled,
+                usize::MAX,
                 &mut Vec::new(),
                 &mut Vec::new(),
             )
